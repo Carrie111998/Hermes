@@ -7345,9 +7345,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_claim": self._adapter_credential_claim(
                 adapter.platform, adapter
             ),
-            "listener_claim": self._adapter_listener_claim(
-                adapter.platform, adapter
-            ),
         }
         logger.info(
             "%s queued for background reconnection",
@@ -11406,9 +11403,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "credential_claim": self._adapter_credential_claim(
                                     platform, adapter
                                 ),
-                                "listener_claim": self._adapter_listener_claim(
-                                    platform, adapter
-                                ),
                             }
                     else:
                         self._update_platform_runtime_status(
@@ -11426,9 +11420,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "attempts": 1,
                             "next_retry": time.monotonic() + 30,
                             "credential_claim": self._adapter_credential_claim(
-                                platform, adapter
-                            ),
-                            "listener_claim": self._adapter_listener_claim(
                                 platform, adapter
                             ),
                         }
@@ -11451,9 +11442,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "attempts": 1,
                     "next_retry": time.monotonic() + 30,
                     "credential_claim": self._adapter_credential_claim(
-                        platform, adapter
-                    ),
-                    "listener_claim": self._adapter_listener_claim(
                         platform, adapter
                     ),
                 }
@@ -13482,24 +13470,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         active = get_active_profile_name() or "default"
         connected = 0
         # Resource claim -> profile that owns it. Credential claims prevent two
-        # profiles polling the same account; listener claims prevent sidecars
-        # with distinct credentials from binding the same endpoint.
+        # profiles from polling the same account.
         claimed: Dict[tuple, str] = {}
         for _plat, _ad in self.adapters.items():
             fp = self._adapter_credential_fingerprint(_ad)
             if fp is not None:
                 claimed[(_plat, fp)] = active
-            listener_claim = self._adapter_listener_claim(_plat, _ad)
-            if listener_claim is not None:
-                claimed[listener_claim] = active
-        # A retryable primary still owns its configured credential and listener.
-        # Reserve both while it is queued so a secondary cannot take the endpoint
-        # before the reconnect watcher retries the primary adapter.
+        # A retryable primary still owns its configured credential. Reserve it
+        # while queued so a secondary cannot claim it before reconnect retries.
         for retry_info in getattr(self, "_failed_platforms", {}).values():
-            for claim_name in ("credential_claim", "listener_claim"):
-                retry_claim = retry_info.get(claim_name)
-                if isinstance(retry_claim, tuple):
-                    claimed[retry_claim] = active
+            retry_claim = retry_info.get("credential_claim")
+            if isinstance(retry_claim, tuple):
+                claimed[retry_claim] = active
 
         for profile_name, profile_home in profiles_to_serve(multiplex=True):
             if profile_name == active:
@@ -13625,30 +13607,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     # This adapter has not connected and therefore owns no
                     # resources to clean up. Calling disconnect here can mutate
-                    # the shared platform state and, for a same-credential Photon
-                    # adapter, shut down the primary profile's live sidecar.
-                    continue
-
-            listener_claim = self._adapter_listener_claim(platform, adapter)
-            if listener_claim is not None:
-                owner = claimed.get(listener_claim)
-                if owner is not None:
-                    bind, port = listener_claim[-2:]
-                    logger.error(
-                        "Profile '%s' and '%s' both configure %s sidecars on "
-                        "%s:%s — refusing to start the duplicate listener. "
-                        "Set platforms.%s.extra.sidecar_port to a distinct port "
-                        "for profile '%s'.",
-                        owner,
-                        profile_name,
-                        platform.value,
-                        bind,
-                        port,
-                        platform.value,
-                        profile_name,
-                    )
-                    # Like credential conflicts, this adapter never connected
-                    # and owns no resources that should be disconnected.
+                    # shared platform state owned by the primary profile.
                     continue
 
             self._configure_profile_adapter(adapter, profile_name, platform)
@@ -13662,8 +13621,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     profile_map[platform] = adapter
                     if credential_claim is not None:
                         claimed[credential_claim] = profile_name
-                    if listener_claim is not None:
-                        claimed[listener_claim] = profile_name
                     connected += 1
                     logger.info("✓ %s connected (profile: %s)", platform.value, profile_name)
                 else:
@@ -13918,28 +13875,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (platform, fingerprint)
 
     @staticmethod
-    def _adapter_listener_claim(platform: Platform, adapter: Any) -> Optional[tuple]:
-        """Return the exclusive listener resource claimed by an adapter.
-
-        Photon sidecars are per-profile processes. Even when two profiles use
-        different project credentials, their sidecars cannot share a bind and
-        port. Represent that endpoint as a claim so multiplex startup rejects
-        the later adapter before either ``connect()`` or ``disconnect()`` can
-        disturb the first profile.
-        """
-        if getattr(platform, "value", None) != "photon":
-            return None
-        bind = getattr(adapter, "_sidecar_bind", None)
-        port = getattr(adapter, "_sidecar_port", None)
-        if not isinstance(bind, str) or not bind.strip():
-            return None
-        try:
-            port = int(port)
-        except (TypeError, ValueError):
-            return None
-        return ("listener", "photon", bind.strip().lower(), port)
-
-    @staticmethod
     def _adapter_credential_fingerprint(adapter: Any) -> Optional[str]:
         """Return a stable, log-safe fingerprint of an adapter's credential.
 
@@ -13955,10 +13890,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "_token",
             "api_token",
             "_bot_token",
-            # Photon/Spectrum authenticates with project credentials instead
-            # of a bot token. Including its secret keeps multiplexed profiles
-            # from spawning competing sidecars for the same account and port.
-            "_project_secret",
         ):
             val = getattr(adapter, attr, None)
             if isinstance(val, str) and val.strip():
@@ -27418,7 +27349,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 snapshot_shutdown_context,
                 spawn_async_diagnostic,
             )
-            _shutdown_ctx = snapshot_shutdown_context(received_signal)
+            _shutdown_ctx = snapshot_shutdown_context(
+                received_signal,
+                planned_takeover=planned_takeover,
+                planned_stop=planned_stop,
+            )
         except Exception as _e:
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
@@ -27458,7 +27393,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             except Exception as _e:
                 logger.debug("format_context_for_log failed: %s", _e)
 
-            # Spawn the heavyweight diagnostic (ps auxf, pstree, dmesg) in
+            # Spawn the bounded, redacted process diagnostic in
             # a detached subprocess so it can finish writing to disk even
             # if our cgroup is being torn down.  Bounded by an internal
             # timeout; never blocks the event loop here.

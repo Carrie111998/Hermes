@@ -20,12 +20,18 @@ the unified index existed).
 
 import json
 import os
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 
 import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from scripts.skills_index_policy import is_retired_platform_catalog_entry
+
 LOCAL_SKILL_DIRS = [
     ("skills", "built-in"),
     ("optional-skills", "optional"),
@@ -372,6 +378,10 @@ def extract_unified_index_skills():
     out = []
     for entry in data.get("skills", []):
         if not isinstance(entry, dict):
+            continue
+        # Defense in depth for stale/pre-policy unified indexes: never derive a
+        # public Skills Hub record for the retired bundled integration.
+        if is_retired_platform_catalog_entry(entry):
             continue
         source_id = (entry.get("source") or "").lower()
         identifier = entry.get("identifier", "") or ""

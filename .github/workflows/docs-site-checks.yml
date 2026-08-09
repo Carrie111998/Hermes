@@ -33,10 +33,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install ascii-guard
-        uses: ./.github/actions/retry
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
         with:
-          command: python -m pip install ascii-guard==2.3.0 pyyaml==6.0.3
+          version: "0.9.28"
 
       - name: Extract skill metadata for dashboard
         run: python3 website/scripts/extract-skills.py
@@ -46,6 +46,10 @@ jobs:
 
       - name: Lint docs diagrams
         run: npm run lint:diagrams
+        working-directory: website
+
+      - name: Verify vendored image parser security regressions
+        run: npm run test:security
         working-directory: website
 
       - name: Build Docusaurus

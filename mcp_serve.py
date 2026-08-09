@@ -92,8 +92,30 @@ def _load_sessions_index() -> dict:
     """
     entries = _load_sessions_index_from_db()
     if entries:
-        return entries
-    return _load_sessions_index_from_json()
+        return _filter_retired_sessions(entries)
+    return _filter_retired_sessions(_load_sessions_index_from_json())
+
+
+def _filter_retired_sessions(entries: dict) -> dict:
+    """Remove migration-only platform rows before any MCP consumer sees them."""
+    from gateway.retired_platforms import is_retired_platform_id
+
+    filtered = {}
+    for key, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        origin = entry.get("origin")
+        origin_platform = origin.get("platform") if isinstance(origin, dict) else None
+        session_key = str(entry.get("session_key") or key)
+        key_parts = session_key.split(":")
+        key_platform = key_parts[2] if len(key_parts) > 2 else None
+        if any(
+            is_retired_platform_id(value)
+            for value in (entry.get("platform"), origin_platform, key_platform)
+        ):
+            continue
+        filtered[key] = entry
+    return filtered
 
 
 def _row_to_index_entry(row: dict) -> dict:
@@ -206,7 +228,29 @@ def _load_channel_directory() -> dict:
         return {}
     try:
         with open(directory_file, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {}
+        from gateway.retired_platforms import is_retired_platform_id
+
+        platforms = data.get("platforms")
+        if isinstance(platforms, dict):
+            data = dict(data)
+            data["platforms"] = {
+                name: entries
+                for name, entries in platforms.items()
+                if not is_retired_platform_id(name)
+            }
+        else:
+            # Normalize the old unwrapped cache shape to the current contract.
+            data = {
+                "platforms": {
+                    name: entries
+                    for name, entries in data.items()
+                    if not is_retired_platform_id(name)
+                }
+            }
+        return data
     except Exception as e:
         logger.debug("Failed to load channel_directory.json: %s", e)
         return {}

@@ -17,6 +17,8 @@ Behaviour (all behaviours selectable via env var ``MOCK_LSP_SCRIPT``):
   (simulates a crashing server).
 - ``"slow"`` — same as ``clean`` but sleeps 1s before responding to
   ``initialize`` (lets us test timeout behaviour).
+- ``"hang_initialize"`` — records its PID when requested and never answers
+  ``initialize`` (lets us test cancellation ownership without timing races).
 - ``"stale"`` — pushes one error on ``didOpen``, then goes SILENT on
   ``didChange`` (no push) and rejects the pull endpoint with
   method-not-found.  Models a slow tsserver that hasn't re-checked
@@ -64,6 +66,10 @@ def write_message(obj):
 
 def main():
     script = os.environ.get("MOCK_LSP_SCRIPT", "clean")
+    pid_file = os.environ.get("MOCK_LSP_PID_FILE")
+    if pid_file:
+        with open(pid_file, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
 
     while True:
         msg = read_message()
@@ -71,6 +77,8 @@ def main():
             return 0
 
         if "id" in msg and msg.get("method") == "initialize":
+            if script == "hang_initialize":
+                time.sleep(60.0)
             if script == "slow":
                 time.sleep(1.0)
             write_message(

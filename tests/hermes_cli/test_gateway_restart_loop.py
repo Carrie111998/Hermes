@@ -39,7 +39,7 @@ class TestGatewayLifecyclePattern:
         # #62891: a blocked direct restart/kill laundered through a NEW
         # launchd keepalive job wrapping a helper script, instead of a
         # direct kickstart/unload/stop/restart on the existing service.
-        "launchctl submit -l ai.hermes.gateway-hard-restart-no-photon-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh",
+        "launchctl submit -l ai.hermes.gateway-hard-restart-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_notice.sh",
         "launchctl submit -l hermes-gateway-restart-helper -- /bin/sh helper.sh",
         # bootstrap loads an arbitrary plist — same laundering shape.
         "launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.hermes.gateway.restart-once.plist",
@@ -49,8 +49,8 @@ class TestGatewayLifecyclePattern:
         # physical lines unless continuations are normalized first.
         (
             "launchctl submit \\\n"
-            "  -l ai.hermes.gateway-hard-restart-no-photon-notice \\\n"
-            "  -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh"
+            "  -l ai.hermes.gateway-hard-restart-notice \\\n"
+            "  -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_notice.sh"
         ),
     ])
     def test_launchctl_submit_bootstrap_commands(self, text):
@@ -271,7 +271,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         "hermes gateway restart",
         "launchctl kickstart gui/501/ai.hermes.gateway",
         # #62891 exact reported shape and its bootstrap sibling.
-        "launchctl submit -l ai.hermes.gateway-hard-restart-no-photon-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_no_photon_notice.sh",
+        "launchctl submit -l ai.hermes.gateway-hard-restart-notice -- /bin/sh ~/.hermes/scripts/hard_restart_gateway_notice.sh",
         "launchctl submit -l com.foo -- /path/gateway",
         "launchctl bootstrap gui/501 ~/Library/LaunchAgents/ai.hermes.gateway.restart-once.plist",
         "pkill -f hermes.*gateway",

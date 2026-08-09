@@ -4,12 +4,11 @@
 The conversational counterpart to the user's tapback: the same reaction store,
 the same one-per-author semantics, just written with ``author="agent"``.
 
-Lives in the ``desktop_ui`` toolset (like the other GUI affordances) so it costs
-nothing on every other surface — the platform adapters already expose reactions
-through ``send_message(action="react")``, and this is the desktop's equivalent.
+Lives in the ``desktop_ui`` toolset (like the other GUI affordances), so it is
+only exposed where the desktop can persist and render message reactions.
 
-Defaults to the message that triggered this turn (the photon precedent: the
-model shouldn't have to thread row ids through tool calls), and emits
+Defaults to the message that triggered this turn (the model should not have to
+thread row ids through tool calls), and emits
 ``message.reaction`` so the renderer paints it without waiting for a resume.
 """
 

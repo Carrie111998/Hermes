@@ -17,10 +17,10 @@ def _run_async_immediately(coro):
     return asyncio.run(coro)
 
 
-def test_photon_e164_target_is_explicit() -> None:
-    chat_id, thread_id, is_explicit = _parse_target_ref("photon", "+15551234567")
+def test_signal_e164_target_is_explicit() -> None:
+    chat_id, thread_id, is_explicit = _parse_target_ref("signal", "+15550001234")
 
-    assert chat_id == "+15551234567"
+    assert chat_id == "+15550001234"
     assert thread_id is None
     assert is_explicit is True
 

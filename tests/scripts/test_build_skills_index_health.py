@@ -30,6 +30,34 @@ def _meta(name, src):
     )
 
 
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "identifier": "skills-sh/photon-hq/skills/spectrum",
+            "repo": "photon-hq/skills",
+            "tags": [],
+        },
+        {
+            "identifier": "chronicle-monograph-memory",
+            "description": "Photon: AI-enhanced memory system",
+            "tags": ["Photon"],
+        },
+    ],
+)
+def test_retired_platform_catalog_entries_are_rejected(entry):
+    assert build_mod.is_retired_platform_catalog_entry(entry) is True
+
+
+def test_photonics_skill_is_not_mistaken_for_retired_platform():
+    entry = {
+        "identifier": "finance-photonics-cpo",
+        "description": "Research co-packaged optics and photonics supply chains",
+        "tags": ["photonics-cpo"],
+    }
+    assert build_mod.is_retired_platform_catalog_entry(entry) is False
+
+
 class _FakeSource:
     def __init__(self, src, n, rate_limited=False):
         self._src = src

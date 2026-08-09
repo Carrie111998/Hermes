@@ -23,22 +23,6 @@ class TestCredentialFingerprint:
         assert GatewayRunner._adapter_credential_fingerprint(_FakeAdapter()) is None
 
 
-    def test_reads_photon_project_secret(self):
-        class _PhotonAdapter:
-            def __init__(self, secret):
-                self._project_secret = secret
-
-        fp1 = GatewayRunner._adapter_credential_fingerprint(
-            _PhotonAdapter("shared-project-secret")
-        )
-        fp2 = GatewayRunner._adapter_credential_fingerprint(
-            _PhotonAdapter("shared-project-secret")
-        )
-
-        assert fp1 == fp2
-        assert fp1 is not None
-        assert "shared-project-secret" not in fp1
-
 
     def test_reads_config_token(self):
         """Adapters like Discord store token on `config`, not on self.
@@ -351,18 +335,16 @@ class TestSecondaryProfileConfigHandling:
 
 
     @pytest.mark.asyncio
-    async def test_secondary_distinct_photon_credentials_distinct_ports_connect(
+    async def test_secondary_distinct_credentials_connect(
         self, monkeypatch
     ):
-        """Multiplexing remains supported when Photon sidecars cannot collide."""
+        """Multiplexing remains supported for distinct credentials."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
-        class _PhotonAdapter:
-            def __init__(self, secret, port):
-                self._project_secret = secret
-                self._sidecar_bind = "127.0.0.1"
-                self._sidecar_port = port
-                self.platform = Platform("photon")
+        class _CredentialAdapter:
+            def __init__(self, secret):
+                self.token = secret
+                self.platform = Platform.TELEGRAM
                 self.connected = False
                 self.disconnected = False
                 self.config = PlatformConfig(enabled=True)
@@ -381,14 +363,14 @@ class TestSecondaryProfileConfigHandling:
         runner.session_store = None
         runner._busy_text_mode = "queue"
 
-        photon = Platform("photon")
+        platform = Platform.TELEGRAM
         reviewer_cfg = GatewayConfig(multiplex_profiles=True)
-        reviewer_cfg.platforms = {photon: PlatformConfig(enabled=True)}
-        primary = _PhotonAdapter("primary-secret", 8789)
-        secondary = _PhotonAdapter("different-secret", 8790)
-        claimed = {
-            GatewayRunner._adapter_listener_claim(photon, primary): "default"
-        }
+        reviewer_cfg.platforms = {platform: PlatformConfig(enabled=True)}
+        primary = _CredentialAdapter("primary-secret")
+        secondary = _CredentialAdapter("different-secret")
+        primary_claim = GatewayRunner._adapter_credential_claim(platform, primary)
+        assert primary_claim is not None
+        claimed = {primary_claim: "default"}
 
         async def _connect(adapter, platform):
             adapter.connected = True
@@ -408,21 +390,19 @@ class TestSecondaryProfileConfigHandling:
         assert connected == 1
         assert secondary.connected is True
         assert secondary.disconnected is False
-        assert runner._profile_adapters["reviewer"][photon] is secondary
+        assert runner._profile_adapters["reviewer"][platform] is secondary
 
     @pytest.mark.asyncio
-    async def test_failed_photon_connect_releases_listener_for_later_profile(
+    async def test_failed_connect_does_not_reserve_credential_for_later_profile(
         self, monkeypatch
     ):
-        """A failed sidecar must not reserve an endpoint it never owned."""
+        """A failed adapter must not reserve a credential it never consumed."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
 
-        class _PhotonAdapter:
+        class _CredentialAdapter:
             def __init__(self, secret, should_connect):
-                self._project_secret = secret
-                self._sidecar_bind = "127.0.0.1"
-                self._sidecar_port = 8789
-                self.platform = Platform("photon")
+                self.token = secret
+                self.platform = Platform.TELEGRAM
                 self.should_connect = should_connect
                 self.disconnected = False
                 self.config = PlatformConfig(enabled=True)
@@ -441,11 +421,11 @@ class TestSecondaryProfileConfigHandling:
         runner.session_store = None
         runner._busy_text_mode = "queue"
 
-        photon = Platform("photon")
+        platform = Platform.TELEGRAM
         profile_cfg = GatewayConfig(multiplex_profiles=True)
-        profile_cfg.platforms = {photon: PlatformConfig(enabled=True)}
-        failed = _PhotonAdapter("failed-secret", False)
-        later = _PhotonAdapter("later-secret", True)
+        profile_cfg.platforms = {platform: PlatformConfig(enabled=True)}
+        failed = _CredentialAdapter("shared-secret", False)
+        later = _CredentialAdapter("shared-secret", True)
         adapters = iter((failed, later))
         claimed = {}
 
@@ -465,7 +445,7 @@ class TestSecondaryProfileConfigHandling:
         assert first == 0
         assert failed.disconnected is True
         assert second == 1
-        assert runner._profile_adapters["later"][photon] is later
+        assert runner._profile_adapters["later"][platform] is later
 
 
 class TestFeishuPortBindingConditional:

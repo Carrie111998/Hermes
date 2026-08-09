@@ -32,6 +32,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
 
+from gateway.retired_platforms import is_retired_platform_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -215,6 +217,8 @@ class PlatformRegistry:
         registered directly (e.g. a built-in) takes precedence -- the deferred
         loader is then dropped.
         """
+        if is_retired_platform_id(name):
+            raise ValueError(f"Platform '{name}' is permanently retired")
         if name in self._entries:
             # Already concretely registered; no need to defer.
             return
@@ -222,6 +226,10 @@ class PlatformRegistry:
 
     def _resolve(self, name: str) -> None:
         """Run the deferred loader for *name* if one is pending."""
+        if is_retired_platform_id(name):
+            self._deferred.pop(name, None)
+            self._entries.pop(name, None)
+            return
         loader = self._deferred.pop(name, None)
         if loader is None:
             return
@@ -255,6 +263,8 @@ class PlatformRegistry:
         If an entry with the same name exists, it is replaced (last writer
         wins -- this lets plugins override built-in adapters if desired).
         """
+        if is_retired_platform_id(entry.name):
+            raise ValueError(f"Platform '{entry.name}' is permanently retired")
         # A concrete registration supersedes any pending deferred loader.
         self._deferred.pop(entry.name, None)
         if entry.name in self._entries:
@@ -275,6 +285,10 @@ class PlatformRegistry:
 
     def get(self, name: str) -> Optional[PlatformEntry]:
         """Look up a platform entry by name."""
+        if is_retired_platform_id(name):
+            self._deferred.pop(name, None)
+            self._entries.pop(name, None)
+            return None
         if name not in self._entries:
             self._resolve(name)
         return self._entries.get(name)
@@ -282,19 +296,29 @@ class PlatformRegistry:
     def all_entries(self) -> list[PlatformEntry]:
         """Return all registered platform entries."""
         self._resolve_all()
-        return list(self._entries.values())
+        return [
+            entry
+            for entry in self._entries.values()
+            if not is_retired_platform_id(entry.name)
+        ]
 
     def plugin_entries(self) -> list[PlatformEntry]:
         """Return only plugin-registered platform entries."""
         self._resolve_all()
-        return [e for e in self._entries.values() if e.source == "plugin"]
+        return [
+            entry
+            for entry in self._entries.values()
+            if entry.source == "plugin" and not is_retired_platform_id(entry.name)
+        ]
 
     def is_registered(self, name: str) -> bool:
         # A deferred (not-yet-imported) platform still counts as registered --
         # the loader will materialize it on first real use.  This keeps cheap
         # membership checks (toolset resolution, webhook deliver-target checks)
         # from triggering a heavy import.
-        return name in self._entries or name in self._deferred
+        return not is_retired_platform_id(name) and (
+            name in self._entries or name in self._deferred
+        )
 
     def create_adapter(self, name: str, config: Any) -> Optional[Any]:
         """Create an adapter instance for the given platform name.
@@ -306,6 +330,10 @@ class PlatformRegistry:
         - validate_config() returns False (misconfigured)
         - The factory raises an exception
         """
+        if is_retired_platform_id(name):
+            self._deferred.pop(name, None)
+            self._entries.pop(name, None)
+            return None
         if name not in self._entries:
             self._resolve(name)
         entry = self._entries.get(name)

@@ -38,8 +38,6 @@ MIGRATED_ADAPTER_MODULES = [
     ("plugins.platforms.dingtalk.adapter", "DINGTALK_CLIENT_SECRET"),
     ("plugins.platforms.feishu.adapter", "FEISHU_APP_SECRET"),
     ("plugins.platforms.wecom.adapter", "WECOM_SECRET"),
-    ("plugins.platforms.photon.adapter", "PHOTON_PROJECT_SECRET"),
-    ("plugins.platforms.photon.auth", "PHOTON_PROJECT_SECRET"),
     ("plugins.platforms.buzz.adapter", "BUZZ_PRIVATE_KEY"),
     ("gateway.platforms.bluebubbles", "BLUEBUBBLES_PASSWORD"),
     ("gateway.platforms.api_server", "API_SERVER_KEY"),

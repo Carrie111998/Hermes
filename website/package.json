@@ -16,7 +16,8 @@
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
     "typecheck": "tsc -p . --noEmit",
-    "lint:diagrams": "ascii-guard lint --exclude-code-blocks docs"
+    "test:security": "node scripts/security-image-size-regression.mjs",
+    "lint:diagrams": "uvx --from ascii-guard==2.3.0 --with pyyaml==6.0.3 ascii-guard lint --exclude-code-blocks docs"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.2",
@@ -25,6 +26,7 @@
     "@docusaurus/theme-mermaid": "3.10.2",
     "@mdx-js/react": "3.1.1",
     "clsx": "2.1.1",
+    "image-size": "file:vendor/image-size",
     "prism-react-renderer": "2.3.0",
     "react": "19.2.7",
     "react-dom": "19.2.7"
@@ -39,7 +41,14 @@
     "serialize-javascript": "7.0.7",
     "uuid": "14.0.1",
     "minimatch": "10.2.6",
-    "nanoid": "3.3.17"
+    "nanoid": "3.3.17",
+    "image-size": "$image-size",
+    "dompurify": "3.4.13",
+    "fast-uri": "3.1.5",
+    "js-yaml": "4.3.1",
+    "mermaid": "11.16.1",
+    "postcss": "8.5.23",
+    "undici": "7.29.0"
   },
   "browserslist": {
     "production": [
@@ -59,6 +68,7 @@
   },
   "allowScripts": {
     "core-js@3.49.0": true,
+    "core-js-pure@3.49.0": true,
     "fsevents@2.3.3": true
   }
 }

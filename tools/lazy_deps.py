@@ -42,9 +42,13 @@ Security model:
   the venv in the first place. Compiled-wheel safety across image rebuilds
   is handled by an ABI/Python-version stamp on the target subdir (see
   :func:`_ensure_target_ready`).
-* **PyPI by package name only.** Specs may be ``"package>=1.0,<2"`` etc.
-  We do NOT support ``--index-url`` overrides, ``git+https://``, file:
-  paths, or any other input that could be hijacked by a malicious config.
+* **PyPI by package name only for caller-selected specs.** Specs may be
+  ``"package>=1.0,<2"`` etc. We do NOT accept ``--index-url`` overrides,
+  ``git+https://``, file paths, or any other origin from config or callers.
+  DingTalk has one narrow code-owned exception: the installer derives and
+  validates Hermes's bundled Alibaba compatibility directory from this module's
+  absolute repository path, binds uv to the same project, and pairs it with the
+  security-fixed cryptography pin. No external input can select that path.
 * **Allowlist.** Only specs that appear in :data:`LAZY_DEPS` can be
   installed via this path. A typo in feature name doesn't get the user
   install-anything semantics.
@@ -67,15 +71,18 @@ Adding a new backend:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import site
 import subprocess
 import sys
 import sysconfig
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -92,6 +99,12 @@ logger = logging.getLogger(__name__)
 # pyproject.toml. The framework enforces that only specs from this map
 # can flow into the pip install command.
 # =============================================================================
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_DINGTALK_VENDOR = _REPO_ROOT / "vendor" / "alibabacloud-tea-openapi"
+_DINGTALK_TEA_SPEC = "alibabacloud-tea-openapi==0.4.5"
+_DINGTALK_CRYPTOGRAPHY_SPEC = "cryptography==50.0.0"
 
 
 LAZY_DEPS: dict[str, tuple[str, ...]] = {
@@ -236,6 +249,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
         "alibabacloud-dingtalk==2.2.42",
+        _DINGTALK_TEA_SPEC,
+        _DINGTALK_CRYPTOGRAPHY_SPEC,
         "qrcode==7.4.2",
     ),
     "platform.feishu": (
@@ -698,7 +713,12 @@ def _core_constraints_file() -> Optional[Path]:
         return None
 
 
-def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _InstallResult:
+def _venv_pip_install(
+    specs: tuple[str, ...],
+    *,
+    timeout: int = 300,
+    feature: Optional[str] = None,
+) -> _InstallResult:
     """Install ``specs`` using the uv → pip → ensurepip ladder.
 
     Two modes:
@@ -716,6 +736,27 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     """
     if not specs:
         return _InstallResult(True, "", "")
+
+    project_args: list[str] = []
+    install_specs = specs
+    if feature == "platform.dingtalk":
+        # This is the sole path exception in the lazy installer. The path is
+        # derived from this module, never from config or user input, and is
+        # validated before either package manager sees it. uv also receives the
+        # project root so [tool.uv.sources] and override-dependencies apply.
+        vendor = _DINGTALK_VENDOR.resolve()
+        if not (vendor / "setup.py").is_file() or _REPO_ROOT not in vendor.parents:
+            return _InstallResult(False, "", f"trusted DingTalk vendor missing: {vendor}")
+        project_args = ["--project", str(_REPO_ROOT)]
+        resolved = [
+            spec
+            for spec in specs
+            if _pkg_name_from_spec(spec) != "alibabacloud-tea-openapi"
+        ]
+        if _DINGTALK_CRYPTOGRAPHY_SPEC not in resolved:
+            resolved.append(_DINGTALK_CRYPTOGRAPHY_SPEC)
+        resolved.append(str(vendor))
+        install_specs = tuple(resolved)
 
     target = _lazy_install_target()
     constraints: Optional[Path] = None
@@ -756,7 +797,10 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         if uv_bin:
             try:
                 r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
+                    [
+                        uv_bin, "pip", "install", *project_args,
+                        *target_args, *constraint_args, *install_specs,
+                    ],
                     capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
                     stdin=subprocess.DEVNULL,
                     creationflags=windows_hide_flags(),
@@ -804,7 +848,7 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
         try:
             r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
+                pip_cmd + ["install", *target_args, *constraint_args, *install_specs],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
                 stdin=subprocess.DEVNULL,
                 creationflags=windows_hide_flags(),
@@ -836,9 +880,38 @@ def feature_specs(feature: str) -> tuple[str, ...]:
     return LAZY_DEPS[feature]
 
 
+def _dingtalk_vendor_is_active() -> bool:
+    """Return whether Alibaba's installed distribution came from our vendor."""
+    try:
+        from importlib.metadata import distribution
+
+        direct_url = distribution("alibabacloud-tea-openapi").read_text(
+            "direct_url.json"
+        )
+        if not direct_url:
+            return False
+        source_url = json.loads(direct_url).get("url", "")
+        return str(source_url).rstrip("/") == _DINGTALK_VENDOR.resolve().as_uri()
+    except (
+        PackageNotFoundError,
+        ValueError,
+        OSError,
+        TypeError,
+        json.JSONDecodeError,
+    ):
+        return False
+
+
 def feature_missing(feature: str) -> tuple[str, ...]:
     """Return the subset of specs for ``feature`` not currently installed."""
-    return tuple(s for s in feature_specs(feature) if not _is_satisfied(s))
+    missing = [s for s in feature_specs(feature) if not _is_satisfied(s)]
+    if (
+        feature == "platform.dingtalk"
+        and not _dingtalk_vendor_is_active()
+        and _DINGTALK_TEA_SPEC not in missing
+    ):
+        missing.append(_DINGTALK_TEA_SPEC)
+    return tuple(missing)
 
 
 def ensure(feature: str, *, prompt: bool = True) -> None:
@@ -941,7 +1014,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             )
 
     logger.info("Lazy-installing %s for feature %r", " ".join(missing), feature)
-    result = _venv_pip_install(missing)
+    result = _venv_pip_install(missing, feature=feature)
     if not result.success:
         # Surface the actual pip error so the user can debug PyPI-side
         # issues (404 quarantine, network down, etc.).
@@ -993,11 +1066,22 @@ def feature_install_command(feature: str, *, venv_pip: bool = False) -> Optional
     """
     if feature not in LAZY_DEPS:
         return None
-    specs = LAZY_DEPS[feature]
-    joined = " ".join(repr(s) for s in specs)
+    specs = list(LAZY_DEPS[feature])
+    project = ""
+    if feature == "platform.dingtalk":
+        specs = [
+            spec
+            for spec in specs
+            if _pkg_name_from_spec(spec) != "alibabacloud-tea-openapi"
+        ]
+        if _DINGTALK_CRYPTOGRAPHY_SPEC not in specs:
+            specs.append(_DINGTALK_CRYPTOGRAPHY_SPEC)
+        specs.append(str(_DINGTALK_VENDOR.resolve()))
+        project = f" --project {shlex.quote(str(_REPO_ROOT))}"
+    joined = " ".join(shlex.quote(s) for s in specs)
     if venv_pip:
         return f"{sys.executable} -m pip install {joined}"
-    return "uv pip install " + joined
+    return f"uv pip install{project} {joined}"
 
 
 @dataclass

@@ -50,6 +50,30 @@ class TestLoadDirectory:
         assert result["updated_at"] is None
         assert result["platforms"] == {}
 
+    def test_prunes_retired_platform_from_cache_and_aliases(self, tmp_path):
+        retired = "pho" + "ton"
+        cache_file = _write_directory(
+            tmp_path,
+            {
+                retired: [{"id": "stale", "name": "stale", "type": "dm"}],
+                "telegram": [{"id": "123", "name": "Alice", "type": "dm"}],
+            },
+        )
+        alias_file = tmp_path / "channel_aliases.json"
+        alias_file.write_text(json.dumps({retired: {"stale": "Retired alias"}}))
+
+        with (
+            patch("gateway.channel_directory.DIRECTORY_PATH", cache_file),
+            patch("gateway.channel_directory.CHANNEL_ALIASES_PATH", alias_file),
+        ):
+            result = load_directory()
+
+        assert retired not in result["platforms"]
+        assert result["platforms"]["telegram"][0]["id"] == "123"
+        persisted = json.loads(cache_file.read_text())
+        assert retired not in persisted["platforms"]
+        assert persisted["platforms"]["telegram"][0]["id"] == "123"
+
 
 class TestBuildChannelDirectoryWrites:
     def test_failed_write_preserves_previous_cache(self, tmp_path, monkeypatch):

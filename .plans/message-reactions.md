@@ -6,32 +6,26 @@ read the other's reactions as conversational signal.
 
 ## What already exists
 
-Hermes already models reactions on the **platform** side — the desktop is the
-only surface without them.
+Hermes models reactions independently on the desktop and on several messaging
+platforms; those surfaces do not share one adapter-level mutation API.
 
 | Surface | Reaction support | Where |
 |---|---|---|
-| Agent → platform message | `send_message(action="react"/"unreact")` | `tools/send_message_tool.py:266` `_handle_react()` |
-| Photon / iMessage | tapbacks in + out, routed only for messages we sent | `plugins/platforms/photon/adapter.py:1240-1283` |
+| Agent → desktop message | `react_to_message` desktop-only tool | `tools/react_to_message_tool.py` |
 | Telegram | `setMessageReaction`, config-gated | `plugins/platforms/telegram/adapter.py:9669+` |
 | Slack / Matrix / Feishu / Discord | inbound reaction events → hooks | `gateway/run.py:4688` `_handle_reaction_event()` → `HookRegistry.emit("reaction:added")` |
-| Adapter contract | `add_reaction()` / `remove_reaction()` coroutines, `set_reaction_handler()` | `gateway/platforms/base.py:3330` |
 | Core "affection" detector | regex on user text → `vibe`, drives CLI pet / TUI heart / desktop hearts | `agent/reactions.py`, `agent/turn_context.py:592-604` |
 
 Two things follow from that table:
 
-1. **The agent-facing verb already exists.** `send_message(action="react")` is
-   the established shape. A desktop reaction should extend that tool, not add a
-   new core tool — every new tool ships on every API call (AGENTS.md footprint
-   ladder).
-2. **The inbound convention already exists.** Photon turns a tapback into a
-   normal message event with `reply_to_message_id` + `reply_to_is_own_message`,
-   and the gateway prefixes `[Replying to your previous message: "…"]`
-   (`gateway/run.py:13125-13132`). Desktop reactions should read the same way to
-   the model.
+1. **Desktop reaction mutation is intentionally desktop-only.** The tool is
+   loaded with the `desktop_ui` toolset instead of adding a model-visible action
+   to every messaging deployment.
+2. **Inbound platform reactions remain adapter events.** They are routed through
+   the gateway and hooks without implying a shared outbound adapter contract.
 
-Nothing exists on the desktop side: `grep -ri reaction` across `apps/desktop`
-finds only the pet-overlay hearts.
+The desktop implementation now persists reactions in the session database and
+renders them through the desktop message event stream.
 
 ## Prior art
 
@@ -112,7 +106,7 @@ becomes a provider field. Two candidate paths:
 | Path | Cache impact | Notes |
 |---|---|---|
 | Rewrite the reacted-to message's content to carry the annotation | **Breaks the cached prefix** — mutates past context | Rejected. AGENTS.md: prompt caching is sacred. |
-| Deliver the reaction as the *next* turn's leading annotation, mirroring photon | Prefix untouched; only the new turn carries it | Matches `[Replying to your previous message: "…"]` (`gateway/run.py:13125`), which the agent already understands |
+| Deliver the reaction as the *next* turn's leading annotation | Prefix untouched; only the new turn carries it | Matches the existing reply annotation shape, which the agent already understands |
 
 The second is the same trick the platform adapters already use, so the model
 sees a familiar shape and no existing conversation is rewritten.

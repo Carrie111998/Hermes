@@ -13,7 +13,6 @@ const SOURCE_LABELS: Record<string, string> = {
   local: 'Local',
   matrix: 'Matrix',
   mattermost: 'Mattermost',
-  photon: 'Photon',
   qqbot: 'QQ',
   signal: 'Signal',
   slack: 'Slack',
@@ -28,7 +27,6 @@ const SOURCE_LABELS: Record<string, string> = {
 
 const SOURCE_ALIASES: Record<string, string[]> = {
   bluebubbles: ['apple messages', 'imessage'],
-  photon: ['imessage', 'messages'],
   cli: ['terminal'],
   desktop: ['app', 'gui'],
   local: ['machine'],
@@ -46,6 +44,11 @@ const SOURCE_ALIASES: Record<string, string[]> = {
 export const LOCAL_SESSION_SOURCE_IDS = ['cli', 'codex', 'desktop', 'gateway', 'kanban', 'local', 'tui']
 const LOCAL_SOURCE_IDS = new Set(LOCAL_SESSION_SOURCE_IDS)
 
+// Keep retired sources out of Recents without deleting the user's historical
+// session data or advertising the retired integration anywhere in the UI.
+export const RETIRED_SESSION_SOURCE_IDS = ['photon']
+const RETIRED_SOURCE_IDS = new Set(RETIRED_SESSION_SOURCE_IDS)
+
 // External messaging platforms that each get their own self-managed sidebar
 // section (fetched separately from local recents). Mirrors the gateway platform
 // adapters; keep in sync with PLATFORM_ICONS in app/messaging/platform-icon.tsx.
@@ -58,7 +61,6 @@ export const MESSAGING_SESSION_SOURCE_IDS = [
   'signal',
   'whatsapp',
   'bluebubbles',
-  'photon',
   'homeassistant',
   'email',
   'sms',
@@ -101,7 +103,7 @@ export function handoffOriginSource(
 
   const id = normalizeSessionSource(handoffPlatform)
 
-  if (!id || LOCAL_SOURCE_IDS.has(id)) {
+  if (!id || LOCAL_SOURCE_IDS.has(id) || RETIRED_SOURCE_IDS.has(id)) {
     return null
   }
 
@@ -111,7 +113,7 @@ export function handoffOriginSource(
 export function sessionSourceLabel(source: null | string | undefined): string | null {
   const id = normalizeSessionSource(source)
 
-  if (!id) {
+  if (!id || RETIRED_SOURCE_IDS.has(id)) {
     return null
   }
 
@@ -122,7 +124,7 @@ export function sessionSourceSearchTerms(source: null | string | undefined): str
   const id = normalizeSessionSource(source)
   const label = sessionSourceLabel(id)
 
-  if (!id) {
+  if (!id || RETIRED_SOURCE_IDS.has(id)) {
     return []
   }
 

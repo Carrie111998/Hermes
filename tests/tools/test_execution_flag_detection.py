@@ -4,11 +4,34 @@ import os
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 
 import pytest
 
 from tools.approval import detect_dangerous_command, detect_hardline_command
+
+
+def _supports_real_execution_probe(tool, args):
+    """Return whether the host binary implements the grammar under test."""
+    if tool == "sort":
+        version = subprocess.run(
+            [tool, "--version"], text=True, capture_output=True, timeout=5
+        )
+        return "GNU coreutils" in (version.stdout + version.stderr)
+    if tool == "man" and args and args[0] == "--pager":
+        help_result = subprocess.run(
+            [tool, "--help"], text=True, capture_output=True, timeout=5
+        )
+        return "--pager" in (help_result.stdout + help_result.stderr)
+    return True
+
+
+def _pty_command(argv):
+    """Wrap argv with the host's script(1) syntax."""
+    if sys.platform == "darwin":
+        return ["script", "-q", "/dev/null", *argv]
+    return ["script", "-qec", shlex.join(argv), "/dev/null"]
 
 
 @pytest.mark.parametrize(
@@ -49,6 +72,8 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if not _supports_real_execution_probe(tool, args):
+        pytest.skip(f"host {tool} does not implement this execution-bearing option")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"
@@ -70,7 +95,7 @@ def test_real_binaries_execute_leading_dash_program_payload(
     }
     argv = [tool, *resolved_args]
     if needs_tty:
-        argv = ["script", "-qec", shlex.join(argv), "/dev/null"]
+        argv = _pty_command(argv)
 
     subprocess.run(argv, input=input_text, text=True, capture_output=True, env=env, timeout=20)
 

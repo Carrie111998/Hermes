@@ -45,6 +45,16 @@ class TestPlatformEnumDynamic:
         finally:
             _reg.unregister("my-platform")
 
+    def test_retired_name_is_rejected_even_if_stale_bundled_plugin_exists(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            "gateway.config._Platform__bundled_plugin_names", {"photon"}
+        )
+
+        with pytest.raises(ValueError):
+            Platform("photon")
+
 
 # ── PlatformRegistry ──────────────────────────────────────────────────────
 
@@ -74,6 +84,38 @@ class TestPlatformRegistry:
     def test_get_unknown_returns_none(self):
         reg = PlatformRegistry()
         assert reg.get("nonexistent") is None
+
+    def test_retired_platform_registration_fails_closed(self):
+        reg = PlatformRegistry()
+        entry, _ = self._make_entry("photon")
+
+        with pytest.raises(ValueError, match="retired"):
+            reg.register(entry)
+
+        assert reg.get("photon") is None
+        assert not reg.is_registered("photon")
+
+    def test_retired_deferred_registration_never_runs_loader(self):
+        reg = PlatformRegistry()
+        loader = MagicMock()
+
+        with pytest.raises(ValueError, match="retired"):
+            reg.register_deferred("photon", loader)
+
+        assert reg.get("photon") is None
+        loader.assert_not_called()
+
+    def test_retired_adapter_creation_rejects_poisoned_registry_state(self):
+        reg = PlatformRegistry()
+        entry, adapter = self._make_entry("photon")
+        reg._entries["photon"] = entry
+
+        assert reg.get("photon") is None
+        assert not reg.is_registered("photon")
+        assert reg.create_adapter("photon", MagicMock()) is None
+        assert reg.all_entries() == []
+        assert reg.plugin_entries() == []
+        assert adapter.call_count == 0
 
     def test_unregister(self):
         reg = PlatformRegistry()

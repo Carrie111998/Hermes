@@ -7467,8 +7467,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Row id of the most recent active user message, or ``None``.
 
         The agent's default reaction target: "the message that triggered me",
-        so the model never has to thread row ids through a tool call (mirrors
-        the photon adapter's ``_record_last_inbound``).
+        so the model never has to thread row ids through a tool call.
         """
         return self.latest_message_row_id(session_id, role="user")
 

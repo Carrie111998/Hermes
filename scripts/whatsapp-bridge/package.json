@@ -15,5 +15,9 @@
   },
   "overrides": {
     "protobufjs": "^7.5.5"
+  },
+  "allowScripts": {
+    "@whiskeysockets/baileys@7.0.0-rc13": true,
+    "protobufjs@7.6.5": true
   }
 }

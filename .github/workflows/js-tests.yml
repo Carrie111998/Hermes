@@ -76,4 +76,46 @@ jobs:
       - uses: ./.github/actions/retry
         with:
           command: npm ci
+        env:
+          electron_config_cache: ${{ runner.temp }}/hermes-electron-${{ github.run_id }}-${{ github.run_attempt }}
       - run: npm run --prefix ${{ matrix.package }} ${{ matrix.script }}
+
+  windows-native-install:
+    name: Windows native dependency install (Node ${{ matrix.node-version }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [22.22.0, 26]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          # Exercise both the lowest supported Node patch and the Node version
+          # pinned by the Docker/runtime toolchain.
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+
+      - name: grab npm 12
+        run: npm i -g npm@12
+
+      # This proves Electron can download/extract without loading the native
+      # addon blocked by Windows Smart App Control and that get-windows can
+      # consume its publisher-provided prebuilt binding.
+      - uses: ./.github/actions/retry
+        with:
+          command: npm ci
+        env:
+          electron_config_cache: ${{ runner.temp }}/hermes-electron-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify Electron and published get-windows binaries
+        run: node scripts/ci/verify-native-deps.mjs
+      - name: Re-extract the real Electron archive into a fresh directory
+        run: node scripts/ci/verify-electron-extraction.mjs
+
+      # Also exercise the fallback that matters when a prebuilt binary is not
+      # available. windows-latest includes the supported MSVC build toolchain.
+      - name: Rebuild get-windows from source
+        run: npm rebuild get-windows --build-from-source
+      - name: Verify rebuilt get-windows binding
+        run: node scripts/ci/verify-native-deps.mjs

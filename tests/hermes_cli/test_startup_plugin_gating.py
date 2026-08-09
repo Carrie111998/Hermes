@@ -86,10 +86,10 @@ def test_deferred_platform_cli_resolution_targets_matching_platform():
     """The slow path must import the deferred platform whose name matches the
     invoked command, so its register_cli_command side effect fires.
 
-    Photon registers ``hermes photon`` only when its adapter module is
+    A platform CLI command is registered only when its adapter module is
     imported; on the unknown-command slow path the platform is still a
     deferred entry, so without this resolution step the CLI command stays
-    absent and argparse rejects ``photon`` (issue #54678).
+    absent and argparse rejects it (issue #54678).
     """
     from hermes_cli import main as _main
 
@@ -105,9 +105,9 @@ def test_deferred_platform_cli_resolution_targets_matching_platform():
     fake_module = type(sys)("gateway.platform_registry")
     fake_module.platform_registry = fake
     with patch.dict(sys.modules, {"gateway.platform_registry": fake_module}):
-        _resolve_deferred_platform_cli_command("photon")
+        _resolve_deferred_platform_cli_command("sampleplatform")
 
-    assert fake.resolved == ["photon"]
+    assert fake.resolved == ["sampleplatform"]
 
 
 def test_deferred_platform_loader_registers_cli_command_before_parser_table():
@@ -120,7 +120,7 @@ def test_deferred_platform_loader_registers_cli_command_before_parser_table():
 
     1. a deferred platform loader is pending on a real ``PlatformRegistry``
     2. that loader materializes a ``register_cli_command`` side effect on the
-       plugin manager (no Photon SDK import)
+       plugin manager without importing an external SDK
     3. ``_resolve_deferred_platform_cli_command`` runs the pending loader
     4. the registered command is present on the manager *and* visible as an
        argparse subparser/choice after the same construction path ``main()``
@@ -132,8 +132,8 @@ def test_deferred_platform_loader_registers_cli_command_before_parser_table():
     from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
 
     mgr = PluginManager()
-    manifest = PluginManifest(name="fake-photon-platform")
-    command_name = "fakephoton"
+    manifest = PluginManifest(name="fake-deferred-platform")
+    command_name = "fakeplatform"
 
     def _fake_loader():
         # Mirrors what a real platform adapter does on import: register its
@@ -164,7 +164,7 @@ def test_deferred_platform_loader_registers_cli_command_before_parser_table():
     assert command_name in mgr._cli_commands
     cmd_info = mgr._cli_commands[command_name]
     assert cmd_info["name"] == command_name
-    assert cmd_info["plugin"] == "fake-photon-platform"
+    assert cmd_info["plugin"] == "fake-deferred-platform"
 
     # Same parser-table assembly main() uses after reading _cli_commands.
     parser = argparse.ArgumentParser(prog="hermes")

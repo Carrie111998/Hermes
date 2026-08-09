@@ -29,6 +29,8 @@ from hermes_constants import get_hermes_home, _get_platform_default_hermes_home
 from typing import Any, Callable, NamedTuple, Optional
 from utils import atomic_json_write
 
+from .retired_platforms import RETIRED_PLATFORM_IDS, is_retired_platform_id
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -992,9 +994,15 @@ def write_runtime_status(
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
+    platforms = payload.get("platforms")
+    if not isinstance(platforms, dict):
+        platforms = {}
+    else:
+        for retired_id in RETIRED_PLATFORM_IDS:
+            platforms.pop(retired_id, None)
+    payload["platforms"] = platforms
     previous_payload = copy.deepcopy(payload)
     current_record = _build_pid_record()
-    payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
@@ -1015,7 +1023,7 @@ def write_runtime_status(
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
 
-    if platform is not _UNSET:
+    if platform is not _UNSET and not is_retired_platform_id(platform):
         platform_payload = payload["platforms"].get(platform, {})
         if platform_state is not _UNSET:
             platform_payload["state"] = platform_state

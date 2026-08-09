@@ -173,6 +173,7 @@ class LSPService:
 
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
+        self._starting_clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
@@ -449,15 +450,22 @@ class LSPService:
         # ``_get_or_spawn`` so the client may still be hanging in
         # ``_clients`` with a half-initialized state.
         with self._state_lock:
-            client = self._clients.pop(key, None)
+            client = self._clients.get(key) or self._starting_clients.get(key)
             self._last_used.pop(key, None)
         if client is not None:
             try:
-                # Fire-and-forget shutdown — give it a second to cleanup,
-                # but don't block.  We're already on a slow path.
-                self._loop.run(client.shutdown(), timeout=1.0)
+                # Startup cleanup may consume both graceful-exit intervals.
+                # Keep the client manager-owned unless teardown completes;
+                # service shutdown can then still recover it.
+                self._loop.run(client.shutdown(), timeout=3.0)
             except Exception:  # noqa: BLE001
                 pass
+            if client._proc is None:
+                with self._state_lock:
+                    if self._clients.get(key) is client:
+                        self._clients.pop(key, None)
+                    if self._starting_clients.get(key) is client:
+                        self._starting_clients.pop(key, None)
 
         if not already_broken:
             eventlog.log_spawn_failed(srv.server_id, per_server_root, exc)
@@ -562,7 +570,10 @@ class LSPService:
             spawning = self._spawning.get(key)
         if spawning is not None:
             try:
-                return await spawning
+                # A caller may abandon its wait without owning the shared
+                # startup. Do not let waiter cancellation cancel the owner's
+                # coordination future and poison every other caller.
+                return await asyncio.shield(spawning)
             except Exception:  # noqa: BLE001
                 return None
 
@@ -598,19 +609,43 @@ class LSPService:
                 initialization_options=spec.initialization_options,
                 seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
             )
+            with self._state_lock:
+                self._starting_clients[key] = client
             try:
                 await client.start()
             except Exception as e:  # noqa: BLE001
+                with self._state_lock:
+                    if self._starting_clients.get(key) is client:
+                        self._starting_clients.pop(key, None)
                 eventlog.log_spawn_failed(srv.server_id, per_server_root, e)
                 self._broken.add(key)
                 spawn_future.set_result(None)
                 return None
             with self._state_lock:
-                self._clients[key] = client
-                self._last_used[key] = time.time()
+                owns_start = self._starting_clients.get(key) is client
+                if owns_start:
+                    self._starting_clients.pop(key, None)
+                    self._clients[key] = client
+                    self._last_used[key] = time.time()
+            if not owns_start:
+                # Service shutdown claimed this client while initialization
+                # was in flight. Do not resurrect it after shutdown.
+                await client.shutdown()
+                spawn_future.set_result(None)
+                return None
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
+        except asyncio.CancelledError:
+            # LSPClient.start() owns and completes process cleanup before it
+            # re-raises cancellation.  Release callers that were sharing this
+            # spawn only after that ownership boundary has completed.
+            if not spawn_future.done():
+                spawn_future.set_result(None)
+            with self._state_lock:
+                if self._starting_clients.get(key) is client:
+                    self._starting_clients.pop(key, None)
+            raise
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
@@ -673,8 +708,13 @@ class LSPService:
             reaper.cancel()
             await asyncio.gather(reaper, return_exceptions=True)
         with self._state_lock:
-            clients = list(self._clients.values())
+            clients = list(
+                dict.fromkeys(
+                    [*self._clients.values(), *self._starting_clients.values()]
+                )
+            )
             self._clients.clear()
+            self._starting_clients.clear()
             self._broken.clear()
             self._last_used.clear()
         await asyncio.gather(

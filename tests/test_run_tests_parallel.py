@@ -22,6 +22,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -29,6 +31,7 @@ import time
 from pathlib import Path
 
 import pytest
+from scripts import run_tests_parallel as runner_module
 
 
 # Both tests share the same handoff file: the leaker writes here, the
@@ -61,6 +64,44 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True
     return True
+
+
+def test_reaped_leader_never_signals_captured_numeric_pgid(monkeypatch) -> None:
+    calls: list[tuple[int, int]] = []
+
+    class ReapedProcess:
+        pid = 424242
+        returncode = 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(runner_module.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        runner_module.os, "killpg", lambda pgid, sig: calls.append((pgid, sig))
+    )
+
+    runner_module._kill_tree(ReapedProcess(), pgid=424242)  # type: ignore[arg-type]
+
+    assert calls == []
+
+
+def test_child_env_builder_drops_python_and_loader_injection(monkeypatch) -> None:
+    forbidden = {
+        "PYTHONPATH": "/tmp/attacker-pythonpath",
+        "PYTEST_PLUGINS": "attacker_plugin",
+        "PYTEST_ADDOPTS": "--capture=no",
+        "PYTHONHOME": "/tmp/attacker-pythonhome",
+        "LD_PRELOAD": "/tmp/attacker.so",
+        "DYLD_INSERT_LIBRARIES": "/tmp/attacker.dylib",
+    }
+    for name, value in forbidden.items():
+        monkeypatch.setenv(name, value)
+
+    child_env = runner_module._build_pytest_env("/tmp/hp-test")
+
+    for name, value in forbidden.items():
+        assert child_env.get(name) != value
 
 
 def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> None:
@@ -98,6 +139,196 @@ def test_progress_output_tolerates_legacy_stdout_encoding(tmp_path: Path) -> Non
     assert proc.returncode == 0, proc.stdout
     assert "UnicodeEncodeError" not in proc.stdout
     assert "1 tests passed" in proc.stdout
+
+
+def test_direct_runner_scrubs_ambient_secrets_before_collection(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "env-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "env-result.json"
+    (probe_dir / "test_env_probe.py").write_text(
+        textwrap.dedent(
+            f"""
+            import json, os
+            from pathlib import Path
+
+            assert 'HERMES_RUNNER_SECRET_SENTINEL' not in os.environ
+            assert os.environ.get('PYTHONPATH') != '/tmp/attacker-pythonpath'
+            assert os.environ.get('PYTEST_PLUGINS') != 'attacker_plugin'
+            assert 'PYTEST_ADDOPTS' not in os.environ
+            assert 'PYTHONHOME' not in os.environ
+            assert 'DYLD_INSERT_LIBRARIES' not in os.environ
+            Path({str(handoff)!r}).write_text(json.dumps({{
+                'path': bool(os.environ.get('PATH')),
+                'tz': os.environ.get('TZ'),
+                'hashseed': os.environ.get('PYTHONHASHSEED'),
+            }}), encoding='utf-8')
+
+            def test_environment_is_deterministic():
+                assert os.environ['TZ'] == 'UTC'
+                assert os.environ['PYTHONHASHSEED'] == '0'
+            """
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_RUNNER_SECRET_SENTINEL"] = "must-not-reach-pytest"
+    env["PYTEST_ADDOPTS"] = "--capture=no"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+            "--file-retries",
+            "0",
+        ],
+        cwd=repo_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    assert json.loads(handoff.read_text(encoding="utf-8")) == {
+        "path": True,
+        "tz": "UTC",
+        "hashseed": "0",
+    }
+
+
+def test_ci_canonical_python_lane_explicitly_disables_file_retries() -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    workflow = (repo_root / ".github" / "workflows" / "tests.yml").read_text(
+        encoding="utf-8"
+    )
+    canonical_step = re.search(
+        r"- name: Run tests \(slice .*?\n(?P<body>.*?)(?=\n\s{6}- name:|\Z)",
+        workflow,
+        flags=re.DOTALL,
+    )
+    assert canonical_step is not None
+    body = canonical_step.group("body")
+    assert "scripts/run_tests.sh" in body
+    assert re.search(r'HERMES_TEST_FILE_RETRIES:\s*["\']0["\']', body), (
+        "the canonical CI Python lane must fail on the first file failure; "
+        "automatic retries are not a release gate"
+    )
+
+
+def test_parallel_files_get_distinct_cleaned_pytest_temp_roots(tmp_path: Path) -> None:
+    """Per-file pytest processes must not share pytest's symlink namespace."""
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "temp-root-probes"
+    probe_dir.mkdir()
+
+    handoffs: list[Path] = []
+    for index in range(2):
+        handoff = tmp_path / f"temp-root-{index}.txt"
+        handoffs.append(handoff)
+        (probe_dir / f"test_temp_root_{index}.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n\n"
+            "def test_records_pytest_temp_root():\n"
+            f"    Path({str(handoff)!r}).write_text("
+            "os.environ.get('PYTEST_DEBUG_TEMPROOT', ''), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "2",
+            "--file-timeout",
+            "30",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    roots = [handoff.read_text(encoding="utf-8") for handoff in handoffs]
+    assert all(roots), f"runner did not assign temp roots: {roots!r}"
+    assert len(set(roots)) == len(roots), f"pytest temp roots were shared: {roots!r}"
+    assert all(not Path(root).exists() for root in roots), (
+        f"runner leaked pytest temp roots: {roots!r}"
+    )
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS AF_UNIX path limit")
+def test_direct_runner_uses_short_temp_root_for_real_unix_socket(
+    tmp_path: Path,
+) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "socket-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "socket-root.txt"
+    (probe_dir / "test_s.py").write_text(
+        textwrap.dedent(
+            f"""
+            import os, socket
+            from pathlib import Path
+
+            def test_s(tmp_path):
+                Path({str(handoff)!r}).write_text(
+                    os.environ['PYTEST_DEBUG_TEMPROOT'], encoding='utf-8'
+                )
+                socket_path = tmp_path / 'voice' / 'pulse' / 'native'
+                socket_path.parent.mkdir(parents=True)
+                server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    server.bind(str(socket_path))
+                finally:
+                    server.close()
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "30",
+            "--file-retries",
+            "0",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+
+    assert proc.returncode == 0, proc.stdout
+    root = handoff.read_text(encoding="utf-8")
+    assert root.startswith("/private/tmp/hp-"), root
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only probe")
@@ -226,6 +457,150 @@ def test_grandchild_leak_is_killed_by_runner(tmp_path: Path) -> None:
             f"diag={diag!r} test_pid={test_pid} test_pgid={test_pgid}; "
             f"runner output:\n{proc.stdout}"
         )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group probe")
+@pytest.mark.live_system_guard_bypass
+def test_inherited_stdout_descendant_does_not_force_file_timeout(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "stdout-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "stdout-child.pid"
+    (probe_dir / "test_spawn.py").write_text(
+        textwrap.dedent(
+            f"""
+            import signal, subprocess, sys
+            from pathlib import Path
+
+            def test_spawn():
+                child = subprocess.Popen([
+                    sys.executable,
+                    '-c',
+                    'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)',
+                ])
+                Path({str(handoff)!r}).write_text(str(child.pid), encoding='utf-8')
+            """
+        ),
+        encoding="utf-8",
+    )
+    started = time.monotonic()
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "5",
+            "--file-retries",
+            "0",
+            "-s",
+            "-q",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        encoding="utf-8",
+        errors="replace",
+        timeout=15,
+    )
+    elapsed = time.monotonic() - started
+    assert proc.returncode == 0, proc.stdout
+    assert handoff.exists(), proc.stdout
+    child_pid = int(handoff.read_text(encoding="utf-8"))
+    try:
+        assert elapsed < 4.0, f"runner waited {elapsed:.2f}s for inherited stdout"
+        assert not _pid_alive(child_pid)
+    finally:
+        if _pid_alive(child_pid):
+            os.kill(child_pid, 9)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX signal probe")
+@pytest.mark.live_system_guard_bypass
+def test_sigterm_runner_cleans_active_processes_and_temp_root(tmp_path: Path) -> None:
+    repo_root = Path(__file__).resolve().parent.parent
+    runner = repo_root / "scripts" / "run_tests_parallel.py"
+    probe_dir = tmp_path / "sigterm-probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "sigterm-handoff.json"
+    (probe_dir / "test_wait.py").write_text(
+        textwrap.dedent(
+            f"""
+            import json, os, signal, subprocess, sys, time
+            from pathlib import Path
+
+            def test_waits_forever():
+                child = subprocess.Popen(
+                    [sys.executable, '-c',
+                     'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(600)'],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                Path({str(handoff)!r}).write_text(json.dumps({{
+                    'test_pid': os.getpid(),
+                    'child_pid': child.pid,
+                    'temp_root': os.environ['PYTEST_DEBUG_TEMPROOT'],
+                }}), encoding='utf-8')
+                time.sleep(600)
+            """
+        ),
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(runner),
+            "--paths",
+            str(probe_dir),
+            "-j",
+            "1",
+            "--file-timeout",
+            "600",
+            "--file-retries",
+            "0",
+        ],
+        cwd=repo_root,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    data = None
+    try:
+        deadline = time.monotonic() + 10.0
+        while not handoff.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert handoff.exists(), "probe never reached active process state"
+        data = json.loads(handoff.read_text(encoding="utf-8"))
+
+        proc.terminate()
+        proc.wait(timeout=10)
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if (
+                not _pid_alive(data["test_pid"])
+                and not _pid_alive(data["child_pid"])
+                and not Path(data["temp_root"]).exists()
+            ):
+                break
+            time.sleep(0.05)
+
+        assert not _pid_alive(data["test_pid"])
+        assert not _pid_alive(data["child_pid"])
+        assert not Path(data["temp_root"]).exists()
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if data is not None:
+            for pid in (data["test_pid"], data["child_pid"]):
+                if _pid_alive(pid):
+                    os.kill(pid, 9)
+            shutil.rmtree(data["temp_root"], ignore_errors=True)
 
 
 # ── Bare pytest-flag passthrough ─────────────────────────────────────────────

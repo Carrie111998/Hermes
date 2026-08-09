@@ -190,6 +190,45 @@ class TestGatewayRuntimeStatus:
         assert payload["pid"] == os.getpid(), "PID should be overwritten, not preserved via setdefault"
         assert payload["start_time"] != 1000.0, "start_time should be overwritten on restart"
 
+    def test_write_runtime_status_prunes_retired_platforms(self, tmp_path, monkeypatch):
+        """Retired adapters must not survive restart or re-enter health metrics."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = tmp_path / "gateway_state.json"
+        state_path.write_text(json.dumps({
+            "pid": 99999,
+            "start_time": 1000.0,
+            "kind": "hermes-gateway",
+            "gateway_state": "running",
+            "platforms": {
+                "photon": {"state": "connected"},
+                "telegram": {"state": "connected"},
+            },
+            "updated_at": "2025-01-01T00:00:00Z",
+        }))
+
+        transitions = []
+        import agent.monitoring.gateway_health as gateway_health
+        monkeypatch.setattr(
+            gateway_health,
+            "emit_runtime_status_transition",
+            lambda before, after: transitions.append((before, after)),
+        )
+
+        status.write_runtime_status(
+            gateway_state="starting",
+            platform="photon",
+            platform_state="connected",
+        )
+
+        payload = status.read_runtime_status()
+        assert payload is not None
+        assert "photon" not in payload["platforms"]
+        assert payload["platforms"]["telegram"]["state"] == "connected"
+        assert len(transitions) == 1
+        before, after = transitions[0]
+        assert "photon" not in before["platforms"]
+        assert "photon" not in after["platforms"]
+
 
     def test_runtime_status_running_pid_rejects_pid_reused_by_other_profile(self, monkeypatch):
         """Regression (user report): a stale profile's recycled PID must not be

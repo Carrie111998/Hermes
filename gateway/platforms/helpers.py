@@ -443,7 +443,7 @@ def compile_mention_patterns(
       fallback parsing; must be a list or string, anything else logs a warning
       and yields ``[]``. Non-string entries are skipped. A summary info log is
       emitted when patterns load.
-    * **Wakeword-style** (photon, bluebubbles): pass ``defaults``. ``raw`` may
+    * **Wakeword-style** (bluebubbles): pass ``defaults``. ``raw`` may
       be None (use defaults), a string (JSON list or comma/newline separated),
       a list, or a scalar (wrapped in a list). Entries are coerced via
       ``str()``.
@@ -493,7 +493,7 @@ def compile_mention_patterns(
             )
         return compiled
 
-    # Wakeword-style (photon/bluebubbles) semantics.
+    # Wakeword-style (BlueBubbles) semantics.
     if raw is None:
         patterns = list(defaults or [])
     elif isinstance(raw, str):

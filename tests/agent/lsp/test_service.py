@@ -7,6 +7,9 @@ on.
 """
 from __future__ import annotations
 
+import asyncio
+import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -58,6 +61,14 @@ def _install_mock_server(monkeypatch, script: str = "errors", server_id: str = "
     yield
 
     SERVERS[target_index] = original
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 @pytest.fixture
@@ -219,9 +230,183 @@ def test_reaper_survives_sweep_error(mock_pyright):
         svc.shutdown()
 
 
+def test_manager_timeout_bridge_does_not_orphan_starting_client(
+    tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    source = repo / "x.py"
+    source.write_text("")
+    pid_file = tmp_path / "manager-lsp.pid"
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("MOCK_LSP_PID_FILE", str(pid_file))
+    gen = _install_mock_server(monkeypatch, "hang_initialize", "pyright")
+    next(gen)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+
+    try:
+        with pytest.raises(TimeoutError):
+            svc._loop.run(svc._get_or_spawn(str(source)), timeout=0.05)
+
+        deadline = time.monotonic() + 2.0
+        while (not pid_file.exists() or svc._spawning) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pid_file.exists()
+        pid = int(pid_file.read_text())
+        while _pid_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert not _pid_exists(pid)
+        assert svc._spawning == {}
+        assert svc._clients == {}
+    finally:
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            if _pid_exists(pid):
+                os.kill(pid, signal.SIGTERM)
+        svc.shutdown()
+        try:
+            next(gen)
+        except StopIteration:
+            pass
 
 
+def test_service_shutdown_waits_for_cancelled_startup_cleanup(tmp_path, monkeypatch):
+    repo = tmp_path / "repo-shutdown"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    (repo / "pyproject.toml").write_text("")
+    source = repo / "x.py"
+    source.write_text("")
+    pid_file = tmp_path / "shutdown-lsp.pid"
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("MOCK_LSP_PID_FILE", str(pid_file))
+    gen = _install_mock_server(monkeypatch, "hang_initialize", "pyright")
+    next(gen)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+    stopped = False
+
+    try:
+        with pytest.raises(TimeoutError):
+            svc._loop.run(svc._get_or_spawn(str(source)), timeout=0.05)
+        deadline = time.monotonic() + 1.0
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert pid_file.exists()
+        pid = int(pid_file.read_text())
+
+        svc.shutdown()
+        stopped = True
+
+        deadline = time.monotonic() + 2.0
+        while _pid_exists(pid) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not _pid_exists(pid)
+    finally:
+        if not stopped:
+            svc.shutdown()
+        if pid_file.exists():
+            pid = int(pid_file.read_text())
+            if _pid_exists(pid):
+                os.kill(pid, signal.SIGTERM)
+        try:
+            next(gen)
+        except StopIteration:
+            pass
 
 
+@pytest.mark.asyncio
+async def test_cancelled_spawn_owner_releases_concurrent_waiter(
+    mock_pyright, monkeypatch
+):
+    repo = mock_pyright
+    source = repo / "waiter.py"
+    source.write_text("")
+    started = asyncio.Event()
+    release = asyncio.Event()
 
+    async def hanging_start(self):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr("agent.lsp.manager.LSPClient.start", hanging_start)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+    owner = asyncio.create_task(svc._get_or_spawn(str(source)))
+    waiter = None
+    try:
+        await started.wait()
+        waiter = asyncio.create_task(svc._get_or_spawn(str(source)))
+        await asyncio.sleep(0)
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+
+        assert await asyncio.wait_for(waiter, timeout=0.1) is None
+    finally:
+        release.set()
+        if not owner.done():
+            owner.cancel()
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+        svc.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_spawn_waiter_does_not_poison_owner(mock_pyright, monkeypatch):
+    repo = mock_pyright
+    source = repo / "waiter-cancel.py"
+    source.write_text("")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def controlled_start(self):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr("agent.lsp.manager.LSPClient.start", controlled_start)
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=3.0,
+        install_strategy="manual",
+    )
+    owner = asyncio.create_task(svc._get_or_spawn(str(source)))
+    waiter = None
+    try:
+        await started.wait()
+        waiter = asyncio.create_task(svc._get_or_spawn(str(source)))
+        await asyncio.sleep(0)
+
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release.set()
+
+        client = await asyncio.wait_for(owner, timeout=0.1)
+        assert client is not None
+        assert client in svc._clients.values()
+    finally:
+        release.set()
+        if not owner.done():
+            owner.cancel()
+        if waiter is not None and not waiter.done():
+            waiter.cancel()
+        svc.shutdown()
 

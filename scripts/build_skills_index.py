@@ -42,6 +42,7 @@ from tools.skills_hub import (
     BrowseShSource,
     SkillMeta,
 )
+from scripts.skills_index_policy import is_retired_platform_catalog_entry
 import httpx
 
 OUTPUT_PATH = os.path.join(REPO_ROOT, "website", "static", "api", "skills-index.json")
@@ -294,6 +295,18 @@ def main():
 
     # Batch resolve GitHub paths for skills.sh entries
     all_skills = batch_resolve_paths(all_skills, auth)
+
+    # Do not republish community records tied to a permanently retired bundled
+    # integration.  This happens before enrichment and health accounting so
+    # neither the raw API nor its derived Skills Hub payload can revive it.
+    before_policy = len(all_skills)
+    all_skills = [
+        skill for skill in all_skills
+        if not is_retired_platform_catalog_entry(skill)
+    ]
+    retired_count = before_policy - len(all_skills)
+    if retired_count:
+        print(f"  Excluded {retired_count} retired-platform catalog entries")
 
     # Enrich ClawHub skills with owner handles. The listing API does not
     # include owner info, so we fetch each skill's detail page concurrently.

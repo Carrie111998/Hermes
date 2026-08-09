@@ -2972,6 +2972,14 @@ install_desktop() {
         return 0
     fi
 
+    local _electron_cache_dir
+    _electron_cache_dir="$(mktemp -d "${TMPDIR:-/tmp}/hermes-electron-cache.XXXXXX")" || {
+        log_error "Cannot create a private Electron download cache"
+        return 1
+    }
+    local electron_config_cache="$_electron_cache_dir"
+    export electron_config_cache
+
     # 1. Root workspace install so apps/desktop's deps (Electron, Vite,
     #    node-pty prebuilds) resolve. The browser-tools install runs in the
     #    repo-root package workspace, which does not pull apps/* deps.
@@ -3021,6 +3029,7 @@ install_desktop() {
         log_info "  sudo chown -R \"\$(id -un)\" ~/.npm && npm cache verify"
         log_info "Then re-run this installer, or build manually:"
         log_info "  cd \"$INSTALL_DIR\" && npm ci && cd apps/desktop && npm run pack"
+        rm -rf "$_electron_cache_dir"
         return 1
     fi
 
@@ -3071,6 +3080,7 @@ install_desktop() {
         log_info "  ELECTRON_MIRROR=<mirror-base-url> \\"
         log_info "    bash -c 'cd \"$desktop_dir\" && CSC_IDENTITY_AUTO_DISCOVERY=false npm run pack'"
         log_info "Otherwise build manually: cd $desktop_dir && npm run pack"
+        rm -rf "$_electron_cache_dir"
         return 1
     fi
 
@@ -3094,6 +3104,7 @@ install_desktop() {
     fi
     if [ -z "$app" ]; then
         log_error "Desktop build completed but no app was found under $desktop_dir/release/"
+        rm -rf "$_electron_cache_dir"
         return 1
     fi
     log_success "Desktop app built: $app"
@@ -3108,15 +3119,18 @@ install_desktop() {
             if [ "$(id -u)" -eq 0 ]; then
                 chown root:root "$sandbox" && chmod 4755 "$sandbox" || {
                     log_error "Cannot configure Electron sandbox helper: $sandbox"
+                    rm -rf "$_electron_cache_dir"
                     return 1
                 }
             elif command -v sudo >/dev/null 2>&1; then
                 sudo chown root:root "$sandbox" && sudo chmod 4755 "$sandbox" || {
                     log_error "Cannot configure Electron sandbox helper (sudo failed): $sandbox"
+                    rm -rf "$_electron_cache_dir"
                     return 1
                 }
             else
                 log_error "Cannot configure Electron sandbox helper without sudo: $sandbox"
+                rm -rf "$_electron_cache_dir"
                 return 1
             fi
         fi
@@ -3162,6 +3176,7 @@ PYEOF
     # `npm install` + `npm run pack` rewrite lockfiles; restore them so the
     # checkout stays clean for the next `hermes update`.
     restore_dirty_lockfiles "$INSTALL_DIR"
+    rm -rf "$_electron_cache_dir"
 }
 
 # Each --stage runs in its own process, so (unlike the monolithic main() where

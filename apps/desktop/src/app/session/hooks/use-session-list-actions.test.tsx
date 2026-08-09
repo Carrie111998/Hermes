@@ -2,6 +2,7 @@ import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo, SidebarSessionsResponse } from '@/hermes'
+import { RETIRED_SESSION_SOURCE_IDS } from '@/lib/session-source'
 import {
   $cronSessions,
   $messagingSessions,
@@ -222,8 +223,28 @@ describe('refreshSessions batches slices into one request', () => {
     expect(listSidebarSessions).toHaveBeenCalledWith(
       expect.objectContaining({
         recentsProfile: 'work',
-        recentsExclude: expect.arrayContaining(['cron']),
-        messagingExclude: expect.arrayContaining(['cron'])
+        recentsExclude: expect.arrayContaining(['cron', ...RETIRED_SESSION_SOURCE_IDS]),
+        messagingExclude: expect.arrayContaining(['cron', ...RETIRED_SESSION_SOURCE_IDS])
+      })
+    )
+  })
+
+  it('excludes retired sources before the standalone messaging limit', async () => {
+    listAllProfileSessions.mockResolvedValue({ sessions: [] })
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'work' }))
+
+    await act(async () => {
+      await result.current.refreshMessagingSessions()
+    })
+
+    expect(listAllProfileSessions).toHaveBeenCalledWith(
+      expect.any(Number),
+      1,
+      'exclude',
+      'recent',
+      'all',
+      expect.objectContaining({
+        excludeSources: expect.arrayContaining(RETIRED_SESSION_SOURCE_IDS)
       })
     )
   })
