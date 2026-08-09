@@ -161,3 +161,53 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_auto_candidates_exclude_block_loop_escalations(kanban_home):
+    """Human-escalation triage must not be rewritten by auto-decompose.
+
+    ``block_loop_detected`` intentionally moves a repeatedly blocked task to
+    triage for operator attention.  Audit comments after the transition must
+    not make that task look like a new rough idea, while ordinary triage stays
+    eligible for the gateway's auto-decompose tick.
+    """
+    with kb.connect_closing() as conn:
+        rough = kb.create_task(
+            conn,
+            title="rough idea",
+            body="please turn this into concrete work",
+            triage=True,
+        )
+        escalated = kb.create_task(
+            conn,
+            title="preserve canonical body",
+            body='{"workflow_stage":"planning","staged_manifest":{"id":"exact"}}',
+            assignee="worker",
+        )
+        assert kb.claim_task(conn, escalated, claimer="worker") is not None
+        assert kb.block_task(
+            conn, escalated, reason="missing capability", kind="capability",
+        )
+        assert kb.unblock_task(conn, escalated)
+        assert kb.claim_task(conn, escalated, claimer="worker") is not None
+        assert kb.block_task(
+            conn, escalated, reason="missing capability", kind="capability",
+        )
+        escalated_task = kb.get_task(conn, escalated)
+        assert escalated_task is not None
+        assert escalated_task.status == "triage"
+        kb.add_comment(
+            conn, escalated, author="worker", body="operator repair required",
+        )
+        escalated_task = kb.get_task(conn, escalated)
+        assert escalated_task is not None
+        original_body = escalated_task.body
+
+    candidates = decomp.list_triage_ids()
+
+    assert rough in candidates
+    assert escalated not in candidates
+    with kb.connect_closing() as conn:
+        escalated_task = kb.get_task(conn, escalated)
+        assert escalated_task is not None
+        assert escalated_task.body == original_body
+
+

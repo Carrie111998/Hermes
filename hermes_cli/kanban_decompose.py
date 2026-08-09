@@ -457,12 +457,26 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return rough-input triage tasks eligible for automatic decomposition.
+
+    A ``block_loop_detected`` event means the task was routed to triage as a
+    human escalation, not submitted as an underspecified idea. Keep those
+    tasks out of the gateway's automatic LLM rewrite path. Explicit
+    ``hermes kanban decompose <id>`` remains available to an operator.
+    """
     with kb.connect_closing() as conn:
-        rows = kb.list_tasks(
-            conn,
-            status="triage",
-            tenant=tenant,
-            limit=1000,
+        query = (
+            "SELECT t.id FROM tasks AS t "
+            "WHERE t.status = 'triage' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM task_events AS e "
+            "  WHERE e.task_id = t.id AND e.kind = 'block_loop_detected'"
+            ")"
         )
-    return [row.id for row in rows]
+        params: list[str] = []
+        if tenant is not None:
+            query += " AND t.tenant = ?"
+            params.append(tenant)
+        query += " ORDER BY t.created_at ASC, t.id ASC LIMIT 1000"
+        rows = conn.execute(query, params).fetchall()
+    return [str(row["id"]) for row in rows]
