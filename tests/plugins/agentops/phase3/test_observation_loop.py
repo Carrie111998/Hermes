@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import plistlib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dt_time
 from pathlib import Path
 
 import pytest
@@ -12,6 +12,7 @@ import pytest
 from plugins.agentops.control.collectors.base import failed_batch
 from plugins.agentops.control.observer_models import Criticality, Signal, Target, TargetKind, TargetSpec, utc_now
 from plugins.agentops.control.observation import DefaultObservationLoop, ObservationBoundaryError, ObservationLedger, ObservationRunbook
+import plugins.agentops.control.observation as observation_module
 from plugins.agentops.control.registry import FleetRegistry
 from plugins.agentops.control.redaction import contains_secret
 
@@ -53,6 +54,17 @@ class _Process:
     def uids(self):
         class Uids: real = os.getuid()
         return Uids()
+
+
+def _retimestamp_records(loop: DefaultObservationLoop, day):
+    seen: dict[str, int] = {}
+    for stored in loop.ledger._records:
+        record = dict(stored.record)
+        collector = str(record["collector"])
+        slot = min(seen.get(collector, 0), 2)
+        seen[collector] = seen.get(collector, 0) + 1
+        record["collected_at"] = datetime.combine(day, dt_time(hour=slot * 8, minute=1), tzinfo=timezone.utc).isoformat()
+        object.__setattr__(stored, "record", record)
 
 
 def test_ledger_is_append_only_detached_and_bounded(tmp_path):
@@ -169,7 +181,7 @@ def test_runbook_backlog_drain_reaches_tail_without_counting_observation_day(tmp
     assert report["stop_reason"] == "tail_reached"
 
 
-def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path):
+def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path, monkeypatch):
     registry, log, _, _ = _trusted_registry(tmp_path)
     loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
     for collector in loop.collectors:
@@ -183,7 +195,11 @@ def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path):
     receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
     runbook._next_observation_utc_day = day
-    loop.collect_once()
+    for _ in range(3):
+        loop.collect_once()
+    _retimestamp_records(loop, day)
+    real_now = datetime.now(timezone.utc)
+    monkeypatch.setattr(observation_module, "utc_now", lambda: real_now + timedelta(days=1))
     summary = loop.ledger.daily_summary(day)
     terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
     receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -197,7 +213,7 @@ def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path):
         runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra, export_verified=False)
 
 
-def test_runbook_export_receipt_is_bound_to_current_ledger(tmp_path):
+def test_runbook_export_receipt_is_bound_to_current_ledger(tmp_path, monkeypatch):
     registry, log, _, _ = _trusted_registry(tmp_path)
     loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
     for collector in loop.collectors:
@@ -211,11 +227,16 @@ def test_runbook_export_receipt_is_bound_to_current_ledger(tmp_path):
     receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
     runbook._next_observation_utc_day = day
-    loop.collect_once()
+    for _ in range(3):
+        loop.collect_once()
+    _retimestamp_records(loop, day)
     old_summary = loop.ledger.daily_summary(day)
     old_terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
     old_receipt = hashlib.sha256(json.dumps({"summary": old_summary, "terra_input": old_terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     loop.collect_once()
+    _retimestamp_records(loop, day)
+    real_now = datetime.now(timezone.utc)
+    monkeypatch.setattr(observation_module, "utc_now", lambda: real_now + timedelta(days=1))
     before = loop.ledger.batches()
     with pytest.raises(ObservationBoundaryError, match="current ledger"):
         runbook.rotate_after_daily_export(utc_day=day, summary=old_summary, terra_input=old_terra, export_verified=True, export_receipt_sha256=old_receipt)
@@ -304,7 +325,7 @@ def test_runbook_finalize_backlog_requires_verified_export_and_marks_day0(tmp_pa
         runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
 
 
-def test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event(tmp_path):
+def test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event(tmp_path, monkeypatch):
     registry, log, _, _ = _trusted_registry(tmp_path)
     loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
     for collector in loop.collectors:
@@ -318,7 +339,11 @@ def test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event(tmp_path):
     receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
     runbook._next_observation_utc_day = day
-    loop.collect_once()
+    for _ in range(3):
+        loop.collect_once()
+    _retimestamp_records(loop, day)
+    real_now = datetime.now(timezone.utc)
+    monkeypatch.setattr(observation_module, "utc_now", lambda: real_now + timedelta(days=1))
     current = loop.ledger.batches()
     old = dict(current[0])
     old["collected_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
@@ -331,6 +356,31 @@ def test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event(tmp_path):
     with pytest.raises(ObservationBoundaryError, match="event budget"):
         runbook.rotate_after_daily_export(utc_day=day, summary=loop.ledger.daily_summary(day), terra_input=loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024), export_verified=True, export_receipt_sha256="0" * 64)
     assert len(loop.ledger.batches()) == len(current)
+
+
+def test_runbook_day1_single_0001_collection_cannot_count_as_day(tmp_path, monkeypatch):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    runbook = ObservationRunbook(loop)
+    assert runbook.drain_backlog(max_passes=1)["tail_reached"] is True
+    day = datetime.now(timezone.utc).date()
+    summary = loop.ledger.daily_summary(day)
+    terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
+    runbook._next_observation_utc_day = day
+    loop.collect_once()
+    _retimestamp_records(loop, day)
+    real_now = datetime.now(timezone.utc)
+    monkeypatch.setattr(observation_module, "utc_now", lambda: real_now + timedelta(days=1))
+    summary = loop.ledger.daily_summary(day)
+    terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with pytest.raises(ObservationBoundaryError, match="slots incomplete"):
+        runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
 
 
 def test_runbook_capacity_and_slot_reservations_fail_before_mutation(tmp_path):

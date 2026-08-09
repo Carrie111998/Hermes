@@ -6,7 +6,7 @@
 runbook hardening in this candidate is a code descendant (it changes
 `observation.py` and the log collector); it is not a documentation-only
 descendant and requires independent review. The latest local
-`tests/plugins/agentops` passed 155 tests and local `tests/plugins` passed 694
+`tests/plugins/agentops` passed 156 tests and local `tests/plugins` passed 695
 tests; final execution results are recorded with the candidate commit.
 
 ## Scope and trust boundary
@@ -72,7 +72,9 @@ is not an LLM call; it is a redacted, size/item-bounded analysis handoff.
    `day_success_eligible=false` and performs no collection. Future and duplicate
    slots are rejected; a missed slot makes that UTC day ineligible for export.
    Finalize records the next eligible UTC day, so same-day/future receipts cannot
-   be replayed as observation days. Every event records UTC timestamp/day, target,
+   be replayed as observation days. Rotation requires an ended UTC day and all
+   collectors to have runs in the 00:00, 08:00, and 16:00 UTC slots; a Day1
+   00:01 one-pass cannot count. Every event records UTC timestamp/day, target,
    collectors, ledger counters, and stage status in a detached bounded metadata
    record.
 
@@ -102,7 +104,7 @@ production writes.
 | Read-only Process/Launchd/Log/Cron collection and unchanged input hashes | `test_default_loop_collects_read_only_process_launchd_logs_and_cron` |
 | Fixed asset/fingerprint/label fail-closed binding on every pass | `test_default_loop_rejects_tampered_or_disabled_binding`, `test_launchd_asset_replacement_between_passes_fails_closed` |
 | No SQLite/lifecycle surface | `test_default_loop_does_not_expose_sqlite_or_lifecycle_surface` |
-| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_export_receipt_is_bound_to_current_ledger`, `test_runbook_backlog_stops_on_ledger_budget`, `test_runbook_rate_limit_is_safe_stop_not_catch_up`, `test_runbook_rejects_inode_changed_tail`, `test_runbook_rejects_path_rotation_before_declaring_tail`, `test_runbook_finalize_backlog_requires_verified_export_and_marks_day0`, `test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event`, `test_runbook_capacity_and_slot_reservations_fail_before_mutation`, `test_runbook_rejects_future_duplicate_slots_and_metadata_mutation` |
+| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_export_receipt_is_bound_to_current_ledger`, `test_runbook_backlog_stops_on_ledger_budget`, `test_runbook_rate_limit_is_safe_stop_not_catch_up`, `test_runbook_rejects_inode_changed_tail`, `test_runbook_rejects_path_rotation_before_declaring_tail`, `test_runbook_finalize_backlog_requires_verified_export_and_marks_day0`, `test_runbook_rejects_mixed_utc_days_and_reserves_rotation_event`, `test_runbook_day1_single_0001_collection_cannot_count_as_day`, `test_runbook_capacity_and_slot_reservations_fail_before_mutation`, `test_runbook_rejects_future_duplicate_slots_and_metadata_mutation` |
 
 ## Known limitations
 
