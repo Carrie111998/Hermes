@@ -7,6 +7,7 @@ import {
 } from '../config/timing.js'
 import type { SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
 import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
+import { stampHumanMessage } from '../lib/messages.js'
 import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
   boundedLiveRenderText,
@@ -170,6 +171,19 @@ class TurnController {
     this.statusTimer = clear(this.statusTimer)
   }
 
+  private ensureStreamingStartedAt() {
+    const current = getTurnState().streamingStartedAt
+
+    if (current !== undefined) {
+      return current
+    }
+
+    const startedAt = Date.now()
+    patchTurnState({ streamingStartedAt: startedAt })
+
+    return startedAt
+  }
+
   // ── Notice: arrival ──────────────────────────────────────────────────
   //
   // A `notification.show` arrived. If a turn is in flight (`busy`), the
@@ -281,6 +295,7 @@ class TurnController {
       streamPendingTools: [],
       streamSegments: [],
       streaming: '',
+      streamingStartedAt: undefined,
       subagents: [],
       tools: [],
       turnTrail: []
@@ -303,6 +318,7 @@ class TurnController {
     const segments = this.segmentMessages
     const partial = this.bufRef.trimStart()
     const tools = this.pendingSegmentTools
+    const partialStartedAt = getTurnState().streamingStartedAt ?? Date.now()
 
     // Drain streaming/segment state off the nanostore before writing the
     // preserved snapshot to the transcript — otherwise each flushed segment
@@ -323,6 +339,7 @@ class TurnController {
     if (partial || tools.length) {
       appendMessage({
         role: 'assistant',
+        timestamp: partialStartedAt,
         text: partial ? `${partial}\n\n*[interrupted]*` : '*[interrupted]*',
         ...(tools.length && { tools })
       })
@@ -411,12 +428,14 @@ class TurnController {
       this.syncReasoningSegment()
     }
 
-    const msg: Msg = {
+    const baseMessage: Msg = {
       role: split.text ? 'assistant' : 'system',
       text: split.text,
       ...(!split.text && { kind: 'trail' as const }),
       ...(this.pendingSegmentTools.length && { tools: this.pendingSegmentTools })
     }
+
+    const msg = split.text ? stampHumanMessage(baseMessage, this.ensureStreamingStartedAt()) : baseMessage
 
     this.streamTimer = clear(this.streamTimer)
 
@@ -426,7 +445,12 @@ class TurnController {
 
     this.pendingSegmentTools = []
     this.bufRef = ''
-    patchTurnState({ streamPendingTools: [], streamSegments: this.segmentMessages, streaming: '' })
+    patchTurnState({
+      streamPendingTools: [],
+      streamSegments: this.segmentMessages,
+      streaming: '',
+      streamingStartedAt: undefined
+    })
   }
 
   pulseReasoningStreaming() {
@@ -501,10 +525,12 @@ class TurnController {
       return
     }
 
-    this.segmentMessages = [
-      ...this.segmentMessages,
-      { kind: 'diff', role: 'assistant', text: block, ...(tools.length && { tools }) }
-    ]
+    const diffMessage = stampHumanMessage(
+      { kind: 'diff', role: 'assistant', text: block, ...(tools.length && { tools }) },
+      Date.now()
+    )
+
+    this.segmentMessages = [...this.segmentMessages, diffMessage]
     patchTurnState({ streamSegments: this.segmentMessages })
   }
 
@@ -632,7 +658,9 @@ class TurnController {
     ]
 
     if (finalText) {
-      finalMessages.push({ role: 'assistant', text: finalText })
+      finalMessages.push(
+        stampHumanMessage({ role: 'assistant', text: finalText }, getTurnState().streamingStartedAt ?? Date.now())
+      )
     }
 
     const wasInterrupted = this.interrupted
@@ -671,6 +699,7 @@ class TurnController {
       return
     }
 
+    this.ensureStreamingStartedAt()
     this.pruneTransient()
     this.endReasoningPhase()
 
@@ -972,6 +1001,11 @@ class TurnController {
   hydrateStreamingText(text: string) {
     this.streamTimer = clear(this.streamTimer)
     this.bufRef = text
+
+    if (text) {
+      this.ensureStreamingStartedAt()
+    }
+
     const raw = this.bufRef.trimStart()
     const visible = hasReasoningTag(raw) ? splitReasoning(raw).text : raw
     patchTurnState({ streaming: boundedLiveRenderText(visible) })
@@ -1002,7 +1036,15 @@ class TurnController {
     }
 
     patchUiState({ busy: true })
-    patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
+    patchTurnState({
+      activity: [],
+      outcome: '',
+      streamingStartedAt: undefined,
+      subagents: [],
+      toolTokens: 0,
+      tools: [],
+      turnTrail: []
+    })
   }
 
   upsertSubagent(

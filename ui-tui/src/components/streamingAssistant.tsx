@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { memo, useRef } from 'react'
+import { memo } from 'react'
 
 import type { AppLayoutProgressProps } from '../app/interfaces.js'
 import { toggleTodoCollapsed, useTurnSelector } from '../app/turnStore.js'
@@ -35,18 +35,9 @@ export const StreamingAssistant = memo(function StreamingAssistant({
   const streamSegments = useTurnSelector(state => state.streamSegments)
   const streamPendingTools = useTurnSelector(state => state.streamPendingTools)
   const streaming = useTurnSelector(state => state.streaming)
+  const streamingStartedAt = useTurnSelector(state => state.streamingStartedAt)
   const activeTools = useTurnSelector(state => state.tools)
   const showStreamingArea = Boolean(streaming)
-
-  const streamingTimestamp = useRef<number | undefined>(undefined)
-
-  if (showStreamingArea && streamingTimestamp.current === undefined) {
-    streamingTimestamp.current = Date.now()
-  } else if (!showStreamingArea) {
-    streamingTimestamp.current = undefined
-  }
-
-  const streamingStartedAt = streamingTimestamp.current
 
   if (!progress.showProgressArea && !showStreamingArea && !activeTools.length) {
     return null

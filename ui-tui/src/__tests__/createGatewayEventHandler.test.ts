@@ -416,6 +416,43 @@ describe('createGatewayEventHandler', () => {
     expect(appended[appended.length - 1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
+  it('keeps display-only timestamps stable as streamed assistant text settles', () => {
+    vi.useFakeTimers()
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    try {
+      vi.setSystemTime(new Date('2026-08-08T19:04:05.000Z'))
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { text: 'Before edit.' }, type: 'message.delta' } as any)
+      const firstSegmentStartedAt = Date.now()
+
+      expect(getTurnState().streamingStartedAt).toBe(firstSegmentStartedAt)
+
+      turnController.flushStreamingSegment()
+      expect(getTurnState().streamSegments[0]).toMatchObject({
+        role: 'assistant',
+        text: 'Before edit.',
+        timestamp: firstSegmentStartedAt
+      })
+
+      vi.setSystemTime(new Date('2026-08-08T19:05:05.000Z'))
+      onEvent({ payload: { text: 'Final answer.' }, type: 'message.delta' } as any)
+      const finalSegmentStartedAt = Date.now()
+      onEvent({ payload: { text: 'Final answer.' }, type: 'message.complete' } as any)
+
+      expect(appended.find(msg => msg.text === 'Before edit.')).toMatchObject({
+        timestamp: firstSegmentStartedAt
+      })
+      expect(appended.find(msg => msg.text === 'Final answer.')).toMatchObject({
+        timestamp: finalSegmentStartedAt
+      })
+      expect(appended.map(msg => msg.text).filter(Boolean)).toEqual(['Before edit.', 'Final answer.'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('filters spinner/status-only reasoning noise from completed thinking', () => {
     const appended: Msg[] = []
     const streamed = '(¬_¬) synthesizing...\nactual plan\n( ͡° ͜ʖ ͡°) pondering...\nnext step'
@@ -621,7 +658,7 @@ describe('createGatewayEventHandler', () => {
 
     // Diff is already committed to segmentMessages as its own segment.
     expect(appended).toHaveLength(0)
-    expect(turnController.segmentMessages).toEqual([
+    expect(turnController.segmentMessages).toMatchObject([
       { role: 'assistant', text: 'Editing the file' },
       {
         kind: 'diff',

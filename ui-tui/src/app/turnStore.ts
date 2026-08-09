@@ -76,6 +76,8 @@ export interface TurnState {
   streamPendingTools: string[]
   streamSegments: Msg[]
   streaming: string
+  /** Display-only epoch milliseconds for the assistant segment currently streaming. */
+  streamingStartedAt?: number
   subagents: SubagentProgress[]
   todoCollapsed: boolean
   todos: TodoItem[]
