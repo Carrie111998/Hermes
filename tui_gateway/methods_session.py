@@ -448,6 +448,11 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
             if live is not None:
+                # Reopening a live chat is also a re-announcement: the client may
+                # have switched connection/profile since this session was
+                # registered (#82140). prompt.submit refreshes it again before
+                # any turn runs, so this only tightens the window.
+                _remember_connection_mode(live[1], params)
                 return _ok(rid, _reuse_live_payload(*live))
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
