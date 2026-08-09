@@ -122,7 +122,7 @@ def bootstrap_gateway_registry() -> FleetRegistry:
                         labels["process_observation"] = "disabled"
                         return TargetSpec(target_id=f"hermes:profile:{profile}:gateway", profile=profile, kind=TargetKind.GATEWAY, criticality=criticality, observed_paths=(logs_path, f"~/Library/LaunchAgents/{label}.plist"), labels=labels, existing_writer="launchd+hermes_gateway_watchdog")
                     digest = hashlib.sha256("\x00".join(args).encode()).hexdigest()
-                    labels.update(process_marker=label_profile, command_fingerprint="sha256:" + digest, process_observation="enabled", process_command_label_optional="true")
+                    labels.update(process_marker=label_profile, command_fingerprint="sha256:" + digest, process_observation="enabled", process_command_label_optional="true", process_marker_optional="true")
                 else:
                     labels["process_observation"] = "disabled"
             else:
