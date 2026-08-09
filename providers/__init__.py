@@ -35,8 +35,10 @@ import importlib
 import importlib.util
 import hashlib
 import logging
+import os
 import sys
 import threading
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -88,6 +90,11 @@ class ProviderCatalogSnapshot:
     known_provider_ids: frozenset[str]
 
 
+_PUBLISHED_PROVIDER_CATALOG: ContextVar[ProviderCatalogSnapshot | None] = (
+    ContextVar("published_provider_catalog", default=None)
+)
+
+
 @dataclass
 class _ProviderBuildState:
     registry: dict[str, ProviderProfile]
@@ -101,6 +108,9 @@ _LAST_SNAPSHOT_FINGERPRINT: tuple[object, ...] | None = None
 _NOTIFIED_SNAPSHOT_FINGERPRINTS: set[tuple[object, ...]] = set()
 _MODULE_REGISTRATIONS: dict[str, tuple[ProviderProfile, ...]] = {}
 _OBSERVED_PROVIDER_IDS_BY_SCOPE: dict[tuple[str, str], set[str]] = {}
+_PROVIDER_SCOPE_IDENTITY_CACHE: dict[
+    tuple[str, str], tuple[str, str]
+] = {}
 _RUNTIME_REGISTRY: dict[str, ProviderProfile] = {}
 _RUNTIME_ALIASES: dict[str, str] = {}
 _RUNTIME_REGISTRATION_GENERATION = 0
@@ -203,18 +213,44 @@ def get_provider_catalog_snapshot() -> ProviderCatalogSnapshot:
     return snapshot
 
 
-def get_provider_scope_identity() -> tuple[str, str]:
-    """Return the profile/project identity without importing plugin code."""
+def get_published_provider_catalog_snapshot() -> ProviderCatalogSnapshot | None:
+    """Return this context's last resolved catalog without running discovery."""
+    return _PUBLISHED_PROVIDER_CATALOG.get()
+
+
+def _provider_scope_marker() -> tuple[str, str]:
+    """Return a cheap logical scope marker for the current context."""
     try:
         from hermes_constants import get_hermes_home
 
-        home = _path_identity(get_hermes_home())
+        home = os.path.normcase(
+            os.path.abspath(os.path.expanduser(str(get_hermes_home())))
+        )
     except Exception:
         home = ""
-    project = _path_identity(Path.cwd()) if env_var_enabled(
-        "HERMES_ENABLE_PROJECT_PLUGINS"
-    ) else ""
+    project = ""
+    if env_var_enabled("HERMES_ENABLE_PROJECT_PLUGINS"):
+        try:
+            project = os.path.normcase(os.path.abspath(str(Path.cwd())))
+        except (OSError, RuntimeError):
+            project = ""
     return home, project
+
+
+def get_provider_scope_identity() -> tuple[str, str]:
+    """Return the physical profile/project identity without importing plugins."""
+    marker = _provider_scope_marker()
+    with _DISCOVERY_LOCK:
+        cached = _PROVIDER_SCOPE_IDENTITY_CACHE.get(marker)
+    if cached is not None:
+        return cached
+
+    resolved = tuple(
+        _path_identity(Path(value)) if value else ""
+        for value in marker
+    )
+    with _DISCOVERY_LOCK:
+        return _PROVIDER_SCOPE_IDENTITY_CACHE.setdefault(marker, resolved)
 
 
 def register_provider_refresh_hook(callback: Callable[[], None]) -> None:
@@ -256,12 +292,22 @@ def invalidate_provider_discovery() -> None:
     """Rebuild providers and notify indexes after activation changes."""
     global _discovered, _ACTIVATION_STATE, _DISCOVERY_FINGERPRINT
     global _LAST_SNAPSHOT_FINGERPRINT
-    scope_identity = get_provider_scope_identity()
+    scope_marker = _provider_scope_marker()
     with _DISCOVERY_LOCK:
+        previous_scope_identity = _PROVIDER_SCOPE_IDENTITY_CACHE.pop(
+            scope_marker,
+            None,
+        )
+    scope_identity = get_provider_scope_identity()
+    _PUBLISHED_PROVIDER_CATALOG.set(None)
+    with _DISCOVERY_LOCK:
+        stale_scope_identities = {scope_identity}
+        if previous_scope_identity is not None:
+            stale_scope_identities.add(previous_scope_identity)
         stale = [
             fingerprint
             for fingerprint, snapshot in _SNAPSHOT_CACHE.items()
-            if snapshot.scope_identity == scope_identity
+            if snapshot.scope_identity in stale_scope_identities
         ]
         for fingerprint in stale:
             _SNAPSHOT_CACHE.pop(fingerprint, None)
@@ -371,6 +417,12 @@ def _ensure_providers_discovered() -> ProviderCatalogSnapshot | None:
         if fingerprint not in _NOTIFIED_SNAPSHOT_FINGERPRINTS:
             _NOTIFIED_SNAPSHOT_FINGERPRINTS.add(fingerprint)
             callbacks = tuple(_PROVIDER_REFRESH_HOOKS)
+
+    # Publish on every selection, including a cached A -> B -> A revisit whose
+    # once-per-fingerprint hooks do not run again. Downstream hot paths can
+    # select matching immutable metadata without re-entering discovery for
+    # every alias lookup.
+    _PUBLISHED_PROVIDER_CATALOG.set(snapshot)
 
     callback_failed = False
     for callback in callbacks:

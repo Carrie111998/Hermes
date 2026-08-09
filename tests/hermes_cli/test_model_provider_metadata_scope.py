@@ -9,6 +9,69 @@ from types import SimpleNamespace
 import pytest
 
 
+def test_provider_metadata_cache_uses_catalog_scope_authority(monkeypatch):
+    import hermes_cli.models as models
+    import providers
+
+    physical_scope = (r"f:\profiles\primary", r"f:\repos\hermes")
+    catalog = SimpleNamespace(
+        scope_identity=physical_scope,
+        fingerprint=("catalog", "primary"),
+    )
+    monkeypatch.setattr(
+        providers,
+        "get_provider_scope_identity",
+        lambda: physical_scope,
+    )
+    monkeypatch.setattr(
+        providers,
+        "get_published_provider_catalog_snapshot",
+        lambda: catalog,
+    )
+
+    assert models._provider_metadata_scope_key() == physical_scope
+    assert models._provider_metadata_cache_key() == (
+        physical_scope,
+        catalog.fingerprint,
+    )
+
+
+def test_warm_provider_metadata_reads_do_not_resolve_scope_paths(monkeypatch):
+    import hermes_cli.models as models
+    import providers
+
+    logical_scope = (r"c:\profiles\primary", r"c:\repos\hermes")
+    physical_scope = (r"f:\profiles\primary", r"f:\repos\hermes")
+    resolved = iter(physical_scope)
+    resolve_calls = 0
+    metadata = models._build_provider_metadata([])
+
+    def resolve_path(_path):
+        nonlocal resolve_calls
+        resolve_calls += 1
+        return next(resolved)
+
+    monkeypatch.setattr(providers, "_provider_scope_marker", lambda: logical_scope)
+    monkeypatch.setattr(providers, "_path_identity", resolve_path)
+    monkeypatch.setattr(providers, "_PROVIDER_SCOPE_IDENTITY_CACHE", {})
+    monkeypatch.setattr(
+        providers,
+        "get_published_provider_catalog_snapshot",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        models,
+        "_PROVIDER_METADATA_BY_SCOPE",
+        {(physical_scope, None): metadata},
+    )
+
+    assert providers.get_provider_scope_identity() == physical_scope
+    assert resolve_calls == 2
+    for _ in range(20):
+        models.normalize_provider("openrouter")
+    assert resolve_calls == 2
+
+
 @contextmanager
 def _hermes_home(path):
     from hermes_constants import (

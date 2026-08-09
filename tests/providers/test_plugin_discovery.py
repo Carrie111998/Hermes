@@ -29,6 +29,8 @@ def _clear_provider_caches():
     _pkg._discovered = False
     _pkg._ACTIVATION_STATE = None
     _pkg._DISCOVERY_FINGERPRINT = None
+    _pkg._PUBLISHED_PROVIDER_CATALOG.set(None)
+    _pkg._PROVIDER_SCOPE_IDENTITY_CACHE.clear()
     _pkg._IMPORTED_PROVIDER_MODULES.clear()
     # Evict any cached plugin modules so the next import re-executes.
     for mod in list(sys.modules.keys()):
@@ -394,6 +396,47 @@ def test_cached_profile_switch_does_not_repeat_refresh_hooks(
         (str(home_a.resolve()), ""),
         (str(home_b.resolve()), ""),
     ]
+
+
+def test_cached_activation_revisit_restores_model_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    home = tmp_path / "activation-metadata-home"
+    home.mkdir()
+    provider_name = "activation-metadata-provider"
+    provider_key = f"model-providers/{provider_name}"
+    _write_user_provider(
+        home,
+        provider_name,
+        base_url="https://activation-metadata.example/v1",
+        aliases=("activation-metadata-alias",),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    import hermes_cli.models as models
+    import providers
+
+    _write_activation(home, enabled=(provider_key,))
+    assert providers.get_provider_profile(provider_name) is not None
+    enabled_snapshot = models._provider_metadata_snapshot()
+    assert models.normalize_provider("activation-metadata-alias") == provider_name
+
+    _write_activation(home, disabled=(provider_key,))
+    assert providers.get_provider_profile(provider_name) is None
+    disabled_snapshot = models._provider_metadata_snapshot()
+    assert disabled_snapshot is not enabled_snapshot
+    assert provider_name not in models._KNOWN_PROVIDER_NAMES
+
+    # The enabled catalog is cached and its once-per-fingerprint refresh hook
+    # has already fired. Each user-facing inventory is a freshness boundary
+    # for direct config edits and must select matching cached metadata.
+    _write_activation(home, enabled=(provider_key,))
+    available_ids = {row["id"] for row in models.list_available_providers()}
+    assert provider_name in available_ids
+    assert providers.get_provider_profile(provider_name) is not None
+    assert models._provider_metadata_snapshot() is enabled_snapshot
+    assert models.normalize_provider("activation-metadata-alias") == provider_name
 
 
 def test_profile_env_metadata_is_monotonic_across_cached_scopes(

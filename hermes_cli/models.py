@@ -1186,8 +1186,11 @@ class _ProviderMetadataSnapshot(NamedTuple):
     known_provider_names: frozenset[str]
 
 
+_ProviderMetadataCacheKey = tuple[
+    tuple[str, str], tuple[object, ...] | None
+]
 _PROVIDER_METADATA_BY_SCOPE: dict[
-    tuple[str, str], _ProviderMetadataSnapshot
+    _ProviderMetadataCacheKey, _ProviderMetadataSnapshot
 ] = {}
 
 
@@ -1199,34 +1202,53 @@ def _path_scope_identity(path: Path) -> str:
 
 
 def _provider_metadata_scope_key() -> tuple[str, str]:
-    """Return the lightweight profile/project identity for this context.
+    """Return the provider subsystem's profile/project identity.
 
     Provider activation changes arrive through the registered refresh hook,
     so hot readers must not call ``get_provider_discovery_identity()`` here.
-    That API performs provider discovery and config freshness checks; using it
-    for every alias lookup turned ``normalize_provider()`` into a filesystem
-    and callback-heavy operation and made compatibility-view materialization
-    repeat the same work once per item.
+    ``get_provider_scope_identity()`` caches normalized physical paths; using
+    that same authority here keeps Windows junction aliases from splitting one
+    profile into two metadata scopes without resolving paths on every read.
     """
     try:
-        from hermes_constants import get_hermes_home
+        from providers import get_provider_scope_identity
 
-        home = _path_scope_identity(get_hermes_home())
+        return get_provider_scope_identity()
     except Exception:
-        home = ""
-
-    project = ""
-    if os.environ.get("HERMES_ENABLE_PROJECT_PLUGINS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
         try:
-            project = _path_scope_identity(Path.cwd())
-        except (OSError, RuntimeError):
-            project = ""
-    return home, project
+            from hermes_constants import get_hermes_home
+
+            home = _path_scope_identity(get_hermes_home())
+        except Exception:
+            home = ""
+
+        project = ""
+        if os.environ.get("HERMES_ENABLE_PROJECT_PLUGINS", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            try:
+                project = _path_scope_identity(Path.cwd())
+            except (OSError, RuntimeError):
+                project = ""
+        return home, project
+
+
+def _provider_metadata_cache_key() -> _ProviderMetadataCacheKey:
+    """Bind metadata to the catalog last resolved in this execution context."""
+    scope_key = _provider_metadata_scope_key()
+    try:
+        from providers import get_published_provider_catalog_snapshot
+
+        catalog = get_published_provider_catalog_snapshot()
+        if catalog is not None:
+            if catalog.scope_identity == scope_key:
+                return scope_key, catalog.fingerprint
+    except Exception:
+        pass
+    return scope_key, None
 
 
 def _build_provider_metadata(profiles: list[Any]) -> _ProviderMetadataSnapshot:
@@ -1305,6 +1327,8 @@ def _refresh_canonical_providers_from_plugins() -> None:
         try:
             from providers import list_providers
 
+            # list_providers() returns the immutable catalog selected in this
+            # ContextVar scope and publishes its fingerprint for cache_key.
             profiles = list_providers()
         except Exception:
             logger.debug(
@@ -1313,13 +1337,13 @@ def _refresh_canonical_providers_from_plugins() -> None:
             )
             return
 
-        scope_key = _provider_metadata_scope_key()
+        cache_key = _provider_metadata_cache_key()
         snapshot = _build_provider_metadata(profiles)
 
         # One dict-slot assignment publishes the complete immutable snapshot.
         # Other profile scopes keep their own entry and therefore cannot be
         # overwritten by this refresh.
-        _PROVIDER_METADATA_BY_SCOPE[scope_key] = snapshot
+        _PROVIDER_METADATA_BY_SCOPE[cache_key] = snapshot
 
         # During module initialization the legacy globals are still concrete
         # containers. Replace them wholesale (never clear/update in place).
@@ -1339,23 +1363,23 @@ def _refresh_canonical_providers_from_plugins() -> None:
 
 def _provider_metadata_snapshot() -> _ProviderMetadataSnapshot:
     """Return the immutable metadata snapshot for the current scope."""
-    scope_key = _provider_metadata_scope_key()
+    cache_key = _provider_metadata_cache_key()
     with _PROVIDER_METADATA_LOCK:
-        snapshot = _PROVIDER_METADATA_BY_SCOPE.get(scope_key)
+        snapshot = _PROVIDER_METADATA_BY_SCOPE.get(cache_key)
     if snapshot is not None:
         return snapshot
 
     _refresh_canonical_providers_from_plugins()
-    scope_key = _provider_metadata_scope_key()
+    cache_key = _provider_metadata_cache_key()
     with _PROVIDER_METADATA_LOCK:
-        snapshot = _PROVIDER_METADATA_BY_SCOPE.get(scope_key)
+        snapshot = _PROVIDER_METADATA_BY_SCOPE.get(cache_key)
         if snapshot is not None:
             return snapshot
 
         # Discovery is best-effort. Keep callers functional even if an
         # out-of-tree provider raised while the current scope was loading.
         snapshot = _build_provider_metadata([])
-        _PROVIDER_METADATA_BY_SCOPE[scope_key] = snapshot
+        _PROVIDER_METADATA_BY_SCOPE[cache_key] = snapshot
         return snapshot
 
 
@@ -2501,6 +2525,15 @@ def list_available_providers() -> list[dict[str, str]]:
     Derives the provider list from :data:`CANONICAL_PROVIDERS` (single
     source of truth shared with ``hermes model``, ``/model``, etc.).
     """
+    # This inventory is a coarse user-facing boundary. Resolve direct config
+    # edits once here; metadata aliases/labels below remain discovery-free.
+    try:
+        from providers import get_provider_catalog_snapshot
+
+        get_provider_catalog_snapshot()
+    except Exception:
+        pass
+
     metadata = _provider_metadata_snapshot()
     provider_order = [p.slug for p in metadata.canonical_providers]
     if "custom" in metadata.provider_labels and "custom" not in provider_order:

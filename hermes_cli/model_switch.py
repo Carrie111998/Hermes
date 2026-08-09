@@ -2104,6 +2104,15 @@ def list_authenticated_providers(
     matches the active provider without blocking on every saved/offline custom
     endpoint.
     """
+    # One coarse freshness boundary per picker build keeps direct config edits
+    # live while metadata alias/label hot loops stay discovery-free.
+    try:
+        from providers import get_provider_catalog_snapshot
+
+        get_provider_catalog_snapshot()
+    except Exception:
+        pass
+
     import os
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
