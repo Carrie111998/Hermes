@@ -357,6 +357,8 @@ class ProcessSession:
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
+    exact_redactions: tuple[str, ...] = field(default_factory=tuple, repr=False)
+    _redaction_pending: str = field(default="", repr=False)
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
@@ -483,6 +485,58 @@ class ProcessRegistry:
             sink(session, chunk)
         except Exception:
             pass
+
+    @staticmethod
+    def _redact_process_output(
+        session: ProcessSession,
+        text: str,
+        *,
+        final: bool = False,
+    ) -> str:
+        """Redact request-local opaque values across arbitrary output chunks."""
+        secrets = session.exact_redactions
+        if not secrets:
+            return text
+
+        pending = session._redaction_pending + text
+        output: list[str] = []
+        while pending:
+            matches = [
+                (index, -len(secret), secret)
+                for secret in secrets
+                if (index := pending.find(secret)) >= 0
+            ]
+            if matches:
+                index, _negative_length, secret = min(matches)
+                output.append(pending[:index])
+                output.append("«redacted-secret»")
+                pending = pending[index + len(secret):]
+                continue
+
+            if final:
+                output.append(pending)
+                pending = ""
+                break
+
+            # Retain only a suffix that could be the beginning of a secret.
+            # Everything before it is safe to release to buffers/watchers/UI.
+            hold = 0
+            for secret in secrets:
+                max_prefix = min(len(pending), len(secret) - 1)
+                for size in range(max_prefix, 0, -1):
+                    if pending.endswith(secret[:size]):
+                        hold = max(hold, size)
+                        break
+            if hold:
+                output.append(pending[:-hold])
+                pending = pending[-hold:]
+            else:
+                output.append(pending)
+                pending = ""
+            break
+
+        session._redaction_pending = pending
+        return "".join(output)
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -970,6 +1024,7 @@ class ProcessRegistry:
         # pipe mode.  This applies trusted request-local values and, for an
         # explicitly empty managed scope, removes ambient PAPERCLIP_* values
         # instead of inheriting a stale gateway identity.
+        from agent.redact import get_exact_redactions
         from tools.environments.local import _make_run_env
 
         spawn_env = _make_run_env(env_vars or {})
@@ -981,6 +1036,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            exact_redactions=get_exact_redactions(),
         )
 
         pty_scope_attempted = False
@@ -1330,11 +1386,14 @@ class ProcessRegistry:
         # (Ported from openclaw/openclaw#112325.)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-        def _append_chunk(chunk: str):
+        def _append_chunk(chunk: str, *, final: bool = False):
             nonlocal first_chunk
-            if first_chunk:
+            if first_chunk and chunk:
                 chunk = self._clean_shell_noise(chunk)
                 first_chunk = False
+            chunk = self._redact_process_output(session, chunk, final=final)
+            if not chunk:
+                return
             with session._lock:
                 session.output_buffer += chunk
                 if len(session.output_buffer) > session.max_output_chars:
@@ -1418,6 +1477,7 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
+            _append_chunk("", final=True)
             # Always reap the child to prevent zombie processes.
             try:
                 session.process.wait(timeout=5)
@@ -1495,7 +1555,10 @@ class ProcessRegistry:
         # (Ported from openclaw/openclaw#112325.)
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
-        def _append_text(text: str):
+        def _append_text(text: str, *, final: bool = False):
+            text = self._redact_process_output(session, text, final=final)
+            if not text:
+                return
             with session._lock:
                 session.output_buffer += text
                 if len(session.output_buffer) > session.max_output_chars:
@@ -1526,6 +1589,7 @@ class ProcessRegistry:
                 _append_text(tail)
         except Exception:
             pass
+        _append_text("", final=True)
 
         # Process exited
         try:

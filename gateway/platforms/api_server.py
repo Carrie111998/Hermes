@@ -6523,10 +6523,10 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         def _redact_run_text(value: Any) -> str:
-            text = redact_sensitive_text(value, force=True)
+            text = str(value)
             for secret in exact_run_secrets:
                 text = text.replace(secret, "«redacted-secret»")
-            return text
+            return redact_sensitive_text(text, force=True)
 
         raw_input = body.get("input")
         if not raw_input:
