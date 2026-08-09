@@ -2,6 +2,7 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $currentCwd, $gatewayState } from '@/store/session'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
@@ -201,6 +202,33 @@ async function advanceBackoff() {
 }
 
 describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => {
+  it('publishes a secondary-window profile before the first gateway open event', async () => {
+    window.history.replaceState({}, '', '/?win=secondary&profile=life#/session-123')
+    $activeGatewayProfile.set('default')
+    const desktop = fakeDesktop()
+    let profileAtFirstOpen: string | null = null
+
+    const stop = $gatewayState.listen(state => {
+      if (state === 'open' && profileAtFirstOpen === null) {
+        profileAtFirstOpen = $activeGatewayProfile.get()
+      }
+    })
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    try {
+      render(<Harness />)
+      await flushAsync()
+
+      expect(desktop.getConnection).toHaveBeenCalledWith('life')
+      expect(profileAtFirstOpen).toBe('life')
+    } finally {
+      stop()
+      window.history.replaceState({}, '', '/')
+      $activeGatewayProfile.set('default')
+    }
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it

@@ -95,6 +95,15 @@ export function useGatewayBoot({
   useEffect(() => {
     let cancelled = false
     const desktop = window.hermesDesktop
+    const profileOverride = windowProfileOverride()
+
+    // A profile-pinned helper window must publish its ownership before the
+    // gateway can emit `open`: route resume is gated on that event and scopes
+    // its first REST lookup through $activeGatewayProfile. Adopting only after
+    // connect lets a fast wrong-profile 404 reset the routed watch session.
+    if (profileOverride) {
+      $activeGatewayProfile.set(profileOverride)
+    }
 
     const publish = (next: HermesConnection | null) => {
       callbacksRef.current.onConnectionReady(next)
@@ -256,14 +265,13 @@ export function useGatewayBoot({
     // Best-effort: a missing preference means "default". Shared by boot + soft
     // switch.
     //
-    // Helper windows (the HUD) can carry an explicit profile override in their
-    // URL: the HUD is opened ON a conversation, and when that conversation
-    // belongs to a non-primary profile, adopting the primary here resolves the
-    // session id against the wrong backend — the HUD then falls back to the
-    // default profile's last session (#82285). The override wins over the
-    // stored preference; absent, behavior is unchanged.
+    // Helper windows (the HUD and session popouts) can carry an explicit
+    // profile override in their URL. When the routed conversation belongs to a
+    // non-primary profile, adopting the primary here resolves its session id
+    // against the wrong backend. The override wins over the stored preference;
+    // absent, behavior is unchanged (#82285).
     async function adoptPrimaryProfile() {
-      const override = windowProfileOverride()
+      const override = profileOverride
 
       try {
         const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
@@ -310,7 +318,7 @@ export function useGatewayBoot({
 
         // Same override rule as boot(): a profile-pinned helper window stays
         // on its pinned profile's backend across a soft switch.
-        const conn = await desktop.getConnection(windowProfileOverride() ?? undefined)
+        const conn = await desktop.getConnection(profileOverride ?? undefined)
 
         if (cancelled) {
           return
@@ -500,10 +508,10 @@ export function useGatewayBoot({
 
     async function boot() {
       try {
-        // A profile-pinned helper window (the HUD) dials its target profile's
-        // backend directly — ensureBackend spawns/reuses it from the pool.
+        // A profile-pinned helper window (HUD or session popout) dials its target
+        // profile's backend directly — ensureBackend spawns/reuses it from the pool.
         // Everything else keeps dialing the primary.
-        const conn = await desktop.getConnection(windowProfileOverride() ?? undefined)
+        const conn = await desktop.getConnection(profileOverride ?? undefined)
 
         if (cancelled) {
           return
