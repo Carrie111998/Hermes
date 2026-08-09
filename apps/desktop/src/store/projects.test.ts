@@ -463,11 +463,13 @@ describe('repository discovery policy', () => {
 
     expect(scanRepos).not.toHaveBeenCalled()
     expect(getHermesConfig).not.toHaveBeenCalled()
-    // The desktop can't crawl the remote host's filesystem, but the
-    // sidebar still has to learn about repos that exist on the host
-    // (`projects.tree` derives them from session cwds server-side).
-    // Regression for #81723: the sidebar used to go silent in remote
-    // mode and never refresh again.
+    // The desktop can't crawl the remote host's filesystem, so it asks the
+    // host to scan its own discovery roots (`projects.discover_repos` with
+    // `scan: true`) — repos with zero Hermes sessions must still surface —
+    // then refreshes the tree to pick up the merged list. Regression for
+    // #81723: the sidebar used to go silent in remote mode and never
+    // refresh again.
+    expect(request).toHaveBeenCalledWith('projects.discover_repos', { scan: true })
     expect(request).toHaveBeenCalledWith(
       'projects.tree',
       expect.objectContaining({ preview_limit: expect.any(Number) })
