@@ -83,9 +83,37 @@ Baseline results:
 
 The negative set intentionally records lexical candidate-generation behavior: the baseline returns candidates for irrelevant queries, while no expected memory is marked as a hit. The `negative_no_result_precision` metric is therefore `0.0`; later hybrid acceptance must not worsen the measured false-recall behavior, and this limitation remains visible rather than being hidden by the hit-only metric.
 
+## Commit 2 — embedding backend protocol
+
+Commit 2 adds only the backend contract and deterministic fake adapter. Production retrieval, configuration, runtime hooks, SQLite schema, HTTP communication, CLI, and dependencies remain unchanged.
+
+Implemented files:
+- `plugins/semantic_graph/embedding/base.py`
+- `plugins/semantic_graph/embedding/fake.py`
+- `plugins/semantic_graph/embedding/__init__.py`
+- `tests/plugins/test_semantic_graph_embedding_backend.py`
+
+Contract decisions:
+- `EmbeddingModelIdentity.namespace` is stable and maps an empty revision to `unversioned`.
+- Identity rejects empty provider/model, non-positive dimensions, and non-positive serializer versions.
+- The fake backend validates dimensions and finite numeric values at construction, but does not normalize or pack vectors.
+- Returned vectors are defensive copies.
+- Unavailable, unknown-input, and injected-failure paths raise `EmbeddingBackendError`.
+- No network, database, config, or production recall path is exercised by this commit.
+
+Verification evidence:
+- RED: canonical runner failed during collection before implementation with `ModuleNotFoundError: No module named 'plugins.semantic_graph.embedding'` (exit 1).
+- Backend contract: canonical runner, 16 tests passed, exit 0.
+- Baseline + hardening: canonical runner, 10 tests passed, exit 0.
+- Ruff: PASS.
+- Python compile check: PASS.
+- `git diff --check`: PASS.
+- Secret/local-path scan: no findings.
+- No live embedding server call performed.
+
 ## 現在の変更範囲
 
-The current branch contains the lexical benchmark baseline and the Phase 2 start log only. No embedding implementation, schema migration, dependency change, or live network call has been made.
+The current branch contains the lexical benchmark baseline, the Phase 2 start log, and the Commit 2 embedding backend contract only. No SQLite migration, dependency change, production retrieval change, HTTP adapter, or CLI has been made.
 
 
 ## 検証計画
