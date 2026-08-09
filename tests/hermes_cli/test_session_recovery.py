@@ -670,9 +670,15 @@ class _AutoRollbackConnection:
         statement = sql.strip().upper()
         if statement.startswith("ROLLBACK"):
             self.rollback_attempts += 1
-            # SQLite already unwound the transaction; undo it for real so the
-            # connection stays usable, then fail the way SQLite would.
-            self._connection.execute("ROLLBACK")
+            # Undo any transaction still open underneath so the connection
+            # stays usable, then fail the way SQLite does once it has already
+            # unwound the transaction itself. The simulated failure is raised
+            # unconditionally so the stub never depends on the real
+            # connection's transaction state.
+            try:
+                self._connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
             raise sqlite3.OperationalError(
                 "cannot rollback - no transaction is active"
             )

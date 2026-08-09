@@ -377,30 +377,6 @@ def inspect_session_database(
         temp_dir.cleanup()
 
 
-def _rollback_without_masking(destination: sqlite3.Connection) -> None:
-    """Roll the destination back without shadowing the failure in flight.
-
-    SQLite may already have rolled the transaction back on its own — it does
-    that for SQLITE_FULL, SQLITE_IOERR, SQLITE_BUSY and SQLITE_NOMEM, which
-    are precisely the errors a recovery run into a fresh destination hits.
-    The explicit ``ROLLBACK`` then raises ``cannot rollback - no transaction
-    is active`` from inside the exception handler and *replaces* the original
-    failure, so the caller reports the spurious rollback error and never
-    reaches its own ``raise``.
-
-    ``sqlite3.Error`` rather than ``sqlite3.OperationalError``: this module
-    tears its connections down in a ``finally`` block, so the rollback can
-    also land on an already-closed connection and raise ``ProgrammingError``.
-    Whatever the rollback itself fails with, it matters less than the
-    exception already being propagated. Non-SQLite errors still surface.
-    """
-
-    try:
-        destination.execute("ROLLBACK")
-    except sqlite3.Error:
-        pass
-
-
 def _copy_table(
     source: sqlite3.Connection,
     destination: sqlite3.Connection,
@@ -443,7 +419,7 @@ def _copy_table(
                 destination.executemany(insert_sql, rows)
                 destination.execute("COMMIT")
             except BaseException:
-                _rollback_without_masking(destination)
+                destination.execute("ROLLBACK")
                 raise
             result["copied_rows"] += len(rows)
             if progress_cb is not None:
@@ -628,7 +604,7 @@ def _copy_table_salvage(
                         destination.executemany(insert_sql, included)
                         destination.execute("COMMIT")
                     except BaseException:
-                        _rollback_without_masking(destination)
+                        destination.execute("ROLLBACK")
                         raise
 
                 result["copied_rows"] += len(included)
@@ -741,7 +717,7 @@ def _copy_state_meta(
                 )
                 destination.execute("COMMIT")
             except BaseException:
-                _rollback_without_masking(destination)
+                destination.execute("ROLLBACK")
                 raise
             result["copied_rows"] += len(rows)
             if progress_cb is not None:
@@ -1040,7 +1016,7 @@ def _cleanup_partial_orphans(
             result[report_key] = orphan_count
         destination.execute("COMMIT")
     except BaseException:
-        _rollback_without_masking(destination)
+        destination.execute("ROLLBACK")
         raise
     # Only destructive/relinking actions belong in this total. The
     # reconstruction counters describe data RETAINED, so summing them here
@@ -1273,7 +1249,7 @@ def _finalize_derived_metadata(destination: sqlite3.Connection) -> dict[str, Any
         )
         destination.execute("COMMIT")
     except BaseException:
-        _rollback_without_masking(destination)
+        destination.execute("ROLLBACK")
         raise
     result["finalized"] = True
     return result
