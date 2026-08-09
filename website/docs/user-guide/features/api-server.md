@@ -355,6 +355,34 @@ Create a new agent run. Returns a `run_id` that can be used to subscribe to prog
 
 Runs accept a simple `input` string and optional `session_id`, `instructions`, `conversation_history`, or `previous_response_id`. When `session_id` is provided, Hermes surfaces it in the run status so external UIs can correlate runs with their own conversation IDs.
 
+You can also pass `runtime_env` (or the deprecated `environment` alias, but not both) to inject environment variables visible only to that run. This is how control-plane systems like Paperclip pass task context into the agent without persisting it in the shell or config. Only these eight keys are permitted: `PAPERCLIP_AGENT_ID`, `PAPERCLIP_API_KEY`, `PAPERCLIP_API_URL`, `PAPERCLIP_COMPANY_ID`, `PAPERCLIP_ISSUE_WORK_MODE`, `PAPERCLIP_RUN_ID`, `PAPERCLIP_TASK_ID`, `PAPERCLIP_WAKE_REASON`. The value must be an object where every value is a string. NUL bytes are rejected, and the total encoded size cannot exceed 32 KiB. Sending both `runtime_env` and `environment` returns 400 `provide only one of 'runtime_env' or 'environment'`. An unsupported key or non-string value returns 400 `'runtime_env' contains an unsupported name or non-string value`. A NUL byte returns 400 `'runtime_env' contains an invalid value`. Exceeding the size cap returns 400 `'runtime_env' is too large`.
+
+```json
+{
+  "input": "Review the latest metrics",
+  "session_id": "metrics-review-001",
+  "runtime_env": {
+    "PAPERCLIP_AGENT_ID": "b013c561-43a1-48bc-bf03-2adb66412343",
+    "PAPERCLIP_COMPANY_ID": "ac1b2405-20df-4df0-9f34-cd7c29d8463f",
+    "PAPERCLIP_RUN_ID": "4dbc2e17-bfb8-4f32-a22f-b3ef355b7a8f"
+  }
+}
+```
+
+Example:
+
+```json
+{
+  "input": "Resolve ACE-42",
+  "session_id": "task-session-123",
+  "runtime_env": {
+    "PAPERCLIP_RUN_ID": "abc-123",
+    "PAPERCLIP_TASK_ID": "ACE-42",
+    "PAPERCLIP_API_URL": "https://api.paperclip.example"
+  }
+}
+```
+
 ### GET /v1/runs/\{run_id\}
 
 Poll the current run state. This is useful for dashboards that need status without holding an SSE connection open, or for UIs that reconnect after navigation.
