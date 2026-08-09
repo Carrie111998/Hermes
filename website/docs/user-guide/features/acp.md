@@ -23,7 +23,12 @@ conversation transport.
 
 ## What Hermes exposes in ACP mode
 
-Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. It includes:
+Hermes runs with a curated `hermes-acp` toolset designed for editor workflows. It also
+loads the native plugin toolsets enabled for the active Hermes profile, so an ACP host
+such as Buzz sees the same profile-specific plugin capabilities as a native Hermes
+session. Disabled plugins remain unavailable, and profiles do not share plugin settings.
+
+The base ACP toolset includes:
 
 - file tools: `read_file`, `write_file`, `patch`, `search_files`
 - terminal tools: `terminal`, `process`

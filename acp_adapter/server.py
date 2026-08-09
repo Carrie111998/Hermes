@@ -976,11 +976,30 @@ class HermesACPAgent(acp.Agent):
         if not mcp_servers:
             return
 
+        allowed_names = getattr(state.agent, "_acp_mcp_allowed_names", None)
+        if not isinstance(allowed_names, frozenset):
+            allowed_names = None
+        denied_names = getattr(state.agent, "_acp_mcp_denied_names", frozenset())
+        if not isinstance(denied_names, frozenset):
+            denied_names = frozenset()
+        accepted_servers = [
+            server
+            for server in mcp_servers
+            if server.name not in denied_names
+            and (allowed_names is None or server.name in allowed_names)
+        ]
+        if not accepted_servers:
+            logger.info(
+                "Session %s: ACP MCP registration denied by session policy",
+                state.session_id,
+            )
+            return
+
         try:
             from tools.mcp_tool import register_mcp_servers
 
             config_map: dict[str, dict] = {}
-            for server in mcp_servers:
+            for server in accepted_servers:
                 name = server.name
                 if isinstance(server, McpServerStdio):
                     config = {
@@ -1010,7 +1029,7 @@ class HermesACPAgent(acp.Agent):
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
-                mcp_server_names=[server.name for server in mcp_servers],
+                mcp_server_names=[server.name for server in accepted_servers],
             )
             state.agent.enabled_toolsets = enabled_toolsets
             disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
@@ -2222,7 +2241,11 @@ class HermesACPAgent(acp.Agent):
             toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"]
             )
-            tools = get_tool_definitions(enabled_toolsets=toolsets, quiet_mode=True)
+            tools = get_tool_definitions(
+                enabled_toolsets=toolsets,
+                disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
+                quiet_mode=True,
+            )
             tool_view = SimpleNamespace(
                 tools=list(tools or []),
                 valid_tool_names={
@@ -2231,6 +2254,7 @@ class HermesACPAgent(acp.Agent):
                     if isinstance(tool, dict)
                 },
                 enabled_toolsets=toolsets,
+                disabled_toolsets=getattr(state.agent, "disabled_toolsets", None),
                 _memory_manager=getattr(state.agent, "_memory_manager", None),
             )
             inject_memory_provider_tools(tool_view)
