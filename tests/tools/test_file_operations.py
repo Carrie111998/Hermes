@@ -677,6 +677,17 @@ class TestReadNonUtf8IsBinary:
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
 
+    def test_replacement_char_at_eof_stays_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # A real U+FFFD at EOF must not be mistaken for a truncation artifact.
+        assert ops._is_likely_binary("notes.txt", "漢字\ufffd") is True
+
+    def test_replacement_char_before_boundary_stays_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # A replacement marker before the boundary is evidence of an invalid
+        # byte in the file, not a truncation artifact.
+        assert ops._is_likely_binary("notes.txt", "bad\ufffd text") is True
+
 # =========================================================================
 # Byte-layer binary detection (#80308 class: CJK/multibyte text flagged
 # binary because the byte-boundary sample manufactured U+FFFD in transit)
@@ -794,4 +805,57 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         result = ops.read_file("/tmp/a.out")
         assert result.is_binary is True
+
+    def test_fallback_sample_completes_utf8_boundary(self, mock_env):
+        content = (b"a" * 999 + "中".encode("utf-8") + b" text")
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("wc -c"):
+                return {"output": f"{len(content)}\n", "returncode": 0}
+            if command.startswith("head -c 1003"):
+                # Force the legacy text fallback rather than byte-layer
+                # detection, then return the complete 1003-byte sample.
+                return {"output": content[:1003].decode("utf-8"), "returncode": 0}
+            if command.startswith("head -c 1000"):
+                return {"output": "not base64", "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": content.decode("utf-8"), "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "1\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/boundary.txt")
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert any("head -c 1003" in command for command in commands)
+
+    def test_read_file_raw_fallback_completes_utf8_boundary(self, mock_env):
+        content = (b"a" * 999 + "中".encode("utf-8") + b" text")
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("wc -c"):
+                return {"output": f"{len(content)}\n", "returncode": 0}
+            if command.startswith("head -c 1003"):
+                return {"output": content[:1003].decode("utf-8"), "returncode": 0}
+            if command.startswith("head -c 1000"):
+                return {"output": "not base64", "returncode": 0}
+            if command.startswith("cat "):
+                return {"output": content.decode("utf-8"), "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file_raw("/tmp/boundary.txt")
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert result.content == content.decode("utf-8")
+        assert any("head -c 1003" in command for command in commands)
 
