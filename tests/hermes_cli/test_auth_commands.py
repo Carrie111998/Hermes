@@ -1012,8 +1012,8 @@ def test_auth_usage_reports_unavailable_snapshot(monkeypatch, capsys):
 # `--all` / `--account` — multi-pool-entry iteration for `auth usage`
 # ──────────────────────────────────────────────────────────────────────────
 #
-# The default (no flag) path renders only the resolver-selected account and
-# prints a hint when the pool has more than one entry. ``--all`` iterates
+# The default (no flag) path delegates to the native resolver and prints a
+# hint when the pool has more than one entry. ``--all`` iterates
 # every entry and renders each separately; ``--account LABEL`` filters to a
 # single entry by stored label. Per-entry failures are surfaced inline and
 # do not abort the loop; only "no entry rendered at all" exits non-zero.
@@ -1097,9 +1097,13 @@ def test_auth_usage_all_renders_every_pool_entry(monkeypatch, capsys):
     # non-zero and the assertions below will fire spuriously.
     import agent.account_usage as _account_usage
 
-    monkeypatch.setattr(
-        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
-    )
+    fetch_tokens = []
+
+    def _fetch(*args, **kwargs):
+        fetch_tokens.append(kwargs.get("api_key"))
+        return snapshot
+
+    monkeypatch.setattr(_account_usage, "fetch_account_usage", _fetch)
 
     auth_usage_command(
         SimpleNamespace(provider="openai-codex", all_accounts=True, account="")
@@ -1111,6 +1115,7 @@ def test_auth_usage_all_renders_every_pool_entry(monkeypatch, capsys):
     assert "=== openai-codex: codex-current ===" in out
     assert "=== openai-codex: openai-codex-oauth-2 ===" in out
     assert out.count("Session") == 2
+    assert fetch_tokens == ["tok-1", "tok-2"]
     # No final SystemExit — both rendered cleanly.
     assert "no account returned usable usage" not in out
 
@@ -1168,9 +1173,13 @@ def test_auth_usage_account_filters_to_label(monkeypatch, capsys):
 
     import agent.account_usage as _account_usage
 
-    monkeypatch.setattr(
-        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
-    )
+    fetch_tokens = []
+
+    def _fetch(*args, **kwargs):
+        fetch_tokens.append(kwargs.get("api_key"))
+        return snapshot
+
+    monkeypatch.setattr(_account_usage, "fetch_account_usage", _fetch)
 
     auth_usage_command(
         SimpleNamespace(
@@ -1186,6 +1195,7 @@ def test_auth_usage_account_filters_to_label(monkeypatch, capsys):
     assert "Account limits" in out
     assert "Session" in out
     assert "50%" in out
+    assert fetch_tokens == ["tok-1"]
     # With a single-entry filter, no per-account header banner is emitted
     # (consistent with the default one-shot path).
     assert "===" not in out
@@ -1304,7 +1314,7 @@ def test_auth_usage_all_continues_after_per_entry_failure(monkeypatch, capsys):
 
 
 def test_auth_usage_default_warns_when_multiple_pool_entries(monkeypatch, capsys):
-    """The no-flag path must show the head entry AND a hint about ``--all``."""
+    """The no-flag path must use the resolver and hint about ``--all``."""
     from hermes_cli.auth_commands import auth_usage_command
 
     monkeypatch.setattr(
@@ -1357,20 +1367,27 @@ def test_auth_usage_default_warns_when_multiple_pool_entries(monkeypatch, capsys
 
     import agent.account_usage as _account_usage
 
-    monkeypatch.setattr(
-        _account_usage, "fetch_account_usage", lambda *a, **kw: snapshot
-    )
+    fetch_tokens = []
+
+    def _fetch(*args, **kwargs):
+        fetch_tokens.append(kwargs.get("api_key"))
+        return snapshot
+
+    monkeypatch.setattr(_account_usage, "fetch_account_usage", _fetch)
 
     auth_usage_command(
         SimpleNamespace(provider="openai-codex", all_accounts=False, account="")
     )
 
     out = capsys.readouterr().out
-    # Hint points the user at --all; the head entry's snapshot still renders.
+    # The hint points the user at --all; the actual fetch must use the native
+    # resolver rather than silently forcing the pool head.
     assert "2 pool entries" in out
     assert "--all" in out
-    assert "codex-current" in out
-    # The second entry never renders in the default path.
+    assert "resolver-selected" in out
+    assert fetch_tokens == [""]
+    # Neither pool label is selected or printed in the resolver path.
+    assert "codex-current" not in out
     assert "openai-codex-oauth-2" not in out
 
 
@@ -1514,11 +1531,13 @@ def test_auth_usage_reset_redeems_when_credit_available(monkeypatch, capsys):
 
     import agent.account_usage as _account_usage
 
-    monkeypatch.setattr(
-        _account_usage,
-        "redeem_codex_reset_credit",
-        lambda *a, **kw: good_result,
-    )
+    reset_tokens = []
+
+    def _redeem(*args, **kwargs):
+        reset_tokens.append(kwargs.get("api_key"))
+        return good_result
+
+    monkeypatch.setattr(_account_usage, "redeem_codex_reset_credit", _redeem)
 
     # Must not raise — successful redemption exits 0.
     auth_usage_reset_command(
@@ -1531,8 +1550,9 @@ def test_auth_usage_reset_redeems_when_credit_available(monkeypatch, capsys):
     )
 
     out = capsys.readouterr().out
-    assert "codex-current" in out
+    assert "resolver-selected" in out
     assert "Reset redeemed" in out
+    assert reset_tokens == [None]
 
 
 def test_auth_usage_reset_no_credits_banked_is_not_an_error(monkeypatch, capsys):
@@ -1580,11 +1600,13 @@ def test_auth_usage_reset_no_credits_banked_is_not_an_error(monkeypatch, capsys)
 
     import agent.account_usage as _account_usage
 
-    monkeypatch.setattr(
-        _account_usage,
-        "redeem_codex_reset_credit",
-        lambda *a, **kw: no_credit_result,
-    )
+    reset_tokens = []
+
+    def _redeem(*args, **kwargs):
+        reset_tokens.append(kwargs.get("api_key"))
+        return no_credit_result
+
+    monkeypatch.setattr(_account_usage, "redeem_codex_reset_credit", _redeem)
 
     # No SystemExit: structured no-op is a 0 exit so shell loops continue.
     auth_usage_reset_command(
@@ -1598,7 +1620,8 @@ def test_auth_usage_reset_no_credits_banked_is_not_an_error(monkeypatch, capsys)
 
     out = capsys.readouterr().out
     assert "No banked reset credits" in out
-    assert "codex-current" in out
+    assert "resolver-selected" in out
+    assert reset_tokens == [None]
 
 
 def test_auth_usage_reset_transport_failure_exits_nonzero(monkeypatch, capsys):

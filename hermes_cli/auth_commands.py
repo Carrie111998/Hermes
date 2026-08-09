@@ -595,6 +595,16 @@ def _list_provider_account_credentials(provider: str) -> list[dict]:
     return rows
 
 
+def _resolver_account_credential() -> dict[str, str]:
+    """Return the marker row that delegates selection to the native resolver."""
+    return {
+        "label": "resolver-selected",
+        "source": "resolver",
+        "access_token": "",
+        "account_id": "",
+    }
+
+
 def _fetch_account_usage_with_timeout(
     *,
     provider: str,
@@ -733,18 +743,18 @@ def auth_usage_command(args) -> None:
             )
         creds = matches
 
-    if not show_all and len(creds) > 1:
-        # Default behavior with multiple accounts: render the first (pool
-        # head) and print a hint that ``--all`` exists. This keeps the
-        # default output deterministic and one-shot, matching the original
-        # PR #81819 contract.
-        first = creds[0]
-        print(
-            f"Note: {provider} has {len(creds)} pool entries; showing "
-            f"{first['label']!r}. Re-run with --all to render every "
-            "account, or --account <label> to pick one."
-        )
-        creds = [first]
+    if not show_all and not account_filter:
+        # Default behavior must follow the native runtime resolver rather than
+        # silently forcing the pool head. The resolver may prefer a singleton
+        # credential over the pool (Codex) or a higher-priority source such as
+        # an environment/Claude Code credential (Anthropic).
+        if len(creds) > 1:
+            print(
+                f"Note: {provider} has {len(creds)} pool entries; showing "
+                "the resolver-selected account. Re-run with --all to render "
+                "every account, or --account <label> to pick one."
+            )
+        creds = [_resolver_account_credential()]
 
     any_rendered = False
     any_failed = False
@@ -918,14 +928,17 @@ def auth_usage_reset_command(args) -> None:
             )
         creds = matches
 
-    if not show_all and len(creds) > 1:
-        first = creds[0]
-        print(
-            f"Note: {provider} has {len(creds)} pool entries; resetting "
-            f"{first['label']!r}. Re-run with --all to reset every account, "
-            "or --account <label> to pick one."
-        )
-        creds = [first]
+    if not show_all and not account_filter:
+        # Keep reset selection aligned with the read path: no explicit token
+        # means ``redeem_codex_reset_credit`` uses the native resolver rather
+        # than accidentally resetting the first pool entry.
+        if len(creds) > 1:
+            print(
+                f"Note: {provider} has {len(creds)} pool entries; resetting "
+                "the resolver-selected account. Re-run with --all to reset "
+                "every account, or --account <label> to pick one."
+            )
+        creds = [_resolver_account_credential()]
 
     any_redeemed = False
     any_failed = False

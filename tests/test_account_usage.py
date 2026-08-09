@@ -95,6 +95,51 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert "Credits balance: $12.50" in snapshot.details
 
 
+def test_fetch_account_usage_anthropic_uses_explicit_oauth_token(monkeypatch):
+    calls = []
+
+    class _AnthropicClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, url, headers=None):
+            calls.append({"url": url, "headers": headers})
+            return _Response(
+                {
+                    "five_hour": {"utilization": 0.25, "resets_at": 1_900_000_000},
+                    "seven_day": {"utilization": 0.4, "resets_at": 1_900_500_000},
+                }
+            )
+
+    def _unexpected_resolver_call():
+        raise AssertionError("explicit pool token must bypass the global resolver")
+
+    monkeypatch.setattr(
+        "agent.account_usage.resolve_anthropic_token",
+        _unexpected_resolver_call,
+    )
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _AnthropicClient(),
+    )
+
+    snapshot = fetch_account_usage("anthropic", api_key="cc-account-two")
+
+    assert snapshot is not None
+    assert snapshot.provider == "anthropic"
+    assert [window.label for window in snapshot.windows] == [
+        "Current session",
+        "Current week",
+    ]
+    assert snapshot.windows[0].used_percent == 25.0
+    assert calls[0]["url"] == "https://api.anthropic.com/api/oauth/usage"
+    assert calls[0]["headers"]["Authorization"] == "Bearer cc-account-two"
+    assert calls[0]["headers"]["anthropic-beta"] == "oauth-2025-04-20"
+
+
 def test_render_account_usage_lines_includes_reset_and_provider():
     snapshot = AccountUsageSnapshot(
         provider="openai-codex",
