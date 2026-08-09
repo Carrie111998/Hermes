@@ -55,6 +55,7 @@ class LogCollector:
         self.min_interval_seconds = min_interval_seconds
         self._last_collection = 0.0
         self._rate_lock = threading.Lock()
+        self.last_identity: tuple[int, int] | None = None
 
     @staticmethod
     def _normalize_message(line: str) -> str:
@@ -108,6 +109,7 @@ class LogCollector:
             opened = os.fstat(descriptor)
             if not stat.S_ISREG(opened.st_mode):
                 return failed_batch(target, self.name, "log_path_rejected", source_id=self.source_id)
+            self.last_identity = (int(opened.st_dev), int(opened.st_ino))
             if cursor is not None and cursor.source_id not in ("", self.source_id):
                 cursor = None
                 reset_reason = CursorResetReason.SOURCE_CHANGED

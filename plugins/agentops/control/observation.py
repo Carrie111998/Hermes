@@ -411,11 +411,16 @@ class DefaultObservationLoop:
 class ObservationRunbook:
     """Explicit two-stage run protocol; never installs or invokes a scheduler."""
 
-    def __init__(self, loop: DefaultObservationLoop) -> None:
+    def __init__(self, loop: DefaultObservationLoop, *, max_events: int = 10000) -> None:
         if not isinstance(loop, DefaultObservationLoop):
             raise ValueError("runbook requires a default observation loop")
         self.loop = loop
+        if not isinstance(max_events, int) or max_events <= 0:
+            raise ValueError("invalid runbook event budget")
+        self.max_events = max_events
         self._events: list[dict[str, Any]] = []
+        self._slot_keys: set[str] = set()
+        self._backlog_tail_reached = False
 
     def _metadata(self, *, stage: str, status: str, **fields: Any) -> dict[str, Any]:
         now = utc_now()
@@ -432,8 +437,13 @@ class ObservationRunbook:
             "ledger_bytes": self.loop.ledger.bytes_used,
             **fields,
         }
+        if len(self._events) >= self.max_events:
+            raise ObservationBoundaryError("runbook event budget exceeded")
         self._events.append(item)
-        return dict(item)
+        return json.loads(json.dumps(item, sort_keys=True))
+
+    def _next_eligible_seconds(self) -> float:
+        return max(float(getattr(collector, "min_interval_seconds", 0.0)) for collector in self.loop.collectors)
 
     def drain_backlog(self, *, max_passes: int = 64) -> dict[str, Any]:
         """Drain existing log backlog in bounded passes; it is not observation day 1."""
@@ -446,6 +456,9 @@ class ObservationRunbook:
         tail_reached = False
         stop_reason = "pass_budget_exhausted"
         for _ in range(max_passes):
+            if passes > 0 and self._next_eligible_seconds() > 0:
+                stop_reason = "next_eligible_not_reached"
+                break
             passes += 1
             try:
                 batches = self.loop.collect_once()
@@ -458,39 +471,71 @@ class ObservationRunbook:
                 break
             cursor = log_batch.next_cursor
             try:
-                size = logs.path.stat().st_size
+                metadata = logs.path.lstat()
+                opened_identity = getattr(logs, "last_identity", None)
+                if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode) or cursor is None or opened_identity != (int(metadata.st_dev), int(metadata.st_ino)) or int(cursor.inode) != int(metadata.st_ino):
+                    stop_reason = "log_source_changed"
+                    break
+                size = metadata.st_size
             except OSError:
                 stop_reason = "log_asset_unavailable"
                 break
             if cursor is not None and cursor.offset >= size:
                 tail_reached = True
                 stop_reason = "tail_reached"
+                self._backlog_tail_reached = True
                 break
         status = "tail_reached" if tail_reached else "safe_stop"
-        return self._metadata(stage="backlog_drain", status=status, passes=passes, tail_reached=tail_reached, stop_reason=stop_reason, observation_day_counted=False)
+        return self._metadata(stage="backlog_drain", status=status, passes=passes, tail_reached=tail_reached, stop_reason=stop_reason, next_eligible_seconds=self._next_eligible_seconds() if stop_reason == "next_eligible_not_reached" else 0, observation_day_counted=False)
 
-    def rotate_after_daily_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = True) -> dict[str, Any]:
-        """Replace only the in-memory ledger after a verified UTC export."""
+    def _verify_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool, export_receipt_sha256: str | None) -> tuple[date, str]:
         day = _utc_day(utc_day)
         if export_verified is not True or not isinstance(summary, Mapping) or not isinstance(terra_input, Mapping):
             raise ObservationBoundaryError("daily export verification required")
+        current_summary = self.loop.ledger.daily_summary(day)
+        current_terra = self.loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+        if json.dumps(summary, sort_keys=True, separators=(",", ":")) != json.dumps(current_summary, sort_keys=True, separators=(",", ":")) or json.dumps(terra_input, sort_keys=True, separators=(",", ":")) != json.dumps(current_terra, sort_keys=True, separators=(",", ":")):
+            raise ObservationBoundaryError("daily export does not match current ledger")
+        envelope = {"summary": current_summary, "terra_input": current_terra}
+        expected_receipt = hashlib.sha256(_canonical_json(envelope)).hexdigest()
+        if not isinstance(export_receipt_sha256, str) or export_receipt_sha256 != expected_receipt:
+            raise ObservationBoundaryError("daily export receipt mismatch")
+        return day, expected_receipt
+
+    def rotate_after_daily_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
+        """Replace only the in-memory ledger after a verified UTC export."""
+        day, receipt = self._verify_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
         if summary.get("day") != day.isoformat() or terra_input.get("summary", {}).get("day") != day.isoformat():
             raise ObservationBoundaryError("daily export UTC day mismatch")
         if contains_secret(summary) or contains_secret(terra_input):
             raise ObservationBoundaryError("daily export redaction gate failed")
-        if len(_canonical_json(summary)) > self.loop.ledger.max_bytes or len(_canonical_json(terra_input)) > self.loop.ledger.max_bytes:
-            raise ObservationBoundaryError("daily export exceeds ledger budget")
         cursor_keys_before = tuple(sorted(self.loop._cursors))
         self.loop.ledger = ObservationLedger(max_runs=self.loop.ledger.max_runs, max_signals=self.loop.ledger.max_signals, max_bytes=self.loop.ledger.max_bytes)
-        return self._metadata(stage="daily_rotation", status="rotated", exported_utc_day=day.isoformat(), cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=True)
+        return self._metadata(stage="daily_rotation", status="rotated", exported_utc_day=day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=True)
+
+    def finalize_backlog_export(self, *, utc_day: date | str, summary: Mapping[str, Any], terra_input: Mapping[str, Any], export_verified: bool = False, export_receipt_sha256: str | None = None) -> dict[str, Any]:
+        if not self._backlog_tail_reached:
+            raise ObservationBoundaryError("backlog has not reached a verified tail")
+        day, receipt = self._verify_export(utc_day=utc_day, summary=summary, terra_input=terra_input, export_verified=export_verified, export_receipt_sha256=export_receipt_sha256)
+        cursor_keys_before = tuple(sorted(self.loop._cursors))
+        self.loop.ledger = ObservationLedger(max_runs=self.loop.ledger.max_runs, max_signals=self.loop.ledger.max_signals, max_bytes=self.loop.ledger.max_bytes)
+        next_day = day + timedelta(days=1)
+        return self._metadata(stage="backlog_finalize", status="finalized", exported_utc_day=day.isoformat(), next_observation_utc_day=next_day.isoformat(), export_receipt_sha256=receipt, cursor_keys_preserved=cursor_keys_before == tuple(sorted(self.loop._cursors)), observation_day_counted=False, day1_cleanup=True)
 
     def record_missed_slot(self, scheduled_at: datetime) -> dict[str, Any]:
         if not isinstance(scheduled_at, datetime) or scheduled_at.tzinfo is None:
             raise ValueError("scheduled slot must be timezone-aware")
-        return self._metadata(stage="scheduled_slot", status="missed", scheduled_at_utc=scheduled_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"), catch_up=False, observation_day_counted=True)
+        scheduled_utc = scheduled_at.astimezone(timezone.utc)
+        if scheduled_utc > utc_now():
+            raise ObservationBoundaryError("future scheduled slot is not missable")
+        slot_key = scheduled_utc.isoformat().replace("+00:00", "Z")
+        if slot_key in self._slot_keys:
+            raise ObservationBoundaryError("duplicate scheduled slot")
+        self._slot_keys.add(slot_key)
+        return self._metadata(stage="scheduled_slot", status="missed", scheduled_at_utc=slot_key, catch_up=False, slot_satisfied=False, day_success_eligible=False, observation_day_counted=False)
 
     def metadata(self) -> tuple[dict[str, Any], ...]:
-        return tuple(dict(item) for item in self._events)
+        return tuple(json.loads(json.dumps(item, sort_keys=True)) for item in self._events)
 
 
 class _UnavailableCronCollector:

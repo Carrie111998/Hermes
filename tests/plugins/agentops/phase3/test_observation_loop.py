@@ -180,14 +180,45 @@ def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path):
     day = datetime.now(timezone.utc).date()
     summary = loop.ledger.daily_summary(day)
     terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     cursor_keys = tuple(sorted(loop._cursors))
-    rotated = runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra)
+    rotated = runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
     assert rotated["status"] == "rotated" and rotated["cursor_keys_preserved"] is True
     assert tuple(sorted(loop._cursors)) == cursor_keys and len(loop.ledger.batches()) == 0
     missed = runbook.record_missed_slot(datetime.now(timezone.utc) - timedelta(hours=8))
     assert missed["catch_up"] is False and missed["status"] == "missed"
     with pytest.raises(ObservationBoundaryError):
         runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra, export_verified=False)
+
+
+def test_runbook_export_receipt_is_bound_to_current_ledger(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    runbook = ObservationRunbook(loop)
+    loop.collect_once()
+    day = datetime.now(timezone.utc).date()
+    old_summary = loop.ledger.daily_summary(day)
+    old_terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    old_receipt = hashlib.sha256(json.dumps({"summary": old_summary, "terra_input": old_terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    loop.collect_once()
+    before = loop.ledger.batches()
+    with pytest.raises(ObservationBoundaryError, match="current ledger"):
+        runbook.rotate_after_daily_export(utc_day=day, summary=old_summary, terra_input=old_terra, export_verified=True, export_receipt_sha256=old_receipt)
+    assert loop.ledger.batches() == before
+
+
+def test_runbook_rate_limit_is_safe_stop_not_catch_up(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    log.write_text("{\"state\":\"failed\",\"message\":\"gateway down\"}\n" * 500, encoding="utf-8")
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    report = ObservationRunbook(loop).drain_backlog(max_passes=2)
+    assert report["status"] == "safe_stop"
+    assert report["passes"] == 1
+    assert report["stop_reason"] == "next_eligible_not_reached"
+    assert report["next_eligible_seconds"] >= 60
 
 
 def test_runbook_backlog_stops_on_ledger_budget(tmp_path):
@@ -199,3 +230,69 @@ def test_runbook_backlog_stops_on_ledger_budget(tmp_path):
             collector.min_interval_seconds = 0
     report = ObservationRunbook(loop).drain_backlog(max_passes=1)
     assert report["status"] == "safe_stop" and report["stop_reason"] == "ledger_budget_exceeded"
+
+
+def test_runbook_rejects_inode_changed_tail(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    logs = next(item for item in loop.collectors if item.name == "logs")
+    batch = logs.collect(loop.target)
+    object.__setattr__(batch, "next_cursor", type(batch.next_cursor)(inode=batch.next_cursor.inode + 1, offset=batch.next_cursor.offset, source_id=batch.next_cursor.source_id))
+    loop.collect_once = lambda: (batch,)
+    report = ObservationRunbook(loop).drain_backlog(max_passes=1)
+    assert report["status"] == "safe_stop" and report["stop_reason"] == "log_source_changed"
+
+
+def test_runbook_rejects_path_rotation_before_declaring_tail(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    original_collect = loop.collect_once
+
+    def collect_then_rotate():
+        batches = original_collect()
+        replacement = log.with_name("gateway.log.replacement")
+        replacement.write_text(log.read_text(encoding="utf-8"), encoding="utf-8")
+        os.replace(replacement, log)
+        return batches
+
+    loop.collect_once = collect_then_rotate
+    report = ObservationRunbook(loop).drain_backlog(max_passes=1)
+    assert report["status"] == "safe_stop" and report["stop_reason"] == "log_source_changed"
+
+
+def test_runbook_finalize_backlog_requires_verified_export_and_marks_day0(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    runbook = ObservationRunbook(loop)
+    report = runbook.drain_backlog(max_passes=1)
+    assert report["tail_reached"] is True
+    day = datetime.now(timezone.utc).date()
+    summary = loop.ledger.daily_summary(day)
+    terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    receipt = hashlib.sha256(json.dumps({"summary": summary, "terra_input": terra}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    finalized = runbook.finalize_backlog_export(utc_day=day, summary=summary, terra_input=terra, export_verified=True, export_receipt_sha256=receipt)
+    assert finalized["day1_cleanup"] is True and finalized["observation_day_counted"] is False
+    assert finalized["next_observation_utc_day"] != day.isoformat() and len(loop.ledger.batches()) == 0
+
+
+def test_runbook_rejects_future_duplicate_slots_and_metadata_mutation(tmp_path):
+    registry, _, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry)
+    runbook = ObservationRunbook(loop, max_events=2)
+    with pytest.raises(ObservationBoundaryError):
+        runbook.record_missed_slot(datetime.now(timezone.utc) + timedelta(hours=1))
+    scheduled = datetime.now(timezone.utc) - timedelta(hours=1)
+    first = runbook.record_missed_slot(scheduled)
+    with pytest.raises(ObservationBoundaryError):
+        runbook.record_missed_slot(scheduled)
+    runbook.record_missed_slot(scheduled - timedelta(hours=1))
+    with pytest.raises(ObservationBoundaryError, match="event budget"):
+        runbook.record_missed_slot(scheduled - timedelta(hours=2))
+    first["status"] = "mutated"
+    assert runbook.metadata()[0]["status"] == "missed"

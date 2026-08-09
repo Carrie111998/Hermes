@@ -4,9 +4,9 @@
 
 **Sol-reviewed AgentOps implementation head:** `fbdc57bdd`. Subsequent PR
 commits are documentation-only descendants; the AgentOps implementation tree
-remains identical. Local `tests/plugins/agentops` passed 144 tests and local
-`tests/plugins` passed 683 tests; compileall, static read-only scan, and diff
-check also passed.
+remains identical. The latest local `tests/plugins/agentops` passed 153 tests
+and local `tests/plugins` passed 692 tests; compileall, static read-only scan,
+and diff check also passed.
 
 ## Scope and trust boundary
 
@@ -40,21 +40,33 @@ is not an LLM call; it is a redacted, size/item-bounded analysis handoff.
 ## Two-stage operating runbook
 
 1. **Day 1 backlog drain (not an observation day):** invoke
-   `ObservationRunbook.drain_backlog(max_passes=...)`. Each pass uses the
-   existing loop cursor and review-pack limits, appends only bounded batches,
-   and stops when the log cursor reaches the current file tail or when the
-   ledger/asset/collector safety boundary is reached. A backlog report carries
-   `observation_day_counted=false`, `passes`, `tail_reached`, `stop_reason`,
-   and ledger counters. Missed slots are not replayed as bursts.
+   `ObservationRunbook.drain_backlog(max_passes=...)`. Each invocation performs
+   at most one eligible collection pass: the next pass is safe-stopped until
+   every collector's review-pack rate interval (at least 60 seconds in the
+   default pack) is eligible. It uses the existing loop cursor and bounded
+   review-pack limits, and stops when the log cursor reaches the current file
+   tail or when a no-follow dev/inode identity, ledger, asset, or collector
+   boundary fails. A backlog report carries
+   `observation_day_counted=false`, `passes`, `tail_reached`,
+   `next_eligible_seconds`, `stop_reason`, and ledger counters. Missed slots are
+   not replayed as bursts.
 2. **Daily observation rotation:** after a UTC day's `daily_summary` and full
    bounded `terra_input` have been exported and independently validated,
-   invoke `rotate_after_daily_export`. It replaces only the in-memory ledger;
-   the same loop instance and cursor map are preserved. If export validation,
-   UTC day matching, redaction, or budget checks fail, rotation is rejected and
-   the old ledger remains authoritative.
+   invoke `rotate_after_daily_export`. The operation recomputes the current
+   UTC summary/Terra envelope, checks the redaction and 8 MiB/item budgets, and
+   requires a SHA-256 receipt over that exact canonical envelope. It replaces
+   only the in-memory ledger; the same loop instance and cursor map are
+   preserved. If the receipt, current-ledger binding, UTC day, redaction, or
+   budget checks fail, rotation is rejected and the old ledger remains
+   authoritative.
+   After backlog reaches a verified tail, `finalize_backlog_export` performs the
+   same receipt check, clears the Day0 ledger with `observation_day_counted=false`,
+   preserves cursors, and reports the next UTC observation day.
 3. **Missed slot:** invoke `record_missed_slot(scheduled_at)` for metadata only;
-   it records `catch_up=false` and performs no collection. Every event records
-   UTC timestamp/day, target, collectors, ledger counters, and stage status.
+   it records `catch_up=false`, `slot_satisfied=false`, and
+   `day_success_eligible=false` and performs no collection. Future and duplicate
+   slots are rejected. Every event records UTC timestamp/day, target, collectors,
+   ledger counters, and stage status in a detached bounded metadata record.
 
 ## P0/P1 validation and exit conditions
 
@@ -82,7 +94,7 @@ production writes.
 | Read-only Process/Launchd/Log/Cron collection and unchanged input hashes | `test_default_loop_collects_read_only_process_launchd_logs_and_cron` |
 | Fixed asset/fingerprint/label fail-closed binding on every pass | `test_default_loop_rejects_tampered_or_disabled_binding`, `test_launchd_asset_replacement_between_passes_fails_closed` |
 | No SQLite/lifecycle surface | `test_default_loop_does_not_expose_sqlite_or_lifecycle_surface` |
-| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_backlog_stops_on_ledger_budget` |
+| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_export_receipt_is_bound_to_current_ledger`, `test_runbook_backlog_stops_on_ledger_budget`, `test_runbook_rate_limit_is_safe_stop_not_catch_up`, `test_runbook_rejects_inode_changed_tail`, `test_runbook_rejects_path_rotation_before_declaring_tail`, `test_runbook_finalize_backlog_requires_verified_export_and_marks_day0`, `test_runbook_rejects_future_duplicate_slots_and_metadata_mutation` |
 
 ## Known limitations
 
