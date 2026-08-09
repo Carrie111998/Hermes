@@ -29,7 +29,7 @@ import {
 } from '@/store/gateway'
 import { $gatewaySwitching, wipeSessionListsForGatewaySwitch } from '@/store/gateway-switch'
 import { notify, notifyError } from '@/store/notifications'
-import { $activeGatewayProfile, normalizeProfileKey, touchActiveGatewayBackend } from '@/store/profile'
+import { $activeGatewayProfile, normalizeProfileKey, prewarmBackend, touchActiveGatewayBackend } from '@/store/profile'
 import {
   $activeSessionId,
   $connection,
@@ -508,12 +508,14 @@ export function useGatewayBoot({
 
     async function boot() {
       try {
+        const connectionScope = windowProfileOverride() ?? undefined
+
         // A profile-pinned helper window (the HUD) dials its target profile's
         // backend directly — ensureBackend spawns/reuses it from the pool.
         // Everything else keeps dialing the primary.
         await adoptPrimaryProfile()
 
-        const conn = await desktop.getConnection(windowProfileOverride() ?? undefined)
+        const conn = await desktop.getConnection(connectionScope)
 
         if (cancelled) {
           return
@@ -549,6 +551,19 @@ export function useGatewayBoot({
 
         if (cancelled) {
           return
+        }
+
+        if (conn.mode === 'local') {
+          void desktop
+            .getConnectionConfig?.(connectionScope)
+            .then(config => {
+              if (config.remoteUrl.trim()) {
+                prewarmBackend('remote')
+              }
+            })
+            .catch(() => undefined)
+        } else {
+          prewarmBackend('local')
         }
 
         // Profile adoption must land first: refreshSessions scopes its fetch by

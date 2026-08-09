@@ -5,6 +5,34 @@ import { $desktopBoot } from '@/store/boot'
 import { $currentCwd, $gatewayState } from '@/store/session'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
+
+const { prewarmBackend, setPrimaryBackendMode } = vi.hoisted(() => ({
+  prewarmBackend: vi.fn(),
+  setPrimaryBackendMode: vi.fn()
+}))
+
+vi.mock('@/store/profile', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/profile')>()
+
+  prewarmBackend.mockImplementation(actual.prewarmBackend)
+
+  return {
+    ...actual,
+    prewarmBackend
+  }
+})
+
+vi.mock('@/store/gateway', async importOriginal => {
+  const actual = await importOriginal<typeof import('@/store/gateway')>()
+
+  setPrimaryBackendMode.mockImplementation(actual.setPrimaryBackendMode)
+
+  return {
+    ...actual,
+    setPrimaryBackendMode
+  }
+})
+
 import { useGatewayBoot } from './use-gateway-boot'
 
 // End-to-end-ish repro of the "remote VPS → stuck on CONNECTING, no Settings"
@@ -80,13 +108,14 @@ function fakeDesktop() {
   const conn = {
     authMode: 'token' as const,
     baseUrl: 'https://vps.example.com',
+    mode: 'local' as const,
     profile: 'default',
     token: 't',
     wsUrl: 'wss://vps.example.com/api/ws?token=t'
   }
 
   return {
-    getConnection: vi.fn(async () => conn),
+    getConnection: vi.fn(async () => conn as never),
     getGatewayWsUrl: vi.fn(async () => conn.wsUrl),
     getBootProgress: vi.fn(async () => ({
       error: null,
@@ -109,6 +138,25 @@ function fakeDesktop() {
     onPowerResume: vi.fn(() => () => undefined),
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
+    getConnectionConfig: vi.fn(async () =>
+      ({
+        cloudOrg: '',
+        envOverride: false,
+        mode: 'remote' as const,
+        profile: null,
+        remoteAuthMode: 'token' as const,
+        remoteOauthConnected: false,
+        remoteTokenPreview: 't',
+        remoteTokenSet: true,
+        remoteUrl: 'https://vps.example.com',
+        sshHost: '',
+        sshKeyPath: '',
+        sshPort: null,
+        sshRemoteHermesPath: '',
+        sshRemoteProfile: '',
+        sshUser: ''
+      }) as never
+    ),
     profile: { get: vi.fn(async () => ({ profile: 'default' })) }
   }
 }
@@ -147,6 +195,8 @@ beforeEach(() => {
   FakeWebSocket.mode = 'open'
   FakeWebSocket.instances = []
   connectionApplied = null
+  prewarmBackend.mockClear()
+  setPrimaryBackendMode.mockClear()
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
@@ -273,6 +323,110 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect(calls.indexOf('profile')).toBeGreaterThanOrEqual(0)
     expect(calls.indexOf('connection')).toBeGreaterThan(calls.indexOf('profile'))
+  })
+
+  it('publishes the remote primary mode and prewarms the local root after boot connects', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () =>
+      ({
+        authMode: 'token' as const,
+        baseUrl: 'https://vps.example.com',
+        mode: 'remote' as const,
+        profile: 'default',
+        token: 't',
+        wsUrl: 'wss://vps.example.com/api/ws?token=t'
+      }) as never
+    )
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    expect(setPrimaryBackendMode).toHaveBeenCalledWith('remote')
+    expect(prewarmBackend).toHaveBeenCalledWith('local')
+  })
+
+  it('publishes the local primary mode and prewarms the remote root when a remote URL is configured', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () =>
+      ({
+        authMode: 'token' as const,
+        baseUrl: 'http://127.0.0.1:9191',
+        mode: 'local' as const,
+        profile: 'default',
+        token: 't',
+        wsUrl: 'ws://127.0.0.1:9191/api/ws?token=t'
+      }) as never
+    )
+    desktop.getConnectionConfig = vi.fn(async () =>
+      ({
+        cloudOrg: '',
+        envOverride: false,
+        mode: 'remote' as const,
+        profile: null,
+        remoteAuthMode: 'token' as const,
+        remoteOauthConnected: false,
+        remoteTokenPreview: 't',
+        remoteTokenSet: true,
+        remoteUrl: 'https://vps.example.com',
+        sshHost: '',
+        sshKeyPath: '',
+        sshPort: null,
+        sshRemoteHermesPath: '',
+        sshRemoteProfile: '',
+        sshUser: ''
+      }) as never
+    )
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    expect(setPrimaryBackendMode).toHaveBeenCalledWith('local')
+    expect(prewarmBackend).toHaveBeenCalledWith('remote')
+  })
+
+  it('does not prewarm the remote root when the local primary has no saved remote URL', async () => {
+    const desktop = fakeDesktop()
+    desktop.getConnection = vi.fn(async () =>
+      ({
+        authMode: 'token' as const,
+        baseUrl: 'http://127.0.0.1:9191',
+        mode: 'local' as const,
+        profile: 'default',
+        token: 't',
+        wsUrl: 'ws://127.0.0.1:9191/api/ws?token=t'
+      }) as never
+    )
+    desktop.getConnectionConfig = vi.fn(async () =>
+      ({
+        cloudOrg: '',
+        envOverride: false,
+        mode: 'local' as const,
+        profile: null,
+        remoteAuthMode: 'token' as const,
+        remoteOauthConnected: false,
+        remoteTokenPreview: null,
+        remoteTokenSet: false,
+        remoteUrl: '   ',
+        sshHost: '',
+        sshKeyPath: '',
+        sshPort: null,
+        sshRemoteHermesPath: '',
+        sshRemoteProfile: '',
+        sshUser: ''
+      }) as never
+    )
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    expect(setPrimaryBackendMode).toHaveBeenCalledWith('local')
+    expect(prewarmBackend).not.toHaveBeenCalledWith('remote')
   })
 
   it('a remote that drops post-boot keeps looping with NO boot.error (the dead-end CONNECTING combo)', async () => {
