@@ -429,6 +429,22 @@ def _render_state_db_stats(
     return lines
 
 
+def _state_db_issue_from_detail(detail: str) -> str:
+    """Build the actionable summary without dropping combined remediations."""
+    actions: list[str] = []
+    if "auto_prune" in detail:
+        actions.append("enable sessions.auto_prune in config.yaml")
+    elif "retention_days" in detail:
+        actions.append(
+            "set sessions.retention_days to a positive integer in config.yaml"
+        )
+    if "optimize-storage" in detail:
+        actions.append("run 'hermes sessions optimize-storage' to compact FTS storage")
+    if not actions:
+        actions.append("inspect the state.db warning above")
+    return "state.db is large — " + " and ".join(actions)
+
+
 def _section(title: str) -> None:
     """Print a doctor section banner: blank line + bold cyan ◆ title."""
     print()
@@ -1839,25 +1855,7 @@ def run_doctor(args):
             ):
                 if _kind == "warn":
                     check_warn(_text, _detail)
-                    if "auto_prune" in _detail:
-                        issues.append(
-                            "state.db is large — enable sessions.auto_prune "
-                            "in config.yaml"
-                            + (
-                                " and run 'hermes sessions optimize-storage'"
-                                if "optimize-storage" in _detail else ""
-                            )
-                        )
-                    elif "retention_days" in _detail:
-                        issues.append(
-                            "state.db is large — set sessions.retention_days "
-                            "to a positive integer in config.yaml"
-                        )
-                    elif "optimize-storage" in _detail:
-                        issues.append(
-                            "state.db is large — run 'hermes sessions "
-                            "optimize-storage' to compact FTS storage"
-                        )
+                    issues.append(_state_db_issue_from_detail(_detail))
                 else:
                     check_info(_text + (f" {_detail}" if _detail else ""))
         except Exception as _stats_exc:

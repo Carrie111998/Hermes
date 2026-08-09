@@ -248,6 +248,26 @@ def test_render_large_db_pending_rebuild_still_warns_with_auto_prune():
     assert "auto_prune" not in blob
 
 
+def test_state_db_issue_summary_keeps_invalid_retention_and_optimize_actions():
+    from hermes_cli.doctor import (
+        STATE_DB_SIZE_WARN_BYTES,
+        _render_state_db_stats,
+        _state_db_issue_from_detail,
+    )
+
+    big = STATE_DB_SIZE_WARN_BYTES + 1
+    lines = _render_state_db_stats(
+        _base_stats(logical_size_bytes=big, fts_rebuild_pending=True),
+        holders=None,
+        auto_prune_enabled=True,
+        retention_days=0,
+    )
+    detail = next(detail for kind, _text, detail in lines if kind == "warn")
+    issue = _state_db_issue_from_detail(detail)
+    assert "retention_days" in issue
+    assert "optimize-storage" in issue
+
+
 def test_render_large_db_legacy_trigram_suggests_optimize():
     from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES, _render_state_db_stats
 
