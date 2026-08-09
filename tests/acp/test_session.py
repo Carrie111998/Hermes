@@ -288,8 +288,7 @@ class TestPersistence:
             "codex_reasoning_items": [
                 {"type": "reasoning", "id": "rs_123", "encrypted_content": "enc_blob"},
             ],
-        }
-
+        }]
 
     def test_acp_agents_route_human_output_to_stderr(self, tmp_path, monkeypatch):
         """ACP agents must keep stdout clean for JSON-RPC stdio transport."""

@@ -646,20 +646,23 @@ def rollback(backup_id: Optional[str] = None) -> Tuple[bool, str, Optional[Path]
     # Step 4: extract the snapshot into skills/
     try:
         with tarfile.open(archive, "r:gz") as tf:
-            # Python 3.12+ supports filter='data' for safer extraction.
-            # Fall back to the unfiltered call for older interpreters but
-            # still reject absolute paths and .. components defensively.
-            for member in tf.getmembers():
-                name = member.name
-                if name.startswith("/") or ".." in Path(name).parts:
-                    raise tarfile.TarError(
-                        f"refusing to extract unsafe path: {name!r}"
-                    )
-            try:
-                tf.extractall(str(skills), filter="data")  # type: ignore[call-arg]
-            except TypeError:
-                # Python < 3.12 — no filter kwarg
-                tf.extractall(str(skills))
+            # Uses the stdlib 'data' filter where it exists (3.11.4+) and hand-
+            # extracts otherwise, rather than falling back to an unfiltered
+            # extractall. This matters more here than in a temp dir: the
+            # destination is the skills tree, i.e. executable content. See
+            # safe_extract_tar for why a pre-flight member check is not a
+            # substitute for the filter.
+            from agent.file_safety import safe_extract_tar
+
+            # The excluded names are preserved across a rollback and are
+            # never part of a snapshot, so a member under either is
+            # illegitimate. Passing them makes the destination effectively
+            # empty for extraction purposes — everything else was staged
+            # aside above — which is what removes the whole class of
+            # destination-state hazards rather than guarding each one.
+            safe_extract_tar(
+                tf, skills, refuse_top_level=frozenset(_EXCLUDE_TOP_LEVEL)
+            )
     except (OSError, tarfile.TarError) as e:
         # Best-effort recover. A partial extract can leave entries the
         # original tree never had, so drop those first, otherwise the

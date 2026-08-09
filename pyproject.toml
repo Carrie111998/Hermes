@@ -12,7 +12,16 @@ readme = "README.md"
 # wheel yet and fall back to a maturin source build that fails. Capping at
 # <3.14 makes uv refuse 3.14 with a clear error instead of attempting that
 # build. Raise the ceiling once our Rust transitives ship cp314 wheels.
-requires-python = ">=3.11,<3.14"
+# Floor is 3.11.4, not 3.11.0, because that is where tarfile's `data`
+# extraction filter landed. Below it, `agent/file_safety.safe_extract_tar`
+# extracts members by hand, and that path needs `dir_fd` support to refuse
+# traversing a symlink already present in the destination — which Windows
+# does not have. The combination therefore refuses to extract at all, so a
+# curator rollback there fails before its first member: a mitigation that
+# destroys the feature it protects. Excluding the combination is the honest
+# fix. No real install is affected — CI's `python-version: '3.11'` and the
+# Windows installer both resolve to the newest 3.11.x, years past .4.
+requires-python = ">=3.11.4,<3.14"
 authors = [{ name = "Nous Research" }]
 license = "MIT"
 license-files = ["LICENSE"]

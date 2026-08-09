@@ -4436,9 +4436,35 @@ def _prompt_api_key(
 
 
 def _infer_stepfun_region(base_url: str) -> str:
-    """Infer the current StepFun region from the configured endpoint."""
+    """Infer the current StepFun region from the configured endpoint.
+
+    Matches the host exactly rather than by substring: ``api.stepfun.com`` also
+    appears inside hosts like ``api.stepfun.com.example.net``, which would infer
+    ``china`` for an unrelated endpoint.
+    """
+    from urllib.parse import urlparse
+
     normalized = (base_url or "").strip().lower()
-    if "api.stepfun.com" in normalized:
+    # A bare host needs "//" prepended so urlparse reads it as an authority
+    # rather than a path. Testing for "//" *anywhere* got that wrong: it also
+    # matched a double slash in the path or query, so
+    # "api.stepfun.com//step_plan/v1" was left unprefixed, parsed entirely as a
+    # path, and yielded an empty hostname — inferring "international" for a
+    # China endpoint and offering to rewrite it to the .ai host. Only a scheme
+    # or a leading "//" means an authority is already present.
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", normalized) and not normalized.startswith(
+        "//"
+    ):
+        normalized = f"//{normalized}"
+    try:
+        host = (urlparse(normalized).hostname or "").rstrip(".")
+    except ValueError:
+        # Malformed netloc (e.g. an unmatched IPv6 bracket) — this value comes
+        # straight from STEPFUN_BASE_URL / model.base_url with no prior
+        # validation, and the caller shows a region picker afterwards. Inferring
+        # a default must never abort setup, which the substring check never did.
+        return "international"
+    if host == "api.stepfun.com":
         return "china"
     return "international"
 
