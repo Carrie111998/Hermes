@@ -7,6 +7,7 @@ import hashlib
 import os
 import plistlib
 import json
+import re
 import stat
 from pathlib import Path
 from typing import Iterable
@@ -53,11 +54,26 @@ class FleetRegistry:
         self._snapshots[snapshot.target_id] = snapshot
 
     def record_process_result(self, batch) -> None:
-        from plugins.agentops.control.observer_models import CollectionBatch
+        from plugins.agentops.control.observer_models import CollectionBatch, TargetKind, utc_now
+        import os
         if not isinstance(batch, CollectionBatch) or batch.collector != "processes" or not batch.source_id:
             raise TargetRegistrationError("process result must be a processes CollectionBatch")
         target_id, healthy = batch.target_id, batch.health.healthy
-        self.get_target(target_id)
+        target = self.get_target(target_id)
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", batch.source_id) or any(
+            signal.collector != "processes" or signal.target_id != target_id or signal.signal_type != "process.snapshot"
+            or signal.observed_at < batch.collected_at - __import__("datetime").timedelta(seconds=5)
+            or signal.observed_at > batch.collected_at + __import__("datetime").timedelta(seconds=5)
+            or not {"command_fingerprint", "profile_marker", "owner_uid"}.issubset(signal.payload)
+            or signal.payload.get("command_fingerprint") != target.spec.labels.get("command_fingerprint")
+            or signal.payload.get("profile_marker") != target.spec.labels.get("process_marker")
+            or int(signal.payload.get("owner_uid", -1)) != os.getuid()
+            for signal in batch.signals
+        ):
+            raise TargetRegistrationError("process result evidence binding rejected")
+        previous = self._process_health.get(target_id)
+        if previous is not None and batch.collected_at < previous[0]:
+            raise TargetRegistrationError("stale process result")
         self._process_health[target_id] = (batch.collected_at, batch.source_id, bool(healthy and batch.signals))
 
     def get_target(self, target_id: str) -> Target:
