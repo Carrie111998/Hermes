@@ -18042,6 +18042,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 # Main Entry Point
 # ============================================================================
 
+def _kanban_workspace_git_head(path: str) -> "str | None":
+    """Best-effort ``git rev-parse HEAD`` for a kanban task's workspace.
+
+    Used as a progress signal for the goal loop: unlike a heartbeat (which
+    fires on ordinary API/tool bookkeeping regardless of whether the worker
+    is actually getting anywhere), a moved HEAD means a commit landed —
+    real, hard-to-fake evidence of forward progress. Fail-closed: returns
+    None (no signal) for a missing/non-git workspace, a git error, or a
+    hung git process, never raises.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=5, stdin=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
 def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     """Drive a kanban goal_mode worker through the Ralph-style goal loop.
 
@@ -18084,9 +18109,12 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     max_turns = task.goal_max_turns or _DEF_TURNS
 
     # Snapshot progress markers before the loop starts so a stuck worker
-    # (no heartbeat, no operator comments since spawn) still blocks at the
-    # turn budget instead of extending forever.
-    loop_started_at = int(time.time())
+    # (no new operator comments, no commits landed since spawn) still
+    # blocks at the turn budget instead of extending forever. Heartbeats
+    # are deliberately NOT used here: they fire on ordinary API/tool
+    # bookkeeping (rate-limited, but on every kind of activity) regardless
+    # of whether the worker is making real headway, so they can't tell a
+    # genuinely stuck worker from one thrashing uselessly (#81990 review).
     conn = _kb.connect()
     try:
         _existing_comments = _kb.list_comments(conn, task_id)
@@ -18097,20 +18125,25 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
             pass
     initial_comment_id = _existing_comments[-1].id if _existing_comments else 0
 
+    initial_head = None
+    if task.workspace_kind in ("worktree", "dir") and task.workspace_path:
+        initial_head = _kanban_workspace_git_head(task.workspace_path)
+
     def _progress_check() -> bool:
         c = _kb.connect()
         try:
-            t = _kb.get_task(c, task_id)
-            if t is None:
-                return False
-            if t.last_heartbeat_at and t.last_heartbeat_at >= loop_started_at:
+            if _kb.list_comments_after(c, task_id, after_id=initial_comment_id):
                 return True
-            return bool(_kb.list_comments_after(c, task_id, after_id=initial_comment_id))
         finally:
             try:
                 c.close()
             except Exception:
                 pass
+        if initial_head is not None:
+            current_head = _kanban_workspace_git_head(task.workspace_path)
+            if current_head is not None and current_head != initial_head:
+                return True
+        return False
 
     def _run_turn(prompt: str) -> str:
         result = cli.agent.run_conversation(

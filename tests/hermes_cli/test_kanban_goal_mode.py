@@ -12,6 +12,7 @@ Covers three layers:
 
 from __future__ import annotations
 
+import subprocess
 import sqlite3
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import goals
+import cli
 
 
 @pytest.fixture
@@ -147,6 +149,56 @@ def test_loop_blocks_at_budget_without_progress_signal(monkeypatch):
     assert res["outcome"] == "blocked_budget"
     assert res["turns_used"] == 1
     assert len(blocked) == 1
+
+
+# ---------------------------------------------------------------------------
+# cli.py's real progress_check_fn wiring (heartbeat is NOT a progress
+# signal — see #81990 review; git HEAD movement is what actually gets
+# checked for workspace-backed tasks).
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo(path: Path) -> None:
+    for args in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "test@example.com"],
+        ["git", "config", "user.name", "Test"],
+    ):
+        subprocess.run(args, cwd=path, check=True, capture_output=True)
+
+
+def _git_commit(path: Path, filename: str, content: str) -> None:
+    (path / filename).write_text(content)
+    subprocess.run(["git", "add", filename], cwd=path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", f"add {filename}"], cwd=path, check=True, capture_output=True,
+    )
+
+
+def test_workspace_git_head_detects_new_commit(tmp_path):
+    """The real signal cli.py wires in: HEAD moving means a commit landed —
+    unlike a heartbeat, this can't be true for a worker that is merely
+    alive and thrashing without producing anything."""
+    _init_git_repo(tmp_path)
+    _git_commit(tmp_path, "a.txt", "1")
+    initial_head = cli._kanban_workspace_git_head(str(tmp_path))
+    assert initial_head
+
+    # No new commit yet — HEAD hasn't moved, so there is no progress signal.
+    assert cli._kanban_workspace_git_head(str(tmp_path)) == initial_head
+
+    _git_commit(tmp_path, "b.txt", "2")
+    new_head = cli._kanban_workspace_git_head(str(tmp_path))
+    assert new_head and new_head != initial_head
+
+
+def test_workspace_git_head_none_for_non_git_dir(tmp_path):
+    (tmp_path / "not_a_repo").mkdir()
+    assert cli._kanban_workspace_git_head(str(tmp_path / "not_a_repo")) is None
+
+
+def test_workspace_git_head_none_for_missing_dir(tmp_path):
+    assert cli._kanban_workspace_git_head(str(tmp_path / "does_not_exist")) is None
 
 
 def test_loop_extends_budget_when_progress_detected(monkeypatch):
