@@ -147,7 +147,7 @@ You can configure a different model for subagents via `config.yaml` — useful f
 ```yaml
 # In ~/.hermes/config.yaml
 delegation:
-  model: "google/gemini-flash-2.0"    # Cheaper model for subagents
+  model: "google/gemini-3-flash-preview"    # Cheaper model for subagents
   provider: "openrouter"              # Optional: route subagents to a different provider
 ```
 

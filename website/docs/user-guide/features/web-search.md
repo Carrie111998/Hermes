@@ -363,6 +363,10 @@ If no backend is explicitly configured, Hermes picks the first available one bas
 
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
 
+:::tip X posts and profiles
+For current discussion, reactions, or claims **on X (Twitter)** — posts, profiles, and threads — use the separate [`x_search` tool](x-search.md) instead. It searches the X index directly via Grok and returns synthesized answers with citations. `web_search` targets general web pages; `x_search` targets X specifically.
+:::
+
 ---
 
 ## Verify your setup

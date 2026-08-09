@@ -86,6 +86,8 @@ SECTIONS: list[tuple[str, list[tuple[str, str, str | None]]]] = [
         ("user-guide/features/vision", "Vision", None),
         ("user-guide/features/image-generation", "Image Generation", None),
         ("user-guide/features/tts", "Text-to-Speech", None),
+        ("user-guide/features/web-search", "Web Search & Extract", None),
+        ("user-guide/features/x-search", "X (Twitter) Search", None),
     ]),
     ("Messaging Platforms", [
         ("user-guide/messaging/index", "Overview", None),
@@ -195,7 +197,14 @@ def resolve_desc(slug: str, provided: str | None) -> str:
 
 
 def emit_llms_index() -> str:
-    """Build the short llms.txt index."""
+    """Build the short llms.txt index.
+
+    Emits the curated sections first (front-loaded product story), then a
+    final "More pages" section with every remaining `.md` file under
+    website/docs/ so no routed page ever drops out of the LLM index again.
+    Auto-generated per-skill pages are skipped — the two catalog reference
+    pages cover them.
+    """
     lines: list[str] = []
     lines.append("# Hermes Agent")
     lines.append("")
@@ -223,6 +232,45 @@ def emit_llms_index() -> str:
         lines.append("")
         for slug, title, desc_override in items:
             desc = resolve_desc(slug, desc_override)
+            url = f"{SITE_BASE}/{slug}"
+            if desc:
+                lines.append(f"- [{title}]({url}): {desc}")
+            else:
+                lines.append(f"- [{title}]({url})")
+        lines.append("")
+
+    # Everything else — sorted by path so the output is stable across runs.
+    curated: set[Path] = set()
+    for _, items in SECTIONS:
+        for slug, _t, _d in items:
+            p = DOCS / f"{slug}.md"
+            if not p.exists():
+                p = DOCS / slug / "index.md"
+            if p.exists():
+                curated.add(p.resolve())
+    more: list[Path] = []
+    for path in sorted(DOCS.rglob("*.md")):
+        if path.resolve() in curated:
+            continue
+        rel = path.relative_to(DOCS)
+        parts = rel.parts
+        if len(parts) >= 3 and parts[0] == "user-guide" and parts[1] == "skills" \
+                and parts[2] in {"bundled", "optional"}:
+            continue
+        more.append(path)
+    if more:
+        lines.append("## More pages")
+        lines.append("")
+        for path in more:
+            rel = path.relative_to(DOCS)
+            slug = str(rel).removesuffix(".md")
+            if path.name == "index.md":
+                slug = str(rel.parent)
+            title = path.stem
+            meta, _ = read_frontmatter(path)
+            if "title" in meta:
+                title = meta["title"]
+            desc = meta.get("description", "")
             url = f"{SITE_BASE}/{slug}"
             if desc:
                 lines.append(f"- [{title}]({url}): {desc}")

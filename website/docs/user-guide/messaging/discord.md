@@ -282,7 +282,7 @@ You can run `hermes gateway` in the background or as a systemd service for persi
 
 ## Configuration Reference
 
-Discord behavior is controlled through two files: **`~/.hermes/.env`** for credentials and env-level toggles, and **`~/.hermes/config.yaml`** for structured settings. Environment variables always take precedence over config.yaml values when both are set.
+Discord behavior is controlled through two files: **`~/.hermes/.env`** for credentials and env-level toggles, and **`~/.hermes/config.yaml`** for structured settings. Secrets (bot tokens) go in `.env`; structured settings go in `config.yaml`. See [Configuration Precedence](/user-guide/configuration#configuration-precedence) for how the two files interact.
 
 ### Environment Variables (`.env`)
 
