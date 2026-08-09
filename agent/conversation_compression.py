@@ -2217,6 +2217,9 @@ def compress_context(
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
     _trigger_source = "manual" if force else "auto"
+    # Track whether aux summarization has dispatched for this compression trigger
+    # within the same turn. Prevents re-billing on model fallback chain.
+    _aux_dispatched_this_trigger = getattr(agent, "_aux_compression_dispatched", False)
     try:
         agent._compression_attempt_id = _attempt_id
         setattr(agent.context_compressor, "_compression_telemetry_seed", {
@@ -2749,19 +2752,35 @@ def compress_context(
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    logger.info(
-                        "compression: session=%s grew before lease "
-                        "(%d → %d msgs); adopting durable snapshot",
-                        _lock_sid,
-                        len(messages),
-                        len(durable_parent),
-                    )
-                    messages = durable_parent
-                    _pre_msg_count = len(messages)
-                    # Token estimate was for the stale snapshot; clear it so
-                    # the compressor re-derives from the adopted transcript
-                    # instead of under-counting the newly visible rows.
-                    approx_tokens = 0
+                    # Cap the growth factor to avoid adopting a wildly inflated transcript
+                    # during a single compression attempt (e.g., due to fallback-chain reloads).
+                    # If growth exceeds 1.5x, keep the original snapshot and log a warning.
+                    MAX_GROWTH_FACTOR = 1.5
+                    if len(durable_parent) <= len(messages) * MAX_GROWTH_FACTOR:
+                        logger.info(
+                            "compression: session=%s grew before lease "
+                            "(%d → %d msgs); adopting durable snapshot",
+                            _lock_sid,
+                            len(messages),
+                            len(durable_parent),
+                        )
+                        messages = durable_parent
+                        _pre_msg_count = len(messages)
+                        # Token estimate was for the stale snapshot; clear it so
+                        # the compressor re-derives from the adopted transcript
+                        # instead of under-counting the newly visible rows.
+                        approx_tokens = 0
+                    else:
+                        logger.warning(
+                            "compression: session=%s grew before lease "
+                            "(%d → %d msgs, growth factor %.2f > %.2f); "
+                            "rejecting adoption to avoid transcript inflation",
+                            _lock_sid,
+                            len(messages),
+                            len(durable_parent),
+                            len(durable_parent) / len(messages),
+                            MAX_GROWTH_FACTOR,
+                        )
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -2859,18 +2878,36 @@ def compress_context(
                 )
                 compressed = messages
             else:
-                with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                    cancel_event=_hard_cancel_event
-                ):
-                    compressed = compress_fn(messages, **compress_kwargs)
-                    # Freeze a hard stop that arrived after the final provider
-                    # attempt unwound but before this transaction can rotate
-                    # session state.
-                    if (
-                        _hard_cancel_event is not None
-                        and _hard_cancel_event.is_set()
+                # If aux summarization already dispatched for this trigger, skip re-dispatch.
+                # Prevents re-billing on model fallback chain re-entries (see #82576).
+                if _aux_dispatched_this_trigger:
+                    logger.info(
+                        "Compression: aux summarization already dispatched for this trigger "
+                        "(session=%s); skipping fallback re-dispatch.",
+                        agent.session_id or "none",
+                    )
+                    compressed = messages
+                else:
+                    with aux_progress_hook(_progress_hook), aux_interrupt_protection(
+                        cancel_event=_hard_cancel_event
                     ):
-                        raise AuxiliaryExplicitCancellation()
+                        # Mark that aux summarization has been dispatched for this trigger.
+                        agent._aux_compression_dispatched = True
+                        try:
+                            compressed = compress_fn(messages, **compress_kwargs)
+                        finally:
+                            # Reset the hard-interrupt flag so fallback chain re-entries
+                            # don't inherit the same interrupt and re-bill.
+                            if _hard_cancel_event is not None:
+                                _hard_cancel_event.clear()
+                        # Freeze a hard stop that arrived after the final provider
+                        # attempt unwound but before this transaction can rotate
+                        # session state.
+                        if (
+                            _hard_cancel_event is not None
+                            and _hard_cancel_event.is_set()
+                        ):
+                            raise AuxiliaryExplicitCancellation()
         finally:
             if commit_fence is not None:
                 try:
@@ -3590,6 +3627,14 @@ def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
+        # Clear the aux dispatch flag so a future compression trigger in a later
+        # turn can proceed normally. This must be after commit_fence.finish_commit()
+        # to avoid a race where the fence is still active but the flag is cleared.
+        try:
+            if hasattr(agent, "_aux_compression_dispatched"):
+                delattr(agent, "_aux_compression_dispatched")
+        except Exception:
+            pass
 
 
 def _compress_context_via_codex_app_server(
