@@ -37,6 +37,25 @@ At the end of each UTC day, the operator exports `daily_summary(day)` and the
 bounded `terra_input(day)` for offline analysis. Terra input has no actions and
 is not an LLM call; it is a redacted, size/item-bounded analysis handoff.
 
+## Two-stage operating runbook
+
+1. **Day 1 backlog drain (not an observation day):** invoke
+   `ObservationRunbook.drain_backlog(max_passes=...)`. Each pass uses the
+   existing loop cursor and review-pack limits, appends only bounded batches,
+   and stops when the log cursor reaches the current file tail or when the
+   ledger/asset/collector safety boundary is reached. A backlog report carries
+   `observation_day_counted=false`, `passes`, `tail_reached`, `stop_reason`,
+   and ledger counters. Missed slots are not replayed as bursts.
+2. **Daily observation rotation:** after a UTC day's `daily_summary` and full
+   bounded `terra_input` have been exported and independently validated,
+   invoke `rotate_after_daily_export`. It replaces only the in-memory ledger;
+   the same loop instance and cursor map are preserved. If export validation,
+   UTC day matching, redaction, or budget checks fail, rotation is rejected and
+   the old ledger remains authoritative.
+3. **Missed slot:** invoke `record_missed_slot(scheduled_at)` for metadata only;
+   it records `catch_up=false` and performs no collection. Every event records
+   UTC timestamp/day, target, collectors, ledger counters, and stage status.
+
 ## P0/P1 validation and exit conditions
 
 - P0 injection: secret-bearing or malformed signal evidence is rejected before
@@ -63,6 +82,7 @@ production writes.
 | Read-only Process/Launchd/Log/Cron collection and unchanged input hashes | `test_default_loop_collects_read_only_process_launchd_logs_and_cron` |
 | Fixed asset/fingerprint/label fail-closed binding on every pass | `test_default_loop_rejects_tampered_or_disabled_binding`, `test_launchd_asset_replacement_between_passes_fails_closed` |
 | No SQLite/lifecycle surface | `test_default_loop_does_not_expose_sqlite_or_lifecycle_surface` |
+| Two-stage backlog/rotation/missed-slot protocol | `test_runbook_backlog_drain_reaches_tail_without_counting_observation_day`, `test_runbook_daily_rotation_requires_export_and_preserves_cursor`, `test_runbook_backlog_stops_on_ledger_budget` |
 
 ## Known limitations
 

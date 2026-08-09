@@ -11,7 +11,7 @@ import pytest
 
 from plugins.agentops.control.collectors.base import failed_batch
 from plugins.agentops.control.observer_models import Criticality, Signal, Target, TargetKind, TargetSpec, utc_now
-from plugins.agentops.control.observation import DefaultObservationLoop, ObservationBoundaryError, ObservationLedger
+from plugins.agentops.control.observation import DefaultObservationLoop, ObservationBoundaryError, ObservationLedger, ObservationRunbook
 from plugins.agentops.control.registry import FleetRegistry
 from plugins.agentops.control.redaction import contains_secret
 
@@ -154,3 +154,48 @@ def test_default_loop_does_not_expose_sqlite_or_lifecycle_surface(tmp_path):
     loop = DefaultObservationLoop.create(registry=registry)
     assert not hasattr(loop, "repair") and not hasattr(loop, "restart") and not hasattr(loop, "launchctl")
     assert not list(tmp_path.glob("observer.db*"))
+
+
+def test_runbook_backlog_drain_reaches_tail_without_counting_observation_day(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    runbook = ObservationRunbook(loop)
+    report = runbook.drain_backlog(max_passes=2)
+    assert report["status"] == "tail_reached"
+    assert report["observation_day_counted"] is False
+    assert report["stop_reason"] == "tail_reached"
+
+
+def test_runbook_daily_rotation_requires_export_and_preserves_cursor(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    loop = DefaultObservationLoop.create(registry=registry, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    runbook = ObservationRunbook(loop)
+    loop.collect_once()
+    day = datetime.now(timezone.utc).date()
+    summary = loop.ledger.daily_summary(day)
+    terra = loop.ledger.terra_input(day, max_items=500, max_bytes=8 * 1024 * 1024)
+    cursor_keys = tuple(sorted(loop._cursors))
+    rotated = runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra)
+    assert rotated["status"] == "rotated" and rotated["cursor_keys_preserved"] is True
+    assert tuple(sorted(loop._cursors)) == cursor_keys and len(loop.ledger.batches()) == 0
+    missed = runbook.record_missed_slot(datetime.now(timezone.utc) - timedelta(hours=8))
+    assert missed["catch_up"] is False and missed["status"] == "missed"
+    with pytest.raises(ObservationBoundaryError):
+        runbook.rotate_after_daily_export(utc_day=day, summary=summary, terra_input=terra, export_verified=False)
+
+
+def test_runbook_backlog_stops_on_ledger_budget(tmp_path):
+    registry, log, _, _ = _trusted_registry(tmp_path)
+    ledger = ObservationLedger(max_runs=1, max_signals=10000, max_bytes=1000000)
+    loop = DefaultObservationLoop.create(registry=registry, ledger=ledger, log_path=log, process_iter=lambda: [])
+    for collector in loop.collectors:
+        if hasattr(collector, "min_interval_seconds"):
+            collector.min_interval_seconds = 0
+    report = ObservationRunbook(loop).drain_backlog(max_passes=1)
+    assert report["status"] == "safe_stop" and report["stop_reason"] == "ledger_budget_exceeded"
