@@ -106,22 +106,30 @@ def _tools_tree() -> ast.Module:
 
 
 def _docstring_lines(tree: ast.Module) -> set[int]:
-    """Line numbers of module/function/class docstrings (module docs are
-    prose, not wire data — the module docstring legitimately names the
-    legacy ``message/send`` spelling in a sentence)."""
-    return {
-        node.value.lineno
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Constant)
-        and isinstance(node.value.value, str)
-    }
+    """Line numbers of REAL docstrings only: the first statement of a
+    module/function/class body when it is a bare string constant. Bare
+    string expressions elsewhere in a body are statements, not docs, and
+    must stay visible to the drift net."""
+    lines: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.body:
+                first = node.body[0]
+                if (isinstance(first, ast.Expr)
+                        and isinstance(first.value, ast.Constant)
+                        and isinstance(first.value.value, str)):
+                    lines.add(first.value.lineno)
+    return lines
 
 
 def extract_outbound_methods() -> set[str]:
-    """Structural extraction: the ``"method"`` value of every JSON-RPC request
-    dict literal in tools.py. Parses the source; never imports-and-calls the
-    network code."""
+    """Structural extraction: the ``"method"`` value of every JSON-RPC
+    request construction in tools.py — dict literals ({"method": ...}) AND
+    dict(method=...) keyword constructors, so a refactor to either shape
+    stays covered. urllib.request.Request(method="GET") calls are NOT
+    dict constructors and their HTTP verbs are excluded defensively.
+    Parses the source; never imports-and-calls the network code."""
+    _HTTP_VERBS = {"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"}
     found: set[str] = set()
     for node in ast.walk(_tools_tree()):
         if isinstance(node, ast.Dict):
@@ -133,6 +141,20 @@ def extract_outbound_methods() -> set[str]:
                     and isinstance(value.value, str)
                 ):
                     found.add(value.value)
+        elif isinstance(node, ast.Call):
+            # Only bare dict(...) constructors count — Request(url, method=
+            # "GET") and other non-dict calls carry HTTP verbs, not
+            # JSON-RPC method names.
+            if not (isinstance(node.func, ast.Name) and node.func.id == "dict"):
+                continue
+            for kw in node.keywords:
+                if (
+                    kw.arg == "method"
+                    and isinstance(kw.value, ast.Constant)
+                    and isinstance(kw.value.value, str)
+                    and kw.value.value not in _HTTP_VERBS
+                ):
+                    found.add(kw.value.value)
     return found
 
 
@@ -292,7 +314,9 @@ class TestStreamingParity:
         pascal = _method_info("SendStreamingMessage")
         legacy = _method_info("message/stream")
         assert pascal[0] == legacy[0] == "stream"
-        assert pascal[1] is not legacy[1]
+        # PascalCase spelling is v1-canonical, slash spelling is the legacy
+        # alias — compare by VALUE, not identity.
+        assert pascal[1] is True and legacy[1] is False
 
 
 # --------------------------------------------------------------------------
@@ -362,7 +386,7 @@ class TestDispatchUnknownMethod:
         _, _, payload = raw.partition("\r\n\r\n")
         resp = json.loads(payload)
         assert resp["id"] == 12
-        assert "error" not in resp or resp["error"]["code"] != -32601
+        assert "error" not in resp, f"canonical SendMessage must not error: {resp.get('error')}"
         assert "result" in resp
 
 
