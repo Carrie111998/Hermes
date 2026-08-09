@@ -783,15 +783,18 @@ class TestUsageFromSanitizedResponse:
 
 
 # ---------------------------------------------------------------------------
-# Failure status marking (#81731).
+# Failure level marking (#81731).
 #
 # Before the fix, failed LLM calls and failed/blocked/cancelled tool calls
 # were ended as successful observations — the Langfuse UI showed every
 # generation and tool span green regardless of outcome.  The fix:
 #   * registers an ``api_request_error`` hook that resolves the failed
-#     request's open generation and ends it with status/level ERROR,
+#     request's open generation and ends it with level ERROR,
 #   * maps the ``post_tool_call`` ``status`` kwarg (error/blocked/cancelled)
-#     onto Langfuse ERROR/WARNING status+level.
+#     onto Langfuse ERROR/WARNING level.
+# ``level`` is the only failure marker langfuse-python's ``update()``
+# supports — there is no ``status`` parameter (``**kwargs`` ignores it), so
+# the plugin must not pretend to send one.
 # ---------------------------------------------------------------------------
 
 
@@ -838,7 +841,6 @@ class TestApiRequestErrorMarking:
         )
 
         assert ended["obs"] is observation
-        assert ended["status"] == "ERROR"
         assert ended["level"] == "ERROR"
         assert "AuthenticationError" in ended["status_message"]
         assert "invalid api key" in ended["status_message"]
@@ -855,7 +857,6 @@ class TestApiRequestErrorMarking:
             error={"type": "RateLimitError", "message": "429 too many requests"},
         )
 
-        assert ended["status"] == "ERROR"
         assert ended["level"] == "ERROR"
         assert "RateLimitError" in ended["status_message"]
 
@@ -872,7 +873,7 @@ class TestApiRequestErrorMarking:
             api_call_count=1,
             error={"type": "RateLimitError", "message": "429"},
         )
-        assert ended["status"] == "ERROR"
+        assert ended["level"] == "ERROR"
 
         # Simulate the retry: pre_api_request under the same key starts a NEW
         # generation (the previous one was popped, not re-ended as success).
@@ -900,6 +901,23 @@ class TestApiRequestErrorMarking:
             task_id="task-x", session_id="session-x",
             api_call_count=7, error={"type": "X", "message": "y"},
         )
+
+    def test_no_status_kwarg_sent_to_update(self, monkeypatch):
+        """langfuse-python's ``update()`` has no ``status`` parameter
+        (``**kwargs`` silently ignores it), so the plugin must not forward
+        one — only ``level``/``status_message`` may reach the SDK. (#81731)"""
+        mod = self._make_mod()
+        observation, ended = self._setup_generation(mod, monkeypatch)
+
+        mod.on_api_request_error(
+            task_id="task-1",
+            session_id="session-1",
+            api_call_count=1,
+            error={"type": "X", "message": "boom"},
+        )
+
+        assert "status" not in ended
+        assert ended["level"] == "ERROR"
 
 
 class TestToolCallFailureMarking:
@@ -940,7 +958,6 @@ class TestToolCallFailureMarking:
         )
 
         assert ended["obs"] is observation
-        assert ended["status"] == "ERROR"
         assert ended["level"] == "ERROR"
         assert ended["status_message"] == "permission denied"
 
@@ -960,7 +977,6 @@ class TestToolCallFailureMarking:
             error_message="Tool blocked by guardrail policy",
         )
 
-        assert ended["status"] == "WARNING"
         assert ended["level"] == "WARNING"
         assert ended["status_message"] == "Tool blocked by guardrail policy"
 
@@ -980,11 +996,10 @@ class TestToolCallFailureMarking:
             error_message="Tool execution cancelled by user interrupt",
         )
 
-        assert ended["status"] == "WARNING"
         assert ended["level"] == "WARNING"
 
     def test_ok_status_stays_default_no_error_kwargs(self, monkeypatch):
-        """Successful calls must not carry ERROR/WARNING status — the
+        """Successful calls must not carry ERROR/WARNING level — the
         observation keeps the default level so the UI shows it green."""
         mod = self._make_mod()
         observation, ended = self._setup_tool(mod, monkeypatch)
@@ -1000,7 +1015,6 @@ class TestToolCallFailureMarking:
         )
 
         assert ended["obs"] is observation
-        assert ended.get("status") is None
         assert ended.get("level") is None
         assert ended.get("status_message") is None
         assert ended["output"] == {"output": "hi"}
@@ -1022,5 +1036,27 @@ class TestToolCallFailureMarking:
             tool_call_id="call-1",
         )
 
-        assert ended.get("status") is None
+        assert ended.get("level") is None
         assert ended["output"] == {"error": "exit code 1"}
+
+    def test_error_level_no_status_kwarg_sent_to_update(self, monkeypatch):
+        """The failed-tool path must forward only ``level``/``status_message``
+        to ``update()`` — ``status`` is not a real SDK parameter and would be
+        silently dropped. (#81731)"""
+        mod = self._make_mod()
+        observation, ended = self._setup_tool(mod, monkeypatch)
+
+        mod.on_post_tool_call(
+            tool_name="bash",
+            args={"command": "false"},
+            result='{"error": "exit code 1"}',
+            task_id="task-1",
+            session_id="session-1",
+            tool_call_id="call-1",
+            status="error",
+            error_type="tool_error",
+            error_message="exit code 1",
+        )
+
+        assert "status" not in ended
+        assert ended["level"] == "ERROR"

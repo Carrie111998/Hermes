@@ -682,7 +682,7 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
                      usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
-                     status: Optional[str] = None, level: Optional[str] = None,
+                     level: Optional[str] = None,
                      status_message: Optional[str] = None) -> None:
     if observation is None:
         return
@@ -696,8 +696,9 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
             update_kwargs["usage_details"] = usage_details
         if cost_details:
             update_kwargs["cost_details"] = cost_details
-        if status:
-            update_kwargs["status"] = status
+        # ``level`` is the only failure marker langfuse-python's
+        # ``update()`` supports; a ``status`` param does not exist and is
+        # silently dropped via ``**kwargs`` (ignored) — see #81731.
         if level:
             update_kwargs["level"] = level
         if status_message:
@@ -709,21 +710,23 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
         _debug(f"end observation failed: {exc}")
 
 
-def _tool_call_status(status: str) -> tuple[Optional[str], Optional[str]]:
-    """Map a Hermes ``post_tool_call`` status to Langfuse status/level.
+def _tool_call_level(status: str) -> Optional[str]:
+    """Map a Hermes ``post_tool_call`` status to a Langfuse ``level``.
 
     Hermes statuses: ``ok`` (derived), ``error`` (derived or explicit),
     ``blocked`` (guardrail/plugin block), ``cancelled`` (interrupt).
-    Langfuse ``status``/``level`` wire values are ``ERROR`` / ``WARNING``
-    (uppercase enums). Success maps to ``(None, None)`` so the observation
-    stays at the default level — failed calls must be distinguishable in
-    the Langfuse UI, which is exactly what this mapping exists for.
+    Langfuse ``level`` wire values are ``ERROR`` / ``WARNING`` (uppercase
+    literals). Success maps to ``None`` so the observation stays at the
+    default level — failed calls must be distinguishable in the Langfuse
+    UI, which is exactly what this mapping exists for.  (``level`` is the
+    only failure marker langfuse-python's ``update()`` supports; there is
+    no ``status`` parameter, so the mapping returns the level alone.)
     """
     if status == "error":
-        return "ERROR", "ERROR"
+        return "ERROR"
     if status in {"blocked", "cancelled"}:
-        return "WARNING", "WARNING"
-    return None, None
+        return "WARNING"
+    return None
 
 
 def _merge_trace_output(output: Any, state: TraceState) -> Any:
@@ -1145,15 +1148,14 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
                             function_payload["output"] = safe_result_value
                         break
 
-    obs_status, obs_level = _tool_call_status(status)
+    obs_level = _tool_call_level(status)
     status_message = error_message or error_type
     _end_observation(
         observation,
         output=safe_result_value,
         metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
-        status=obs_status,
         level=obs_level,
-        status_message=status_message if obs_status else None,
+        status_message=status_message if obs_level else None,
     )
 
 
@@ -1202,7 +1204,6 @@ def on_api_request_error(*, task_id: str = "", session_id: str = "", api_call_co
     _debug(f"api request error: {err_type}: {err_message}")
     _end_observation(
         generation,
-        status="ERROR",
         level="ERROR",
         status_message=f"[{err_type}] {err_message}".strip(),
     )
