@@ -32,8 +32,8 @@ This page is the top-level map of Hermes Agent internals. Use it to orient yours
 │  ┌──────┴───────┐  ┌──────┴───────┐  ┌──────┴───────┐               │
 │  │ Compression  │  │ 3 API Modes  │  │ Tool Registry│               │
 │  │ & Caching    │  │ chat_compl.  │  │ (registry.py)│               │
-│  │              │  │ codex_resp.  │  │ 70+ tools    │               │
-│  │              │  │ anthropic    │  │ 28 toolsets  │               │
+│  │              │  │ codex_resp.  │  │ 80+ tools    │               │
+│  │              │  │ anthropic    │  │ 30 toolsets  │               │
 │  └──────────────┘  └──────────────┘  └──────────────┘               │
 └─────────┴─────────────────┴─────────────────┴───────────────────────┘
            │                                    │
@@ -207,13 +207,13 @@ Prompt construction and maintenance across the conversation lifecycle:
 
 ### Provider Resolution
 
-A shared runtime resolver used by CLI, gateway, cron, ACP, and auxiliary calls. Maps `(provider, model)` tuples to `(api_mode, api_key, base_url)`. Handles 18+ providers, OAuth flows, credential pools, and alias resolution.
+A shared runtime resolver used by CLI, gateway, cron, ACP, and auxiliary calls. Maps `(provider, model)` tuples to `(api_mode, api_key, base_url)`. Handles 30+ providers, OAuth flows, credential pools, and alias resolution.
 
 → [Provider Runtime Resolution](./provider-runtime.md)
 
 ### Tool System
 
-Central tool registry (`tools/registry.py`) with 70+ registered tools across ~28 toolsets. Each tool file self-registers at import time. The registry handles schema collection, dispatch, availability checking, and error wrapping. Terminal tools support 7 backends (local, Docker, SSH, Daytona, Modal, Singularity, Vercel Sandbox).
+Central tool registry (`tools/registry.py`) with 80+ registered tools across ~30 toolsets. Each tool file self-registers at import time. The registry handles schema collection, dispatch, availability checking, and error wrapping. Terminal tools support 7 backends (local, Docker, SSH, Daytona, Modal, Singularity, Vercel Sandbox).
 
 → [Tools Runtime](./tools-runtime.md)
 
@@ -225,7 +225,7 @@ SQLite-based session storage with FTS5 full-text search. Sessions have lineage t
 
 ### Messaging Gateway
 
-Long-running process with 25+ platform adapters (built-in + bundled plugins), unified session routing, user authorization (allowlists + DM pairing), slash command dispatch, hook system, cron ticking, and background maintenance.
+Long-running process with 20+ platform adapters (built-in + bundled plugins), unified session routing, user authorization (allowlists + DM pairing), slash command dispatch, hook system, cron ticking, and background maintenance.
 
 → [Gateway Internals](./gateway-internals.md)
 

@@ -109,7 +109,8 @@ compromise you accept.
 `health_report` MCP tool and prints a per-check matrix. It's the single
 fastest way to find out *why* an action isn't working.
 
-```
+```text
+# Illustrative output — versions and checks vary by install
 $ hermes computer-use doctor
 ⚠️  cua-driver 0.5.8 on darwin — degraded
   ✅ binary_version: cua-driver 0.5.8
@@ -117,7 +118,6 @@ $ hermes computer-use doctor
   ✅ session_active: MCP session is active.
   ❌ bundle_identity: Process has no CFBundleIdentifier.
       → Run the binary inside CuaDriver.app so TCC grants attribute correctly.
-  ✅ tcc_accessibility: Accessibility is granted.
   ✅ tcc_screen_recording: Screen Recording is granted.
   ✅ ax_capability: AX is trusted and reachable.
   ✅ screen_capture_capability: ScreenCaptureKit reachable; 1 display(s) shareable.
