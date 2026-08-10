@@ -35,6 +35,7 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import ast
 import logging
 import os
 import re
@@ -105,6 +106,11 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
 
 _SHELL_EXECUTABLES = frozenset({"sh", "bash", "dash", "ksh", "zsh"})
 _SHELL_OPTIONS_WITH_VALUES = frozenset({"-O", "+O", "-o", "+o"})
+_PYTHON_SCRIPT_SUFFIXES = frozenset({".py", ".pyw"})
+_PYTHON_EXECUTABLE_PATTERN = re.compile(
+    r"python(?:\d+(?:\.\d+)*)?",
+    re.IGNORECASE,
+)
 _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
@@ -347,8 +353,8 @@ def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
-) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell."""
+) -> Iterator[tuple[Path, bool]]:
+    """Yield referenced paths with whether a shell explicitly interprets them."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -360,7 +366,7 @@ def _iter_referenced_shell_scripts(
             if len(segment) > index + 1:
                 resolved = _resolve_terminal_script_path(segment[index + 1], cwd)
                 if resolved is not None:
-                    yield resolved
+                    yield resolved, True
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -386,7 +392,7 @@ def _iter_referenced_shell_scripts(
             }:
                 resolved = _resolve_terminal_script_path(arguments[arg_index], cwd)
                 if resolved is not None:
-                    yield resolved
+                    yield resolved, True
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -398,7 +404,7 @@ def _iter_referenced_shell_scripts(
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
                 resolved = _resolve_terminal_script_path(executable, cwd)
                 if resolved is not None:
-                    yield resolved
+                    yield resolved, False
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -501,18 +507,167 @@ def _sanitize_remote_script_text(text: Optional[str]) -> tuple[Optional[str], bo
     return text, False
 
 
+def _python_shebang(text: str) -> bool:
+    """Return whether the first line has a real Python interpreter shebang."""
+    first_line = text.partition("\n")[0].rstrip("\r")
+    if not first_line.startswith("#!"):
+        return False
+    try:
+        tokens = shlex.split(first_line[2:].strip(), posix=True)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+
+    interpreter = Path(tokens[0]).name
+    if interpreter == "env":
+        interpreter = ""
+        arguments = tokens[1:]
+        index = 0
+        while index < len(arguments):
+            argument = arguments[index]
+            if argument == "--":
+                index += 1
+                if index < len(arguments):
+                    interpreter = Path(arguments[index]).name
+                break
+            if argument == "-S":
+                index += 1
+                if index < len(arguments):
+                    interpreter = Path(arguments[index]).name
+                break
+            if argument.startswith("-") or re.match(
+                r"^[A-Za-z_][A-Za-z0-9_]*=", argument
+            ):
+                index += 1
+                continue
+            interpreter = Path(argument).name
+            break
+
+    return bool(_PYTHON_EXECUTABLE_PATTERN.fullmatch(interpreter))
+
+
+def _is_python_script(path: Path, text: str, *, forced_shell: bool) -> bool:
+    """Identify Python source before filtering speculative path references.
+
+    A valid first-line shebang takes precedence over the suffix. Explicit
+    ``sh script.py`` execution also takes precedence: the same bytes are shell
+    source in that invocation and must retain the full fail-closed shell walk.
+    """
+    if forced_shell:
+        return False
+    first_line = text.partition("\n")[0].rstrip("\r")
+    if first_line.startswith("#!"):
+        return _python_shebang(text)
+    return path.suffix.lower() in _PYTHON_SCRIPT_SUFFIXES
+
+
+def _literal_python_command(node: ast.AST) -> Optional[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, (ast.List, ast.Tuple)):
+        values: list[str] = []
+        for element in node.elts:
+            if not isinstance(element, ast.Constant) or not isinstance(
+                element.value, str
+            ):
+                return None
+            values.append(element.value)
+        return shlex.join(values)
+    return None
+
+
+def _iter_python_command_payloads(text: str) -> Iterator[str]:
+    """Yield statically literal commands passed to Python execution APIs."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return
+
+    module_aliases = {"os": "os", "subprocess": "subprocess"}
+    function_aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in {"os", "subprocess"}:
+                    module_aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess"}:
+            for alias in node.names:
+                function_aliases[alias.asname or alias.name] = (
+                    f"{node.module}.{alias.name}"
+                )
+
+    subprocess_calls = {
+        "subprocess.Popen",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+        "subprocess.run",
+    }
+    os_single_argument_calls = {"os.popen", "os.system"}
+    os_vector_calls = {"os.execv", "os.execve", "os.execvp", "os.execvpe"}
+    os_list_calls = {"os.execl", "os.execle", "os.execlp", "os.execlpe"}
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        call_name: Optional[str] = None
+        if isinstance(node.func, ast.Name):
+            call_name = function_aliases.get(node.func.id)
+        elif isinstance(node.func, ast.Attribute) and isinstance(
+            node.func.value, ast.Name
+        ):
+            module = module_aliases.get(node.func.value.id)
+            if module:
+                call_name = f"{module}.{node.func.attr}"
+        if not call_name:
+            continue
+
+        argument: Optional[ast.AST] = None
+        if call_name in subprocess_calls | os_single_argument_calls and node.args:
+            argument = node.args[0]
+        elif call_name in subprocess_calls:
+            argument = next(
+                (keyword.value for keyword in node.keywords if keyword.arg == "args"),
+                None,
+            )
+        elif call_name in os_vector_calls and len(node.args) > 1:
+            argument = node.args[1]
+        elif call_name in os_list_calls and len(node.args) > 1:
+            argument = ast.List(elts=node.args[1:], ctx=ast.Load())
+        if argument is None:
+            continue
+        payload = _literal_python_command(argument)
+        if payload:
+            yield payload
+
+
 def _contains_unsafe_gateway_action(
     command: str,
     *,
     cwd: Optional[str],
     depth: int,
-    visited: set[Path],
+    visited: set[tuple[Path, bool]],
     read_remote_script: Optional[_ReadRemoteScriptFn] = None,
+    source_is_python: bool = False,
 ) -> bool:
     if _direct_lifecycle_scan(command):
         return True
     if depth >= _MAX_REFERENCED_SCRIPT_DEPTH:
         return True
+
+    if source_is_python:
+        for payload in _iter_python_command_payloads(command):
+            if _contains_unsafe_gateway_action(
+                payload,
+                cwd=cwd,
+                depth=depth + 1,
+                visited=visited,
+                read_remote_script=read_remote_script,
+            ):
+                return True
 
     for payload in _iter_shell_command_payloads(command):
         if _contains_unsafe_gateway_action(
@@ -524,7 +679,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path, forced_shell in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -532,9 +687,21 @@ def _contains_unsafe_gateway_action(
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
             resolved = script_path
-        if resolved in visited:
+        if source_is_python and not forced_shell:
+            # Python parsing is intentionally out of scope for this shell
+            # guard. Its shell-token walk is retained as conservative
+            # defense-in-depth, but non-regular local path constants are not
+            # executable script references. Treating a directory constant as
+            # a script is the rack-pr-close-safe false positive.
+            try:
+                if not stat.S_ISREG(resolved.stat().st_mode):
+                    continue
+            except OSError:
+                pass
+        visit_key = (resolved, forced_shell)
+        if visit_key in visited:
             continue
-        visited.add(resolved)
+        visited.add(visit_key)
         script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
@@ -550,6 +717,9 @@ def _contains_unsafe_gateway_action(
                 return True
         if not script_text:
             continue
+        script_is_python = _is_python_script(
+            resolved, script_text, forced_shell=forced_shell
+        )
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
         script_dir = _resolve_script_directory(str(resolved)) or cwd
@@ -559,6 +729,7 @@ def _contains_unsafe_gateway_action(
             depth=depth + 1,
             visited=visited,
             read_remote_script=read_remote_script,
+            source_is_python=script_is_python,
         ):
             return True
     return False
