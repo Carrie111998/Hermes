@@ -110,3 +110,56 @@ class TestKillToolSubprocessesMarksCronInterrupted:
         assert marked_calls, "mark_running_jobs_interrupted was never called during shutdown"
         assert any(result == ["job-1"] for _reason, result in marked_calls)
 
+    @pytest.mark.asyncio
+    async def test_graceful_drain_does_not_mark_cron_interrupted(self, monkeypatch):
+        """A clean shutdown must not report cron jobs as interrupted.
+
+        ``final-cleanup`` ran ``mark_running_jobs_interrupted`` even when
+        the drain succeeded and nothing was truncated. The marking is a
+        global sweep with no per-job targeting, so a job dispatched during
+        teardown -- after the drain already saw an empty queue -- was
+        reported as "killed the job's tool subprocess before the run
+        finished". One restart could fail dozens of healthy jobs this way.
+
+        The subprocess kill itself must still run (zombie catch-all).
+        """
+        import cron.scheduler as sched
+        import tools.process_registry as _pr
+        import tools.terminal_tool as _tt
+        import tools.browser_tool as _bt
+
+        runner, adapter = make_restart_runner()
+        runner._restart_drain_timeout = 5.0  # generous: the drain succeeds
+
+        kill_calls = []
+        monkeypatch.setattr(
+            _pr.process_registry,
+            "kill_all",
+            lambda task_id=None: (kill_calls.append(task_id), 0)[1],
+        )
+        monkeypatch.setattr(_tt, "cleanup_all_environments", lambda: None)
+        monkeypatch.setattr(_bt, "cleanup_all_browsers", lambda: None)
+
+        marked_calls = []
+        monkeypatch.setattr(
+            sched,
+            "mark_running_jobs_interrupted",
+            lambda reason: (marked_calls.append(reason), [])[1],
+        )
+
+        # A job appears mid-teardown, after the drain already saw an empty
+        # queue -- the exact race that produced the spurious failures.
+        async def _late_job(*_a, **_kw):
+            sched._running_job_ids.add("late-job")
+
+        adapter.disconnect = _late_job
+
+        with patch("gateway.status.remove_pid_file"), patch("gateway.status.write_runtime_status"), \
+             patch("cron.scheduler.mark_job_run"):
+            await runner.stop()
+
+        assert kill_calls, "subprocess kill must still run on the graceful path"
+        assert not marked_calls, (
+            f"graceful shutdown marked cron job(s) interrupted: {marked_calls}"
+        )
+

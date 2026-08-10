@@ -38,13 +38,21 @@ DEFAULT_CONFIG = {
         # Force-interrupt budget once gateway stop()/drain has begun
         # (seconds). Applies to SIGTERM/external stop and to the final
         # phase of in-band restart after any after-turn wait. 0 = interrupt
-        # immediately (the default).
+        # immediately.
         #
         # Keep this short and under systemd TimeoutStopSec — a long value
         # here invites SIGKILL-mid-cleanup. For in-band restart
         # (/restart, SIGUSR1), prefer restart_after_turn_timeout below so
         # active turns finish *before* stop() begins (#77184).
-        "restart_drain_timeout": 0,
+        #
+        # Default 30s rather than 0: on a host running a cron fleet, an
+        # immediate interrupt truncates every in-flight job on every
+        # restart, and each one surfaces as a "killed the job's tool
+        # subprocess" failure needing a human. 30s lets short tool calls
+        # finish while staying well under the 60s TimeoutStopSec shipped
+        # in deploy/hermes-gateway.service. Raise both together, never
+        # this alone.
+        "restart_drain_timeout": 30,
         # In-band restart wait for active turns to finish before stop()
         # (seconds). /restart and SIGUSR1 refuse new work, then wait up to
         # this cap for in-flight agents/cron/api runs to complete naturally

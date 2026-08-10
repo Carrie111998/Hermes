@@ -12559,7 +12559,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         async def _stop_impl() -> None:
-            def _kill_tool_subprocesses(phase: str) -> None:
+            def _kill_tool_subprocesses(
+                phase: str, *, mark_cron: bool = True
+            ) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
 
                 Called twice in the shutdown path: once eagerly after a
@@ -12568,6 +12570,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 SIGKILL on the cgroup — #8202), and once as a final
                 catch-all at the end of _stop_impl() for the graceful
                 path or anything respawned mid-teardown.
+
+                ``mark_cron=False`` kills subprocesses without reporting
+                cron jobs as interrupted. The kill is always safe to repeat,
+                but the *marking* is a global sweep with no per-job
+                targeting, so running it on a path where nothing was
+                actually truncated reports healthy jobs as failed.
 
                 All steps are best-effort; exceptions are swallowed so
                 one subsystem's failure doesn't block the rest.
@@ -12591,16 +12599,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # now-truncated tool output; mark the run interrupted so
                     # the scheduler can never report that as success (#60432).
                     # No-op when no cron job is in flight.
-                    from cron.scheduler import mark_running_jobs_interrupted
-                    _interrupted = mark_running_jobs_interrupted(
-                        f"Gateway shutdown ({phase}) killed the job's tool "
-                        "subprocess before the run finished."
-                    )
-                    if _interrupted:
-                        logger.warning(
-                            "Shutdown (%s): marked %d in-flight cron job(s) interrupted: %s",
-                            phase, len(_interrupted), ", ".join(_interrupted),
+                    if mark_cron:
+                        from cron.scheduler import mark_running_jobs_interrupted
+                        _interrupted = mark_running_jobs_interrupted(
+                            f"Gateway shutdown ({phase}) killed the job's tool "
+                            "subprocess before the run finished."
                         )
+                        if _interrupted:
+                            logger.warning(
+                                "Shutdown (%s): marked %d in-flight cron job(s) interrupted: %s",
+                                phase, len(_interrupted), ", ".join(_interrupted),
+                            )
                 except Exception as _e:
                     logger.debug("mark_running_jobs_interrupted (%s) error: %s", phase, _e)
                 try:
@@ -12907,7 +12916,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
-            _kill_tool_subprocesses("final-cleanup")
+            # Kill unconditionally (zombie catch-all), but only report cron
+            # jobs interrupted when the drain actually timed out. On the
+            # graceful path nothing was truncated, so marking here reported
+            # healthy jobs as failed — including any job dispatched during
+            # teardown, which is how a single restart produced dozens of
+            # spurious "killed the job's tool subprocess" failures at once.
+            # Same reasoning the timed-out branch above applies to sessions
+            # that finished during the drain window.
+            _kill_tool_subprocesses("final-cleanup", mark_cron=timed_out)
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",
                 _phase_elapsed(),

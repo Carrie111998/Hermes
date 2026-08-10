@@ -54,6 +54,13 @@ EnvironmentFile=/etc/hermes/gateway.env
 ExecStart=/home/hermes/.local/bin/hermes gateway run
 Restart=always
 RestartSec=10
+# Must exceed agent.restart_drain_timeout so SIGKILL cannot land mid-drain
+# — the exact failure the drain exists to prevent. This mirrors what
+# `hermes setup` generates: max(60, drain + 30), which is 60s at the
+# default 30s drain. If you raise restart_drain_timeout, raise this with
+# it (or re-run `hermes setup` to regenerate the unit); the gateway logs
+# a mismatch warning at startup when the two drift apart.
+TimeoutStopSec=60
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=hermes-gateway
