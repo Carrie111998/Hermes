@@ -38,7 +38,7 @@
 |---|---|---|
 | `ARCH-001` | complete | Merged to Hermes `main` and deployed to DGX; service active after restart. |
 | `ARCH-001-MAINLINE-001` | `COMPLETE` (Codex READY; AGY waived by owner) | Merge `ec50a154…`; compile and 35 targeted tests passed; runtime restart verified. |
-| `CI-BASELINE-001` | `IMPLEMENTED_PENDING_CI` | Original five failures and prior run `31379116076` pass; follow-up run `31380083270` exposed one brittle test assertion in slice 4. |
+| `CI-BASELINE-001` | `IMPLEMENTED_PENDING_REVIEW` | Original five failures, correction, and GitHub Actions run `31380833174` pass; PR #3 is ready for independent review. |
 | `ARCH-002` to `ARCH-004` | proposed | Start after CI-BASELINE-001 is green and reviewed. |
 
 ARCH-001 was merged by owner-authorized admin merge because the repository's

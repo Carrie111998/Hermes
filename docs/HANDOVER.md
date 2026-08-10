@@ -40,10 +40,10 @@
     `backup/pre-arch-001-deploy-20260810T031625Z`.
   - Deployment record merged to main as
     `5fb3d5cd1ee8358570e86d9fbce95e8e73dd584b`.
-- **Active:** `CI-BASELINE-001` is implemented in `d20c48132` with handover
-  refresh commit `a0fd6fc42`; draft PR [#3](https://github.com/cwliao/hermes-agent/pull/3)
-  is open. The latest GitHub Actions run exposed one unrelated brittle test
-  assertion; CI must be green again before review and merge.
+- **Active:** `CI-BASELINE-001` is implemented in `d20c48132` with follow-up
+  correction commit `ac9b37924`; PR [#3](https://github.com/cwliao/hermes-agent/pull/3)
+  is ready for review. GitHub Actions run `31380833174` is green; independent
+  review and merge remain.
 - **Deferred / not goals:** No DGX deploy or service restart for CI-BASELINE-001
   before remote CI and merge gates pass. Do not reset or edit Claude-owned
   dirty/diverged worktrees.
@@ -61,9 +61,9 @@
   - Ruff, compileall, and `git diff --check`: passed.
 - **Health:** Last DGX read-only check showed `hermes-gateway.service`
   `active/running` and no error entries in the checked recent journal window.
-  Draft PR #3 is the active repository review object. Prior run `31379116076`
-  passed, but latest run `31380083270` failed only in test slice 4 with
-  **5,685 passed / 1 failed**; the failing assertion is being revised.
+  PR #3 is the active repository review object. Prior run `31380083270`
+  exposed one brittle test assertion; latest run `31380833174` passed all
+  eight Python slices and `All required checks pass`.
 - **UI/runtime smoke:** No new UI smoke was run for CI-BASELINE-001. The DGX
   gateway process remains the existing runtime evidence boundary.
 - **Data/storage safety:** No DGX `.hermes` storage mutation was performed for
@@ -71,15 +71,15 @@
 - **Deployment:** DGX remains on `ec50a154eeb44e7206f24b7703f9032b8f97069c`.
   CI-BASELINE-001 has **not** been deployed. Rollback ref remains
   `backup/pre-arch-001-deploy-20260810T031625Z`.
-- **Known risks:** The latest failure is a global `shutil.which` mock-order
-  assertion in `tests/tools/test_delegate.py`; no DGX deployment is authorized
-  by this ticket.
+- **Known risks:** No current CI failure remains. Independent code review and
+  reconciliation are still required; no DGX deployment is authorized by this
+  ticket.
 
 ## 4. Next ticket
 
 - **Ticket:** `CI-BASELINE-001 - Restore the blocking Python CI baseline`
-- **Status:** `IMPLEMENTED_PENDING_CI` after follow-up failure in run
-  `31380083270`; draft PR #3 remains open.
+- **Status:** `IMPLEMENTED_PENDING_REVIEW` on head `ac9b37924`; PR #3 is ready
+  for review.
 - **Scope:** `agent/codex_responses_adapter.py`, `gateway/run.py`,
   `hermes_cli/main.py`, affected tests, and the ticket/roadmap documents.
 - **Dependencies:** Clean Hermes `main`; preserve ARCH-001 runtime-state
@@ -88,8 +88,8 @@
   ARCH-001 regression remains green; Ruff/OSV/attribution/uv/Docker/JS checks
   remain green; GitHub Actions `All required checks pass` is green; then code
   review, merge, and only later consider deployment.
-- **Open questions:** Confirm the follow-up test correction in GitHub Actions;
-  then repeat independent code review before merge.
+- **Open questions:** Obtain an independently valid reviewer result and
+  reconcile it before merge; deployment remains a later gate.
 
 ## 5. Safe continuation instructions
 
