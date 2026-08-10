@@ -14,9 +14,9 @@ describe('Zoomable', () => {
     render(
       <Zoomable
         label="Open diagram"
-        overlay={<div data-testid="overlay" dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} />}
+        overlay={<div dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} data-testid="overlay" />}
       >
-        <div data-testid="inline" dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} />
+        <div dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} data-testid="inline" />
       </Zoomable>
     )
 
@@ -29,7 +29,7 @@ describe('Zoomable', () => {
     render(
       <Zoomable
         label="Open diagram"
-        overlay={<div data-testid="overlay" dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} />}
+        overlay={<div dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} data-testid="overlay" />}
       >
         <div dangerouslySetInnerHTML={{ __html: MERMAID_SVG }} />
       </Zoomable>
