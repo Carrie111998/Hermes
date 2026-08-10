@@ -118,8 +118,12 @@ def _run_polling(
     patterns: list[str] | None,
     ignore: list[str] | None,
     interval: float,
+    max_iterations: int = 0,
 ) -> int:
-    """Fallback polling watcher (no watchdog dependency)."""
+    """Fallback polling watcher (no watchdog dependency).
+
+    Set *max_iterations* > 0 for bounded test loops.
+    """
     patterns = patterns or ["*"]
     ignore = ignore or []
 
@@ -146,6 +150,7 @@ def _run_polling(
     )
 
     count = 0
+    iterations = 0
     shutdown = [False]
 
     def _handle_signal(signum, frame):
@@ -157,6 +162,9 @@ def _run_polling(
 
     try:
         while not shutdown[0]:
+            iterations += 1
+            if max_iterations > 0 and iterations > max_iterations:
+                break
             time.sleep(interval)
             for fpath, (fname, mtime) in list(tracked.items()):
                 if not os.path.exists(fpath):

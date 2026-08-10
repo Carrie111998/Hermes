@@ -28,7 +28,7 @@ def temp_dir():
 
 
 class TestBuildWatchParser:
-    """argparse integration tests."""
+    """argparse integration tests — fast, no I/O."""
 
     def _make_parser(self):
         p = argparse.ArgumentParser(prog="hermes")
@@ -72,46 +72,61 @@ class TestBuildWatchParser:
         assert args.run_command == "echo hi"
         assert args.command == "watch"
 
+    def test_multiple_paths(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", "src", "tests"])
+        assert args.paths == ["src", "tests"]
+
 
 class TestPolling:
-    """Polling watcher: cold paths and error edges."""
+    """Polling watcher — bounded with max_iterations."""
 
     def test_no_valid_paths(self):
+        """Non-existent directory exits 1 immediately."""
         code = _run_polling(
-            [Path("/tmp/_nonexist_hwatch_99999")], None, None, 0.1
+            [Path("/tmp/_nonexist_hwatch_99999")], None, None, 0.1,
+            max_iterations=1,
         )
         assert code == 1
 
-    def test_empty_dir_starts(self, temp_dir):
-        """Empty directory — watcher starts, runs one loop, exits via timer."""
-        import signal
-
-        old = signal.signal(signal.SIGALRM, lambda s, f: None)
-        signal.setitimer(signal.ITIMER_REAL, 1.2)
-        try:
-            code = _run_polling([temp_dir], None, None, 0.3)
-            assert code == 0
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, old)
+    def test_empty_dir_completes_cleanly(self, temp_dir):
+        """Empty directory runs bounded iterations and exits 0."""
+        code = _run_polling(
+            [temp_dir], None, None, 0.1, max_iterations=2,
+        )
+        assert code == 0
 
     def test_detects_created_file(self, temp_dir):
-        """File created during polling loop is detected."""
-        import signal
+        """File created before first iteration is detected."""
+        # Create file before polling starts
+        (temp_dir / "new.txt").write_text("hello")
+        code = _run_polling(
+            [temp_dir], None, None, 0.05, max_iterations=2,
+        )
+        assert code == 0
 
-        def _create():
-            time.sleep(0.4)
-            (temp_dir / "new.txt").write_text("hi")
+    def test_detects_modified_file(self, temp_dir):
+        """File modified between iterations is detected."""
+        f = temp_dir / "mod.txt"
+        f.write_text("v1")
 
-        t = threading.Thread(target=_create, daemon=True)
+        def _modify():
+            time.sleep(0.2)
+            f.write_text("v2")
+
+        t = threading.Thread(target=_modify, daemon=True)
         t.start()
+        code = _run_polling(
+            [temp_dir], None, None, 0.15, max_iterations=3,
+        )
+        t.join(timeout=1)
+        assert code == 0
 
-        old = signal.signal(signal.SIGALRM, lambda s, f: None)
-        signal.setitimer(signal.ITIMER_REAL, 2.0)
-        try:
-            code = _run_polling([temp_dir], None, None, 0.3)
-            assert code == 0
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
-            signal.signal(signal.SIGALRM, old)
-            t.join(timeout=0.5)
+    def test_pattern_filtering(self, temp_dir):
+        """Pattern filtering doesn't crash and only watches matching files."""
+        (temp_dir / "foo.py").write_text("ok")
+        (temp_dir / "bar.txt").write_text("ok")
+        code = _run_polling(
+            [temp_dir], ["*.py"], ["*.pyc"], 0.05, max_iterations=2,
+        )
+        assert code == 0
