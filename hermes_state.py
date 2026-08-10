@@ -8649,7 +8649,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             for msg in repaired_messages
             if isinstance(msg, dict) and msg.get("_row_id") in pre_repair
         }
-        removed_ids = sorted(set(pre_repair) - set(survivors))
+        # Verification candidates are collapsed only from MODEL replay; their
+        # substantive answer must remain active in the persisted DISPLAY
+        # transcript (#65919). repair_message_sequence deliberately replaces
+        # the candidate with the verified assistant without mutating either
+        # durable row, so do not treat that model-only replacement as archival.
+        verification_finish_reasons = {
+            "verification_required",
+            "verify_hook_continue",
+        }
+        removed_ids = sorted(
+            row_id
+            for row_id, original in pre_repair.items()
+            if row_id not in survivors
+            and original.get("finish_reason") not in verification_finish_reasons
+        )
         updates = []
 
         for row_id, msg in survivors.items():
