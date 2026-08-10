@@ -11334,6 +11334,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     focus_topic=focus_topic or None,
                     force=True,
                     defer_context_engine_notification=True,
+                    **({"protected_tail": tail} if partial and tail else {}),
                 )
 
                 # If _compress_context returned unchanged because a

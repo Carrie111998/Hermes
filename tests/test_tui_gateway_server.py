@@ -10784,6 +10784,7 @@ def _partial_compress_agent(compress_context_calls):
 
     def _fake_compress_context(history, sys, approx_tokens=0, focus_topic=None, **kw):
         compress_context_calls.append((list(history), focus_topic))
+        agent._last_test_protected_tail = kw.get("protected_tail")
         return list(_PARTIAL_COMPRESSED_HEAD), {}
 
     agent._compress_context = _fake_compress_context
@@ -10814,6 +10815,7 @@ def test_compress_session_history_here_triggers_partial_compress():
     head_passed, focus_passed = compress_context_calls[0]
     assert head_passed == _PARTIAL_FAKE_HISTORY[:-2]
     assert focus_passed is None  # partial compress has no focus topic
+    assert agent._last_test_protected_tail == _PARTIAL_FAKE_HISTORY[-2:]
     # Session history must now contain the rejoined transcript: compressed
     # head + the last exchange verbatim.
     assert session["history"] == _PARTIAL_COMPRESSED_HEAD + _PARTIAL_FAKE_HISTORY[-2:]

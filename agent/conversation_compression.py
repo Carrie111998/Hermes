@@ -2158,6 +2158,7 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    protected_tail: Optional[list] = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2180,6 +2181,13 @@ def compress_context(
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
+        protected_tail: Verbatim recent messages selected by a boundary-aware
+            manual compression. The compressor still returns only the compacted
+            head so existing callers can perform their normal in-memory rejoin,
+            but durable in-place/rotation publication commits the head and this
+            tail atomically. Without this commit-time input, in-place compaction
+            archives the whole session while persisting only the summarized
+            head, silently dropping the very turns the user asked to preserve.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -3206,6 +3214,25 @@ def compress_context(
                 })
         _ensure_compressed_has_user_turn(messages, compressed)
 
+        # Boundary-aware manual compression is orchestrated outside this low-
+        # level compressor: the caller summarizes ``messages`` (the head) and
+        # rejoins its protected tail after this function returns. Persistence,
+        # however, happens *inside* this function. Build the durable transcript
+        # before either archive_and_compact() or child publication so the head
+        # and protected tail cross the SQLite boundary atomically. Keep the
+        # returned ``compressed`` value head-only for backward compatibility;
+        # callers already perform the in-memory rejoin exactly once.
+        durable_compressed = compressed
+        if protected_tail:
+            from hermes_cli.partial_compress import (
+                rejoin_compressed_head_and_tail,
+            )
+
+            durable_compressed = rejoin_compressed_head_and_tail(
+                compressed,
+                protected_tail,
+            )
+
         cached_system_prompt = agent._cached_system_prompt
         agent._invalidate_system_prompt()
 
@@ -3279,7 +3306,7 @@ def compress_context(
 
                     agent._session_db.archive_and_compact(
                         agent.session_id,
-                        compressed,
+                        durable_compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
@@ -3354,7 +3381,7 @@ def compress_context(
                         model=agent.model,
                         model_config=agent._session_init_model_config,
                         system_prompt=new_system_prompt,
-                        messages=compressed,
+                        messages=durable_compressed,
                         cwd=getattr(agent, "working_directory", None),
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,
@@ -3445,11 +3472,11 @@ def compress_context(
                     )
                     agent._last_flushed_db_idx = 0
                 else:
-                    agent._last_flushed_db_idx = len(compressed)
+                    agent._last_flushed_db_idx = len(durable_compressed)
                     agent._flushed_db_message_session_id = agent.session_id
                     agent._flushed_db_message_ids = {
                         id(message)
-                        for message in compressed
+                        for message in durable_compressed
                         if isinstance(message, dict)
                     }
                 _session_commit_succeeded = True

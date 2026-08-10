@@ -4873,6 +4873,7 @@ def _compress_session_history(
             focus_topic=focus_topic or None,
             force=True,
             defer_context_engine_notification=True,
+            **({"protected_tail": tail} if partial and tail else {}),
         )
     except Exception:
         finalize_context_engine_compression_notification(

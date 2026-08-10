@@ -59,6 +59,61 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
+    def test_in_place_atomically_commits_manual_protected_tail(self):
+        """Partial manual compression must persist its protected tail.
+
+        Regression: the outer manual-compression helper split history into a
+        head and tail, then called _compress_context(head). In-place compaction
+        archived every active SQLite row and committed only the compressed head;
+        rejoining the tail afterward repaired the in-memory list but not the
+        durable session. A reload therefore lost exactly the turns selected by
+        "Keep recent".
+        """
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260810_partial_tail"
+            _seed(db, sid, "partial-tail")
+            agent = _make_agent(db, sid, in_place=True)
+            head = [{"role": "user", "content": f"head {i}"} for i in range(8)]
+            protected_tail = [
+                {"role": "user", "content": "keep user turn"},
+                {"role": "assistant", "content": "keep assistant reply"},
+            ]
+
+            compressed_head, _ = compress_context(
+                agent,
+                head,
+                "sys",
+                approx_tokens=100_000,
+                protected_tail=protected_tail,
+            )
+
+            # Backward-compatible return contract: manual callers still do the
+            # in-memory rejoin once after _compress_context returns.
+            assert [m["content"] for m in compressed_head] == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+            ]
+            # Durability contract: the atomic in-place commit already includes
+            # the protected tail, so resume/reload cannot discard it.
+            reloaded = db.get_messages_as_conversation(sid)
+            reloaded_contents = [m["content"] for m in reloaded]
+            active_count = db.get_session(sid)["message_count"]
+            # The wrapper may use a pooled worker on Windows. Close the explicit
+            # fixture connection before TemporaryDirectory removes the DB file.
+            db.close()
+
+            assert reloaded_contents == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+                "keep user turn",
+                "keep assistant reply",
+            ]
+            assert active_count == 4
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
