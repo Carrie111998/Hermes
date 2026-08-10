@@ -81,6 +81,30 @@ def _sidecar_path(db_path: Path, suffix: str) -> Path:
     return db_path if not suffix else db_path.with_name(db_path.name + suffix)
 
 
+def _unlink_if_present(path: Path) -> None:
+    """Best-effort removal of a file this run created but never completed."""
+
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _discard_recovery_output(output: Path) -> None:
+    """Remove an output bundle a failed run created but never completed.
+
+    ``_validate_paths`` refuses to start when the output *or any of its
+    journal sidecars* already exists, so an output left behind by a run that
+    raised locks the user out of every retry of the one command a damaged
+    database has left. Removing the database on its own would not lift that
+    refusal: the guard covers all of ``_SIDECAR_SUFFIXES``, and an
+    interrupted run can leave a live WAL next to it.
+    """
+
+    for suffix in _SIDECAR_SUFFIXES:
+        _unlink_if_present(_sidecar_path(output, suffix))
+
+
 def _resolved_output_path(path: Path) -> Path:
     """Resolve a not-yet-created output path without requiring it to exist."""
 
@@ -1306,6 +1330,7 @@ def recover_session_database(
     disk_space = _disk_space_preflight(source, work_root, output.parent)
 
     temp_dir, snapshot_source, inspection = _snapshot_and_inspect(source, work_root)
+    output_created = False
     try:
         if not inspection.get("recoverable") and not allow_partial:
             reasons = "; ".join(inspection.get("errors") or ["unknown source error"])
@@ -1337,6 +1362,10 @@ def recover_session_database(
                 inspection["tables"][table].get("available") for table in _TOPIC_TABLES
             )
 
+            # SessionDB creates the output before it finishes initializing it,
+            # so a constructor that raises part way still leaves a database —
+            # and a live WAL — behind. Arm the cleanup before the call.
+            output_created = True
             destination_db = SessionDB(db_path=output)
             if has_topic_tables:
                 destination_db.apply_telegram_topic_migration()
@@ -1457,6 +1486,13 @@ def recover_session_database(
             "verified": bool(verification.get("healthy") and source_unchanged),
             "installed": False,
         }
+    except BaseException:
+        # Only on the raise path. ``_verify_recovered_database`` collects
+        # errors and returns, so an output that failed verification is kept
+        # for the inspection the CLI tells the user to perform.
+        if output_created:
+            _discard_recovery_output(output)
+        raise
     finally:
         temp_dir.cleanup()
 
