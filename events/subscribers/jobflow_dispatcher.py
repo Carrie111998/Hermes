@@ -36,7 +36,7 @@ from typing import Any, Callable, Optional
 
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
-from jobflow_dispatch.contracts import route_mailbox
+from jobflow_dispatch.contracts import message_key as canonical_key, route_mailbox
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +127,12 @@ class JobFlowDispatcher(BaseSubscriber):
         if not targets:
             return
 
-        message_key = payload.get("file") or getattr(event, "correlation_id", None)
-        if not isinstance(message_key, str) or not message_key.strip():
+        raw_key = payload.get("file") or getattr(event, "correlation_id", None)
+        try:
+            # MailboxWatcher yields OS-native separators; the reconciler builds
+            # its own. Both must land on the same ledger row.
+            key = canonical_key(raw_key)
+        except ValueError:
             logger.warning("dispatch: message with no usable key — dropped")
             return
 
@@ -137,23 +141,43 @@ class JobFlowDispatcher(BaseSubscriber):
 
         for activity_id in targets:
             if not self.store.claim(
-                message_key, activity_id, now=now, correlation_id=correlation_id
+                key, activity_id, now=now, correlation_id=correlation_id
             ):
                 continue  # already claimed or completed — at-least-once absorbed
 
+            # From here on, any path that does NOT deliver a wake must hand the
+            # claim back. A committed claim with no wake is the worst state:
+            # the reconciler skips it (it looks claimed) and no worker was ever
+            # woken, so the work stalls until the lease expires.
             try:
                 job_id = self._resolve_job_id(activity_id)
             except Exception:
                 logger.exception("dispatch: resolving %s failed", activity_id)
+                self._release(key, activity_id)
                 continue
             if not job_id:
+                self._release(key, activity_id)
                 continue
 
             if self._mode == MODE_SHADOW:
                 logger.info(
                     "dispatch[shadow]: would wake %s (%s) for %s",
-                    job_id, activity_id, message_key,
+                    job_id, activity_id, key,
                 )
+                # Shadow observes; it must not consume work it never dispatched,
+                # or the real run would find it already claimed.
+                self._release(key, activity_id)
                 continue
 
-            self._waker(job_id, caller=self.subscriber_id, reason="mailbox_message")
+            if self._waker(job_id, caller=self.subscriber_id, reason="mailbox_message") is False:
+                logger.warning(
+                    "dispatch: wake channel refused %s (%s) — releasing claim",
+                    job_id, activity_id,
+                )
+                self._release(key, activity_id)
+
+    def _release(self, key: str, activity_id: str) -> None:
+        try:
+            self.store.release(key, activity_id)
+        except Exception:
+            logger.exception("dispatch: releasing claim %s/%s failed", key, activity_id)

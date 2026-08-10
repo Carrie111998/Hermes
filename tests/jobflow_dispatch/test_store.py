@@ -176,3 +176,44 @@ class TestSharedLedgerPath:
         assert path.name == "jobflow_dispatch.db"
         assert path.parent.name == "telemetry"
         assert "profiles" not in path.parts
+
+
+class TestLeaseOutlivesRealRuns:
+    def test_default_lease_exceeds_the_cron_wall_clock_ceiling(self):
+        """A lease shorter than a legitimate run causes duplicate model calls.
+
+        Nothing calls complete() in production yet, so lease expiry is the ONLY
+        thing that releases a claim. If a woken worker can legitimately run
+        longer than the lease, redelivery or reconciliation re-claims the same
+        message mid-run and wakes it a second time.
+        """
+        from jobflow_dispatch.store import CRON_WALL_CLOCK_CEILING_SECONDS, DEFAULT_LEASE_SECONDS
+
+        assert DEFAULT_LEASE_SECONDS > CRON_WALL_CLOCK_CEILING_SECONDS
+
+    def test_release_returns_a_claim_for_immediate_retry(self):
+        """Used when the wake could not be delivered after the claim committed."""
+        import tempfile, pathlib
+        from jobflow_dispatch.store import ActivationStore
+
+        store = ActivationStore(pathlib.Path(tempfile.mkdtemp()) / "d.db", lease_seconds=900)
+        assert store.claim("m1", "a1", now=1000) is True
+        store.release("m1", "a1")
+        assert store.claim("m1", "a1", now=1001) is True, "release must not wait for the lease"
+
+    def test_release_never_resurrects_completed_work(self):
+        import tempfile, pathlib
+        from jobflow_dispatch.store import ActivationStore
+
+        store = ActivationStore(pathlib.Path(tempfile.mkdtemp()) / "d.db", lease_seconds=900)
+        store.claim("m1", "a1", now=1000)
+        store.complete("m1", "a1", outcome="succeeded", now=1010)
+        store.release("m1", "a1")
+        assert store.claim("m1", "a1", now=2000) is False
+
+    def test_release_of_unknown_row_is_a_noop(self):
+        import tempfile, pathlib
+        from jobflow_dispatch.store import ActivationStore
+
+        store = ActivationStore(pathlib.Path(tempfile.mkdtemp()) / "d.db", lease_seconds=900)
+        store.release("nope", "a1")

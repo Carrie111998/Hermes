@@ -56,6 +56,21 @@ class Activation:
             raise ValueError("correlation_id must be non-empty when provided")
 
 
+def message_key(raw: Any) -> str:
+    """Canonical ledger key for one physical mailbox file.
+
+    Two producers derive this independently: ``MailboxWatcher`` from
+    ``Path.relative_to()`` (OS-native separators — backslashes on Windows) and
+    the reconciler by assembling ``destination/inbox/name``. Without one
+    normalisation the same file yields two ledger rows, and the reconciler
+    re-dispatches work the subscriber already claimed — duplicate model calls
+    with no error surfaced anywhere.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("message_key must be a non-empty string")
+    return raw.strip().replace("\\", "/")
+
+
 def _key(value: Any) -> str | None:
     if not isinstance(value, str):
         return None

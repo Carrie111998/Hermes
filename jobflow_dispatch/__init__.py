@@ -1,3 +1,3 @@
-from .contracts import Activation, route_mailbox
+from .contracts import Activation, message_key, route_mailbox
 
-__all__ = ["Activation", "route_mailbox"]
+__all__ = ["Activation", "message_key", "route_mailbox"]

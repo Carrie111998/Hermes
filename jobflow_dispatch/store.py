@@ -41,7 +41,17 @@ CREATE INDEX IF NOT EXISTS activations_pending
     ON activations (activity_id, state);
 """
 
-DEFAULT_LEASE_SECONDS = 900
+#: Longest a single cron run can legitimately take (``_DEFAULT_SCRIPT_TIMEOUT``
+#: in cron/scheduler.py, plus the agent's own wall-clock bound).
+CRON_WALL_CLOCK_CEILING_SECONDS = 3600
+
+#: The lease is a CRASH-recovery device, not a run timer. Nothing calls
+#: ``complete()`` in production yet — wiring a completion signal from a cron run
+#: back to this ledger is Task 5 work — so lease expiry is currently the only
+#: thing that releases a claim. It must therefore comfortably exceed the longest
+#: legitimate run, or redelivery re-claims a message while its worker is still
+#: going and wakes it a second time.
+DEFAULT_LEASE_SECONDS = 2 * CRON_WALL_CLOCK_CEILING_SECONDS
 
 
 def default_ledger_path() -> Path:
@@ -192,6 +202,33 @@ class ActivationStore:
                 )
                 if cursor.rowcount == 0:
                     raise KeyError(f"activation missing: {key}/{activity}")
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    def release(self, message_key: Any, activity_id: Any) -> None:
+        """Hand a claim back so it can be retried immediately.
+
+        For the case where the claim committed but the activation could not be
+        delivered (wake channel full, job unresolvable). Without this the
+        message is invisible to BOTH paths until the lease expires — claimed so
+        the reconciler skips it, but never actually woken.
+
+        Completed work is never resurrected.
+        """
+        key = _identity(message_key, "message_key")
+        activity = _identity(activity_id, "activity_id")
+
+        conn = self._get_conn()
+        with self._write_lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "DELETE FROM activations "
+                    "WHERE message_key = ? AND activity_id = ? AND state != 'completed'",
+                    (key, activity),
+                )
                 conn.commit()
             except Exception:
                 conn.rollback()

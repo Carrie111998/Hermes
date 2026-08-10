@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .contracts import ROUTES, Activation, route_mailbox
+from .contracts import ROUTES, Activation, message_key, route_mailbox
 from .store import ActivationStore
 
 #: Only these inbox directories are scanned. An unknown destination is not
@@ -88,16 +88,16 @@ def scan_actionable(
             if not targets:
                 continue
 
-            message_key = f"{destination}/inbox/{path.name}"
+            key = message_key(f"{destination}/inbox/{path.name}")
             correlation_id = _correlation_id(path)
             for activity_id in targets:
-                if not _is_available(store, message_key, activity_id, now):
+                if not _is_available(store, key, activity_id, now):
                     continue
                 found.append(
                     Activation(
                         activity_id=activity_id,
                         profile=profile,
-                        message_key=message_key,
+                        message_key=key,
                         correlation_id=correlation_id,
                         reason="reconcile",
                     )

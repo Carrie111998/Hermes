@@ -103,3 +103,41 @@ class TestActivation:
         routed = {aid for targets in ROUTES.values() for aid in targets}
         missing = sorted(a for a in routed if a not in registry.policies)
         assert missing == [], f"routes reference unknown activities: {missing}"
+
+
+class TestMessageKeyNormalisation:
+    """One physical file must produce ONE ledger key, whatever built it.
+
+    MailboxWatcher derives its key from ``Path.relative_to()``, which on
+    Windows yields backslashes; the reconciler assembles its own from the
+    destination and filename. Two spellings of the same file mean two ledger
+    rows, and the reconciler re-dispatches work the subscriber already
+    claimed — duplicate model calls with no error anywhere.
+    """
+
+    def test_separators_are_normalised(self):
+        from jobflow_dispatch.contracts import message_key
+
+        assert message_key("tailor" + chr(92) + "inbox" + chr(92) + "x.json") == "tailor/inbox/x.json"
+        assert message_key("tailor/inbox/x.json") == "tailor/inbox/x.json"
+
+    def test_watcher_and_reconciler_spellings_agree(self):
+        from pathlib import Path
+
+        from jobflow_dispatch.contracts import message_key
+
+        watcher_style = str(Path("tailor") / "inbox" / "x.json")   # OS-native
+        reconciler_style = "tailor/inbox/x.json"
+        assert message_key(watcher_style) == message_key(reconciler_style)
+
+    def test_mixed_separators_collapse(self):
+        from jobflow_dispatch.contracts import message_key
+
+        assert message_key("tailor" + chr(92) + "inbox/x.json") == "tailor/inbox/x.json"
+
+    @pytest.mark.parametrize("bad", (None, "", "   ", 7))
+    def test_unusable_keys_are_rejected(self, bad):
+        from jobflow_dispatch.contracts import message_key
+
+        with pytest.raises(ValueError, match="message_key"):
+            message_key(bad)
