@@ -165,7 +165,14 @@ class HostSupervisor:
         self._closing = False
         self._stopped_respawning = False
         self._restart_times: list[float] = []
-        self._pending_turns: dict[str, tuple[str, Callable[[dict], None] | None]] = {}
+        self._pending_turns: dict[
+            str,
+            tuple[
+                str,
+                Callable[[dict], None] | None,
+                Callable[[dict], None] | None,
+            ],
+        ] = {}
         self._pending_controls: dict[str, queue.Queue[dict]] = {}
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
@@ -240,6 +247,7 @@ class HostSupervisor:
         frame: dict[str, Any],
         *,
         on_complete: Callable[[dict], None] | None = None,
+        on_dispatch: Callable[[dict], None] | None = None,
     ) -> str:
         self.start()
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
@@ -248,7 +256,7 @@ class HostSupervisor:
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
         with self._lock:
-            self._pending_turns[request_id] = (sid, on_complete)
+            self._pending_turns[request_id] = (sid, on_complete, on_dispatch)
         try:
             self._send_frame(payload)
         except Exception as exc:
@@ -430,6 +438,16 @@ class HostSupervisor:
         if ftype in {"turn.end", "turn.error"}:
             self._complete_turn(frame)
             return
+        if ftype == "turn.dispatched":
+            request_id = str(frame.get("request_id") or "")
+            with self._lock:
+                pending = self._pending_turns.get(request_id)
+            if pending is not None and pending[2] is not None:
+                try:
+                    pending[2](frame)
+                except Exception:
+                    logger.exception("compute host turn dispatch callback failed")
+            return
         if ftype in {"control.ack", "control.error", "interrupt.ack", "reload_mcp.ack", "shutdown.ack"}:
             request_id = str(frame.get("request_id") or "")
             with self._lock:
@@ -456,7 +474,7 @@ class HostSupervisor:
             pending = self._pending_turns.pop(request_id, None)
         if pending is None:
             return
-        _sid, cb = pending
+        _sid, cb, _on_dispatch = pending
         if cb is not None:
             try:
                 cb(frame)
@@ -479,7 +497,7 @@ class HostSupervisor:
         with self._lock:
             pending = self._pending_turns
             self._pending_turns = {}
-        for request_id, (sid, cb) in pending.items():
+        for request_id, (sid, cb, _on_dispatch) in pending.items():
             frame = {
                 "type": "turn.error",
                 "sid": sid,

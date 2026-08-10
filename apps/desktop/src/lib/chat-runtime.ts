@@ -270,7 +270,13 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
       return { type: row.type, output: str(row.output) }
 
     case 'alias':
-      return typeof row.target === 'string' ? { type: 'alias', target: row.target } : null
+      return typeof row.target === 'string'
+        ? {
+            type: 'alias',
+            target: row.target,
+            ...(typeof row.arg === 'string' ? { arg: row.arg } : {})
+          }
+        : null
 
     case 'skill':
       return typeof row.name === 'string'

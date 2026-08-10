@@ -156,6 +156,18 @@ _VAR_MAP = {
 }
 
 
+@contextmanager
+def session_platform_scope(platform: str, profile: str = ""):
+    """Temporarily bind catalog discovery to one adapter's platform/profile."""
+    platform_token = _SESSION_PLATFORM.set(platform or "")
+    profile_token = _SESSION_PROFILE.set(profile or "")
+    try:
+        yield
+    finally:
+        _SESSION_PROFILE.reset(profile_token)
+        _SESSION_PLATFORM.reset(platform_token)
+
+
 def set_current_session_id(session_id: str) -> None:
     """Synchronize ``HERMES_SESSION_ID`` across ContextVar and ``os.environ``.
 

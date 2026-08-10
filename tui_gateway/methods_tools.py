@@ -9,6 +9,7 @@ from .method_ctx import HandlerRegistry
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
+_session_catalog_scoped = _registry.session_catalog_scoped
 
 
 @method("system.battery")
@@ -253,6 +254,7 @@ def _(rid, params: dict) -> dict:
 
 
 @method("commands.catalog")
+@_session_catalog_scoped
 def _(rid, params: dict) -> dict:
     """Registry-backed slash metadata for the TUI — categorized, no aliases."""
     try:
@@ -593,6 +595,38 @@ def _(rid, params: dict) -> dict:
         from hermes_cli.init_command import build_init_prompt_for_cwd
 
         return _ok(rid, {"type": "send", "message": build_init_prompt_for_cwd(extra=arg)})
+    if name == "refresh":
+        if arg.strip() == "--branch":
+            if not session:
+                return _err(rid, 4001, "no active session")
+            # Reload under the authoritative profile before asking the client
+            # to reuse its normal native branch action. session.branch remains
+            # the sole owner of child construction, lineage, and switching.
+            from agent.session_refresh import build_soft_refresh
+            from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+            profile_token = set_hermes_home_override(session.get("profile_home"))
+            try:
+                build_soft_refresh()
+            finally:
+                reset_hermes_home_override(profile_token)
+            return _ok(rid, {"type": "alias", "target": "branch", "arg": ""})
+        if arg.strip():
+            return _err(rid, 4004, "usage: /refresh [--branch]")
+        if not session:
+            return _err(rid, 4001, "no active session")
+
+        from agent.session_refresh import build_soft_refresh
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_token = set_hermes_home_override(session.get("profile_home"))
+        try:
+            result = build_soft_refresh()
+        finally:
+            reset_hermes_home_override(profile_token)
+        with session["history_lock"]:
+            _queue_pending_refresh_note_locked(session, result.context_note)
+        return _ok(rid, {"type": "exec", "output": result.report})
     if name == "moa":
         # /moa is one-shot sugar only: run a single prompt through the default
         # MoA preset, then restore the prior model. To *switch* to a MoA preset

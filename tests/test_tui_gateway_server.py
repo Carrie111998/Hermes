@@ -8516,6 +8516,67 @@ def test_commands_catalog_survives_an_unreadable_usage_sidecar(monkeypatch):
     )
 
 
+def test_commands_catalog_uses_live_session_profile_without_cache_leak(
+    tmp_path, monkeypatch
+):
+    """A warmed gateway must discover skills in the requested session scope."""
+    from agent import skill_commands
+
+    default_home = tmp_path / "default"
+    secondary_home = tmp_path / "secondary"
+    for home, name in (
+        (default_home, "default-only"),
+        (secondary_home, "secondary-only"),
+    ):
+        skill_dir = home / "skills" / name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            f"---\nname: {name}\ndescription: Profile marker.\n---\n# {name}\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(skill_commands, "_skill_commands_cache", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands", {})
+    monkeypatch.setattr(skill_commands, "_skill_commands_key", None)
+    sid = "secondary-catalog-profile"
+    server._sessions[sid] = {
+        "history_lock": threading.Lock(),
+        "profile_home": str(secondary_home),
+        "source": "desktop",
+    }
+    try:
+        secondary = server.handle_request(
+            {
+                "id": "secondary",
+                "method": "commands.catalog",
+                "params": {"session_id": sid},
+            }
+        )
+        default = server.handle_request(
+            {"id": "default", "method": "commands.catalog", "params": {}}
+        )
+        secondary_again = server.handle_request(
+            {
+                "id": "secondary-again",
+                "method": "commands.catalog",
+                "params": {"session_id": sid},
+            }
+        )
+    finally:
+        server._sessions.pop(sid, None)
+
+    secondary_names = dict(secondary["result"]["pairs"])
+    default_names = dict(default["result"]["pairs"])
+    secondary_again_names = dict(secondary_again["result"]["pairs"])
+    assert "/secondary-only" in secondary_names
+    assert "/default-only" not in secondary_names
+    assert "/default-only" in default_names
+    assert "/secondary-only" not in default_names
+    assert "/secondary-only" in secondary_again_names
+    assert "/default-only" not in secondary_again_names
+
+
 def test_commands_catalog_includes_tui_mouse_command():
     resp = server.handle_request(
         {"id": "1", "method": "commands.catalog", "params": {}}

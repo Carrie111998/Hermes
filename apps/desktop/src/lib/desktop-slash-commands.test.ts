@@ -18,6 +18,8 @@ describe('desktop slash command curation', () => {
   it('keeps core desktop chat commands in suggestions', () => {
     expect(isDesktopSlashSuggestion('/new')).toBe(true)
     expect(isDesktopSlashSuggestion('/branch')).toBe(true)
+    expect(isDesktopSlashSuggestion('/refresh')).toBe(true)
+    expect(resolveDesktopCommand('/refresh')?.surface).toEqual({ kind: 'exec' })
     expect(isDesktopSlashSuggestion('/skin')).toBe(true)
     expect(isDesktopSlashSuggestion('/usage')).toBe(true)
     expect(isDesktopSlashSuggestion('/version')).toBe(true)

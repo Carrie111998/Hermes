@@ -10385,6 +10385,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.undo_last(_undo_n)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "refresh":
+            self._handle_refresh_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":
@@ -14342,6 +14344,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if _srn:
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
+                _refresh_note = getattr(self, '_pending_refresh_note', None)
+                if _refresh_note:
+                    agent_message = _prepend_note_to_message(agent_message, _refresh_note)
+                    self._pending_refresh_note = None
                 # Barged mid-speech (VAD or record key)? Tell the model it was
                 # cut off — same one-shot, API-local note channel as above.
                 from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted

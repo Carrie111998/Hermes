@@ -38,6 +38,11 @@ class HandlerRegistry:
         fn._hermes_profile_scoped = True
         return fn
 
+    def session_catalog_scoped(self, fn):
+        """Bind command discovery to the live session named by the RPC."""
+        fn._hermes_session_catalog_scoped = True
+        return fn
+
     def install(self, server) -> None:
         """Rebind pending handlers onto ``server``'s globals and register them."""
         g = vars(server)
@@ -50,4 +55,6 @@ class HandlerRegistry:
             real.__dict__.update(fn.__dict__)
             if getattr(fn, "_hermes_profile_scoped", False):
                 real = server._profile_scoped(real)
+            if getattr(fn, "_hermes_session_catalog_scoped", False):
+                real = server._session_catalog_scoped(real)
             server._methods[name] = real

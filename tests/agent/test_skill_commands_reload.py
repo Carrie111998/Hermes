@@ -13,6 +13,7 @@ dicts. Descriptions are truncated to 60 chars.
 import shutil
 import tempfile
 import textwrap
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -109,3 +110,89 @@ class TestReloadSkillsHelper:
             "prompt cache snapshot should be preserved — skills don't live "
             "in the system prompt so there's no reason to invalidate it"
         )
+
+
+def test_warmed_import_keeps_profile_skill_catalogs_isolated(tmp_path, monkeypatch):
+    """A later context-local profile must not reuse the import-time skills dir."""
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    _write_skill(profile_a / "skills", "alpha-only", "alpha private description")
+    _write_skill(profile_b / "skills", "beta-only", "beta private description")
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+
+    # Warm both modules while profile A is process-global.  This reproduces
+    # long-lived multiplexed gateways where profile B is selected afterward.
+    import agent.skill_commands as skill_commands
+    import tools.skills_tool  # noqa: F401
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    skill_commands._skill_commands = {}
+    assert set(skill_commands.scan_skill_commands()) == {"/alpha-only"}
+
+    token = set_hermes_home_override(profile_b)
+    try:
+        beta = skill_commands.reload_skills()
+        catalog = skill_commands.get_skill_commands()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert set(catalog) == {"/beta-only"}
+    assert catalog["/beta-only"]["description"] == "beta private description"
+    assert "alpha private description" not in repr(catalog)
+    assert beta["added"] == [
+        {"name": "beta-only", "description": "beta private description"}
+    ]
+
+
+def test_concurrent_profile_scans_publish_complete_isolated_snapshots(tmp_path, monkeypatch):
+    """Readers must see one complete profile/platform snapshot, never a blend."""
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    for index in range(8):
+        _write_skill(
+            profile_a / "skills", f"alpha-{index}", f"alpha private {index}"
+        )
+        _write_skill(
+            profile_b / "skills", f"beta-{index}", f"beta private {index}"
+        )
+    monkeypatch.setenv("HERMES_HOME", str(profile_a))
+
+    import agent.skill_commands as skill_commands
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    skill_commands._skill_commands = {}
+    expected = {
+        profile_a: {f"/alpha-{index}" for index in range(8)},
+        profile_b: {f"/beta-{index}" for index in range(8)},
+    }
+
+    def read_profile(home: Path) -> list[dict]:
+        token = set_hermes_home_override(home)
+        try:
+            seen = []
+            for _ in range(30):
+                skill_commands.reload_skills()
+                catalog = skill_commands.get_skill_commands()
+                seen.append({
+                    "keys": set(catalog),
+                    "descriptions": {row["description"] for row in catalog.values()},
+                })
+            return seen
+        finally:
+            reset_hermes_home_override(token)
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(read_profile, profile_a),
+            pool.submit(read_profile, profile_b),
+            pool.submit(read_profile, profile_a),
+            pool.submit(read_profile, profile_b),
+        ]
+
+    for home, future in zip(
+        (profile_a, profile_b, profile_a, profile_b), futures, strict=True
+    ):
+        for snapshot in future.result():
+            assert snapshot["keys"] == expected[home]
+            private_prefix = "alpha" if home == profile_a else "beta"
+            assert all(desc.startswith(private_prefix) for desc in snapshot["descriptions"])

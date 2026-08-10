@@ -15746,6 +15746,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
+        if canonical == "refresh":
+            return await self._handle_refresh_command(event)
+
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
 
@@ -16117,6 +16120,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        # Claim refresh context only for a genuine inbound user event accepted
+        # after the command. Event timestamps keep an older FIFO entry from
+        # stealing the note; generation keeps an already-running turn out.
+        if not is_internal:
+            refresh_reservation = self._claim_refresh_context_note(
+                _quick_key, event, _run_generation
+            )
+            if refresh_reservation:
+                event.metadata["refresh_context_note"] = refresh_reservation["note"]
+                event.metadata["refresh_context_token"] = refresh_reservation["token"]
+
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(
@@ -16168,6 +16182,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            if not (getattr(event, "metadata", None) or {}).get(
+                "refresh_context_note_committed"
+            ):
+                self._finish_refresh_context_note(
+                    _quick_key,
+                    str((getattr(event, "metadata", None) or {}).get("refresh_context_token") or ""),
+                    _run_generation,
+                    attempted=False,
+                )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -18080,8 +18103,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            refresh_context_note = str(
+                (getattr(event, "metadata", None) or {}).get("refresh_context_note") or ""
+            )
+            agent_message_text = (
+                refresh_context_note + "\n\n" + message_text
+                if refresh_context_note
+                else message_text
+            )
+            # This is the authoritative model-dispatch boundary. Everything
+            # above it is rollback-safe; once _run_agent is invoked the note is
+            # consumed exactly once even if the provider later fails.
+            if refresh_context_note:
+                self._finish_refresh_context_note(
+                    session_key,
+                    str(event.metadata.get("refresh_context_token") or ""),
+                    run_generation,
+                    attempted=True,
+                )
+                event.metadata["refresh_context_note_committed"] = True
             agent_result = await self._run_agent(
-                message=message_text,
+                message=agent_message_text,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -18826,6 +18868,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if not (getattr(event, "metadata", None) or {}).get(
+                "refresh_context_note_committed"
+            ):
+                self._finish_refresh_context_note(
+                    _quick_key,
+                    str((getattr(event, "metadata", None) or {}).get("refresh_context_token") or ""),
+                    run_generation,
+                    attempted=False,
+                )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -23679,6 +23730,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if isinstance(pending_skills_reload_notes, dict):
             pending_skills_reload_notes.pop(session_key, None)
+
+        pending_refresh_notes = getattr(self, "_pending_refresh_notes", None)
+        if isinstance(pending_refresh_notes, dict):
+            pending_refresh_notes.pop(session_key, None)
 
         _sec_state = self._peek_session_state(session_key)
         if _sec_state is not None:

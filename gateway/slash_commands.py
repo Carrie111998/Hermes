@@ -24,6 +24,8 @@ import os
 import re
 import shlex
 import sys
+import threading
+import uuid
 import time
 from datetime import datetime
 from pathlib import Path
@@ -4883,6 +4885,94 @@ class GatewaySlashCommandsMixin:
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
+    async def _handle_refresh_command(self, event: MessageEvent) -> str:
+        """Handle cache-safe soft refresh or delegate authoritative branching."""
+        args = event.get_command_args().strip()
+        if args == "--branch":
+            # Authoritative refresh happens before the native branch copies
+            # lineage and constructs its child from current skills/memory.
+            await self._reload_skills_and_refresh_adapters(event.source)
+            # The branch handler remains the sole owner of transcript copying,
+            # lineage, routing columns, cache eviction, and child switching.
+            event.text = "/branch"
+            return await self._handle_branch_command(event)
+        if args:
+            return "Usage: /refresh [--branch]"
+
+        from agent.session_refresh import build_soft_refresh
+
+        skills_result = await self._reload_skills_and_refresh_adapters(event.source)
+        result = await asyncio.to_thread(build_soft_refresh, skills_result=skills_result)
+        session_key = self._session_key_for_source(event.source)
+        if session_key:
+            state = self._session_state(session_key)
+            lock = getattr(self, "_pending_refresh_notes_lock", None)
+            if lock is None:
+                lock = threading.RLock()
+                self._pending_refresh_notes_lock = lock
+            with lock:
+                if not hasattr(self, "_pending_refresh_notes"):
+                    self._pending_refresh_notes = {}
+                self._pending_refresh_notes.setdefault(session_key, []).append({
+                    "token": uuid.uuid4().hex,
+                    "note": result.context_note,
+                    "after": event.timestamp,
+                    "generation": int(state.persistent.run_generation) + 1,
+                    "reserved_by": None,
+                })
+        return result.report
+
+    def _claim_refresh_context_note(self, session_key, event, generation: int) -> dict | None:
+        """Reserve a refresh note for one accepted genuine inbound event."""
+        if getattr(event, "internal", False) or event.is_command():
+            return None
+        lock = getattr(self, "_pending_refresh_notes_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._pending_refresh_notes_lock = lock
+        pending_refresh = getattr(self, "_pending_refresh_notes", None)
+        with lock:
+            records = pending_refresh.get(session_key) if isinstance(pending_refresh, dict) else None
+            if not isinstance(records, list):
+                return None
+            event_time = getattr(event, "timestamp", None)
+            for pending in records:
+                after = pending.get("after")
+                if (
+                    pending.get("reserved_by") is not None
+                    or generation < int(pending.get("generation", 0) or 0)
+                    or event_time is None
+                    or after is None
+                    or event_time <= after
+                ):
+                    continue
+                pending["reserved_by"] = generation
+                return {"token": pending["token"], "note": str(pending.get("note") or "")}
+            return None
+
+    def _finish_refresh_context_note(
+        self, session_key, token: str, generation: int, *, attempted: bool
+    ) -> None:
+        """Commit an attempted reservation, or release it for a safe retry."""
+        lock = getattr(self, "_pending_refresh_notes_lock", None)
+        pending_refresh = getattr(self, "_pending_refresh_notes", None)
+        if lock is None or not isinstance(pending_refresh, dict):
+            return
+        with lock:
+            records = pending_refresh.get(session_key)
+            if not isinstance(records, list):
+                return
+            for index, pending in enumerate(records):
+                if pending.get("token") != token or pending.get("reserved_by") != generation:
+                    continue
+                if attempted:
+                    records.pop(index)
+                    if not records:
+                        pending_refresh.pop(session_key, None)
+                else:
+                    pending["reserved_by"] = None
+                return
+
     async def _handle_topup_command(self, event: MessageEvent) -> str:
         """Handle /topup -- show the Nous balance and hand off to the portal.
 
@@ -5296,11 +5386,8 @@ class GatewaySlashCommandsMixin:
         is written to the session transcript out-of-band, so message
         alternation is preserved.
         """
-        loop = asyncio.get_running_loop()
         try:
-            from agent.skill_commands import reload_skills
-
-            result = await loop.run_in_executor(None, reload_skills)
+            result = await self._reload_skills_and_refresh_adapters(event.source)
             added = result.get("added", [])      # [{"name", "description"}, ...]
             removed = result.get("removed", [])  # [{"name", "description"}, ...]
             total = result.get("total", 0)
@@ -5313,20 +5400,6 @@ class GatewaySlashCommandsMixin:
             # adapters that don't override refresh_skill_group (Telegram's
             # BotCommand menu, Slack subcommand map, etc.) are silently
             # skipped — the in-process reload above is enough for them.
-            for adapter in list(self.adapters.values()):
-                refresh = getattr(adapter, "refresh_skill_group", None)
-                if not callable(refresh):
-                    continue
-                try:
-                    maybe = refresh()
-                    if inspect.isawaitable(maybe):
-                        await maybe
-                except Exception as exc:
-                    logger.warning(
-                        "Adapter %s refresh_skill_group raised: %s",
-                        getattr(adapter, "name", adapter), exc,
-                    )
-
             lines = [t("gateway.reload_skills.header")]
             if not added and not removed:
                 lines.append(t("gateway.reload_skills.no_new"))
@@ -5380,6 +5453,62 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.warning("Skills reload failed: %s", e)
             return t("gateway.reload_skills.failed", error=e)
+
+    async def _reload_skills_and_refresh_adapters(self, source: SessionSource) -> dict:
+        """Reload and resync only the transport profile that owns ``source``."""
+        from agent.skill_commands import reload_skills
+        from hermes_constants import get_hermes_home
+        from gateway.run import _profile_runtime_scope
+        from gateway.session_context import session_platform_scope
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        default_adapters = getattr(self, "adapters", None) or {}
+        if profile_home == get_hermes_home():
+            adapters = default_adapters
+            profile_name = None
+        else:
+            profile_name = self._adapter_profile_for_source(source)
+            invoking_adapter = self._adapter_for_source(source)
+            adapters = None
+            if invoking_adapter in default_adapters.values():
+                adapters = default_adapters
+                profile_name = None
+            else:
+                for owner, owned in (
+                    getattr(self, "_profile_adapters", None) or {}
+                ).items():
+                    if invoking_adapter in owned.values():
+                        adapters = owned
+                        profile_name = owner
+                        break
+        if adapters is None:
+            # Fail closed: an unowned/stale source must never resync another
+            # profile merely because its platform name happens to match.
+            adapters = {}
+
+        caller_platform = getattr(getattr(source, "platform", None), "value", "")
+        with _profile_runtime_scope(profile_home), session_platform_scope(
+            caller_platform, profile_name or ""
+        ):
+            result = await asyncio.to_thread(reload_skills)
+        for platform, adapter in list(adapters.items()):
+            refresh = getattr(adapter, "refresh_skill_group", None)
+            if not callable(refresh):
+                continue
+            try:
+                platform_name = getattr(platform, "value", str(platform))
+                with _profile_runtime_scope(profile_home), session_platform_scope(
+                    platform_name, profile_name or ""
+                ):
+                    maybe = refresh()
+                    if inspect.isawaitable(maybe):
+                        await maybe
+            except Exception as exc:
+                logger.warning(
+                    "Adapter %s refresh_skill_group raised: %s",
+                    getattr(adapter, "name", adapter), exc,
+                )
+        return result
 
     async def _handle_bundles_command(self, event: MessageEvent) -> str:
         """Handle /bundles — list installed skill bundles.

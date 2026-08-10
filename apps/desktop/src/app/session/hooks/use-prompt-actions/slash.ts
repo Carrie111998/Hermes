@@ -15,6 +15,7 @@ import {
   resolveDesktopCommand
 } from '@/lib/desktop-slash-commands'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
+import { cachedSlashCompletion, invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { openCommandPalettePage } from '@/store/command-palette'
 import { setComposerDraft } from '@/store/composer'
@@ -267,11 +268,27 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           if (dispatch.type === 'exec' || dispatch.type === 'plugin') {
             renderSlashOutput(dispatch.output ?? '(no output)')
 
+            if (name === 'refresh') {
+              invalidateSlashCompletions()
+              await cachedSlashCompletion('catalog', () =>
+                requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
+              ).catch(() => undefined)
+            }
+
             return
           }
 
           if (dispatch.type === 'alias') {
-            await runSlash(`/${dispatch.target}${arg ? ` ${arg}` : ''}`, sessionId, false)
+            const aliasArg = dispatch.arg === undefined ? arg : dispatch.arg
+
+            if (name === 'refresh') {
+              invalidateSlashCompletions()
+              await cachedSlashCompletion('catalog', () =>
+                requestGateway<CommandsCatalogLike>('commands.catalog', { session_id: sessionId })
+              ).catch(() => undefined)
+            }
+
+            await runSlash(`/${dispatch.target}${aliasArg ? ` ${aliasArg}` : ''}`, sessionId, false)
 
             return
           }

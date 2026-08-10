@@ -19,7 +19,11 @@ export const asCommandDispatch = (value: unknown): CommandDispatchResponse | nul
   }
 
   if (t === 'alias' && typeof o.target === 'string') {
-    return { type: 'alias', target: o.target }
+    return {
+      type: 'alias',
+      target: o.target,
+      ...(typeof o.arg === 'string' ? { arg: o.arg } : {})
+    }
   }
 
   const str = (value: unknown) => (typeof value === 'string' ? value : undefined)

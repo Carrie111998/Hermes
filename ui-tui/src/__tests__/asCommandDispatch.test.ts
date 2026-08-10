@@ -6,6 +6,11 @@ describe('asCommandDispatch', () => {
   it('parses exec, alias, skill, and send', () => {
     expect(asCommandDispatch({ type: 'exec', output: 'hi' })).toEqual({ type: 'exec', output: 'hi' })
     expect(asCommandDispatch({ type: 'alias', target: 'help' })).toEqual({ type: 'alias', target: 'help' })
+    expect(asCommandDispatch({ type: 'alias', target: 'branch', arg: '' })).toEqual({
+      type: 'alias',
+      target: 'branch',
+      arg: ''
+    })
     expect(asCommandDispatch({ type: 'skill', name: 'x', message: 'do' })).toEqual({
       type: 'skill',
       name: 'x',
