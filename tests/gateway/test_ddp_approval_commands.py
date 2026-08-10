@@ -395,7 +395,7 @@ async def test_ddp_approve_fails_closed_when_decision_lookup_is_unavailable(tmp_
 
     assert "unavailable" in result.lower()
     assert ledger.get_request(request_id)["state"] == "TRIAGED"
-    assert not runner._ddp_confirmation_store()
+    assert not runner._ddp_decision_service().has_pending()
 
 
 @pytest.mark.asyncio
@@ -547,7 +547,7 @@ async def test_ddp_confirmation_commits_before_telemetry_failure(tmp_path):
     assert "telemetry" in result.lower()
     assert ledger.get_request(request_id)["state"] == "PLANNED"
     assert ledger.human_decision_for(request_id, "telegram:admin-1") is not None
-    assert token not in runner._ddp_confirmation_store()
+    assert runner._ddp_decision_service().pending(token) is None
 
 
 @pytest.mark.asyncio
@@ -581,7 +581,7 @@ async def test_ddp_confirm_uses_durable_token_guard_for_concurrent_delivery(tmp_
     assert "already decided" in result.lower()
     assert ledger.get_request(request_id)["state"] == "TRIAGED"
     assert len(ledger.transitions_for(request_id)) == 1
-    assert token not in runner._ddp_confirmation_store()
+    assert runner._ddp_decision_service().pending(token) is None
 
 
 @pytest.mark.asyncio
@@ -683,7 +683,7 @@ async def test_ddp_confirmation_rejects_missing_unknown_and_wrong_decision_token
     assert "different" in wrong_decision.lower()
     assert ledger.get_request(request_id)["state"] == "TRIAGED"
     assert ledger.human_decision_for(request_id, "telegram:admin-1") is None
-    assert token in runner._ddp_confirmation_store()
+    assert runner._ddp_decision_service().pending(token) is not None
 
 
 @pytest.mark.asyncio
@@ -696,15 +696,18 @@ async def test_ddp_confirmation_expiry_removes_pending_token_without_mutating(tm
         _make_event(f"/ddp-approve {request_id} operator reviewed", source)
     )
     token = prompt.rsplit(" ", 1)[-1].strip("`.")
-    runner._ddp_confirmation_store()[token]["created_at"] = 0
-    monkeypatch.setattr("gateway.slash_commands.time.monotonic", lambda: runner._DDP_CONFIRM_TTL_SECONDS + 1)
+    monkeypatch.setattr(
+        runner._ddp_decision_service(),
+        "_monotonic",
+        lambda: runner._ddp_decision_service().pending(token).expires_at_monotonic + 1,
+    )
 
     result = await runner._handle_ddp_approve_confirm_command(
         _make_event(f"/ddp-approve-confirm {token}", source)
     )
 
     assert "expired" in result.lower()
-    assert token not in runner._ddp_confirmation_store()
+    assert runner._ddp_decision_service().pending(token) is None
     assert ledger.get_request(request_id)["state"] == "TRIAGED"
     assert ledger.human_decision_for(request_id, "telegram:admin-1") is None
 
