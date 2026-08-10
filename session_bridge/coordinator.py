@@ -3555,14 +3555,29 @@ class SessionBridgeCoordinator:
         }
 
     async def _after_successful_scan(self, summary: ScanSummary) -> None:
-        if summary.failed or not await self._register_sidebar_after_successful_scan():
+        if summary.failed:
             return
-        if self._any_configured_provider_unhealthy():
-            return
-        if self._sidebar_executor is not None:
+        sidebar_registered = await self._register_sidebar_after_successful_scan()
+        providers_unhealthy = self._any_configured_provider_unhealthy()
+        if (
+            sidebar_registered
+            and not providers_unhealthy
+            and self._sidebar_executor is not None
+        ):
             await self._run_post_scan_worker(
                 self._sidebar_executor, "sidebar_executor_failed"
             )
+        # Claude-side visibility is a separate lane from the Codex sidebar. The
+        # 2026-07-17 claude-native-session-visibility design requires that it
+        # "must not reuse or couple transitions to session_sidebar_jobs, which
+        # remains specific to Codex" -- pausing the Codex sidebar is a supported
+        # state and must not silently stop desktop registry records.
+        #
+        # It is deliberately outside the provider-health gate too: floating and
+        # registering mirrors only reads the local state database and writes
+        # local registry files, so it cannot depend on Codex reachability. Codex
+        # scans hang on this host (codex_scan_failed), which otherwise starves
+        # the Claude lane indefinitely.
         if self._mirror_float is not None:
             await self._run_post_scan_worker(
                 self._mirror_float, "mirror_float_failed"

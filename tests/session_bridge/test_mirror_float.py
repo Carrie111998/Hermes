@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from datetime import timezone
 from pathlib import Path
@@ -11,7 +12,10 @@ from session_bridge.claude_visibility import (
     ClaudeVisibilityCandidate,
     derive_claude_visibility_identity,
 )
-from session_bridge.mirror_float import ClaudeMirrorFloatWorker
+from session_bridge.mirror_float import (
+    ClaudeMirrorFloatWorker,
+    discover_ccd_registry_roots,
+)
 from session_bridge.models import (
     OriginKind,
     ProjectedMessage,
@@ -481,11 +485,13 @@ def test_serve_runtime_wires_mirror_float_when_configured(
     db, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     sentinel = Path("C:/sentinel-registry")
+    other = Path("C:/sentinel-registry-3p")
     monkeypatch.setattr(
-        "session_bridge.cli.discover_ccd_registry_root", lambda base: sentinel
+        "session_bridge.cli.discover_ccd_registry_roots", lambda: (sentinel, other)
     )
     coordinator = _serve_runtime_coordinator(db, monkeypatch, float_activity=True)
     assert isinstance(coordinator._mirror_float, ClaudeMirrorFloatWorker)
+    assert coordinator._mirror_float._registry_roots == (sentinel, other)
     assert coordinator._mirror_float._registry_root == sentinel
 
 
@@ -494,6 +500,96 @@ def test_serve_runtime_omits_mirror_float_when_disabled(
 ) -> None:
     coordinator = _serve_runtime_coordinator(db, monkeypatch, float_activity=False)
     assert coordinator._mirror_float is None
+
+
+def _make_harness(
+    user_data_dir: Path, account: str, workspace: str, records: int
+) -> Path:
+    """Build a Claude Code desktop userData dir with one populated registry leaf."""
+    user_data_dir.mkdir(parents=True, exist_ok=True)
+    (user_data_dir / "config.json").write_text(
+        json.dumps({"lastKnownAccountUuid": account}), encoding="utf-8"
+    )
+    leaf = user_data_dir / "claude-code-sessions" / account / workspace
+    leaf.mkdir(parents=True, exist_ok=True)
+    for index in range(records):
+        (leaf / f"local_{index}.json").write_text(
+            json.dumps({"cliSessionId": f"uuid-{index}"}), encoding="utf-8"
+        )
+    return leaf
+
+
+def test_discover_registry_roots_covers_every_harness(tmp_path) -> None:
+    main_leaf = _make_harness(tmp_path / "Claude", "acct-main", "ws-main", 3)
+    third_party_leaf = _make_harness(tmp_path / "Claude-3p", "acct-3p", "ws-3p", 2)
+
+    roots = discover_ccd_registry_roots(
+        (tmp_path / "Claude", tmp_path / "Claude-3p")
+    )
+
+    assert set(roots) == {main_leaf, third_party_leaf}
+
+
+def test_discover_registry_roots_ignores_backup_siblings(tmp_path) -> None:
+    """A recovery backup can hold MORE records than the live leaf.
+
+    The 3P store on this machine carries `.junction-backup-*` siblings that
+    junction back into the subscription store, so ranking leaves by population
+    silently resolves to the wrong harness.
+    """
+    leaf = _make_harness(tmp_path / "Claude-3p", "acct-3p", "ws-3p", 2)
+    account_dir = leaf.parent
+    decoy = account_dir / "ws-3p.junction-backup-20260809T2031384958"
+    decoy.mkdir()
+    for index in range(50):
+        (decoy / f"local_b{index}.json").write_text(
+            json.dumps({"cliSessionId": f"backup-{index}"}), encoding="utf-8"
+        )
+    (account_dir / "recovery-backup-20260809T2031384958").mkdir()
+    (account_dir / "ws-3p.real-20260728").mkdir()
+
+    roots = discover_ccd_registry_roots((tmp_path / "Claude-3p",))
+
+    assert roots == (leaf,)
+
+
+def test_discover_registry_roots_dedupes_shared_leaf(tmp_path) -> None:
+    leaf = _make_harness(tmp_path / "Claude", "acct", "ws", 2)
+
+    roots = discover_ccd_registry_roots((tmp_path / "Claude", tmp_path / "Claude"))
+
+    assert roots == (leaf,)
+
+
+def test_discover_registry_roots_skips_harness_without_account(tmp_path) -> None:
+    (tmp_path / "Claude-3p").mkdir()
+
+    assert discover_ccd_registry_roots((tmp_path / "Claude-3p",)) == ()
+
+
+def test_worker_registers_record_in_every_harness(db, tmp_path) -> None:
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    _seed_visible_mirror(
+        db,
+        store,
+        tmp_path,
+        provider=Provider.CODEX,
+        source_last_active=5_000.0,
+        mirror_mtime=1_000.0,
+    )
+    root_a = tmp_path / "registry-main"
+    root_b = tmp_path / "registry-3p"
+    root_a.mkdir()
+    root_b.mkdir()
+    worker = ClaudeMirrorFloatWorker(
+        store, min_interval_seconds=900.0, registry_roots=(root_a, root_b)
+    )
+
+    result = worker.run_once()
+
+    assert result["registered"] == 1
+    assert len(list(root_a.glob("local_*.json"))) == 1
+    assert len(list(root_b.glob("local_*.json"))) == 1
 
 
 def test_hermes_source_resolves_via_canonical_fallback(db, tmp_path) -> None:

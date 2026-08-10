@@ -7,11 +7,12 @@ import re
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .models import Provider, canonical_session_id
 
 _VISIBILITY_ORIGIN_PREFIX = "claude-visibility:"
+_BACKUP_MARKERS = (".junction-backup", ".real-", "recovery-backup")
 _REPLACE_ATTEMPTS = 3
 _REPLACE_RETRY_SECONDS = 0.05
 _CLI_SESSION_ID_PATTERN = re.compile(r'"cliSessionId"\s*:\s*"([^"]+)"')
@@ -46,6 +47,78 @@ def discover_ccd_registry_root(base: Path | None) -> Path | None:
     return None
 
 
+def _ccd_user_data_dirs() -> tuple[Path, ...]:
+    """Every Claude Code desktop userData dir this machine may run against.
+
+    The subscription harness and the third-party/gateway harness are two modes
+    of the same installed app, each with its own userData dir AND its own signed
+    in account, so neither one's sidebar can ever show the other's records.
+    """
+    dirs: list[Path] = []
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        dirs.append(Path(appdata) / "Claude")
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        dirs.append(Path(local_appdata) / "Claude-3p")
+    return tuple(dirs)
+
+
+def _account_uuid(user_data_dir: Path) -> str | None:
+    try:
+        raw = (user_data_dir / "config.json").read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = data.get("lastKnownAccountUuid") if isinstance(data, Mapping) else None
+    return value if isinstance(value, str) and value else None
+
+
+def discover_ccd_registry_roots(
+    user_data_dirs: Iterable[Path] | None = None,
+) -> tuple[Path, ...]:
+    """Resolve one live registry leaf per desktop harness.
+
+    Selection is anchored on ``config.json``'s ``lastKnownAccountUuid`` rather
+    than "the most populated leaf". The third-party store on this machine holds
+    ``.junction-backup-*`` siblings that junction back into the subscription
+    store and therefore contain MORE records than the harness's own real
+    directory -- a population ranking silently resolves to the wrong harness.
+    Rotated/backup siblings are excluded by name, and roots are de-duplicated by
+    resolved path so a junctioned harness is written exactly once.
+    """
+    candidates = (
+        tuple(user_data_dirs) if user_data_dirs is not None else _ccd_user_data_dirs()
+    )
+    roots: list[Path] = []
+    seen: set[str] = set()
+    for user_data_dir in candidates:
+        account = _account_uuid(user_data_dir)
+        if not account:
+            continue
+        account_dir = user_data_dir / "claude-code-sessions" / account
+        if not account_dir.is_dir():
+            continue
+        leaves = [
+            leaf
+            for leaf in account_dir.iterdir()
+            if leaf.is_dir()
+            and not any(marker in leaf.name for marker in _BACKUP_MARKERS)
+        ]
+        if not leaves:
+            continue
+        leaf = max(leaves, key=lambda path: len(list(path.glob("local_*.json"))))
+        try:
+            key = os.path.normcase(str(leaf.resolve()))
+        except OSError:
+            key = os.path.normcase(str(leaf))
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(leaf)
+    return tuple(roots)
+
+
 class _MirrorFloatSkip(Exception):
     """Internal: this mirror cannot be floated safely; count it as skipped."""
 
@@ -77,6 +150,7 @@ class ClaudeMirrorFloatWorker:
         *,
         min_interval_seconds: float = 900.0,
         registry_root: Path | None = None,
+        registry_roots: Iterable[Path] | None = None,
         id_factory: Callable[[], str] | None = None,
         run_min_interval_seconds: float = 300.0,
         monotonic: Callable[[], float] = time.monotonic,
@@ -89,9 +163,17 @@ class ClaudeMirrorFloatWorker:
             raise ValueError("run_min_interval_seconds must be finite and non-negative")
         if registry_root is not None and not isinstance(registry_root, Path):
             raise TypeError("registry_root must be a Path or None")
+        roots: list[Path] = []
+        if registry_root is not None:
+            roots.append(registry_root)
+        for root in registry_roots or ():
+            if not isinstance(root, Path):
+                raise TypeError("registry_roots must contain Path entries")
+            if root not in roots:
+                roots.append(root)
         self._store = store
         self._min_interval_seconds = interval
-        self._registry_root = registry_root
+        self._registry_roots = tuple(roots)
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
         self._run_min_interval_seconds = run_interval
         self._monotonic = monotonic
@@ -158,69 +240,82 @@ class ClaudeMirrorFloatWorker:
             floated = True
 
         registered = False
-        if self._registry_root is not None:
+        if self._registry_roots:
             registered, record_floated = self._ensure_registry_record(
                 canonical_id, claude_uuid, activity, registry_index
             )
             floated = floated or record_floated
         return floated, registered
 
+    @property
+    def _registry_root(self) -> Path | None:
+        """Back-compat accessor: the primary harness registry root."""
+        return self._registry_roots[0] if self._registry_roots else None
+
     def _ensure_registry_record(
         self,
         canonical_id: str,
         claude_uuid: str,
         activity: float,
-        registry_index: dict[str, Path],
+        registry_index: dict[Path, dict[str, Path]],
     ) -> tuple[bool, bool]:
         activity_ms = int(activity * 1000)
-        existing = registry_index.get(claude_uuid)
-        if existing is None:
-            session_row = self._store.db.get_session(canonical_id) or {}
-            record_id = f"local_{self._id_factory()}"
-            title = session_row.get("title") or f"[Bridge] {claude_uuid}"
-            cwd = session_row.get("cwd") or ""
-            started_at = session_row.get("started_at")
-            created_ms = (
-                int(float(started_at) * 1000)
-                if isinstance(started_at, (int, float))
-                and not isinstance(started_at, bool)
-                and math.isfinite(float(started_at))
-                else activity_ms
-            )
-            record = {
-                "sessionId": record_id,
-                "cliSessionId": claude_uuid,
-                "cwd": cwd,
-                "originCwd": cwd,
-                "createdAt": created_ms,
-                "lastActivityAt": activity_ms,
-                "model": session_row.get("model") or "claude-fable-5",
-                "isArchived": False,
-                "title": title,
-                "permissionMode": "default",
-                "alwaysAllowedReasons": [],
-                "sessionPermissionUpdates": [],
-            }
-            path = self._registry_root / f"{record_id}.json"
-            self._write_record(path, record)
-            registry_index[claude_uuid] = path
-            return True, False
-        try:
-            record = json.loads(existing.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            raise _MirrorFloatSkip("registry record unreadable") from None
-        recorded_ms = record.get("lastActivityAt")
-        if (
-            not isinstance(recorded_ms, (int, float))
-            or isinstance(recorded_ms, bool)
-            or not math.isfinite(float(recorded_ms))
-        ):
-            recorded_ms = 0
-        if activity_ms - float(recorded_ms) < self._min_interval_seconds * 1000:
-            return False, False
-        record["lastActivityAt"] = activity_ms
-        self._write_record(existing, record)
-        return False, True
+        session_row: Mapping[str, Any] | None = None
+        registered = False
+        floated = False
+        for root in self._registry_roots:
+            index = registry_index.setdefault(root, {})
+            existing = index.get(claude_uuid)
+            if existing is None:
+                if session_row is None:
+                    session_row = self._store.db.get_session(canonical_id) or {}
+                record_id = f"local_{self._id_factory()}"
+                title = session_row.get("title") or f"[Bridge] {claude_uuid}"
+                cwd = session_row.get("cwd") or ""
+                started_at = session_row.get("started_at")
+                created_ms = (
+                    int(float(started_at) * 1000)
+                    if isinstance(started_at, (int, float))
+                    and not isinstance(started_at, bool)
+                    and math.isfinite(float(started_at))
+                    else activity_ms
+                )
+                record = {
+                    "sessionId": record_id,
+                    "cliSessionId": claude_uuid,
+                    "cwd": cwd,
+                    "originCwd": cwd,
+                    "createdAt": created_ms,
+                    "lastActivityAt": activity_ms,
+                    "model": session_row.get("model") or "claude-fable-5",
+                    "isArchived": False,
+                    "title": title,
+                    "permissionMode": "default",
+                    "alwaysAllowedReasons": [],
+                    "sessionPermissionUpdates": [],
+                }
+                path = root / f"{record_id}.json"
+                self._write_record(path, record)
+                index[claude_uuid] = path
+                registered = True
+                continue
+            try:
+                record = json.loads(existing.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                raise _MirrorFloatSkip("registry record unreadable") from None
+            recorded_ms = record.get("lastActivityAt")
+            if (
+                not isinstance(recorded_ms, (int, float))
+                or isinstance(recorded_ms, bool)
+                or not math.isfinite(float(recorded_ms))
+            ):
+                recorded_ms = 0
+            if activity_ms - float(recorded_ms) < self._min_interval_seconds * 1000:
+                continue
+            record["lastActivityAt"] = activity_ms
+            self._write_record(existing, record)
+            floated = True
+        return registered, floated
 
     def _write_record(self, path: Path, record: Mapping[str, Any]) -> None:
         temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -238,18 +333,22 @@ class ClaudeMirrorFloatWorker:
         temporary.unlink(missing_ok=True)
         raise last_error if last_error is not None else OSError("replace failed")
 
-    def _load_registry_index(self) -> dict[str, Path]:
-        index: dict[str, Path] = {}
-        if self._registry_root is None or not self._registry_root.is_dir():
-            return index
-        for path in self._registry_root.glob("local_*.json"):
-            try:
-                match = _CLI_SESSION_ID_PATTERN.search(path.read_text(encoding="utf-8"))
-            except OSError:
-                continue
-            if match:
-                index[match.group(1)] = path
-        return index
+    def _load_registry_index(self) -> dict[Path, dict[str, Path]]:
+        indexes: dict[Path, dict[str, Path]] = {}
+        for root in self._registry_roots:
+            index: dict[str, Path] = {}
+            if root.is_dir():
+                for path in root.glob("local_*.json"):
+                    try:
+                        match = _CLI_SESSION_ID_PATTERN.search(
+                            path.read_text(encoding="utf-8")
+                        )
+                    except OSError:
+                        continue
+                    if match:
+                        index[match.group(1)] = path
+            indexes[root] = index
+        return indexes
 
     def _resolve_source_activity(self, source_session_id: str) -> float:
         if ":" in source_session_id:

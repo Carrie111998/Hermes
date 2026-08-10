@@ -6535,9 +6535,17 @@ async def test_reconcile_rejects_non_deterministic_claude_attempt_sidecar(
 
 @pytest.mark.parametrize("continuous", (False, True))
 @pytest.mark.asyncio
-async def test_successful_scan_runs_mirror_float_only_in_continuous_mode(
+async def test_successful_scan_runs_mirror_float_independent_of_sidebar_continuous(
     continuous: bool,
 ) -> None:
+    """Claude-side visibility must not be gated by the Codex sidebar lane.
+
+    Per the 2026-07-17 claude-native-session-visibility design, Claude delivery
+    "must not reuse or couple transitions to session_sidebar_jobs, which remains
+    specific to Codex". Pausing the Codex sidebar (sidebar.continuous=false) is a
+    deliberate, supported state and must not silently stop desktop registry
+    records for Codex/Hermes mirrors.
+    """
     now = 3_000_000.0
     store = _SidebarScanStore()
     event_loop_thread = get_ident()
@@ -6560,9 +6568,49 @@ async def test_successful_scan_runs_mirror_float_only_in_continuous_mode(
     summary = await coordinator.scan_once(Provider.CLAUDE)
 
     assert summary.failed == 0
-    assert len(float_threads) == int(continuous)
-    if continuous:
-        assert float_threads[0] != event_loop_thread
+    assert len(float_threads) == 1
+    assert float_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_successful_scan_floats_mirrors_when_another_provider_is_degraded() -> (
+    None
+):
+    """A degraded Codex provider must not stop Claude-side desktop registration.
+
+    Floating/registering mirrors only reads the local state database and writes
+    local registry files, so it cannot depend on Codex reachability. Codex scans
+    hang on this host (codex_scan_failed), which previously starved the Claude
+    visibility lane indefinitely.
+    """
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    float_calls: list[int] = []
+
+    class RecordingFloatWorker:
+        def run_once(self) -> dict[str, int]:
+            float_calls.append(1)
+            return {"examined": 0, "floated": 0, "skipped": 0}
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={
+            Provider.CLAUDE: _LifecycleClaudeAdapter(),
+            # Configured but never scanned -> last_success stays None, which is
+            # exactly how a hung Codex provider presents.
+            Provider.CODEX: _LifecycleClaudeAdapter(),
+        },
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        mirror_float=RecordingFloatWorker(),
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert coordinator._any_configured_provider_unhealthy() is True
+    assert float_calls == [1]
 
 
 def test_mirror_float_must_provide_run_once() -> None:
