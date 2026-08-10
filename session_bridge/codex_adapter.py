@@ -1268,6 +1268,7 @@ class CodexSourceAdapter:
             archived=False,
             source_kinds=source_kinds,
             state_db_only=state_db_only,
+            stop_on_native_id=wanted,
         )
         found = next(
             (summary for summary in active if summary.native_id == wanted), None
@@ -1280,6 +1281,7 @@ class CodexSourceAdapter:
             archived=True,
             source_kinds=source_kinds,
             state_db_only=state_db_only,
+            stop_on_native_id=wanted,
         )
         found = next(
             (summary for summary in archived if summary.native_id == wanted), None
@@ -1369,12 +1371,14 @@ class CodexSourceAdapter:
         archived: bool,
         source_kinds: tuple[str, ...] | None = None,
         state_db_only: bool = False,
+        stop_on_native_id: str | None = None,
     ) -> list[CodexThreadSummary]:
         if source_kinds is None:
             summaries = self._fetch_inventory_pages(
                 archived=archived,
                 source_kinds=None,
                 state_db_only=state_db_only,
+                stop_on_native_id=stop_on_native_id,
             )
             return self._refresh_trusted_origins(summaries)
         try:
@@ -1382,6 +1386,7 @@ class CodexSourceAdapter:
                 archived=archived,
                 source_kinds=source_kinds,
                 state_db_only=state_db_only,
+                stop_on_native_id=stop_on_native_id,
             )
         except Exception as exc:
             retry_without_filter = _is_source_kinds_schema_error(exc)
@@ -1394,6 +1399,7 @@ class CodexSourceAdapter:
             archived=archived,
             source_kinds=None,
             state_db_only=state_db_only,
+            stop_on_native_id=stop_on_native_id,
         )
         return self._refresh_trusted_origins(summaries)
 
@@ -1405,6 +1411,7 @@ class CodexSourceAdapter:
         state_db_only: bool = False,
         stop_after: float | None = None,
         known_native_ids: frozenset[str] = frozenset(),
+        stop_on_native_id: str | None = None,
     ) -> list[CodexThreadSummary]:
         cursor: Any = None
         seen_cursors: set[str] = set()
@@ -1460,6 +1467,8 @@ class CodexSourceAdapter:
                     )
 
             next_cursor = _first(response, "nextCursor", "next_cursor")
+            if stop_on_native_id is not None and stop_on_native_id in page_native_ids:
+                break
             if (
                 known_native_ids
                 and page_native_ids
@@ -1906,6 +1915,7 @@ class CodexTargetAdapter:
             archived=False,
             source_kinds=_TARGET_SOURCE_KINDS,
             state_db_only=True,
+            stop_on_native_id=native_id,
         )
         matches = [summary for summary in summaries if summary.native_id == native_id]
         if len(matches) != 1:
