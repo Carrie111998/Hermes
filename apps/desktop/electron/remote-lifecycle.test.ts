@@ -80,19 +80,31 @@ function goneIdentityOut() {
 function mutexRules() {
   return [
     [/stale_ms=/, 'ACQUIRED\n'],
-    [/print\("HELD"/, 'HELD\n'],
-    [/data==holder/, '']
+    [/OWNER_EPOCH_HEARTBEAT|print\("HELD"/, 'HELD\n'],
+    [/OWNER_EPOCH_RELEASE/, '']
+  ]
+}
+
+function leaseMutationDefaults() {
+  // Appended AFTER test-specific rules so collectors can observe lock writes.
+  return [
+    [/print\("WROTE"\)/, 'WROTE\n'],
+    [/print\("REMOVED"\)/, 'REMOVED\n'],
+    [/print\("LOG_REMOVED"\)/, 'LOG_REMOVED\n'],
+    [/print\("TOKEN_REMOVED"\)/, 'TOKEN_REMOVED\n']
   ]
 }
 
 function baseConnectRules(extra: any[] = []) {
   // Mutex acquire/release + optional extras. Identity/token/spawn rules should
   // be more specific than bare /python3 -c/ so they win first-match.
+  // leaseMutationDefaults stay last so tests can intercept WROTE/REMOVED.
   return [
     ...mutexRules(),
     [/uname/, 'Linux\nx86_64'],
     [/\[ -x/, 'OK'],
-    ...extra
+    ...extra,
+    ...leaseMutationDefaults()
   ]
 }
 
@@ -293,7 +305,8 @@ test('writeLockfile mkdir -ps and stamps the schema version', async () => {
   const ssh = fakeSsh([])
   await writeLockfile(ssh, OWNERSHIP_ID, ownedLock({ pid: 7, port: 9 }))
   const cmd = ssh.calls.join('\n')
-  assert.match(cmd, /mkdir -p/)
+  assert.match(cmd, /os\.makedirs|mkdir -p/)
+  assert.match(cmd, /os\.replace/)
   assert.match(cmd, new RegExp(`"schemaVersion":${LOCKFILE_SCHEMA_VERSION}`))
 })
 
@@ -366,8 +379,8 @@ test('cleanupStale kills ONLY a provably-ours pid; foreign alive is ownership-co
     hermesPath: '/x/hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
   })
-  assert.ok(ours.calls.some(c => /terminate_result/.test(c)))
-  assert.ok(ours.calls.some(c => /rm -f/.test(c)))
+  assert.ok(ours.calls.some(c => /terminate_result|pidfd_open/.test(c)))
+  assert.ok(ours.calls.some(c => /REMOVED|unlink|rm -f/.test(c) && /backend\.lock\.json/.test(c)))
 })
 
 test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
@@ -702,11 +715,11 @@ test('connect() fresh spawn writes hermesHome + protocolVersion into the lockfil
     [/kill -0 700/, 'ALIVE'],
     [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=45500\n'],
     [
-      /printf '%s' '/,
+      c => /print\("WROTE"\)/.test(c) || /printf '%s' '/.test(c),
       c => {
         writes.push(c)
 
-        return ''
+        return /print\("WROTE"\)/.test(c) ? 'WROTE\n' : ''
       }
     ]
   ]))
@@ -727,12 +740,10 @@ test('connect() respawns when the lockfile pid is dead (killed dashboard)', asyn
   const ssh = fakeSsh(baseConnectRules([
     [/cat .*lock\.json/, () => (sawDeadCleanup ? '' : JSON.stringify(lock))],
     [/kill -0 333/, 'DEAD'],
-    [/rm -f/, c => {
-      if (/backend\.lock\.json/.test(c)) {
-        sawDeadCleanup = true
-      }
+    [c => /backend\.lock\.json/.test(c) && (/REMOVED|unlink|rm -f|print\("REMOVED"\)/.test(c)), c => {
+      sawDeadCleanup = true
 
-      return ''
+      return 'REMOVED\n'
     }],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [command => /python3 -c/.test(command) && /O_EXCL/.test(command), ''],
@@ -929,15 +940,15 @@ test('spawnRemoteDashboard removes a token file when upload reporting fails', as
 
   const ssh = fakeSsh([
     [/grep -q ssh-session-token-file/, 'YES\n'],
-    [command => /python3 -c/.test(command) && !/rm -f/.test(command), failure],
-    [/rm -f/, '']
+    [command => /python3 -c/.test(command) && /O_EXCL/.test(command), failure],
+    [command => /TOKEN_REMOVED|unlink/.test(command) && /\.token/.test(command), 'TOKEN_REMOVED\n']
   ])
 
   await assert.rejects(
     () => spawnRemoteDashboard(ssh, { hermesPath: '/x/hermes', profile: '', token: 'tok', ownershipId: OWNERSHIP_ID }),
     /channel closed/
   )
-  assert.ok(ssh.calls.some(command => /rm -f .*\.token/.test(command)))
+  assert.ok(ssh.calls.some(command => /\.token/.test(command) && (/TOKEN_REMOVED|unlink|rm -f/.test(command))))
 })
 
 test('spawnRemoteDashboard streams the token over stdin, not argv/env', async () => {
@@ -1124,7 +1135,7 @@ test('connect removes the token file when a fresh backend fails after returning 
   ]))
 
   await assert.rejects(() => connect(connectDeps(ssh)), /exited before announcing/i)
-  assert.ok(ssh.calls.some(command => /rm -f .*\.token/.test(command)))
+  assert.ok(ssh.calls.some(command => /\.token/.test(command) && (/TOKEN_REMOVED|unlink|rm -f/.test(command))))
 })
 
 test('connect preserves an exact-owned backend when reuse proof transport fails', async () => {
@@ -1150,7 +1161,7 @@ test('connect preserves an exact-owned backend when reuse proof transport fails'
     (error: any) => error.kind === 'transient-transport-error'
   )
   assert.ok(!ssh.calls.some(command => /kill 333\b/.test(command)))
-  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+  assert.ok(!ssh.calls.some(command => /backend\.lock\.json/.test(command) && (/REMOVED|unlink|rm -f/.test(command))))
 })
 
 test('connect replaces an exact-owned backend only after authenticated stale proof', async () => {
@@ -1231,7 +1242,7 @@ test('exec-wrapper ownership identity verifies as owned and can be reaped', asyn
   assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes-wrapper', lock), true)
   await cleanupStale(ssh, OWNERSHIP_ID, lock)
   assert.ok(ssh.calls.some(c => /terminate_result/.test(c)))
-  assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
+  assert.ok(ssh.calls.some(c => /backend\.lock\.json/.test(c) && (/REMOVED|unlink|os\.replace/.test(c) || /rm -f/.test(c))))
 })
 
 test('PID reuse start-time mismatch is foreign and never signaled', async () => {
@@ -1283,7 +1294,7 @@ test('cleanup waits for asynchronous SIGTERM exit before removing evidence', asy
 
   await cleanupStale(ssh, OWNERSHIP_ID, lock)
   assert.equal(livenessChecks, 2)
-  assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
+  assert.ok(ssh.calls.some(c => /backend\.lock\.json/.test(c) && (/REMOVED|unlink|os\.replace|rm -f/.test(c))))
 })
 
 test('identity-checked termination helper is executable and reports an absent pid as GONE', async () => {
@@ -1320,7 +1331,7 @@ test('GONE during failed-spawn cleanup preserves the original spawn error', asyn
     () => connect(connectDeps(ssh)),
     (err: any) => err.kind === 'spawn-failed' && /exited before announcing/i.test(err.message)
   )
-  assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)), 'gone spawn evidence should be cleaned')
+  assert.ok(ssh.calls.some(c => /backend\.lock\.json/.test(c)), 'gone spawn evidence should be cleaned')
 })
 
 test('ownership mutex heartbeats and fences a callback after lease loss', async () => {
@@ -1328,12 +1339,12 @@ test('ownership mutex heartbeats and fences a callback after lease loss', async 
 
   const ssh = fakeSsh([
     [/stale_ms=/, 'ACQUIRED\n'],
-    [/print\("HELD"/, () => {
+    [/OWNER_EPOCH_HEARTBEAT|print\("HELD"/, () => {
       heldChecks += 1
 
       return heldChecks === 1 ? 'HELD\n' : 'LOST\n'
     }],
-    [/data==holder/, '']
+    [/OWNER_EPOCH_RELEASE|lease_token=/, '']
   ])
 
   await assert.rejects(
@@ -1367,4 +1378,119 @@ test('token-absent healthy lock still reuses when identity-owned', async () => {
   const result = await connect(connectDeps(ssh, { reuseToken, adoptServedToken: async (_b, t) => t }))
   assert.equal(result.reused, true)
   assert.ok(!ssh.calls.some(c => /setsid/.test(c)))
+})
+
+test('owner-epoch acquire reclaims under flock without pathname unlink', async () => {
+  const ssh = fakeSsh([
+    [/stale_ms=/, 'ACQUIRED\n'],
+    [/OWNER_EPOCH_RELEASE|lease_token=/, '']
+  ])
+
+  await withOwnershipMutex(ssh, OWNERSHIP_ID, async () => 'ok')
+  const acquire = ssh.calls.find(c => /stale_ms=/.test(c)) || ''
+  assert.match(acquire, /fcntl\.flock/, 'stale reclaim must hold an exclusive flock')
+  assert.match(acquire, /ftruncate|os\.lseek/, 'stale reclaim must rewrite the same inode')
+  assert.ok(!/if age>stale_ms:\s*os\.unlink\(p\)/.test(acquire), 'must not pathname-unlink then recreate')
+  assert.match(acquire, /token=/, 'lease payload must carry an owner-epoch token')
+})
+
+test('owner-epoch heartbeat refuses to refresh a successor lease', async () => {
+  const ssh = fakeSsh([
+    [/stale_ms=/, 'ACQUIRED\n'],
+    [/OWNER_EPOCH_HEARTBEAT/, 'LOST\n'],
+    [/OWNER_EPOCH_RELEASE|lease_token=/, '']
+  ])
+
+  await assert.rejects(
+    () => withOwnershipMutex(ssh, OWNERSHIP_ID, async lease => {
+      await lease.assertHeld()
+    }),
+    (err: any) => err.kind === 'ownership-conflict'
+  )
+  const heartbeat = ssh.calls.find(c => /OWNER_EPOCH_HEARTBEAT/.test(c)) || ''
+  assert.match(heartbeat, /fcntl\.flock|LOCK_EX/, 'heartbeat must flock before utime')
+  assert.match(heartbeat, /data!=token|data==token/, 'heartbeat must compare the full owner-epoch token')
+})
+
+test('lease-fenced lock write refuses mutation after token loss', async () => {
+  const ssh = fakeSsh([
+    [/stale_ms=/, 'ACQUIRED\n'],
+    [/OWNER_EPOCH_HEARTBEAT|print\("HELD"/, 'HELD\n'],
+    [/lease_token=/, 'LOST\n'],
+    [/OWNER_EPOCH_RELEASE/, '']
+  ])
+
+  await assert.rejects(
+    () => withOwnershipMutex(ssh, OWNERSHIP_ID, async lease => {
+      await writeLockfile(ssh, OWNERSHIP_ID, ownedLock({ pid: 9, port: 1 }), lease)
+    }),
+    (err: any) => err.kind === 'ownership-conflict'
+  )
+  assert.ok(ssh.calls.some(c => /lease_token=/.test(c) && /WROTE|os\.replace/.test(c)))
+})
+
+test('adversarial stale takeover loses the original owner mutation fence', async () => {
+  let mutate = 0
+
+  const ssh = fakeSsh([
+    [/stale_ms=/, 'ACQUIRED\n'],
+    [/OWNER_EPOCH_HEARTBEAT|print\("HELD"/, 'HELD\n'],
+    [/lease_token=/, () => {
+      mutate += 1
+
+      // First fenced mutation still held; second simulates a successor reclaim.
+      return mutate === 1 ? 'WROTE\n' : 'LOST\n'
+    }],
+    [/OWNER_EPOCH_RELEASE/, '']
+  ])
+
+  await assert.rejects(
+    () => withOwnershipMutex(ssh, OWNERSHIP_ID, async lease => {
+      await writeLockfile(ssh, OWNERSHIP_ID, ownedLock({ pid: 1, port: 2 }), lease)
+      await writeLockfile(ssh, OWNERSHIP_ID, ownedLock({ pid: 1, port: 3 }), lease)
+    }),
+    (err: any) => err.kind === 'ownership-conflict'
+  )
+  assert.equal(mutate, 2)
+})
+
+test('Darwin termination path is identity-stable without pidfd', async () => {
+  const lock = ownedLock({ pid: 5 })
+
+  const ssh = fakeSsh([
+    [/terminate_result|pidfd_open/, (command: string) => {
+      assert.match(command, /pidfd_open/)
+      assert.match(command, /ps","-o","lstart=|ps.*lstart/)
+      assert.match(command, /signal\.SIGTERM|SIGTERM/)
+
+      // Simulate non-pidfd host falling through to Darwin path and succeeding.
+      return 'TERMINATED\n'
+    }]
+  ])
+
+  const result = await terminateOwnedProcess(ssh, lock)
+  assert.equal(result, 'TERMINATED')
+})
+
+test('lease-fenced termination checks owner-epoch token under flock', async () => {
+  const lock = ownedLock({ pid: 5 })
+
+  const lease = {
+    path: ownershipDirectory(OWNERSHIP_ID) + '/lifecycle.mutex',
+    token: 'holder:epoch',
+    holder: 'holder'
+  }
+
+  const ssh = fakeSsh([
+    [/terminate_result|pidfd_open/, (command: string) => {
+      assert.match(command, /lease_token=/)
+      assert.match(command, /fcntl\.flock|LOCK_EX/)
+      assert.match(command, /data!=lease_token|lease_token/)
+
+      return 'LOST\n'
+    }]
+  ])
+
+  const result = await terminateOwnedProcess(ssh, lock, lease)
+  assert.equal(result, 'LOST')
 })

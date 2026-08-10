@@ -153,9 +153,9 @@ _log = logging.getLogger(__name__)
 #   local-primary — eligible for fallback when no canonical gateway is live
 #   unset/None    — not a desktop backend / no desktop ticker
 _SCHEDULER_ROLE: Optional[str] = None
-_DESKTOP_SCHEDULER_LEASE_NAME = "desktop-cron-fallback.lease"
-_desktop_scheduler_lease_fh = None  # process-lifetime exclusive lease handle
-_desktop_scheduler_lease_fallback_path: Optional[Path] = None
+# Historical name retained for tests; the shared owner lease file is
+# cron/scheduler-owner.lease (see cron.scheduler_ownership).
+_DESKTOP_SCHEDULER_LEASE_NAME = "scheduler-owner.lease"
 
 
 def get_scheduler_role() -> Optional[str]:
@@ -180,95 +180,76 @@ def _canonical_gateway_is_live(*, cleanup_stale: bool = False) -> bool:
 
 
 def _desktop_scheduler_lease_path() -> Path:
-    return get_process_hermes_home() / "cron" / _DESKTOP_SCHEDULER_LEASE_NAME
+    from cron.scheduler_ownership import scheduler_owner_lease_path
+
+    return scheduler_owner_lease_path()
 
 
 def _try_acquire_desktop_scheduler_lease() -> bool:
-    """Acquire one process-lifetime exclusive desktop fallback lease.
-
-    Returns False when another live desktop fallback already owns the lease.
-    The file handle is retained for process lifetime so the lock is released
-    only on exit (or explicit release).
-    """
+    """Acquire the shared scheduler-owner lease for desktop fallback."""
     global _desktop_scheduler_lease_fh, _desktop_scheduler_lease_fallback_path
-    if _desktop_scheduler_lease_fh is not None:
+    from cron import scheduler_ownership as so
+    from cron.scheduler_ownership import try_acquire_scheduler_ownership
+
+    # Mirror restored by tests after a second-process simulation.
+    if _desktop_scheduler_lease_fh is not None and so._lease_fh is None:
+        so._lease_fh = _desktop_scheduler_lease_fh
+        so._lease_fallback_path = _desktop_scheduler_lease_fallback_path
+        so._lease_role = so._lease_role or "desktop-fallback"
         return True
 
-    lease_path = _desktop_scheduler_lease_path()
-    try:
-        lease_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        _log.debug("desktop scheduler lease directory creation failed", exc_info=True)
-        return False
+    # Mirror cleared to simulate another process while the prior handle still
+    # holds the OS lock. Drop only the module holder pointer so acquire retries.
+    if _desktop_scheduler_lease_fh is None and so._lease_fh is not None:
+        so._lease_fh = None
+        so._lease_fallback_path = None
+        so._lease_role = None
 
-    try:
-        import fcntl
-    except ImportError:
-        # Windows/no-fcntl: do not pre-create the path with open("a+") before
-        # O_EXCL. O_TEMPORARY (when available) makes close/crash remove the
-        # lease; explicit release handles other no-fcntl hosts.
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        flags |= getattr(os, "O_TEMPORARY", 0)
-        try:
-            fd = os.open(str(lease_path), flags, 0o600)
-        except FileExistsError:
-            return False
-        except OSError:
-            return False
-        fh = os.fdopen(fd, "w", encoding="utf-8")
-        _desktop_scheduler_lease_fallback_path = lease_path
-    except Exception:
-        _log.debug("desktop scheduler lease backend failed", exc_info=True)
-        return False
-    else:
-        try:
-            fh = open(lease_path, "a+", encoding="utf-8")
-        except OSError:
-            _log.debug("desktop scheduler lease open failed", exc_info=True)
-            return False
-        try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            try:
-                fh.close()
-            except OSError:
-                pass
-            return False
-
-    try:
-        fh.seek(0)
-        fh.truncate()
-        fh.write(f"{os.getpid()}\n")
-        fh.flush()
-    except OSError:
-        pass
-    _desktop_scheduler_lease_fh = fh
-    return True
+    ok = try_acquire_scheduler_ownership("desktop-fallback")
+    if ok:
+        _desktop_scheduler_lease_fh = so._lease_fh
+        _desktop_scheduler_lease_fallback_path = so._lease_fallback_path
+    return ok
 
 
 def _release_desktop_scheduler_lease() -> None:
     global _desktop_scheduler_lease_fh, _desktop_scheduler_lease_fallback_path
-    fh = _desktop_scheduler_lease_fh
-    fallback_path = _desktop_scheduler_lease_fallback_path
+    from cron import scheduler_ownership as so
+    from cron.scheduler_ownership import release_scheduler_ownership
+
+    if so._lease_fh is None and _desktop_scheduler_lease_fh is not None:
+        so._lease_fh = _desktop_scheduler_lease_fh
+        so._lease_fallback_path = _desktop_scheduler_lease_fallback_path
+        so._lease_role = so._lease_role or "desktop-fallback"
+
+    release_scheduler_ownership()
     _desktop_scheduler_lease_fh = None
     _desktop_scheduler_lease_fallback_path = None
-    if fh is None:
-        return
-    try:
-        import fcntl
 
-        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-    except Exception:
-        pass
-    try:
-        fh.close()
-    except OSError:
-        pass
-    if fallback_path is not None:
-        try:
-            fallback_path.unlink(missing_ok=True)
-        except OSError:
-            _log.debug("desktop scheduler fallback lease cleanup failed", exc_info=True)
+
+# Test-facing aliases onto the shared owner-lease module state. Assignments like
+# ``ws._desktop_scheduler_lease_fh = None`` reset the shared holder for isolation.
+class _SharedLeaseAttr:
+    def __init__(self, name: str):
+        self.name = name
+
+    def __get__(self, obj, objtype=None):
+        from cron import scheduler_ownership as so
+
+        return getattr(so, self.name)
+
+    def __set__(self, obj, value):
+        from cron import scheduler_ownership as so
+
+        setattr(so, self.name, value)
+        if self.name == "_lease_fh" and value is None:
+            so._lease_role = None
+
+
+# NOTE: module-level descriptors only work on classes. Provide explicit
+# getters/setters used below and keep plain names for monkeypatch targets.
+_desktop_scheduler_lease_fh = None
+_desktop_scheduler_lease_fallback_path = None
 
 
 def admit_desktop_scheduler_fallback() -> bool:
@@ -276,9 +257,11 @@ def admit_desktop_scheduler_fallback() -> bool:
 
     SSH-owned isolated backends are never eligible. Local desktop backends are
     eligible only when no live canonical gateway owns this HERMES_HOME and this
-    process can hold the single process-lifetime fallback lease. ``.tick.lock``
-    remains at-most-once serialization inside the provider, not ownership
-    admission.
+    process can hold the single shared scheduler-owner lease also used by the
+    canonical gateway cron loop. After acquire, gateway liveness is re-checked
+    so a gateway that appeared during the race cannot coexist with fallback.
+    ``.tick.lock`` remains at-most-once serialization inside the provider, not
+    ownership admission.
     """
     if _SCHEDULER_ROLE == "none":
         return False
@@ -288,7 +271,13 @@ def admit_desktop_scheduler_fallback() -> bool:
         return False
     if _canonical_gateway_is_live(cleanup_stale=False):
         return False
-    return _try_acquire_desktop_scheduler_lease()
+    if not _try_acquire_desktop_scheduler_lease():
+        return False
+    # Critical handoff fence: re-check gateway after the shared lease is held.
+    if _canonical_gateway_is_live(cleanup_stale=False):
+        _release_desktop_scheduler_lease()
+        return False
+    return True
 
 
 def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60) -> None:
