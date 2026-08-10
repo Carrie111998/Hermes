@@ -392,7 +392,8 @@ def test_gateway_goal_resume_fifo_separates_multiplexed_slot_and_state_keys():
     assert runner._session_state(state_key).conversation.queued_events == [user_event]
 
 
-def test_gateway_real_user_preempts_queued_goal_continuation():
+@pytest.mark.parametrize("message_type", [MessageType.TEXT, MessageType.PHOTO])
+def test_gateway_real_user_preempts_queued_goal_continuation(message_type):
     """A newly arriving user event outranks an already-staged synthetic turn."""
     adapter = _PendingAdapter()
     runner = object.__new__(GatewayRunner)
@@ -418,7 +419,7 @@ def test_gateway_real_user_preempts_queued_goal_continuation():
     )
     real_user = MessageEvent(
         text="pause and change direction",
-        message_type=MessageType.TEXT,
+        message_type=message_type,
         source=source,
     )
     adapter._pending_messages[adapter_key] = continuation
