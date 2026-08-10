@@ -3939,9 +3939,10 @@ def _same_effective_delegation_provider(
 
     MoA is never the same as a real endpoint provider — its credential is only
     a virtual-provider sentinel. Provider aliases (zhipu/glm→zai, etc.) collapse
-    via ``normalize_provider``. Custom endpoints additionally require matching
-    base_url / custom pool identity so two different ``provider=custom`` targets
-    never inherit each other's keys.
+    via ``normalize_provider``. When either side is ``custom`` (direct-endpoint
+    runtimes collapse to that label), compare endpoint identity via base_url /
+    custom pool key so the same URL can inherit across mixed ``custom``/named
+    labels, while different custom targets never share keys.
     """
     parent = _canonicalize_delegation_provider(parent_provider)
     configured = _canonicalize_delegation_provider(configured_provider)
@@ -3949,11 +3950,12 @@ def _same_effective_delegation_provider(
         return False
     if parent == "moa" or configured == "moa":
         return False
-    # Direct-endpoint runtimes collapse to "custom"; bare string equality would
-    # treat unrelated base_urls as interchangeable and leak parent keys.
+    # Direct-endpoint runtimes collapse to "custom". Bare string equality would
+    # treat unrelated base_urls as interchangeable; requiring *both* labels to
+    # be the string "custom" would also reject mixed custom/named pairs that
+    # share the same endpoint (e.g. parent stamped custom + delegation.provider
+    # =zai against the same URL) and fail closed instead of inheriting.
     if parent == "custom" or configured == "custom":
-        if parent != "custom" or configured != "custom":
-            return False
         return _same_custom_delegation_endpoint(parent_base_url, configured_base_url)
     return parent == configured
 

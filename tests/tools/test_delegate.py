@@ -818,6 +818,82 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["api_key"])
         mock_resolve.assert_not_called()
 
+    def test_custom_parent_named_provider_same_base_url_inherits_parent_key(self):
+        """Direct-endpoint parents are stamped provider=custom; same URL may inherit.
+
+        Bug hunter BUG-1: mixed custom/named labels with matching base_url must
+        still count as the same endpoint so a live parent key is inherited when
+        delegation.api_key is empty (instead of fail-closed via resolve).
+        """
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "custom"
+        parent.base_url = "https://api.z.ai/api/coding/paas/v4"
+        parent.api_key = "live-parent-key"
+        cfg = {
+            "model": "glm-5.2",
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "",
+        }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider"
+        ) as mock_resolve:
+            creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertIsNone(creds["api_key"])
+        mock_resolve.assert_not_called()
+
+    def test_named_parent_custom_provider_same_base_url_inherits_parent_key(self):
+        """Inverse mixed labels: named parent + delegation.provider=custom, same URL."""
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "zai"
+        parent.base_url = "https://api.z.ai/api/coding/paas/v4"
+        parent.api_key = "parent-zai-key"
+        cfg = {
+            "model": "glm-5.2",
+            "provider": "custom",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "",
+        }
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider"
+        ) as mock_resolve:
+            creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertIsNone(creds["api_key"])
+        mock_resolve.assert_not_called()
+
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_custom_parent_named_provider_different_base_url_resolves_target_key(
+        self, mock_resolve
+    ):
+        """Mixed custom/named must not inherit across different endpoints."""
+        mock_resolve.return_value = {
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "env-zai-key",
+            "api_mode": "chat_completions",
+            "source": "env/config",
+        }
+        parent = _make_mock_parent(depth=0)
+        parent.provider = "custom"
+        parent.base_url = "https://provider-a.example/v1"
+        parent.api_key = "secret-a"
+        cfg = {
+            "model": "glm-5.2",
+            "provider": "zai",
+            "base_url": "https://api.z.ai/api/coding/paas/v4",
+            "api_key": "",
+        }
+
+        creds = _resolve_delegation_credentials(cfg, parent)
+
+        self.assertEqual(creds["api_key"], "env-zai-key")
+        self.assertNotEqual(creds["api_key"], parent.api_key)
+        mock_resolve.assert_called_once()
+
     def test_direct_endpoint_auto_detects_anthropic_messages_suffix(self):
         # Issue #10213: Azure AI Foundry exposes Anthropic-compatible models at
         # a /anthropic URL suffix. Subagents must pick anthropic_messages
