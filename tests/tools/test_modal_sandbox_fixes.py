@@ -437,3 +437,57 @@ class TestDockerHostBindApproval:
         res = A.check_execute_code_guard("import os", "vercel_sandbox",
                                          has_host_access=True)
         assert res["approved"] is True
+
+    def test_docker_extra_args_bind_mount_detection(self):
+        """_docker_has_host_access detects bind mounts in docker_extra_args.
+
+        docker_extra_args appends directly to ``docker run`` and supports
+        the same mount syntaxes as docker_volumes, but in argv form.
+        The classifier must inspect every flag form so a host bind cannot
+        be treated as isolated.
+        """
+        # Separated --mount with bind spec
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "docker",
+            "docker_extra_args": [
+                "--mount", "type=bind,source=/host,target=/container"
+            ],
+        }) is True
+
+        # Equals form --mount=...
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "docker",
+            "docker_extra_args": [
+                "--mount=type=bind,source=/host,target=/container"
+            ],
+        }) is True
+
+        # -v short form (separated)
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "docker",
+            "docker_extra_args": ["-v", "/host:/container"],
+        }) is True
+
+        # --volume (separated)
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "docker",
+            "docker_extra_args": ["--volume", "/tmp:/workspace"],
+        }) is True
+
+        # Non-bind flags do not trigger host access
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "docker",
+            "docker_extra_args": ["--gpus=all", "--shm-size=16g"],
+        }) is False
+
+        # docker_extra_args with no binds
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "docker",
+            "docker_extra_args": [],
+        }) is False
+
+        # Non-docker env_type ignores extra_args
+        assert _tt_mod._docker_has_host_access({
+            "env_type": "local",
+            "docker_extra_args": ["-v", "/:/host"],
+        }) is False

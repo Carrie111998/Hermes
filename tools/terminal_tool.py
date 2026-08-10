@@ -376,13 +376,67 @@ def _docker_volume_uses_host_path(volume_spec: str) -> bool:
     return False
 
 
+def _docker_extra_args_has_host_path(extra_args: list) -> bool:
+    """Return True when docker_extra_args contains a host-path bind mount.
+    
+    docker_extra_args appends directly to ``docker run`` and supports
+    the same mount syntaxes as docker_volumes, but in argv form:
+    
+        --mount type=bind,source=/host,target=/container  (separated)
+        --mount=type=bind,source=/host,target=/container  (equals form)
+        -v /host:/container                                 (short form)
+    
+    Pairs each flag with the next arg when the value is separated,
+    then delegates to ``_docker_volume_uses_host_path`` for the
+    actual parsing.
+    """
+    if not isinstance(extra_args, list):
+        return False
+    
+    i = 0
+    while i < len(extra_args):
+        arg = str(extra_args[i]) if extra_args[i] is not None else ""
+        
+        # Separated form: --mount value (next arg is the spec)
+        if arg == "--mount" and i + 1 < len(extra_args):
+            spec = str(extra_args[i + 1]) if extra_args[i + 1] is not None else ""
+            if _docker_volume_uses_host_path(spec):
+                return True
+            i += 2
+            continue
+        
+        # Equals form: --mount=type=bind,source=...
+        if arg.startswith("--mount=") and len(arg) > 8:
+            spec = arg[8:]
+            if _docker_volume_uses_host_path(spec):
+                return True
+            i += 1
+            continue
+        
+        # -v /host:/container (separated)
+        if arg in ("-v", "--volume") and i + 1 < len(extra_args):
+            spec = str(extra_args[i + 1]) if extra_args[i + 1] is not None else ""
+            if _docker_volume_uses_host_path(spec):
+                return True
+            i += 2
+            continue
+        
+        i += 1
+    
+    return False
+
+
 def _docker_has_host_access(config: Dict[str, Any]) -> bool:
     """Return True when a Docker sandbox exposes host paths through bind mounts."""
     if config.get("env_type") != "docker":
         return False
     if config.get("host_cwd") and config.get("docker_mount_cwd_to_workspace"):
         return True
-    return any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", []))
+    if any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", [])):
+        return True
+    if _docker_extra_args_has_host_path(config.get("docker_extra_args", [])):
+        return True
+    return False
 
 
 def _check_all_guards(command: str, env_type: str,
