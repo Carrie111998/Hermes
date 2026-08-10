@@ -749,6 +749,23 @@ _ABS_PATH_BLOCK = [
     # (Grok round 2)
     ">&2x /sbin/shutdown -h now",
     "2>&1x /sbin/reboot",
+    # sudo/env wrapper options use their case-sensitive upstream grammars.
+    "sudo -E /sbin/shutdown",
+    "sudo -P /sbin/shutdown",
+    "sudo -H /sbin/shutdown",
+    "sudo -a type /sbin/shutdown",
+    "sudo -Eu root /sbin/shutdown",
+    "sudo -PC 5 /sbin/shutdown",
+    # getopt_long exact and unambiguous abbreviated required options own the
+    # following word, while an =-attached operand remains in the option token.
+    "sudo --use root /sbin/shutdown",
+    "sudo --chd /tmp /sbin/shutdown",
+    "sudo --chdir=/tmp /sbin/shutdown",
+    # Both command-word walkers must share the same bundle handling.
+    "sudo -P /sbin/shut\\down",
+    # Whitespace inside a redirection operand's command substitution must not
+    # terminate the operand scan before the following executable.
+    ">$(printf '%s' a) /sbin/shutdown",
 ]
 
 _ABS_PATH_ALLOW = [
@@ -771,6 +788,12 @@ _ABS_PATH_ALLOW = [
     "env --chdir /tmp/reboot /bin/echo ok",
     "env --chdir /tmp/reboot echo ok",
     "env --argv0 /tmp/reboot /bin/echo ok",
+    # GNU env accepts the unambiguous --argv0 abbreviation and still treats
+    # its following word as data.
+    "env --arg /tmp/x /bin/echo ok",
+    # Ambiguous sudo long options make sudo exit before executing a command.
+    # The projection must not invent an operand skip for them.
+    "sudo --pre root /sbin/shutdown",
     # `}` is not a shell metacharacter: it can end a legitimate word
     "/tmp/reboot}",
     # benign leading redirections in front of a benign command stay allowed

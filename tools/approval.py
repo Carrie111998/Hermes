@@ -1314,7 +1314,9 @@ _COMMAND_WRAPPER_WORDS = {
     "builtin",
 }
 _SUDO_OPTIONS_WITH_ARG = {
-    "-c", "--close-from",
+    "-a", "--auth-type",
+    "-C", "--close-from",
+    "-c", "--login-class",
     "-D", "--chdir",
     "-g", "--group",
     "-h", "--host",
@@ -1335,10 +1337,129 @@ _SUDO_OPTIONS_WITH_ARG = {
 # (same verdict as the design review); skipping keeps parity with main.
 _ENV_OPTIONS_WITH_ARG = {
     "-a", "--argv0",
-    "-c", "--chdir",
-    "-s", "--split-string",
+    "-C", "--chdir",
+    "-S", "--split-string",
     "-u", "--unset",
 }
+
+# Complete long-option universes used for getopt_long-compatible exact and
+# unambiguous-prefix resolution. Keep these synchronized with sudo v1.9.17
+# src/parse_args.c and GNU coreutils v9.11 src/env.c. Missing or ambiguous
+# entries deliberately consume no following word, which biases detection
+# toward over-blocking rather than hiding an executable as option data.
+_SUDO_LONG_OPTION_ARITY = {
+    "--other-user": "required",
+    "--auth-type": "required",
+    "--close-from": "required",
+    "--login-class": "required",
+    "--chdir": "required",
+    "--group": "required",
+    "--host": "required",
+    "--prompt": "required",
+    "--chroot": "required",
+    "--role": "required",
+    "--command-timeout": "required",
+    "--type": "required",
+    "--user": "required",
+    "--preserve-env": "optional",
+    "--background": "none",
+    "--edit": "none",
+    "--set-home": "none",
+    "--login": "none",
+    "--remove-timestamp": "none",
+    "--list": "none",
+    "--preserve-groups": "none",
+    "--shell": "none",
+    "--validate": "none",
+    "--askpass": "none",
+    "--bell": "none",
+    "--help": "none",
+    "--reset-timestamp": "none",
+    "--no-update": "none",
+    "--non-interactive": "none",
+    "--stdin": "none",
+    "--version": "none",
+}
+_ENV_LONG_OPTION_ARITY = {
+    "--argv0": "required",
+    "--unset": "required",
+    "--chdir": "required",
+    "--split-string": "required",
+    "--default-signal": "optional",
+    "--ignore-signal": "optional",
+    "--block-signal": "optional",
+    "--ignore-environment": "none",
+    "--null": "none",
+    "--debug": "none",
+    "--list-signal-handling": "none",
+    "--help": "none",
+    "--version": "none",
+}
+_SUDO_SHORT_OPTIONS_REQUIRED_ARG = frozenset("aCcDgpRrTtUu")
+_SUDO_SHORT_OPTIONS_OPTIONAL_ARG = frozenset("h")
+_SUDO_SHORT_OPTIONS_NO_ARG = frozenset("ABbEeHiKklNnPSsVv")
+_ENV_SHORT_OPTIONS_REQUIRED_ARG = frozenset("aCSu")
+_ENV_SHORT_OPTIONS_OPTIONAL_ARG = frozenset()
+_ENV_SHORT_OPTIONS_NO_ARG = frozenset("i0v")
+
+
+def _wrapper_option_consumes_next_word(wrapper: str, token: str) -> bool:
+    """Return whether one sudo/env option word owns the following word.
+
+    Short bundles follow each wrapper's case-sensitive optstring. Required
+    options consume the remainder of their bundle, or the next word when they
+    occur last. sudo's short ``-h`` follows its got_host_flag behavior and
+    conservatively consumes the next word when no host is attached.
+
+    Long options use exact-match-first, then unique-prefix resolution like
+    ``getopt_long``. Optional long arguments only consume ``=``-attached data.
+    Unknown or ambiguous options consume no next word so executable detection
+    continues in the fail-closed direction.
+    """
+    if wrapper == "sudo":
+        long_options = _SUDO_LONG_OPTION_ARITY
+        required_short = _SUDO_SHORT_OPTIONS_REQUIRED_ARG
+        optional_short = _SUDO_SHORT_OPTIONS_OPTIONAL_ARG
+        no_arg_short = _SUDO_SHORT_OPTIONS_NO_ARG
+    elif wrapper == "env":
+        long_options = _ENV_LONG_OPTION_ARITY
+        required_short = _ENV_SHORT_OPTIONS_REQUIRED_ARG
+        optional_short = _ENV_SHORT_OPTIONS_OPTIONAL_ARG
+        no_arg_short = _ENV_SHORT_OPTIONS_NO_ARG
+    else:
+        return False
+
+    if token.startswith("--"):
+        option, equals, _ = token.partition("=")
+        arity = long_options.get(option)
+        if arity is None:
+            matches = [
+                candidate
+                for candidate in long_options
+                if candidate.startswith(option)
+            ]
+            if len(matches) != 1:
+                return False
+            arity = long_options[matches[0]]
+        return arity == "required" and not equals
+
+    if (
+        not token.startswith("-")
+        or token == "-"
+        or "=" in token
+        or len(token) < 2
+    ):
+        return False
+
+    chars = token[1:]
+    for index, char in enumerate(chars):
+        if char in required_short:
+            return index == len(chars) - 1
+        if char in optional_short:
+            return index == len(chars) - 1
+        if char not in no_arg_short:
+            return False
+    return False
 
 _INTERPRETER_EXEC_FLAGS = {
     "python": {"-c"},
@@ -2203,7 +2324,7 @@ def _iter_shell_command_word_spans(command: str):
     for command_start in _iter_shell_command_starts(command):
         pos = command_start
         prefix_words = 0
-        skip_wrapper_options = False
+        wrapper_kind: str | None = None
         skip_next_wrapper_arg = False
         while prefix_words < 12:
             word_start, word_end, word = _read_shell_word(command, pos)
@@ -2216,11 +2337,9 @@ def _iter_shell_command_word_spans(command: str):
                 pos = word_end
                 prefix_words += 1
                 continue
-            if skip_wrapper_options and lower_word.startswith("-"):
-                option_name = lower_word.split("=", 1)[0]
-                skip_next_wrapper_arg = (
-                    "=" not in lower_word
-                    and option_name in _SUDO_OPTIONS_WITH_ARG
+            if wrapper_kind and deobfuscated.startswith("-"):
+                skip_next_wrapper_arg = _wrapper_option_consumes_next_word(
+                    wrapper_kind, deobfuscated
                 )
                 pos = word_end
                 prefix_words += 1
@@ -2230,11 +2349,11 @@ def _iter_shell_command_word_spans(command: str):
             prefix_words += 1
 
             if lower_word in _COMMAND_WRAPPER_WORDS:
-                skip_wrapper_options = lower_word in {"sudo", "env"}
+                wrapper_kind = lower_word if lower_word in {"sudo", "env"} else None
                 pos = word_end
                 continue
             if _ENV_ASSIGNMENT_RE.fullmatch(deobfuscated):
-                skip_wrapper_options = False
+                wrapper_kind = None
                 pos = word_end
                 continue
             break
@@ -2284,6 +2403,14 @@ def _projected_executable_basename(word: str) -> str | None:
     if not _PROJECTED_BASENAME_RE.fullmatch(basename):
         return None
     return basename
+
+
+_MALFORMED_REDIRECTION = -1
+# `_project_path_spelled_executables` has a string-or-None compatibility
+# contract with callers outside this segment. A malformed redirection operand
+# therefore projects to a guaranteed hardline marker rather than returning
+# None and silently allowing an uninspected command suffix.
+_MALFORMED_REDIRECTION_PROJECTION = "\nmkfs"
 
 
 def _skip_leading_redirection(command: str, pos: int) -> int | None:
@@ -2357,21 +2484,32 @@ def _skip_leading_redirection(command: str, pos: int) -> int | None:
     # except a process-substitution operand which we balance.
     k = j
     if k < n and not command[k].isspace():
-        return _scan_redirection_operand(command, k)
+        operand_end = _scan_redirection_operand(command, k)
+        return (
+            operand_end
+            if operand_end is not None
+            else _MALFORMED_REDIRECTION
+        )
     # Separated operand: skip whitespace, then the operand word.
     k = _skip_shell_whitespace(command, k)
     if k >= n:
         return j  # dangling operator; nothing to consume
-    return _scan_redirection_operand(command, k)
+    operand_end = _scan_redirection_operand(command, k)
+    return (
+        operand_end
+        if operand_end is not None
+        else _MALFORMED_REDIRECTION
+    )
 
 
-def _scan_redirection_operand(command: str, pos: int) -> int:
+def _scan_redirection_operand(command: str, pos: int) -> int | None:
     """Return the offset past one redirection operand starting at ``pos``.
 
     ``<(cmd)`` / ``>(cmd)`` process substitutions are consumed as a balanced
     paren group; every other operand runs to the next unquoted whitespace or
     metacharacter (mirroring ``_read_shell_word`` minus the ``&`` break, which
-    inside an operand is just filename text)."""
+    inside an operand is just filename text). Returns None when a command
+    substitution or backtick payload is unterminated."""
     n = len(command)
     i = pos
     if command.startswith("<(", i) or command.startswith(">(", i):
@@ -2395,6 +2533,18 @@ def _scan_redirection_operand(command: str, pos: int) -> int:
             if ch == "\\" and i + 1 < n:
                 i += 2
                 continue
+            if command.startswith("$(", i):
+                end = _scan_dollar_paren_end(command, i)
+                if end is None:
+                    return None
+                i = end
+                continue
+            if ch == "`":
+                end = _scan_backtick_end(command, i)
+                if end is None:
+                    return None
+                i = end
+                continue
             if ch == "(":
                 depth += 1
             elif ch == ")":
@@ -2402,7 +2552,7 @@ def _scan_redirection_operand(command: str, pos: int) -> int:
                 if depth == 0:
                     return i + 1
             i += 1
-        return i
+        return None
     quote: str | None = None
     while i < n:
         ch = command[i]
@@ -2420,6 +2570,18 @@ def _scan_redirection_operand(command: str, pos: int) -> int:
             continue
         if ch == "\\" and i + 1 < n:
             i += 2
+            continue
+        if command.startswith("$(", i):
+            end = _scan_dollar_paren_end(command, i)
+            if end is None:
+                return None
+            i = end
+            continue
+        if ch == "`":
+            end = _scan_backtick_end(command, i)
+            if end is None:
+                return None
+            i = end
             continue
         if ch.isspace() or ch in ";&|<>":
             break
@@ -2447,8 +2609,7 @@ def _project_path_spelled_executables(command: str) -> str | None:
     replacements: dict[int, tuple[int, str]] = {}
     for command_start in _iter_shell_command_starts(command):
         pos = command_start
-        wrapper_arg_options: frozenset | set = frozenset()
-        skip_wrapper_options = False
+        wrapper_kind: str | None = None
         skip_next_wrapper_arg = False
         # POSIX prefixes (``VAR=v``, ``2>/dev/null``) can precede the command
         # word any number of times. When one is consumed, the command word
@@ -2461,6 +2622,8 @@ def _project_path_spelled_executables(command: str) -> str | None:
         while True:
             scan = _skip_shell_whitespace(command, pos)
             redir_end = _skip_leading_redirection(command, scan) if scan < len(command) else None
+            if redir_end == _MALFORMED_REDIRECTION:
+                return _MALFORMED_REDIRECTION_PROJECTION
             if redir_end is not None and redir_end > scan:
                 prefix_consumed = True
                 pos = redir_end
@@ -2481,21 +2644,24 @@ def _project_path_spelled_executables(command: str) -> str | None:
             word = command[word_start:word_end]
             if skip_next_wrapper_arg:
                 skip_next_wrapper_arg = False
+                # The option that owns this operand already proved a prefix
+                # ran, so the bare command word that follows needs the same
+                # ``\n`` anchor a projected path spelling would get.
+                prefix_consumed = True
                 continue
             deobfuscated = _deobfuscate_shell_word_for_detection(word) or word
             if _ENV_ASSIGNMENT_RE.fullmatch(deobfuscated):
                 prefix_consumed = True
                 continue  # VAR=value prefix: data, keep walking
-            if skip_wrapper_options and deobfuscated.startswith("-"):
-                raw_option = deobfuscated.split("=", 1)[0]
-                # sudo short options are case-significant (``-C`` close-from vs
-                # ``-c``, ``-D`` chdir), so match the raw spelling as well as
-                # the lowercased one the long options are listed under.
-                takes_arg = (
-                    raw_option in wrapper_arg_options
-                    or raw_option.lower() in wrapper_arg_options
+            if wrapper_kind and deobfuscated.startswith("-"):
+                skip_next_wrapper_arg = _wrapper_option_consumes_next_word(
+                    wrapper_kind, deobfuscated
                 )
-                skip_next_wrapper_arg = "=" not in deobfuscated and takes_arg
+                # A wrapper option is itself a prefix word, whether or not it
+                # owns an operand: ``sudo -E rm ...`` needs the same anchor as
+                # ``sudo -u root rm ...`` in front of the bare command word
+                # that follows.
+                prefix_consumed = True
                 continue
             basename = _projected_executable_basename(word)
             effective = (basename or deobfuscated).lower()
@@ -2510,11 +2676,7 @@ def _project_path_spelled_executables(command: str) -> str | None:
                 # anchor a projected path spelling would get.
                 replacements[word_start] = (word_end, word)
             if effective in _COMMAND_WRAPPER_WORDS:
-                skip_wrapper_options = effective in {"sudo", "env"}
-                if effective == "sudo":
-                    wrapper_arg_options = _SUDO_OPTIONS_WITH_ARG
-                elif effective == "env":
-                    wrapper_arg_options = _ENV_OPTIONS_WITH_ARG
+                wrapper_kind = effective if effective in {"sudo", "env"} else None
                 continue  # wrapper (bare or path-spelled): walk to the command
             break
     if not replacements:
