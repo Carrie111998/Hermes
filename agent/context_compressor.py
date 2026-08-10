@@ -2251,6 +2251,7 @@ class ContextCompressor(ContextEngine):
                 api_key=self.api_key,
                 config_context_length=self._config_context_length,
                 provider=self.provider,
+                custom_providers=self.custom_providers,
             )
             # Small-context threshold floor: models under 512K trigger at
             # >=75% so compaction doesn't fire with half the window still
@@ -3076,6 +3077,7 @@ class ContextCompressor(ContextEngine):
         proactive_prune_min_reclaim_tokens: int = 4096,
         min_tail_user_messages: int = 1,
         tail_mode: str = "legacy",
+        custom_providers: list | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -3086,6 +3088,10 @@ class ContextCompressor(ContextEngine):
         # tail + verbatim-user-message summary section + recovery pointers;
         # "legacy" = 0.20*window tail (shipping behavior).
         self.tail_mode = tail_mode if tail_mode in ("legacy", "lean") else "legacy"
+        # Per-model context_length overrides from custom_providers, threaded
+        # into get_model_context_length so a per-model override (e.g. 256K)
+        # isn't skipped in favour of a hardcoded catalog default (128K).
+        self.custom_providers = list(custom_providers) if custom_providers else None
         # Per-model threshold overrides (longest substring match wins).
         # Stored as a plain dict; resolved in _resolve_threshold(), then the
         # small-context floor is applied on top.
