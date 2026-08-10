@@ -809,6 +809,236 @@ class TestAnsiCQuotingBypass:
 
         assert is_hardline is True
 
+    def test_ansi_c_wrappers_still_hit_hardline_floor(self):
+        r"""Executable `command` forms must expose their real utility."""
+        for cmd in (
+            "command rm -rf /",
+            "command $'\\x72\\x6d' -rf /",
+            "command $'\\x72\\x6d' -rf $'\\x2f'",
+            "command -p $'\\x72\\x6d' -rf /",
+            "builtin exec rm -rf /",
+            "builtin command rm -rf /",
+        ):
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, f"wrapper/ANSI-C spelling escaped hardline: {cmd!r}"
+
+    def test_nonexecuting_command_and_builtin_forms_are_not_hardline(self):
+        for cmd in (
+            "command -v rm -rf /",
+            "command -V reboot",
+            "builtin rm -rf /",
+            "builtin reboot",
+        ):
+            is_hardline, _ = detect_hardline_command(cmd)
+            assert is_hardline is False, f"nonexecuting wrapper form blocked: {cmd!r}"
+
+    def test_eval_payloads_hit_hardline_floor(self, monkeypatch):
+        commands = (
+            "eval 'rm -rf /'",
+            "eval -- 'rm -rf /'",
+            "builtin eval 'rm -rf /'",
+            "builtin eval -- 'rm -rf /'",
+            "command eval 'rm -rf /'",
+            "command eval -- 'rm -rf /'",
+            "builtin command eval 'rm -rf /'",
+            "builtin command eval -- 'rm -rf /'",
+            "env -S 'eval -- \"rm -rf /\"'",
+            'eval "$PAYLOAD"',
+        )
+        for cmd in commands:
+            assert detect_hardline_command(cmd)[0] is True, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for cmd in commands:
+            assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            assert approval_module.check_all_command_guards(cmd, "local")["approved"] is False, cmd
+
+    def test_exec_argv0_options_hit_hardline_floor(self, monkeypatch):
+        commands = (
+            "exec -a harmless rm -rf /",
+            "exec -ca harmless rm -rf /",
+            "command exec -a harmless rm -rf /",
+            "builtin exec -a harmless rm -rf /",
+        )
+        for cmd in commands:
+            assert detect_hardline_command(cmd)[0] is True, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for cmd in commands:
+            assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            assert approval_module.check_all_command_guards(cmd, "local")["approved"] is False, cmd
+
+    def test_env_option_prefixes_still_hit_hardline_floor(self):
+        r"""GNU env options / `--` must stay inside the hardline command-position
+        prefix. Assignment-only `env FOO=1 rm` already matched; `env -i` and
+        `env --` previously left the decoded wipe outside the unconditional
+        floor while the softer dangerous detector still fired."""
+        for cmd in (
+            "env -i rm -rf /",
+            "env -- rm -rf /",
+            "env -i -- rm -rf /",
+            "env -iv rm -rf /",
+            "env -u HOME rm -rf /",
+            "env --un HOME rm -rf /",
+            "env --u HOME rm -rf /",
+            "env -C /tmp rm -rf /",
+            "env --ch /tmp rm -rf /",
+            "env --block-signal rm -rf /",
+            "env --default-signal rm -rf /",
+            "env --ignore-signal rm -rf /",
+            "env -i PATH=/usr/bin rm -rf /",
+            "sudo env -i rm -rf /",
+            "env -i $'\\x72\\x6d' -rf /",
+            "env -- $'\\x72\\x6d' -rf /",
+            "env -i $'\\x72\\x6d' -rf $'\\x2f'",
+            "env -- $'\\x72\\x6d' -rf $'\\x2f'",
+            "env -u HOME $'\\x72\\x6d' -rf $'\\x2f'",
+        ):
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, f"env-option prefix escaped hardline: {cmd!r}"
+
+    def test_env_split_string_payloads_hit_hardline_floor(self):
+        for cmd in (
+            "env -S 'rm -rf /'",
+            "env --split-string 'rm -rf /'",
+            "env --split-string='rm -rf /'",
+            "env --s 'rm -rf /'",
+            "env --split-str='rm -rf /'",
+            "env -S'rm -rf /'",
+            "env -iS 'rm -rf /'",
+            "env -iS'rm -rf /'",
+            "sudo env -S 'rm -rf /'",
+            "env -S $'rm -rf /'",
+        ):
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, f"env split-string escaped hardline: {cmd!r}"
+
+    def test_env_split_string_payloads_stay_blocked_in_yolo(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+
+        for cmd in (
+            "env -S 'rm -rf /'",
+            "env -S $'rm -rf /'",
+            'env -S "$PAYLOAD"',
+            "env -S 'sh -c \"rm -rf /\"'",
+            "command env -S 'rm -rf /'",
+            "command -p env -S 'rm -rf /'",
+            "builtin command env -S 'rm -rf /'",
+            "builtin exec env -S 'rm -rf /'",
+            'command env "$OPT" \'rm -rf /\'',
+        ):
+            result = approval_module.check_dangerous_command(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result["hardline"] is True, cmd
+
+    def test_env_split_string_payloads_stay_blocked_when_approvals_off(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+
+        for cmd in (
+            "env --split-string='rm -rf /'",
+            'env -S "$(printf \'rm -rf /\')"',
+            "env -S `printf 'rm -rf /'`",
+            "sudo env -S 'sh -c \"rm -rf /\"'",
+            "command env -S 'rm -rf /'",
+            "builtin exec env -S 'rm -rf /'",
+            'command env "$OPT" \'rm -rf /\'',
+        ):
+            result = approval_module.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result["hardline"] is True, cmd
+
+    def test_env_split_string_execution_payloads_are_recursively_inspected(self):
+        for cmd in (
+            "env -S 'sh -c \"rm -rf /\"'",
+            "env -S 'bash -c \"rm -rf /\"'",
+            "sudo env -S 'sh -c \"rm -rf /\"'",
+            "env -S 'command sh -c \"rm -rf /\"'",
+            "env -S \"env -S 'rm -rf /'\"",
+            "env -S 'env --unset HOME rm -rf /'",
+            "env -S 'env -u HOME rm -rf /'",
+            "env -S 'sh -c \"env --unset HOME rm -rf /\"'",
+        ):
+            is_hardline, _ = detect_hardline_command(cmd)
+            assert is_hardline is True, f"nested env payload escaped: {cmd!r}"
+
+    def test_dynamic_env_option_position_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        commands = (
+            'OPT=-S; env "$OPT" \'rm -rf /\'',
+            "env $(printf -- -S) 'rm -rf /'",
+            "env `$OPTION_COMMAND` 'rm -rf /'",
+        )
+        for cmd in commands:
+            result = approval_module.check_dangerous_command(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result["hardline"] is True, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            result = approval_module.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result["hardline"] is True, cmd
+
+    def test_deep_execution_payload_traversal_fails_closed(self):
+        commands = [f"sh -c 'printf safe{index}'" for index in range(31)]
+
+        is_hardline, desc = detect_hardline_command("; ".join(commands))
+        assert is_hardline is True
+        assert "parser limit" in desc
+
+    def test_env_assignment_ends_option_parsing(self):
+        is_hardline, _ = detect_hardline_command("env FOO=x -S 'rm -rf /'")
+        assert is_hardline is False
+
+    def test_invalid_or_nonexecuting_env_forms_are_not_hardline(self):
+        for cmd in (
+            "env --i rm -rf /",
+            "env --ignore rm -rf /",
+            "env --bogus rm -rf /",
+            "env -Z rm -rf /",
+            "env --help rm -rf /",
+            "env --version rm -rf /",
+            "env -0 rm -rf /",
+            "env --null rm -rf /",
+        ):
+            assert detect_hardline_command(cmd) == (False, None), cmd
+
+    def test_safe_env_split_string_payloads_are_not_hardline(self):
+        for cmd in (
+            "env -S 'printf safe'",
+            "env --split-string='echo harmless'",
+            "env -S 'echo \"rm -rf /\"'",
+            "env -S 'sh -c \"printf safe\"'",
+            "env -S 'printf %s \"sh -c rm -rf /\"'",
+            "env LABEL='rm -rf /' printf safe",
+        ):
+            is_hardline, _ = detect_hardline_command(cmd)
+            assert is_hardline is False, f"safe env split-string blocked: {cmd!r}"
+
+    def test_malformed_env_split_string_fails_closed(self):
+        for cmd in (
+            "env -S \"'\"",
+            "env --split-string",
+            r"env -S 'printf %s a\_b'",
+            "env -S 'printf %s ${PAYLOAD}'",
+            'env --split-string="$PAYLOAD"',
+            'env -S"$PAYLOAD"',
+            'env -iS"$PAYLOAD"',
+        ):
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, f"malformed env split-string allowed: {cmd!r}"
+            assert "malformed executable payload" in desc
+
     def test_ansi_c_forms_still_flagged_dangerous(self):
         for cmd in (
             "$'\\x72\\x6d' -rf /tmp/x",
