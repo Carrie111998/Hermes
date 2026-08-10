@@ -6430,6 +6430,59 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: unknown provider %r", provider)
         return None, None
 
+    if pconfig.auth_type == "oauth_minimax":
+        # MiniMax OAuth uses an Anthropic Messages-compatible endpoint with
+        # Bearer auth.  The main runtime resolver already knows how to refresh
+        # and resolve these credentials, but auxiliary calls historically fell
+        # through the generic provider switch and returned (None, None), which
+        # broke MoA reference slots and every other auxiliary MiniMax OAuth use.
+        api_key = str(explicit_api_key or "").strip()
+        base_url = str(explicit_base_url or "").strip().rstrip("/")
+        if not api_key or not base_url:
+            try:
+                from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
+
+                creds = resolve_minimax_oauth_runtime_credentials()
+                api_key = api_key or str(creds.get("api_key") or "").strip()
+                base_url = base_url or str(creds.get("base_url") or "").strip().rstrip("/")
+            except Exception as exc:
+                logger.debug(
+                    "resolve_provider_client: minimax-oauth credential resolution failed: %s",
+                    exc,
+                )
+                return None, None
+        if not api_key or not base_url:
+            return None, None
+
+        default_model = _get_aux_model_for_provider(provider)
+        final_model = _normalize_resolved_model(model or default_model, provider)
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+
+            real_client = build_anthropic_client(api_key, base_url)
+        except ImportError:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth requires the anthropic SDK"
+            )
+            return None, None
+        client = AnthropicAuxiliaryClient(
+            real_client,
+            final_model,
+            api_key,
+            base_url,
+            # MiniMax accepts bearer auth on an Anthropic-compatible endpoint,
+            # but it is not native Anthropic OAuth.  Enabling this flag would
+            # inject Claude Code identity prompts, tool transforms, and beta
+            # headers into third-party requests.
+            is_oauth=False,
+        )
+        logger.debug("resolve_provider_client: minimax-oauth (%s)", final_model)
+        return (
+            _to_async_client(client, final_model, is_vision=is_vision)
+            if async_mode
+            else (client, final_model)
+        )
+
     if pconfig.auth_type == "api_key":
         if provider == "anthropic":
             client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
