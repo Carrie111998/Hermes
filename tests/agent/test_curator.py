@@ -808,17 +808,18 @@ def test_review_fork_preserves_structured_conversation_failure(curator_env, monk
     curator = curator_env["curator"]
     import importlib
     importlib.reload(curator)
+    conversation_result = {
+        "final_response": "",
+        "failed": True,
+        "error": "provider rejected credentials",
+    }
 
     class _StubAgent:
         def __init__(self, **_kwargs):
             self._session_messages = []
 
         def run_conversation(self, **_kwargs):
-            return {
-                "final_response": "",
-                "failed": True,
-                "error": "provider rejected credentials",
-            }
+            return conversation_result
 
         def close(self):
             pass
@@ -829,6 +830,13 @@ def test_review_fork_preserves_structured_conversation_failure(curator_env, monk
 
     assert result["error"] == "provider rejected credentials"
     assert result["summary"] == "error (provider rejected credentials)"
+
+    long_error = "provider rejected credentials: " + "x" * 300
+    conversation_result["error"] = long_error
+    result = curator._run_llm_review("review")
+
+    assert result["error"] == long_error
+    assert result["summary"] == f"error ({long_error})"[:240] + "…"
 
 
 

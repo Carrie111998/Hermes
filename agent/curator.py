@@ -1968,7 +1968,12 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if conversation_failed or conversation_error:
             error = str(conversation_error or "conversation failed")
             result_meta["error"] = error
-            result_meta["summary"] = f"error ({error})"
+            error_summary = f"error ({error})"
+            result_meta["summary"] = (
+                error_summary[:240] + "…"
+                if len(error_summary) > 240
+                else error_summary
+            )
         else:
             result_meta["summary"] = (
                 (final[:240] + "…") if len(final) > 240 else (final or "no change")
