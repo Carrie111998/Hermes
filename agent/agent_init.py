@@ -1780,8 +1780,6 @@ def init_agent(
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
                 _prefetch_timeout = mem_config.get("prefetch_timeout")
-                if _prefetch_timeout is not None:
-                    _prefetch_timeout = float(_prefetch_timeout)
                 agent._memory_manager = _MemoryManager(
                     external_prefetch_timeout=_prefetch_timeout,
                 )
