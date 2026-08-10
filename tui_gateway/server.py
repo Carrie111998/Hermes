@@ -5040,10 +5040,17 @@ def _get_usage(agent) -> dict:
         if last_prompt < 0:
             last_prompt = 0
         ctx_max = getattr(comp, "context_length", 0) or 0
+        threshold_tokens = getattr(comp, "threshold_tokens", 0) or 0
         if ctx_max and last_prompt:
             usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
+        if ctx_max and threshold_tokens:
+            usage["compression_threshold_tokens"] = threshold_tokens
+            usage["compression_threshold_percent"] = max(
+                0,
+                min(100, round(threshold_tokens / ctx_max * 100)),
+            )
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status

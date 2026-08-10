@@ -15883,12 +15883,15 @@ def test_get_usage_reports_real_current_occupancy():
             last_prompt_tokens=60_000,
             context_length=120_000,
             compression_count=2,
+            threshold_tokens=90_000,
         ),
     )
     usage = server._get_usage(agent)
     assert usage["context_used"] == 60_000
     assert usage["context_max"] == 120_000
     assert usage["context_percent"] == 50
+    assert usage["compression_threshold_tokens"] == 90_000
+    assert usage["compression_threshold_percent"] == 75
 
 
 def test_get_usage_clamps_post_compression_sentinel():

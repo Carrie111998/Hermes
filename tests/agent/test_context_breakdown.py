@@ -13,6 +13,7 @@ def _make_agent(
     tools: list | None = None,
     context_length: int = 200_000,
     last_prompt_tokens: int = 0,
+    threshold_tokens: int = 150_000,
 ):
     agent = MagicMock()
     agent.model = "openai/gpt-5.4"
@@ -27,6 +28,7 @@ def _make_agent(
     agent.context_compressor = MagicMock(
         context_length=context_length,
         last_prompt_tokens=last_prompt_tokens,
+        threshold_tokens=threshold_tokens,
     )
     return agent, {"stable": stable, "context": context, "volatile": volatile}
 
@@ -47,6 +49,8 @@ def test_breakdown_includes_major_categories():
     ids = {item["id"] for item in data["categories"]}
     assert {"system_prompt", "tool_definitions", "rules", "skills", "mcp", "subagent_definitions", "conversation"} <= ids
     assert data["context_max"] == 200_000
+    assert data["compression_threshold_tokens"] == 150_000
+    assert data["compression_threshold_percent"] == 75
     assert data["estimated_total"] > 0
 
 
