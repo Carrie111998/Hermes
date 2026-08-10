@@ -24,6 +24,11 @@ _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
 )
 
 
+def _provider_dispatch(metadata: dict[str, Any] | None = None):
+    from agent.provider_wire_instrumentation import provider_wire_dispatch
+    return provider_wire_dispatch(metadata)
+
+
 def execute(
     request: dict[str, Any],
     callback: Callable[[dict[str, Any]], Any],
@@ -37,7 +42,8 @@ def execute(
     """Run one non-streaming physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return callback(request)
+        with _provider_dispatch(metadata):
+            return callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
 
@@ -60,7 +66,8 @@ def execute(
             # Nested relay calls inside a managed provider callback must run
             # unmanaged (#77244) — see relay_runtime.managed_callback_guard.
             with relay_runtime.managed_callback_guard():
-                return callback(final)
+                with _provider_dispatch(metadata):
+                    return callback(final)
 
         try:
             final_request = _provider_request(
@@ -129,7 +136,8 @@ async def execute_async(
     """Run one asynchronous physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return await callback(request)
+        with _provider_dispatch(metadata):
+            return await callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
 
@@ -159,7 +167,8 @@ async def execute_async(
                 # Nested relay calls inside a managed provider callback must
                 # run unmanaged (#77244).
                 with relay_runtime.managed_callback_guard():
-                    return await callback(final_request)
+                    with _provider_dispatch(metadata):
+                        return await callback(final_request)
 
             task = callback_context.copy().run(
                 asyncio.create_task,
@@ -221,7 +230,8 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return callback(request)
+        with _provider_dispatch(metadata):
+            return callback(request)
     return execute(
         request,
         callback,
@@ -245,7 +255,8 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
-        return await callback(request)
+        with _provider_dispatch(metadata):
+            return await callback(request)
     return await execute_async(
         request,
         callback,
@@ -289,7 +300,8 @@ def stream_current(
     """
     turn = relay_runtime.active_turn()
     if turn is None:
-        return stream_factory(request)
+        with _provider_dispatch(metadata):
+            return stream_factory(request)
     if _has_running_event_loop():
         # Managed provider callbacks execute on the Relay session's event
         # loop. A nested ManagedLlmStream built here would be synchronously
@@ -300,7 +312,8 @@ def stream_current(
         # own completed_response_predicate traps a completed response (e.g.
         # the MoA facade's auxiliary ``call_llm(stream=True)`` returning a
         # full response when an adapter ignores ``stream=True``).
-        return stream_factory(request)
+        with _provider_dispatch(metadata):
+            return stream_factory(request)
     managed = stream(
         request,
         stream_factory,
@@ -421,7 +434,8 @@ class ManagedLlmStream(Iterator[Any]):
             or session is None
             or not runtime.managed_execution_enabled()
         ):
-            raw_stream = stream_factory(request)
+            with _provider_dispatch(metadata):
+                raw_stream = stream_factory(request)
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
             ):
@@ -449,16 +463,17 @@ class ManagedLlmStream(Iterator[Any]):
         async def provider_stream(next_request: Any):
             raw_stream = None
             try:
-                raw_stream = run_callback(
-                    stream_factory,
-                    _provider_request(
-                        request,
-                        next_request,
-                        relay_request_body=relay_request_body,
-                        codec_baseline_body=codec_baseline_body,
-                        metadata=metadata,
-                    )
+                final_request = _provider_request(
+                    request,
+                    next_request,
+                    relay_request_body=relay_request_body,
+                    codec_baseline_body=codec_baseline_body,
+                    metadata=metadata,
                 )
+                def open_provider_stream():
+                    with _provider_dispatch(metadata):
+                        return stream_factory(final_request)
+                raw_stream = run_callback(open_provider_stream)
                 if (
                     completed_response_predicate is not None
                     and run_callback(
