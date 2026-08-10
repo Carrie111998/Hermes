@@ -6,6 +6,9 @@ from typing import Any, Mapping
 
 import yaml
 
+from activity_policy.schema import ActivityPolicy, PolicyError
+
+
 class _UniqueKeyLoader(yaml.SafeLoader):
     pass
 
@@ -28,9 +31,13 @@ _UniqueKeyLoader.add_constructor(
 
 
 def _load_yaml(text: str):
-    return yaml.load(text, Loader=_UniqueKeyLoader) or {}
+    try:
+        return yaml.load(text, Loader=_UniqueKeyLoader) or {}
+    except PolicyError:
+        raise
+    except Exception as exc:
+        raise PolicyError("invalid policy YAML") from exc
 
-from activity_policy.schema import ActivityPolicy, PolicyError
 
 _ACTIVITY_ID = re.compile(r"^[a-z][a-z0-9]*(?:\.[a-z0-9]+)*$")
 

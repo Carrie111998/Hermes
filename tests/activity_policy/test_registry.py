@@ -175,3 +175,28 @@ def test_load_rejects_duplicate_activity_ids_after_yaml_construction(tmp_path):
     )
     with pytest.raises(PolicyError, match="duplicate activity ID"):
         ActivityRegistry.load(path)
+
+
+def test_load_normalizes_malformed_yaml_to_policy_error(tmp_path):
+    path = tmp_path / "malformed.yaml"
+    path.write_text("enforcement: observe\nactivities: [\n", encoding="utf-8")
+
+    with pytest.raises(PolicyError, match="invalid policy YAML") as raised:
+        ActivityRegistry.load(path)
+
+    assert raised.value.__cause__ is not None
+    assert raised.value.__cause__.__class__.__module__.startswith("yaml")
+
+
+def test_load_normalizes_unhashable_mapping_key_to_policy_error(tmp_path):
+    path = tmp_path / "unhashable-key.yaml"
+    path.write_text(
+        "enforcement: observe\nactivities:\n  ? [bad, key]\n  : {}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(PolicyError, match="invalid policy YAML") as raised:
+        ActivityRegistry.load(path)
+
+    assert isinstance(raised.value.__cause__, TypeError)
+    assert "unhashable type" in str(raised.value.__cause__)

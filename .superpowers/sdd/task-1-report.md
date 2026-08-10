@@ -19,3 +19,11 @@ Implemented the strict, immutable, observational `activity_policy` registry, fro
 
 ## Concerns
 - None affecting Task 1. Generated build artifacts under `.superpowers/sdd/dist-task-1` are evidence only and are not intended for staging.
+
+
+## Review fix: YAML error normalization
+- RED: `python -m pytest tests/activity_policy/test_registry.py -q` produced **2 failed, 25 passed in 6.54s**. The malformed document leaked `yaml.parser.ParserError`; the sequence mapping key leaked `TypeError: unhashable type: 'list'`.
+- Fix: `_load_yaml()` now preserves existing `PolicyError` declarations and normalizes all other YAML parsing/construction failures to `PolicyError("invalid policy YAML")` using `raise ... from exc`, retaining the original cause. Focused tests call `ActivityRegistry.load()` and assert both the public exception and concrete cause type/content.
+- Exact verification command: `python -m pytest tests/activity_policy/test_registry.py tests/test_packaging_metadata.py -q && python -m ruff check activity_policy/registry.py tests/activity_policy/test_registry.py tests/test_packaging_metadata.py`
+- Output: **39 passed in 6.85s**; **All checks passed!**
+- Review-fix commit: `ac6b36d455d627be8216189a80f8f9bbb27d8d87`.
