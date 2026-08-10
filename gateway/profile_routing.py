@@ -148,6 +148,54 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
         except (ValueError, ImportError):
             logger.warning("Skipping profile route %s: invalid profile name %r", name, profile)
             continue
+        user_id = None
+        if entry.get("user_id") is not None:
+            raw_user_id = entry["user_id"]
+            if isinstance(raw_user_id, bool):
+                logger.warning(
+                    "Skipping profile route %s: invalid user_id %r",
+                    name,
+                    raw_user_id,
+                )
+                continue
+            if isinstance(raw_user_id, (list, dict, set, tuple)):
+                logger.warning(
+                    "Skipping profile route %s: invalid user_id %r",
+                    name,
+                    raw_user_id,
+                )
+                continue
+            if isinstance(raw_user_id, float):
+                logger.warning(
+                    "Skipping profile route %s: invalid user_id %r",
+                    name,
+                    raw_user_id,
+                )
+                continue
+            if isinstance(raw_user_id, int):
+                if raw_user_id <= 0:
+                    logger.warning(
+                        "Skipping profile route %s: user_id must be a positive integer, got %r",
+                        name,
+                        raw_user_id,
+                    )
+                    continue
+                user_id = str(raw_user_id)
+            elif isinstance(raw_user_id, str):
+                user_id = raw_user_id.strip()
+                if not user_id:
+                    logger.warning(
+                        "Skipping profile route %s: empty user_id",
+                        name,
+                    )
+                    continue
+            else:
+                logger.warning(
+                    "Skipping profile route %s: invalid user_id %r",
+                    name,
+                    raw_user_id,
+                )
+                continue
         routes.append(
             ProfileRoute(
                 name=name,
@@ -156,11 +204,7 @@ def parse_profile_routes(raw: Optional[List[Dict[str, Any]]]) -> List[ProfileRou
                 guild_id=entry.get("guild_id"),
                 chat_id=entry.get("chat_id"),
                 thread_id=entry.get("thread_id"),
-                user_id=(
-                    str(entry["user_id"]).strip()
-                    if entry.get("user_id") is not None
-                    else None
-                ),
+                user_id=user_id,
                 enabled=entry.get("enabled", True),
             )
         )

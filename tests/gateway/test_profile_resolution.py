@@ -8,7 +8,7 @@ import pytest
 
 from gateway.session import SessionSource, build_session_key
 from gateway.run import GatewayRunner
-from gateway.profile_routing import ProfileRoute
+from gateway.profile_routing import ProfileRoute, parse_profile_routes
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.base import BasePlatformAdapter
 
@@ -243,6 +243,7 @@ class TestAdapterToSessionKeyIntegration:
         ]
 
     def test_discord_adapter_stamps_profile_and_scopes_key(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
         mock_runner.config.profile_routes = self._routes()
         adapter = _stub_adapter(Platform.DISCORD, mock_runner)
 
@@ -255,6 +256,84 @@ class TestAdapterToSessionKeyIntegration:
         assert key.startswith("agent:coder:"), key
         # A default-profile key would land in agent:main — must differ.
         assert key != build_session_key(source, profile=None)
+
+    def test_discord_sender_route_via_parse_stamps_profile_and_scopes_key(
+        self, mock_runner,
+    ):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = parse_profile_routes([
+            {"name": "builder", "platform": "discord", "profile": "product-builder",
+             "user_id": 392686399226380294},
+        ])
+        adapter = _stub_adapter(Platform.DISCORD, mock_runner)
+
+        source = adapter.build_source(
+            chat_id="222",
+            chat_type="group",
+            guild_id="111",
+            user_id="392686399226380294",
+        )
+        assert source.profile == "product-builder"
+
+        key = build_session_key(source, profile=source.profile)
+        assert key.startswith("agent:product-builder:"), key
+        assert key != build_session_key(source, profile=None)
+
+    def test_telegram_sender_route_via_parse_matching_user(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = parse_profile_routes([
+            {"name": "vip", "platform": "telegram", "profile": "vip-profile",
+             "user_id": 123456789},
+        ])
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+
+        source = adapter.build_source(
+            chat_id="-1001234567890",
+            chat_type="group",
+            user_id="123456789",
+        )
+        assert source.profile == "vip-profile"
+
+        key = build_session_key(source, profile=source.profile)
+        assert key.startswith("agent:vip-profile:"), key
+
+    def test_telegram_sender_route_via_parse_nonmatching_user(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = parse_profile_routes([
+            {"name": "vip", "platform": "telegram", "profile": "vip-profile",
+             "user_id": 123456789},
+        ])
+        adapter = _stub_adapter(Platform.TELEGRAM, mock_runner)
+
+        source = adapter.build_source(
+            chat_id="-1001234567890",
+            chat_type="group",
+            user_id="999999999",
+        )
+        assert source.profile is None
+
+        key = build_session_key(source, profile=source.profile)
+        assert key.startswith("agent:main:"), key
+
+    def test_empty_user_id_route_does_not_stamp_profile(self, mock_runner):
+        mock_runner.config.multiplex_profiles = True
+        mock_runner.config.profile_routes = parse_profile_routes([
+            {"name": "bad-sender", "platform": "discord", "profile": "leaked",
+             "user_id": ""},
+        ])
+        assert mock_runner.config.profile_routes == []
+        adapter = _stub_adapter(Platform.DISCORD, mock_runner)
+
+        source = adapter.build_source(
+            chat_id="222",
+            chat_type="group",
+            guild_id="111",
+            user_id="392686399226380294",
+        )
+        assert source.profile is None
+
+        key = build_session_key(source, profile=source.profile)
+        assert key.startswith("agent:main:"), key
 
 
 class TestMultiplexGate:

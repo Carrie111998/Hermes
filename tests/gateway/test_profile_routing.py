@@ -1,5 +1,7 @@
 """Tests for gateway/profile_routing.py — profile-based routing."""
 
+import logging
+
 import pytest
 from gateway.profile_routing import (
     ProfileRoute,
@@ -68,6 +70,29 @@ class TestProfileRouteMatching:
         assert not r.matches("discord", user_id="42", chat_id="333")
         assert not r.matches("discord", user_id="43", chat_id="222")
 
+    def test_sender_guild_chat_thread_conjunctive(self):
+        r = ProfileRoute(
+            name="full",
+            platform="discord",
+            profile="scoped",
+            user_id="42",
+            guild_id="111",
+            chat_id="222",
+            thread_id="333",
+        )
+        base = dict(
+            platform="discord",
+            user_id="42",
+            guild_id="111",
+            chat_id="222",
+            thread_id="333",
+        )
+        assert r.matches(**base)
+        assert not r.matches(**{**base, "user_id": "99"})
+        assert not r.matches(**{**base, "guild_id": "999"})
+        assert not r.matches(**{**base, "chat_id": "888"})
+        assert not r.matches(**{**base, "thread_id": "444"})
+
 
 class TestParseProfileRoutes:
     def test_empty(self):
@@ -84,6 +109,71 @@ class TestParseProfileRoutes:
         routes = parse_profile_routes(raw)
         by_name = {r.name: r for r in routes}
         assert by_name["sender"].user_id == "42"
+
+    @pytest.mark.parametrize("user_id", ["", "   "])
+    def test_empty_user_id_route_skipped(self, user_id, caplog):
+        raw = [
+            {"name": "bad-sender", "platform": "discord", "profile": "p",
+             "user_id": user_id},
+        ]
+        with caplog.at_level(logging.WARNING):
+            routes = parse_profile_routes(raw)
+        assert routes == []
+        assert any("bad-sender" in r.message and "empty user_id" in r.message
+                   for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "user_id",
+        [True, 1.5, [123], {"id": 1}],
+    )
+    def test_malformed_user_id_route_skipped(self, user_id, caplog):
+        raw = [
+            {"name": "bad-sender", "platform": "discord", "profile": "p",
+             "user_id": user_id},
+        ]
+        with caplog.at_level(logging.WARNING):
+            routes = parse_profile_routes(raw)
+        assert routes == []
+        assert any("bad-sender" in r.message and "invalid user_id" in r.message
+                   for r in caplog.records)
+
+    @pytest.mark.parametrize("user_id", [0, -7])
+    def test_nonpositive_int_user_id_route_skipped(self, user_id, caplog):
+        raw = [
+            {"name": "bad-sender", "platform": "discord", "profile": "p",
+             "user_id": user_id},
+        ]
+        with caplog.at_level(logging.WARNING):
+            routes = parse_profile_routes(raw)
+        assert routes == []
+        assert any(
+            "bad-sender" in r.message and "positive integer" in r.message
+            for r in caplog.records
+        )
+
+    def test_valid_user_id_normalization(self):
+        snowflake = 392686399226380294
+        raw = [
+            {"name": "int-sender", "platform": "discord", "profile": "p",
+             "user_id": 42},
+            {"name": "snowflake-sender", "platform": "discord", "profile": "p",
+             "user_id": snowflake},
+            {"name": "str-sender", "platform": "discord", "profile": "p",
+             "user_id": " 42 "},
+        ]
+        routes = parse_profile_routes(raw)
+        by_name = {r.name: r for r in routes}
+        assert by_name["int-sender"].user_id == "42"
+        assert by_name["snowflake-sender"].user_id == str(snowflake)
+        assert by_name["str-sender"].user_id == "42"
+
+    def test_absent_user_id_stays_none(self):
+        routes = parse_profile_routes([
+            {"name": "loc", "platform": "discord", "profile": "p",
+             "guild_id": "1", "chat_id": "2"},
+        ])
+        assert len(routes) == 1
+        assert routes[0].user_id is None
 
 
 class TestMatchProfileRoute:
