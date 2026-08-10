@@ -1247,6 +1247,11 @@ export const ja = defineLocale({
     noDailyActivity: '日別アクティビティがありません。',
     topModels: 'よく使うモデル',
     noModelUsage: 'モデルの使用履歴はまだありません。',
+    accountLimits: 'アカウント上限',
+    topProviders: 'プロバイダー',
+    noProviderUsage: 'プロバイダーの使用記録はまだありません。',
+    topTasks: 'タスク',
+    noTaskUsage: '補助タスクの使用記録はまだありません。',
     topSkills: 'よく使うスキル',
     noSkillActivity: 'スキルのアクティビティはまだありません。',
     actions: count => `${count} アクション`
@@ -2366,6 +2371,13 @@ export const ja = defineLocale({
           unsupported: 'このプロバイダーはアカウント使用量を報告しません'
         },
         remaining: percent => `残り ${percent}%`,
+        openInCommandCenter: 'コマンドセンターで開く',
+        refresh: '更新',
+        refreshing: '更新中…',
+        resetsAt: time => `リセット: ${time}`,
+        sourceOfficial: 'プロバイダー公式データ',
+        staleData: 'キャッシュデータ',
+        updatedAt: time => `更新: ${time}`,
         categories: {
           conversation: '会話',
           mcp: 'MCP',

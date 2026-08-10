@@ -804,8 +804,30 @@ export interface AnalyticsModelEntry {
   sessions: number
 }
 
+export interface AnalyticsProviderEntry {
+  api_calls: number
+  estimated_cost: number
+  input_tokens: number
+  output_tokens: number
+  provider: string
+  sessions: number
+}
+
+export interface AnalyticsTaskEntry {
+  api_calls: number
+  estimated_cost: number
+  input_tokens: number
+  models: string[]
+  output_tokens: number
+  task: string
+}
+
 export interface AnalyticsResponse {
   by_model: AnalyticsModelEntry[]
+  /** Real per-provider accounting (sessions + aux, add-only). Absent on older backends. */
+  by_provider?: AnalyticsProviderEntry[]
+  /** Aux usage per task (vision, compression, ...). Absent on older backends. */
+  by_task?: AnalyticsTaskEntry[]
   daily: AnalyticsDailyEntry[]
   period_days: number
   skills: {

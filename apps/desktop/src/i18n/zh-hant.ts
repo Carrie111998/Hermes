@@ -1212,6 +1212,11 @@ export const zhHant = defineLocale({
     noDailyActivity: '暫無每日活動。',
     topModels: '常用模型',
     noModelUsage: '暫無模型使用量。',
+    accountLimits: '帳號額度',
+    topProviders: '供應商',
+    noProviderUsage: '暫無供應商用量記錄。',
+    topTasks: '任務',
+    noTaskUsage: '暫無輔助任務用量記錄。',
     topSkills: '常用技能',
     noSkillActivity: '暫無技能活動。',
     actions: count => `${count} 次動作`
@@ -2289,6 +2294,13 @@ export const zhHant = defineLocale({
           unsupported: '此供應商不回報帳號用量'
         },
         remaining: percent => `剩餘 ${percent}%`,
+        openInCommandCenter: '在命令中心開啟',
+        refresh: '重新整理',
+        refreshing: '重新整理中…',
+        resetsAt: time => `重置於 ${time}`,
+        sourceOfficial: '供應商官方資料',
+        staleData: '快取資料',
+        updatedAt: time => `更新於 ${time}`,
         categories: {
           conversation: '對話',
           mcp: 'MCP',

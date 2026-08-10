@@ -534,6 +534,7 @@ export function useStatusbarItems({
         menuContent: (
           <ContextUsagePanel
             currentUsage={currentUsage}
+            onOpenCommandCenter={() => openCommandCenterSection('usage')}
             onUsageSnapshot={publishContextUsage}
             profile={activeGatewayProfile}
             requestGateway={requestGateway}
