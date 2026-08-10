@@ -41,6 +41,14 @@ from hermes_constants import venv_python_path
 
 logger = logging.getLogger(__name__)
 
+# DEV-0145: known-good SHA-256 of the main-branch ZIP at the time this
+# release was built.  When upstream publishes new commits, the embedded
+# digest must be bumped in the next release cycle.  Set
+# ``HERMES_UPDATE_ZIP_EXPECTED_SHA256`` to override at runtime.
+_HERMES_MAIN_ZIP_SHA256 = (
+    "6d7d7fdc10a17d1b33065e5c4e0d37020f0b5feaf5b04f79387b6368dbb05f81"
+)
+
 
 def _m():
     """Lazy ``hermes_cli.main`` reference.
@@ -811,6 +819,40 @@ def _update_via_zip(args):
     try:
         zip_path = os.path.join(tmp_dir, f"hermes-agent-{branch}.zip")
         urlretrieve(zip_url, zip_path)
+
+        # DEV-0145: verify ZIP digest before extraction.
+        # The pinned SHA-256 is the known-good digest at the time this
+        # release was built.  When the digest changes (because upstream
+        # pushed new commits after this release), set the env variable to
+        # the new value after verifying it against the GitHub release page.
+        # This turns the single TLS hop into a two-factor trust check:
+        #  1. TLS to github.com (transport integrity)
+        #  2. Embedded digest pin (content integrity)
+        _compute_sha256 = hashlib.sha256()
+        with open(zip_path, "rb") as _zf:
+            while True:
+                _chunk = _zf.read(65536)
+                if not _chunk:
+                    break
+                _compute_sha256.update(_chunk)
+        _actual = _compute_sha256.hexdigest()
+        _expected = os.environ.get(
+            "HERMES_UPDATE_ZIP_EXPECTED_SHA256",
+            _HERMES_MAIN_ZIP_SHA256,
+        )
+        if _actual != _expected:
+            raise SystemExit(
+                "✗  Update ZIP digest mismatch — the downloaded archive does not\n"
+                "   match the expected SHA-256. This could indicate a tampered\n"
+                "   download or that upstream has published new commits since this\n"
+                "   release was built.\n\n"
+                "   Expected: {}\n"
+                "   Got:      {}\n\n"
+                "   If you have verified the new digest against the GitHub release\n"
+                "   page, set HERMES_UPDATE_ZIP_EXPECTED_SHA256={} and rerun.".format(
+                    _expected, _actual, _actual
+                )
+            )
 
         print("→ Extracting...")
         import stat as _stat
