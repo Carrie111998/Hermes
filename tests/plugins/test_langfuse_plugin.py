@@ -1317,6 +1317,55 @@ class TestSessionFinalizeHook:
         # _LANGFUSE_CLIENT is None on a fresh module; must not raise or init.
         mod.on_session_finalize(session_id="whatever")
 
+    def test_finalize_shuts_down_client_on_process_exit(self, monkeypatch):
+        """reason="shutdown" must call client.shutdown() while the interpreter
+        is alive, so the SDK's own atexit handler (which runs during
+        interpreter finalization, after opentelemetry.trace.Span is torn
+        down) becomes a no-op instead of raising the "isinstance() arg 2
+        must be a type" TypeError on quit."""
+        mod = self._fresh_plugin()
+        events = []
+
+        class _Client:
+            def flush(self):
+                events.append("flush")
+
+            def shutdown(self):
+                events.append("shutdown")
+
+        client = _Client()
+        monkeypatch.setattr(mod, "_LANGFUSE_CLIENT", client)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        mod._TRACE_STATE.clear()
+
+        mod.on_session_finalize(session_id="sess-a", reason="shutdown")
+        assert "shutdown" in events
+        assert events.index("flush") < events.index("shutdown")
+
+    def test_finalize_keeps_client_alive_on_session_rotation(self, monkeypatch):
+        """/new, /reset, and gateway session expiry finalize the session but
+        the process lives on — the cached client must NOT be shut down or
+        later sessions silently stop exporting."""
+        mod = self._fresh_plugin()
+        events = []
+
+        class _Client:
+            def flush(self):
+                events.append("flush")
+
+            def shutdown(self):
+                events.append("shutdown")
+
+        client = _Client()
+        monkeypatch.setattr(mod, "_LANGFUSE_CLIENT", client)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        mod._TRACE_STATE.clear()
+
+        for reason in ("session_boundary", "new_session", "session_expired", ""):
+            mod.on_session_finalize(session_id="sess-a", reason=reason)
+        assert "shutdown" not in events
+        assert "flush" in events
+
 
 # ---------------------------------------------------------------------------
 # Subagent tracing: delegated children as spans under the parent turn
