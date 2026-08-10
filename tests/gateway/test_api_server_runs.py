@@ -9,6 +9,7 @@ Covers:
 """
 
 import asyncio
+import sqlite3
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -66,6 +67,7 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=mws)
     app["api_server_adapter"] = adapter
     app.router.add_post("/v1/runs", adapter._handle_runs)
+    app.router.add_get("/v1/runs", adapter._handle_lookup_run)
     app.router.add_get("/v1/runs/{run_id}", adapter._handle_get_run)
     app.router.add_get("/v1/runs/{run_id}/events", adapter._handle_run_events)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
@@ -120,6 +122,177 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_reservation_is_serialized_with_stale_snapshot_recovery(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        from gateway import run_ledger
+
+        real_recover = run_ledger.recover_interrupted_runs
+        real_reserve = run_ledger.reserve_run
+        recovery_calls = 0
+        second_recovery_entered = threading.Event()
+        allow_second_recovery = threading.Event()
+        first_row_reserved = threading.Event()
+        release_first_reservation = threading.Event()
+
+        def controlled_recover(active_run_ids=None):
+            nonlocal recovery_calls
+            recovery_calls += 1
+            if recovery_calls == 2:
+                second_recovery_entered.set()
+                allow_second_recovery.wait(timeout=2)
+            return real_recover(active_run_ids)
+
+        def controlled_reserve(**kwargs):
+            result = real_reserve(**kwargs)
+            if kwargs.get("idempotency_key") == "serialized-a":
+                first_row_reserved.set()
+                release_first_reservation.wait(timeout=2)
+            return result
+
+        monkeypatch.setattr(run_ledger, "recover_interrupted_runs", controlled_recover)
+        monkeypatch.setattr(run_ledger, "reserve_run", controlled_reserve)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                first = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "first"},
+                        headers={"Idempotency-Key": "serialized-a"},
+                    )
+                )
+                assert await asyncio.to_thread(first_row_reserved.wait, 1)
+                second = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "second"},
+                        headers={"Idempotency-Key": "serialized-b"},
+                    )
+                )
+                await asyncio.sleep(0.05)
+                assert not second_recovery_entered.is_set()
+                release_first_reservation.set()
+                first_response = await first
+                assert await asyncio.to_thread(second_recovery_entered.wait, 1)
+                allow_second_recovery.set()
+                second_response = await second
+                assert first_response.status == 202
+                assert second_response.status == 202
+                first_run_id = (await first_response.json())["run_id"]
+                lookup = await cli.get(f"/v1/runs/{first_run_id}")
+                assert (await lookup.json())["status"] != "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_durable_reservation_does_not_block_event_loop(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        from gateway import run_ledger
+
+        real_reserve = run_ledger.reserve_run
+
+        reserve_entered = threading.Event()
+        release_reserve = threading.Event()
+
+        def slow_reserve(**kwargs):
+            reserve_entered.set()
+            release_reserve.wait(timeout=2)
+            return real_reserve(**kwargs)
+
+        monkeypatch.setattr(run_ledger, "reserve_run", slow_reserve)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                post_task = asyncio.create_task(
+                    cli.post("/v1/runs", json={"input": "hello"})
+                )
+                assert await asyncio.to_thread(reserve_entered.wait, 1)
+                started = time.monotonic()
+                await asyncio.sleep(0.02)
+                elapsed = time.monotonic() - started
+                assert elapsed < 0.5
+                release_reserve.set()
+                response = await post_task
+                assert response.status == 202
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_conflict_does_not_start_second_run(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "aic-conflict-398"}
+
+                first = await cli.post(
+                    "/v1/runs", json={"input": "first"}, headers=headers
+                )
+                conflict = await cli.post(
+                    "/v1/runs", json={"input": "changed"}, headers=headers
+                )
+
+                assert first.status == 202
+                assert conflict.status == 409
+                data = await conflict.json()
+                assert data["error"]["code"] == "idempotency_conflict"
+                assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_same_idempotency_key_recovers_original_run(self, monkeypatch, tmp_path):
+        """A lost 202 can be retried without dispatching a duplicate run."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                headers = {"Idempotency-Key": "aic-submit-398"}
+                payload = {"input": "hello", "session_id": "aic-session"}
+
+                first = await cli.post("/v1/runs", json=payload, headers=headers)
+                second = await cli.post("/v1/runs", json=payload, headers=headers)
+
+                assert first.status == 202
+                assert second.status == 202
+                first_data = await first.json()
+                second_data = await second.json()
+                assert second_data["run_id"] == first_data["run_id"]
+                assert second_data["session_id"] == "aic-session"
+                assert second_data["idempotency_key"] == "aic-submit-398"
+                assert mock_create.call_count == 1
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -267,6 +440,240 @@ class TestStartRun:
 class TestRunStatus:
 
     @pytest.mark.asyncio
+    async def test_cross_profile_cannot_read_or_stop_cached_run(
+        self, monkeypatch, tmp_path
+    ):
+        home_a = tmp_path / "profile-a"
+        home_b = tmp_path / "profile-b"
+        monkeypatch.setenv("HERMES_HOME", str(home_a))
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "profile a"},
+                    headers={"Idempotency-Key": "shared-profile-key"},
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if adapter._run_statuses[run_id]["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+            monkeypatch.setenv("HERMES_HOME", str(home_b))
+            status_response = await cli.get(f"/v1/runs/{run_id}")
+            stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+            assert status_response.status == 404
+            assert stop_response.status == 404
+
+    @pytest.mark.asyncio
+    async def test_missing_adapter_task_reconciles_live_owner_row(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.run_ledger import reserve_run, update_run
+
+        reserve_run(
+            run_id="run_no_task",
+            idempotency_key="aic-no-task-398",
+            request_fingerprint="fingerprint",
+            data={"session_id": "no-task", "model": "test"},
+        )
+        update_run("run_no_task", "running")
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            lookup = await cli.get(
+                "/v1/runs", headers={"Idempotency-Key": "aic-no-task-398"}
+            )
+            assert lookup.status == 200
+            assert (await lookup.json())["status"] == "interrupted"
+
+    @pytest.mark.asyncio
+    async def test_terminal_retention_purges_expired_correlation(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.run_ledger import RETENTION_SECONDS, reserve_run, update_run
+
+        reserve_run(
+            run_id="run_expired",
+            idempotency_key="aic-expired-398",
+            request_fingerprint="fingerprint",
+            data={"session_id": "expired", "model": "test"},
+        )
+        update_run("run_expired", "completed")
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            conn.execute(
+                "UPDATE api_runs SET updated_at = ? WHERE run_id = ?",
+                (time.time() - RETENTION_SECONDS - 1, "run_expired"),
+            )
+
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            lookup = await cli.get(
+                "/v1/runs", headers={"Idempotency-Key": "aic-expired-398"}
+            )
+            assert lookup.status == 404
+
+    def test_terminal_status_cannot_regress(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.run_ledger import get_run, reserve_run, update_run
+
+        reserve_run(
+            run_id="run_terminal",
+            idempotency_key="aic-terminal-398",
+            request_fingerprint="fingerprint",
+            data={"session_id": "terminal-session", "model": "test"},
+        )
+        update_run("run_terminal", "completed", output="done")
+        update_run("run_terminal", "running", last_event="late.event")
+
+        status = get_run("run_terminal")
+        assert status["status"] == "completed"
+        assert status["output"] == "done"
+        assert status.get("last_event") != "late.event"
+
+    def test_terminal_same_status_update_is_byte_immutable(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.run_ledger import get_run, reserve_run, update_run
+
+        reserve_run(
+            run_id="run_terminal_same",
+            idempotency_key="aic-terminal-same-398",
+            request_fingerprint="fingerprint",
+            data={"session_id": "terminal-same", "model": "test"},
+        )
+        update_run("run_terminal_same", "completed", output="original")
+        before = get_run("run_terminal_same")
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            durable_before = conn.execute(
+                "SELECT * FROM api_runs WHERE run_id = ?", ("run_terminal_same",)
+            ).fetchone()
+
+        update_run(
+            "run_terminal_same",
+            "completed",
+            output="changed",
+            last_event="late.completed",
+        )
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            durable_after = conn.execute(
+                "SELECT * FROM api_runs WHERE run_id = ?", ("run_terminal_same",)
+            ).fetchone()
+        assert durable_after == durable_before
+        assert get_run("run_terminal_same") == before
+
+        adapter = _make_adapter()
+        adapter._run_statuses["run_terminal_same"] = dict(before)
+        adapter._set_run_status(
+            "run_terminal_same",
+            "completed",
+            output="memory changed",
+            last_event="late.memory.completed",
+        )
+        assert adapter._run_statuses["run_terminal_same"] == before
+
+    def test_stopping_status_cannot_regress_to_active(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.run_ledger import get_run, reserve_run, update_run
+
+        reserve_run(
+            run_id="run_stopping",
+            idempotency_key="aic-stopping-398",
+            request_fingerprint="fingerprint",
+            data={"session_id": "stopping-session", "model": "test"},
+        )
+        update_run("run_stopping", "running")
+        update_run("run_stopping", "stopping")
+        update_run("run_stopping", "waiting_for_approval")
+        update_run("run_stopping", "running")
+
+        assert get_run("run_stopping")["status"] == "stopping"
+
+    @pytest.mark.asyncio
+    async def test_restart_marks_orphaned_run_interrupted(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.run_ledger import reserve_run, update_run
+
+        reserve_run(
+            run_id="run_orphaned",
+            idempotency_key="aic-orphaned-398",
+            request_fingerprint="fingerprint",
+            data={"session_id": "orphaned-session", "model": "test"},
+        )
+        update_run("run_orphaned", "running")
+        with sqlite3.connect(tmp_path / "state.db") as conn:
+            conn.execute(
+                "UPDATE api_runs SET owner_pid = ?, owner_started_at = ? WHERE run_id = ?",
+                (999_999_999, 1, "run_orphaned"),
+            )
+
+        restarted_adapter = _make_adapter()
+        restarted_app = _create_runs_app(restarted_adapter)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            lookup = await cli.get(
+                "/v1/runs", headers={"Idempotency-Key": "aic-orphaned-398"}
+            )
+
+            assert lookup.status == 200
+            data = await lookup.json()
+            assert data["run_id"] == "run_orphaned"
+            assert data["status"] == "interrupted"
+            assert data["last_event"] == "run.interrupted"
+
+    @pytest.mark.asyncio
+    async def test_correlation_lookup_survives_adapter_restart(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        headers = {"Idempotency-Key": "aic-restart-398"}
+        first_adapter = _make_adapter()
+        first_app = _create_runs_app(first_adapter)
+
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch.object(first_adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "restart-session"},
+                    headers=headers,
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if first_adapter._run_statuses[run_id]["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        restarted_adapter = _make_adapter()
+        restarted_app = _create_runs_app(restarted_adapter)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            status_response = await cli.get(f"/v1/runs/{run_id}")
+            assert status_response.status == 200
+            assert (await status_response.json())["status"] == "completed"
+
+            lookup = await cli.get("/v1/runs", headers=headers)
+            assert lookup.status == 200
+            data = await lookup.json()
+            assert data["run_id"] == run_id
+            assert data["status"] == "completed"
+            assert data["session_id"] == "restart-session"
+            assert data["idempotency_key"] == "aic-restart-398"
+
+    @pytest.mark.asyncio
     async def test_status_reflects_explicit_session_id(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -409,6 +816,18 @@ class TestRunEvents:
 
 
 class TestRunLifecycleSweep:
+    def test_interrupted_status_is_swept_from_memory(self, adapter):
+        now = time.time()
+        adapter._run_statuses["run_interrupted"] = {
+            "run_id": "run_interrupted",
+            "status": "interrupted",
+            "updated_at": now - adapter._RUN_STATUS_TTL - 1,
+        }
+
+        adapter._sweep_orphaned_runs_once(now)
+
+        assert "run_interrupted" not in adapter._run_statuses
+
 
     @pytest.mark.asyncio
     async def test_expired_live_run_drops_transport_but_keeps_control_state(self, adapter):
@@ -424,7 +843,7 @@ class TestRunLifecycleSweep:
                 start_resp = await cli.post("/v1/runs", json={"input": "hello"})
                 assert start_resp.status == 202
                 run_id = (await start_resp.json())["run_id"]
-                assert agent_ready.wait(timeout=3.0)
+                assert await asyncio.to_thread(agent_ready.wait, 3.0)
 
                 task = adapter._active_run_tasks[run_id]
                 assert isinstance(task, asyncio.Task)
@@ -478,6 +897,68 @@ class TestRunLifecycleSweep:
 class TestStopRun:
 
     @pytest.mark.asyncio
+    async def test_storage_failure_cannot_prevent_active_interrupt(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        adapter = _make_adapter()
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_create_agent") as mock_create:
+                mock_agent, ready, interrupted = _make_slow_agent()
+                mock_create.return_value = mock_agent
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(ready.wait, 3)
+
+                monkeypatch.setattr(
+                    "gateway.run_ledger.update_run",
+                    MagicMock(side_effect=sqlite3.OperationalError("disk full")),
+                )
+                stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+
+                assert stop_response.status == 200
+                assert interrupted.wait(timeout=1)
+                assert (await stop_response.json())["status"] == "stopping"
+
+    @pytest.mark.asyncio
+    async def test_stop_terminal_run_is_idempotent_after_restart(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        first_adapter = _make_adapter()
+        first_app = _create_runs_app(first_adapter)
+        async with TestClient(TestServer(first_app)) as cli:
+            with patch.object(first_adapter, "_create_agent") as mock_create:
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "aic-stop-terminal-398"},
+                )
+                run_id = (await response.json())["run_id"]
+                for _ in range(40):
+                    if first_adapter._run_statuses[run_id]["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        restarted_adapter = _make_adapter()
+        restarted_app = _create_runs_app(restarted_adapter)
+        async with TestClient(TestServer(restarted_app)) as cli:
+            first_stop = await cli.post(f"/v1/runs/{run_id}/stop")
+            second_stop = await cli.post(f"/v1/runs/{run_id}/stop")
+
+            assert first_stop.status == 200
+            assert second_stop.status == 200
+            assert (await first_stop.json())["status"] == "completed"
+            assert (await second_stop.json())["run_id"] == run_id
+
+    @pytest.mark.asyncio
     async def test_stop_keeps_uncooperative_executor_tracked_until_exit(self, adapter):
         """Cancelling an asyncio wrapper must not hide its live executor thread."""
         app = _create_runs_app(adapter)
@@ -503,7 +984,7 @@ class TestStopRun:
 
                 resp = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await resp.json())["run_id"]
-                assert started.wait(timeout=3)
+                assert await asyncio.to_thread(started.wait, 3)
 
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
                 assert stop_resp.status == 200
