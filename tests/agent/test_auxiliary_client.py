@@ -2571,22 +2571,22 @@ class TestAuxiliaryAuthRefreshRetry:
         with (
             patch("agent.auxiliary_client._client_cache", {cache_key: (stale_client, "google/gemini-3-flash-preview", None)}),
             patch(
-                "agent.vertex_adapter.get_vertex_config",
-                return_value=("ya29.FRESH", "https://aiplatform.googleapis.com/v1beta1/projects/p/locations/global/endpoints/openapi"),
-            ) as mock_get_config,
+                "agent.vertex_adapter.refresh_vertex_credentials",
+                return_value=True,
+            ) as mock_refresh,
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("vertex") is True
 
-        mock_get_config.assert_called_once()
+        mock_refresh.assert_called_once()
         stale_client.close.assert_called_once()
 
     def test_refresh_provider_credentials_vertex_returns_false_when_unminted(self):
         """No usable token/base_url (e.g. ADC and the service-account file
         both failed) — refresh must report failure, not silently evict and
         pretend the client is fixed."""
-        with patch("agent.vertex_adapter.get_vertex_config", return_value=(None, None)):
+        with patch("agent.vertex_adapter.refresh_vertex_credentials", return_value=False):
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("vertex") is False
