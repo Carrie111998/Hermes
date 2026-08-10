@@ -259,7 +259,14 @@ class SqliteMemoryStore:
 
     def stage_candidate(self, candidate: MemoryCandidate) -> str:
         candidate_id = new_id("candidate")
-        payload = {"content": candidate.content, "memory_type": candidate.memory_type, "scope": candidate.scope}
+        payload = {
+            "content": candidate.content,
+            "memory_type": candidate.memory_type,
+            "scope": candidate.scope,
+            "authority": candidate.authority.value,
+            "verification": candidate.verification.value,
+            "metadata": dict(candidate.metadata),
+        }
         with self.connection():
             self.connection().execute(
                 "INSERT INTO candidates(candidate_id,payload) VALUES(?,?)",

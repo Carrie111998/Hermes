@@ -135,11 +135,13 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
 
     def on_delegation(self, task: str, result: str, **kwargs) -> None:
         if self._broker:
-            self._broker.observe(MemoryEvent(
-                "delegation_result",
+            child_session_id = kwargs.get("child_session_id", "")
+            self._broker.propose(MemoryCandidate(
                 content=f"Task: {task}\nResult: {result}",
-                session_id=kwargs.get("child_session_id", ""),
-                metadata={"event_kind": "delegation_result"},
+                metadata={
+                    "event_kind": "delegation_result",
+                    "child_session_id": child_session_id,
+                },
             ))
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
