@@ -238,6 +238,84 @@ gateway:
 
 Set `text_batch_delay_seconds: 0` to dispatch each message immediately (disables batching).
 
+### Named Consumer Routes (Advanced)
+
+Hermes can expose selected owner commands to another **local** process without opening a second
+WhatsApp Web session. The Baileys bridge remains the only WhatsApp client: it receives each
+message once, then places that event in either Hermes's `default` queue or one configured named
+queue. This avoids duplicate replies and competing pollers.
+
+Configure named routes under `gateway.platforms.whatsapp.extra.consumer_routes`:
+
+```yaml
+# ~/.hermes/config.yaml
+gateway:
+  platforms:
+    whatsapp:
+      extra:
+        consumer_routes:
+          - consumer: "secondary-app"
+            prefix: "/secondary"
+            chat_ids:
+              - "<owner-jid>"
+```
+
+:::warning Exact configuration path
+`consumer_routes` must be nested under `gateway.platforms.whatsapp.extra`. A top-level
+`whatsapp.consumer_routes` setting is not bridged into the WhatsApp adapter and is ignored.
+:::
+
+Named routes have the following safeguards:
+
+- They apply only to direct messages. Group messages always remain on Hermes's `default` queue,
+  even if a group ID appears in `chat_ids`.
+- A command matches the prefix exactly, or the prefix followed by a space or newline.
+  `/secondary-task` does not match the `/secondary` prefix.
+- Consumer IDs are lowercased and may contain letters, digits, `_`, and `-`; they must be 1–64
+  characters, cannot be `default`, and at most 16 valid routes are loaded.
+- Each queue holds at most 100 events and drops its oldest event when full. One inbound event is
+  placed in exactly one queue.
+
+The secondary process uses the loopback-only bridge API. The bridge defaults to
+`http://127.0.0.1:3000`; use the effective `bridge_port` if you changed it.
+
+```bash
+# Drain this consumer's queued events.
+curl --fail --silent \
+  'http://127.0.0.1:3000/messages?consumer=secondary-app'
+```
+
+Invalid consumer IDs return HTTP 400. Valid IDs that are not configured return HTTP 404 without
+creating a queue. The regular Hermes adapter polls `/messages` without a consumer parameter and
+therefore drains only the `default` queue.
+
+To acknowledge an inbound event with a native WhatsApp reaction, copy its complete
+`readReceiptKey` into the `key` field unchanged:
+
+```bash
+curl --fail --silent \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "key": {
+      "remoteJid": "<owner-jid>",
+      "id": "<inbound-message-id>",
+      "fromMe": false
+    },
+    "emoji": "🙌"
+  }' \
+  http://127.0.0.1:3000/react
+```
+
+Do not reconstruct the key from only the chat and message IDs. Group and LID-addressed messages
+can include additional fields such as `participant` or `addressingMode`; echoing the complete key
+keeps the reaction attached to the correct message. An empty `emoji` removes an existing
+reaction. Reactions share the bridge's serialized send queue with normal messages.
+
+`GET /health` reports `consumerQueueLengths` and the bridge runtime fingerprint. When Hermes next
+connects, a change to `consumer_routes`, `send_read_receipts`, or the loaded bridge modules makes
+the existing bridge stale and restarts it with the new configuration. The API remains bound to
+`127.0.0.1`; do not expose it through a public listener or reverse proxy.
+
 ---
 
 ## Troubleshooting
