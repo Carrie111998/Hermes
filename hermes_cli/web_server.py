@@ -14311,6 +14311,57 @@ def _aux_task_summary(aux_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return result
 
 
+def _provider_summary(
+    db, cutoff: float, aux_rows: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Aggregate real usage per billing provider.
+
+    Session rows carry the main agent model's accounting; aux rows (vision,
+    compression, ...) live only in ``session_model_usage``, so folding them in
+    here is add-only and cannot double count. Rows without a recorded
+    ``billing_provider`` land in an explicit ``unknown`` bucket — callers must
+    never infer a provider from the model name.
+    """
+    by_provider: Dict[str, Dict[str, Any]] = {}
+    try:
+        cur = db._conn.execute("""
+            SELECT COALESCE(NULLIF(billing_provider, ''), 'unknown') as provider,
+                   SUM(input_tokens) as input_tokens,
+                   SUM(output_tokens) as output_tokens,
+                   COALESCE(SUM(estimated_cost_usd), 0) as estimated_cost,
+                   COUNT(*) as sessions,
+                   SUM(COALESCE(api_call_count, 0)) as api_calls
+            FROM sessions WHERE started_at > ?
+            GROUP BY COALESCE(NULLIF(billing_provider, ''), 'unknown')
+        """, (cutoff,))
+        for r in cur.fetchall():
+            row = dict(r)
+            by_provider[row["provider"]] = row
+    except Exception:
+        # DB predates the billing_provider column — the breakdown is simply
+        # unavailable; never fall back to guessing from model names.
+        by_provider = {}
+    for aux in aux_rows:
+        provider = aux.get("billing_provider") or "unknown"
+        d = by_provider.setdefault(provider, {
+            "provider": provider,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost": 0,
+            "sessions": 0,
+            "api_calls": 0,
+        })
+        d["input_tokens"] += aux.get("input_tokens") or 0
+        d["output_tokens"] += aux.get("output_tokens") or 0
+        d["estimated_cost"] += aux.get("estimated_cost") or 0
+        d["api_calls"] += aux.get("api_calls") or 0
+    result = list(by_provider.values())
+    result.sort(
+        key=lambda r: (r.get("input_tokens") or 0) + (r.get("output_tokens") or 0),
+        reverse=True,
+    )
+    return result
+
 def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
     from agent.insights import InsightsEngine
 
@@ -14372,6 +14423,8 @@ def _get_usage_analytics(days: int = 30, profile: Optional[str] = None):
             # Aux-task summary across models (vision, compression, ...). Lets
             # the dashboard answer "what is compression costing me" directly.
             "by_task": _aux_task_summary(aux_rows),
+            # Per-provider real accounting (sessions + aux, add-only merge).
+            "by_provider": _provider_summary(db, cutoff, aux_rows),
             "totals": totals,
             "period_days": days,
             "skills": usage["skills"],
