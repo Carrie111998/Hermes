@@ -171,7 +171,10 @@ export function useGatewayBoot({
         // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
         await desktop.revalidateConnection?.().catch(() => undefined)
 
-        const conn = await desktop.getConnection($activeGatewayProfile.get())
+        // This gateway is the window's primary socket. A foreground profile
+        // switch may activate a secondary socket, but it must not retarget this
+        // reconnect or relabel the primary connection.
+        const conn = await desktop.getConnection(connectionProfile ?? profileOverride ?? undefined)
 
         if (cancelled) {
           return

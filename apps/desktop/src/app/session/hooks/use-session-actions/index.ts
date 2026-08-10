@@ -653,11 +653,12 @@ export function useSessionActions({
       // gateway call (no-op when it's already on that profile / single-profile).
       // resolveStoredSession finds the row by id (cheap), so an uncached pasted
       // id loads as fast as a sidebar click instead of hanging on a list scan.
-      const storedForProfile = await resolveStoredSession(storedSessionId)
+      const pinnedWindowProfile = windowProfileOverride() ?? undefined
+      const storedForProfile = await resolveStoredSession(storedSessionId, pinnedWindowProfile)
       // A fresh subagent watch can open before the child has flushed its first
       // stored row. The validated window hint is authoritative for that narrow
       // race and keeps shared-remote resume/REST requests on the owning profile.
-      const sessionProfile = storedForProfile?.profile ?? windowProfileOverride() ?? undefined
+      const sessionProfile = storedForProfile?.profile ?? pinnedWindowProfile
 
       if (resumeRequestRef.current !== requestId) {
         return

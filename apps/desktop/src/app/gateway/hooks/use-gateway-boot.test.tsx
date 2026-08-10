@@ -281,6 +281,22 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     }
   })
 
+  it('reconnects the primary socket with its frozen owner after the foreground profile changes', async () => {
+    const desktop = fakeDesktop('life')
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    $activeGatewayProfile.set('other')
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    await advanceBackoff()
+
+    expect(desktop.getConnection).toHaveBeenLastCalledWith('life')
+  })
+
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {
     // The report's actual path: a fresh launch pointed at an unreachable VPS.
     // startHermes()'s remote branch awaits waitForHermes() for 45s before it
