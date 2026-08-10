@@ -55,6 +55,17 @@ def _build_artifact(kind: str, tmp_path, *, nix_build: bool) -> subprocess.Compl
     )
 
 
+@pytest.fixture(scope="module")
+def built_wheel(tmp_path_factory) -> Path:
+    artifact_dir = tmp_path_factory.mktemp("packaging-wheel")
+    result = _build_artifact("wheel", artifact_dir, nix_build=True)
+
+    assert result.returncode == 0, result.stderr
+    wheels = list(artifact_dir.glob("hermes_agent-*.whl"))
+    assert len(wheels) == 1
+    return wheels[0]
+
+
 @pytest.mark.parametrize("kind", ["sdist", "wheel"])
 def test_artifact_build_rejects_nix_development_shell_environment(kind, tmp_path):
     result = _build_artifact(kind, tmp_path, nix_build=False)
@@ -94,3 +105,30 @@ def test_artifact_build_allows_explicit_nix_package_build_marker(kind, artifact_
 
     missing = sorted(expected - shipped)
     assert not missing, f"{kind} omits bundled plugin manifests: {missing}"
+
+
+def test_packaged_platform_manifests_remain_discoverable(built_wheel, tmp_path):
+    install_root = tmp_path / "installed"
+    with zipfile.ZipFile(built_wheel) as wheel:
+        wheel.extractall(install_root)
+
+    from hermes_cli.plugins import PluginManager
+
+    manager = PluginManager()
+    manifests = manager._scan_directory(
+        install_root / "plugins" / "platforms",
+        source="bundled",
+    )
+    discovered = {
+        manager._platform_name_from_manifest(manifest)
+        for manifest in manifests
+        if manifest.kind == "platform"
+    }
+    expected = {
+        path.parent.name
+        for pattern in ("plugin.yaml", "plugin.yml")
+        for path in (PROJECT_ROOT / "plugins" / "platforms").glob(f"*/{pattern}")
+    }
+
+    assert expected <= discovered
+    assert "feishu" in discovered
