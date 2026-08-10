@@ -2416,7 +2416,7 @@ class ContextCompressor(ContextEngine):
         """Resolve historical thinking-text/envelope replay capabilities."""
         from agent.transports import get_transport
 
-        transport = get_transport(self.api_mode)
+        transport = get_transport(getattr(self, "api_mode", None))
         if transport is None:
             return False, False
         kwargs = {"base_url": self.base_url, "model": self.model}
