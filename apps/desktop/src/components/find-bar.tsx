@@ -37,6 +37,7 @@ export function FindBar() {
   const { active, query, matchOrdinal, matchCount } = useStore($findInPage)
   const inputRef = useRef<HTMLInputElement>(null)
   const [localQuery, setLocalQuery] = useState('')
+  const [filesPaneRight, setFilesPaneRight] = useState<number | null>(null)
   const { pathname } = useLocation()
 
   // Navigating away (opening another session, a settings page, …) closes the
@@ -65,6 +66,34 @@ export function FindBar() {
 
     return undefined
   }, [active])
+
+  // The files pane (right sidebar, `aside[aria-label="Right sidebar"]`) is a
+  // floating right rail. The find bar is `fixed right-4` by default, which
+  // would cover the files pane's header + first rows when it is open. Measure
+  // the pane's live rect and park the bar just left of it instead.
+  useEffect(() => {
+    if (!active) {
+      setFilesPaneRight(null)
+
+      return undefined
+    }
+
+    const measure = () => {
+      const aside = document.querySelector('aside[aria-label="Right sidebar"]')
+      const rect = aside?.getBoundingClientRect()
+
+      if (rect && rect.width > 0 && rect.left < window.innerWidth) {
+        setFilesPaneRight(window.innerWidth - rect.left)
+      } else {
+        setFilesPaneRight(null)
+      }
+    }
+
+    measure()
+    window.addEventListener('resize', measure)
+
+    return () => window.removeEventListener('resize', measure)
+  }, [active, pathname])
 
   // Subscribe to found-in-page results from the main process. Refcounted in
   // the store, so a remount (connection re-home) can't stack listeners; the
@@ -156,6 +185,11 @@ export function FindBar() {
 
   const matchLabel = formatMatchLabel(query, matchOrdinal, matchCount)
 
+  const barStyle =
+    filesPaneRight != null
+      ? { right: `calc(${filesPaneRight}px + 0.75rem)` }
+      : undefined
+
   return (
     <div
       className={cn(
@@ -169,6 +203,7 @@ export function FindBar() {
         'flex items-center gap-1 rounded-lg border border-(--ui-stroke-tertiary) bg-(--ui-surface-background) px-2 py-1 shadow-md'
       )}
       role="search"
+      style={barStyle}
     >
       <input
         aria-label={t.keybinds.actions['view.findInPage'] ?? 'Find in page'}
