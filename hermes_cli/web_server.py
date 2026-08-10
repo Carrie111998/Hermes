@@ -16411,6 +16411,21 @@ _BUILTIN_DASHBOARD_THEMES = [
     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},
+    {
+        "name": "chatgpt-auto",
+        "label": "ChatGPT Auto",
+        "description": "Follows your system light/dark appearance automatically",
+    },
+    {
+        "name": "chatgpt-dark",
+        "label": "ChatGPT Dark",
+        "description": "OpenAI-inspired neutral dark theme",
+    },
+    {
+        "name": "chatgpt-light",
+        "label": "ChatGPT Light",
+        "description": "OpenAI-inspired warm daytime theme",
+    },
     {"name": "midnight",      "label": "Midnight",            "description": "Deep blue-violet with cool accents"},
     {"name": "ember",     "label": "Ember",          "description": "Warm crimson and bronze — forge vibes"},
     {"name": "mono",      "label": "Mono",           "description": "Clean grayscale — minimal and focused"},

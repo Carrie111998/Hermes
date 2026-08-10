@@ -587,6 +587,7 @@ export default function App() {
               background: "var(--component-sidebar-background)",
               clipPath: "var(--component-sidebar-clip-path)",
               borderImage: "var(--component-sidebar-border-image)",
+              boxShadow: "var(--component-sidebar-box-shadow)",
             }}
           >
             <div

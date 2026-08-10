@@ -409,6 +409,12 @@ function applyTheme(theme: DashboardTheme) {
 // ---------------------------------------------------------------------------
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
+  /** System appearance used by the virtual `chatgpt-auto` theme. */
+  const [systemPrefersDark, setSystemPrefersDark] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    return window.matchMedia("(prefers-color-scheme: dark)").matches;
+  });
+
   /** Name of the currently active theme (built-in id or user YAML name). */
   const [themeName, setThemeName] = useState<string>(() => {
     if (typeof window === "undefined") return "default";
@@ -421,6 +427,20 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     }
     return migrated;
   });
+
+  // Re-resolve Auto immediately whenever the OS/browser appearance changes.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
+    const media = window.matchMedia("(prefers-color-scheme: dark)");
+    const handleChange = (event: MediaQueryListEvent) => {
+      setSystemPrefersDark(event.matches);
+    };
+
+    setSystemPrefersDark(media.matches);
+    media.addEventListener("change", handleChange);
+    return () => media.removeEventListener("change", handleChange);
+  }, []);
 
   /** All selectable themes (shown in the picker). Starts with just the
    *  built-ins; the API call below merges in user themes. */
@@ -452,13 +472,19 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   // only when neither a built-in nor a user theme is found.
   const resolveTheme = useCallback(
     (name: string): DashboardTheme => {
+      if (name === "chatgpt-auto") {
+        return systemPrefersDark
+          ? BUILTIN_THEMES["chatgpt-dark"]
+          : BUILTIN_THEMES["chatgpt-light"];
+      }
+
       return (
         BUILTIN_THEMES[name] ??
         userThemeDefs[name] ??
         defaultTheme
       );
     },
-    [userThemeDefs],
+    [userThemeDefs, systemPrefersDark],
   );
 
   // Apply the active theme (and re-assert the font override at its tail)
