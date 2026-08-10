@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from cron import wake_channel
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import resolve_windows_git_bash, windows_hide_flags
 from hermes_cli.config import load_config, _expand_env_vars
@@ -348,6 +349,7 @@ from cron.jobs import (
     get_due_and_skipped_jobs,
     get_due_jobs,
     heartbeat_run_claim,
+    load_jobs,
     mark_job_run,
     save_job_output,
 )
@@ -4053,6 +4055,57 @@ def _finish_cron_activity(
         )
 
 
+def _collect_woken_jobs(*, exclude_ids: set) -> list:
+    """Turn pending event wakes into jobs to execute on this tick.
+
+    Deliberately does NOT advance ``next_run_at``: an event says "there is work
+    now", not "the schedule moved". Advancing would let inbound traffic drift a
+    job's regular cadence.
+
+    A wake is always consumed, even when it cannot be used (job unknown,
+    disabled, or already due) — otherwise a disabled worker's wake would be
+    redelivered on every tick forever.
+
+    Never raises into the tick: losing a wake degrades to the deterministic
+    reconciler catching the work, while an exception here would stall every
+    scheduled job.
+    """
+    woken_ids = wake_channel.drain_wakes()
+    if not woken_ids:
+        return []
+
+    try:
+        by_id = {j.get("id"): j for j in load_jobs()}
+    except Exception as exc:
+        logger.warning(
+            "cron wake collection failed, dropping %d wake(s): %s",
+            len(woken_ids), type(exc).__name__,
+        )
+        return []
+
+    collected = []
+    for job_id in sorted(woken_ids):
+        if job_id in exclude_ids:
+            continue  # already firing on schedule this tick
+        job = by_id.get(job_id)
+        if job is None:
+            logger.warning("cron wake for unknown job %s — dropped", job_id)
+            continue
+        if not job.get("enabled"):
+            # An operator disabled this on purpose. Unlike trigger_job, a wake
+            # never re-enables.
+            logger.info("cron wake for disabled job %s — not revived", job_id)
+            continue
+        collected.append(job)
+
+    if collected:
+        logger.info(
+            "cron: %d job(s) woken by event: %s",
+            len(collected), ", ".join(j.get("name") or j["id"] for j in collected),
+        )
+    return collected
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -5625,7 +5678,13 @@ def tick(
             except Exception:
                 logger.exception("Failed to emit cron_skipped events")
 
-        if verbose and not due_jobs:
+        # Event-driven wakes. Drained before the no-work early return so a tick
+        # with zero SCHEDULED jobs still runs work an event asked for.
+        woken_jobs = _collect_woken_jobs(
+            exclude_ids={j["id"] for j in due_jobs}
+        )
+
+        if verbose and not due_jobs and not woken_jobs:
             logger.info("%s - No jobs due", _hermes_now().strftime('%H:%M:%S'))
             return 0
 
@@ -5639,6 +5698,12 @@ def tick(
         # mark_job_run() overwrites next_run_at on completion.
         for job in due_jobs:
             advance_next_run(job["id"])
+
+        # Woken jobs execute alongside the due ones but are appended AFTER the
+        # advance loop on purpose: an event says "there is work now", not "the
+        # schedule moved", so their next_run_at is left exactly where it was.
+        if woken_jobs:
+            due_jobs = due_jobs + woken_jobs
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
