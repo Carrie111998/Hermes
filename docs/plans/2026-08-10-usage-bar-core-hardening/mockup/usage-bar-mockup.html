@@ -511,9 +511,12 @@ body {
 .badge-stale { color: var(--ui-warm); background: color-mix(in srgb, var(--ui-warm) 12%, transparent); }
 .badge-err { color: var(--color-destructive); background: color-mix(in srgb, var(--color-destructive) 10%, transparent); }
 .badge-plan { color: var(--color-muted-foreground); border: 1px solid var(--ui-stroke-tertiary); }
-.alert { display: flex; align-items: center; gap: 0.5rem; color: var(--color-destructive); }
-.link { color: var(--color-primary); text-decoration: none; cursor: pointer; }
+.alert { display: flex; align-items: flex-start; gap: 0.5rem; color: var(--color-destructive); }
+.vp-narrow .alert { flex-direction: column; gap: 0.25rem; }
+.alert .muted { color: var(--color-muted-foreground); }
+.link { color: var(--color-primary); text-decoration: none; cursor: pointer; background: none; border: 0; font: inherit; padding: 0; }
 .link:hover { text-decoration: underline; }
+.link:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: 1px; border-radius: 2px; }
 /* ===== command center overlay (M2) ===== */
 .overlay-backdrop { position: absolute; inset: 0; background: color-mix(in srgb, #000 18%, transparent); display: flex; align-items: center; justify-content: center; }
 .overlay {
@@ -541,8 +544,10 @@ body {
   width: 100%; border: 0; outline: none; background: none; color: var(--color-foreground);
   font: inherit; padding: 0.75rem 1rem; border-bottom: 1px solid var(--ui-stroke-tertiary);
 }
-.palette-item { display: flex; align-items: center; gap: 0.625rem; padding: 0.5rem 1rem; font-size: 0.75rem; cursor: pointer; }
+.palette-item { display: flex; align-items: center; gap: 0.625rem; padding: 0.5rem 1rem; font-size: 0.75rem; cursor: pointer; width: 100%; background: none; border: 0; color: var(--color-foreground); font-family: inherit; text-align: left; }
 .palette-item.active { background: var(--theme-accent-soft); }
+.palette-item:hover { background: var(--chrome-action-hover); }
+.palette-item:focus-visible { outline: 2px solid var(--theme-primary); outline-offset: -2px; }
 .palette-item .kbd { margin-left: auto; font-size: 0.625rem; color: var(--color-muted-foreground); }
 /* ===== annotations ===== */
 .note { position: absolute; top: 0.75rem; left: 0.75rem; max-width: 22rem; font-size: 0.6875rem; color: var(--color-muted-foreground); background: var(--color-card); border: 1px dashed var(--ui-stroke-secondary); border-radius: 8px; padding: 0.5rem 0.75rem; }
@@ -579,11 +584,13 @@ if (q.get('full') === '1') {
     <li>④ 状态栏整体关闭时的到达路径（Command Palette）：<a class="link" href="?scene=palette&amp;theme=light">light</a> · <a class="link" href="?scene=palette&amp;theme=dark">dark</a></li>
   </ul>
   <div class="stack small" style="border-top:1px solid var(--ui-stroke-tertiary); padding-top:0.75rem; max-width:40rem">
-    <p><b>键盘焦点</b>：状态栏触发器为真实 <code>&lt;button&gt;</code>，<code>:focus-visible</code> 2px 主题色环；popover 打开后焦点进入面板，Esc 关闭并返还触发器；面板内每行 account 为可聚焦行，方向键在窗口行间移动（roving tabindex）。</p>
-    <p><b>reduced-motion</b>：全部过渡包在 <code>@media (prefers-reduced-motion: no-preference)</code>；reduced 下进度条宽度变化即时生效、popover 无滑入位移，仅透明度交叉淡入。本页底部的媒体查询已强制演示。</p>
-    <p><b>live region</b>：quota 的 stale/error 状态变化经 <code>role="status"</code>（polite）播报；provider-specific error 用 <code>role="alert"</code>。</p>
-    <p><b>真相来源分离</b>：provider quota（官方接口）/ credential health（本地凭证池状态）/ local analytics（本地计量）三区独立渲染、独立 loading/error，不混算、不跨窗口平均。</p>
-    <p><b>stale 语义</b>：仅传输类故障（timeout/5xx）回退 stale 缓存并标注 "Cached · 时间"；401/403 直接显示认证失效，绝不用 stale 掩盖。</p>
+    <p><b>进度条语义</b>：Account limits 的 bar fill = remaining，与 <code>xx% left</code> 文字同值（父验收 B1 统一）；By provider/model/task 的 bar = 占比份额，aria-label 各自说明。</p>
+    <p><b>键盘（mockup 内真实实现的最小路径）</b>：状态栏触发器为真实 <code>&lt;button&gt;</code>，Tab 可达、<code>:focus-visible</code> 主题色环；popover 场景的 Esc 真实关闭面板并返还焦点给触发器（可现场验证）；面板内 "Open in Command Center" 为真实 <code>&lt;a href&gt;</code>（跳转本 mockup 的 CC 场景）、CC 的 "Refresh" 为真实 <code>&lt;button&gt;</code>；palette rows 为真实 <code>&lt;button role="option"&gt;</code>。</p>
+    <p><b>Production implementation acceptance targets（mockup 未实现，不声称已实现）</b>：focus trap、roving tabindex（方向键在窗口行间移动）、打开后焦点自动进入面板、live region 对 stale/error 状态变化的动态播报。这些在 M1/M2 生产实现时验收。</p>
+    <p><b>reduced-motion</b>：全部过渡包在 <code>@media (prefers-reduced-motion: reduce)</code> 下禁用（本页底部媒体查询演示）；reduced 下进度条宽度即时生效、popover 无位移。</p>
+    <p><b>live region</b>：stale 状态行带稳定 <code>role="status"</code>（polite）；provider error 用 <code>role="alert"</code>。</p>
+    <p><b>真相来源分离</b>：provider quota（官方接口，用户文案 "Official provider data"）/ credential health（本地凭证池状态）/ local analytics（本地计量）三区独立渲染、独立 loading/error，不混算、不跨窗口平均。</p>
+    <p><b>stale 语义</b>：仅可重试故障（timeout/network/remote-protocol/proxy/5xx）回退 stale 并标注 "Cached · 时间"；401/403/429 与本地配置错误（UnsupportedProtocol/LocalProtocolError）直接表面化，绝不用 stale 掩盖。</p>
   </div>
 </div>
 
@@ -614,7 +621,7 @@ if (q.get('full') === '1') {
     <p class="small fg tabular">38% full</p>
     <div class="ctxbar"><span style="background:var(--theme-primary);width:22%"></span><span style="background:var(--ui-warm);width:9%"></span><span style="background:var(--ui-green);width:7%"></span></div>
     <div class="section" aria-label="Account limits">
-      <div class="row"><p class="title">Account limits</p><span class="small muted">source: provider_reported</span></div>
+      <div class="row"><p class="title">Account limits</p><span class="small muted">Official provider data</span></div>
 
       <!-- openai-codex -->
       <div class="stack-lg">
@@ -626,9 +633,9 @@ if (q.get('full') === '1') {
           </div>
           <div class="stack">
             <div class="row-center small"><span class="muted truncate">5 hour</span><span class="fg tabular">68% left · resets in 2h 14m</span></div>
-            <div class="progress"><i style="width:32%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="68" aria-valuemin="0" aria-valuemax="100" aria-label="5 hour: 68% left"><i style="width:68%"></i></div>
             <div class="row-center small"><span class="muted truncate">Weekly</span><span class="fg tabular">41% left · resets in 3d 4h</span></div>
-            <div class="progress warn"><i style="width:59%"></i></div>
+            <div class="progress warn" role="progressbar" aria-valuenow="41" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 41% left"><i style="width:41%"></i></div>
             <p class="small muted">updated 12s ago</p>
           </div>
         </div>
@@ -639,8 +646,8 @@ if (q.get('full') === '1') {
           </div>
           <div class="stack">
             <div class="row-center small"><span class="muted truncate">Weekly</span><span class="fg tabular">77% left · resets in 5d 1h</span></div>
-            <div class="progress"><i style="width:23%"></i></div>
-            <p class="small muted">Cached · 11:42:03 — request timed out, showing last good read</p>
+            <div class="progress" role="progressbar" aria-valuenow="77" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 77% left"><i style="width:77%"></i></div>
+            <p class="small muted" role="status">Cached · 11:42:03 — request timed out, showing last good read</p>
           </div>
         </div>
       </div>
@@ -655,9 +662,9 @@ if (q.get('full') === '1') {
           </div>
           <div class="stack">
             <div class="row-center small"><span class="muted truncate">Weekly</span><span class="fg tabular">73% left · resets in 4d 6h</span></div>
-            <div class="progress"><i style="width:27%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="73" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 73% left"><i style="width:73%"></i></div>
             <div class="row-center small"><span class="muted truncate">5 hour</span><span class="fg tabular">90% left · resets in 47m</span></div>
-            <div class="progress"><i style="width:10%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="90" aria-valuemin="0" aria-valuemax="100" aria-label="5 hour: 90% left"><i style="width:90%"></i></div>
             <p class="small muted">Parallel limit: 5 · updated 12s ago</p>
           </div>
         </div>
@@ -668,18 +675,21 @@ if (q.get('full') === '1') {
         <div class="row"><span class="title truncate">anthropic</span><span class="small muted">0/1 ready</span></div>
         <div class="stack">
           <div class="row"><span class="fg truncate">Claude 1</span><span class="small muted">cooldown</span></div>
-          <p class="alert small" role="alert">⚠ Credential token expired — re-authenticate. <span class="muted">(401; never masked by stale cache)</span></p>
+          <div class="alert small" role="alert">
+            <span>⚠ Credential token expired — re-authenticate.</span>
+            <span class="muted">401 responses are never masked by stale cache.</span>
+          </div>
         </div>
       </div>
 
-      <div class="row"><span class="small muted">Local analytics · this session</span><a class="link small">Open in Command Center</a></div>
+      <div class="row"><span class="small muted">Local analytics · this session</span><a class="link small" href="?scene=command-center">Open in Command Center</a></div>
     </div>
   </div>
   <div class="statusbar">
     <span class="sb-item"><span class="dot"></span>Gateway</span>
     <span class="sb-item truncate">aichat_group · main</span>
     <span class="sb-spacer"></span>
-    <button class="sb-btn" style="outline:2px solid var(--theme-primary); outline-offset:1px" aria-expanded="true">
+    <button class="sb-btn" data-popover-trigger style="outline:2px solid var(--theme-primary); outline-offset:1px" aria-expanded="true" aria-haspopup="dialog" aria-label="Context and account usage">
       <span class="meter-mini"><span class="track"><span class="fill" style="width:38%"></span></span></span>
       <span class="tabular">Ctx 38%</span><span class="muted">·</span><span class="tabular fg">Codex 41% wk</span>
     </button>
@@ -693,30 +703,30 @@ if (q.get('full') === '1') {
     <div class="overlay" role="dialog" aria-label="Command Center — Usage">
       <div class="cc-head"><span class="cc-title">Command Center · Usage</span><button class="cc-close" aria-label="Close">✕</button></div>
       <div class="stack-lg">
-        <div class="row"><p class="title">Account limits</p><span class="small muted">source: provider_reported · refreshed 12s ago · <a class="link">Refresh</a></span></div>
+        <div class="row"><p class="title">Account limits</p><span class="small muted">Official provider data · refreshed 12s ago · <button class="link small" type="button">Refresh</button></span></div>
         <div class="cc-grid">
           <div class="stack">
             <div class="row"><span class="fg">Codex 1 <span class="badge badge-current">current</span> <span class="badge badge-plan">Plus</span></span><span class="small muted">openai-codex</span></div>
             <div class="row-center small"><span class="muted">5 hour</span><span class="fg tabular">68% left · resets in 2h 14m</span></div>
-            <div class="progress"><i style="width:32%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="68" aria-valuemin="0" aria-valuemax="100" aria-label="5 hour: 68% left"><i style="width:68%"></i></div>
             <div class="row-center small"><span class="muted">Weekly</span><span class="fg tabular">41% left · resets in 3d 4h</span></div>
-            <div class="progress warn"><i style="width:59%"></i></div>
+            <div class="progress warn" role="progressbar" aria-valuenow="41" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 41% left"><i style="width:41%"></i></div>
           </div>
           <div class="stack">
             <div class="row"><span class="fg">Codex 2 <span class="badge badge-plan">Plus</span> <span class="badge badge-stale">stale</span></span><span class="small muted">openai-codex</span></div>
             <div class="row-center small"><span class="muted">Weekly</span><span class="fg tabular">77% left · resets in 5d 1h</span></div>
-            <div class="progress"><i style="width:23%"></i></div>
-            <p class="small muted">Cached · 11:42:03 — transient upstream timeout</p>
+            <div class="progress" role="progressbar" aria-valuenow="77" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 77% left"><i style="width:77%"></i></div>
+            <p class="small muted" role="status">Cached · 11:42:03 — transient upstream timeout</p>
           </div>
           <div class="stack">
             <div class="row"><span class="fg">Kimi 1 <span class="badge badge-plan">Level 2</span></span><span class="small muted">kimi-coding</span></div>
             <div class="row-center small"><span class="muted">Weekly</span><span class="fg tabular">73% left · resets in 4d 6h</span></div>
-            <div class="progress"><i style="width:27%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="73" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly: 73% left"><i style="width:73%"></i></div>
             <p class="small muted">Parallel limit: 5</p>
           </div>
           <div class="stack">
             <div class="row"><span class="fg">Claude 1</span><span class="small muted">anthropic</span></div>
-            <p class="alert small" role="alert">⚠ Credential token expired — re-authenticate</p>
+            <div class="alert small" role="alert"><span>⚠ Credential token expired — re-authenticate</span></div>
           </div>
         </div>
       </div>
@@ -726,16 +736,25 @@ if (q.get('full') === '1') {
           <div class="stack">
             <span class="dim-note">By provider (7d, local)</span>
             <div class="row-center small"><span class="muted">kimi-coding</span><span class="fg tabular">1.2M tok · 214 calls</span></div>
-            <div class="progress"><i style="width:64%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="64" aria-valuemin="0" aria-valuemax="100" aria-label="kimi-coding: 64% of local tokens"><i style="width:64%"></i></div>
             <div class="row-center small"><span class="muted">openai-codex</span><span class="fg tabular">0.6M tok · 88 calls</span></div>
-            <div class="progress"><i style="width:32%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="32" aria-valuemin="0" aria-valuemax="100" aria-label="openai-codex: 32% of local tokens"><i style="width:32%"></i></div>
           </div>
           <div class="stack">
             <span class="dim-note">By model (7d, local)</span>
             <div class="row-center small"><span class="muted">k3</span><span class="fg tabular">0.9M tok</span></div>
-            <div class="progress"><i style="width:48%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="48" aria-valuemin="0" aria-valuemax="100" aria-label="k3: 48% of local tokens"><i style="width:48%"></i></div>
             <div class="row-center small"><span class="muted">gpt-5.3-codex</span><span class="fg tabular">0.6M tok</span></div>
-            <div class="progress"><i style="width:32%"></i></div>
+            <div class="progress" role="progressbar" aria-valuenow="32" aria-valuemin="0" aria-valuemax="100" aria-label="gpt-5.3-codex: 32% of local tokens"><i style="width:32%"></i></div>
+          </div>
+          <div class="stack">
+            <span class="dim-note">By task (7d, local)</span>
+            <div class="row-center small"><span class="muted">coding</span><span class="fg tabular">1.1M tok · 61%</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="61" aria-valuemin="0" aria-valuemax="100" aria-label="coding: 61% of local tokens"><i style="width:61%"></i></div>
+            <div class="row-center small"><span class="muted">tool ops</span><span class="fg tabular">0.4M tok · 22%</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="22" aria-valuemin="0" aria-valuemax="100" aria-label="tool ops: 22% of local tokens"><i style="width:22%"></i></div>
+            <div class="row-center small"><span class="muted">research</span><span class="fg tabular">0.3M tok · 17%</span></div>
+            <div class="progress" role="progressbar" aria-valuenow="17" aria-valuemin="0" aria-valuemax="100" aria-label="research: 17% of local tokens"><i style="width:17%"></i></div>
           </div>
         </div>
       </div>
@@ -749,9 +768,11 @@ if (q.get('full') === '1') {
   <div class="stage" style="align-items:flex-start; padding-top:12vh">
     <div class="palette" role="dialog" aria-label="Command palette">
       <input value="usage" aria-label="Command search" readonly>
-      <div class="palette-item active">▸ Open Usage — Command Center<span class="kbd">Enter</span></div>
-      <div class="palette-item">▸ Refresh account limits<span class="kbd">usage.accounts</span></div>
-      <div class="palette-item muted">▸ Toggle statusbar visibility<span class="kbd">Settings</span></div>
+      <div role="listbox" aria-label="Commands">
+        <button class="palette-item active" type="button" role="option" aria-selected="true">▸ Open Usage — Command Center<span class="kbd">Enter</span></button>
+        <button class="palette-item" type="button" role="option" aria-selected="false">▸ Refresh account limits<span class="kbd">usage.accounts</span></button>
+        <button class="palette-item" type="button" role="option" aria-selected="false">▸ Toggle statusbar visibility<span class="kbd">Settings</span></button>
+      </div>
     </div>
   </div>
   <div class="statusbar" style="opacity:0.35"><span class="sb-item muted">（statusbar 已整体关闭 — 仅为演示占位）</span></div>
@@ -762,6 +783,24 @@ if (q.get('full') === '1') {
 const scenes = document.querySelectorAll('[data-scene]');
 scenes.forEach(s => { s.style.display = (s.dataset.scene === scene) ? '' : 'none'; });
 if (scene === 'index') document.querySelector('[data-scene="index"]').style.display = '';
+
+// Minimal real keyboard path (mockup scope): the statusbar trigger toggles the
+// popover; Escape closes it and returns focus to the trigger. Focus trap /
+// roving tabindex remain production acceptance targets (see index notes).
+if (scene === 'popover') {
+  const root = document.querySelector('[data-scene="popover"]');
+  const trigger = root.querySelector('[data-popover-trigger]');
+  const pop = root.querySelector('.popover');
+  const setOpen = (open) => {
+    pop.style.display = open ? '' : 'none';
+    trigger.setAttribute('aria-expanded', String(open));
+    if (!open) trigger.focus();
+  };
+  trigger.addEventListener('click', () => setOpen(pop.style.display === 'none'));
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && pop.style.display !== 'none') setOpen(false);
+  });
+}
 </script>
 </body>
 </html>

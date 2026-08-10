@@ -1,7 +1,7 @@
 {
   "task": "usage-bar-core-hardening",
-  "phase": "M0_COMPLETE_MOCKUP_SUBMITTED",
-  "status": "AWAITING_MOCKUP_APPROVAL",
+  "phase": "M0_COMPLETE_MOCKUP_REVISED",
+  "status": "AWAITING_PARENT_REVIEW",
   "session_id": "20260810_115223_1ade7f",
   "suggested_session_title": "Usage Bar 内建化 M0 固化 + M1/M2 mockup",
   "writer": "20260810_115223_1ade7f",
@@ -10,32 +10,46 @@
   "git": {
     "branch": "codex/hermes-custom-migrate-v020",
     "head_at_start": "299d5d7d9",
-    "head_now": "ba45dc8a5",
+    "head_before_acceptance_fix": "83531309f",
+    "head_resolution": "git rev-parse HEAD",
     "commits_this_round": [
       "c64d5af1f feat(agent): harden usage.accounts contract with cache identity and concurrent fetch",
       "05b6a1de4 fix(desktop): keep account usage reachable in the statusbar by default",
-      "0db51dea5 docs: usage bar core hardening M0 control plane + M1/M2 mockup (on-branch; 2ab1a7e00 为其 amend 前版本)",
+      "0db51dea5 docs: usage bar core hardening M0 control plane + M1/M2 mockup",
       "eee304619 fix(agent): close cache-identity and stale-semantics gaps from plan review",
-      "ba45dc8a5 fix(desktop): narrow statusbar migration to the untouched legacy default"
+      "ba45dc8a5 fix(desktop): narrow statusbar migration to the untouched legacy default",
+      "83531309f docs: usage bar plan R5 verify APPROVE + two-writer resolution",
+      "acceptance-round1 commits: fix(agent) stale classifier + docs/mockup (见 git log, 不自引用)"
     ],
     "uncommitted_not_mine_resolved": "两个写者会话交错提交已核实：历史线性、双方工作完整保留；原 uncommitted_not_mine 清单即本会话 R4 修复，已提交为 eee304619/ba45dc8a5",
     "backup_branch": "backup/usage-bar-hardening-pre-m0-20260810",
-    "dirty_snapshot": "history/pre-m0-dirty.patch",
+    "dirty_snapshot": {
+      "path": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\usage-bar-core-hardening\\pre-m0-dirty.patch",
+      "sha256": "201485725060ed142de905d62d888713dd1420b43da641564564adb947d369c0",
+      "bytes": 46471,
+      "note": "moved out of repo per parent acceptance A3; hash verified 2026-08-10"
+    },
     "noise_reverted": [
       "package-lock.json"
     ],
     "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree exit 0 零冲突; live-checkout guard 禁止运行中 merge)"
   },
   "tests_final": {
-    "backend": "24 passed (usage_contract + usage_accounts + account_usage)",
+    "backend": "25 passed (usage_contract 17 + usage_accounts 1 + account_usage 7)",
     "desktop": "19 passed (context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
-    "total": "43 passed",
+    "total": "44 passed",
     "typecheck": "tsc x3 exit 0",
-    "git_diff_check": "clean"
+    "git_diff_check": "git diff --check 299d5d7d9..HEAD -> clean (range, 验收轮复跑)",
+    "mockup_dom_assertions": "mockup/dom-assertions.json: 10/10 passed (360px overflow/focusables/bar-text consistency/Task/source copy/role=status/Esc path)"
+  },
+  "parent_acceptance_round1": {
+    "findings": "A1 stale classifier 过宽 / A2 wall-clock 口径 / A3 artifact gate / A4 控制面陈旧 / B mockup 7 项",
+    "resolution": "全部修订完成, 详见 history/parent-acceptance-round1.md",
+    "code_review": "fix(agent) stale classifier 经本地 Codex read-only 复审 APPROVE (proc_545676d89b5c)"
   },
   "milestones": {
-    "M0": "DONE",
-    "M1": "PLAN_APPROVED (Codex 4 轮终审 APPROVE); 并行写者已开始 R1 修复; 生产实施待 mockup 批准",
+    "M0": "DONE (父验收 R1 修订后: stale 分类收窄+TDD、wall-clock 口径修正、artifact gate 达标)",
+    "M1": "PLAN_APPROVED; 生产实施待父会话批准 mockup; wall-clock/singleflight/negative-cache 为发布阻塞",
     "M2": "PLANNED_AWAITING_MOCKUP_APPROVAL",
     "M3": "PLANNED"
   },

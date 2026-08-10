@@ -25,8 +25,8 @@
     凭证池文件为可信配置，`env:<VAR>` 引用无 allowlist）。Codex 过期 token
     单账号走 native resolver 且绕过缓存。
   - `agent/account_usage.py`：`USAGE_FETCH_TIMEOUT_SECONDS = 6.0` 统一收敛
-    contract 路径全部 provider 单请求预算（Codex/Anthropic/Kimi 6s；
-    OpenRouter 两次顺序请求各 3s，总预算 6s ≤ deadline）。
+    contract 路径全部 provider 的 HTTP phase timeout（httpx 各阶段标量，
+    非 wall-clock；Codex/Anthropic/Kimi 6s；OpenRouter 两次顺序请求各 3s）。
   - Desktop：statusbar `context-usage` 移出默认隐藏集；一次性迁移**仅在持久化
     集合与旧默认完全一致时**剥离 context-usage（无法逐条区分"默认隐藏"与
     "显式隐藏"，自定义集合一律视为有意保留；残余风险：恰好复现旧默认集合的
@@ -82,15 +82,19 @@
 
 ### 可靠性面
 
-- 已实现（M0，Codex R4 修订后）：6.5s 全局 deadline + ≤4 worker 并发 +
-  fresh/stale 二级缓存 + **全部 provider 单请求预算 ≤ deadline**（统一
-  `USAGE_FETCH_TIMEOUT_SECONDS=6s`，OpenRouter 双请求各 3s；逐 provider
-  断言测试在库）+ 错误分类器（timeout/connect/5xx → stale 回退；
-  401/403/429 → error，绝不 stale；有/无缓存场景均锁定）+ late worker
-  不污染缓存/contract 回归测试 + >4 jobs 并发上限测试。
-  注意：`future.cancel()` 不能终止已运行的 HTTP 请求，deadline 是"面板响应
-  上限"而非"请求生命周期上限"——detached daemon worker 会自然消亡，但在
-  singleflight 落地前，高频重复构建仍可能累积少量 in-flight 请求。
+- 已实现（M0，父验收 R1 修订后口径）：**面板/contract 等待上限 6.5s**
+  （`wait(timeout=_FETCH_DEADLINE_SECONDS)` 保证 build 按时返回）、单次 build
+  ≤4 workers、HTTP phase timeout 收敛（`USAGE_FETCH_TIMEOUT_SECONDS=6s` 是
+  httpx 的 connect/read/write/pool **各阶段**标量，不是整个调用的
+  wall-clock 上限；OpenRouter 双请求各 3s 同理）、late worker 不写 usage
+  cache、错误分类器（timeout/network/remote-protocol/proxy/5xx → stale；
+  401/403/429/UnsupportedProtocol/LocalProtocolError → error，绝不 stale；
+  有/无缓存场景均锁定）、>4 jobs 并发上限测试。
+  **未闭环（父验收 A2）**：httpx 标量按阶段生效，一次调用可多阶段/多请求，
+  wall-clock 无上限；单 Codex 过期 token 的 native resolver refresh 默认
+  可达 20s 且认证锁可能更久——contract 外层 6.5s 及时返回，但 daemon
+  worker 继续运行。worker 生命周期须随 M1 singleflight + 进程级 semaphore
+  一并闭环。
 - 待补（**1–3 为 M1 发布前阻塞条件**，Codex R1#2/#3）：
   1. in-flight dedupe（singleflight，R2#1 状态机明确如下）：in-flight registry
      每个 cache_key 至多一个 entry `(future, deadline)`——
@@ -110,9 +114,12 @@
      （如 30s）；429 尊重 Retry-After 设置负缓存时长（封顶 120s）；
      401/403 语义细化为 `status=unavailable` + auth reason（M0 为 error，
      已满足"不被 stale 掩盖"底线）。
-  3. 线程生命周期压测：`shutdown(wait=False)` 不终止运行中线程是已知事实，
-     "worker 纯化"仅是缓解不是上限；补连续多轮 deadline 压测：活跃 worker 数
-     有界、旧 future 不被新请求复用且最终释放。
+  3. **worker 生命周期 wall-clock 闭环（父验收 A2 强化）**：httpx phase
+     timeout 不等于 wall-clock；Codex native resolver refresh 可达 20s+认证
+     锁。M1 必须把 in-flight 生命周期、Codex refresh 长调用、进程级并发上限
+     与 singleflight + process-wide semaphore + negative cache + worker
+     bounded stress 一起闭环：连续多轮 deadline 压测下活跃 worker 数有界、
+     旧 future 不被新请求复用且最终释放（含 native refresh 路径）。
 
 ### 测试矩阵（M1）
 

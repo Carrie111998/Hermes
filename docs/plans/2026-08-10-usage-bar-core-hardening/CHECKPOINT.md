@@ -2,8 +2,10 @@
 
 ## 恢复指引
 
-- 安全锚点：分支 `backup/usage-bar-hardening-pre-m0-20260810` +
-  `history/pre-m0-dirty.patch`（锚点后全部 dirty 快照，1283 行）。
+- 安全锚点：分支 `backup/usage-bar-hardening-pre-m0-20260810`；dirty 快照已移出
+  repo（父验收 A3）：`C:\Users\Admin\AppData\Local\hermes\cache\usage-bar-core-hardening\pre-m0-dirty.patch`
+  （46,471 bytes，SHA-256
+  `201485725060ed142de905d62d888713dd1420b43da641564564adb947d369c0`，已核验一致）。
 - 控制面：`docs/plans/2026-08-10-usage-bar-core-hardening/`（本目录）。
 - 恢复流程：读 STATE.json → 读本文件 → 按 PLAN.md 未完成的 milestone 继续。
 
