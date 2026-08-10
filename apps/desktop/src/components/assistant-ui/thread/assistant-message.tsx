@@ -17,6 +17,7 @@ import {
 } from '@/components/assistant-ui/thread/content'
 import { MESSAGE_PARTS_COMPONENTS } from '@/components/assistant-ui/thread/message-parts'
 import { ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
+import { MessageTimestamp } from '@/components/assistant-ui/thread/message-timestamp'
 import { ResponseLoadingIndicator, StreamStallIndicator } from '@/components/assistant-ui/thread/status'
 import { formatMessageTimestamp } from '@/components/assistant-ui/thread/timestamp'
 import { useMessageReactions, useTapbackDoubleClick } from '@/components/assistant-ui/thread/use-message-reactions'
@@ -157,6 +158,9 @@ export const AssistantMessage: FC<{
             )}
           </ErrorPrimitive.Root>
         </MessagePrimitive.Error>
+        {/* When this reply was written, visible at a glance — the hover-only
+            relative age in the action bar never showed the actual time. */}
+        <MessageTimestamp className="mt-1 block pr-(--message-text-indent) pl-(--message-text-indent) text-right" />
       </div>
       {hasVisibleText && !isInterim && (
         <AssistantFooter getMessageText={getMessageText} messageId={messageId} onBranchInNewChat={onBranchInNewChat} />

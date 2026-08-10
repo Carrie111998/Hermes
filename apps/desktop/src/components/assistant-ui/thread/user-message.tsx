@@ -4,6 +4,7 @@ import { type FC, type ReactNode, useCallback, useRef, useState } from 'react'
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { messageAttachmentRefs, messageContentText } from '@/components/assistant-ui/thread/content'
 import { ReactionBadge, ReactionPicker } from '@/components/assistant-ui/thread/message-reactions'
+import { MessageTimestamp } from '@/components/assistant-ui/thread/message-timestamp'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
@@ -260,6 +261,15 @@ export const UserMessage: FC<{
     </div>
   )
 
+  // When this prompt was written, always visible under the text. Kept out of
+  // the clamped text block so the 2-line clamp measurement stays text-only.
+  const bubbleBody = hasBody && (
+    <>
+      {bubbleContent}
+      <MessageTimestamp className="self-end" />
+    </>
+  )
+
   return (
     <MessagePrimitive.Root asChild>
       <StickyHumanMessageContainer
@@ -320,7 +330,7 @@ export const UserMessage: FC<{
                     title={bodyClamped ? (expanded ? t.common.collapse : copy.expandMessage) : undefined}
                     type="button"
                   >
-                    {bubbleContent}
+                    {bubbleBody}
                   </button>
                 ) : (
                   // Always editable — clicking opens the edit composer even while a
@@ -351,7 +361,7 @@ export const UserMessage: FC<{
                       title={copy.editMessage}
                       type="button"
                     >
-                      {bubbleContent}
+                      {bubbleBody}
                     </button>
                   </ActionBarPrimitive.Edit>
                 )}
