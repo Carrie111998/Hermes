@@ -211,6 +211,11 @@ _WINDOWS_ROOT_DELETE_BLOCK = [
     "cmd /c rd F:\\ /s /q",
     'cmd /c rmdir "G:\\" /s /q',
     "cmd /c rd /q H:/ /s",
+    "cmd /d /s /c rd /s /q I:\\",
+    'cmd.exe /v:on /c "rmdir /s /q J:/"',
+    "echo $(cmd /d /c rd /s /q K:/)",
+    "cmd /c rd /s /q L:\\.",
+    "cmd /c rd M:/.. /s /q",
     (
         r'''powershell -NoProfile -Command 'cmd /c \"rd /s /q '''
         r'''\\\"C:\Users\Art\Documents\ChatGPT\Software\clipsift-release\\\"\"' '''
@@ -222,8 +227,12 @@ _WINDOWS_ROOT_DELETE_ALLOW = [
     "cmd /c rd /s /q C:\\Users\\Art\\Documents\\clipsift-release",
     "cmd /c rmdir /q /s D:/clipsift-release",
     "cmd /c rd /q C:\\",
+    "cmd /d /c rd /s /q E:\\scoped",
+    "cmd /c rd /s /q F:\\...",
+    "cmd /c rd /s /q G:\\.config",
     r'''cmd /c "rd /s /q \"C:\Users\Art\Documents\clipsift-release\""''',
     'echo "cmd /c rd /s /q C:\\"',
+    'echo "cmd /d /c rd /s /q D:\\"',
     'echo "powershell -NoProfile -Command cmd /c rd /s /q C:\\"',
     '''python -c "print('powershell -Command cmd /c rd /s /q C:\\')"''',
 ]

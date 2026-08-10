@@ -432,13 +432,20 @@ _HARDLINE_SYSTEM_DIRS = (
 _RM_FLAG_PREFIX = _CMDPOS + r'rm\s+(-[^\s]*\s+)*'
 
 # Windows ``rd`` / ``rmdir`` root deletion must stay below every approval
-# bypass just like ``rm -rf /``.  The PowerShell prefix is intentionally
-# narrow: ``cmd`` must be the -Command payload, so quoted prose stays data.
-_WINDOWS_CMD_PREFIX = _CMDPOS + r'cmd(?:\.exe)?\s+/(?:c|k)\s+'
+# bypass just like ``rm -rf /``.  ``cmd`` accepts its own switches before
+# ``/c`` or ``/k``; those switches must be consumed by the cmd-owned prefix
+# rather than mistaken for the nested command payload.
+_WINDOWS_CMD_INVOKE = (
+    r'cmd(?:\.exe)?'
+    r'(?:\s+/(?:d|q|a|u|s|e:(?:on|off)|f:(?:on|off)|v:(?:on|off)))*'
+    r'\s+/(?:c|k)\s+'
+)
+_WINDOWS_CMD_PREFIX = _CMDPOS + _WINDOWS_CMD_INVOKE
 _WINDOWS_POWERSHELL_CMD_PREFIX = (
     _CMDPOS
     + r'(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+'
-    r'-(?:command|c)\s+["\']?cmd(?:\.exe)?\s+/(?:c|k)\s+'
+    + r'-(?:command|c)\s+["\']?'
+    + _WINDOWS_CMD_INVOKE
 )
 _WINDOWS_RD_PREFIX = (
     r'\\?["\']?(?:rd|rmdir)\b\s+'
@@ -447,9 +454,14 @@ _WINDOWS_RECURSIVE_FLAGS_PREFIX = (
     r'(?=(?:(?:/[sq])\s+)*/s(?:\s|$))'
     r'(?:(?:/[sq])\s+)+'
 )
+_WINDOWS_COLLAPSING_ROOT = (
+    r'(?:[a-z]:)?[\\/]+'
+    r'(?:(?:\.\.?)?[\\/]+)*(?:\.\.?)?'
+)
 _WINDOWS_ROOT_TARGET = (
-    r'(?:["\'](?:[a-z]:)?[\\/]+["\']|'
-    r'(?:[a-z]:)?[\\/]+(?=["\']?(?:[\s`;|&)]|$)))'
+    r'(?:["\'](?:' + _WINDOWS_COLLAPSING_ROOT + r')["\']|'
+    r'(?:' + _WINDOWS_COLLAPSING_ROOT
+    + r')(?=["\']?(?:[\s`;|&)]|$)))'
 )
 _WINDOWS_RECURSIVE_ROOT_ARGUMENTS = (
     r'(?:'
