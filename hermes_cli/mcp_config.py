@@ -109,9 +109,8 @@ def _remove_mcp_token_files(name: str) -> bool:
 
     Always routes through :class:`tools.mcp_oauth.HermesTokenStorage` so
     the ``.json``, ``.client.json``, and ``.meta.json`` siblings are
-    handled together — fixing the orphan-``.meta.json`` revival bug
-    where ``hermes mcp remove`` left cached OAuth metadata on disk and
-    the gateway bootstrap re-read it on the next restart (#81050).
+    handled together — leftover per-server OAuth files can otherwise be
+    re-read when the server is re-added later (#81050).
     """
     from tools.mcp_oauth import HermesTokenStorage
 
@@ -655,9 +654,9 @@ def cmd_mcp_add(args):
 def cmd_mcp_remove(args):
     """Remove an MCP server from config AND clean up all on-disk state.
 
-    Always deletes the per-server files under ``mcp-tokens/`` so an
-    orphan ``.meta.json`` (or ``.client.json``) cannot be re-read by the
-    gateway bootstrap on the next restart (#81050).
+    Always deletes the per-server files under ``mcp-tokens/``, including
+    orphan files for servers no longer in config, so a later re-add of
+    the same server does not pick up stale OAuth state (#81050).
     """
     name = args.name
     existing = _get_mcp_servers()

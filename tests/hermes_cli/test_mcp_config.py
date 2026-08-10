@@ -202,8 +202,8 @@ class TestMcpRemove:
 
         If a server has already been removed from config but its token
         files survive on disk (orphan state), `hermes mcp remove` must
-        still clean the leftover files so the server cannot be revived
-        on the next gateway restart.
+        still clean the leftover files so a later re-add of the same
+        server does not pick up stale OAuth state.
         """
         # No config seeding — server is absent from mcp_servers, but
         # token files still present on disk.
