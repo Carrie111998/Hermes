@@ -133,6 +133,7 @@ def strip_interrupted_tool_tails(
             incomplete = any(
                 result_counts[call_id] < count for call_id, count in call_counts.items()
             )
+            malformed = result_counts != call_counts
             interrupted = any(
                 is_interrupted_tool_result(m.get("content", "")) for m in tool_results
             )
@@ -155,6 +156,14 @@ def strip_interrupted_tool_tails(
                     j - 1,
                     len(tool_results),
                 )
+                i = j
+                continue
+            if malformed:
+                # Every declared call is answered, but surplus, duplicate, or
+                # unknown-ID rows still make the provider payload invalid.
+                # Rebuild from the declaration to retain exactly the first
+                # persisted result for each call in declared-call order.
+                cleaned.extend(_complete_side_effecting_tool_batch(msg, tool_results))
                 i = j
                 continue
         if msg.get("role") == "tool" and is_interrupted_tool_result(

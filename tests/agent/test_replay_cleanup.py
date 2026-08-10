@@ -105,6 +105,43 @@ def test_completed_multi_call_batch_is_unchanged():
     assert sanitize_replay_history(history) == history
 
 
+def test_surplus_malformed_result_is_dropped_from_completed_batch():
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "a", "function": {"name": "read_file", "arguments": "{}"}},
+            {"id": "b", "function": {"name": "write_file", "arguments": "{}"}},
+        ],
+    }
+    read_result = _tool("read", call_id="a")
+    write_result = _tool("wrote", call_id="b")
+    malformed_result = {"role": "tool", "content": "missing id"}
+    following_user = _user("next")
+
+    assert sanitize_replay_history(
+        [assistant, read_result, write_result, malformed_result, following_user]
+    ) == [assistant, read_result, write_result, following_user]
+
+
+def test_surplus_duplicate_result_is_dropped_from_completed_batch():
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "a", "function": {"name": "read_file", "arguments": "{}"}},
+            {"id": "b", "function": {"name": "write_file", "arguments": "{}"}},
+        ],
+    }
+    first_a = _tool("first", call_id="a")
+    duplicate_a = _tool("duplicate", call_id="a")
+    result_b = _tool("wrote", call_id="b")
+
+    assert sanitize_replay_history(
+        [assistant, first_a, duplicate_a, result_b]
+    ) == [assistant, first_a, result_b]
+
+
 def test_sanitize_replay_history_combines_both():
     # interrupted block is removed; a dangling read-only call is safe to erase
     history = [
