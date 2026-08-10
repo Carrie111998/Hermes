@@ -30,20 +30,32 @@ logger = logging.getLogger(__name__)
 def _configured_mcp_dynamic_tools(agent) -> list[dict[str, Any]]:
     """Project this session's registered MCP schemas onto Codex dynamic tools.
 
-    ``agent.tools`` is already filtered by the platform toolset policy.  The
-    registered-name map is the extra provenance check: a registry/native tool
-    that merely resembles an MCP name never crosses this boundary.
+    ``agent.tools`` may be the tool-search bridge surface, so resolve the raw
+    catalog under the exact session policy first.  The registered-name map is
+    the extra provenance check: a registry/native tool that merely resembles
+    an MCP name never crosses this boundary.
     """
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None)
+    if enabled_toolsets == []:
+        return []
+
     try:
+        from model_tools import get_tool_definitions
         from tools.mcp_tool import _mcp_tool_server_names
 
         registered = set(_mcp_tool_server_names)
+        raw_tools = get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        ) or []
     except Exception:
         return []
 
     dynamic_tools: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for tool in getattr(agent, "tools", ()) or ():
+    for tool in raw_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
         if not isinstance(function, dict):
             continue

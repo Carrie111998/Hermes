@@ -114,8 +114,164 @@ class TestCodexAppServerModule:
 
 
 class TestConfiguredMcpDynamicTools:
-    def test_only_registered_mcp_schemas_are_projected(self, monkeypatch) -> None:
+    def test_raw_authorized_mcp_schemas_are_projected(self, monkeypatch) -> None:
         from agent.codex_runtime import _configured_mcp_dynamic_tools
+        import model_tools
+        from tools import mcp_tool
+
+        monkeypatch.setattr(
+            mcp_tool,
+            "_mcp_tool_server_names",
+            {
+                "mcp__law_firm_ops__list_email_obligations": "law_firm_ops",
+                "mcp__law_firm_ops__get_email_obligation": "law_firm_ops",
+                "mcp__law_firm_ops__list_obligation_receipts": "law_firm_ops",
+                "mcp__other__unconfigured": "other",
+            },
+        )
+        calls = []
+
+        def raw_catalog(**kwargs):
+            calls.append(kwargs)
+            return [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__law_firm_ops__list_email_obligations",
+                        "description": "List canonical obligations.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "Native tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "description": "Bridge tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__law_firm_ops__get_email_obligation",
+                        "description": "Get one canonical obligation.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool_call",
+                        "description": "Bridge tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__law_firm_ops__list_obligation_receipts",
+                        "description": "List canonical receipts.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__law_firm_ops__list_email_obligations",
+                        "description": "Duplicate must not cross.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ]
+
+        monkeypatch.setattr(model_tools, "get_tool_definitions", raw_catalog)
+        agent = SimpleNamespace(
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool_search",
+                        "description": "Bridge-only assembled surface.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool_describe",
+                        "description": "Bridge-only assembled surface.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "tool_call",
+                        "description": "Bridge-only assembled surface.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ],
+            enabled_toolsets=["law-firm-ops"],
+            disabled_toolsets=["outlook"],
+        )
+
+        dynamic_tools = _configured_mcp_dynamic_tools(agent)
+
+        assert calls == [
+            {
+                "enabled_toolsets": ["law-firm-ops"],
+                "disabled_toolsets": ["outlook"],
+                "quiet_mode": True,
+                "skip_tool_search_assembly": True,
+            }
+        ]
+        assert dynamic_tools == [
+            {
+                "type": "function",
+                "name": "mcp__law_firm_ops__list_email_obligations",
+                "description": "List canonical obligations.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "mcp__law_firm_ops__get_email_obligation",
+                "description": "Get one canonical obligation.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "type": "function",
+                "name": "mcp__law_firm_ops__list_obligation_receipts",
+                "description": "List canonical receipts.",
+                "inputSchema": {"type": "object", "properties": {}},
+            }
+        ]
+
+    def test_explicit_empty_toolsets_are_deny_all(self, monkeypatch) -> None:
+        from agent.codex_runtime import _configured_mcp_dynamic_tools
+        import model_tools
+
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: pytest.fail("deny-all must not resolve tools"),
+        )
+
+        assert _configured_mcp_dynamic_tools(
+            SimpleNamespace(enabled_toolsets=[], disabled_toolsets=None)
+        ) == []
+
+    def test_catalog_or_registry_errors_fail_closed(self, monkeypatch) -> None:
+        from agent.codex_runtime import _configured_mcp_dynamic_tools
+        import model_tools
         from tools import mcp_tool
 
         monkeypatch.setattr(
@@ -123,43 +279,26 @@ class TestConfiguredMcpDynamicTools:
             "_mcp_tool_server_names",
             {"mcp__law_firm_ops__list_email_obligations": "law_firm_ops"},
         )
-        agent = SimpleNamespace(
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "mcp__law_firm_ops__list_email_obligations",
-                        "description": "Canonical obligations.",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "outlook_list_messages",
-                        "description": "Must not leak.",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "mcp__spoofed__tool",
-                        "description": "Not registered.",
-                        "parameters": {"type": "object", "properties": {}},
-                    },
-                },
-            ]
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: (_ for _ in ()).throw(RuntimeError("unavailable")),
         )
 
-        assert _configured_mcp_dynamic_tools(agent) == [
-            {
-                "type": "function",
-                "name": "mcp__law_firm_ops__list_email_obligations",
-                "description": "Canonical obligations.",
-                "inputSchema": {"type": "object", "properties": {}},
-            }
-        ]
+        assert _configured_mcp_dynamic_tools(
+            SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
+        ) == []
+
+        monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", object())
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: pytest.fail("registry errors must resolve no tools"),
+        )
+
+        assert _configured_mcp_dynamic_tools(
+            SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
+        ) == []
 
 
 class TestSpawnEnvIsolation:
