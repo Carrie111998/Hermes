@@ -56,15 +56,25 @@ Every claim must end in exactly one of:
 
 The kanban kernel enforces that exactly one of these terminates each run. A worker that calls neither and exits normally is treated as crashed.
 
+## Recoverable-first obstacle protocol
+
+Workers classify obstacles before stopping:
+
+- **Recoverable/internal** — test or CI failures, lint/type errors, merge conflicts, missing packages, transient network errors, and tool/skill lookup failures. Inspect the exact failure, consult the relevant skill or project documentation, retry within a bound, try an alternate command/path/provider, and create a correctly assigned remediation child (with the current task as parent) when that preserves progress. These are not human blockers by themselves.
+- **Dependency-wait** — work cannot continue until another tracked task finishes. Use `kind="dependency"`; the task returns to `todo` and is promoted automatically when its parent completes.
+- **Genuine human/external gate** — a missing owner decision, permission or credential after checking documented sources, legal/customer approval, or an unavailable external system. Use `kind="needs_input"` or `kind="capability"` and include the evidence in the reason.
+
+Untyped blocks remain accepted for legacy callers, but new workers must not use them as an escape hatch for recoverable engineering failures. Review-required is a handoff state, not a generic blocker: submit the native Review handoff with the repository, PR, immutable head SHA, verification, and deployment implications.
+
 ## Outputs and the review-required convention
 
-For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The kanban kernel doesn't enforce this distinction (a "code-changing task" is fuzzy and forcing block-instead-of-complete on every code worker would break flows where no review is wanted). It's a convention layered on top:
+For most code-changing tasks, the work isn't truly *done* the moment the worker finishes — it needs a human reviewer. The native Review handoff carries that state without pretending the task is blocked:
 
-- **Block instead of complete**, with `reason` prefixed `review-required: ` so the dashboard / `hermes kanban show` surfaces the row as awaiting review.
-- **Drop structured metadata into a `kanban_comment` first** since `kanban_block` only carries the human-readable `reason`. Comments are the durable annotation channel — every audit-relevant field (changed_files, tests_run, diff_path or PR url, decisions) belongs there.
-- **Reviewer either approves and unblocks**, which respawns the worker with the comment thread for follow-ups; or asks for changes via another comment, which the next worker run sees as part of `kanban_show`'s context.
+- **Submit the native Review handoff** with the repository, PR URL, immutable head SHA, verification, deployment implications, and original implementer.
+- **Preserve structured evidence** (changed files, tests, decisions, and route metadata) in the handoff/comment so the reviewer does not need to reconstruct it from logs.
+- **Do not use `kanban_block(reason="review-required: ...")`** as a substitute for the Review handoff.
 
-The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the `review-required` block pattern.
+The injected `KANBAN_GUIDANCE` covers both `kanban_complete` (truly terminal tasks — typo fixes, docs changes, research writeups) and the native Review handoff.
 
 ## Logs and audit trail
 

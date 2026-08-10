@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -228,6 +229,69 @@ def _connect(board: Optional[str] = None):
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+
+_RECOVERABLE_ENGINEERING_MARKERS = (
+    # Test and static-analysis failures are worker-owned recovery work.
+    "test failed",
+    "tests failed",
+    "test failure",
+    "tests failing",
+    "tests are failing",
+    "pytest failed",
+    "pytest error",
+    "lint failed",
+    "lint error",
+    "lint errors",
+    "type check failed",
+    "type check error",
+    "typecheck failed",
+    "typecheck error",
+    "mypy failed",
+    "mypy error",
+    "mypy errors",
+    # Source-control and CI failures are recoverable unless explicitly typed
+    # as a genuine external/dependency/capability gate.
+    "merge conflict",
+    "merge conflicts",
+    "ci failed",
+    "ci failure",
+    "ci timed out",
+    "ci timeout",
+    "continuous integration failed",
+    # Installation and connectivity failures should be retried or repaired.
+    "missing package",
+    "package not found",
+    "package installation failed",
+    "installation failed",
+    "install failed",
+    "pip install failed",
+    "npm install failed",
+    "network error",
+    "network failure",
+    "network timeout",
+    "transient network",
+    # Tool/skill discovery failures are not human blockers by default.
+    "tool unavailable",
+    "tool not available",
+    "tool not found",
+    "tool lookup",
+    "skill unavailable",
+    "skill not available",
+    "skill not found",
+    "skill lookup",
+)
+
+
+def _looks_recoverable_engineering_obstacle(reason: str) -> bool:
+    """Identify common internal failures that should enter recovery, not block.
+
+    The patterns are intentionally specific rather than matching broad words
+    such as ``unavailable`` or ``error``. Legacy callers may still omit
+    ``kind`` for arbitrary human-facing reasons, while workers get a clear tool
+    error for recurring engineering-failure escape hatches.
+    """
+    normalized = re.sub(r"\s+", " ", str(reason).strip().lower())
+    return any(marker in normalized for marker in _RECOVERABLE_ENGINEERING_MARKERS)
 
 
 def _goal_judge_available() -> bool:
@@ -827,6 +891,19 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    # A typed boundary prevents the most common passive-block escape hatch:
+    # stopping on an engineering failure that the worker is expected to
+    # diagnose and recover from. Keep untyped blocks accepted for legacy
+    # callers, but make the failure actionable so the worker retries with an
+    # explicit genuine-gate kind rather than parking a solvable task.
+    if kind in {None, "transient"} and _looks_recoverable_engineering_obstacle(reason):
+        return tool_error(
+            "kanban_block rejected: this looks like a recoverable engineering "
+            "obstacle. Diagnose it, consult skills/docs, retry with a bounded "
+            "alternate path, or create an assigned remediation child. Use "
+            "kind='dependency', 'needs_input', or 'capability' only for a "
+            "genuine gate, with evidence in the reason."
+        )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

@@ -34,6 +34,7 @@ from agent.prompt_builder import (
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
+    KANBAN_GUIDANCE,
 )
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
 
@@ -44,6 +45,19 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_kanban_guidance_is_recoverable_first(self):
+        assert "recoverable/internal" in KANBAN_GUIDANCE
+        assert "bounded retry" in KANBAN_GUIDANCE
+        assert "alternate command/path/provider" in KANBAN_GUIDANCE
+        assert "correctly assigned remediation child" in KANBAN_GUIDANCE
+        assert "Test failures, lint/type errors, merge conflicts" in KANBAN_GUIDANCE
+        assert "native Review handoff (`kanban_submit_review`)" in KANBAN_GUIDANCE
+        assert "repository, PR, " in KANBAN_GUIDANCE
+        assert "immutable head SHA" in KANBAN_GUIDANCE
+        assert "deployment implications" in KANBAN_GUIDANCE
+        assert "`kanban_block(reason=\"review-required:" not in KANBAN_GUIDANCE
+        assert "review-required" in KANBAN_GUIDANCE
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
