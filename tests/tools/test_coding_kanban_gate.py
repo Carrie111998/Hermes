@@ -1,0 +1,1277 @@
+"""Behavioral coverage for the chat-to-DEV coding handoff gate."""
+
+from __future__ import annotations
+
+import json
+from types import SimpleNamespace
+
+import pytest
+
+from tools.registry import ToolRegistry
+from tools.coding_kanban_gate import (
+    _verification_tool_allowed,
+    coding_tool_gate_refusal,
+    is_coding_intent,
+    task_capability_preflight,
+)
+
+
+def _registry(calls: list[str], *names: str) -> ToolRegistry:
+    registry = ToolRegistry()
+    for name in names:
+        registry.register(
+            name=name,
+            toolset="test",
+            schema={"name": name},
+            handler=lambda args, _name=name, **kwargs: calls.append(_name) or json.dumps({"ok": True}),
+        )
+    return registry
+
+
+def _payload(result):
+    return json.loads(result)
+
+
+def test_legacy_task_without_capability_metadata_remains_dispatchable():
+    task = type("Task", (), {"status": "ready", "assignee": "dev", "metadata": {}})()
+    assert task_capability_preflight(task) is None
+
+
+@pytest.mark.parametrize("metadata", [{"capability": ""}, {"capability": "bogus"}])
+def test_explicit_malformed_capability_metadata_fails_closed(metadata):
+    task = type("Task", (), {"status": "ready", "assignee": "dev", "metadata": metadata})()
+    assert task_capability_preflight(task)
+
+
+def _declare_profile(tmp_path, name: str) -> None:
+    """Declare a real on-disk profile in the temp HERMES_HOME.
+
+    Kanban ingress is strict: ``create_task``/``assign_task`` reject an
+    assignee that does not resolve to an on-disk profile or a configured
+    lane/alias.  These gate tests run against a bare temp home, so any
+    synthetic assignee must exist as a profile directory first.
+    """
+    (tmp_path / ".hermes" / "profiles" / name).mkdir(parents=True)
+    (tmp_path / ".hermes" / "profiles" / name / "config.yaml").write_text("model: test\n")
+
+
+def test_feature_request_hands_off_before_patch_and_reports_real_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    result = _payload(registry.dispatch(
+        "patch", {"scope": "Implement the parser feature"},
+        session_id="chat-feature", task_id="message-1",
+        user_message="Please implement the parser feature",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert result["assignee"] == "dev"
+    assert result["coding_agent"] == "codex"
+    assert calls == []
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task = kanban_db.get_task(conn, result["task_id"])
+    assert task is not None
+    assert task.metadata["lane"] == "DEV"
+    assert task.metadata["origin"] == {"session_id": "chat-feature", "message_id": "message-1"}
+    assert task.metadata["repository"]
+    assert task.metadata["workspace"]
+    assert task.metadata["acceptance_criteria"]
+
+
+def test_tiny_edit_reuses_card_without_unlocking_originating_chat(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "write_file")
+    kwargs = dict(
+        session_id="chat-edit", task_id="message-2",
+        user_message="Make the tiny edit to the version string",
+    )
+
+    first = _payload(registry.dispatch("write_file", {"path": "x", "content": "1"}, **kwargs))
+    second = _payload(registry.dispatch("write_file", {"path": "x", "content": "1"}, **kwargs))
+
+    assert second["task_id"] == first["task_id"]
+    assert second["status"] == first["status"] == "ready"
+    assert second["reused"] is True
+    assert calls == []
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert len(kanban_db.list_tasks(conn, session_id="chat-edit")) == 1
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "message"),
+    [
+        ("terminal", {"command": "pwd && git status --short && rg 'needle' ."}, "Inspect the repo"),
+        ("execute_code", {"code": "print(sum(range(10)))"}, "Calculate a value"),
+        ("delegate_task", {"goal": "Research the relevant parser documentation"}, "Research only"),
+    ],
+)
+def test_read_only_inspection_calculation_and_research_remain_available(
+    monkeypatch, tmp_path, name, args, message,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+
+    result = _payload(registry.dispatch(name, args, session_id="chat-read", user_message=message))
+
+    assert result == {"ok": True}
+    assert calls == [name]
+
+
+def test_discussion_to_implementation_creates_card_at_transition(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "read_file", "patch")
+
+    assert _payload(registry.dispatch(
+        "read_file", {}, session_id="chat-transition", user_message="Can you inspect this?"
+    )) == {"ok": True}
+    handoff = _payload(registry.dispatch(
+        "patch", {}, session_id="chat-transition", task_id="turn-3",
+        user_message="Now implement the fix",
+    ))
+
+    assert handoff["task_id"].startswith("t_")
+    assert handoff["status"] == "ready"
+    assert calls == ["read_file"]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("terminal", {"command": "git branch feature-x"}),
+        ("terminal", {"command": "git worktree add ../feature-x"}),
+        ("delegate_task", {"goal": "Implement the parser fix"}),
+    ],
+)
+def test_branch_worktree_and_implementation_delegation_handoff_before_execution(
+    monkeypatch, tmp_path, name, args,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+
+    result = _payload(registry.dispatch(
+        name, args, session_id="chat-handoff", task_id="handoff-message",
+        user_message="Implement this change",
+    ))
+
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert calls == []
+
+
+def test_agent_level_delegate_dispatch_cannot_bypass_handoff(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from model_tools import handle_function_call
+
+    result = _payload(handle_function_call(
+        "delegate_task", {"goal": "Implement the requested fix"},
+        task_id="agent-message", session_id="chat-agent",
+        user_task="Please implement the requested fix",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+
+
+def test_cursor_is_recorded_only_when_explicit_and_claude_cannot_launch(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    cursor = _payload(registry.dispatch(
+        "terminal", {"command": "cursor agent"}, session_id="chat-cursor",
+        task_id="cursor-message", user_message="Use Cursor for this implementation",
+    ))
+    claude = _payload(registry.dispatch(
+        "terminal", {"command": "claude"}, session_id="chat-claude",
+        task_id="claude-message", user_message="Use Claude for this implementation",
+    ))
+
+    assert cursor["coding_agent"] == "cursor"
+    assert claude["error_type"] == "unsupported_coding_agent"
+    assert calls == []
+
+
+def test_existing_canonical_matching_task_is_reused(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn,
+            title="Implement parser",
+            assignee="dev",
+            session_id="chat-existing",
+            workspace_kind="dir",
+            workspace_path=str(tmp_path),
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "chat-existing", "message_id": "existing-message"},
+                "repository": str(tmp_path), "workspace": str(tmp_path),
+            },
+        )
+
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    result = _payload(registry.dispatch(
+        "patch", {"scope": "Implement parser", "workspace": str(tmp_path), "repository": str(tmp_path)}, session_id="chat-existing",
+        task_id="existing-message", user_message="Implement parser",
+    ))
+
+    assert result["task_id"] == task_id
+    assert result["reused"] is True
+    with kanban_db.connect_closing() as conn:
+        assert len(kanban_db.list_tasks(conn, session_id="chat-existing")) == 1
+
+
+def test_kanban_unavailable_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(kanban_db, "connect", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")))
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    result = _payload(registry.dispatch("patch", {}, session_id="chat-offline", user_message="Fix it"))
+
+    assert result["error_type"] == "kanban_unavailable"
+    assert calls == []
+
+
+def test_arbitrary_session_task_does_not_unlock_originating_chat(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "worker")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        kanban_db.create_task(conn, title="unrelated", assignee="worker", session_id="chat-unrelated")
+
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    result = _payload(registry.dispatch("patch", {}, session_id="chat-unrelated", user_message="Fix it"))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+    assert calls == []
+
+
+def test_worker_can_change_code_only_from_own_canonical_dev_task(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, "dev")
+    _declare_profile(tmp_path, "worker")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        own_id = kanban_db.create_task(
+            conn, title="worker task", assignee="dev", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+        other_id = kanban_db.create_task(
+            conn, title="other task", assignee="worker", session_id="origin",
+        )
+
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    with kanban_db.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET current_run_id = 42 WHERE id = ?", (own_id,))
+    assert _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", other_id)
+    denied = _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement"))
+    assert denied["error_type"] == "kanban_task_required"
+    assert calls == ["patch"]
+
+
+def test_fake_task_environment_without_active_run_cannot_unlock_worker(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, "dev")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="fake", assignee="dev", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "999")
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    result = _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement"))
+    assert result["error_type"] == "kanban_task_required"
+    assert calls == []
+
+
+def test_codex_app_server_enters_the_same_intake_gate(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    result = _payload(coding_tool_gate_refusal(
+        "codex_app_server",
+        session_id="chat-codex",
+        task_id="message-1",
+        user_message="Implement the requested feature",
+    ))
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert result["coding_agent"] == "codex"
+
+
+@pytest.mark.parametrize("command", [
+    "date", "ps -ef", "curl -I https://example.com", "sqlite3 state.db '.tables'",
+    "gh pr view 19", "git remote -v", "git remote show origin",
+])
+def test_read_only_operational_probes_are_not_coding_intent(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect runtime state") is False
+
+
+@pytest.mark.parametrize("command", [
+    "hermes kanban show t_2ea69c53 --json",
+    "hermes kanban show t_2ea69c53 --json > /tmp/audit.json 2>/dev/null",
+    "hermes kanban list --json > /tmp/board.json 2>/tmp/err",
+    "hermes kanban stats",
+    "hermes kanban diagnostics --json",
+    "hermes kanban runs t_123",
+    "hermes kanban assignees",
+    "hermes kanban log t_123 --tail",
+    "hermes kanban boards list",
+    "hermes kanban boards current",
+    "export PATH=\"$HOME/x:$PATH\"; hermes kanban list --json > /tmp/out.json",
+    "for id in t_1 t_2; do hermes kanban show $id --json > /tmp/out.json; echo done; done",
+    "if [ -f /tmp/x ]; then cat /tmp/x; fi",
+    "git log --oneline -5 2>&1 | head",
+    "git status --short 2>&1",
+    "curl -s https://mc.solobot.cloud/build-info.json > /tmp/bi.json",
+    "hermes kanban list &> /tmp/x",
+    "echo hi > /tmp/out.txt",
+    "echo 'a > b'",
+    "cat <<EOF\nhello\nEOF",
+    "python3 - <<'PY'\nimport json\nprint(json.load(open('/tmp/x.json')))\nPY",
+    "python3 -c \"import json; d=json.load(open('/tmp/audit.json')); print(len(d))\"",
+    "python3 -c \"import sqlite3; c=sqlite3.connect('/home/solo/.hermes/kanban.db'); print(c.execute('select count(*) from tasks').fetchone())\"",
+])
+def test_scratch_redirect_export_loop_and_read_probes_are_read_only(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect the board") is False
+
+
+@pytest.mark.parametrize("command", [
+    # env wrapper must NOT defeat the gate (regression for PR #29 review:
+    # env added to _READ_ONLY_COMMANDS without wrapper handling let
+    # `env git commit` etc. classify pass-through)
+    "env git commit -m x",
+    "env git push origin main",
+    "env FOO=1 git add -A",
+    "env -i git commit -m x",
+    "env -u FOO git push",
+    "env --unset=HOME git add -A",
+    "env bash -c \"rm x\"",
+    "env python3 -c \"open('/tmp/x','w').write('y')\"",
+    "python3 -c \"open('/tmp/x','w').write('y')\"",
+    # tee is a write command even to scratch (only shell redirection to
+    # scratch is exempt, per the "base command read-only" rule)
+    "echo hi | tee /tmp/out.txt",
+    # loop/conditional body with a mutating command stays gated
+    "if [ -f x ]; then rm x; fi",
+    "echo hi > repo/out.txt",
+    "echo hi >> repo/out.txt",
+    "hermes kanban list &> repo/x",
+    "cat <<EOF > repo/out.txt\nhello\nEOF",
+    "rm \"important file.txt\"",
+    "mv \"a b.txt\" \"c d.txt\"",
+    "python3 - <<'PY'\nopen('/tmp/x','w').write('y')\nPY",
+])
+def test_mutating_hermes_verbs_and_interpreter_writes_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Manage the board") is True
+
+
+@pytest.mark.parametrize("command", [
+    # env wrapper forms that are genuinely read-only must pass through
+    # (regression for PR #29 review acceptance criteria)
+    "env",
+    "env | grep HOME",
+    "env -0",
+    "env -i python3 -c \"print(1)\"",
+    "env python3 --version",
+    "env git status",
+    "env python3 -c \"import json; d=json.load(open('/tmp/audit.json')); print(len(d))\"",
+])
+def test_env_wrapper_read_only_forms_pass_through(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect the board") is False
+
+
+@pytest.mark.parametrize("command", [
+    # `cd`/`pushd`/`popd` are directory-change prefixes, not actions: the
+    # wrapped command after the prefix decides read-only vs coding intent.
+    "cd /tmp && file /etc/hostname",
+    "cd /home/solo/.hermes/mission-control/chat-attachments && file a760file",
+    "cd /tmp && git status && cd ..",
+    "pushd /tmp && ls && popd",
+    "git status && cd /tmp",
+    "cd /tmp && ps -ef | grep hermes",
+    "cd /tmp && journalctl -u hermes --no-pager | tail -20",
+    "pushd -n /tmp && pwd && popd -n",
+])
+def test_cd_prefix_read_only_chains_are_not_coding_intent(command):
+    assert is_coding_intent("terminal", {"command": command}, "Inspect state") is False
+
+
+@pytest.mark.parametrize("command", [
+    # A `cd` prefix must NOT weaken the gate: mutating commands chained after
+    # it still fail closed.
+    "cd /tmp && git commit -m x",
+    "cd /tmp && rm file.txt",
+    "cd repo && git push origin main",
+    "cd /tmp && touch x",
+    "cd /tmp && env git commit -m x",
+])
+def test_cd_prefix_mutation_chains_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Run the change") is True
+
+
+@pytest.mark.parametrize("command", [
+    # Every `hermes kanban <subcommand>` is board governance, never coding:
+    # board ops do not write repository files, so none may become a card.
+    "hermes kanban complete t_2e59ceaa",
+    "hermes kanban create 'probe'",
+    "hermes kanban create -t 'new task'",
+    "hermes kanban boards create dev2",
+    "hermes kanban boards rm dev2",
+    "hermes kanban boards switch dev2",
+    "hermes kanban boards list",
+    "hermes kanban repair",
+    "hermes kanban gc",
+    "hermes kanban list",
+    "hermes kanban show t_123 --json",
+    "hermes kanban dispatch",
+    "hermes kanban unblock t_123",
+    "hermes kanban heal t_123",
+    "hermes kanban archive t_123",
+    "hermes kanban update t_123",
+])
+def test_hermes_kanban_board_ops_are_not_coding_intent(command):
+    assert is_coding_intent("terminal", {"command": command}, "Manage the board") is False
+
+
+@pytest.mark.parametrize("code", [
+    # subprocess/os/hermes_tools wrappers are classified by the wrapped
+    # command, not by the mere presence of the wrapper.
+    "import subprocess\nsubprocess.run(['journalctl', '-u', 'hermes'], capture_output=True)",
+    "import subprocess\nsubprocess.run(['grep', 'needle', '/tmp/log.txt'])",
+    "import subprocess as sp\nsp.run(['git', 'status'], capture_output=True)",
+    "from subprocess import run\nrun(['ls', '-la'])",
+    "import os\nos.system('journalctl -u hermes | tail -20')",
+    "from hermes_tools import terminal\nterminal('journalctl -u hermes')",
+    "from hermes_tools import terminal as t\nt('git status --short')",
+    "import hermes_tools\nhermes_tools.terminal('git status --short')",
+])
+def test_execute_code_read_only_wrappers_are_not_coding_intent(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Inspect state") is False
+
+
+@pytest.mark.parametrize("code", [
+    # Wrapper calls must fail closed when the wrapped command mutates, when
+    # the argument is dynamic, or when a star import hides the tool names.
+    "import subprocess\nsubprocess.run(['touch', 'x'])",
+    "import subprocess\nsubprocess.run(['git', 'commit', '-m', 'x'])",
+    "import subprocess\nsubprocess.run(['bash', '-c', 'rm x'])",
+    "from hermes_tools import terminal\nterminal('git commit -m x')",
+    "import os\nos.system('rm -rf /tmp/x')",
+    "import subprocess\ncmd = ['git', 'status']\nsubprocess.run(cmd)",
+    "from hermes_tools import terminal as t\ncmd = 'git commit -m x'\nt(cmd)",
+    "from hermes_tools import *\nterminal('git status')",
+    "import subprocess\nsubprocess.run(['git', 'status'])\nsubprocess.run(['touch', 'x'])",
+])
+def test_execute_code_wrapper_mutations_fail_closed(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Run the script") is True
+
+
+@pytest.mark.parametrize("code", [
+    "import sqlite3\nc = sqlite3.connect('/tmp/db.sqlite')\nprint(c.execute('select 1').fetchone())",
+    "text = 'a-b'.replace('-', '_')\nprint(text)",
+    "items = [1, 2, 3]\nitems.remove(2)\nprint(items)",
+    "import json\nprint(json.load(open('/tmp/x.json')))",
+])
+def test_execute_code_read_only_probes_are_not_coding_intent(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Inspect state") is False
+
+
+@pytest.mark.parametrize("code", [
+    "import os\nos.remove('/tmp/x')",
+    "from pathlib import Path\nPath('/tmp/x').unlink()",
+    "import shutil\nshutil.rmtree('/tmp/x')",
+    "import os\nos.replace('/tmp/a', '/tmp/b')",
+    "import subprocess\nsubprocess.run(['touch', 'x'])",
+    "open('/tmp/x', 'w').write('y')",
+])
+def test_execute_code_fs_mutations_fail_closed(code):
+    assert is_coding_intent("execute_code", {"code": code}, "Run the script") is True
+
+
+@pytest.mark.parametrize("command", [
+    # curl output to a real/repo path or implicit-CWD writes fail closed
+    "curl -o repo/out.json https://example.com/data",
+    "curl --output repo/out.json https://example.com/data",
+    "curl -O https://example.com/file.bin",
+    "curl --remote-name https://example.com/file.bin",
+    "curl --remote-name-all https://example.com/a https://example.com/b",
+    "curl --output-dir /tmp -O https://example.com/file.bin",
+    "curl --output-dir repo https://example.com/file.bin",
+    "curl --output-dir repo -o out.json https://example.com/file.bin",
+    "curl --output-dir /tmp -o sub/out.json https://example.com/file.bin",
+    "curl --output-dir /tmp -o ~/out.json https://example.com/file.bin",
+    "curl -d 'a=1' https://example.com/api",
+    "curl --data-binary @payload.json https://example.com/api",
+    "curl -F 'file=@x.txt' https://example.com/upload",
+    "curl -T /tmp/x.txt https://example.com/upload",
+    "curl -X POST https://example.com/api",
+    "curl --request PUT https://example.com/api",
+])
+def test_curl_file_write_and_mutation_forms_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Fetch remote data") is True
+
+
+@pytest.mark.parametrize("command", [
+    # curl output flags are read-only when the destination is scratch
+    # (/dev/null, /tmp, /var/tmp, or the system temp dir)
+    "curl -o /dev/null https://example.com",
+    "curl -o /tmp/probe.json https://example.com/data",
+    "curl --output /tmp/out.json https://example.com/data",
+    "curl -sfo /tmp/out.json https://example.com/data",
+    "curl --output=/tmp/out.json https://example.com/data",
+    "curl --output-dir /tmp https://example.com/file.bin",
+    "curl --output-dir /tmp -o out.json https://example.com/file.bin",
+    "curl -o out.json --output-dir /tmp https://example.com/file.bin",
+    "curl -s https://example.com/health > /dev/null",
+])
+def test_curl_scratch_output_is_read_only(command):
+    assert is_coding_intent("terminal", {"command": command}, "Fetch remote data") is False
+
+
+@pytest.mark.parametrize("command", [
+    # systemctl inspection subcommands are read-only
+    "systemctl --user show hermes.service",
+    "systemctl --user status hermes.service",
+    "systemctl is-active hermes.service",
+    "systemctl is-enabled hermes.service",
+    "systemctl list-units",
+    "systemctl list-jobs",
+    "systemctl get-default",
+])
+def test_systemctl_inspection_is_read_only(command):
+    assert is_coding_intent("terminal", {"command": command}, "Check service state") is False
+
+
+@pytest.mark.parametrize("command", [
+    # systemctl mutation subcommands must fail closed
+    "systemctl start hermes.service",
+    "systemctl stop hermes.service",
+    "systemctl restart hermes.service",
+    "systemctl reload hermes.service",
+    "systemctl enable hermes.service",
+    "systemctl disable hermes.service",
+    "systemctl kill hermes.service",
+    "systemctl daemon-reload",
+    "systemctl set-property hermes.service MemoryMax=1G",
+    "systemctl mask hermes.service",
+    "systemctl unmask hermes.service",
+    "systemctl edit hermes.service",
+])
+def test_systemctl_mutations_fail_closed(command):
+    assert is_coding_intent("terminal", {"command": command}, "Manage services") is True
+
+
+def test_markdown_doc_write_is_not_coding_intent(tmp_path):
+    # .md documentation edits are governance/content work, not code.
+    assert is_coding_intent(
+        "write_file", {"path": str(tmp_path / "notes.md"), "content": "# Notes"},
+        "Update the notes",
+    ) is False
+    assert is_coding_intent(
+        "write_file", {"path": "/home/solo/notes.md", "content": "# Notes"},
+        "Update the notes",
+    ) is False
+
+
+def test_markdown_doc_write_with_code_intent_still_gates(tmp_path):
+    # A .md write whose request explicitly describes code work stays gated.
+    assert is_coding_intent(
+        "write_file", {"path": str(tmp_path / "notes.md"), "content": "# Notes"},
+        "Implement the parser and write the change",
+    ) is True
+
+
+def test_mutating_shell_probes_are_coding_intent():
+    assert is_coding_intent("terminal", {"command": "find . -delete"}, "Inspect the tree") is True
+    assert is_coding_intent("terminal", {"command": "git remote add origin https://example.com"}, "Inspect remotes") is True
+
+
+def test_report_write_and_read_only_codex_turn_do_not_create_intake_task(tmp_path):
+    assert is_coding_intent(
+        "write_file", {"path": str(tmp_path / "report.md"), "content": "Findings"},
+        "Write the audit report",
+    ) is False
+    assert is_coding_intent("codex_app_server", {}, "Inspect the repository and report findings") is False
+
+
+def test_active_non_dev_worker_can_still_inspect(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "not-a-real-task")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "run-1")
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal", {"command": "date"}, session_id="worker", user_message="Inspect time",
+    ))
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("delegate_task", {"task_name": "ship_feature"}),
+        ("execute_code", {"code": "from hermes_tools import write_file as wf\nwf('/tmp/x.py', 'x')"}),
+        ("write_file", {"path": "/tmp/x.py", "content": "print(1)"}),
+    ],
+)
+def test_mutation_aliases_fail_closed_before_task_association(monkeypatch, tmp_path, name, args):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    assert is_coding_intent(name, args, "Inspect this request") is True
+
+
+def test_specialist_owned_active_worker_can_change_code(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, "forge")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Forge task", assignee="forge", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "FORGE", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+        conn.execute("UPDATE tasks SET current_run_id = 7 WHERE id = ?", (task_id,))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    assert _payload(registry.dispatch("patch", {}, session_id="worker", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
+
+
+def test_canonical_session_association_unlocks_scoped_coding(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
+    from hermes_cli import kanban_db
+    from hermes_state import SessionDB
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Session task", assignee="dev", session_id="chat-associated",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "chat-associated", "message_id": "m"},
+                "repository": str(tmp_path), "workspace": str(tmp_path),
+            },
+        )
+    db = SessionDB()
+    try:
+        db.create_session("chat-associated", "cli", model_config={"kanban_task_id": task_id})
+    finally:
+        db.close()
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    assert _payload(registry.dispatch("patch", {}, session_id="chat-associated", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "message"),
+    [
+        ("patch", {"path": "/unrelated/other-repo/file.py"}, "Implement the fix"),
+        ("write_file", {"path": "/unrelated/other-repo/x.py", "content": "print(1)"}, "Write the module"),
+        ("terminal", {"command": "cd /unrelated && make build", "workdir": "/unrelated"}, "Build the other repo"),
+        ("terminal", {"command": "git -C /unrelated status && git -C /unrelated commit -m x"}, "Commit in other repo"),
+        ("execute_code", {"code": "from hermes_tools import write_file\nwrite_file('/unrelated/x.py', 'x')", "workdir": "/unrelated"}, "Run the script"),
+        ("delegate_task", {"goal": "Implement", "workspace": "/unrelated/other-repo"}, "Implement it"),
+    ],
+)
+def test_associated_session_cannot_unlock_unrelated_targets(monkeypatch, tmp_path, name, args, message):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
+    from hermes_cli import kanban_db
+    from hermes_state import SessionDB
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Session task", assignee="dev", session_id="chat-scoped",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "chat-scoped", "message_id": "m"},
+                "repository": str(tmp_path), "workspace": str(tmp_path),
+            },
+        )
+    db = SessionDB()
+    try:
+        db.create_session("chat-scoped", "cli", model_config={"kanban_task_id": task_id})
+    finally:
+        db.close()
+    calls: list[str] = []
+    registry = _registry(calls, name)
+    result = _payload(registry.dispatch(name, args, session_id="chat-scoped", user_message=message))
+
+    assert result["error_type"] == "kanban_task_scope_mismatch"
+    assert result["task_id"] == task_id
+    assert calls == []
+
+
+def _claim_review_lane_task(monkeypatch, tmp_path, *, assignee="orion", metadata=None, title="Review task") -> str:
+    """Create a task, move it into the review column, and claim it the way the
+    dispatcher does for a review worker (``claim_review_task``). Returns the
+    task id with ``HERMES_KANBAN_TASK`` / ``HERMES_KANBAN_RUN_ID`` set to the
+    claimed review run."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    _declare_profile(tmp_path, assignee)
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title=title, assignee=assignee, session_id="origin",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+            metadata=metadata,
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        claimed = kanban_db.claim_review_task(conn, task_id, ttl_seconds=30, claimer=assignee)
+        assert claimed is not None
+        run_id = claimed.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    return task_id
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "gh pr merge 123 --repo acme/repo",
+        "gh pr close 123 --repo acme/repo",
+        "gh pr review 123 --repo acme/repo --approve",
+        "git push origin main",
+        "git fetch origin",
+        "npm run deploy:mc",
+        "systemctl restart mission-control.service",
+        "systemctl is-active mission-control.service",
+    ],
+)
+def test_review_lane_worker_can_run_sdlc_terminal_mutations(monkeypatch, tmp_path, command):
+    _claim_review_lane_task(monkeypatch, tmp_path)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal", {"command": command}, session_id="review-worker", user_message="Execute the SDLC review step",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_review_lane_worker_can_run_terminal_via_review_title_without_metadata(monkeypatch, tmp_path):
+    _claim_review_lane_task(monkeypatch, tmp_path, title="Audit PR #99 authorization boundaries")
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal", {"command": "git status --short"}, session_id="review-worker", user_message="Inspect the PR",
+    ))
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_review_lane_worker_can_run_terminal_via_review_identity_metadata(monkeypatch, tmp_path):
+    _claim_review_lane_task(
+        monkeypatch, tmp_path,
+        metadata={"review_identity": "github-pr:acme/repo:123:deadbeef"},
+    )
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal", {"command": "gh pr merge 123 --repo acme/repo"}, session_id="review-worker",
+        user_message="Merge the reviewed PR",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_verification_capability_cannot_be_bypassed_by_review_lane_heuristic(monkeypatch, tmp_path):
+    _claim_review_lane_task(
+        monkeypatch,
+        tmp_path,
+        title="Review PR #99 authorization boundaries",
+        metadata={"canonical": True, "capability": "verification", "lane": "VERIFICATION"},
+    )
+    calls: list[str] = []
+    registry = _registry(calls, "write_file")
+
+    result = _payload(registry.dispatch(
+        "write_file",
+        {"path": str(tmp_path / "changed.py"), "content": "print(1)"},
+        session_id="review-worker",
+        user_message="Inspect the PR",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert "verification workers are read-only" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("patch", {"path": "/repo/file.py"}),
+        ("write_file", {"path": "/repo/file.py", "content": "print(1)"}),
+        ("execute_code", {"code": "from hermes_tools import write_file\nwrite_file('/repo/file.py', 'x')"}),
+    ],
+)
+def test_review_lane_worker_cannot_write_implementation_code(monkeypatch, tmp_path, name, args):
+    _claim_review_lane_task(monkeypatch, tmp_path)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+
+    result = _payload(registry.dispatch(
+        name, args, session_id="review-worker", user_message="Implement the change",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert "review-lane workers cannot write implementation code" in result["error"]
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["git status --short", "git diff --stat", "gh pr view 123 --repo acme/repo", "git log --oneline -5"],
+)
+def test_review_lane_worker_read_only_inspection_passes(monkeypatch, tmp_path, command):
+    _claim_review_lane_task(monkeypatch, tmp_path)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal", {"command": command}, session_id="review-worker", user_message="Inspect the repository",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+
+def test_review_lane_session_does_not_gain_review_privileges(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "orion")
+    from hermes_cli import kanban_db
+    from hermes_state import SessionDB
+
+    with kanban_db.connect_closing() as conn:
+        task_id = kanban_db.create_task(
+            conn, title="Review task", assignee="orion", session_id="chat-review",
+            workspace_kind="dir", workspace_path=str(tmp_path),
+        )
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (task_id,))
+        claimed = kanban_db.claim_review_task(conn, task_id, ttl_seconds=30, claimer="orion")
+        assert claimed is not None
+    db = SessionDB()
+    try:
+        db.create_session("chat-review", "cli", model_config={"kanban_task_id": task_id})
+    finally:
+        db.close()
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    result = _payload(registry.dispatch(
+        "patch", {}, session_id="chat-review", user_message="Implement",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Run-card regression coverage (PR #31 / #33 fixed false positives)
+#
+# The chat-to-DEV gate must never mint a wrapper "Run: ..." card for
+# read-only diagnostics or for `hermes kanban` board operations.  Each test
+# below exercises the FULL gate path through the registry (not just
+# is_coding_intent) and asserts the kanban DB card count stays at zero.
+# ---------------------------------------------------------------------------
+
+
+def _task_rows(conn) -> list:
+    return conn.execute("SELECT id, title, status FROM tasks ORDER BY created_at").fetchall()
+
+
+def _run_card_titles(conn) -> list:
+    return [row[1] for row in conn.execute(
+        "SELECT id, title FROM tasks WHERE title LIKE 'Run:%' ORDER BY created_at"
+    ).fetchall()]
+
+
+def _completed_task_ids(conn) -> set:
+    return {row[0] for row in conn.execute(
+        "SELECT id FROM tasks WHERE status = 'done'"
+    ).fetchall()}
+
+
+@pytest.mark.parametrize(
+    ("name", "args", "message"),
+    [
+        # (1) `cd /tmp && file /etc/hostname` is read-only and creates no card.
+        ("terminal", {"command": "cd /tmp && file /etc/hostname"}, "Inspect the hostname file"),
+        # (2) `hermes kanban complete <existing-id>` is board governance, not
+        # coding: it must complete the target card and create no new card.
+        ("terminal", {"command": "hermes kanban complete t_2e59ceaa"}, "Complete the board card"),
+        # (3) `hermes kanban create 'probe'` is board governance: it must
+        # create only the requested probe card and no wrapper Run card.
+        ("terminal", {"command": "hermes kanban create 'probe'"}, "Create a probe card"),
+        # (4) execute_code importing subprocess and running a read-only
+        # journalctl/grep command creates no card.
+        (
+            "execute_code",
+            {"code": "import subprocess\nsubprocess.run(['journalctl', '-u', 'hermes'], capture_output=True)"},
+            "Inspect the journal",
+        ),
+        (
+            "execute_code",
+            {"code": "import subprocess\nsubprocess.run(['grep', 'needle', '/tmp/log.txt'])"},
+            "Grep the log",
+        ),
+    ],
+)
+def test_read_only_diagnostics_do_not_create_cards(monkeypatch, tmp_path, name, args, message):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, name)
+
+    result = _payload(registry.dispatch(
+        name, args, session_id="chat-regression", user_message=message,
+    ))
+
+    # The call is allowed through (no refusal, no handoff) and no card is
+    # minted by the gate.
+    assert result == {"ok": True}
+    assert calls == [name]
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_hermes_kanban_complete_does_not_create_new_card(monkeypatch, tmp_path):
+    """Regression: completing an existing card via the CLI must not mint a
+    wrapper Run: card from the gate path (PR #31)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _declare_profile(tmp_path, "dev")
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        target = kanban_db.create_task(conn, title="Target card", assignee="dev", session_id="origin")
+        kanban_db.complete_task(conn, target, result="done")
+
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": f"hermes kanban complete {target}"},
+        session_id="chat-complete",
+        user_message="Complete the board card",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    with kanban_db.connect_closing() as conn:
+        assert _completed_task_ids(conn) == {target}
+        # The only card that exists is the pre-existing target; no wrapper.
+        rows = _task_rows(conn)
+        assert len(rows) == 1
+        assert rows[0][0] == target
+        assert _run_card_titles(conn) == []
+
+
+def test_hermes_kanban_create_probe_creates_only_requested_card(monkeypatch, tmp_path):
+    """Regression: `hermes kanban create 'probe'` from a chat must create
+    exactly the one requested card and no wrapper Run card (PR #31)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": "hermes kanban create 'probe'"},
+        session_id="chat-create",
+        user_message="Create a probe card",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    # The gate itself never creates a card for a board-op terminal command.
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_execute_code_write_via_subprocess_still_creates_card(monkeypatch, tmp_path):
+    """Control: execute_code that runs a WRITE command via subprocess must
+    still create a handoff card (the gate only stops read-only diagnostics)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "execute_code")
+
+    result = _payload(registry.dispatch(
+        "execute_code",
+        {"code": "import subprocess\nsubprocess.run(['touch', 'x'])"},
+        session_id="chat-write",
+        user_message="Run the script",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert calls == []
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        rows = _task_rows(conn)
+        assert len(rows) == 1
+        assert rows[0][0] == result["task_id"]
+        # The handoff card is a real implementation card, never a Run: wrapper.
+        assert _run_card_titles(conn) == []
+
+
+# ---------------------------------------------------------------------------
+# Kill-switch coverage: KANBAN_CODING_GATE=disabled / kanban.coding_gate.enabled=false
+# turns off the chat/cron intake path (no card mint, no read-only scoping)
+# while the worker path and the unset default stay unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_kill_switch_env_disabled_allows_chat_terminal_without_card(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("KANBAN_CODING_GATE", "disabled")
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": "touch src/new_feature.py && git add -A"},
+        session_id="chat-killswitch",
+        user_message="Implement the new feature",
+    ))
+
+    # Tool call is ALLOWED with no interception and no read-only scoping.
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_kill_switch_env_case_insensitive_and_falsey_values(monkeypatch, tmp_path):
+    for value in ("DISABLED", "False", "0", "off", "no"):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        monkeypatch.setenv("KANBAN_CODING_GATE", value)
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        calls: list[str] = []
+        registry = _registry(calls, "patch")
+        result = _payload(registry.dispatch(
+            "patch", {"scope": "Implement the parser feature"},
+            session_id=f"chat-{value}", user_message="Please implement the parser feature",
+        ))
+        assert result == {"ok": True}, f"KANBAN_CODING_GATE={value!r} should disable the gate"
+        assert calls == ["patch"]
+
+
+def test_kill_switch_config_disabled_allows_chat_tool_without_card(monkeypatch, tmp_path):
+    (tmp_path / ".hermes").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".hermes" / "config.yaml").write_text(
+        "kanban:\n  coding_gate:\n    enabled: false\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("KANBAN_CODING_GATE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "terminal")
+
+    result = _payload(registry.dispatch(
+        "terminal",
+        {"command": "touch src/new_feature.py"},
+        session_id="chat-killswitch-config",
+        user_message="Implement the new feature",
+    ))
+
+    assert result == {"ok": True}
+    assert calls == ["terminal"]
+
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        assert _task_rows(conn) == []
+        assert _run_card_titles(conn) == []
+
+
+def test_kill_switch_worker_path_unaffected(monkeypatch, tmp_path):
+    """Kill-switch disabled must NOT weaken the worker path (canonical DEV
+    worker still owns its task; non-canonical workers are still refused)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("KANBAN_CODING_GATE", "disabled")
+    _declare_profile(tmp_path, "dev")
+    _declare_profile(tmp_path, "worker")
+    from hermes_cli import kanban_db
+
+    with kanban_db.connect_closing() as conn:
+        own_id = kanban_db.create_task(
+            conn, title="worker task", assignee="dev", session_id="origin",
+            metadata={
+                "canonical": True, "lane": "DEV", "coding_agent": "codex",
+                "origin": {"session_id": "origin", "message_id": "m"},
+            },
+        )
+        other_id = kanban_db.create_task(
+            conn, title="other task", assignee="worker", session_id="origin",
+        )
+
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", own_id)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
+    with kanban_db.connect_closing() as conn:
+        conn.execute("UPDATE tasks SET current_run_id = 42 WHERE id = ?", (own_id,))
+    assert _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement")) == {"ok": True}
+    assert calls == ["patch"]
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", other_id)
+    denied = _payload(registry.dispatch("patch", {}, session_id="worker-session", user_message="Implement"))
+    assert denied["error_type"] == "kanban_task_required"
+    assert calls == ["patch"]
+
+
+def test_kill_switch_unset_preserves_existing_behavior(monkeypatch, tmp_path):
+    """Control: with the switch unset, the chat path still hands off coding
+    work to a canonical DEV card exactly as before."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.delenv("KANBAN_CODING_GATE", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    calls: list[str] = []
+    registry = _registry(calls, "patch")
+
+    result = _payload(registry.dispatch(
+        "patch", {"scope": "Implement the parser feature"},
+        session_id="chat-default", task_id="message-default",
+        user_message="Please implement the parser feature",
+    ))
+
+    assert result["error_type"] == "kanban_task_required"
+    assert result["task_id"].startswith("t_")
+    assert result["status"] == "ready"
+    assert result["assignee"] == "dev"
+    assert calls == []
+
+
+def _capability_task(assignee="orion", capability="verification", lane="VERIFICATION", **metadata):
+    return SimpleNamespace(
+        assignee=assignee,
+        status="ready",
+        metadata={"canonical": True, "capability": capability, "lane": lane, **metadata},
+    )
+
+
+def test_orion_verification_contract_allows_read_only_tools():
+    assert task_capability_preflight(_capability_task()) is None
+    assert _verification_tool_allowed("terminal", {"command": "git status --short"}) == (True, "")
+    assert _verification_tool_allowed("execute_code", {"code": "print(2 + 2)"}) == (True, "")
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "args"),
+    [
+        ("write_file", {"path": "src/x.py", "content": "x"}),
+        ("patch", {"path": "src/x.py"}),
+        ("terminal", {"command": "git commit -am change"}),
+        ("execute_code", {"code": "open('x', 'w').write('x')"}),
+    ],
+)
+def test_orion_verification_contract_denies_writes(tool_name, args):
+    allowed, reason = _verification_tool_allowed(tool_name, args)
+    assert allowed is False
+    assert reason
+
+
+@pytest.mark.parametrize(
+    ("task", "expected"),
+    [
+        (_capability_task(capability=None), "missing task capability"),
+        (_capability_task(capability="bogus"), "unsupported task capability"),
+        (_capability_task(assignee="dev", capability="verification"), "requires assignee orion"),
+    ],
+)
+def test_malformed_capability_metadata_is_rejected_before_spawn(task, expected):
+    reason = task_capability_preflight(task)
+    assert reason is not None
+    assert expected in reason
+
+
+def test_native_review_contract_remains_separate_from_verification():
+    assert task_capability_preflight(_capability_task(capability="review", lane="REVIEW")) is None
+    assert task_capability_preflight(_capability_task(assignee="dev", capability="implementation", lane="DEV")) is None

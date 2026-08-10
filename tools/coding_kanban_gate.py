@@ -1,0 +1,1250 @@
+"""Intent-aware handoff gate for coding work requested from chat.
+
+The gate deliberately lives below the model-facing dispatchers.  A model can
+inspect and reason in chat, but a code-changing operation is handed to the
+canonical DEV lane before its handler is allowed to run.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+from pathlib import Path
+from typing import Any, Optional
+
+
+CODING_TOOLS = frozenset({
+    "write_file",
+    "patch",
+    "terminal",
+    "execute_code",
+    "delegate_task",
+    "project_create",
+    "project_switch",
+    "codex_app_server",
+})
+CANONICAL_ASSIGNEE = "dev"
+IMPLEMENTATION_ASSIGNEES = frozenset({"dev", "forge", "quill", "chip"})
+VERIFICATION_ASSIGNEES = frozenset({"orion"})
+TASK_CAPABILITIES = frozenset({"implementation", "review", "verification"})
+SUPPORTED_CODING_AGENTS = frozenset({"codex", "cursor"})
+ACTIVE_TASK_STATUSES = frozenset({"todo", "ready", "running", "review"})
+
+_READ_ONLY_COMMANDS = frozenset({
+    "awk", "cat", "cut", "diff", "dirname", "du", "file", "find",
+    "git", "grep", "head", "jq", "ls", "pwd", "readlink", "rg", "sed",
+    "sort", "stat", "tail", "test", "tree", "uniq", "wc", "which",
+    "whoami", "python", "python3", "node", "ruby", "go", "cargo", "npm",
+    "date", "ps", "curl", "sqlite3", "gh", "journalctl", "systemctl",
+    "echo", "printf", "true", "false", "env", "id", "hostname", "uname",
+    "realpath", "clear", "tput", "basename",
+    "hermes",
+    "[", "[[",
+})
+_GIT_READ_ONLY = frozenset({
+    "branch", "diff", "log", "ls-files", "remote", "rev-parse", "show",
+    "status", "tag",
+    "worktree", "fetch", "cherry", "merge-base", "rev-list", "cat-file",
+    "for-each-ref", "show-ref", "count-objects", "ls-remote", "describe",
+    "blame",
+})
+# systemctl subcommands that only inspect units/state.  Everything that
+# mutates units (start/stop/restart/reload/enable/disable/kill/reset-failed/
+# daemon-reload/set-property/mask/unmask/edit) stays fail-closed.
+_SYSTEMCTL_READ_ONLY = frozenset({
+    "show", "status", "is-active", "is-enabled", "is-failed", "is-system-running",
+    "list-units", "list-unit-files", "list-jobs", "list-timers", "list-sockets",
+    "list-machines", "get-default", "cat", "help",
+})
+_WRITE_MARKERS = re.compile(
+    r"(?:^|[^<])(?:>>?|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
+    r"\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|"
+    r"\binstall\b|\btruncate\b|\btruncate\b)",
+    re.IGNORECASE,
+)
+# Redirections that only move bytes around scratch space or duplicate an fd
+# do not write repository files.  Stripped before the write-marker check so
+# `hermes kanban list --json > /tmp/out.json 2>/dev/null` stays read-only.
+_SCRATCH_REDIRECT_RE = re.compile(
+    r"(?:[0-9]?>>?|&>)\s*(?:/tmp|/var/tmp|/dev/null)\S*|"
+    r"[0-9]?>>?\s*&\d+",
+)
+# For `hermes kanban <op>` board ops, only real redirection/write operators
+# (>, >>, &>, tee, sed/perl -i, install, truncate) write repository files.
+# Mutating command words (rm/mv/cp/mkdir/touch/...) can legitimately appear
+# as kanban CLI arguments (`hermes kanban boards rm dev2`) and are NOT writes.
+_HERMES_KANBAN_WRITE_RE = re.compile(
+    r"(?:^|[^<])(?:>>?|&>)\s*\S+|\btee\b|"
+    r"\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
+    r"\binstall\b|\btruncate\b",
+    re.IGNORECASE,
+)
+# Content inside quotes is data, not shell syntax: `echo 'a > b'` writes
+# nothing even though it contains a `>` character.  Mask quoted regions
+# before the write-marker scan; heredoc bodies (`<<EOF ... EOF`) are stdin
+# input, not writes, and are handled separately by the marker's `>`/`tee`
+# alternatives when combined with an actual file target.
+_QUOTED_REGION_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+# Shell control keywords are structural, not actions: `for`, `do`, `done`,
+# `if`, `then`, `fi`, etc.  A fragment that is only control structure (from
+# quote-aware `_command_parts` splitting) must not fail read-only probes.
+_SHELL_CONTROL_RE = re.compile(
+    r"^(?:do|done|then|fi|else|elif|while|until|case|esac|in|if)\b\s*", re.I,
+)
+_SHELL_FOR_HEADER_RE = re.compile(r"^for\s+\S+\s+in\b", re.I)
+# Interpreter (python/node/ruby) probes fail closed only on actual write or
+# execute patterns, not on read-only words like `open`/`run`/`call`.
+_INTERPRETER_WRITE_RE = re.compile(
+    r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
+    r"\.write(?:File|FileSync|_text|_bytes)?\s*\(|"
+    r"\b(?:os|Path|shutil)\.(?:unlink|remove|rename|replace|mkdir|rmdir|"
+    r"rmtree|copytree|copy|move|system|popen)\s*\(|"
+    r"\b(?:unlink|mkdir|rmdir|rmtree)\s*\(|"
+    r"\b(?:subprocess|check_call|check_output)\b)",
+    re.I,
+)
+_CODING_AGENT_RE = re.compile(r"\b(codex|cursor|claude)(?:\s+(?:code|cli|agent))?\b", re.I)
+_CODING_INTENT_RE = re.compile(
+    r"\b(?:implement|modify|edit|write|add|remove|delete|fix|refactor|patch|"
+    r"change|create|build|develop|code|commit|branch|worktree|checkout|launch|ship)\b",
+    re.I,
+)
+_RESEARCH_RE = re.compile(r"\b(?:explain|research|inspect|査|review|analy[sz]e|look\s+up)\b", re.I)
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _has_coding_intent(value: Any) -> bool:
+    text = _text(value)
+    normalized = re.sub(r"[^A-Za-z0-9]+", " ", text)
+    return bool(_CODING_INTENT_RE.search(text) or _CODING_INTENT_RE.search(normalized))
+
+
+def _first_line(value: str, fallback: str) -> str:
+    line = next((line.strip() for line in value.splitlines() if line.strip()), "")
+    return (line or fallback)[:240]
+
+
+def _command_parts(command: str) -> list[str]:
+    """Split a shell command enough to classify each simple command.
+
+    Quote-aware: separators (&&, ||, |, ;) only split OUTSIDE single/double
+    quotes, so a semicolon inside a quoted argument (e.g. a multi-statement
+    sqlite3 query string) is not mistaken for a command separator. A bare
+    fragment from such a split would fail read-only classification and spawn
+    a junk DEV task.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        # Outside quotes: a separator ends the current simple command.
+        # A lone `&` stays a separator (background command), EXCEPT when it is
+        # part of an fd-dup redirect (`2>&1`, `>&2`, `<&3`): splitting there
+        # would produce `2>` + `1` fragments that trip the write-marker check.
+        if ch in "&|;":
+            if ch == "&" and i + 1 < n and command[i + 1] == "&":
+                i += 2
+            elif ch == "|" and i + 1 < n and command[i + 1] == "|":
+                i += 2
+            elif ch == "&" and (
+                (buf and buf[-1] in "><") or (i + 1 < n and command[i + 1] in "><")
+            ):
+                buf.append(ch)
+                i += 1
+                continue
+            else:
+                i += 1
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
+
+
+def _simple_command_is_read_only(command: str) -> bool:
+    command = command.strip()
+    if not command:
+        return False
+    # Shell control fragments (`for id in ...`, `do`, `done`, `if`, `then`,
+    # `fi`) are structural, not actions.  A loop header binds variables only;
+    # the body (split out by _command_parts) is what gets classified.
+    if _SHELL_FOR_HEADER_RE.match(command):
+        return True
+    stripped_control = _SHELL_CONTROL_RE.sub("", command)
+    if not stripped_control:
+        return True
+    command = stripped_control
+    # Scratch-space and fd-dup redirections are not repository writes.  Quote
+    # contents are data (`echo 'a > b'` writes nothing) so mask them first;
+    # heredoc bodies (`<<EOF`) are stdin, and only a real file target (`>` or
+    # `tee`) after the marker check gates.
+    write_scan = _QUOTED_REGION_RE.sub(" ", _SCRATCH_REDIRECT_RE.sub("", command))
+    if not command:
+        return False
+    # `hermes kanban <op>` board ops never write repository files, so the
+    # generic write-marker scan (which flags mutating command words such as
+    # `rm` even when they are kanban CLI arguments) would misfire.  Only real
+    # redirection/write operators gate a kanban board op.
+    if re.match(r"^\s*hermes\s+kanban\b", command, re.I):
+        if _HERMES_KANBAN_WRITE_RE.search(write_scan):
+            return False
+    elif _WRITE_MARKERS.search(write_scan):
+        return False
+    if re.search(r"\b(?:codex|cursor|claude|aider|copilot|gh\s+pr\s+(?:checkout|create))\b", command, re.I):
+        return False
+    try:
+        words = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return False
+    if not words:
+        return True
+    # Environment assignments (`VAR=...`), `export VAR=...`, and `env`
+    # prefixes are wrappers; only the wrapped command matters. `env` is
+    # stripped along with its option tokens (`-i`, `-u NAME`, `--unset=...`,
+    # `VAR=...`) before classifying the wrapped command; a bare `env` with
+    # no wrapped command is read-only (it just prints the environment).
+    while words:
+        w0 = words[0]
+        if "=" in w0 and not w0.startswith("="):
+            words.pop(0)
+            continue
+        if w0.lower() == "export" and len(words) > 1 and "=" in words[1] and not words[1].startswith("="):
+            words.pop(0)
+            continue
+        if w0.lower() == "env":
+            i = 1
+            while i < len(words):
+                w = words[i]
+                if w in ("-i", "-0"):
+                    i += 1
+                elif w in ("-u", "--unset") and i + 1 < len(words):
+                    i += 2
+                elif w.startswith("--unset="):
+                    i += 1
+                elif "=" in w and not w.startswith("="):
+                    i += 1
+                else:
+                    break
+            rest = words[i:]
+            if not rest:
+                return True
+            return _simple_command_is_read_only(" ".join(rest))
+        if w0.lower() in ("cd", "pushd", "popd"):
+            # Directory-change prefixes are wrappers, not actions: `cd /tmp
+            # && file x` changes the working directory but writes nothing.
+            # Strip the command word plus its single operand (the target
+            # directory for cd/pushd; popd takes none), along with the
+            # POSIX directory flags (-L/-P/-e for cd, -n for pushd/popd).
+            # An empty remainder is read-only.
+            i = 1
+            flags = {"-n"} if w0.lower() in ("pushd", "popd") else {"-L", "-P", "-e"}
+            while i < len(words) and words[i] in flags:
+                i += 1
+            if w0.lower() != "popd" and i < len(words):
+                i += 1  # single directory operand
+            rest = words[i:]
+            if not rest:
+                return True
+            return _simple_command_is_read_only(" ".join(rest))
+        break
+    if not words:
+        return True
+    base = Path(words[0]).name.lower()
+    if base not in _READ_ONLY_COMMANDS:
+        return False
+    if base == "curl":
+        # curl is read-only only for inspection probes. Output flags that
+        # write to a real file path (-o/--output/--output-dir) are allowed
+        # ONLY when the destination is scratch (/dev/null, /tmp, /var/tmp, or
+        # the system temp dir); repo paths and implicit-CWD writes
+        # (-O/--remote-name/--remote-header-name/--remote-name-all) fail
+        # closed, as do request-body/mutation flags (-d/--data*, -F/--form,
+        # -T/--upload-file, -X/--request).
+        _CURL_SCRATCH_PREFIXES = ("/dev/null", "/tmp", "/var/tmp")
+        _CURL_IMPLICIT_WRITE = {
+            "remote-name", "remote-name-all", "remote-header-name",
+        }
+        _CURL_MUTATING = {
+            "data", "data-raw", "data-binary", "data-urlencode", "data-ascii",
+            "form", "upload-file", "request",
+        }
+
+        def _scratch_target(value: str) -> bool:
+            value = value.strip()
+            if not value:
+                return False
+            if value == "/dev/null":
+                return True
+            for prefix in _CURL_SCRATCH_PREFIXES:
+                if value == prefix or value.startswith(prefix + "/"):
+                    return True
+            tmpdir = os.environ.get("TMPDIR") or "/tmp"
+            try:
+                return Path(value).expanduser().resolve().is_relative_to(
+                    Path(tmpdir).expanduser().resolve()
+                )
+            except OSError:
+                return False
+
+        i = 1
+        scratch_output_dir = False
+        # curl applies --output-dir regardless of argument order, so resolve
+        # it first: a scratch --output-dir makes a bare-filename -o/--output
+        # destination scratch too (curl applies --output-dir to -o unless the
+        # name already contains a path).
+        for w in words[1:]:
+            if w == "--output-dir":
+                idx = words.index(w)
+                if idx + 1 < len(words):
+                    scratch_output_dir = _scratch_target(words[idx + 1])
+            elif w.startswith("--output-dir="):
+                scratch_output_dir = _scratch_target(w.split("=", 1)[1])
+        while i < len(words):
+            word = words[i]
+            if word.startswith("--"):
+                name, _, inline = word[2:].partition("=")
+                name = name.lower()
+                if name in _CURL_MUTATING:
+                    return False
+                if name in _CURL_IMPLICIT_WRITE:
+                    return False
+                if name in {"output", "output-dir"}:
+                    # --output PATH (or --output=PATH); --output-dir DIR.
+                    dest = inline
+                    if not dest and i + 1 < len(words):
+                        dest = words[i + 1]
+                        i += 1
+                    if not _scratch_target(dest) and not (
+                        scratch_output_dir
+                        and "/" not in dest
+                        and not dest.startswith("~")
+                    ):
+                        return False
+                i += 1
+            elif word.startswith("-") and len(word) > 1:
+                # Combined short flags (e.g. -sfo).  Any mutating letter
+                # (-d data, -F form, -T upload, -X request, -O implicit
+                # remote-name write) fails closed.  -o takes the next word as
+                # its destination and is allowed only for scratch paths; -f
+                # (--fail) and -I (--head) remain safe.
+                for ch in word[1:]:
+                    if ch in "dFTX":
+                        return False
+                    if ch == "O":
+                        return False
+                if "o" in word[1:]:
+                    dest = ""
+                    if i + 1 < len(words) and not words[i + 1].startswith("-"):
+                        dest = words[i + 1]
+                        i += 1
+                    if not _scratch_target(dest) and not (
+                        scratch_output_dir
+                        and "/" not in dest
+                        and not dest.startswith("~")
+                    ):
+                        return False
+                i += 1
+            else:
+                i += 1
+    if base == "git":
+        try:
+            subcommand = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if subcommand not in _GIT_READ_ONLY:
+            return False
+        if subcommand == "remote":
+            # `git remote` is read-only only for inspection.  `add`, `remove`,
+            # and `set-*` mutate repository configuration before any worker
+            # could be authorized.
+            remote_args = [word for word in words[2:] if not word.startswith("-")]
+            if remote_args and words[2] not in {"show", "get-url"}:
+                return False
+        if subcommand == "branch":
+            # `git branch --show-current`, `-a`, and `--list` inspect; a
+            # positional branch name creates a branch.
+            if any(not word.startswith("-") for word in words[2:]):
+                return False
+        if subcommand == "tag" and any(not word.startswith("-") for word in words[2:]):
+            return False
+        if subcommand == "worktree":
+            # Only `git worktree list` is read-only; add/remove/move/repair
+            # mutate the repo and must fail closed.
+            wt_args = [word for word in words[2:] if not word.startswith("-")]
+            if wt_args != ["list"]:
+                return False
+    if base in {"python", "python3", "node", "ruby", "go", "cargo", "npm"}:
+        # Package/build commands mutate caches or the workspace.  Inline
+        # calculations and version/help probes remain available.
+        lowered = command.lower()
+        if base in {"npm", "cargo", "go"} and not re.search(r"\b(?:--version|version|help)\b", lowered):
+            return False
+        # Read probes (`json.load(open('/tmp/x.json'))`, sqlite3 SELECTs) are
+        # read-only; fail closed only on actual write/execute calls.
+        if _INTERPRETER_WRITE_RE.search(command):
+            return False
+    if base == "gh":
+        # Keep status/view/list probes available, but never permit a mutating
+        # GitHub subcommand to slip through the read-only classification.
+        try:
+            gh_subcommand = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if gh_subcommand not in {"auth", "pr", "run", "repo", "issue"}:
+            return False
+        if any(word in {"create", "close", "merge", "edit", "delete", "checkout", "comment", "rerun"} for word in words[1:]):
+            return False
+    if base == "systemctl":
+        # systemctl is read-only only for inspection subcommands.  A missing
+        # or mutating subcommand (start/stop/restart/reload/enable/disable/
+        # kill/reset-failed/daemon-reload/set-property/mask/unmask/edit)
+        # fails closed before task association.
+        try:
+            sysctl_sub = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if sysctl_sub not in _SYSTEMCTL_READ_ONLY:
+            return False
+    if base == "hermes":
+        # Read-only Hermes CLI probes must not create gate-junk DEV cards.
+        # `hermes kanban <anything>` is board governance, not coding — board
+        # ops (complete/archive/create/update/heal/unblock/dispatch/gc/boards
+        # /repair/...) never write repository files. Other hermes subcommands
+        # keep their read-only subcommand allowlists; mutating ones fail closed.
+        _HERMES_READ_ONLY = {
+            "webhook": {"list"},
+            "gateway": {"status", "doctor", "version", "health", "info"},
+            "config": {"get", "list", "show"},
+            "cron": {"list"},
+            "session": {"list", "show", "search"},
+            "version": set(),
+            "doctor": set(),
+            "help": set(),
+            "skills": {"list"},
+        }
+        try:
+            hermes_cmd = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if hermes_cmd == "kanban":
+            # Every kanban subcommand is a board op. Board ops never write
+            # repository files, so none of them is coding intent.
+            return True
+        allowed = _HERMES_READ_ONLY.get(hermes_cmd)
+        if allowed is None:
+            return False
+        if not allowed:
+            return True
+        try:
+            hermes_sub = next(word for word in words[2:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if hermes_sub not in allowed:
+            return False
+    return True
+
+
+def _write_file_is_coding(args: dict, user_message: Any) -> bool:
+    """Permit ordinary report/artifact authoring outside the repository.
+
+    ``write_file`` is also the file tool used for reports and research notes.
+    Those must not be forced through the coding lane merely because the tool
+    can write.  Repository files, or a request explicitly describing code
+    work, remain coding operations.
+    """
+    path = _text(args.get("path") or args.get("file_path"))
+    message = _text(user_message)
+    suffix = Path(path).suffix.lower() if path else ""
+    # Documentation (.md) writes are governance/content work, not code.
+    # Exempt markdown from the coding-lane classification regardless of
+    # location (repo or not) unless the request explicitly describes code
+    # work.  All code extensions stay gated.
+    _CODE_EXTENSIONS = {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".rb", ".sh"}
+    is_markdown_doc = suffix == ".md"
+    report_request = bool(re.search(r"\b(?:report|audit|research|findings|notes?)\b", message, re.I))
+    if (_has_coding_intent(message) or (suffix in _CODE_EXTENSIONS and not is_markdown_doc)) and not report_request:
+        return True
+    if not path:
+        return True
+    try:
+        candidate = Path(path).expanduser().resolve()
+        repo = Path(_repository(_workspace(args), args)).resolve()
+        if candidate == repo or repo in candidate.parents:
+            # Markdown documentation inside a repository is exempt only when
+            # the request is not explicitly code work.
+            if is_markdown_doc and not _has_coding_intent(message):
+                return False
+            return True
+        if report_request:
+            return False
+    except OSError:
+        return True
+    return False
+
+
+_EXECUTE_CODE_MUTATION_RE = re.compile(
+    r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
+    r"\.write(?:_text|_bytes)?\s*\(|"
+    r"\b(?:os|Path|pathlib|shutil)\.(?:unlink|remove|rename|replace|mkdir|rmdir|rmtree|copytree|copy|move)\s*\(|"
+    r"\b(?:unlink|mkdir|rmdir|rmtree)\s*\()",
+    re.I,
+)
+
+
+def _execute_code_is_read_only(code: str) -> bool:
+    code = _text(code)
+    if not code:
+        return True
+    # Direct file mutations always fail closed, independent of how they are
+    # wrapped: open() write modes, .write*(), os/Path/pathlib/shutil
+    # mutation calls, and bare unlink/mkdir/rmdir/rmtree calls.
+    if _EXECUTE_CODE_MUTATION_RE.search(code):
+        return False
+    try:
+        import ast
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError):
+        return False
+    return _execute_code_wrappers_read_only(tree)
+
+
+def _execute_code_wrappers_read_only(tree) -> bool:
+    """Classify subprocess/os/hermes_tools wrapper calls by the wrapped command.
+
+    Aliases are resolved from ``import`` / ``from ... import`` statements
+    (e.g. ``import subprocess as sp``, ``from subprocess import run``,
+    ``from hermes_tools import terminal as t``, ``import os``). A bare
+    unaliased ``terminal``/``write_file``/``patch`` call is the tool itself,
+    and ``import hermes_tools [as X]`` + ``X.terminal(...)`` is the tool.
+    ``write_file``/``patch`` calls always fail closed. Other wrappers are
+    classified by the wrapped command with the existing shell classifier
+    (all ``_command_parts`` must be read-only); a wrapper call with a
+    non-literal/dynamic argument fails closed, and ``import *`` from a
+    wrapper module fails closed because the imported names are unknowable.
+    """
+    import ast
+
+    subprocess_modules = {"subprocess"}
+    subprocess_call_names = {"run", "call", "check_call", "check_output", "Popen"}
+    os_modules = {"os"}
+    os_call_names = {"system", "popen"}
+    hermes_tools_modules = set()
+    # name -> canonical tool: write_file / patch / terminal
+    tool_names: dict[str, str] = {
+        "write_file": "write_file",
+        "patch": "patch",
+        "terminal": "terminal",
+    }
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for item in node.names:
+                name = item.name
+                leaf = name.rsplit(".", 1)[-1]
+                alias = item.asname or leaf
+                if name == "subprocess":
+                    subprocess_modules.add(alias)
+                elif name == "os":
+                    os_modules.add(alias)
+                elif name == "hermes_tools":
+                    hermes_tools_modules.add(alias)
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            for item in node.names:
+                if item.name == "*":
+                    # Names from a star import are unknowable; fail closed so
+                    # `from hermes_tools import *` cannot smuggle tools past
+                    # the classifier.
+                    if module in {"hermes_tools", "subprocess", "os"}:
+                        return False
+                    continue
+                alias = item.asname or item.name
+                if module == "subprocess":
+                    subprocess_call_names.add(alias)
+                elif module == "os":
+                    os_call_names.add(alias)
+                elif module == "hermes_tools" and item.name in tool_names:
+                    tool_names[alias] = item.name
+
+    def _first_arg_command(call) -> Optional[str]:
+        """Return the wrapped command when the first argument is a string
+        literal or a list/tuple of string literals; ``None`` when dynamic."""
+        if not call.args:
+            return None
+        arg = call.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        if isinstance(arg, (ast.List, ast.Tuple)):
+            parts: list[str] = []
+            for elt in arg.elts:
+                if not (isinstance(elt, ast.Constant) and isinstance(elt.value, str)):
+                    return None
+                parts.append(elt.value)
+            if not parts:
+                return None
+            return " ".join(parts)
+        return None
+
+    def _classify_command(command: Optional[str]) -> bool:
+        if command is None:
+            return False
+        return all(_simple_command_is_read_only(part) for part in _command_parts(command))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        mutating = False
+        if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+            owner = func.value.id
+            attr = func.attr
+            if owner in subprocess_modules:
+                if attr not in subprocess_call_names:
+                    continue
+                mutating = not _classify_command(_first_arg_command(node))
+            elif owner in os_modules:
+                if attr not in os_call_names:
+                    continue
+                mutating = not _classify_command(_first_arg_command(node))
+            elif owner in hermes_tools_modules:
+                if attr in ("write_file", "patch"):
+                    mutating = True
+                elif attr == "terminal":
+                    mutating = not _classify_command(_first_arg_command(node))
+        elif isinstance(func, ast.Name):
+            name = func.id
+            if name in tool_names:
+                canonical = tool_names[name]
+                if canonical in ("write_file", "patch"):
+                    mutating = True
+                else:
+                    mutating = not _classify_command(_first_arg_command(node))
+            elif name in subprocess_call_names:
+                mutating = not _classify_command(_first_arg_command(node))
+            elif name in os_call_names:
+                mutating = not _classify_command(_first_arg_command(node))
+        if mutating:
+            return False
+    return True
+
+
+def is_coding_intent(tool_name: str, args: Optional[dict] = None, user_message: Any = None) -> bool:
+    """Return whether this call could start implementation work."""
+    args = args if isinstance(args, dict) else {}
+    if tool_name == "codex_app_server":
+        return bool(_has_coding_intent(user_message) and not (
+            _RESEARCH_RE.search(_text(user_message))
+            and not _has_coding_intent(_text(user_message))
+        ))
+    if tool_name == "write_file":
+        return _write_file_is_coding(args, user_message)
+    if tool_name == "patch":
+        return True
+    if tool_name == "terminal":
+        command = _text(args.get("command"))
+        return not command or not all(_simple_command_is_read_only(part) for part in _command_parts(command))
+    if tool_name == "execute_code":
+        return not _execute_code_is_read_only(_text(args.get("code")))
+    if tool_name == "delegate_task":
+        goals: list[str] = []
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                for child in value.values():
+                    collect(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    collect(child)
+            elif value:
+                goals.append(_text(value))
+        collect(args)
+        text = "\n".join(item for item in goals if item)
+        # A review/research request is read-only unless it also asks for a
+        # change.  This keeps documentation/research delegation available.
+        return bool(_has_coding_intent(text) and not (
+            _RESEARCH_RE.search(text) and not _has_coding_intent(text)
+        ))
+    if tool_name in {"project_create", "project_switch"}:
+        return bool(re.search(r"\b(?:branch|worktree|repository|repo|codebase|implementation)\b", _text(user_message), re.I))
+    return False
+
+
+def _requested_coding_agent(args: dict, user_message: Any) -> tuple[str, Optional[str]]:
+    explicit = _text(args.get("coding_agent") or args.get("agent"))
+    source = "\n".join(
+        item for item in (
+            explicit,
+            _text(user_message),
+            _text(args.get("command")),
+            _text(args.get("goal")),
+            _text(args.get("context")),
+        ) if item
+    )
+    matches = _CODING_AGENT_RE.findall(source)
+    if explicit:
+        requested = explicit.casefold()
+    elif matches:
+        requested = matches[-1].casefold()
+    else:
+        requested = "codex"
+    if requested == "claude":
+        return requested, "Claude is not an allowed coding worker; use Codex or explicitly request Cursor."
+    if requested not in SUPPORTED_CODING_AGENTS:
+        return requested, f"Unsupported coding agent {requested!r}; use Codex or Cursor."
+    return requested, None
+
+
+def _workspace(args: dict) -> str:
+    raw = _text(args.get("workspace") or args.get("workdir") or os.environ.get("TERMINAL_CWD"))
+    if not raw:
+        raw = os.getcwd()
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except OSError:
+        return raw
+
+
+def _repository(workspace: str, args: dict) -> str:
+    explicit = _text(args.get("repository") or args.get("repo"))
+    if explicit:
+        return explicit
+    try:
+        result = subprocess.run(
+            ["git", "-C", workspace, "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=2, check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return str(Path(result.stdout.strip()).resolve())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return workspace
+
+
+def _metadata(*, agent: str, session_id: str, message_id: str, scope: str, repository: str, workspace: str, acceptance: list[str]) -> dict:
+    return {
+        "canonical": True,
+        "lane": "DEV",
+        "capability": "implementation",
+        "coding_agent": agent,
+        "origin": {"session_id": session_id, "message_id": message_id},
+        "scope": scope,
+        "repository": repository,
+        "workspace": workspace,
+        "acceptance_criteria": acceptance,
+    }
+
+
+def _refusal(*, error: str, tool_name: str, **fields: Any) -> str:
+    payload = {"error": error, "error_type": "kanban_task_required", "tool": tool_name}
+    payload.update(fields)
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _worker_refusal(tool_name: str, task_id: str, reason: str) -> str:
+    return _refusal(
+        error=f"Kanban worker {task_id!r} cannot use {tool_name}: {reason}",
+        tool_name=tool_name,
+        task_id=task_id,
+    )
+
+
+def task_capability_preflight(task) -> Optional[str]:
+    """Validate the task capability/lane contract before worker spawn."""
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    assignee = _text(getattr(task, "assignee", "")).lower()
+    capability_key = next(
+        (key for key in ("capability", "task_capability") if key in metadata),
+        None,
+    )
+    capability = _text(metadata.get(capability_key)).lower() if capability_key else ""
+    lane = _text(metadata.get("lane")).lower()
+    if getattr(task, "status", None) not in ACTIVE_TASK_STATUSES:
+        return f"task status is {getattr(task, 'status', None)!r}"
+    # Tasks created before capability routing was introduced intentionally have
+    # no capability key. Keep those legacy cards dispatchable; only validate the
+    # contract when a caller explicitly supplied capability metadata.
+    if capability_key is None:
+        return None
+    if not capability:
+        return "missing task capability metadata; capability must name implementation, review, or verification"
+    if capability and capability not in TASK_CAPABILITIES:
+        return f"unsupported task capability {capability!r}; expected one of {sorted(TASK_CAPABILITIES)}"
+    if capability == "implementation":
+        if assignee not in IMPLEMENTATION_ASSIGNEES:
+            return "implementation capability requires assignee dev, forge, quill, or chip"
+        expected_lane = "dev" if assignee == "dev" else assignee
+        if metadata.get("canonical") is not True or lane not in {expected_lane, "engineering"}:
+            return "implementation capability requires canonical DEV/ENGINEERING lane metadata"
+    elif capability == "verification":
+        if assignee not in VERIFICATION_ASSIGNEES:
+            return "verification capability requires assignee orion"
+        if metadata.get("canonical") is not True or lane != "verification":
+            return "verification capability requires canonical VERIFICATION lane metadata"
+    elif capability == "review" and assignee != "orion":
+        return "review capability requires assignee orion"
+    return None
+
+
+def _verification_tool_allowed(tool_name: str, function_args: dict) -> tuple[bool, str]:
+    """Keep Orion verification strictly read-only at the tool boundary."""
+    if tool_name in {"write_file", "patch", "delegate_task", "codex_app_server", "project_create", "project_switch"}:
+        return False, "verification workers are read-only and cannot write or start coding work"
+    if tool_name == "terminal":
+        command = _text(function_args.get("command"))
+        if command and not all(_simple_command_is_read_only(part) for part in _command_parts(command)):
+            return False, "verification terminal commands must be read-only"
+    if tool_name == "execute_code":
+        code = _text(function_args.get("code") or function_args.get("command"))
+        masked = _QUOTED_REGION_RE.sub(" ", code)
+        if _INTERPRETER_WRITE_RE.search(code) or _WRITE_MARKERS.search(masked):
+            return False, "verification execute_code must be read-only"
+    return True, ""
+
+
+def _task_is_review_lane(task) -> bool:
+    """Return whether this task was claimed into the SDLC review lane.
+
+    Review-lane cards are claimed by reviewer profiles (e.g. ``orion``) via
+    ``claim_review_task`` after the implementer submitted the card for review.
+    The lane is detected from the claim history (a ``claimed`` event whose
+    payload records ``source_status: "review"``) or from explicit review
+    identity on the card (``review_identity`` metadata or a ``review_submitted``
+    event).  A later plain ``claimed`` event (a changes-requested requeue back
+    to the implementation lane) ends the review lane.
+    """
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    if _text(metadata.get("review_identity")):
+        return True
+    # Auto-decomposed GitHub review cards may arrive without native review
+    # metadata. Their durable title/assignee still identifies the review lane;
+    # otherwise the coding gate rejects the reviewer before it can inspect the
+    # PR and the card becomes a capability-block loop.
+    title = _text(getattr(task, "title", "")).lower()
+    body = _text(getattr(task, "body", "")).lower()
+    if task.assignee == "orion" and re.search(
+        r"\b(?:review|audit|inspect|evaluate)\b.*\bpr\s*#?\d+",
+        f"{title} {body}",
+    ):
+        return True
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect()
+        try:
+            events = kanban_db.list_events(conn, task.id)
+        finally:
+            conn.close()
+    except Exception:
+        return False
+    # Newest-first: the most recent claim decides the lane.  A claim from
+    # status=review marks a reviewer-owned run; a plain ready->running claim
+    # after a review (changes requested) returns the card to the
+    # implementation lane.
+    for event in reversed(events):
+        if event.kind == "claimed":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            return payload.get("source_status") == "review"
+        if event.kind == "review_submitted":
+            return True
+    return False
+
+
+def _canonical_worker_task(task_id: str, *, tool_name: Optional[str] = None):
+    from hermes_cli import kanban_db
+
+    conn = kanban_db.connect()
+    try:
+        task = kanban_db.get_task(conn, task_id)
+    finally:
+        conn.close()
+    if task is None:
+        return None, "task does not exist"
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    run_id = _text(os.environ.get("HERMES_KANBAN_RUN_ID"))
+    if not run_id or task.current_run_id is None or str(task.current_run_id) != run_id:
+        return task, "worker is not the active dispatcher run for this task"
+    capability = _text(metadata.get("capability") or metadata.get("task_capability")).lower()
+    if capability == "verification":
+        reason = task_capability_preflight(task)
+        if reason:
+            return task, reason
+        allowed, reason = _verification_tool_allowed(tool_name or "", {})
+        if not allowed:
+            return task, reason
+        return task, None
+    if tool_name is not None and _task_is_review_lane(task):
+        # Review-lane workers are reviewers (e.g. ``orion``), not
+        # implementation profiles.  They need the terminal mutations the SDLC
+        # review requires (``gh pr merge``/``close``/``review``, ``git push``/
+        # ``fetch``, deploy scripts, service checks) but must not write
+        # implementation code.  The session path (``tool_name`` is None) never
+        # inherits review-lane privileges.
+        if tool_name in {"write_file", "patch", "execute_code"}:
+            return task, "review-lane workers cannot write implementation code"
+        if tool_name in {"delegate_task", "codex_app_server", "project_create", "project_switch"}:
+            return task, "review-lane workers cannot start coding work"
+        return task, None
+    capability_reason = task_capability_preflight(task)
+    if capability_reason:
+        return task, capability_reason
+    if task.assignee not in IMPLEMENTATION_ASSIGNEES:
+        return task, "task is not assigned to a validated implementation profile"
+    if task.status not in ACTIVE_TASK_STATUSES:
+        return task, f"task status is {task.status!r}"
+    expected_lane = "DEV" if task.assignee == "dev" else task.assignee.upper()
+    if metadata.get("canonical") is not True or metadata.get("lane") not in {expected_lane, "ENGINEERING"}:
+        return task, "task lacks canonical implementation metadata"
+    if metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS:
+        return task, "task has no supported coding-agent metadata"
+    return task, None
+
+
+def _canonical_worker_task_for_session(task_id: str, session_id: str):
+    task, reason = _canonical_worker_task(task_id)
+    if reason:
+        # Session-associated chat calls do not have a dispatcher run, so the
+        # worker-only run check is not applicable. Revalidate the task's
+        # canonical ownership and active status without weakening those checks.
+        try:
+            from hermes_cli import kanban_db
+            conn = kanban_db.connect()
+            try:
+                task = kanban_db.get_task(conn, task_id)
+            finally:
+                conn.close()
+        except Exception:
+            return None, "Kanban is unavailable"
+        if task is None:
+            return None, "task does not exist"
+        metadata = task.metadata if isinstance(task.metadata, dict) else {}
+        if (
+            task.assignee not in IMPLEMENTATION_ASSIGNEES
+            or task.status not in ACTIVE_TASK_STATUSES
+            or metadata.get("canonical") is not True
+            or metadata.get("coding_agent") not in SUPPORTED_CODING_AGENTS
+            or metadata.get("origin", {}).get("session_id") != session_id
+        ):
+            return task, "session is not associated with a canonical active implementation task"
+        return task, None
+    return task, None
+
+
+def _session_task_id(session_id: str) -> Optional[str]:
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            row = db.get_session(session_id)
+        finally:
+            db.close()
+        config = row.get("model_config") if row else None
+        if isinstance(config, str):
+            config = json.loads(config)
+        return _text(config.get("kanban_task_id")) or None if isinstance(config, dict) else None
+    except Exception:
+        return None
+
+
+def _call_is_scoped_to_task(tool_name: str, args: dict, task) -> tuple[bool, str]:
+    """Return ``(ok, reason)`` whether this call's explicit targets stay
+    inside the associated task's recorded repository/workspace.
+
+    The session-association allow path must not unlock coding calls that
+    target unrelated repositories, workspaces, or paths.  Every explicit
+    target the call names is compared against the task metadata recorded at
+    intake; a mismatch keeps the call gated instead of silently allowing it.
+    """
+    metadata = task.metadata if isinstance(task.metadata, dict) else {}
+    task_repo = _text(metadata.get("repository"))
+    task_ws = _text(metadata.get("workspace")) or _text(getattr(task, "workspace_path", None))
+    bases = [p for p in (task_repo, task_ws) if p]
+    if not bases:
+        return True, "task has no recorded scope"
+
+    def inside(path: str) -> bool:
+        try:
+            candidate = Path(path).expanduser().resolve()
+        except OSError:
+            return False
+        for base in bases:
+            try:
+                base_path = Path(base).expanduser().resolve()
+            except OSError:
+                continue
+            if candidate == base_path or base_path in candidate.parents:
+                return True
+        return False
+
+    if tool_name in {"write_file", "patch"}:
+        path = _text(args.get("path") or args.get("file_path"))
+        if path and not inside(path):
+            return False, f"target path {path!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name == "terminal":
+        workdir = _text(args.get("workdir") or args.get("cwd") or os.environ.get("TERMINAL_CWD"))
+        if workdir and not inside(workdir):
+            return False, f"workdir {workdir!r} is outside the task repository/workspace"
+        # A command that explicitly cd's or targets an absolute path outside
+        # the task workspace must fail closed even without a workdir arg.
+        command = _text(args.get("command"))
+        if command:
+            for part in _command_parts(command):
+                for match in re.finditer(r"\b(?:cd|pushd|git\s+-C)\s+['\"]?([^ '\"]+)", part):
+                    target = match.group(1)
+                    if target.startswith("/") and not inside(target):
+                        return False, f"command target {target!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name == "execute_code":
+        workdir = _text(args.get("workdir") or args.get("cwd"))
+        if workdir and not inside(workdir):
+            return False, f"workdir {workdir!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name == "delegate_task":
+        ws = _text(args.get("workspace") or args.get("workdir"))
+        repo = _text(args.get("repository") or args.get("repo"))
+        if ws and not inside(ws):
+            return False, f"workspace {ws!r} is outside the task repository/workspace"
+        if repo and not inside(repo):
+            return False, f"repository {repo!r} is outside the task repository/workspace"
+        return True, ""
+
+    if tool_name in {"project_create", "project_switch", "codex_app_server"}:
+        return True, ""
+    return True, ""
+
+
+def _persist_session_task_id(session_id: str, task_id: str) -> None:
+    if not session_id or not task_id:
+        return
+    try:
+        from hermes_state import SessionDB
+        db = SessionDB()
+        try:
+            row = db.get_session(session_id) or {}
+            config = row.get("model_config")
+            if isinstance(config, str):
+                config = json.loads(config)
+            if not isinstance(config, dict):
+                config = {}
+            config["kanban_task_id"] = task_id
+            db.update_session_meta(session_id, json.dumps(config, ensure_ascii=False))
+        finally:
+            db.close()
+    except Exception:
+        return
+
+
+def _coding_gate_enabled() -> bool:
+    """Return whether the chat-path coding intake gate is enabled.
+
+    Kill-switch: ``KANBAN_CODING_GATE=disabled`` (env, case-insensitive) or
+    config ``kanban.coding_gate.enabled: false`` disables the gate for
+    chat/cron sessions — coding-intent tool calls are allowed through with
+    no interception and no card minting. The worker path (``HERMES_KANBAN_TASK``
+    set) never consults this switch. Defaults to enabled when unset.
+    """
+    env_value = os.environ.get("KANBAN_CODING_GATE", "").strip().lower()
+    if env_value:
+        return env_value not in {"disabled", "false", "0", "off", "no"}
+    try:
+        from hermes_cli.config import cfg_get, load_config_readonly
+
+        cfg = load_config_readonly()
+        return bool(cfg_get(cfg, "kanban", "coding_gate", "enabled", default=True))
+    except Exception:
+        return True
+
+
+def coding_tool_gate_refusal(
+    tool_name: str,
+    *,
+    function_args: Optional[dict] = None,
+    session_id: Optional[str] = None,
+    task_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    user_message: Any = None,
+) -> Optional[str]:
+    """Return a refusal/handoff payload, or ``None`` when the call may run."""
+    if tool_name not in CODING_TOOLS:
+        return None
+    args = function_args if isinstance(function_args, dict) else {}
+    worker_id = _text(os.environ.get("HERMES_KANBAN_TASK"))
+    if worker_id:
+        try:
+            task, reason = _canonical_worker_task(worker_id, tool_name=tool_name)
+        except Exception:
+            return _worker_refusal(tool_name, worker_id, "Kanban is unavailable")
+        if not is_coding_intent(tool_name, args, user_message):
+            return None
+        if reason:
+            return _worker_refusal(tool_name, worker_id, reason)
+        worker_agent = _text(os.environ.get("HERMES_CODING_AGENT"))
+        if worker_agent and worker_agent.casefold() not in SUPPORTED_CODING_AGENTS:
+            return _worker_refusal(tool_name, worker_id, "the worker provider is not supported")
+        if task is not None and isinstance(task.metadata, dict) and _text(task.metadata.get("capability")).lower() == "verification":
+            allowed, reason = _verification_tool_allowed(tool_name, args)
+            if not allowed:
+                return _worker_refusal(tool_name, worker_id, reason)
+        return None
+
+    # Kill-switch: when the gate is disabled, do not intercept chat/cron
+    # coding calls at all — no card mint, no read-only scoping. The worker
+    # path above is never affected by this switch.
+    if not _coding_gate_enabled():
+        return None
+
+    normalized_session = _text(session_id)
+    if not normalized_session or not is_coding_intent(tool_name, args, user_message):
+        return None
+
+    associated_id = _session_task_id(normalized_session)
+    if associated_id:
+        associated_task, association_error = _canonical_worker_task_for_session(
+            associated_id, normalized_session
+        )
+        if associated_task is not None and association_error is None:
+            in_scope, scope_reason = _call_is_scoped_to_task(tool_name, args, associated_task)
+            if in_scope:
+                return None
+            return _refusal(
+                error=f"Coding call is outside the associated task's scope: {scope_reason}",
+                tool_name=tool_name,
+                error_type="kanban_task_scope_mismatch",
+                task_id=associated_id,
+            )
+
+    agent, agent_error = _requested_coding_agent(args, user_message)
+    if agent_error:
+        return _refusal(error=agent_error, tool_name=tool_name, error_type="unsupported_coding_agent")
+
+    workspace = _workspace(args)
+    repository = _repository(workspace, args)
+    scope = _text(args.get("scope") or args.get("goal") or args.get("context") or user_message)
+    if not scope:
+        # Tool-only call with no user message: title from the actual tool
+        # invocation so gate-created cards describe the real request.
+        tool_summary = _text(args.get("command") or args.get("path") or args.get("url"))
+        if tool_summary:
+            scope = "Run: " + tool_summary[:200]
+        else:
+            scope = "Implement the requested code change."
+    acceptance_value = args.get("acceptance_criteria")
+    if isinstance(acceptance_value, str):
+        acceptance = [acceptance_value.strip()] if acceptance_value.strip() else []
+    elif isinstance(acceptance_value, list):
+        acceptance = [_text(item) for item in acceptance_value if _text(item)]
+    else:
+        acceptance = []
+    if not acceptance:
+        acceptance = ["Implement the requested change in the recorded repository and workspace.", "Verify the change before completing the DEV task."]
+    message_id = _text(args.get("origin_message_id") or turn_id or task_id)
+    if not message_id:
+        message_id = hashlib.sha256(_text(user_message).encode("utf-8")).hexdigest()[:16]
+    metadata = _metadata(
+        agent=agent,
+        session_id=normalized_session,
+        message_id=message_id,
+        scope=scope,
+        repository=repository,
+        workspace=workspace,
+        acceptance=acceptance,
+    )
+    idempotency_payload = {
+        "session_id": normalized_session,
+        "message_id": message_id,
+        "scope": scope,
+        "repository": repository,
+        "workspace": workspace,
+        "coding_agent": agent,
+    }
+    idempotency_key = "chat-coding:" + hashlib.sha256(
+        json.dumps(idempotency_payload, sort_keys=True, ensure_ascii=False).encode("utf-8")
+    ).hexdigest()
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect()
+        try:
+            existing_id = None
+            for candidate in kanban_db.list_tasks(conn, session_id=normalized_session):
+                candidate_meta = candidate.metadata if isinstance(candidate.metadata, dict) else {}
+                if (
+                    candidate.assignee == CANONICAL_ASSIGNEE
+                    and candidate_meta.get("canonical") is True
+                    and candidate_meta.get("coding_agent") == agent
+                    and candidate_meta.get("origin") == metadata["origin"]
+                    and candidate_meta.get("repository") == repository
+                    and candidate_meta.get("workspace") == workspace
+                    and candidate.status in ACTIVE_TASK_STATUSES
+                ):
+                    existing_id = candidate.id
+                    break
+            created_id = existing_id or kanban_db.create_task(
+                conn,
+                title=f"{_first_line(scope, 'Implement requested change')}",
+                body="\n".join([scope, "", "Acceptance criteria:", *[f"- {item}" for item in acceptance]]),
+                assignee=CANONICAL_ASSIGNEE,
+                created_by="chat",
+                workspace_kind="dir",
+                workspace_path=workspace,
+                idempotency_key=idempotency_key,
+                session_id=normalized_session,
+                metadata=metadata,
+                initial_status="running",
+            )
+            task = kanban_db.get_task(conn, created_id)
+        finally:
+            conn.close()
+    except Exception:
+        return _refusal(
+            error="Kanban is unavailable; coding work is blocked until the DEV board can be reached.",
+            tool_name=tool_name,
+            error_type="kanban_unavailable",
+        )
+    if task is None or task.assignee not in IMPLEMENTATION_ASSIGNEES or not isinstance(task.metadata, dict):
+        return _refusal(
+            error="Kanban did not return a canonical DEV task; coding work is blocked.",
+            tool_name=tool_name,
+            error_type="kanban_task_invalid",
+        )
+    _persist_session_task_id(normalized_session, task.id)
+    return _refusal(
+        error="Coding work was handed off to the DEV Kanban worker. The originating chat remains read-only for this change.",
+        tool_name=tool_name,
+        task_id=task.id,
+        status=task.status,
+        assignee=task.assignee,
+        coding_agent=task.metadata.get("coding_agent"),
+        reused=existing_id is not None,
+    )

@@ -220,7 +220,10 @@ def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_
     assert completed_events[0][1] == "web_search"
 
 
-def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispatch():
+def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispatch(
+    monkeypatch,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     agent = _make_agent("write_file")
     original_args = {"path": "/original/path", "content": "old"}
     final_args = {"path": "/approved/path", "content": "new"}
@@ -273,6 +276,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
 
     with (
         patch("agent.relay_tools.execute", side_effect=relay_execute),
+        patch("tools.coding_kanban_gate.coding_tool_gate_refusal", return_value=None),
         patch(
             "hermes_cli.plugins.resolve_pre_tool_block",
             side_effect=observe_plugin,

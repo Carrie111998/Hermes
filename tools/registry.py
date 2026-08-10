@@ -18,6 +18,7 @@ import ast
 import importlib
 import json
 import logging
+
 import sys
 import threading
 import time
@@ -66,6 +67,7 @@ def _bound_json_error_result(result: str) -> str:
         return result
     payload["error"] = _bound_error_text(error)
     return json.dumps(payload, ensure_ascii=False)
+
 
 
 def _is_registry_register_call(node: ast.AST) -> bool:
@@ -810,6 +812,22 @@ class ToolRegistry:
         entry = self.get_entry(name)
         if not entry:
             return tool_error(f"Unknown tool: {name}")
+        # ACP edit calls have their own approval boundary and intentionally do
+        # not carry chat/session context. Chat and dispatcher calls do, so only
+        # those paths enter the coding intake gate here.
+        if kwargs.get("session_id") or kwargs.get("user_message") or kwargs.get("user_task"):
+            from tools.coding_kanban_gate import coding_tool_gate_refusal
+
+            refusal = coding_tool_gate_refusal(
+                name,
+                function_args=args,
+                session_id=kwargs.get("session_id"),
+                task_id=kwargs.get("task_id"),
+                turn_id=kwargs.get("turn_id"),
+                user_message=kwargs.get("user_message") or kwargs.get("user_task"),
+            )
+            if refusal is not None:
+                return refusal
         try:
             if entry.is_async:
                 from model_tools import _run_async
