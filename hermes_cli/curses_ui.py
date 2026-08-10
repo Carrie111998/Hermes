@@ -614,8 +614,16 @@ def _run_curses_menu(
                         result_holder[0] = outcome
                         return
 
-        curses.wrapper(_draw)
-        flush_stdin()
+        # Drain on EVERY exit path, not just the normal return. A
+        # KeyboardInterrupt or a curses error leaves exactly the same stray
+        # escape bytes in the OS input buffer, and the numbered fallback below
+        # calls input() as its very next statement. flush_stdin() no-ops on
+        # non-TTY stdin and swallows its own errors, so it cannot mask the
+        # exception that is unwinding.
+        try:
+            curses.wrapper(_draw)
+        finally:
+            flush_stdin()
         return result_holder[0] if result_holder[0] is not _KEEP else cancel_value
 
     except KeyboardInterrupt:
