@@ -1111,6 +1111,61 @@ class TestCallLlmPaymentFallback:
         # Fallback client should have been used
         assert fallback_client.chat.completions.create.called
 
+    def test_same_provider_only_does_not_call_secondary_provider(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.example.com/v1"
+        rate_err = self._make_429_rate_limit_error()
+        primary_client.chat.completions.create.side_effect = rate_err
+        fallback_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "active-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "active-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_payment_fallback",
+            return_value=(fallback_client, "paid-model", "paid-provider"),
+        ) as fallback:
+            with pytest.raises(Exception, match="Rate limit exceeded"):
+                call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hello"}],
+                    fallback_policy="same_provider_only",
+                )
+
+        fallback.assert_not_called()
+        fallback_client.chat.completions.create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_async_same_provider_only_does_not_call_secondary_provider(self):
+        primary_client = MagicMock()
+        primary_client.base_url = "https://api.example.com/v1"
+        rate_err = self._make_429_rate_limit_error()
+        primary_client.chat.completions.create = AsyncMock(side_effect=rate_err)
+        fallback_client = MagicMock()
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "active-model"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", "active-model", None, None, None),
+        ), patch(
+            "agent.auxiliary_client._try_payment_fallback",
+            return_value=(fallback_client, "paid-model", "paid-provider"),
+        ) as fallback:
+            with pytest.raises(Exception, match="Rate limit exceeded"):
+                await async_call_llm(
+                    task="session_search",
+                    messages=[{"role": "user", "content": "hello"}],
+                    fallback_policy="same_provider_only",
+                )
+
+        fallback.assert_not_called()
+        fallback_client.chat.completions.create.assert_not_called()
+
 # ---------------------------------------------------------------------------
 # Gate: _resolve_api_key_provider must skip anthropic when not configured
 # ---------------------------------------------------------------------------

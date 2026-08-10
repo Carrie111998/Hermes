@@ -68,6 +68,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Uni
 
 logger = logging.getLogger(__name__)
 
+_ALLOWED_FALLBACK_POLICIES = {"host", "same_provider_only"}
+
+
+def _validate_fallback_policy(value: str) -> str:
+    value = str(value or "host").strip().lower()
+    if value not in _ALLOWED_FALLBACK_POLICIES:
+        raise ValueError("fallback_policy must be 'host' or 'same_provider_only'")
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -631,6 +640,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        fallback_policy: str = "host",
     ) -> PluginLlmCompleteResult:
         """Run a host-owned chat completion against the user's active model.
 
@@ -641,6 +651,7 @@ class PluginLlm:
         ``plugins.entries.<id>.llm.allow_*_override`` (see module
         docstring).
         """
+        fallback_policy = _validate_fallback_policy(fallback_policy)
         policy = self._policy_loader(self._plugin_id)
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
@@ -657,6 +668,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            fallback_policy=fallback_policy,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -697,6 +709,7 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        fallback_policy: str = "host",
     ) -> PluginLlmStructuredResult:
         """Run a bounded host-owned structured completion.
 
@@ -710,6 +723,7 @@ class PluginLlm:
         isn't installed, JSON mode still works but schema enforcement is
         skipped with a debug log.
         """
+        fallback_policy = _validate_fallback_policy(fallback_policy)
         if not instructions or not instructions.strip():
             raise ValueError("complete_structured requires non-empty instructions")
         if not input:
@@ -743,6 +757,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            fallback_policy=fallback_policy,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -786,8 +801,10 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        fallback_policy: str = "host",
     ) -> PluginLlmCompleteResult:
         """Async sibling of :meth:`complete`."""
+        fallback_policy = _validate_fallback_policy(fallback_policy)
         policy = self._policy_loader(self._plugin_id)
         eff_provider, eff_model, eff_agent, eff_profile = _check_overrides(
             policy,
@@ -804,6 +821,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            fallback_policy=fallback_policy,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -837,8 +855,10 @@ class PluginLlm:
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        fallback_policy: str = "host",
     ) -> PluginLlmStructuredResult:
         """Async sibling of :meth:`complete_structured`."""
+        fallback_policy = _validate_fallback_policy(fallback_policy)
         if not instructions or not instructions.strip():
             raise ValueError("acomplete_structured requires non-empty instructions")
         if not input:
@@ -870,6 +890,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=extra_body,
+            fallback_policy=fallback_policy,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -927,10 +948,12 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        fallback_policy: str = "host",
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
         ``agent.auxiliary_client`` to avoid circular deps at plugin
         discovery time."""
+        fallback_policy = _validate_fallback_policy(fallback_policy)
         if self._sync_caller is not None:
             return self._sync_caller(
                 messages=messages,
@@ -941,6 +964,7 @@ class PluginLlm:
                 max_tokens=max_tokens,
                 timeout=timeout,
                 extra_body=extra_body,
+                fallback_policy=fallback_policy,
             )
         from agent.auxiliary_client import call_llm
         merged_extra = dict(extra_body or {})
@@ -955,6 +979,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            fallback_policy=fallback_policy,
         )
         provider, model = _resolve_attribution(
             provider_override=provider_override,
@@ -974,7 +999,9 @@ class PluginLlm:
         max_tokens: Optional[int],
         timeout: Optional[float],
         extra_body: Optional[Dict[str, Any]] = None,
+        fallback_policy: str = "host",
     ) -> tuple[str, str, Any]:
+        fallback_policy = _validate_fallback_policy(fallback_policy)
         if self._async_caller is not None:
             return await self._async_caller(
                 messages=messages,
@@ -985,6 +1012,7 @@ class PluginLlm:
                 max_tokens=max_tokens,
                 timeout=timeout,
                 extra_body=extra_body,
+                fallback_policy=fallback_policy,
             )
         from agent.auxiliary_client import async_call_llm
         merged_extra = dict(extra_body or {})
@@ -999,6 +1027,7 @@ class PluginLlm:
             max_tokens=max_tokens,
             timeout=timeout,
             extra_body=merged_extra or None,
+            fallback_policy=fallback_policy,
         )
         provider, model = _resolve_attribution(
             provider_override=provider_override,

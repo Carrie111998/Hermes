@@ -4248,6 +4248,7 @@ def call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    fallback_policy: str = "host",
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -4273,6 +4274,11 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    fallback_policy = str(fallback_policy or "host").strip().lower()
+    if fallback_policy not in {"host", "same_provider_only"}:
+        raise ValueError("fallback_policy must be 'host' or 'same_provider_only'")
+    same_provider_only = fallback_policy == "same_provider_only"
+
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
@@ -4287,6 +4293,10 @@ def call_llm(
             async_mode=False,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
+            if same_provider_only:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}"
+                )
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -4531,6 +4541,8 @@ def call_llm(
         # auto (the default) = best-effort fallback chain.  (#7559)
         is_auto = resolved_provider in {"auto", "", None}
         if should_fallback and is_auto:
+            if same_provider_only:
+                raise first_err
             if _is_payment_error(first_err):
                 reason = "payment error"
                 # Resolve the actual provider label (resolved_provider may be
@@ -4640,11 +4652,17 @@ async def async_call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    fallback_policy: str = "host",
 ) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    fallback_policy = str(fallback_policy or "host").strip().lower()
+    if fallback_policy not in {"host", "same_provider_only"}:
+        raise ValueError("fallback_policy must be 'host' or 'same_provider_only'")
+    same_provider_only = fallback_policy == "same_provider_only"
+
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
@@ -4659,6 +4677,10 @@ async def async_call_llm(
             async_mode=True,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
+            if same_provider_only:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}"
+                )
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -4860,6 +4882,8 @@ async def async_call_llm(
         )
         is_auto = resolved_provider in {"auto", "", None}
         if should_fallback and is_auto:
+            if same_provider_only:
+                raise first_err
             if _is_payment_error(first_err):
                 reason = "payment error"
                 _mark_provider_unhealthy(
