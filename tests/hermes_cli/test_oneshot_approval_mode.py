@@ -22,7 +22,11 @@ def _write_config(home: Path, content: str | None | object) -> None:
 
 
 def _invoke_oneshot_sinks(
-    monkeypatch, tmp_path: Path, config: str | None | object
+    monkeypatch,
+    tmp_path: Path,
+    config: str | None | object,
+    *,
+    suppress_user_config: str | None = None,
 ) -> dict:
     """Run the public one-shot entry point and both real execution sinks."""
     home = tmp_path / "hermes-home"
@@ -37,6 +41,10 @@ def _invoke_oneshot_sinks(
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+    monkeypatch.delenv("HERMES_IGNORE_USER_CONFIG", raising=False)
+    monkeypatch.delenv("HERMES_SAFE_MODE", raising=False)
+    if suppress_user_config is not None:
+        monkeypatch.setenv(suppress_user_config, "1")
 
     # Reproduce the plugin-import ordering concern: approval freezes inherited
     # YOLO before the one-shot invocation resolves its own policy.
@@ -118,6 +126,28 @@ def test_oneshot_invocation_allows_both_sinks_for_exact_true(monkeypatch, tmp_pa
     assert "one-shot mode" not in observed["execute_code"].get("error", "")
 
 
+@pytest.mark.parametrize(
+    "suppress_user_config",
+    ["HERMES_IGNORE_USER_CONFIG", "HERMES_SAFE_MODE"],
+    ids=["ignore-user-config", "safe-mode"],
+)
+def test_oneshot_invocation_suppresses_opt_in_with_user_config_disabled(
+    monkeypatch, tmp_path, suppress_user_config
+):
+    observed = _invoke_oneshot_sinks(
+        monkeypatch,
+        tmp_path,
+        "approvals:\n  oneshot_yolo: true\n",
+        suppress_user_config=suppress_user_config,
+    )
+
+    assert observed["returncode"] == 0
+    assert observed["terminal"]["status"] == "blocked"
+    assert observed["execute_code"]["status"] == "error"
+    assert observed["terminal_target_exists"] is True
+    assert observed["execute_target_exists"] is False
+
+
 @pytest.mark.parametrize("termux", [False, True], ids=["normal", "termux"])
 def test_oneshot_policy_is_resolved_before_agent_startup(
     monkeypatch, tmp_path, termux
@@ -142,6 +172,47 @@ def test_oneshot_policy_is_resolved_before_agent_startup(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
     monkeypatch.setattr(sys, "argv", ["hermes", "-z", "hello"])
+
+    context_token = oneshot_policy._ONESHOT_YOLO_POLICY.set(None)
+    try:
+        with pytest.raises(SystemExit, match="0"):
+            main_mod.main()
+    finally:
+        oneshot_policy._ONESHOT_YOLO_POLICY.reset(context_token)
+
+    assert seen == [False]
+
+
+@pytest.mark.parametrize("termux", [False, True], ids=["normal", "termux"])
+@pytest.mark.parametrize(
+    "option",
+    ["--ignore-user-config", "--safe-mode"],
+    ids=["ignore-user-config", "safe-mode"],
+)
+def test_oneshot_startup_options_suppress_config_opt_in_before_discovery(
+    monkeypatch, tmp_path, termux, option
+):
+    import hermes_cli.main as main_mod
+    from hermes_cli import oneshot_policy
+
+    (tmp_path / "config.yaml").write_text(
+        "approvals:\n  oneshot_yolo: true\n", encoding="utf-8"
+    )
+    seen = []
+
+    def capture_startup(_args):
+        seen.append(oneshot_policy.current_oneshot_yolo_policy())
+
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", capture_startup)
+    monkeypatch.setattr(
+        main_mod,
+        "_run_and_exit_oneshot",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(SystemExit(0)),
+    )
+    monkeypatch.setattr(main_mod, "_is_termux_startup_environment", lambda: termux)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.setattr(sys, "argv", ["hermes", "-z", "hello", option])
 
     context_token = oneshot_policy._ONESHOT_YOLO_POLICY.set(None)
     try:

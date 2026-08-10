@@ -33,14 +33,19 @@ def configure_oneshot_approval_policy() -> OneShotPolicyToken | None:
         return None
 
     enabled = False
-    try:
-        from hermes_cli.config import read_user_config_raw
+    ignore_user_config = (
+        os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
+        or os.environ.get("HERMES_SAFE_MODE") == "1"
+    )
+    if not ignore_user_config:
+        try:
+            from hermes_cli.config import read_user_config_raw
 
-        approvals = (read_user_config_raw() or {}).get("approvals")
-        if isinstance(approvals, dict):
-            enabled = approvals.get("oneshot_yolo") is True
-    except Exception:
-        enabled = False
+            approvals = (read_user_config_raw() or {}).get("approvals")
+            if isinstance(approvals, dict):
+                enabled = approvals.get("oneshot_yolo") is True
+        except Exception:
+            enabled = False
 
     inherited_yolo = os.environ.get("HERMES_YOLO_MODE")
     if enabled:

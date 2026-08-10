@@ -10817,6 +10817,14 @@ def _configure_oneshot_policy_if_needed(args) -> None:
     """Resolve one-shot approval policy before any plugin/tool imports."""
     if not getattr(args, "oneshot", None):
         return
+    # These options suppress behavioral user configuration. Apply them before
+    # resolving the one-shot opt-in so a value from config.yaml cannot survive
+    # an invocation that explicitly asked not to trust that file. This must
+    # happen here (rather than only in cmd_chat) because plugin discovery below
+    # can import and freeze approval state first.
+    _apply_safe_mode(args)
+    if getattr(args, "ignore_user_config", False):
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
     from hermes_cli.oneshot_policy import configure_oneshot_approval_policy
 
     configure_oneshot_approval_policy()
