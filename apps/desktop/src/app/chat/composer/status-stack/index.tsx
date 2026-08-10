@@ -24,8 +24,8 @@ import {
   stopBackgroundProcess
 } from '@/store/composer-status'
 import { refreshSessionGoal } from '@/store/goals'
-import { dismissSubagent } from '@/store/subagents'
 import { $previewStatusBySession, dismissPreviewArtifact } from '@/store/preview-status'
+import { dismissSubagent } from '@/store/subagents'
 import { $threadScrolledUp } from '@/store/thread-scroll'
 import { openSessionInNewWindow } from '@/store/windows'
 
