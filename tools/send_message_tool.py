@@ -251,6 +251,9 @@ def send_message_tool(args, **kw):
     if action == "unreact":
         return _handle_react(args, remove=True)
 
+    if action == "edit":
+        return _handle_edit(args)
+
     return _handle_send(args)
 
 
@@ -527,6 +530,103 @@ def _handle_send(args):
         return json.dumps(_error(f"Send failed: {e}"))
 
 
+def _handle_edit(args):
+    """Edit a previously sent message on a platform target.
+
+    Mirrors ``_handle_send``'s target parsing/resolution exactly (explicit
+    chat_id:thread_id refs, human-friendly channel-name resolution, home
+    channel fallback) but routes through ``_edit_via_platform`` instead of
+    ``_send_to_platform``. There is no fallback to sending a new message —
+    a platform without an editor fails closed with a stable error.
+    """
+    target = args.get("target", "")
+    message = args.get("message", "")
+    message_id = str(args.get("message_id") or "").strip()
+    if not target or not message or not message_id:
+        return tool_error(
+            "'target', 'message_id' and 'message' are required when action='edit'"
+        )
+
+    parts = target.split(":", 1)
+    platform_name = parts[0].strip().lower()
+    target_ref = parts[1].strip() if len(parts) > 1 else None
+    chat_id = None
+    thread_id = None
+
+    if target_ref:
+        chat_id, thread_id, is_explicit = _parse_target_ref(platform_name, target_ref)
+    else:
+        is_explicit = False
+
+    # Resolve human-friendly channel names to numeric IDs, same as send.
+    if target_ref and not is_explicit:
+        try:
+            from gateway.channel_directory import resolve_channel_name
+            resolved = resolve_channel_name(platform_name, target_ref)
+            if resolved:
+                chat_id, thread_id, _ = _parse_target_ref(platform_name, resolved)
+            else:
+                return json.dumps({
+                    "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                    f"Use send_message(action='list') to see available targets."
+                })
+        except Exception:
+            return json.dumps({
+                "error": f"Could not resolve '{target_ref}' on {platform_name}. "
+                f"Try using a numeric channel ID instead."
+            })
+
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return tool_error("Interrupted")
+
+    try:
+        from gateway.config import load_gateway_config, Platform
+        config = load_gateway_config()
+    except Exception as e:
+        return json.dumps(_error(f"Failed to load gateway config: {e}"))
+
+    try:
+        platform = Platform(platform_name)
+    except (ValueError, KeyError):
+        return tool_error(f"Unknown platform: {platform_name}")
+
+    pconfig = config.platforms.get(platform)
+    if not pconfig or not pconfig.enabled:
+        return tool_error(
+            f"Platform '{platform_name}' is not configured. Set up credentials "
+            f"in ~/.hermes/config.yaml or environment variables."
+        )
+
+    if not chat_id:
+        home = config.get_home_channel(platform)
+        if home:
+            chat_id = home.chat_id
+        else:
+            home_env = _HOME_CHANNEL_ENV_OVERRIDES.get(
+                platform_name, f"{platform_name.upper()}_HOME_CHANNEL"
+            )
+            return json.dumps({
+                "error": f"No home channel set for {platform_name} to determine which "
+                f"message to edit. Either specify a channel directly with "
+                f"'{platform_name}:CHANNEL_NAME', or set a home channel via: "
+                f"hermes config set {home_env} <channel_id>"
+            })
+
+    try:
+        from model_tools import _run_async
+        result = _run_async(
+            _edit_via_platform(
+                platform, pconfig, chat_id, message_id, message, thread_id=thread_id,
+            )
+        )
+        if isinstance(result, dict) and "error" in result:
+            result["error"] = _sanitize_error_text(result["error"])
+        return json.dumps(result)
+    except Exception as e:
+        return json.dumps(_error(f"Edit failed: {e}"))
+
+
 def _parse_target_ref(platform_name: str, target_ref: str):
     """Parse a tool target into chat_id/thread_id and whether it is explicit."""
     if platform_name == "telegram":
@@ -776,6 +876,89 @@ async def _send_via_adapter(
             f"running with this platform connected? For out-of-process delivery "
             f"(e.g. cron in a separate process), the platform plugin must "
             f"register a standalone_sender_fn on its PlatformEntry."
+        )
+    }
+
+
+async def _edit_via_platform(platform, pconfig, chat_id, message_id, message, *, thread_id=None):
+    """Edit an existing message on a platform, generically across adapters.
+
+    Order of attempts, mirroring ``_send_via_adapter``:
+      1. Live in-process adapter's ``edit_message()`` (available whenever
+         this call runs inside a running gateway).
+      2. The plugin's ``standalone_editor_fn`` registered on its
+         ``PlatformEntry`` (used when the gateway is not in this process).
+      3. A descriptive, stable error.
+
+    Deliberately fails closed: unlike sending, there is no third "just do
+    something" fallback. A platform with no editor returns an error instead
+    of silently creating a brand-new message, which would be indistinguishable
+    from a successful in-place edit to a caller checking only 'success'.
+    """
+    platform_name = platform.value if hasattr(platform, "value") else str(platform)
+
+    runner = None
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        runner = None
+
+    if runner is not None:
+        try:
+            adapter = runner.adapters.get(platform)
+        except Exception:
+            adapter = None
+        if adapter is not None:
+            try:
+                result = await adapter.edit_message(
+                    chat_id, message_id, message, finalize=True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                return {"error": f"Edit failed: {e}"}
+            if result.success:
+                return {"success": True, "message_id": result.message_id or message_id}
+            return {"error": f"Adapter edit failed: {result.error}"}
+
+    entry = None
+    try:
+        from gateway.platform_registry import platform_registry
+        entry = platform_registry.get(platform_name)
+    except Exception:
+        entry = None
+
+    if entry is not None and entry.standalone_editor_fn is not None:
+        try:
+            result = await entry.standalone_editor_fn(
+                pconfig,
+                chat_id,
+                message_id,
+                message,
+                thread_id=thread_id,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.debug("Plugin standalone edit for %s raised", platform_name, exc_info=True)
+            return {"error": f"Plugin standalone edit failed: {e}"}
+
+        if isinstance(result, dict) and (result.get("success") or result.get("error")):
+            return result
+        return {
+            "error": (
+                f"Plugin standalone edit for '{platform_name}' returned an "
+                f"invalid result: expected a dict with 'success' or 'error' "
+                f"keys, got {type(result).__name__}"
+            )
+        }
+
+    return {
+        "error": (
+            f"No message editor available for platform '{platform_name}'. "
+            f"Neither a live adapter nor a standalone_editor_fn is registered — "
+            f"editing is not supported here."
         )
     }
 
