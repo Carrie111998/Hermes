@@ -220,6 +220,38 @@ def _list_registered_web_providers():
         return []
 
 
+def _backend_is_usable(backend: str) -> bool:
+    """Return whether ``backend`` has the credential it needs to run.
+
+    Mirrors the availability checks in ``_get_backend``'s candidate ladder
+    so the two cannot disagree about what "available" means. Backends with
+    no credential requirement (``ddgs``) and any backend not listed here
+    are treated as usable: an unknown plugin-registered provider should be
+    honoured, not second-guessed.
+    """
+    requirements = {
+        "tavily": lambda: _has_env("TAVILY_API_KEY"),
+        "exa": lambda: _has_env("EXA_API_KEY"),
+        "parallel": lambda: _has_env("PARALLEL_API_KEY"),
+        "firecrawl": lambda: (
+            _has_env("FIRECRAWL_API_KEY")
+            or _has_env("FIRECRAWL_API_URL")
+            or _is_tool_gateway_ready()
+        ),
+        "searxng": lambda: _has_env("SEARXNG_URL"),
+        "brave-free": lambda: _has_env("BRAVE_SEARCH_API_KEY"),
+        "ddgs": _ddgs_package_importable,
+    }
+    check = requirements.get(backend)
+    if check is None:
+        return True
+    try:
+        return bool(check())
+    except Exception as exc:  # noqa: BLE001 — availability probe, never fatal
+        logger.debug("web backend availability probe failed for %s: %s", backend, exc)
+        return True
+
+
 def _get_backend() -> str:
     """Determine which web backend to use (shared fallback).
 
@@ -229,7 +261,23 @@ def _get_backend() -> str:
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
     if configured in _LEGACY_WEB_BACKENDS or _registered_web_provider(configured) is not None:
-        return configured
+        # Honour the configured backend only when it can actually run. A
+        # backend whose credential is missing is registered and therefore
+        # selected here, but then fails every single call -- e.g.
+        # ``backend: brave-free`` with no BRAVE_SEARCH_API_KEY returned
+        # "BRAVE_SEARCH_API_KEY is not set" for every web_search, forever,
+        # while a working TAVILY_API_KEY sat unused because this early
+        # return skips the availability ladder below. Falling through on
+        # an unusable backend degrades to a provider that works instead of
+        # hard-failing.
+        if _backend_is_usable(configured):
+            return configured
+        logger.warning(
+            "Configured web backend %r is missing its credential; "
+            "falling back to the first available backend. Set the key or "
+            "change web.backend in config.yaml.",
+            configured,
+        )
 
     # Fallback for manual / legacy config — pick the highest-priority
     # available backend. Explicit user credentials (TAVILY_API_KEY etc.)

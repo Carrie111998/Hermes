@@ -947,8 +947,22 @@ NOUS_EXTRA_BODY = _nous_extra_body()
 # Set at resolve time — True if the auxiliary client points to Nous Portal
 auxiliary_is_nous: bool = False
 
-# Default auxiliary models per provider
-_OPENROUTER_MODEL = "google/gemini-3.6-flash"
+# Default auxiliary models per provider.
+# Sourced from DEFAULT_CONFIG so this constant and the shipped config
+# default cannot drift: they were separately hardcoded, so changing the
+# config default alone still left every fallback path (and any config-read
+# failure) on the old paid model.
+try:  # pragma: no cover — import guard only
+    from hermes_cli.config_defaults import DEFAULT_CONFIG as _DEFAULT_CONFIG
+
+    _OPENROUTER_MODEL = (
+        _DEFAULT_CONFIG["auxiliary"]["openrouter_model"]
+        or "nvidia/nemotron-3-ultra-550b-a55b:free"
+    )
+    _OPENROUTER_FREE_ONLY = bool(_DEFAULT_CONFIG["auxiliary"]["free_only"])
+except Exception:  # noqa: BLE001 — defaults must never break import
+    _OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    _OPENROUTER_FREE_ONLY = True
 _NOUS_MODEL = "google/gemini-3.6-flash"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
@@ -2444,19 +2458,23 @@ def _is_free_model(model: Optional[str]) -> bool:
 def _aux_openrouter_settings() -> Tuple[bool, str]:
     """Read free_only and openrouter_model from config in one pass.
 
-    Returns (free_only, model) — defaults (False, _OPENROUTER_MODEL) on any
-    config-read failure.
+    Returns (free_only, model) — defaults to the shipped config values
+    (_OPENROUTER_FREE_ONLY, _OPENROUTER_MODEL) on any config-read failure.
+    A hardcoded ``False`` here previously overrode the shipped default, so
+    a config that simply omitted the key engaged the paid lane.
     """
     try:
         from hermes_cli.config import cfg_get, load_config_readonly
 
         cfg = load_config_readonly()
-        free_only = bool(cfg_get(cfg, "auxiliary", "free_only", default=False))
+        free_only = bool(
+            cfg_get(cfg, "auxiliary", "free_only", default=_OPENROUTER_FREE_ONLY)
+        )
         val = cfg_get(cfg, "auxiliary", "openrouter_model")
         model = val.strip() if isinstance(val, str) and val.strip() else _OPENROUTER_MODEL
         return free_only, model
     except Exception:
-        return False, _OPENROUTER_MODEL
+        return _OPENROUTER_FREE_ONLY, _OPENROUTER_MODEL
 
 
 def _warn_paid_lane_once(model: str) -> None:

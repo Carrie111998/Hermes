@@ -157,8 +157,38 @@ class TestBackendSelection:
     def test_config_parallel(self):
         """web.backend=parallel in config → 'parallel' regardless of keys."""
         from tools.web_tools import _get_backend
-        with patch("tools.web_tools._load_web_config", return_value={"backend": "parallel"}):
+        with patch("tools.web_tools._load_web_config", return_value={"backend": "parallel"}), \
+             patch.dict(os.environ, {"PARALLEL_API_KEY": "test-key"}):
             assert _get_backend() == "parallel"
+
+    def test_config_backend_without_credential_falls_back(self):
+        """A configured backend missing its key must not hard-fail forever.
+
+        ``backend: brave-free`` with no BRAVE_SEARCH_API_KEY was selected
+        because the provider is *registered*, then returned
+        "BRAVE_SEARCH_API_KEY is not set" for every single web_search --
+        while a working TAVILY_API_KEY sat unused, because the configured
+        backend returned early and skipped the availability ladder.
+        """
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config",
+                   return_value={"backend": "brave-free"}), \
+             patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test"}):
+            assert _get_backend() == "tavily"
+
+    def test_config_backend_with_credential_still_wins(self):
+        """The fallback must not override a configured backend that works."""
+        from tools.web_tools import _get_backend
+        with patch("tools.web_tools._load_web_config",
+                   return_value={"backend": "brave-free"}), \
+             patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "brave-test",
+                                     "TAVILY_API_KEY": "tvly-test"}):
+            assert _get_backend() == "brave-free"
+
+    def test_unknown_configured_backend_is_honoured(self):
+        """A custom plugin backend has no known credential — don't guess."""
+        from tools.web_tools import _backend_is_usable
+        assert _backend_is_usable("some-custom-plugin") is True
 
 
     # ── Fallback (no web.backend in config) ───────────────────────────

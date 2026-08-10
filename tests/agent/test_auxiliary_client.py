@@ -994,10 +994,17 @@ class TestOpenRouterPaidLaneGuard:
     configurable and never silently engage a PAID model."""
 
     def test_free_only_skips_paid_default_model(self, monkeypatch):
-        """free_only=true + default (paid) model → OpenRouter skipped."""
+        """free_only=true + a paid model → OpenRouter skipped.
+
+        The paid model is named explicitly rather than relying on the
+        shipped default, which is now a ":free" SKU — leaving it implicit
+        would make this test silently stop exercising the guard.
+        """
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
-             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {"free_only": True}}), \
+             patch("hermes_cli.config.load_config_readonly",
+                   return_value={"auxiliary": {"free_only": True,
+                                               "openrouter_model": "google/gemini-3.6-flash"}}), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             client, model = _try_openrouter()
         assert client is None
@@ -1019,11 +1026,16 @@ class TestOpenRouterPaidLaneGuard:
         assert model == "nvidia/nemotron-3-ultra-550b-a55b:free"
 
     def test_configured_model_overrides_hardcoded_default(self, monkeypatch):
-        """auxiliary.openrouter_model replaces _OPENROUTER_MODEL."""
+        """auxiliary.openrouter_model replaces _OPENROUTER_MODEL.
+
+        ``free_only`` is disabled explicitly: the model under test is a paid
+        SKU, and the shipped default now restricts the lane to ":free".
+        """
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
              patch("hermes_cli.config.load_config_readonly",
-                   return_value={"auxiliary": {"openrouter_model": "some/vendor-model"}}), \
+                   return_value={"auxiliary": {"openrouter_model": "some/vendor-model",
+                                               "free_only": False}}), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_client = MagicMock(name="openrouter_client")
             mock_openai.return_value = mock_client
@@ -1043,30 +1055,37 @@ class TestOpenRouterPaidLaneGuard:
         mock_openai.assert_not_called()
 
     def test_paid_lane_warns_once(self, monkeypatch, caplog):
-        """Engaging the default paid model logs a WARNING (once per model)."""
+        """Engaging a paid model logs a WARNING (once per model).
+
+        Names the paid model and disables free_only explicitly: the shipped
+        default is now a ":free" SKU with free_only on, which would skip
+        the lane entirely and never reach the warning.
+        """
         import logging
         from agent.auxiliary_client import _paid_lane_warned
-        _paid_lane_warned.discard(_OPENROUTER_MODEL)
+        paid_model = "google/gemini-3.6-flash"
+        paid_cfg = {"auxiliary": {"openrouter_model": paid_model, "free_only": False}}
+        _paid_lane_warned.discard(paid_model)
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
         with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
-             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}), \
+             patch("hermes_cli.config.load_config_readonly", return_value=paid_cfg), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_client = MagicMock(name="openrouter_client")
             mock_openai.return_value = mock_client
             with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
                 client, model = _try_openrouter()
         assert client is mock_client
-        assert model == _OPENROUTER_MODEL
+        assert model == paid_model
         assert any("PAID lane engaged" in r.getMessage() for r in caplog.records)
         # Second call logs nothing new.
         with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)), \
-             patch("hermes_cli.config.load_config_readonly", return_value={"auxiliary": {}}), \
+             patch("hermes_cli.config.load_config_readonly", return_value=paid_cfg), \
              patch("agent.auxiliary_client.OpenAI") as mock_openai:
             caplog.clear()
             with caplog.at_level(logging.WARNING, logger="agent.auxiliary_client"):
                 _try_openrouter()
         assert not any("PAID lane engaged" in r.getMessage() for r in caplog.records)
-        _paid_lane_warned.discard(_OPENROUTER_MODEL)
+        _paid_lane_warned.discard(paid_model)
 
     def test_is_free_model(self):
         from agent.auxiliary_client import _is_free_model
