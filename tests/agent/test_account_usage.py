@@ -227,3 +227,65 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
 
     assert result.status == "unavailable"
     assert "hermes auth" in result.message
+
+
+@pytest.fixture
+def kimi_usage_payload():
+    return {
+        "user": {"userId": "u-1", "membership": {"level": "LEVEL_ADVANCED"}},
+        "usage": {
+            "limit": "100",
+            "used": "77",
+            "remaining": "23",
+            "resetTime": "2026-08-10T16:51:42.536576Z",
+        },
+        "limits": [
+            {
+                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {
+                    "limit": "100",
+                    "used": "7",
+                    "remaining": "93",
+                    "resetTime": "2026-08-10T02:51:42.536576Z",
+                },
+            }
+        ],
+        "parallel": {"limit": 30},
+        "authentication": {"method": "METHOD_API_KEY", "scope": "FEATURE_CODING"},
+    }
+
+
+def test_kimi_usage_maps_membership_windows_and_details(monkeypatch, kimi_usage_payload):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx,
+        "Client",
+        lambda timeout: _FakeClient(calls, kimi_usage_payload),
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "kimi-coding",
+        base_url="https://api.kimi.com/coding",
+        api_key="sk-kimi-test",
+    )
+
+    assert snapshot is not None
+    assert snapshot.provider == "kimi-coding"
+    assert snapshot.plan == "Advanced"
+    assert snapshot.source == "usage_api"
+    assert [w.label for w in snapshot.windows] == ["Weekly", "5 hour"]
+    assert snapshot.windows[0].used_percent == 77.0
+    assert snapshot.windows[0].reset_at is not None
+    assert snapshot.windows[1].used_percent == 7.0
+    assert any("30" in detail for detail in snapshot.details)
+    assert calls[0]["url"] == "https://api.kimi.com/coding/v1/usages"
+    assert calls[0]["headers"]["Authorization"] == "Bearer sk-kimi-test"
+    assert calls[0]["headers"]["User-Agent"] == "claude-code/0.1.0"
+    assert "sk-kimi-test" not in repr(snapshot)
+
+
+def test_kimi_usage_requires_api_key():
+    assert account_usage.fetch_account_usage("kimi-coding", api_key="") is None
+    assert (
+        account_usage.fetch_account_usage_for_credential("kimi-coding", api_key="") is None
+    )
