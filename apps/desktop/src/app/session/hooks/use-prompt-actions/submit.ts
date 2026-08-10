@@ -50,6 +50,9 @@ import {
   withSessionNotFoundResume
 } from './utils'
 
+/** Factual placeholder for captionless image uploads (issue #82847). */
+const CAPTIONLESS_IMAGE_PLACEHOLDER = '[User attached an image without a caption.]'
+
 interface SubmitPromptDeps {
   activeSessionIdRef: MutableRefObject<string | null>
   busyRef: MutableRefObject<boolean>
@@ -147,7 +150,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         return (
           [contextRefs, terminalContextBlocks, visibleText].filter(Boolean).join('\n\n') ||
-          (present.some(a => a.kind === 'image') ? 'What do you see in this image?' : '')
+          (present.some(a => a.kind === 'image') ? CAPTIONLESS_IMAGE_PLACEHOLDER : '')
         )
       }
 
