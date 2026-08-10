@@ -35,6 +35,7 @@ import type { SessionInfo } from '@/types/hermes'
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 import {
   $activeSessionId,
+  $lastReadAtBySessionId,
   $selectedStoredSessionId,
   $sessions,
   $unreadFinishedSessionIds,
@@ -183,10 +184,18 @@ function handleTransition(previous: ClientSessionState | null, next: ClientSessi
     markSettled(storedId)
 
     if (storedId !== $selectedStoredSessionId.get()) {
-      const cur = $unreadFinishedSessionIds.get()
+      // Re-light only genuinely new completions: if the user already viewed
+      // this session (or its family) at or after this settle moment, a
+      // re-assert of the same completion must not re-arm the dot. `-1` for
+      // "never read" (not `0`) so fake-timer tests pinned to t=0 still light.
+      const lastReadAt = $lastReadAtBySessionId.get()[storedId] ?? -1
 
-      if (!cur.includes(storedId)) {
-        $unreadFinishedSessionIds.set([...cur, storedId])
+      if (Date.now() > lastReadAt) {
+        const cur = $unreadFinishedSessionIds.get()
+
+        if (!cur.includes(storedId)) {
+          $unreadFinishedSessionIds.set([...cur, storedId])
+        }
       }
     }
   }
