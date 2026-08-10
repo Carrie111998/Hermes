@@ -10209,29 +10209,24 @@ ipcMain.on('hermes:hud:move-by', (event, delta) => {
 
   const dx = Number(delta?.x)
   const dy = Number(delta?.y)
+  const width = Number(delta?.width)
+  const height = Number(delta?.height)
 
-  if (!Number.isFinite(dx) || !Number.isFinite(dy)) {
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || !Number.isFinite(width) || !Number.isFinite(height)) {
     return
   }
 
   const [x, y] = hudWindow.getPosition()
 
-  // First moveBy of a drag snapshots the size; every subsequent moveBy of the
-  // same drag re-pins to that snapshot. setBounds — NOT setPosition: on
-  // Windows, a transparent frameless window silently grows ~1px per
-  // setPosition call (worse at >100% DPI — the HUD grew to 1385x1052 this
-  // way), and reading the size back mid-drag compounds the drift (verified on
-  // Electron 40.10.2 / Win11 / 175% DPI: dynamic getSize+setBounds drifts,
-  // fixed-size setBounds is immune).
-  if (hudDragWidth === 0 || hudDragHeight === 0) {
-    ;[hudDragWidth, hudDragHeight] = hudWindow.getSize()
-  }
-
+  // setBounds — NOT setPosition: on Windows, a transparent frameless window
+  // silently grows ~1px per setPosition call (worse at >100% DPI). The renderer
+  // snapshots outerWidth/outerHeight when the composer drag arms and re-pins
+  // to that size on every moveBy (same pattern as the pet overlay drag).
   hudWindow.setBounds({
     x: Math.round(x + dx),
     y: Math.round(y + dy),
-    width: hudDragWidth,
-    height: hudDragHeight
+    width: Math.round(width),
+    height: Math.round(height)
   })
 })
 
@@ -10260,11 +10255,6 @@ ipcMain.on('hermes:hud:set-bounds', (event, bounds) => {
   if (resizing) {
     win.setResizable(false)
   }
-
-  // Keep the drag snapshot in step with the resized window, so a drag right
-  // after a corner-handle resize pins the NEW size instead of snapping back.
-  hudDragWidth = width
-  hudDragHeight = height
 })
 
 // The HUD renderer reporting which session it is on, so the close broadcast
@@ -10275,13 +10265,6 @@ ipcMain.on('hermes:hud:session', (event, sessionId) => {
   }
 })
 
-// Size the HUD drag is pinned to. On Windows a transparent frameless window
-// drifts ~1px per geometry call (see hermes:hud:move-by), and reading the
-// size back mid-drag (getSize) reads the ALREADY-drifted value, so the drift
-// compounds. The renderer snapshots the size once when the drag arms and
-// every moveBy re-pins to that snapshot; the OS can never accumulate.
-let hudDragWidth = 0
-let hudDragHeight = 0
 ipcMain.handle('hermes:hud:close', async () => {
   closeHudWindow()
 

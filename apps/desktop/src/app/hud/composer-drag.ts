@@ -12,6 +12,8 @@ interface PressState {
   armed: boolean
   lastX: number
   lastY: number
+  originH: number
+  originW: number
   pointerId: number
   startX: number
   startY: number
@@ -82,6 +84,8 @@ export function useHudComposerDrag(enabled: boolean) {
         }
 
         state.armed = true
+        state.originW = window.outerWidth
+        state.originH = window.outerHeight
         setGrabbing(true)
         triggerHaptic('selection')
 
@@ -128,7 +132,12 @@ export function useHudComposerDrag(enabled: boolean) {
       state.lastX = event.screenX
       state.lastY = event.screenY
 
-      window.hermesDesktop?.hud?.moveBy?.({ x: dx, y: dy })
+      window.hermesDesktop?.hud?.moveBy?.({
+        x: dx,
+        y: dy,
+        width: state.originW,
+        height: state.originH
+      })
     }
 
     const onUp = (event: PointerEvent) => {
