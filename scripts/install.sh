@@ -212,9 +212,9 @@ print_banner() {
     echo ""
     echo -e "${MAGENTA}${BOLD}"
     echo "┌─────────────────────────────────────────────────────────┐"
-    echo "│             ⚕ Nastech Agent Installer                    │"
+    echo "│             𓄃 Nastech Agent Installer                   │"
     echo "├─────────────────────────────────────────────────────────┤"
-    echo "│  An open source AI agent by Nastech Research.              │"
+    echo "│  An open source AI agent by Nastech Research.           │"
     echo "└─────────────────────────────────────────────────────────┘"
     echo -e "${NC}"
 }
