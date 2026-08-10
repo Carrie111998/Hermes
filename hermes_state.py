@@ -1528,18 +1528,114 @@ def classify_persistence_error(exc_or_str) -> str:
     return "unknown"
 
 
-def _claim_repair_attempt(db_path: Path) -> bool:
-    """Claim the one-shot repair attempt for *db_path* in this process.
+# Persistent cross-process marker (OOF-106): the in-process set above only
+# bounds repair attempts within one interpreter, but state.db is opened by
+# many short-lived processes (cron ticker, dispatcher, CLI, dashboard
+# workers). On an unrepairable database each of those used to claim a
+# "fresh" one-shot attempt, take another identical timestamped backup, and
+# fail again — a production instance accumulated 505 malformed backups
+# (241MB) holding only two distinct content generations, feeding the disk-
+# exhaustion cascade. The marker file records a cheap stat fingerprint of
+# the database (size + mtime_ns, no file descriptor opened on the DB so no
+# POSIX-advisory-lock hazard) so any process can see that these exact bytes
+# were already given their one automatic repair attempt. A changed
+# fingerprint (new corruption event, partial repair write, manual restore)
+# re-arms exactly one new attempt. Explicit `hermes sessions repair` calls
+# repair_state_db_schema() directly and is never gated by this marker.
+_REPAIR_MARKER_SUFFIX = ".repair-attempted.json"
 
-    Returns True for the first caller, False afterwards. Keeps a malformed
-    DB from triggering an unbounded repair/reopen loop and stops concurrent
-    callers from racing surgery on the same file.
+
+def _repair_marker_path(db_path: Path) -> Path:
+    return db_path.with_name(db_path.name + _REPAIR_MARKER_SUFFIX)
+
+
+def _db_stat_fingerprint(db_path: Path) -> Optional[Dict[str, int]]:
+    """Cheap content-change fingerprint via os.stat (never opens the DB)."""
+    try:
+        st = os.stat(db_path)
+    except OSError:
+        return None
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _read_repair_marker(db_path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = _repair_marker_path(db_path).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _write_repair_marker(db_path: Path, fingerprint: Dict[str, int]) -> None:
+    """Best-effort: a failed marker write degrades to per-process guarding."""
+    try:
+        _repair_marker_path(db_path).write_text(
+            json.dumps(
+                {
+                    "fingerprint": fingerprint,
+                    "attempted_at": time.time(),
+                    "pid": os.getpid(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.warning("Could not write repair-attempt marker for %s: %s", db_path, exc)
+
+
+def _clear_repair_marker(db_path: Path) -> None:
+    try:
+        _repair_marker_path(db_path).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - best effort
+        logger.debug("Could not remove repair-attempt marker for %s: %s", db_path, exc)
+
+
+def _claim_repair_attempt(db_path: Path) -> bool:
+    """Claim the one-shot AUTOMATIC repair attempt for *db_path*.
+
+    Returns True for the first caller, False afterwards. Two layers:
+
+    * an in-process set, so concurrent opens in one interpreter can't race
+      surgery on the same file; and
+    * a persistent marker beside the DB recording a stat fingerprint of the
+      bytes that were attempted, so the parade of short-lived processes
+      (cron, dispatcher, CLI, dashboard workers) can't each re-attempt the
+      same unrepairable file — the loop that produced hundreds of identical
+      malformed backups in production (OOF-106).
+
+    The marker is written BEFORE the attempt (at-most-once semantics even
+    if the repairing process dies mid-surgery) and cleared by
+    repair_state_db_schema() on success. Marker I/O failures fail open to
+    the in-process guard: never block a repair because bookkeeping failed.
     """
     key = str(db_path)
     with _repair_attempt_lock:
         if key in _repair_attempted_paths:
             return False
+        fingerprint = _db_stat_fingerprint(db_path)
+        if fingerprint is not None:
+            marker = _read_repair_marker(db_path)
+            if marker is not None and marker.get("fingerprint") == fingerprint:
+                # These exact bytes already had their automatic attempt in
+                # another process. Still record in-process so this process
+                # doesn't repeatedly re-stat on every subsequent open.
+                _repair_attempted_paths.add(key)
+                logger.error(
+                    "state.db at %s is malformed and a previous automatic "
+                    "repair attempt on the same file contents already "
+                    "failed; not retrying. Run `hermes sessions repair` "
+                    "for an explicit attempt, or `hermes sessions recover "
+                    "--source %s --inspect-only` for offline recovery.",
+                    db_path,
+                    db_path,
+                )
+                return False
         _repair_attempted_paths.add(key)
+        if fingerprint is not None:
+            _write_repair_marker(db_path, fingerprint)
         return True
 
 
@@ -1664,6 +1760,86 @@ def _bump_schema_cookie(conn: sqlite3.Connection) -> None:
         logger.warning("Could not bump state.db schema cookie: %s", exc)
 
 
+# Bounds for the malformed-backup family beside a database (OOF-106). Dedup
+# is the primary control: a repair storm copies the SAME corrupt bytes over
+# and over (505 backups / 2 distinct generations observed in production), so
+# embedding a content digest in the filename lets every later attempt
+# recognise the bytes are already preserved. The retention cap is the
+# backstop for genuinely distinct generations — each backup is a full copy
+# of state.db, so an unbounded family is a disk-exhaustion cascade (OOF-107
+# class) on small hosted volumes.
+_MALFORMED_BACKUP_KEEP = 5
+
+
+def _malformed_backups(db_path: Path) -> List[Path]:
+    """Existing malformed backups for *db_path*, oldest first (no sidecars)."""
+    prefix = f"{db_path.name}.malformed-backup-"
+    try:
+        entries = [
+            p
+            for p in db_path.parent.iterdir()
+            if p.name.startswith(prefix) and not p.name.endswith(("-wal", "-shm"))
+        ]
+    except OSError:
+        return []
+
+    # The embedded timestamp only has second granularity, and the digest
+    # suffix after it is effectively random — two backups taken within the
+    # same second would sort in arbitrary order by name alone. Sort by
+    # ctime (inode change time == creation time for a fresh copy), name as
+    # the tiebreaker for equal timestamps and stat failures.
+    def _sort_key(p: Path) -> tuple:
+        try:
+            ctime = p.stat().st_ctime_ns
+        except OSError:
+            ctime = 0
+        return (ctime, p.name)
+
+    return sorted(entries, key=_sort_key)
+
+
+def _file_content_digest(path: Path) -> Optional[str]:
+    """Short content digest for backup dedup; None on read failure.
+
+    Only called from ``_backup_db_file`` AFTER its live-connection guard: a
+    raw open/close on a database with live connections in this process
+    would cancel their POSIX advisory locks (see hermes_cli.sqlite_safe_read).
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()[:12]
+
+
+def _prune_malformed_backups(db_path: Path, keep: Optional[int] = None) -> None:
+    """Delete the oldest malformed backups beyond *keep* (with sidecars).
+
+    Backups are never opened by SQLite, so deleting them carries no
+    advisory-lock hazard. Best-effort: an undeletable file is logged and
+    skipped, never raised."""
+    if keep is None:
+        keep = _MALFORMED_BACKUP_KEEP
+    backups = _malformed_backups(db_path)
+    for stale in backups[:-keep] if keep > 0 else backups:
+        for candidate in (
+            stale,
+            stale.with_name(stale.name + "-wal"),
+            stale.with_name(stale.name + "-shm"),
+        ):
+            try:
+                candidate.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError as exc:  # pragma: no cover - best effort
+                logger.warning(
+                    "Could not prune stale malformed backup %s: %s", candidate, exc
+                )
+
+
 def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     """Copy a (possibly malformed) DB file to a timestamped backup beside it.
 
@@ -1674,6 +1850,14 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
     refused backup as a HARD STOP (see #69603: proceeding without the
     pre-repair backup leaves the writable_schema surgery, FTS deletion and
     VACUUM strategies mutating the only remaining copy of the damaged DB).
+
+    Deduplicated by content (OOF-106): the backup name embeds a short digest
+    of the database bytes, and when an existing backup already holds these
+    exact bytes no new copy is written — the existing backup's path is
+    returned instead. Without this, every process that trips over the same
+    unrepairable file takes another full-size copy (505 identical backups
+    observed in production). The family is additionally capped at
+    _MALFORMED_BACKUP_KEEP distinct backups, oldest pruned first.
 
     Refuses when a connection to this database is still live in the process:
     reading the file would ``close()`` a descriptor for it and cancel that
@@ -1698,18 +1882,39 @@ def _backup_db_file(db_path: Path) -> "Tuple[Optional[Path], Optional[str]]":
         logger.error("Refusing to raw-copy %s for backup: %s", db_path, reason)
         return None, reason
 
+    digest = _file_content_digest(db_path)
+    if digest is not None:
+        marker = f"-{digest}"
+        for existing in reversed(_malformed_backups(db_path)):
+            if existing.name.endswith(marker):
+                logger.info(
+                    "Malformed DB %s already backed up with identical "
+                    "contents at %s; skipping duplicate backup.",
+                    db_path,
+                    existing,
+                )
+                return existing, None
+
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
+    suffix = f"-{digest}" if digest is not None else ""
+    backup_path = db_path.with_name(
+        f"{db_path.name}.malformed-backup-{stamp}{suffix}"
+    )
     try:
         shutil.copy2(db_path, backup_path)
-        for suffix in ("-wal", "-shm"):
-            sidecar = db_path.with_name(db_path.name + suffix)
+        for suffix_part in ("-wal", "-shm"):
+            sidecar = db_path.with_name(db_path.name + suffix_part)
             if sidecar.exists():
-                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
-        return backup_path, None
+                shutil.copy2(
+                    sidecar, backup_path.with_name(backup_path.name + suffix_part)
+                )
     except Exception as exc:  # pragma: no cover - best effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None, f"backup copy failed: {exc}"
+    _prune_malformed_backups(db_path)
+    if backup_path.exists():
+        return backup_path, None
+    return None, "backup copy failed: backup file missing after copy"
 
 
 def preflight_db_writability(
@@ -1949,6 +2154,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
          The next ``SessionDB()`` open rebuilds the FTS indexes from the
          canonical ``messages`` table.
 
+    Page-level corruption of the canonical tables themselves (b-tree damage
+    that fails ``PRAGMA integrity_check`` outright) is beyond in-place
+    surgery — the failure log points at the offline recovery pipeline
+    (``hermes sessions recover``) instead of looping here.
+
     Canonical ``sessions`` / ``messages`` rows are never modified. A
     timestamped raw backup is taken first unless ``backup=False``.
 
@@ -1958,9 +2168,32 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     two of them running ``writable_schema`` surgery concurrently is itself a
     corruption source.
 
+    On success the persistent one-shot repair marker (see
+    ``_claim_repair_attempt``) is cleared, so a FUTURE corruption event on
+    the now-healthy file re-arms its own automatic attempt.
+
     Returns a report dict: ``{repaired: bool, strategy: str|None,
     backup_path: str|None, error: str|None}``.
     """
+    report = _repair_state_db_schema_impl(db_path, backup=backup)
+    db_path = Path(db_path)
+    if report.get("repaired"):
+        _clear_repair_marker(db_path)
+    else:
+        # A failed attempt may still have mutated the file (partial
+        # sqlite_master surgery, VACUUM side effects), which would change the
+        # stat fingerprint and hand the next process a "fresh" attempt —
+        # re-arming exactly the storm the marker exists to stop. Re-stamp the
+        # marker with the post-attempt bytes so the one-shot stays one-shot.
+        fingerprint = _db_stat_fingerprint(db_path)
+        if fingerprint is not None:
+            _write_repair_marker(db_path, fingerprint)
+    return report
+
+
+def _repair_state_db_schema_impl(
+    db_path: Path, *, backup: bool = True
+) -> Dict[str, Any]:
     report: Dict[str, Any] = {
         "repaired": False,
         "strategy": None,
@@ -2140,8 +2373,13 @@ def _repair_state_db_schema_locked(
     if not report["repaired"]:
         logger.error(
             "state.db schema repair could not recover %s automatically "
-            "(backup: %s); manual restore from backup may be required.",
-            db_path, report["backup_path"],
+            "(backup: %s). Automatic in-place surgery only fixes schema/FTS "
+            "corruption; for page-level damage run the offline recovery "
+            "pipeline: `hermes sessions recover --source %s --inspect-only` "
+            "to preview salvageable sessions, then without --inspect-only "
+            "to extract them. Automatic repair will not retry until the "
+            "file's contents change.",
+            db_path, report["backup_path"], db_path,
         )
     return report
 
