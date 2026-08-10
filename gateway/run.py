@@ -3266,6 +3266,30 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def _should_deliver_completed_response_before_pending(
+    *,
+    was_interrupted: bool,
+    pending_event: Any,
+    busy_input_mode: str,
+) -> bool:
+    """Whether a completed turn may deliver before its queued follow-up.
+
+    ``interrupt`` means a newly-arrived human turn supersedes an older turn,
+    even when it arrives in the narrow interval after the agent finishes but
+    before its final response reaches the platform.  Delivering both answers
+    in that interval makes rapid voice follow-ups look like duplicate replies.
+    Internal events remain ordered notifications, and queue/steer modes retain
+    their existing first-response-before-follow-up behavior.
+    """
+    if was_interrupted:
+        return False
+    if pending_event is None:
+        return True
+    if busy_input_mode == "interrupt" and not getattr(pending_event, "internal", False):
+        return False
+    return True
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayAgentMailWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -23233,10 +23257,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
 
-                was_interrupted = result.get("interrupted")
-                if not was_interrupted:
-                    # Queued message after normal completion — deliver the first
-                    # response before processing the queued follow-up.
+                was_interrupted = bool((result or {}).get("interrupted"))
+                _deliver_completed_before_pending = _should_deliver_completed_response_before_pending(
+                    was_interrupted=was_interrupted,
+                    pending_event=pending_event,
+                    busy_input_mode=self._busy_input_mode,
+                )
+                if _deliver_completed_before_pending:
+                    # Queue/steer modes preserve ordered delivery. In interrupt
+                    # mode a human follow-up supersedes a just-completed prior
+                    # turn, so do not emit its stale final in the narrow window
+                    # before the replacement turn starts.
                     # Skip if streaming already delivered it.
                     _sc = stream_consumer_holder[0]
                     if _sc and stream_task:

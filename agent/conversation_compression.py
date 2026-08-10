@@ -1108,6 +1108,7 @@ _SYNTHETIC_USER_PREFIXES = (
     "[System: The previous response was cut off",
     "[System: Your previous tool call",
     "[Your active task list was preserved across context compression]",
+    "CONTEXT COMPRESSION CONTINUITY ARTIFACT:",
     "[IMPORTANT: Background process ",
 )
 

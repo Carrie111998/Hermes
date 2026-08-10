@@ -750,6 +750,11 @@ def test_user_role_compaction_summary_is_not_a_human_anchor() -> None:
         "content": f"{SUMMARY_PREFIX}\n## Historical Task Snapshot\nUser asked: x",
     }
     assert not _is_real_user_message(summary_as_user)
+    assert not _is_real_user_message({
+        "role": "user",
+        "content": "CONTEXT COMPRESSION CONTINUITY ARTIFACT:\n"
+        "A deterministic rich HTML handoff was generated at /tmp/latest.html.",
+    })
     assert _is_real_user_message({"role": "user", "content": "please continue"})
 
 
