@@ -295,7 +295,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # NOTE: lazy-only for now — no pyproject `doc-extract` extra until the
     # package clears the uv exclude-newer 14-day quarantine (first release
     # 2026-08-04); add the mirrored extra then.
-    "tool.doc_extract": ("firecrawl-anydoc==0.1.6",),
+    "tool.doc_extract": ("firecrawl-anydoc==0.1.8",),
     # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
     # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
     # extras in pyproject.toml. The one-liner installer pulls this in via
