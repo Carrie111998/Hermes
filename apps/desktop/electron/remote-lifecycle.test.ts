@@ -1563,6 +1563,24 @@ function localHelperSsh(home: string) {
   }
 }
 
+/** Async SSH stub so separate production helpers contend in real OS processes. */
+function concurrentLocalHelperSsh(home: string) {
+  const calls: string[] = []
+
+  return {
+    calls,
+    async exec(command: string) {
+      calls.push(command)
+      const { stdout } = await execAsync(command, {
+        encoding: 'utf8',
+        env: { ...process.env, HOME: home },
+        timeout: 40_000
+      })
+      return stdout || ''
+    }
+  }
+}
+
 function mutexPathFor(home: string) {
   return path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID, 'lifecycle.mutex')
 }
@@ -1708,3 +1726,90 @@ print('HELD')
   }
 })
 
+test('real multi-process release keeps one inode across queued successor epochs', async () => {
+  const home = makeTempHome()
+  try {
+    const sshA = concurrentLocalHelperSsh(home)
+    const sshB = concurrentLocalHelperSsh(home)
+    const sshC = concurrentLocalHelperSsh(home)
+    let inodeA = 0
+    let inodeB = 0
+    let releaseB!: () => void
+    const holdB = new Promise<void>(resolve => { releaseB = resolve })
+
+    await withOwnershipMutex(sshA as any, OWNERSHIP_ID, async () => {
+      inodeA = fs.statSync(mutexPathFor(home)).ino
+    }, { heartbeatMs: 60_000 })
+
+    // Release must publish an immediately reclaimable epoch on the same inode;
+    // unlinking lets a queued waiter own an unreachable inode beside owner C.
+    assert.equal(fs.readFileSync(mutexPathFor(home), 'utf8').trim(), 'RELEASED')
+    assert.equal(fs.statSync(mutexPathFor(home)).ino, inodeA)
+
+    const ownerB = withOwnershipMutex(sshB as any, OWNERSHIP_ID, async leaseB => {
+      inodeB = fs.statSync(mutexPathFor(home)).ino
+      assert.equal(readMutex(home), leaseB.token)
+      await holdB
+    }, { heartbeatMs: 60_000 })
+
+    while (!inodeB) {
+      await new Promise(resolve => setTimeout(resolve, 10))
+    }
+
+    const ownerC = withOwnershipMutex(sshC as any, OWNERSHIP_ID, async leaseC => {
+      assert.equal(fs.statSync(mutexPathFor(home)).ino, inodeA)
+      assert.equal(readMutex(home), leaseC.token)
+    }, { heartbeatMs: 60_000 })
+
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.equal(readMutex(home).includes('RELEASED'), false)
+    releaseB()
+    await Promise.all([ownerB, ownerC])
+    assert.equal(inodeB, inodeA)
+    assert.equal(fs.statSync(mutexPathFor(home)).ino, inodeA)
+  } finally {
+    rmTempHome(home)
+  }
+})
+
+test('real local-helper: stale owner production spawn path is fenced after successor takeover', async () => {
+  const home = makeTempHome()
+  try {
+    const sshA = localHelperSsh(home)
+    const sshB = localHelperSsh(home)
+    const fakeHermes = path.join(home, 'fake-hermes')
+    const spawnMarker = path.join(home, 'spawned-by-stale-owner')
+    fs.writeFileSync(
+      fakeHermes,
+      `#!/usr/bin/env bash\nif [[ "\${1:-}" == serve && "\${2:-}" == --help ]]; then\n  echo --ssh-session-token-file --ssh-owner-nonce\n  exit 0\nfi\ntouch ${JSON.stringify(spawnMarker)}\necho 4242\n`,
+      { mode: 0o700 }
+    )
+
+    await assert.rejects(
+      () => withOwnershipMutex(sshA as any, OWNERSHIP_ID, async leaseA => {
+        const p = mutexPathFor(home)
+        const past = Math.floor(Date.now() / 1000) - 10_000
+        fs.utimesSync(p, past, past)
+
+        await withOwnershipMutex(sshB as any, OWNERSHIP_ID, async leaseB => {
+          assert.equal(readMutex(home), leaseB.token)
+        }, { heartbeatMs: 60_000 })
+
+        await assert.rejects(
+          () => spawnRemoteDashboard(sshA as any, {
+            hermesPath: fakeHermes,
+            profile: '',
+            token: 'stale-token',
+            ownershipId: OWNERSHIP_ID,
+            lease: leaseA
+          })
+        )
+        assert.equal(fs.existsSync(spawnMarker), false)
+        await leaseA.assertHeld()
+      }, { heartbeatMs: 60_000 }),
+      (err: any) => err.kind === 'ownership-conflict'
+    )
+  } finally {
+    rmTempHome(home)
+  }
+})
