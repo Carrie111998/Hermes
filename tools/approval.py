@@ -585,16 +585,19 @@ _WINDOWS_CMD_PAYLOAD_RES = tuple(
 _WINDOWS_ARGUMENT_TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
 _WINDOWS_DRIVE_VARIABLE_RE = re.compile(
     r'%(?:systemdrive|homedrive)%|!(?:systemdrive|homedrive)!|'
-    r'\$env:(?:systemdrive|homedrive)\b',
+    r'\$env:(?:systemdrive|homedrive)\b|'
+    r'\$\{env:(?:systemdrive|homedrive)\}',
     re.IGNORECASE,
 )
 _WINDOWS_SYSTEM_DIR_VARIABLE_RE = re.compile(
     r'%(?:systemroot|windir)%|!(?:systemroot|windir)!|'
-    r'\$env:(?:systemroot|windir)\b',
+    r'\$env:(?:systemroot|windir)\b|'
+    r'\$\{env:(?:systemroot|windir)\}',
     re.IGNORECASE,
 )
 _WINDOWS_DYNAMIC_PATH_RE = re.compile(
-    r'%[^%]+%|![^!]+!|\$(?:env:)?[a-z_][a-z0-9_]*|`',
+    r'%[^%]+%|![^!]+!|\$\{(?:env:)?[a-z_][a-z0-9_]*\}|'
+    r'\$(?:env:)?[a-z_][a-z0-9_]*|`',
     re.IGNORECASE,
 )
 
@@ -619,6 +622,11 @@ def _windows_path_is_root_or_unscoped_dynamic(token: str) -> bool:
         return _windows_literal_path_is_root(resolved)
 
     suffix = resolved[dynamic_matches[-1].end():].replace("/", "\\")
+    if re.match(r'^:\\', suffix):
+        # Cmd substring/replacement syntax can produce just the drive letter,
+        # with the literal ``:\`` supplied after the expansion. The colon is
+        # drive syntax, not a path component proving the target is scoped.
+        suffix = suffix[1:]
     scoped_components = []
     for component in suffix.split("\\"):
         if component in {"", "."}:
