@@ -697,14 +697,17 @@ def _discover(
     link_profile: str = None,
 ) -> str:
     """Discovery shape: FTS5 + anchored window + bookends per hit. Single call."""
-    role_list = role_filter if role_filter else ["user", "assistant"]
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     title_result = _title_match_result(db, query, current_lineage_root)
 
     try:
+        # Discovery: search ALL roles so that sessions where the FTS match
+        # is only in tool output (web search results, JSON, etc.) are still
+        # found.  role_filter is applied later when building the display
+        # window, not at the SQL search level.  (#83170)
         raw_results = db.search_messages(
             query=query,
-            role_filter=role_list,
+            role_filter=None,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=_DISCOVER_SCAN_LIMIT,  # widen so dedup-by-lineage can find
             # distinct sessions AND so interactive matches buried under a wall
