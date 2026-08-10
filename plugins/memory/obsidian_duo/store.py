@@ -305,6 +305,7 @@ class SqliteMemoryStore:
             "scope": candidate.scope,
             "authority": candidate.authority.value,
             "verification": candidate.verification.value,
+            "evidence_ids": [item.evidence_id for item in candidate.evidence],
             "metadata": dict(candidate.metadata),
         }
         with self.connection():

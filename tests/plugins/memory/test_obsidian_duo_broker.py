@@ -121,6 +121,22 @@ def test_model_proposal_cannot_claim_user_confirmation(tmp_path):
     assert staged == 1
 
 
+def test_staged_candidate_retains_evidence_references(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    broker.propose(MemoryCandidate(
+        "Deferred fact",
+        evidence=(EvidenceRecord("ev_stage", "turn", "support", session_id="s1"),),
+        metadata={"source_session_id": "s1", "task_id": "t1"},
+    ))
+
+    payload = broker.store.connection().execute("SELECT payload FROM candidates").fetchone()[0]
+
+    assert "ev_stage" in payload
+    assert "s1" in payload
+    assert "t1" in payload
+
+
 def test_promotion_runs_conflict_policy_before_writing(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()
