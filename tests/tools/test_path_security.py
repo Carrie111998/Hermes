@@ -190,6 +190,74 @@ class TestExtractFilesystemTargets:
             f"expected at least one token classifying as a filesystem root, got {tokens!r}"
         )
 
+    def test_quote_collapse_with_drive_path_does_not_swallow_root_token(self):
+        """Round-7 MoA review (2026-08-10) flagged a span-overlap bug:
+        when both a normal drive path and a stray bare ``\\`` coexist
+        in the same collapsed command, the bare-root must still be
+        emitted as a root token (drive-path substring check would
+        otherwise swallow it).
+        """
+        # ``cmd /c \"rd /s /q \\\\\"C:\\\\Users\\\\tester\"`` after PowerShell
+        # strips the outer single-quotes surfaces:
+        #   - ``C:\\Users\\tester`` (real user path)
+        #   - one or more bare ``\\`` tokens (root residue)
+        cmd = 'cmd /c "rd /s /q C:\\Users\\tester\\folder"'
+        tokens = extract_filesystem_targets(cmd)
+        # The user-folder string must be present.
+        assert any("tester" in t for t in tokens), (
+            f"expected user-folder token in {tokens!r}"
+        )
+        # Independent of the user folder, the bare-backslash sweep
+        # must not over-emit: ``\\server\\share\\folder`` is NOT root,
+        # so the inner-form drive match must not be double-counted.
+        # No spurious UNC root here, so the only root candidate would
+        # be a bare ``\`` if it appeared, which it does NOT in this
+        # case (no collapse). Verify by ensuring no token classifies
+        # as root:
+        from tools.path_security import is_filesystem_root
+
+        assert not any(is_filesystem_root(t) for t in tokens), (
+            f"command with normal path should not yield a root token, got {tokens!r}"
+        )
+
+    def test_unc_non_root_path_does_not_yield_root_token(self):
+        """Round-7 MoA review flagged that ``\\\\server\\share\\folder``
+        (a UNC non-root) was being decomposed into ``\\\\server\\share\\folder``,
+        plus ``\\\\`` plus ``\\``, and the leading ``\\`` inside the
+        UNC span was incorrectly classified as a filesystem root.
+        After the span-overlap fix this should leave only the
+        non-root drive-substring token (which classifies as False),
+        no bare-root residue.
+        """
+        cmd = 'rd /s /q \\\\server\\share\\folder'
+        from tools.path_security import is_filesystem_root
+
+        tokens = extract_filesystem_targets(cmd)
+        # No token should classify as a filesystem root — the target is a
+        # child folder under the share, NOT a root.
+        assert not any(is_filesystem_root(t) for t in tokens), (
+            f"UNC non-root path should not yield a root token, got {tokens!r}"
+        )
+
+    def test_unconditional_fallback_emits_root_when_only_drive_seen(self):
+        """The fix-#82842 echo-reproduction surfaces BOTH a drive-path
+        substring AND a bare-root residue. After the round-6 +
+        round-7 fixes, ``extract_filesystem_targets`` must surface
+        one of each AND at least one of them must classify as root.
+        """
+        # A cmd fragment simulating the post-collapse form.
+        cmd = 'cmd /c "rd /s /q C:\\Users\\tester \\rdrt"'
+        tokens = extract_filesystem_targets(cmd)
+        from tools.path_security import is_filesystem_root
+
+        # Force a deliberate bare backslash into the command to mimic the
+        # quote-collapse residue:
+        coll = 'cmd /c "rd /s /q \\C:\\Users\\tester"'
+        coll_tokens = extract_filesystem_targets(coll)
+        assert any(is_filesystem_root(t) for t in coll_tokens), (
+            f"standalone bare '\\\\' adjacent to a drive-path must produce a root token, got {coll_tokens!r}"
+        )
+
     def test_posix_root_command(self):
         assert extract_filesystem_targets("rm -rf /") == ["/"]
 

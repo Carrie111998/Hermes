@@ -350,25 +350,49 @@ def _fallback_extract_windows_paths(s: str) -> list[str]:
         if m not in out:
             out.append(m)
     drive_joined = " ".join(drive_matches)
-    for m_match in _BACKSLASH_RE.finditer(s):
-        m = m_match.group(0)
-        if m in drive_joined or m in out:
+    # Build the set of source-string spans covered by path-like
+    # candidates the primary tokenizer already emitted, so the
+    # bare-backslash filter only emits a backslash that is NOT inside
+    # any path-already-shadowed region.  This handles both:
+    #   - drive matches from _DRIVE_ROOT_RE (above), and
+    #   - UNC / drive-root tokens from _command_tokenize that did not
+    #     match the _DRIVE_ROOT_RE regex (e.g. ``\\server\share\folder``).
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for m in drive_matches:
+        idx = s.find(m, cursor)
+        if idx != -1:
+            spans.append((idx, idx + len(m)))
+            cursor = idx + len(m)
+    # Tokenize-and-locate path spans in the source string.
+    # _BACKSLASH_RE-isolated matches inside any of those spans are
+    # inside a path-already-classified region, so they are NOT bare
+    # root residue.
+    cursor2 = 0
+    for tok in _command_tokenize(s):
+        if not _looks_like_filesystem_target(tok):
+            continue
+        idx = s.find(tok, cursor2)
+        if idx == -1:
+            continue
+        spans.append((idx, idx + len(tok)))
+        cursor2 = idx + len(tok)
+    for bmatch in _BACKSLASH_RE.finditer(s):
+        m = bmatch.group(0)
+        if m in out:
+            continue
+        pos, end = bmatch.span()
+        # Skip "\" inside any path-already-classified span.
+        if any(sp <= pos and end <= ep for sp, ep in spans):
             continue
         # Skip the single-backslash continuation artefact
         # ``\\<whitespace>*<newline>`` — that is a shell line-continuation
-        # token, not a filesystem-root target. The shell will silently
-        # strip it before argument parsing. Issue #82842's collapse
-        # always surfaces `\` adjacent to a `\\<drive>` substring,
-        # not `\` before a newline, so this skip is safe.
+        # token, not a filesystem-root target.
         if len(m) == 1:
-            pos = m_match.start()
             tail = s[pos + len(m):]
             stripped = tail.lstrip(" \t")
             if stripped.startswith("\n"):
                 continue
-            # Also skip if the bare backslash is between command
-            # separator characters (`;` or `&`) and an alphanumeric
-            # argument — same shell-line-continuation pattern.
             head = s[:pos].rstrip(" \t")
             if head.endswith((";", "&", "|")) and stripped and (stripped[0].isalpha() or stripped[0] == "_"):
                 continue
