@@ -1695,26 +1695,6 @@ def _slack_dm_base_url(extra: dict | None) -> str:
     return base
 
 
-def _slack_proxy_target_hosts(base_url: str) -> tuple:
-    """Hosts to check against NO_PROXY for Slack DM resolution.
-
-    ``resolve_proxy_url`` only honors NO_PROXY when it is told which hosts the
-    request targets, so calling it bare sends conversations.open through the
-    proxy even when the operator excluded the Slack host. Delegates to the
-    Slack plugin so the host list stays defined in one place; falls back to the
-    base URL's own host if the plugin is unavailable.
-    """
-    try:
-        from plugins.platforms.slack.adapter import _slack_proxy_bypass_hosts
-
-        return tuple(_slack_proxy_bypass_hosts(base_url))
-    except Exception:
-        from urllib.parse import urlsplit
-
-        host = (urlsplit(base_url).hostname or "").strip().lower()
-        return (host,) if host else ()
-
-
 async def _resolve_slack_user_target(token, chat_id, extra=None):
     """Resolve a Slack user target to a D... DM conversation ID.
 
@@ -1734,9 +1714,13 @@ async def _resolve_slack_user_target(token, chat_id, extra=None):
         return None, {"error": "aiohttp not installed. Run: pip install aiohttp"}
     try:
         from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        from urllib.parse import urlsplit
         base_url = _slack_dm_base_url(extra)
-        # NO_PROXY-aware for the built-in Slack hosts and any custom base_url host.
-        _proxy = resolve_proxy_url(target_hosts=_slack_proxy_target_hosts(base_url))
+        # resolve_proxy_url only consults NO_PROXY for the hosts it is told
+        # about, and every request below goes to base_url and nowhere else —
+        # the rule the Slack adapter's DM leg applies as well.
+        _api_host = (urlsplit(base_url).hostname or "").strip().lower()
+        _proxy = resolve_proxy_url(target_hosts=[_api_host] if _api_host else None)
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
