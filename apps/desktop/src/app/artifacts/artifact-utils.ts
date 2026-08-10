@@ -1,5 +1,4 @@
-import { readDesktopFileDataUrl } from '@/lib/desktop-fs'
-import { filePathFromMediaPath, isRemoteGateway, mediaExternalUrl } from '@/lib/media'
+import { mediaExternalUrl, resolveMediaDisplaySrc } from '@/lib/media'
 import type { SessionInfo, SessionMessage } from '@/types/hermes'
 
 export type ArtifactKind = 'image' | 'file' | 'link'
@@ -110,16 +109,14 @@ function artifactHref(value: string): string {
   return value
 }
 
-export async function artifactImageSrc(value: string, href = artifactHref(value)): Promise<string> {
-  if (/^(?:https?|data):/i.test(value)) {
-    return href
-  }
-
-  if (typeof window !== 'undefined' && window.hermesDesktop && isRemoteGateway()) {
-    return readDesktopFileDataUrl(filePathFromMediaPath(value))
-  }
-
-  return href
+export async function artifactImageSrc(value: string): Promise<string> {
+  // Delegate the whole local/remote ladder to the shared media resolver:
+  // inline (http/data) stays as-is, remote gateway goes through the
+  // authenticated fs bridge, local desktop through the Electron
+  // readFileDataUrl, and bare non-path link values fall through untouched.
+  // Reimplementing that ladder here would drift from resolveMediaDisplaySrc
+  // and regress one of its legs (#83380).
+  return resolveMediaDisplaySrc(value)
 }
 
 function artifactLabel(value: string): string {
@@ -283,7 +280,15 @@ export function collectArtifactsForSession(session: SessionInfo, messages: Sessi
         label: artifactLabel(value),
         sessionId: session.id,
         sessionTitle: title,
-        timestamp: message.timestamp || session.last_active || session.started_at || Date.now()
+        // All three sources are epoch SECONDS (message timestamps and
+        // session last_active/started_at are persisted in seconds; the
+        // transcript renderer multiplies by 1000 and session-date-groups
+        // by SECOND). The artifacts page renders with `new Date(timestamp)`
+        // (ms), so normalize once here instead of at each display site.
+        // Date.now() fallback stays ms (#83380).
+        timestamp:
+          (message.timestamp || session.last_active || session.started_at) * 1000 ||
+          Date.now()
       })
     })
   }
