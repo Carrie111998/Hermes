@@ -9,6 +9,7 @@ RUNTIME_DRIVER_FRAME_TYPES = (
     "run_started",
     "heartbeat",
     "text_delta",
+    "runtime_control_request",
     "tool_request",
     "activity_started",
     "activity_completed",
@@ -19,6 +20,7 @@ RUNTIME_DRIVER_FRAME_TYPES = (
 RUNTIME_CAPABILITIES = (
     "delegated_tools",
     "interrupt",
+    "model_contract_control",
     "session_db_resume",
     "system_context.replace",
     "llm_egress",

@@ -1395,16 +1395,13 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
 
 
 @pytest.mark.asyncio
-async def test_runtime_media_requires_exact_catalog_contract_before_submission():
+async def test_runtime_media_requires_exact_private_contract_before_submission():
     queue = asyncio.Queue()
     session = RuntimeBridgeSession(
         "run_media_schema_required",
         asyncio.get_running_loop(),
         queue,
-        [
-            {"name": "media.model_catalog", "input_schema": {"type": "object"}},
-            {"name": "media.generate_image", "input_schema": {"type": "object"}},
-        ],
+        [{"name": "media.generate_image", "input_schema": {"type": "object"}}],
         10_000,
         "agent_media_schema_required",
         _runtime_call_db(
@@ -1419,13 +1416,17 @@ async def test_runtime_media_requires_exact_catalog_contract_before_submission()
         "call_generate",
     ))
     request = await queue.get()
-    assert request["payload"]["name"] == "media.model_catalog"
-    assert request["payload"]["arguments"] == {
-        "action": "get",
-        "model_id": "openai/gpt-image-2/text-to-image",
+    assert request == {
+        "run_id": "run_media_schema_required",
+        "type": "runtime_control_request",
+        "payload": {
+            "request_id": request["payload"]["request_id"],
+            "kind": "model_contract.get",
+            "model": "openai/gpt-image-2/text-to-image",
+        },
     }
-    assert session.submit_result({
-        "call_id": request["payload"]["call_id"],
+    assert session.submit_control_result({
+        "request_id": request["payload"]["request_id"],
         "ok": False,
         "error": {
             "code": "model_not_found",
@@ -1440,17 +1441,14 @@ async def test_runtime_media_requires_exact_catalog_contract_before_submission()
 
 
 @pytest.mark.asyncio
-async def test_runtime_media_uses_catalog_contract_and_rejects_domain_ratio_field():
+async def test_runtime_media_uses_private_contract_and_rejects_domain_ratio_field():
     queue = asyncio.Queue()
     model = "openai/gpt-image-2/text-to-image"
     session = RuntimeBridgeSession(
         "run_media_schema",
         asyncio.get_running_loop(),
         queue,
-        [
-            {"name": "media.model_catalog", "input_schema": {"type": "object"}},
-            {"name": "media.generate_image", "input_schema": {"type": "object"}},
-        ],
+        [{"name": "media.generate_image", "input_schema": {"type": "object"}}],
         10_000,
         "agent_media_schema",
         _runtime_call_db(
@@ -1465,32 +1463,32 @@ async def test_runtime_media_uses_catalog_contract_and_rejects_domain_ratio_fiel
         {"requests": [{"model": model, "prompt": "poster", "aspect_ratio": "3:2"}]},
         "call_generate_bad",
     ))
-    catalog_request = await queue.get()
-    assert catalog_request["payload"]["name"] == "media.model_catalog"
-    assert session.submit_result({
-        "call_id": catalog_request["payload"]["call_id"],
+    contract_request = await queue.get()
+    assert contract_request["type"] == "runtime_control_request"
+    assert contract_request["payload"]["kind"] == "model_contract.get"
+    assert contract_request["payload"]["model"] == model
+    assert session.submit_control_result({
+        "request_id": contract_request["payload"]["request_id"],
         "ok": True,
         "result": {
-            "selected_model": model,
-            "models": [{
-                "model": model,
-                "parameters": [
-                    {"name": "prompt", "type": "string", "required": True},
-                    {
-                        "name": "size",
-                        "type": "string",
-                        "required": False,
-                        "options": ["1024x1024", "1536x1024"],
-                        "description": "Arbitrary resolutions are supported as WIDTHxHEIGHT strings.",
-                    },
-                    {
-                        "name": "quality",
-                        "type": "string",
-                        "required": False,
-                        "options": ["low", "medium", "high"],
-                    },
-                ],
-            }],
+            "model": model,
+            "observed_schema_digest": "sha256:" + "a" * 64,
+            "parameters": [
+                {"name": "prompt", "type": "string", "required": True},
+                {
+                    "name": "size",
+                    "type": "string",
+                    "required": False,
+                    "options": ["1024x1024", "1536x1024"],
+                    "description": "Arbitrary resolutions are supported as WIDTHxHEIGHT strings.",
+                },
+                {
+                    "name": "quality",
+                    "type": "string",
+                    "required": False,
+                    "options": ["low", "medium", "high"],
+                },
+            ],
         },
     })
     invalid = json.loads(await invalid_call)

@@ -434,23 +434,28 @@ def _failed_tool_result_projection(transport: Any) -> dict[str, Any]:
     return projection
 
 
-def _catalog_parameter_contract(result: Any) -> tuple[str, dict[str, dict[str, Any]]] | None:
-    """Extract one exact model contract from a successful catalog get result."""
+def _model_parameter_contract(
+    result: Any,
+) -> tuple[str, str, dict[str, dict[str, Any]]] | None:
+    """Extract one exact model contract from Runtime-private control data."""
     if not isinstance(result, dict):
         return None
-    selected_model = str(result.get("selected_model") or "").strip()
-    models = result.get("models")
-    if not selected_model or not isinstance(models, list) or len(models) != 1:
+    if set(result) != {"model", "parameters", "observed_schema_digest"}:
         return None
-    model = models[0]
-    if not isinstance(model, dict) or str(model.get("model") or "").strip() != selected_model:
+    model = str(result.get("model") or "").strip()
+    digest = str(result.get("observed_schema_digest") or "").strip()
+    if not model or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
         return None
-    parameters = model.get("parameters")
+    parameters = result.get("parameters")
     if not isinstance(parameters, list) or not parameters:
         return None
     contract: dict[str, dict[str, Any]] = {}
     for parameter in parameters:
         if not isinstance(parameter, dict):
+            return None
+        if set(parameter) - {
+            "name", "type", "required", "default", "options", "description"
+        }:
             return None
         name = str(parameter.get("name") or "").strip()
         parameter_type = str(parameter.get("type") or "").strip()
@@ -462,7 +467,7 @@ def _catalog_parameter_contract(result: Any) -> tuple[str, dict[str, dict[str, A
             "options": list(parameter.get("options") or []),
             "description": str(parameter.get("description") or ""),
         }
-    return selected_model, contract
+    return model, digest, contract
 
 
 def _parameter_value_matches_type(value: Any, parameter_type: str) -> bool:
@@ -521,9 +526,8 @@ def _model_request_contract_error(
                 "error": {
                     "code": "model_schema_required",
                     "message": (
-                        f"Before calling {tool_name}, call media.model_catalog with "
-                        f'{{"action":"get","model_id":{json.dumps(model)}}} and use '
-                        "that exact model contract to choose its literal parameters."
+                        f"Runtime did not resolve the exact input contract for model "
+                        f"{model!r} before calling {tool_name}."
                     ),
                     "retryable": True,
                 }
@@ -1409,6 +1413,8 @@ class RuntimeBridgeSession:
         self.non_retryable_failures: dict[str, str] = {}
         self.argument_correction_failures: dict[str, int] = {}
         self.model_parameter_contracts: dict[str, dict[str, dict[str, Any]]] = {}
+        self.model_contract_digests: dict[str, str] = {}
+        self.pending_controls: dict[str, _PendingTool] = {}
         self.agent_ref: list[Any] = [None]
         self.lock = threading.RLock()
         self.interrupted = threading.Event()
@@ -1487,21 +1493,13 @@ class RuntimeBridgeSession:
             with self.lock:
                 if model in self.model_parameter_contracts:
                     continue
-            if "media.model_catalog" not in self.tool_names:
-                return {
-                    "error": {
-                        "code": "model_schema_unavailable",
-                        "message": "Runtime was not granted media.model_catalog for exact model resolution",
-                        "retryable": False,
-                    }
-                }
             digest = hashlib.sha256(
                 (parent_call_id + "\x00" + model).encode("utf-8")
             ).hexdigest()
-            schema_call_id = f"schema_{digest}"
-            pending = _PendingTool(name="media.model_catalog")
+            request_id = f"contract_{digest}"
+            pending = _PendingTool(name="model_contract.get")
             with self.lock:
-                if schema_call_id in self.pending:
+                if request_id in self.pending_controls:
                     return {
                         "error": {
                             "code": "idempotency_conflict",
@@ -1509,12 +1507,11 @@ class RuntimeBridgeSession:
                             "retryable": False,
                         }
                     }
-                self.pending[schema_call_id] = pending
-            catalog_args = {"action": "get", "model_id": model}
-            self.emit("tool_request", {
-                "call_id": schema_call_id,
-                "name": "media.model_catalog",
-                "arguments": catalog_args,
+                self.pending_controls[request_id] = pending
+            self.emit("runtime_control_request", {
+                "request_id": request_id,
+                "kind": "model_contract.get",
+                "model": model,
             })
             wait_timeout = (
                 self.deadline_seconds
@@ -1524,7 +1521,7 @@ class RuntimeBridgeSession:
             ready = pending.ready.wait(wait_timeout)
             if not ready or self.interrupted.is_set():
                 with self.lock:
-                    self.pending.pop(schema_call_id, None)
+                    self.pending_controls.pop(request_id, None)
                 return {
                     "error": {
                         "code": "model_schema_unavailable",
@@ -1533,12 +1530,12 @@ class RuntimeBridgeSession:
                     }
                 }
             result = pending.result or {}
-            catalog_contract = (
-                _catalog_parameter_contract(result.get("result"))
+            model_contract = (
+                _model_parameter_contract(result.get("result"))
                 if result.get("ok")
                 else None
             )
-            if catalog_contract is None or catalog_contract[0] != model:
+            if model_contract is None or model_contract[0] != model:
                 return {
                     "error": {
                         "code": "model_schema_unavailable",
@@ -1547,7 +1544,8 @@ class RuntimeBridgeSession:
                     }
                 }
             with self.lock:
-                self.model_parameter_contracts[model] = catalog_contract[1]
+                self.model_contract_digests[model] = model_contract[1]
+                self.model_parameter_contracts[model] = model_contract[2]
         return None
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
@@ -1727,15 +1725,6 @@ class RuntimeBridgeSession:
             return json.dumps({"error": {"code": code, "message": message, "retryable": False}})
         result = pending.result or {}
         if result.get("ok"):
-            if (
-                name == "media.model_catalog"
-                and str(args.get("action") or "").strip().lower() == "get"
-            ):
-                catalog_contract = _catalog_parameter_contract(result.get("result"))
-                requested_model = str(args.get("model_id") or args.get("model") or "").strip()
-                if catalog_contract is not None and catalog_contract[0] == requested_model:
-                    with self.lock:
-                        self.model_parameter_contracts[requested_model] = catalog_contract[1]
             with self.lock:
                 self.argument_correction_failures.pop(name, None)
             return json.dumps(result.get("result"), ensure_ascii=False, separators=(",", ":"))
@@ -1792,6 +1781,16 @@ class RuntimeBridgeSession:
             pending.ready.set()
         return True
 
+    def submit_control_result(self, result: dict[str, Any]) -> bool:
+        request_id = str(result.get("request_id") or "")
+        with self.lock:
+            pending = self.pending_controls.pop(request_id, None)
+            if pending is None:
+                return False
+            pending.result = result
+            pending.ready.set()
+        return True
+
     def interrupt(self, reason: str) -> None:
         self.interrupt_reason = reason
         self.interrupted.set()
@@ -1801,6 +1800,8 @@ class RuntimeBridgeSession:
             interrupt(reason)
         with self.lock:
             for pending in self.pending.values():
+                pending.ready.set()
+            for pending in self.pending_controls.values():
                 pending.ready.set()
 
     def mark_finished(self) -> None:
@@ -2256,6 +2257,33 @@ class APIServerRuntimeMixin:
             return web.json_response({"error": {"code": "invalid_param", "message": "invalid JSON"}}, status=400)
         if not isinstance(result, dict) or not session.submit_result(result):
             return web.json_response({"error": {"code": "invalid_tool_result", "message": "unknown call_id"}}, status=409)
+        return web.Response(status=204)
+
+    async def _handle_runtime_control_result(self, request: "web.Request") -> "web.Response":
+        auth_error = self._check_auth(request)
+        if auth_error:
+            return auth_error
+        run_id = request.match_info["run_id"]
+        request["hermes_run_id"] = run_id
+        with _SESSIONS_LOCK:
+            session = _SESSIONS.get(run_id)
+        if session is None:
+            return web.json_response(
+                {"error": {"code": "run_not_found", "message": "run is not active"}},
+                status=404,
+            )
+        try:
+            result = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": {"code": "invalid_param", "message": "invalid JSON"}},
+                status=400,
+            )
+        if not isinstance(result, dict) or not session.submit_control_result(result):
+            return web.json_response(
+                {"error": {"code": "invalid_control_result", "message": "unknown request_id"}},
+                status=409,
+            )
         return web.Response(status=204)
 
     async def _handle_runtime_interrupt(self, request: "web.Request") -> "web.Response":
