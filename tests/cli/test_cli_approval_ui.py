@@ -471,7 +471,7 @@ class TestPersistPromptSummary:
             cli._clarify_state["response_queue"].put("B")
             t.join(timeout=2)
 
-        assert result["value"] == "B"
+        assert result["value"] == {"status": "answered", "response": "B"}
         summary = "\n".join(printed)
         assert "Clarify" in summary
         assert "Pick a path?" in summary
@@ -561,4 +561,3 @@ class TestClearOverlaysForInterrupt:
 
         assert not t.is_alive(), "worker thread never unblocked"
         assert result["value"] == "deny"
-

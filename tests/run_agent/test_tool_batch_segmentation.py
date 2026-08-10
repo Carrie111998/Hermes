@@ -370,7 +370,7 @@ def agent():
     with (
         patch(
             "run_agent.get_tool_definitions",
-            return_value=_make_tool_defs("web_search", "terminal"),
+            return_value=_make_tool_defs("web_search", "terminal", "clarify"),
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
@@ -387,6 +387,31 @@ def agent():
 
 
 class TestSegmentedDispatchIntegration:
+    def test_expired_clarify_persists_result_and_cancels_remaining_batch(self, agent):
+        calls = [
+            _tc("clarify", '{"question":"Which node?","choices":["office","xiael"]}', call_id="c1"),
+            _tc("terminal", '{"command":"echo must-not-run"}', call_id="t1"),
+            _tc("web_search", '{"query":"must-not-run"}', call_id="s1"),
+            _tc("web_search", '{"query":"also-must-not-run"}', call_id="s2"),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        messages = []
+        executed = []
+        agent.clarify_callback = lambda *_args, **_kwargs: {"status": "expired"}
+
+        def fake_handle(name, args, task_id, **kwargs):
+            executed.append(kwargs["tool_call_id"])
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        assert [m["tool_call_id"] for m in messages] == ["c1", "t1", "s1", "s2"]
+        assert json.loads(messages[0]["content"])["status"] == "expired"
+        assert executed == []
+        assert all("cancelled" in m["content"] for m in messages[1:])
+        assert agent._clarify_pause_status == "expired"
+
     def test_mixed_batch_runs_safe_prefix_concurrently_and_barrier_after(self, agent):
         """Two web_search calls must overlap in time; terminal must start only
         after both finish; results land in the model's emission order."""

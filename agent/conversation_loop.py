@@ -1561,6 +1561,7 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    agent._clarify_pause_status = None
     # Cause of the most recent persistence failure this turn ('locked',
     # 'disk', or 'unknown' — see hermes_state.classify_persistence_error).
     # Reset alongside the failure flag so a lock-contention diagnosis from a
@@ -6772,6 +6773,19 @@ def run_conversation(
                     _turn_exit_reason = "session_persistence_failed"
                     final_response = ""
                     failed = True
+                    break
+
+                if getattr(agent, "_clarify_pause_status", None):
+                    pause_status = agent._clarify_pause_status
+                    _turn_exit_reason = f"clarify_{pause_status}"
+                    final_response = (
+                        "Input request expired; no action was taken. "
+                        "Send a new message to continue."
+                        if pause_status == "expired"
+                        else "Input request was cancelled; no action was taken. Send a new message to continue."
+                        if pause_status == "cancelled"
+                        else "Input request could not be delivered; no action was taken. Send a new message to continue."
+                    )
                     break
 
                 if agent._tool_guardrail_halt_decision is not None:

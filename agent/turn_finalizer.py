@@ -193,9 +193,13 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
+    paused = str(_turn_exit_reason) in {
+        "clarify_expired", "clarify_cancelled", "clarify_delivery_failed",
+    }
     completed = (
         final_response is not None
         and not failed
+        and not paused
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -375,6 +379,7 @@ def finalize_turn(
                     and getattr(_compressor, '_micro_compact_enabled', False) is True
                     and callable(getattr(_compressor, '_micro_compact', None))
                     and final_response
+                    and not paused
                     # Persistence-isolated agents (background review fork)
                     # must not micro-compact: the pass burns a real aux-LLM
                     # call on a throwaway replay transcript, and if the
@@ -659,6 +664,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "paused": paused,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
