@@ -385,3 +385,75 @@ class TestAuthLossEscalation:
         run_poll(bus, config, fetch_prs=self._not_found_fetch,
                  fetch_builds=lambda *a: [])
         assert len(bus.query(event_type=EventType.CREDENTIAL_LOSS)) == 0
+
+
+# ------------------------------------------------- emitted transition details
+
+class TestTransitionDetails:
+    """The wrapper needs to name what changed, not just count it.
+
+    A silent-on-no-change cron poll can only stay silent safely if it can
+    describe every transition it did emit; a bare count would force the
+    operator back to the logs.
+    """
+
+    def test_poll_summary_records_each_emitted_transition(self, bus, tmp_path, state_path):
+        from events.producers.devflow_pr_build_poller import run_poll
+
+        prs = [{
+            "number": 42,
+            "state": "closed",
+            "merged_at": "2026-08-10T12:00:00Z",
+            "title": "Ship it",
+            "user": {"login": "diego"},
+            "head": {"sha": "sha-1"},
+        }]
+        config = _make_config(tmp_path, state_path)
+        summary = run_poll(bus, config,
+                           fetch_prs=lambda r, c: prs,
+                           fetch_builds=lambda r, s, c: [])
+
+        assert summary.transitions_emitted == len(summary.transitions)
+        assert all({"kind", "repo", "id", "state"} <= set(t) for t in summary.transitions)
+        assert summary.transitions == [
+            {"kind": "pr", "repo": "owner/repo-a", "id": "42", "state": "merged"}
+        ]
+
+    def test_build_transitions_are_recorded_with_their_kind(self, bus, tmp_path, state_path):
+        from events.producers.devflow_pr_build_poller import run_poll
+
+        prs = [{
+            "number": 1, "state": "open", "merged_at": None, "title": "WIP",
+            "user": {"login": "diego"}, "head": {"sha": "sha-1"},
+        }]
+        builds = [{
+            "id": 9001, "name": "ci/build", "status": "completed",
+            "conclusion": "failure", "head_sha": "sha-1",
+        }]
+        config = _make_config(tmp_path, state_path)
+        summary = run_poll(bus, config,
+                           fetch_prs=lambda r, c: prs,
+                           fetch_builds=lambda r, s, c: builds)
+
+        assert summary.transitions_emitted == len(summary.transitions)
+        assert {"kind": "build", "repo": "owner/repo-a", "id": "9001",
+                "state": "failed"} in summary.transitions
+        assert {"kind": "pr", "repo": "owner/repo-a", "id": "1",
+                "state": "open"} in summary.transitions
+
+    def test_unchanged_second_poll_records_no_transitions(self, bus, tmp_path, state_path):
+        """The no-change case is the one the wrapper stays silent on."""
+        from events.producers.devflow_pr_build_poller import run_poll
+
+        prs = [{
+            "number": 5, "state": "open", "merged_at": None, "title": "Same",
+            "user": {"login": "diego"}, "head": {"sha": "sha-9"},
+        }]
+        config = _make_config(tmp_path, state_path)
+        run_poll(bus, config, fetch_prs=lambda r, c: prs,
+                 fetch_builds=lambda r, s, c: [])
+        second = run_poll(bus, config, fetch_prs=lambda r, c: prs,
+                          fetch_builds=lambda r, s, c: [])
+
+        assert second.transitions == []
+        assert second.transitions_emitted == 0

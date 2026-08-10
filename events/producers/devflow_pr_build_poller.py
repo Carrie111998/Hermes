@@ -67,6 +67,10 @@ class PollSummary:
     prs_observed: int = 0
     builds_observed: int = 0
     transitions_emitted: int = 0
+    #: One ``{"kind", "repo", "id", "state"}`` entry per emitted transition,
+    #: so a silent-on-no-change caller can name what actually changed instead
+    #: of reporting a bare count and sending the operator to the logs.
+    transitions: List[dict] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
 
@@ -253,6 +257,9 @@ def run_poll(
                 continue
             if emitted:
                 summary.transitions_emitted += 1
+                summary.transitions.append(
+                    {"kind": "pr", "repo": repo, "id": str(pr_number), "state": state}
+                )
 
             if state in ("merged", "closed"):
                 continue
@@ -291,6 +298,10 @@ def run_poll(
                     continue
                 if emitted:
                     summary.transitions_emitted += 1
+                    summary.transitions.append(
+                        {"kind": "build", "repo": repo, "id": build_id,
+                         "state": bstate}
+                    )
 
     _check_auth_transition(bus, config, summary)
     return summary
