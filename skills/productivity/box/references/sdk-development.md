@@ -12,7 +12,7 @@ Inspect the repository for existing Box clients, `BOX_` configuration, token sto
 | --- | --- |
 | OAuth | each end user connects their own Box account |
 
-OAuth follows the signed-in user's permissions and app scopes. For a shared or background application, authorize a separate Box account or an enterprise Managed User. That dedicated OAuth identity can be invited only to the files, folders, or Hubs the application needs, rather than inheriting a broader user's access.
+OAuth follows the signed-in user's permissions and app scopes. For a shared or background application, the Box account that authorizes the application defines its access boundary; invite that account only to the files, folders, or Hubs the application needs.
 
 ## Use an official SDK
 
@@ -20,7 +20,7 @@ OAuth follows the signed-in user's permissions and app scopes. For a shared or b
 - [Node SDK](https://github.com/box/box-node-sdk)
 - [Other Box SDKs](https://developer.box.com/guides/tooling/sdks/)
 
-Use the SDK matching the project language. Store OAuth tokens and any custom Platform App client secret in the project's approved secret mechanism, not source control. When a custom Platform App needs additional scopes, use **User Authentication (OAuth 2.0)** and have the intended Box user grant access; do not add an impersonation path for normal application work. If an exceptional enterprise operation requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the dedicated runtime identity.
+Use the SDK matching the project language. Store OAuth tokens and any custom Platform App client secret in the project's approved secret mechanism, not source control. When a custom Platform App needs additional scopes, use **User Authentication (OAuth 2.0)** and have the intended Box user grant access; do not add an impersonation path for normal application work. If an exceptional enterprise operation requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the account the application normally uses.
 
 ## OAuth client
 

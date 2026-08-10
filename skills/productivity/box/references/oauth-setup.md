@@ -2,18 +2,17 @@
 
 Use OAuth for every Hermes-to-Box connection. OAuth follows the signed-in Box user's permissions and the app's scopes; it does not grant enterprise-wide access.
 
-## Choose the OAuth identity
+## Choose the OAuth account
 
-- **Personal access:** authorize the Box account the user already uses.
-- **Dedicated Hermes access:** authorize a separate Box account, or an enterprise Managed User created by the Box administrator. A Managed User has normal Box sign-in credentials and can complete OAuth like any other user.
+Authorize the Box account that Hermes should act as. OAuth follows that account's permissions. If the user wants a narrower permission boundary, authorize an account that is invited only to the files, folders, or Hubs Hermes should access. Do not make that account an administrator merely to unlock an exceptional operation.
 
-A dedicated identity is the least-privilege choice for a shared or background Hermes deployment: invite that identity only to the files, folders, or Hubs it needs. Everyone who uses that Hermes deployment receives the access of that one OAuth identity, so do not connect it to a broader personal or administrator account. Before starting the browser flow, make sure the authorization browser is signed in as the intended Box identity.
+Everyone who uses a shared or background Hermes deployment receives the access of the one Box account it authorizes, so do not connect it to a broader personal or administrator account. Before starting the browser flow, make sure the authorization browser is signed in as the intended Box account.
 
-Choose a distinct environment name before signing in: use `hermes-personal-oauth` for personal access and `hermes-dedicated-oauth` for the dedicated identity. Do not overwrite or reauthorize an existing environment until its identity is confirmed.
+Choose a descriptive environment name, such as `hermes-box-oauth`. Do not overwrite or reauthorize an existing environment until its identity is confirmed.
 
 ## Same-host interactive path
 
-Use this path only when the CLI process and the browser in which the user will authorize run on the same host. Do not infer this from operating system alone. If the runtime topology is unclear, ask before starting OAuth. If `box` is not already on `PATH`, install the CLI under the current Hermes home at `tools/box-cli`; use the shell-specific setup in [CLI guide](cli-guide.md). On macOS/Linux, run:
+First ask whether Hermes runs on the same computer as the browser the user will use to authorize Box. Use this path only when they confirm that it does. This is normally a local computer setup. Do not infer this from the operating system alone. If `box` is not already on `PATH`, install the CLI under the current Hermes home at `tools/box-cli`; use the shell-specific setup in [CLI guide](cli-guide.md). On macOS/Linux, run:
 
 ```bash
 BOX_CLI_HOME="${HERMES_HOME:-$HOME/.hermes}/tools/box-cli"
@@ -34,7 +33,7 @@ If `box` already resolves on `PATH`, run the same `box login` and `box users:get
 
 ## Separate-host or headless path
 
-Use this path only after the user explicitly confirms that the CLI and authorization browser are on separate hosts, or that the runtime is headless. Run:
+Use this path only after the user explicitly confirms that Hermes runs on a remote host—such as a VPS, container, or cloud VM—or that it is headless and the authorization browser is on a different computer. Run:
 
 ```bash
 box login --default-box-app --code --name <ENVIRONMENT_NAME>
@@ -52,7 +51,7 @@ box configure:environments:set-current <ENVIRONMENT_NAME>
 box users:get me --json --fields id,name,login
 ```
 
-Request approval before switching the current environment, especially on a shared or background installation. Switch it only after approval and verify the resulting actor. If the returned identity is API-only or has no normal Box login, do not use it as Hermes's runtime identity; connect a personal, dedicated, or Managed User identity through OAuth instead.
+Request approval before switching the current environment, especially on a shared or background installation. Switch it only after approval and verify the resulting actor. If the returned identity is API-only or has no normal Box login, do not use it for Hermes; connect a normal Box account through OAuth instead.
 
 ## Custom OAuth Platform App
 
@@ -62,7 +61,7 @@ Use this path only when the requested operation needs a scope unavailable throug
 box login --platform-app --name <ENVIRONMENT_NAME>
 ```
 
-Let the local CLI prompt for the Client ID and Client Secret. Do not ask the user to paste either value into chat, write either value to Hermes configuration, or reuse a broader administrator identity for normal work. Authenticate the intended user in the browser, then verify the resulting actor. If the operation also requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate a dedicated Hermes identity.
+Let the local CLI prompt for the Client ID and Client Secret. Do not ask the user to paste either value into chat, write either value to Hermes configuration, or reuse a broader administrator identity for normal work. Authenticate the intended user in the browser, then verify the resulting actor. If the operation also requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the account Hermes normally uses.
 
 ## Official links
 

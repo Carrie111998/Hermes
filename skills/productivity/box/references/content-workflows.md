@@ -73,7 +73,7 @@ Report these links for items already known to the caller; they do not create a s
 - File: `https://app.box.com/file/<FILE_ID>`
 - Folder: `https://app.box.com/folder/<FOLDER_ID>`
 
-Include the item ID with the link. If a human cannot open an item visible only to the dedicated OAuth identity, state that rather than creating a link with broader access.
+Include the item ID with the link. If a human cannot open an item visible only to the connected Box account, state that rather than creating a link with broader access.
 
 ## Read and write metadata
 
