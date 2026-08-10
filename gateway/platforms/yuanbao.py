@@ -5077,12 +5077,14 @@ class YuanbaoAdapter(BasePlatformAdapter):
         # them outlives teardown.  Their only removal path is the per-task done
         # callback, so without this they were simply abandoned mid-flight — and
         # an in-flight reconnect would keep trying to revive an adapter that was
-        # deliberately stopped.  Snapshot first: cancelling mutates the set via
-        # that same callback.  The current task is excluded so a shutdown driven
-        # from inside a tracked task cannot await itself.
+        # deliberately stopped.  The snapshot is taken up front, matching the
+        # _inbound_tasks loop above: those done callbacks mutate
+        # _background_tasks as the cancellations land, and the gather below
+        # suspends while they do.  The current task is excluded so a shutdown
+        # driven from inside a tracked task cannot await itself.
         current = asyncio.current_task()
         background = [
-            task for task in self._background_tasks
+            task for task in list(self._background_tasks)
             if task is not current and not task.done()
         ]
         for task in background:
