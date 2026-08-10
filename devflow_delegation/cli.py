@@ -98,7 +98,7 @@ def _cmd_executor(args) -> int:
     counts = run_executor_tick(
         em.ledger, em.allowlist, em.bus, actor=args.actor, pr_client=None, mode="shadow",
     )
-    print(f"processed={counts['processed']} errors={counts['errors']} skipped={counts['skipped']} mode=shadow")
+    print(f"processed={counts['processed']} errors={counts['errors']} skipped={counts['skipped']} mode=shadow pr_client=none")
     return 0 if counts["errors"] == 0 else 1
 
 

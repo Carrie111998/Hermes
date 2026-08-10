@@ -178,7 +178,9 @@ def test_synthetic_executor_cli_has_no_pr_authority(queue_mode, capsys):
     # The production CLI intentionally supplies no PR client. A synthetic flag
     # can expose status/no-op behavior but cannot create a remote PR.
     assert cli.main(["executor", "--synthetic-only"]) == 0
-    assert "mode=shadow" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "mode=shadow" in out
+    assert "pr_client=none" in out
 
 
 def test_executor_shadow_cli_runs_without_pr_authority(queue_mode, capsys):
