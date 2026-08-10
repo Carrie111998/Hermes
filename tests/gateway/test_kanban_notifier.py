@@ -1,6 +1,7 @@
 import asyncio
 import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 
 from gateway.config import Platform
@@ -127,6 +128,34 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
     assert len(adapter.handled) == 1
     assert adapter.handled[0].source.chat_type == "dm"
     assert adapter.handled[0].source.thread_id == "20197"
+
+
+def test_completed_subscription_can_suppress_artifact_delivery(tmp_path, monkeypatch):
+    db_path = tmp_path / "summary-only-completion.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="summary only", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            delivery_metadata={"deliver_artifacts": False},
+        )
+        kb.complete_task(conn, tid, summary="done /tmp/should-not-upload.pdf")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._deliver_kanban_artifacts = AsyncMock()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    runner._deliver_kanban_artifacts.assert_not_awaited()
 
 
 def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
