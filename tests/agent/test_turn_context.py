@@ -179,10 +179,9 @@ def _stub_runtime_main():
     resolution) when the per-test process isolation plugin is disabled. Stub
     it out so the prologue tests stay hermetic.
     """
-    with patch(
-        "agent.auxiliary_client.set_runtime_main", lambda *a, **k: None
-    ), patch(
-        "hermes_cli.config.read_raw_config", return_value={}
+    with (
+        patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None),
+        patch("hermes_cli.config.read_raw_config", return_value={}),
     ):
         yield
 
@@ -441,6 +440,48 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
+
+
+class _TitlingAgent:
+    """Only what ``_maybe_title_session_at_turn_start`` reads off an agent."""
+
+    def __init__(self, platform):
+        self.platform = platform
+        self.session_id = "sess-1"
+        self.model = "test/model"
+        self.provider = "openrouter"
+        self.base_url = "https://openrouter.ai/api/v1"
+        self.api_key = "sk-x"
+        self.api_mode = "chat_completions"
+        self._session_db = MagicMock()
+        self._session_db_created = True
+
+
+def _title_turn(platform, message="Fix the login button"):
+    """Run the prologue's titling step and return the maybe_auto_title mock."""
+    from agent import turn_context
+
+    with patch("agent.title_generator.maybe_auto_title") as titler:
+        turn_context._maybe_title_session_at_turn_start(
+            _TitlingAgent(platform),
+            [{"role": "user", "content": message}],
+        )
+    return titler
+
+
+@pytest.mark.parametrize("platform", ["cli", "telegram", "desktop", "acp", None])
+def test_prologue_titles_the_surfaces_a_person_reads(platform):
+    assert _title_turn(platform).called
+
+
+@pytest.mark.parametrize("platform", ["cron", "CRON", "subagent"])
+def test_prologue_does_not_title_machine_driven_runs(platform):
+    """Cron names its own session after the job, and nobody opens a subagent's.
+
+    Both would otherwise pay a side-LLM call per run for a name that is either
+    overwritten or never read.
+    """
+    assert not _title_turn(platform).called
 
 
 def test_pending_mcp_notice_folds_into_next_real_user_turn_once():
@@ -728,10 +769,9 @@ def test_pending_mcp_server_names_respect_status_and_session_scope():
         {"name": "ready", "status": "connected"},
         {"name": "failed", "status": "failed"},
     ]
-    with patch(
-        "hermes_cli.config.read_raw_config", return_value=raw_config
-    ), patch(
-        "tools.mcp_tool.get_mcp_status", return_value=statuses
+    with (
+        patch("hermes_cli.config.read_raw_config", return_value=raw_config),
+        patch("tools.mcp_tool.get_mcp_status", return_value=statuses),
     ):
         assert _pending_mcp_server_names(None, None) == (
             "configured",
@@ -749,12 +789,15 @@ def test_pending_mcp_server_probe_does_not_import_mcp_stack():
 
     from agent.turn_context import _pending_mcp_server_names
 
-    with patch(
-        "hermes_cli.config.read_raw_config",
-        return_value={"mcp_servers": {"slow-server": {}}},
-    ), patch.dict(
-        sys.modules,
-        {"tools.mcp_tool": None},
+    with (
+        patch(
+            "hermes_cli.config.read_raw_config",
+            return_value={"mcp_servers": {"slow-server": {}}},
+        ),
+        patch.dict(
+            sys.modules,
+            {"tools.mcp_tool": None},
+        ),
     ):
         assert _pending_mcp_server_names(None, None) == ("slow-server",)
 
@@ -772,13 +815,13 @@ def test_pending_mcp_resolution_publishes_superseding_snapshot():
     agent.context_compressor.context_length = 200_000
     config = ToolSearchConfig.from_raw({"listing": "auto"})
 
-    with patch(
-        "agent.turn_context._pending_mcp_server_names",
-        side_effect=[("slow-github",), ()],
-    ), patch(
-        "model_tools.get_tool_definitions", return_value=[]
-    ) as get_defs, patch(
-        "tools.tool_search.load_config", return_value=config
+    with (
+        patch(
+            "agent.turn_context._pending_mcp_server_names",
+            side_effect=[("slow-github",), ()],
+        ),
+        patch("model_tools.get_tool_definitions", return_value=[]) as get_defs,
+        patch("tools.tool_search.load_config", return_value=config),
     ):
         first = _build(agent)
         first_content = first.messages[-1]["content"]
