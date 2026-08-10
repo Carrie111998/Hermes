@@ -55,11 +55,26 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          show_full_output: true
           prompt: |
-            Review this PR for correctness bugs, security issues, type safety,
-            and test coverage gaps on changed behaviour. For each issue found:
-            fix it directly in the code and commit the fix to this branch. After
-            fixing, leave a brief PR comment summarising what was changed and
-            why. Skip style nits caught by the project linter.
-          claude_args: "--model claude-sonnet-4-6 --max-turns 10"
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number }}
 
+            Review this PR. The PR branch is already checked out. Use
+            `gh pr diff` and `gh pr view` to see the changes — do NOT read
+            other files unnecessarily (tight turn budget). Focus on
+            correctness bugs, security issues, and code/config safety.
+
+            Do NOT edit files or commit. Do NOT run tests, linters, or builds.
+
+            Post your review as GitHub comments ONLY — do NOT submit review
+            text as a chat message (the action does not post your final
+            message; you must create the comments yourself):
+            - Use `gh pr comment <PR NUMBER> --body "..."` for a top-level
+              summary (overall findings, or "LGTM — no issues found.").
+            - Use `mcp__github_inline_comment__create_inline_comment` with
+              confirmed: true to annotate a specific line with an issue
+              (severity + issue + suggested fix).
+            If you find no issues, post one top-level "LGTM" comment and stop.
+            Be turn-efficient: `gh pr diff`, then post.
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)" --max-turns 8'
