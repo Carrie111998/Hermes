@@ -137,6 +137,73 @@ def test_credentials_ready_true_for_callable_bearer_provider(monkeypatch):
     assert shell._runtime_credentials_ready() is True
 
 
+def test_credentials_ready_true_for_exact_external_process_contract(monkeypatch):
+    cli = _import_cli()
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: {
+            "provider": "claude-cli",
+            "api_mode": "claude_cli",
+            "api_key": "",
+            "base_url": "",
+            "source": "external-process",
+            "credential_contract": "external_process",
+        },
+    )
+    shell = _make_shell(cli, monkeypatch)
+    assert shell._runtime_credentials_ready() is True
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"provider": "copilot-acp"},
+        {"api_mode": "chat_completions"},
+        {"source": "env/config"},
+        {"api_key": "not-allowed"},
+        {"base_url": "https://not-allowed.invalid"},
+    ],
+)
+def test_credentials_ready_false_for_malformed_external_process_contract(
+    monkeypatch, override
+):
+    cli = _import_cli()
+    runtime = {
+        "provider": "claude-cli",
+        "api_mode": "claude_cli",
+        "api_key": "",
+        "base_url": "",
+        "source": "external-process",
+        "credential_contract": "external_process",
+    }
+    runtime.update(override)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: runtime,
+    )
+    shell = _make_shell(cli, monkeypatch)
+    assert shell._runtime_credentials_ready() is False
+
+
+def test_credentials_ready_fails_closed_for_unknown_contract(monkeypatch):
+    cli = _import_cli()
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: {
+            "provider": "custom",
+            "api_mode": "chat_completions",
+            "api_key": "sk-test",
+            "base_url": "https://example.invalid/v1",
+            "source": "test",
+            "credential_contract": "future_contract",
+        },
+    )
+    shell = _make_shell(cli, monkeypatch)
+    assert shell._runtime_credentials_ready() is False
+
+
 def test_credentials_ready_never_prints(monkeypatch, capsys):
     cli = _import_cli()
 
@@ -250,3 +317,32 @@ def test_empty_key_error_names_actual_provider(monkeypatch, capsys):
     assert "fireworks" in out
     assert "OPENROUTER_API_KEY" not in out
     assert "hermes model" in out or "hermes setup" in out
+
+
+def test_ensure_runtime_credentials_accepts_exact_external_process_contract(
+    monkeypatch, capsys
+):
+    cli = _import_cli()
+    runtime = {
+        "provider": "claude-cli",
+        "api_mode": "claude_cli",
+        "api_key": "",
+        "base_url": "",
+        "source": "external-process",
+        "credential_contract": "external_process",
+    }
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kw: runtime,
+    )
+    shell = _make_shell(cli, monkeypatch)
+    shell.requested_provider = "claude-cli"
+    shell.model = "claude-opus-5"
+    capsys.readouterr()
+
+    assert shell._ensure_runtime_credentials() is True
+    assert shell.provider == "claude-cli"
+    assert shell.api_mode == "claude_cli"
+    assert shell._provider_source == "external-process"
+    assert shell.api_key == ""
+    assert shell.base_url == ""

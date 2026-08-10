@@ -356,6 +356,12 @@ class ClaudeCLIClient:
             raise ClaudeCLIError("claude-cli session is closed", category="closed")
         if self.is_alive():
             return
+        if self._completed_turns:
+            raise ClaudeCLIError(
+                "Claude CLI process exited after a completed turn; refusing to respawn "
+                "without the previous session context",
+                category="lifecycle",
+            )
         if self._popen_factory is _DEFAULT_POPEN:
             available, reason = check_claude_cli_available()
             if not available:

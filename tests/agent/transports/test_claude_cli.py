@@ -226,6 +226,80 @@ def test_two_turns_use_same_process_and_session_with_ordered_deltas():
     assert process.returncode == 0
 
 
+def test_completed_session_refuses_silent_respawn_after_process_exit():
+    first_process = FakeProcess(_turn("session-one", "first", include_init=True))
+    replacement_process = FakeProcess(
+        _turn("session-two", "replacement", include_init=True)
+    )
+    processes = [first_process, replacement_process]
+    spawns = []
+
+    def popen(argv, **kwargs):
+        process = processes[len(spawns)]
+        spawns.append((argv, kwargs))
+        return process
+
+    client = ClaudeCLIClient(popen_factory=popen, env={"HOME": "x"})
+    assert client.run_turn("first").final_text == "first"
+    first_process.returncode = 1
+
+    with pytest.raises(ClaudeCLIError, match="refusing to respawn.*context"):
+        client.run_turn("second")
+
+    assert len(spawns) == 1
+    assert client.completed_turns == 1
+    client.close()
+
+
+@pytest.mark.parametrize(
+    ("replacement_events", "match"),
+    [
+        (_turn("respawned", "unexpected", include_init=False), "Stage-0 initialization"),
+        (
+            [
+                {
+                    "type": "system",
+                    "subtype": "init",
+                    "session_id": "respawned",
+                    "tools": ["Read"],
+                },
+                {"type": "user", "session_id": "respawned"},
+                {
+                    "type": "result",
+                    "session_id": "respawned",
+                    "result": "unexpected",
+                    "is_error": False,
+                },
+            ],
+            "zero-tool",
+        ),
+    ],
+)
+def test_retry_generation_requires_fresh_zero_tool_initialization(
+    replacement_events, match
+):
+    first_process = FakeProcess([])
+    replacement_process = FakeProcess(replacement_events)
+    processes = [first_process, replacement_process]
+    spawns = []
+
+    def popen(*args, **kwargs):
+        del args, kwargs
+        process = processes[len(spawns)]
+        spawns.append(process)
+        return process
+
+    session = ClaudeCLISession(popen_factory=popen, env={"HOME": "x"})
+
+    with pytest.raises(ClaudeCLIError, match=match):
+        session.run_turn("input")
+
+    assert spawns == processes
+    assert session.client is not None
+    assert session.client.generation == 2
+    session.close()
+
+
 @pytest.mark.parametrize(
     "events,match",
     [

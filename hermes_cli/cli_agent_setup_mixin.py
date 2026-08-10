@@ -5,11 +5,11 @@ Extracted from ``cli.py`` as part of the god-file decomposition campaign
 the agent lifecycle/setup cluster: runtime-credential resolution, per-turn agent
 config, first-use agent construction, and resumed-session preload + history recap.
 
-Behavior-neutral: every method is lifted verbatim from ``HermesCLI``. ``self.*``
-calls resolve unchanged via the MRO. Neutral dependencies are imported at module
-top level; ``cli.py``-internal helpers/constants are imported lazily inside each
-method (``from cli import ...`` resolves at call time, when ``cli`` is fully
-loaded) so this module never imports ``cli`` at import time -> no import cycle.
+``self.*`` calls resolve unchanged via the MRO. Neutral dependencies are imported
+at module top level; ``cli.py``-internal helpers/constants are imported lazily
+inside each method (``from cli import ...`` resolves at call time, when ``cli``
+is fully loaded) so this module never imports ``cli`` at import time -> no import
+cycle.
 """
 
 from __future__ import annotations
@@ -17,6 +17,52 @@ from __future__ import annotations
 import sys
 
 from rich.markup import escape as _escape
+
+
+def _validate_runtime_credentials(runtime: object) -> tuple[bool, object, str | None]:
+    """Validate and normalize the resolver's typed credential contract.
+
+    Untagged runtimes retain the existing HTTP credential rules. The dedicated
+    external-process contract is deliberately exact so another provider cannot
+    opt into the Claude CLI path by sharing only ``auth_type``.
+    """
+    if not isinstance(runtime, dict):
+        return False, None, "invalid_runtime"
+
+    api_key = runtime.get("api_key")
+    base_url = runtime.get("base_url")
+
+    if "credential_contract" in runtime:
+        if runtime.get("credential_contract") != "external_process":
+            return False, api_key, "unknown_contract"
+        valid_external_process = (
+            runtime.get("provider") == "claude-cli"
+            and runtime.get("api_mode") == "claude_cli"
+            and runtime.get("source") == "external-process"
+            and api_key == ""
+            and base_url == ""
+        )
+        return (
+            valid_external_process,
+            api_key,
+            None if valid_external_process else "invalid_external_process",
+        )
+
+    has_base_url = isinstance(base_url, str) and bool(base_url)
+    is_callable_provider = callable(api_key) and not isinstance(api_key, str)
+    if is_callable_provider or (isinstance(api_key, str) and bool(api_key)):
+        return (
+            has_base_url,
+            api_key,
+            None if has_base_url else "empty_base_url",
+        )
+
+    # Custom/local HTTP endpoints often ignore auth, but the OpenAI SDK still
+    # requires a non-empty value. Preserve the established placeholder.
+    if has_base_url and "openrouter.ai" not in base_url:
+        return True, "no-key-required", None
+
+    return False, api_key, "missing_api_key"
 
 
 class CLIAgentSetupMixin:
@@ -90,27 +136,11 @@ class CLIAgentSetupMixin:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         resolved_credential_pool = runtime.get("credential_pool")
-        # A callable api_key is a bearer-token provider (Azure Foundry
-        # Entra ID — ``azure_identity_adapter.build_token_provider``).
-        # The OpenAI SDK accepts ``Callable[[], str]`` for ``api_key`` and
-        # invokes it before every request. Skip the string-only validation
-        # and placeholder substitution for callables.
-        _is_callable_provider = callable(api_key) and not isinstance(api_key, str)
-        if not _is_callable_provider and (not isinstance(api_key, str) or not api_key):
-            # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
-            # don't require authentication.  When a base_url IS configured but
-            # no API key was found, use a placeholder so the OpenAI SDK
-            # doesn't reject the request and local servers just ignore it.
-            _source = runtime.get("source", "")
-            _has_custom_base = isinstance(base_url, str) and base_url and "openrouter.ai" not in base_url
-            if _has_custom_base:
-                api_key = "no-key-required"
-                logger.debug(
-                    "No API key for custom endpoint %s (source=%s), "
-                    "using placeholder — local servers typically ignore auth",
-                    base_url, _source,
-                )
-            else:
+        credentials_valid, normalized_api_key, credential_error = (
+            _validate_runtime_credentials(runtime)
+        )
+        if not credentials_valid:
+            if credential_error == "missing_api_key":
                 _prov = (resolved_provider or self.requested_provider or "").strip()
                 if _prov and _prov != "auto":
                     print(f"\n⚠️  No API key found for provider '{_prov}'.")
@@ -119,10 +149,21 @@ class CLIAgentSetupMixin:
                 print("   Run 'hermes model' to choose a provider, or "
                       "'hermes setup' for first-time setup.")
                 return False
-        if not isinstance(base_url, str) or not base_url:
-            print("\n⚠️  Provider resolver returned an empty base URL. "
+            if credential_error == "empty_base_url":
+                print("\n⚠️  Provider resolver returned an empty base URL. "
+                      "Check your provider config or run: hermes setup")
+                return False
+            print("\n⚠️  Provider resolver returned an invalid credential contract. "
                   "Check your provider config or run: hermes setup")
             return False
+        if normalized_api_key == "no-key-required" and api_key != normalized_api_key:
+            logger.debug(
+                "No API key for custom endpoint %s (source=%s), "
+                "using placeholder — local servers typically ignore auth",
+                base_url,
+                runtime.get("source", ""),
+            )
+        api_key = normalized_api_key
 
         credentials_changed = api_key != self.api_key or base_url != self.base_url
         routing_changed = (
@@ -203,20 +244,8 @@ class CLIAgentSetupMixin:
             )
         except Exception:
             return False
-        if not isinstance(runtime, dict):
-            return False
-        api_key = runtime.get("api_key")
-        base_url = runtime.get("base_url")
-        if callable(api_key) and not isinstance(api_key, str):
-            return bool(base_url)
-        if isinstance(api_key, str) and api_key:
-            return bool(base_url)
-        # Keyless custom/local endpoints (ollama, llama.cpp, vLLM…) are fine.
-        return bool(
-            isinstance(base_url, str)
-            and base_url
-            and "openrouter.ai" not in base_url
-        )
+        credentials_valid, _, _ = _validate_runtime_credentials(runtime)
+        return credentials_valid
 
     def _offer_first_run_setup(self) -> bool:
         """Offer the provider picker when no provider is configured at all.

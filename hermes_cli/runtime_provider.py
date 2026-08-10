@@ -1730,6 +1730,7 @@ def resolve_runtime_provider(
             "base_url": "",
             "api_key": "",
             "source": "external-process",
+            "credential_contract": "external_process",
             "requested_provider": "claude-cli",
         }
 

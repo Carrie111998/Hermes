@@ -26,6 +26,7 @@ def test_explicit_runtime_resolution_requires_exact_pair(monkeypatch):
         "base_url": "",
         "api_key": "",
         "source": "external-process",
+        "credential_contract": "external_process",
         "requested_provider": "claude-cli",
     }
 

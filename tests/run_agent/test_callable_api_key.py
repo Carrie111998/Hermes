@@ -235,32 +235,29 @@ class TestBatchRunnerCallableHandling:
 
 
 class TestCliEnsureRuntimeCredentialsCallable:
-    """Regression: ``cli.py:_ensure_runtime_credentials`` previously
-    treated a callable ``api_key`` as "not a string" and overwrote it
-    with the ``"no-key-required"`` placeholder, which then got sent as
-    ``Authorization: Bearer no-key-required`` and rejected by Azure
-    with a 401. This is the most subtle of the callable-api_key audit
-    sites — gated by ``not isinstance(api_key, str)`` rather than the
-    cleaner ``callable(...)`` check used elsewhere.
+    """Regression: runtime credential validation preserves callable keys.
 
-    We verify the source pattern (rather than spinning up a real
-    ``HermesCLI`` instance) — the predicate change is the load-bearing
-    fix and is invariant under the surrounding orchestration code."""
+    A callable ``api_key`` is an Entra bearer-token provider. It must remain
+    callable rather than being normalized to the ``"no-key-required"``
+    placeholder, which would be sent to Azure and rejected with a 401.
+    """
 
-    def test_callable_predicate_present_in_cli_runtime_validation(self):
-        from pathlib import Path
-        # ``_ensure_runtime_credentials`` was extracted from cli.py into the
-        # ``CLIAgentSetupMixin`` (god-file decomposition Phase 4). Read the
-        # module the method actually lives in now.
-        src = (Path(__file__).resolve().parent.parent.parent
-               / "hermes_cli" / "cli_agent_setup_mixin.py").read_text()
-        # The fix introduces ``_is_callable_provider`` which gates the
-        # string-only check so callable token providers survive.
-        assert "_is_callable_provider = callable(api_key)" in src, (
-            "_ensure_runtime_credentials must preserve a callable "
-            "api_key (Entra ID bearer provider). Without the guard, the "
-            "callable is stringified to 'no-key-required' and Azure 401s."
+    def test_callable_key_is_preserved_by_cli_runtime_validation(self):
+        from hermes_cli.cli_agent_setup_mixin import _validate_runtime_credentials
+
+        token_provider = lambda: "synthetic-token"
+        valid, normalized_key, error = _validate_runtime_credentials(
+            {
+                "provider": "azure-foundry",
+                "api_key": token_provider,
+                "base_url": "https://foundry.example.invalid/v1",
+                "source": "entra",
+            }
         )
+
+        assert valid is True
+        assert normalized_key is token_provider
+        assert error is None
 
 
 class TestInlinedDisplayMasks:
