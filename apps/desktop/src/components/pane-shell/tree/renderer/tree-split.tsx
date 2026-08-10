@@ -626,7 +626,9 @@ function Sash({
     <div
       className={cn(
         'group absolute z-20 [-webkit-app-region:no-drag]',
-        horizontal ? 'inset-y-0 left-0 w-[9px] -translate-x-1/2' : 'inset-x-0 top-0 h-[9px] -translate-y-1/2',
+        // Keep the hit target on the incoming pane. Centering it over the
+        // boundary covers the previous pane's right/bottom scrollbar.
+        horizontal ? 'inset-y-0 left-0 w-[5px]' : 'inset-x-0 top-0 h-[5px]',
         disabled ? 'pointer-events-none' : horizontal ? 'cursor-col-resize' : 'cursor-row-resize'
       )}
       onDoubleClick={disabled ? undefined : onDoubleClick}
