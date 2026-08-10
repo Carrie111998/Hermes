@@ -18,6 +18,9 @@ cryptography = false
 nemo-relay = false
 huggingface-hub = false
 h2 = false
+defusedxml = false
+python-olm = false
+unpaddedbase64 = false
 
 [manifest]
 overrides = [
