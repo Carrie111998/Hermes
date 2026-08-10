@@ -1,3 +1,4 @@
+import itertools
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -304,6 +305,94 @@ def test_carried_forward_row_preserves_existing_source(tmp_path):
     anthropic = {p["key"]: p for p in data["providers"]}["anthropic"]
     assert anthropic["state"] == "stale"
     assert anthropic["source"] == "manual"
+
+
+def test_collect_propagates_remaining_budget_and_reports_sanitized_attempts(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+    ticks = itertools.chain((10.0, 10.0, 10.2, 10.2, 10.5, 10.5, 10.7), itertools.repeat(10.8))
+
+    def fetch(provider, *, budget_seconds):
+        calls.append((provider, budget_seconds))
+        if provider == "anthropic":
+            return FakeSnap(True, (FakeWin("Current session", 62.0, None),))
+        if provider == "openai-codex":
+            return FakeSnap(False, (), unavailable_reason="secret URL https://x?token=abc")
+        if provider == "kimi":
+            raise RuntimeError("Bearer secret-token at https://secret.invalid")
+        return FakeSnap(True, (), balance_usd=9.74)
+
+    data = collect(
+        db_path=str(db), prev=None, fetch_usage=fetch, now=NOW,
+        deadline_seconds=5.0, _monotonic=lambda: next(ticks),
+    )
+
+    assert [provider for provider, _ in calls] == [
+        "anthropic", "openai-codex", "kimi", "deepseek",
+    ]
+    assert calls[0][1] == 5.0
+    assert calls[1][1] < calls[0][1]
+    diagnostics = data["diagnostics"]
+    assert diagnostics["deadline_seconds"] == 5.0
+    assert diagnostics["elapsed_ms"] >= 0
+    assert [item["outcome"] for item in diagnostics["providers"][:4]] == [
+        "ok", "unavailable", "exception", "ok",
+    ]
+    assert all(set(item) == {"key", "outcome", "elapsed_ms", "budget_seconds"}
+               for item in diagnostics["providers"])
+    serialized = json.dumps(diagnostics)
+    assert "secret-token" not in serialized
+    assert "https://" not in serialized
+    assert "Bearer" not in serialized
+
+
+def test_collect_stops_starting_providers_after_deadline_and_carries_stale(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+    ticks = itertools.chain((100.0, 100.0), itertools.repeat(102.0))
+    prev = {
+        "providers": [{
+            "key": "openai-codex", "label": "Codex", "mode": "budget",
+            "state": "ok", "windows": [{"used_pct": 50.0}], "detail": "50%",
+        }],
+    }
+
+    def fetch(provider, *, budget_seconds):
+        calls.append(provider)
+        return FakeSnap(True, (FakeWin("Current session", 62.0, None),))
+
+    data = collect(
+        db_path=str(db), prev=prev, fetch_usage=fetch, now=NOW,
+        deadline_seconds=1.0, _monotonic=lambda: next(ticks),
+    )
+
+    assert calls == ["anthropic"]
+    by = {row["key"]: row for row in data["providers"]}
+    assert by["openai-codex"]["state"] == "stale"
+    outcomes = {item["key"]: item["outcome"] for item in data["diagnostics"]["providers"]}
+    assert outcomes["anthropic"] == "deadline_exhausted"
+    assert outcomes["openai-codex"] == "deadline_exhausted"
+    assert outcomes["deepseek"] == "deadline_exhausted"
+    assert outcomes["gemini"] == "deadline_exhausted"
+    assert outcomes["xai"] == "deadline_exhausted"
+    assert outcomes["opencode-go"] == "deadline_exhausted"
+
+
+def test_collect_keeps_one_argument_fetcher_compatibility(tmp_path):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+
+    def legacy_fetch(provider):
+        calls.append(provider)
+        return FakeSnap(False, (), unavailable_reason="no token")
+
+    data = collect(db_path=str(db), prev=None, fetch_usage=legacy_fetch, now=NOW)
+
+    assert calls == ["anthropic", "openai-codex", "kimi", "deepseek"]
+    assert len(data["providers"]) == 7
 
 
 def test_carried_forward_pre_provenance_row_gets_hermes_source(tmp_path):

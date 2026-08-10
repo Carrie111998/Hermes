@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import sqlite3
@@ -63,16 +64,43 @@ def _state_db_row(
     return row
 
 
+def _supports_budget(fetch_usage: Callable[..., object]) -> bool:
+    """Return whether the callable explicitly accepts the cooperative budget."""
+    try:
+        signature = inspect.signature(fetch_usage)
+    except (TypeError, ValueError):
+        return False
+    return "budget_seconds" in signature.parameters or any(
+        parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in signature.parameters.values()
+    )
+
+
+def _diagnostic(key: str, outcome: str, elapsed: float, budget: float) -> dict:
+    return {
+        "key": key,
+        "outcome": outcome,
+        "elapsed_ms": max(0, round(elapsed * 1000)),
+        "budget_seconds": max(0.0, round(budget, 3)),
+    }
+
+
 def collect(
     *,
     db_path: str,
     prev: Optional[dict],
-    fetch_usage: Callable[[str], object],
+    fetch_usage: Callable[..., object],
     now: Optional[datetime] = None,
     manual_store_path: Optional[str] = None,
+    deadline_seconds: float = 90.0,
+    _monotonic: Callable[[], float] = time.monotonic,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
     manual = read_manual_snapshot(manual_store_path, now) if manual_store_path else {}
+    started = _monotonic()
+    deadline_seconds = max(0.0, float(deadline_seconds))
+    deadline = started + deadline_seconds
+    accepts_budget = _supports_budget(fetch_usage)
 
     conn: Optional[sqlite3.Connection] = None
     try:
@@ -82,18 +110,51 @@ def collect(
         conn = None
 
     providers: list[dict] = []
+    attempts: list[dict] = []
     try:
         for key, label, mode in PROVIDERS:
+            attempt_started = _monotonic()
+            remaining = max(0.0, deadline - attempt_started)
+
+            if remaining <= 0:
+                if key in MANUAL_PROVIDER_KEYS and key in manual:
+                    providers.append(dict(manual[key]))
+                elif mode in ("budget", "balance"):
+                    make = budget_provider if mode == "budget" else balance_provider
+                    providers.append(
+                        _carry_forward(prev, key)
+                        or {**make(key, label, None), "source": "official"}
+                    )
+                else:
+                    providers.append(
+                        _carry_forward(prev, key)
+                        or _hermes_error_row(key, label, mode)
+                    )
+                attempts.append(_diagnostic(key, "deadline_exhausted", 0.0, remaining))
+                continue
+
             if key in MANUAL_PROVIDER_KEYS and key in manual:
                 providers.append(dict(manual[key]))
+                attempts.append(_diagnostic(key, "ok", _monotonic() - attempt_started, remaining))
                 continue
 
             if mode in ("budget", "balance"):
                 make = budget_provider if mode == "budget" else balance_provider
+                outcome = "unavailable"
                 try:
-                    snapshot = fetch_usage(key)
+                    if accepts_budget:
+                        snapshot = fetch_usage(key, budget_seconds=remaining)
+                    else:
+                        snapshot = fetch_usage(key)
                 except Exception:
                     snapshot = None
+                    outcome = "exception"
+                finished = _monotonic()
+                if finished >= deadline:
+                    outcome = "deadline_exhausted"
+                elif snapshot is not None and getattr(snapshot, "available", False):
+                    outcome = "ok"
+
                 if snapshot is None or not getattr(snapshot, "available", False):
                     row = _carry_forward(prev, key)
                     if row is None:
@@ -103,14 +164,25 @@ def collect(
                     row = make(key, label, snapshot)
                     row["source"] = "official"
                 providers.append(row)
+                attempts.append(_diagnostic(key, outcome, finished - attempt_started, remaining))
                 continue
 
             providers.append(_state_db_row(key, label, mode, conn, now, prev))
+            attempts.append(_diagnostic(key, "ok", _monotonic() - attempt_started, remaining))
     finally:
         if conn is not None:
             conn.close()
 
-    return {"generated_at": iso(now), "providers": providers}
+    elapsed = max(0.0, _monotonic() - started)
+    return {
+        "generated_at": iso(now),
+        "providers": providers,
+        "diagnostics": {
+            "elapsed_ms": round(elapsed * 1000),
+            "deadline_seconds": deadline_seconds,
+            "providers": attempts,
+        },
+    }
 
 
 def write_atomic(path: Path, data: dict) -> None:
