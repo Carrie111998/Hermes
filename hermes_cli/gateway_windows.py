@@ -36,9 +36,11 @@ import shutil
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
 from hermes_cli._subprocess_compat import (
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
@@ -60,6 +62,27 @@ _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
 _TASK_RESTART_COUNT = 999
+
+_ROOT_GATEWAY_CHILD_SCOPE_ENV_KEYS = (
+    DELEGATED_CHILD_ENV_MARKER,
+    *KANBAN_ENV_KEYS,
+    # Persisted launchers can outlive versions that used these legacy keys.
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_WORKTREE",
+)
+
+
+def root_gateway_subprocess_env(
+    base: Mapping[str, str],
+    overlay: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Build a root-gateway environment without delegated-worker ownership."""
+    env = dict(base)
+    if overlay:
+        env.update(overlay)
+    for key in _ROOT_GATEWAY_CHILD_SCOPE_ENV_KEYS:
+        env.pop(key, None)
+    return env
 
 
 def _schtasks_encoding() -> str:
@@ -420,6 +443,7 @@ def _build_gateway_cmd_script(
         *[_preserve_hermes_home_path(entry) for entry in extra_pythonpath],
     ]
     lines.append(f'set "PYTHONPATH={";".join([*pythonpath_entries, "%PYTHONPATH%"])}"')
+    lines.extend(f'set "{key}="' for key in _ROOT_GATEWAY_CHILD_SCOPE_ENV_KEYS)
 
     prog_args = [python_exe_path, "-m", "hermes_cli.main"]
     if profile_arg:
@@ -505,6 +529,10 @@ def _build_gateway_vbs_script(
         "Else",
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
+        *[
+            f"env.Remove {_quote_vbs_string(key)}"
+            for key in _ROOT_GATEWAY_CHILD_SCOPE_ENV_KEYS
+        ],
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
         # Window style 0 = hidden; bWaitOnReturn False = detached/async. The
         # console python's one console is created hidden and inherited by all
@@ -911,8 +939,9 @@ def _spawn_detached(script_path: Path | None = None) -> int:
     _assert_windows()
     argv, working_dir, env_overlay = _build_gateway_argv()
 
-    # Inherit PATH etc. from the current env, overlay our required vars.
-    env = {**os.environ, **env_overlay}
+    # Inherit PATH etc. while dropping delegated-worker ownership before the
+    # long-lived root gateway process is created.
+    env = root_gateway_subprocess_env(os.environ, env_overlay)
 
     # CREATE_NEW_PROCESS_GROUP 0x00000200 — child gets its own group, won't
     #                                       receive Ctrl+C from our group
