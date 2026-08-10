@@ -139,6 +139,12 @@ def register(ctx) -> None:
     ctx.register_memory_provider(MyMemoryProvider())
 ```
 
+Memory plugins also receive `ctx.llm`, a host-owned `PluginLlm` facade bound to
+the provider directory name. Use it for optional LLM assistance without
+reading API keys or constructing provider clients. Calls that omit provider
+and model overrides inherit the live main Hermes runtime for the active
+session.
+
 ## plugin.yaml
 
 ```yaml

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from agent.memory_provider import MemoryProvider
 from agent.memory_manager import MemoryManager
+from agent.plugin_llm import PluginLlm
 
 # ---------------------------------------------------------------------------
 # Concrete test provider
@@ -402,6 +403,14 @@ class TestPluginMemoryDiscovery:
         from plugins.memory import load_memory_provider
         assert load_memory_provider("nonexistent_provider") is None
 
+    def test_memory_provider_register_context_exposes_host_owned_llm(self):
+        from plugins.memory import _ProviderCollector
+
+        collector = _ProviderCollector(plugin_id="obsidian_duo")
+
+        assert isinstance(collector.llm, PluginLlm)
+        assert collector.llm._plugin_id == "obsidian_duo"
+
 
 class TestUserInstalledProviderDiscovery:
     """Memory providers installed to $HERMES_HOME/plugins/ should be found.
@@ -456,6 +465,36 @@ class TestUserInstalledProviderDiscovery:
         assert p is not None
         assert p.name == "myexternal"
         assert p.is_available()
+
+    def test_load_user_plugin_receives_host_owned_llm(self, tmp_path, monkeypatch):
+        from plugins.memory import load_memory_provider
+
+        plugin_dir = tmp_path / "plugins" / "demo_memory"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "__init__.py").write_text(
+            "from agent.memory_provider import MemoryProvider\n"
+            "\n"
+            "class Demo(MemoryProvider):\n"
+            "    def __init__(self, llm):\n"
+            "        self.llm = llm\n"
+            "    @property\n"
+            "    def name(self): return 'demo_memory'\n"
+            "    def is_available(self): return True\n"
+            "    def initialize(self, session_id, **kwargs): pass\n"
+            "    def get_tool_schemas(self): return []\n"
+            "\n"
+            "def register(ctx):\n"
+            "    ctx.register_memory_provider(Demo(ctx.llm))\n"
+        )
+        monkeypatch.setattr(
+            "plugins.memory._get_user_plugins_dir",
+            lambda: tmp_path / "plugins",
+        )
+
+        provider = load_memory_provider("demo_memory")
+
+        assert provider is not None
+        assert isinstance(provider.llm, PluginLlm)
 
     def test_bundled_takes_precedence(self, tmp_path, monkeypatch):
         """Bundled provider wins when user plugin has the same name."""
