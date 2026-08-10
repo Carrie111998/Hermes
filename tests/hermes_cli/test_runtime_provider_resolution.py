@@ -1144,6 +1144,23 @@ class TestProviderEntryApiKeyEnvAlias:
         assert normalized is not None
         assert "extra_body" in _VALID_CUSTOM_PROVIDER_FIELDS
         assert normalized["extra_body"] == entry["extra_body"]
+
+    def test_prompt_cache_key_capability_is_supported_schema(self):
+        from hermes_cli.config import (
+            _VALID_CUSTOM_PROVIDER_FIELDS,
+            _normalize_custom_provider_entry,
+        )
+
+        entry = {
+            "name": "cache-gateway",
+            "base_url": "https://gateway.example.com/v1",
+            "supports_prompt_cache_key": True,
+        }
+        normalized = _normalize_custom_provider_entry(entry)
+
+        assert normalized is not None
+        assert "supports_prompt_cache_key" in _VALID_CUSTOM_PROVIDER_FIELDS
+        assert normalized["supports_prompt_cache_key"] is True
 # =============================================================================
 # Tencent TokenHub — API-key provider runtime resolution
 # =============================================================================

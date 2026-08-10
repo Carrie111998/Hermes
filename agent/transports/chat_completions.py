@@ -740,7 +740,10 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs,
             messages=sanitized,
             tools=api_kwargs.get("tools"),
-            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            supports_prompt_cache_key=bool(
+                getattr(profile, "supports_prompt_cache_key", False)
+                or params.get("supports_prompt_cache_key")
+            ),
             session_id=params.get("session_id"),
         )
 

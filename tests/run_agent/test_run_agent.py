@@ -1239,6 +1239,18 @@ class TestBuildApiKwargs:
         assert kwargs["messages"] is messages
         assert kwargs["timeout"] == 1800.0
 
+    def test_custom_provider_cache_key_capability_reaches_transport(self, agent):
+        agent.provider = "custom"
+        agent._supports_prompt_cache_key = True
+        messages = [
+            {"role": "system", "content": "You are stable."},
+            {"role": "user", "content": "hi"},
+        ]
+
+        kwargs = agent._build_api_kwargs(messages)
+
+        assert kwargs["prompt_cache_key"].startswith("pck_")
+
     def test_explicit_request_local_tools_reach_native_transport(self, agent, monkeypatch):
         from agent.prompt_caching import build_prompt_cache_plan
 

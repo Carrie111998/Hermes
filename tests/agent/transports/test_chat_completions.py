@@ -647,6 +647,20 @@ class TestPromptCacheKeyCapability:
 
         assert body["prompt_cache_key"] == kwargs["prompt_cache_key"]
 
+    def test_explicit_capability_overrides_default_off_profile(self, transport):
+        from providers.base import ProviderProfile
+
+        kwargs = transport.build_kwargs(
+            model="cache-model",
+            messages=self._messages(),
+            tools=self._tools(),
+            session_id="session-custom-gateway",
+            provider_profile=ProviderProfile(name="custom"),
+            supports_prompt_cache_key=True,
+        )
+
+        assert kwargs["prompt_cache_key"].startswith("pck_")
+
     def test_openai_api_base_url_implies_capability(self, transport):
         """api.openai.com gets the key WITHOUT an explicit flag (exact host)."""
         kwargs = transport.build_kwargs(

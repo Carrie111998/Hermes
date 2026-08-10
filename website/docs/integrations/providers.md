@@ -1271,7 +1271,7 @@ providers:
     transport: anthropic_messages  # for Anthropic-compatible proxies
 ```
 
-Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
+Each entry accepts: `api` (the endpoint base URL — `base_url`/`url` are accepted aliases), `name` (optional display name; defaults to the dict key), `key_env` or inline `api_key`, `transport` (`chat_completions` / `anthropic_messages` / `codex_responses`), `default_model`, `models`, `context_length`, `discover_models`, `supports_prompt_cache_key`, `extra_body`, `extra_headers`, `ssl_ca_cert` / `ssl_verify`, and `enabled: false` to hide an entry without deleting it.
 
 :::note Legacy format
 Older configs used a top-level `custom_providers:` list instead. It still works — Hermes reads both — and `hermes update` auto-migrates it to the `providers:` dict (config v12). Field names differ slightly in the dict format: legacy `model` is `default_model`, and legacy `api_mode` is `transport`.
@@ -1288,6 +1288,22 @@ providers:
       enable_thinking: true
       reasoning_effort: high
 ```
+
+If the endpoint explicitly accepts OpenAI's `prompt_cache_key` request field,
+opt it in with `supports_prompt_cache_key: true`. Hermes then derives a stable,
+session-scoped key from the system prompt and tools instead of requiring a
+hard-coded key:
+
+```yaml
+providers:
+  local-gateway:
+    api: https://gateway.example.com/v1
+    transport: chat_completions
+    supports_prompt_cache_key: true
+```
+
+Leave this off for endpoints that do not document the field; some strict
+OpenAI-compatible servers reject unknown top-level request fields.
 
 Use the shape your server documents. For example, vLLM Gemma deployments and some NVIDIA NIM endpoints expect `enable_thinking` under `chat_template_kwargs` instead of as a top-level `extra_body` field:
 
