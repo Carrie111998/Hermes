@@ -17,7 +17,7 @@ export const Codicon = memo(function Codicon({ className, name, size, spinning, 
     <i
       aria-hidden="true"
       className={cn('codicon', `codicon-${name}`, spinning && 'codicon-modifier-spin', className)}
-      style={{ fontSize: size, ...style }}
+      style={{ ...(size != null && size !== '' ? { fontSize: size } : {}), ...style }}
       {...props}
     />
   )
