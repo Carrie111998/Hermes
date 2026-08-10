@@ -40,6 +40,8 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -918,7 +920,6 @@ class _AsyncCodexCompletionsAdapter:
         self._sync = sync_adapter
 
     async def create(self, **kwargs) -> Any:
-        import asyncio
         return await asyncio.to_thread(self._sync.create, **kwargs)
 
 
@@ -1596,11 +1597,11 @@ def _read_main_model() -> str:
 
     Runtime override: when an AIAgent is active with a CLI/gateway-provided
     model that differs from config.yaml, ``set_runtime_main()`` records the
-    override in a process-local global. This is consulted FIRST so tools
+    override in a context-local value. This is consulted FIRST so tools
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
-    override = _RUNTIME_MAIN_MODEL
+    override = _RUNTIME_MAIN.get()[1]
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
@@ -1627,7 +1628,7 @@ def _read_main_provider() -> str:
     Runtime override: see ``_read_main_model`` — same mechanism for the
     provider half of the runtime tuple.
     """
-    override = _RUNTIME_MAIN_PROVIDER
+    override = _RUNTIME_MAIN.get()[0]
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
@@ -1645,11 +1646,12 @@ def _read_main_provider() -> str:
 
 # Process-local override set by AIAgent at session/turn start. Single-threaded
 # per turn — no lock needed. Cleared by ``clear_runtime_main()``.
-_RUNTIME_MAIN_PROVIDER: str = ""
-_RUNTIME_MAIN_MODEL: str = ""
+_RUNTIME_MAIN: contextvars.ContextVar[tuple[str, str]] = contextvars.ContextVar(
+    "hermes_runtime_main", default=("", "")
+)
 
 
-def set_runtime_main(provider: str, model: str) -> None:
+def set_runtime_main(provider: str, model: str):
     """Record the live runtime provider/model for the current AIAgent.
 
     Called by ``run_agent.AIAgent._sync_runtime_main_for_aux_routing`` (or
@@ -1657,16 +1659,20 @@ def set_runtime_main(provider: str, model: str) -> None:
     ``_read_main_provider`` / ``_read_main_model`` reflect CLI/gateway
     overrides instead of the stale config.yaml default.
     """
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
-    _RUNTIME_MAIN_MODEL = (model or "").strip()
+    return _RUNTIME_MAIN.set((
+        (provider or "").strip().lower(),
+        (model or "").strip(),
+    ))
+
+
+def reset_runtime_main(token) -> None:
+    """Restore the runtime value captured before ``set_runtime_main``."""
+    _RUNTIME_MAIN.reset(token)
 
 
 def clear_runtime_main() -> None:
     """Clear the runtime override (e.g. on session end)."""
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    _RUNTIME_MAIN_PROVIDER = ""
-    _RUNTIME_MAIN_MODEL = ""
+    _RUNTIME_MAIN.set(("", ""))
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:

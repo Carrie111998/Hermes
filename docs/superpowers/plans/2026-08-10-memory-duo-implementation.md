@@ -325,6 +325,7 @@ git commit -m "feat(plugins): add same-provider-only llm fallback policy"
 
 **Files:**
 - Modify: `agent/memory_manager.py`
+- Modify: `agent/auxiliary_client.py` — adapt the existing process-global runtime override to a ContextVar-backed set/reset/clear surface so copied worker contexts retain the submitting route.
 - Modify: `tests/agent/test_memory_provider.py`
 
 **Interfaces:**

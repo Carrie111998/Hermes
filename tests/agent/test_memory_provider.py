@@ -85,6 +85,17 @@ class MetadataMemoryProvider(FakeMemoryProvider):
         self.memory_writes.append((action, target, content, metadata or {}))
 
 
+class RuntimeReadingProvider(FakeMemoryProvider):
+    def __init__(self, name="runtime-reader"):
+        super().__init__(name=name)
+        self.seen_runtime = None
+
+    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+        from agent.auxiliary_client import _read_main_model, _read_main_provider
+
+        self.seen_runtime = (_read_main_provider(), _read_main_model())
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider ABC tests
 # ---------------------------------------------------------------------------
@@ -121,6 +132,62 @@ class TestMemoryProviderABC:
 
 
 class TestMemoryManager:
+    def test_background_sync_inherits_submitting_session_runtime(self):
+        from agent.auxiliary_client import clear_runtime_main, set_runtime_main
+
+        set_runtime_main("opencode-zen", "deepseek/deepseek-v4-flash")
+        try:
+            mgr = MemoryManager()
+            provider = RuntimeReadingProvider("external")
+            mgr.add_provider(provider)
+
+            mgr.sync_all("u", "a", session_id="session-a")
+
+            assert mgr.flush_pending(timeout=5)
+            assert provider.seen_runtime == (
+                "opencode-zen",
+                "deepseek/deepseek-v4-flash",
+            )
+        finally:
+            clear_runtime_main()
+
+    def test_background_sync_keeps_runtime_when_caller_switches_sessions(self):
+        from threading import Event
+
+        from agent.auxiliary_client import reset_runtime_main, set_runtime_main
+
+        started = Event()
+        release = Event()
+
+        class BlockingRuntimeProvider(RuntimeReadingProvider):
+            def sync_turn(self, user_content, assistant_content, *, session_id=""):
+                started.set()
+                release.wait(timeout=5)
+                super().sync_turn(
+                    user_content,
+                    assistant_content,
+                    session_id=session_id,
+                )
+
+        token_a = set_runtime_main("provider-a", "model-a")
+        try:
+            mgr = MemoryManager()
+            provider = BlockingRuntimeProvider("external")
+            mgr.add_provider(provider)
+            mgr.sync_all("u", "a", session_id="session-a")
+            assert started.wait(timeout=5)
+
+            token_b = set_runtime_main("provider-b", "model-b")
+            try:
+                release.set()
+                assert mgr.flush_pending(timeout=5)
+            finally:
+                reset_runtime_main(token_b)
+
+            assert provider.seen_runtime == ("provider-a", "model-a")
+        finally:
+            reset_runtime_main(token_a)
+
     def test_empty_manager(self):
         mgr = MemoryManager()
         assert mgr.providers == []
@@ -223,6 +290,7 @@ class TestMemoryManager:
         mgr.add_provider(p2)
 
         mgr.queue_prefetch_all("next turn")
+        assert mgr.flush_pending(timeout=5)
         assert p1.queued_prefetches == ["next turn"]
         assert p2.queued_prefetches == ["next turn"]
 
@@ -234,6 +302,7 @@ class TestMemoryManager:
         mgr.add_provider(p2)
 
         mgr.sync_all("user msg", "assistant msg")
+        assert mgr.flush_pending(timeout=5)
         assert p1.synced_turns == [("user msg", "assistant msg")]
         assert p2.synced_turns == [("user msg", "assistant msg")]
 
@@ -247,6 +316,7 @@ class TestMemoryManager:
         mgr.add_provider(p2)
 
         mgr.sync_all("user", "assistant")
+        assert mgr.flush_pending(timeout=5)
         # p1 failed but p2 still synced
         assert p2.synced_turns == [("user", "assistant")]
 
@@ -318,6 +388,7 @@ class TestMemoryManager:
         p = FakeMemoryProvider("p")
         mgr.add_provider(p)
         mgr.on_session_end([{"role": "user", "content": "hi"}])
+        assert mgr.flush_pending(timeout=5)
         assert p.session_end_called
 
     def test_on_pre_compress(self):
@@ -871,6 +942,7 @@ class TestCommitMemorySessionRouting:
 
         msgs = [{"role": "user", "content": "hi"}]
         mgr.on_session_end(msgs)
+        assert mgr.flush_pending(timeout=5)
 
         assert builtin.end_calls == [msgs]
         assert external.end_calls == [msgs]
@@ -884,6 +956,7 @@ class TestCommitMemorySessionRouting:
         mgr.add_provider(bad)
 
         mgr.on_session_end([])  # must not raise
+        assert mgr.flush_pending(timeout=5)
 
 
 # ---------------------------------------------------------------------------

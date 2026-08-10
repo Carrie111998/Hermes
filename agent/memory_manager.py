@@ -25,9 +25,12 @@ Usage in run_agent.py:
 
 from __future__ import annotations
 
+import contextvars
+import inspect
 import logging
 import re
-import inspect
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -198,6 +201,39 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        self._background_executor: Optional[ThreadPoolExecutor] = None
+        self._background_futures = []
+        self._background_lock = threading.Lock()
+
+    def _submit_background(self, fn):
+        """Run provider work in a lazy executor with the submitting context."""
+        submission_context = contextvars.copy_context()
+        with self._background_lock:
+            if self._background_executor is None:
+                self._background_executor = ThreadPoolExecutor(
+                    max_workers=4,
+                    thread_name_prefix="hermes-memory",
+                )
+            future = self._background_executor.submit(submission_context.run, fn)
+            self._background_futures.append(future)
+            return future
+
+    def flush_pending(self, timeout: Optional[float] = None) -> bool:
+        """Wait for queued provider work; return whether all work completed."""
+        with self._background_lock:
+            futures = list(self._background_futures)
+        complete = True
+        for future in futures:
+            try:
+                future.result(timeout=timeout)
+            except FutureTimeoutError:
+                complete = False
+                break
+            except Exception:
+                logger.debug("Background memory provider work failed", exc_info=True)
+        with self._background_lock:
+            self._background_futures = [f for f in self._background_futures if not f.done()]
+        return complete
 
     # -- Registration --------------------------------------------------------
 
@@ -304,26 +340,32 @@ class MemoryManager:
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn."""
         for provider in self._providers:
-            try:
-                provider.queue_prefetch(query, session_id=session_id)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
-                    provider.name, e,
-                )
+            def _queue(provider=provider):
+                try:
+                    provider.queue_prefetch(query, session_id=session_id)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
+                        provider.name, e,
+                    )
+
+            self._submit_background(_queue)
 
     # -- Sync ----------------------------------------------------------------
 
     def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Sync a completed turn to all providers."""
         for provider in self._providers:
-            try:
-                provider.sync_turn(user_content, assistant_content, session_id=session_id)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' sync_turn failed: %s",
-                    provider.name, e,
-                )
+            def _sync(provider=provider):
+                try:
+                    provider.sync_turn(user_content, assistant_content, session_id=session_id)
+                except Exception as e:
+                    logger.warning(
+                        "Memory provider '%s' sync_turn failed: %s",
+                        provider.name, e,
+                    )
+
+            self._submit_background(_sync)
 
     # -- Tools ---------------------------------------------------------------
 
@@ -392,13 +434,16 @@ class MemoryManager:
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
         for provider in self._providers:
-            try:
-                provider.on_session_end(messages)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_session_end failed: %s",
-                    provider.name, e,
-                )
+            def _end(provider=provider):
+                try:
+                    provider.on_session_end(messages)
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_session_end failed: %s",
+                        provider.name, e,
+                    )
+
+            self._submit_background(_end)
 
     def on_session_switch(
         self,
@@ -422,18 +467,21 @@ class MemoryManager:
         if not new_session_id:
             return
         for provider in self._providers:
-            try:
-                provider.on_session_switch(
-                    new_session_id,
-                    parent_session_id=parent_session_id,
-                    reset=reset,
-                    **kwargs,
-                )
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_session_switch failed: %s",
-                    provider.name, e,
-                )
+            def _switch(provider=provider):
+                try:
+                    provider.on_session_switch(
+                        new_session_id,
+                        parent_session_id=parent_session_id,
+                        reset=reset,
+                        **kwargs,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Memory provider '%s' on_session_switch failed: %s",
+                        provider.name, e,
+                    )
+
+            self._submit_background(_switch)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Notify all providers before context compression.
@@ -526,6 +574,7 @@ class MemoryManager:
 
     def shutdown_all(self) -> None:
         """Shut down all providers (reverse order for clean teardown)."""
+        self.flush_pending(timeout=5)
         for provider in reversed(self._providers):
             try:
                 provider.shutdown()
@@ -534,6 +583,11 @@ class MemoryManager:
                     "Memory provider '%s' shutdown failed: %s",
                     provider.name, e,
                 )
+        with self._background_lock:
+            executor = self._background_executor
+            self._background_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
         """Initialize all providers.
