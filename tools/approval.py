@@ -2006,6 +2006,13 @@ def _env_split_string_payload(args: list[str]) -> tuple[str | None, bool]:
         if _ENV_ASSIGNMENT_RE.fullmatch(token):
             break
 
+        option_status = "continue"
+        option_consumes_next = False
+        if token.startswith("-"):
+            option_status, option_consumes_next = _classify_env_option(token)
+            if option_status != "continue":
+                return None, False
+
         split_value: str | None = None
         consumed = 1
         long_option, separator, attached_value = token.partition("=")
@@ -2043,7 +2050,7 @@ def _env_split_string_payload(args: list[str]) -> tuple[str | None, bool]:
 
         if token.startswith("-"):
             index += 1
-            if _env_option_consumes_next_arg(token) and index < len(expanded):
+            if option_consumes_next and index < len(expanded):
                 index += 1
             continue
         break
@@ -2104,8 +2111,11 @@ def _env_split_string_findings(command: str):
                         option_phase = False
                         continue
                     if option_phase and resolved.startswith("-"):
+                        option_status, option_consumes_next = _classify_env_option(resolved)
+                        if option_status != "continue":
+                            break
                         split_value_expected = _env_option_owns_split_value(resolved)
-                        option_arg_expected = _env_option_consumes_next_arg(resolved)
+                        option_arg_expected = option_consumes_next
                         continue
                     option_phase = False
                     split_value_expected = False
@@ -2705,7 +2715,15 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
             prefix_words += 1
             continue
         return word_start
-    return current
+    word_start, word_end, word = _read_shell_word(command, current)
+    resolved_boundary, unsupported_boundary = _resolve_env_split_outer_word(word)
+    if (
+        skip_next
+        or unsupported_boundary
+        or (resolved_boundary is not None and resolved_boundary.startswith("-"))
+    ):
+        return -1
+    return word_start if word_start < word_end else current
 
 
 def _mark_unwrapped_executables(command: str) -> str:
@@ -2719,7 +2737,13 @@ def _mark_unwrapped_executables(command: str) -> str:
     offsets: list[int] = []
     for start in _iter_shell_command_starts(command):
         exec_start = _offset_after_command_wrappers(command, start)
-        if exec_start is not None and exec_start > start:
+        if exec_start == -1:
+            return _PARSER_LIMIT_VARIANT
+        if (
+            exec_start is not None
+            and exec_start > start
+            and "\n" not in command[start:exec_start]
+        ):
             offsets.append(exec_start)
     if not offsets:
         return command
@@ -2872,7 +2896,7 @@ def _command_detection_variants(command: str):
         decoded_payload = _deobfuscate_shell_words_preserving_boundaries(variant)
         if decoded_payload not in payload_variants:
             payload_variants.append(decoded_payload)
-        for _ in range(12):
+        for pass_index in range(13):
             added_unwrapped = False
             for base in tuple(payload_variants):
                 unwrapped = _mark_unwrapped_executables(base)
@@ -2880,6 +2904,9 @@ def _command_detection_variants(command: str):
                     payload_variants.append(unwrapped)
                     added_unwrapped = True
             if not added_unwrapped:
+                break
+            if pass_index == 12:
+                yield _PARSER_LIMIT_VARIANT
                 break
 
         for payload_variant in payload_variants:

@@ -996,6 +996,55 @@ class TestAnsiCQuotingBypass:
         assert is_hardline is True
         assert "parser limit" in desc
 
+    def test_wrapper_depth_limit_fails_closed(self, monkeypatch):
+        safe_at_limit = ("command " * 12) + "printf safe"
+        dangerous_at_limit = ("command " * 12) + "rm -rf /"
+        dangerous = ("command " * 13) + "rm -rf /"
+        nested = "env -S " + repr(dangerous)
+        safe = ("command " * 13) + "printf safe"
+
+        assert detect_hardline_command(safe_at_limit) == (False, None)
+        assert detect_hardline_command(("exec " * 12) + "printf safe") == (False, None)
+        assert detect_hardline_command(("sudo " * 12) + "printf safe") == (False, None)
+        assert detect_hardline_command(("env -i " * 6) + "printf safe") == (False, None)
+        assert detect_hardline_command(("env -u HOME " * 4) + "printf safe") == (False, None)
+        is_hardline, desc = detect_hardline_command(dangerous_at_limit)
+        assert is_hardline is True
+        assert "parser limit" not in desc
+
+        for cmd in (dangerous, nested, safe):
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, cmd
+            assert "parser limit" in desc, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        assert approval_module.check_dangerous_command(dangerous, "local")["approved"] is False
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        assert approval_module.check_all_command_guards(dangerous, "local")["approved"] is False
+
+    def test_wrapper_budget_exhaustion_inside_options_fails_closed(self, monkeypatch):
+        commands = (
+            ("sudo " * 12) + "-u root rm -rf /",
+            ("env -i " * 5) + "env -u HOME rm -rf /",
+            ("sudo " * 12) + '"$(printf -- -u)" root rm -rf /',
+            ("sudo " * 12) + '"$OPTION" root rm -rf /',
+            ("sudo " * 12) + "`printf -- -u` root rm -rf /",
+        )
+        for cmd in commands:
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, cmd
+            assert "parser limit" in desc, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for cmd in commands:
+            assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            assert approval_module.check_all_command_guards(cmd, "local")["approved"] is False, cmd
+
     def test_env_assignment_ends_option_parsing(self):
         is_hardline, _ = detect_hardline_command("env FOO=x -S 'rm -rf /'")
         assert is_hardline is False
@@ -1010,6 +1059,15 @@ class TestAnsiCQuotingBypass:
             "env --version rm -rf /",
             "env -0 rm -rf /",
             "env --null rm -rf /",
+            "env --help -S 'rm -rf /'",
+            "env --bogus -S 'rm -rf /'",
+            "env --ignore -S 'rm -rf /'",
+            "env -0 -S 'rm -rf /'",
+            'env --help "$PAYLOAD"',
+            'env --version "$PAYLOAD"',
+            'env --null "$PAYLOAD"',
+            'env --bogus "$PAYLOAD"',
+            'env --ignore "$PAYLOAD"',
         ):
             assert detect_hardline_command(cmd) == (False, None), cmd
 
