@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from pydantic import ValidationError
 from mcp import types as mcp_types
 
 from tools.conduit_decision_return import (
@@ -71,7 +72,7 @@ def test_extended_notification_union_accepts_exact_jsonrpc_envelope() -> None:
     assert isinstance(wrapped.root, ConduitDecisionReturnNotification)
     assert wrapped.root.jsonrpc == "2.0"
 
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         ConduitServerNotification.model_validate({
             "jsonrpc": "1.0",
             "method": "notifications/conduit/decision-return",
