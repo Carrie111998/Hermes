@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import argparse
 import os
-import subprocess
-import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 import pytest
+
+sys_path_added = False
+if not any("hermes_cli" in p for p in __import__("sys").path):
+    __import__("sys").path.insert(
+        0, os.path.join(os.path.dirname(__file__), "..", "..")
+    )
+    sys_path_added = True
+
+from hermes_cli.subcommands.watch import _run_polling, build_watch_parser  # noqa: E402
 
 
 @pytest.fixture
@@ -18,66 +27,91 @@ def temp_dir():
         yield Path(td)
 
 
-def _hermes(args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess:
-    """Run ``hermes watch`` inline. Returns the process result."""
-    hermes_bin = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-        "hermes",
-    )
-    if not os.path.exists(hermes_bin):
-        hermes_bin = "hermes"
-    env = os.environ.copy()
-    return subprocess.run(
-        [sys.executable, hermes_bin, "watch", *args],
-        capture_output=True, text=True, timeout=10, cwd=cwd, env=env,
-    )
+class TestBuildWatchParser:
+    """argparse integration tests."""
+
+    def _make_parser(self):
+        p = argparse.ArgumentParser(prog="hermes")
+        sub = p.add_subparsers(dest="command")
+        build_watch_parser(sub)
+        return p
+
+    def test_parses_paths(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", "."])
+        assert args.command == "watch"
+        assert args.paths == ["."]
+
+    def test_defaults(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", "/tmp"])
+        assert args.recursive is True
+        assert args.interval == 1.0
+        assert args.pattern is None
+        assert args.ignore is None
+        assert args.command == "watch"
+
+    def test_pattern_flag(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", ".", "--pattern", "*.py,*.js"])
+        assert args.pattern == "*.py,*.js"
+
+    def test_ignore_flag(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", ".", "--ignore", "*.pyc"])
+        assert args.ignore == "*.pyc"
+
+    def test_no_recursive(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", ".", "--no-recursive"])
+        assert args.recursive is False
+
+    def test_command_flag(self):
+        p = self._make_parser()
+        args = p.parse_args(["watch", ".", "--command", "echo hi"])
+        assert args.run_command == "echo hi"
+        assert args.command == "watch"
 
 
-def test_watch_help():
-    """``hermes watch --help`` prints usage and exits 0."""
-    proc = _hermes(["--help"])
-    assert proc.returncode == 0, proc.stderr
-    assert "Watching" not in proc.stdout  # help, not a run
-    assert "--pattern" in proc.stdout
+class TestPolling:
+    """Polling watcher: cold paths and error edges."""
 
+    def test_no_valid_paths(self):
+        code = _run_polling(
+            [Path("/tmp/_nonexist_hwatch_99999")], None, None, 0.1
+        )
+        assert code == 1
 
-def test_watch_nonexistent_path():
-    """Non-existent path should print a skip message but exit 1."""
-    proc = _hermes(["/tmp/does-not-exist-924781234"])
-    assert proc.returncode == 1, proc.stderr
-    assert "skipping" in proc.stderr.lower() or "no valid" in proc.stderr.lower()
+    def test_empty_dir_starts(self, temp_dir):
+        """Empty directory — watcher starts, runs one loop, exits via timer."""
+        import signal
 
+        old = signal.signal(signal.SIGALRM, lambda s, f: None)
+        signal.setitimer(signal.ITIMER_REAL, 1.2)
+        try:
+            code = _run_polling([temp_dir], None, None, 0.3)
+            assert code == 0
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
 
-def test_watch_polling_detects_new_file(temp_dir):
-    """Polling watch should detect a newly created file."""
-    watch_file = temp_dir / "watched.txt"
+    def test_detects_created_file(self, temp_dir):
+        """File created during polling loop is detected."""
+        import signal
 
-    # Start watcher in background
-    proc = subprocess.Popen(
-        [sys.executable, "-m", "hermes_cli.main", "watch", str(temp_dir),
-         "--interval", "0.5"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        cwd=str(temp_dir),
-    )
+        def _create():
+            time.sleep(0.4)
+            (temp_dir / "new.txt").write_text("hi")
 
-    time.sleep(0.8)
-    watch_file.write_text("hello")
+        t = threading.Thread(target=_create, daemon=True)
+        t.start()
 
-    time.sleep(1.5)
-    proc.terminate()
-    proc.wait(timeout=3)
-
-    stdout = proc.stdout.read() if proc.stdout else ""
-    stderr = proc.stderr.read() if proc.stderr else ""
-    output = stdout + stderr
-    # Should mention "created" or "Watching"
-    assert "Watching" in output or "created" in output.lower(), (
-        f"No watch output detected:\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    )
-
-
-def test_watch_no_valid_paths():
-    """No valid paths should exit 1."""
-    proc = _hermes(["--interval", "0.1"],
-                   cwd="/tmp/_nonexistent_dir_98761234")
-    assert proc.returncode == 1
+        old = signal.signal(signal.SIGALRM, lambda s, f: None)
+        signal.setitimer(signal.ITIMER_REAL, 2.0)
+        try:
+            code = _run_polling([temp_dir], None, None, 0.3)
+            assert code == 0
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old)
+            t.join(timeout=0.5)

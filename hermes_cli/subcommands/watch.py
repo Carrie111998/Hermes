@@ -207,7 +207,7 @@ def cmd_watch(args: argparse.Namespace) -> int:
 
     if _HAS_WATCHDOG:
         return _run_watchdog(
-            paths, patterns, ignore, args.recursive, args.command
+            paths, patterns, ignore, args.recursive, args.run_command
         )
     else:
         return _run_polling(paths, patterns, ignore, args.interval)
@@ -269,6 +269,7 @@ Examples:
     watch_parser.add_argument(
         "-c",
         "--command",
+        dest="run_command",
         default=None,
         help="Shell command to run after changes are detected",
     )
