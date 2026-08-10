@@ -141,3 +141,36 @@ class TestMessageKeyNormalisation:
 
         with pytest.raises(ValueError, match="message_key"):
             message_key(bad)
+
+
+class TestTrackerIsDeliberatelyUnrouted:
+    """Measured decision, not an oversight — keep it from being "fixed" later.
+
+    The tracker absorbs ~467 messages/7d in ~71 bursts using ~5.4 runs/day.
+    Per-burst activation would raise that to ~10/day, so event dispatch is a
+    REGRESSION for this worker. Its traffic is also largely handled without a
+    model already: APPROVAL_INTENT / STATE_TRANSITION_INTENT go to the
+    IntentApplier, and the operator PIPELINE_UPDATE mirrors are drained every
+    5 minutes by the zero-LLM tracker-operator-drain script.
+
+    See docs/operations/jobflow-event-dispatch.md for the measurement.
+    """
+
+    def test_no_route_targets_the_tracker_worker(self):
+        from jobflow_dispatch.contracts import ROUTES
+
+        destinations = {dest for _mtype, dest in ROUTES}
+        assert "tracker" not in destinations
+
+        targets = {aid for aids in ROUTES.values() for aid in aids}
+        assert not any("tracker" in aid for aid in targets), sorted(targets)
+
+    @pytest.mark.parametrize(
+        "message_type",
+        ("PIPELINE_UPDATE", "SCOUT_DISCOVERY", "VIP_DISCOVERY",
+         "APPROVAL_INTENT", "STATE_TRANSITION_INTENT", "STATUS_REQUEST"),
+    )
+    def test_tracker_traffic_wakes_nobody(self, message_type):
+        from jobflow_dispatch.contracts import route_mailbox
+
+        assert route_mailbox(message_type, "tracker", {}) == ()
