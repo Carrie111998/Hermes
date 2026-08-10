@@ -42,7 +42,7 @@ Use [OpenCode](https://opencode.ai) as an autonomous coding worker orchestrated 
 
 ## Prerequisites
 
-- OpenCode installed: `npm i -g opencode-ai@latest` or `brew install anomalyco/tap/opencode`
+- OpenCode installed: `curl -fsSL https://opencode.ai/install | bash`
 - Auth configured: `opencode auth login` or set provider env vars (OPENROUTER_API_KEY, etc.)
 - Verify: `opencode auth list` should show at least one provider
 - Git repository for code tasks (recommended)
