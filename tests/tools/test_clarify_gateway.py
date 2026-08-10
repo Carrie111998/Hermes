@@ -341,3 +341,25 @@ class TestMultiSelectTextFallback:
         from tools import clarify_gateway as cm
         entry = cm.register("s4", "sk", "Q?", ["A", "B"])
         assert cm._coerce_text_response(entry, "b") == "B"
+
+    def test_single_select_accepts_custom_prose_when_platform_opts_in(self):
+        from tools import clarify_gateway as cm
+        cm.register("s5", "sk", "Q?", ["A", "B"])
+        custom = "Use the repository's existing PR automation"
+        assert cm.resolve_text_response_for_session(
+            "sk",
+            custom,
+            accept_custom=True,
+        ) is True
+        assert cm.wait_for_response("s5", timeout=0.1) == custom
+
+    def test_multi_select_accepts_custom_prose_when_platform_opts_in(self):
+        from tools import clarify_gateway as cm
+        cm.register("m4", "sk", "Q?", ["A", "B"], multi_select=True)
+        custom = "Use neither option"
+        assert cm.resolve_text_response_for_session(
+            "sk",
+            custom,
+            accept_custom=True,
+        ) is True
+        assert cm.wait_for_response("m4", timeout=0.1) == custom

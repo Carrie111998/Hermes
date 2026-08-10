@@ -34,6 +34,7 @@ from gateway.session import SessionSource
 
 
 SESSION_KEY = "agent:main:slack:dm:D123:1111.2222"
+TELEGRAM_SESSION_KEY = "agent:main:telegram:dm:123456789:999"
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -69,6 +70,21 @@ def _event(text):
             thread_id="1111.2222",
         ),
         message_id="msg1",
+    )
+
+
+def _telegram_event(text):
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123456789",
+            chat_type="dm",
+            user_id="123456789",
+            thread_id="999",
+        ),
+        message_id="msg2",
     )
 
 
@@ -132,6 +148,34 @@ async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
 
 
 @pytest.mark.asyncio
+async def test_telegram_prose_resolves_native_multi_choice_as_custom_other():
+    """Telegram's next text should answer a blocking clarify without an extra tap."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    runner._session_key_for_source = lambda source: TELEGRAM_SESSION_KEY
+    cm.register(
+        "cl-telegram",
+        TELEGRAM_SESSION_KEY,
+        "What should I automate?",
+        ["create PRs", "review PRs"],
+    )
+
+    custom = "Inspect the existing PR automation first"
+    result = await _dispatch(runner, _telegram_event(custom))
+
+    assert result == ""
+    with cm._lock:
+        entry = cm._entries.get("cl-telegram")
+    assert entry is not None
+    assert entry.event.is_set()
+    assert entry.response == custom
+    _clear_clarify_state()
+
+
+@pytest.mark.asyncio
 async def test_prose_still_accepted_after_other_flips_text_capture():
     """After the user taps 'Other', free text IS the answer — must resolve."""
     _clear_clarify_state()
@@ -151,5 +195,3 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     assert entry.event.is_set()
     assert entry.response == "a carousel actually"
     _clear_clarify_state()
-
-

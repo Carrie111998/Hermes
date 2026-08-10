@@ -201,13 +201,19 @@ def get_pending_for_session(
         return None
 
 
-def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
+def _coerce_text_response(
+    entry: _ClarifyEntry,
+    response: str,
+    *,
+    accept_custom: bool = False,
+) -> Optional[str]:
     """Map typed choice replies to canonical choice text, otherwise keep or reject custom text.
 
     For native interactive multi-choice clarifies (button UI, awaiting_text=False):
       - Accept numeric selections ("2" → choice[1])
       - Accept exact choice label matches (case-insensitive)
-      - Reject arbitrary prose (return None) so the message continues as a normal turn
+      - Accept arbitrary prose as an "Other" answer when ``accept_custom`` is true
+      - Otherwise reject arbitrary prose so the message continues as a normal turn
 
     For multi-select clarifies (entry.multi_select=True):
       - Accept several numbers separated by commas and/or spaces ("1,3" / "1 3")
@@ -235,9 +241,10 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
         coerced = _coerce_multi_select_text(entry, text)
         if coerced is not None:
             return coerced
-        # Not a parseable selection — accept as custom text only in
-        # awaiting_text mode (the "Other" path); otherwise reject.
-        return text if entry.awaiting_text else None
+        # Not a parseable selection — accept as custom text in explicit
+        # "Other" mode or when the messaging platform opts into treating
+        # its next serialized message as an implicit "Other" response.
+        return text if entry.awaiting_text or accept_custom else None
 
     # Try numeric selection first (always valid for multi-choice)
     try:
@@ -255,7 +262,7 @@ def _coerce_text_response(entry: _ClarifyEntry, response: str) -> Optional[str]:
 
     # For text fallback or awaiting_text mode, accept custom text
     # For native interactive multi-choice mode, reject arbitrary prose
-    if entry.awaiting_text:
+    if entry.awaiting_text or accept_custom:
         return text
 
     return None
@@ -313,17 +320,28 @@ def _coerce_multi_select_text(entry: _ClarifyEntry, text: str) -> Optional[str]:
     return _json.dumps(selected, ensure_ascii=False)
 
 
-def resolve_text_response_for_session(session_key: str, response: str) -> bool:
+def resolve_text_response_for_session(
+    session_key: str,
+    response: str,
+    *,
+    accept_custom: bool = False,
+) -> bool:
     """Resolve the oldest pending clarify in ``session_key`` from typed text.
 
-    Returns False if no pending clarify exists or if the response was rejected
-    (arbitrary prose for native interactive multi-choice clarifies).
+    Returns False if no pending clarify exists or if the response was rejected.
+    Platforms with a serialized conversation, such as Telegram, may pass
+    ``accept_custom=True`` so the next text message acts like choosing
+    "Other" and typing a response in one step.
     """
     entry = get_pending_for_session(session_key, include_choice_prompts=True)
     if entry is None:
         return False
 
-    coerced = _coerce_text_response(entry, response)
+    coerced = _coerce_text_response(
+        entry,
+        response,
+        accept_custom=accept_custom,
+    )
     if coerced is None:
         # Response rejected: message should continue as a normal turn
         return False
