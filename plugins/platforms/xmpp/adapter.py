@@ -690,7 +690,13 @@ class XmppAdapter(BasePlatformAdapter):
             self._process_task = None
         self.client = None
         self._release_platform_lock()
-        self._mark_disconnected()
+        # A one-shot sender's teardown is not the platform's health — see
+        # _on_disconnected. This is the path send_xmpp_message() actually
+        # takes: disconnect() marks state directly rather than relying on
+        # slixmpp's "disconnected" event, so guarding only the handler would
+        # leave the bug fully intact.
+        if not self._ephemeral_sender:
+            self._mark_disconnected()
 
     async def _run_process(self) -> None:
         """slixmpp's process loop runs in the existing asyncio loop."""
@@ -752,6 +758,14 @@ class XmppAdapter(BasePlatformAdapter):
 
     async def _on_disconnected(self, _event: Any) -> None:
         self._session_established = False
+        # A one-shot sender (send_xmpp_message) is a short-lived SECOND
+        # resource on the account, not the platform's health. Its teardown
+        # must not touch shared platform state: observed live, a one-shot
+        # send wrote state=disconnected a second after tearing down while the
+        # gateway's own session was still online, leaving a healthy bridge
+        # reported as dead. Same reasoning as skipping the per-account lock.
+        if self._ephemeral_sender:
+            return
         # A deliberate disconnect(), or a failure we have already reported
         # (e.g. failed_all_auth set a fatal error), needs no escalation —
         # just record the disconnect and let the existing status stand.
@@ -770,6 +784,11 @@ class XmppAdapter(BasePlatformAdapter):
         await self._notify_fatal_error()
 
     async def _on_failed_all_auth(self, _event: Any) -> None:
+        # A one-shot sender's auth failure is that call's problem to report
+        # through its own return value — it must not mark the whole platform
+        # fatal on behalf of a healthy long-lived adapter.
+        if self._ephemeral_sender:
+            return
         # Every SASL mechanism the server offered has been rejected —
         # credentials are wrong or the account is disabled. Non-retryable,
         # and we notify the gateway so the failure actually surfaces instead

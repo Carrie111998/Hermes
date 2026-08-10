@@ -1616,3 +1616,91 @@ class TestXmppOmemoConnect:
             ok = await adapter.connect()
         assert ok is True
         assert "xep_0384" not in registered
+
+
+# ---------------------------------------------------------------------------
+# One-shot sender must not clobber platform health state
+#
+# send_xmpp_message() attaches as a short-lived second resource. It already
+# skips the per-account scoped lock for that reason; it must skip health
+# reporting for the same one. Observed live: a one-shot send wrote
+# state=disconnected over a gateway session that was still online.
+# ---------------------------------------------------------------------------
+
+class TestXmppEphemeralSenderStateIsolation:
+    @pytest.mark.asyncio
+    async def test_ephemeral_teardown_does_not_mark_platform_disconnected(
+        self, monkeypatch
+    ):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter._ephemeral_sender = True
+        adapter._closing = True
+        marked = []
+        adapter._mark_disconnected = lambda *a, **k: marked.append(True)
+
+        await adapter._on_disconnected(None)
+        assert marked == []
+
+    @pytest.mark.asyncio
+    async def test_gateway_teardown_still_marks_platform_disconnected(
+        self, monkeypatch
+    ):
+        # The guard must be narrow: a real gateway close still reports.
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter._closing = True
+        marked = []
+        adapter._mark_disconnected = lambda *a, **k: marked.append(True)
+
+        await adapter._on_disconnected(None)
+        assert marked == [True]
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_disconnect_call_does_not_mark_platform(self, monkeypatch):
+        # disconnect() marks state DIRECTLY rather than via the slixmpp
+        # "disconnected" event, and this is the path send_xmpp_message()
+        # takes — guarding only the handler leaves the bug in place.
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter._ephemeral_sender = True
+        adapter.client = None
+        marked = []
+        adapter._mark_disconnected = lambda *a, **k: marked.append(True)
+
+        await adapter.disconnect()
+        assert marked == []
+
+    @pytest.mark.asyncio
+    async def test_gateway_disconnect_call_still_marks_platform(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter.client = None
+        marked = []
+        adapter._mark_disconnected = lambda *a, **k: marked.append(True)
+
+        await adapter.disconnect()
+        assert marked == [True]
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_auth_failure_does_not_set_platform_fatal(
+        self, monkeypatch
+    ):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter._ephemeral_sender = True
+        fatal = []
+        adapter._set_fatal_error = lambda *a, **k: fatal.append(a)
+        adapter._notify_fatal_error = AsyncMock()
+
+        await adapter._on_failed_all_auth(None)
+        assert fatal == []
+        adapter._notify_fatal_error.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_unexpected_drop_does_not_escalate(self, monkeypatch):
+        adapter = _make_xmpp_adapter(monkeypatch)
+        adapter._ephemeral_sender = True
+        adapter._closing = False
+        fatal = []
+        adapter._set_fatal_error = lambda *a, **k: fatal.append(a)
+        adapter._notify_fatal_error = AsyncMock()
+
+        await adapter._on_disconnected(None)
+        assert fatal == []
+        adapter._notify_fatal_error.assert_not_awaited()
