@@ -307,6 +307,16 @@ def _probe_single_server(
         except (TypeError, ValueError):
             connect_timeout = 30.0
 
+    # The override must reach both timeout layers.  asyncio.wait_for below
+    # bounds the overall probe, while MCPServerTask reads connect_timeout from
+    # its config to bound the HTTP client and initialize handshake.  Passing a
+    # longer timeout only to wait_for caused explicit OAuth logins to cancel
+    # the live HTTP request at the server's shorter configured timeout, then
+    # reconnect into a second browser flow while the first callback listener
+    # still owned its port.
+    config = dict(config)
+    config["connect_timeout"] = connect_timeout
+
     _ensure_mcp_loop()
     tools_found: List[Tuple[str, str]] = []
 

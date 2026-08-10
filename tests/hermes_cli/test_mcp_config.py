@@ -528,6 +528,37 @@ class TestProbeEnvResolution:
         assert tools == [("do_thing", "a tool")]
         assert seen["config"]["headers"]["Authorization"] == "Bearer jwt-token-xyz"
 
+    def test_probe_timeout_override_reaches_transport(self, monkeypatch):
+        """OAuth login timeout must replace the transport's shorter timeout."""
+        import hermes_cli.mcp_config as mc
+
+        seen = {}
+
+        class _FakeServer:
+            _tools = []
+
+            async def shutdown(self):
+                return None
+
+        async def _fake_connect(name, config):
+            seen["config"] = config
+            return _FakeServer()
+
+        monkeypatch.setattr("tools.mcp_tool._connect_server", _fake_connect)
+        original = {
+            "url": "https://mcp.example.com/mcp",
+            "connect_timeout": 10,
+        }
+
+        mc._probe_single_server(
+            "oauth-server",
+            original,
+            connect_timeout=315,
+        )
+
+        assert seen["config"]["connect_timeout"] == 315
+        assert original["connect_timeout"] == 10
+
 
 class TestProbeCapabilityGating:
     """The ``details`` probe must not fire prompts/list or resources/list at
