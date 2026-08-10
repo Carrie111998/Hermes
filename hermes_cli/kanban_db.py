@@ -4856,6 +4856,13 @@ def complete_task(
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
 
+    The legacy ``tasks.result`` column is mirrored from the handoff (R4,
+    output-schemas.md sec. 7) so a done card always carries a
+    human-readable result: an explicit ``result`` wins; otherwise an
+    already-populated ``tasks.result`` is preserved (idempotent — e.g. a
+    retro-fill via ``hermes kanban edit``); otherwise ``summary`` is
+    mirrored into it.
+
     ``created_cards`` is an optional list of task ids the completing
     worker claims to have created. Each id is verified against
     ``tasks.created_by``. If any id is phantom (does not exist or was
@@ -4908,39 +4915,47 @@ def complete_task(
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
+                  SET status       = 'done',
+                      result       = COALESCE(?, tasks.result, ?),
+                      completed_at = ?,
+                      claim_lock   = NULL,
+                      claim_expires= NULL,
+                      worker_pid   = NULL,
+                      block_kind   = NULL,
+                      block_recurrences = 0
+                WHERE id = ?
+                  AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (result, summary, now, task_id),
             )
         else:
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status       = 'done',
-                       result       = ?,
-                       completed_at = ?,
-                       claim_lock   = NULL,
-                       claim_expires= NULL,
-                       worker_pid   = NULL,
-                       block_kind   = NULL,
-                       block_recurrences = 0
-                 WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked')
-                   AND current_run_id = ?
+                  SET status       = 'done',
+                      result       = COALESCE(?, tasks.result, ?),
+                      completed_at = ?,
+                      claim_lock   = NULL,
+                      claim_expires= NULL,
+                      worker_pid   = NULL,
+                      block_kind   = NULL,
+                      block_recurrences = 0
+                WHERE id = ?
+                  AND status IN ('running', 'ready', 'blocked')
+                  AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (result, summary, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
+        # R4 mirror: the legacy ``tasks.result`` column must never stay
+        # NULL on a done card — the COALESCE above already mirrored
+        # summary into it. Read back the landed value so the completed
+        # event payload and the phantom-reference scan reflect exactly
+        # what persisted (same connection sees its own uncommitted write).
+        effective_result = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()["result"]
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -4977,7 +4992,7 @@ def complete_task(
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         completed_payload: dict = {
-            "result_len": len(result) if result else 0,
+            "result_len": len(effective_result) if effective_result else 0,
             "summary": ev_summary or None,
         }
         if verified_cards:
@@ -5005,7 +5020,7 @@ def complete_task(
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
     # time we emit the warning.
-    scan_text = " ".join(filter(None, [summary, result]))
+    scan_text = " ".join(filter(None, [summary, effective_result]))
     if scan_text:
         phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
         # Drop any phantom refs that were already flagged as verified

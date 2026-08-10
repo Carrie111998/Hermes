@@ -612,6 +612,89 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     ]
 
 
+# ---------------------------------------------------------------------------
+# R4: kanban_complete mirrors summary -> tasks.result (t_dc897a67)
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_mirrors_summary_into_result(kanban_home):
+    """A done card must never carry a NULL result: summary is mirrored (R4)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="mirror me")
+        kb.claim_task(conn, t)
+        assert kb.complete_task(conn, t, summary="the handoff summary")
+
+        row = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["result"] == "the handoff summary"
+
+        # The completed event's result_len reflects the mirrored value,
+        # not the (absent) explicit result argument.
+        completed = [e for e in kb.list_events(conn, t) if e.kind == "completed"][-1]
+        assert completed.payload["result_len"] == len("the handoff summary")
+
+        # The structured run record still carries the summary as before.
+        run = kb.latest_run(conn, t)
+        assert run.summary == "the handoff summary"
+
+
+def test_complete_task_preserves_prefilled_result(kanban_home):
+    """COALESCE idempotency: an already-set tasks.result is never overwritten."""
+    with kb.connect() as conn:
+        # Simulate a retro-fill (e.g. `hermes kanban edit` on a done card
+        # later re-opened, or any pre-populated row) — completion with a
+        # summary must preserve it.
+        t = kb.create_task(conn, title="retro-fit")
+        conn.execute("UPDATE tasks SET result = 'prefilled' WHERE id = ?", (t,))
+        conn.commit()
+        assert kb.complete_task(
+            conn, t, summary="worker handoff", metadata={"tests_run": 1},
+        )
+        row = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["result"] == "prefilled"
+
+        # An explicit result argument still wins over both.
+        t2 = kb.create_task(conn, title="explicit wins")
+        conn.execute("UPDATE tasks SET result = 'prefilled' WHERE id = ?", (t2,))
+        conn.commit()
+        assert kb.complete_task(conn, t2, result="explicit", summary="handoff")
+        row2 = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (t2,)
+        ).fetchone()
+        assert row2["result"] == "explicit"
+
+
+def test_edit_completed_task_result_no_double_write(kanban_home):
+    """The `hermes kanban edit` retro-fit path cannot double-write result.
+
+    ``edit_completed_task_result`` only touches ``done`` cards, while
+    ``complete_task`` only accepts ``running|ready|blocked`` — the two
+    writers are mutually exclusive by state, so the R4 mirror can never
+    clobber a retro-fitted result.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="edited")
+        kb.claim_task(conn, t)
+        assert kb.complete_task(conn, t, summary="first handoff")
+        assert kb.edit_completed_task_result(conn, t, result="retro-filled")
+        row = conn.execute(
+            "SELECT status, result FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["status"] == "done"
+        assert row["result"] == "retro-filled"
+
+        # The card is terminal: a re-completion is refused, so the
+        # retro-fitted value can never be overwritten by the mirror.
+        assert kb.complete_task(conn, t, summary="second handoff") is False
+        row = conn.execute(
+            "SELECT result FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        assert row["result"] == "retro-filled"
+
+
 
 
 # ---------------------------------------------------------------------------
