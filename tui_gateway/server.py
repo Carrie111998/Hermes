@@ -6823,8 +6823,24 @@ def _active_image_routing_identity(agent: Any) -> tuple[str, str]:
     )
 
 
+# Per-image cap on desktop image pre-analysis (issue #83291): a single hung
+# vision call must not hold the turn hostage for minutes. On timeout the image
+# degrades to a vision_analyze retry hint instead of stalling the submission.
+_IMAGE_PREANALYSIS_TIMEOUT_S = 120.0
+
+
 def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
-    """Pre-analyze attached images via vision and prepend descriptions to user text."""
+    """Pre-analyze attached images via vision and prepend descriptions to user text.
+
+    Fail-soft by contract: per-image pre-analysis runs under
+    ``_IMAGE_PREANALYSIS_TIMEOUT_S``, and any failure/timeout/interrupt logs the
+    real error to stderr and degrades that image to a ``vision_analyze`` retry
+    hint so the main loop can still analyze it with its own retry. The user's
+    text is always preserved and this function NEVER raises — a broken vision
+    call can never kill the turn (issue #83291: swallowed pre-analysis failures
+    and interrupts during the 60-90s/image window left desktop drag-and-drop
+    attachments with no response or a minutes-long stall).
+    """
     import asyncio, json as _json
     from tools.vision_tools import vision_analyze_tool
 
@@ -6842,7 +6858,12 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
         hint = f"[You can examine it with vision_analyze using image_url: {p}]"
         try:
             r = _json.loads(
-                asyncio.run(vision_analyze_tool(image_url=str(p), user_prompt=prompt))
+                asyncio.run(
+                    asyncio.wait_for(
+                        vision_analyze_tool(image_url=str(p), user_prompt=prompt),
+                        timeout=_IMAGE_PREANALYSIS_TIMEOUT_S,
+                    )
+                )
             )
             desc = r.get("analysis", "") if r.get("success") else None
             parts.append(
@@ -6850,7 +6871,13 @@ def _enrich_with_attached_images(user_text: str, image_paths: list[str]) -> str:
                 if desc
                 else f"[The user attached an image but analysis failed.]\n{hint}"
             )
-        except Exception:
+        except BaseException as _pa_exc:  # noqa: BLE001 — fail-soft, never kill the turn
+            # Visible error (mirrors the CLI warning); the image still degrades
+            # to a retry hint so the main loop can analyze it with its own retry.
+            print(
+                f"[tui_gateway] vision pre-analysis failed for {p}: {_pa_exc!r}",
+                file=sys.stderr,
+            )
             parts.append(f"[The user attached an image but analysis failed.]\n{hint}")
 
     text = user_text or ""
