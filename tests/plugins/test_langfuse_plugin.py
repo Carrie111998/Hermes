@@ -2366,3 +2366,7 @@ class TestCanonicalCostExport:
         )
         assert response_cost == summary_cost
         assert "total" not in response_cost
+        # Subscription-included routes must send NO cost keys at all —
+        # explicit zeros are treated as authoritative by Langfuse and block
+        # its own model-based estimation (#43129).
+        assert response_cost == {}

@@ -780,7 +780,15 @@ def _canonical_usage_and_cost(
 
     cost_details: Dict[str, float] = {}
     try:
-        from agent.usage_pricing import estimate_usage_cost
+        from agent.usage_pricing import estimate_usage_cost, resolve_billing_route
+
+        # Subscription-included routes (e.g. openai-codex): Langfuse treats
+        # provided cost_details as authoritative and will not recalculate
+        # from model pricing when explicit zeros are sent. Omit cost_details
+        # entirely so Langfuse falls back to its own estimation.
+        route = resolve_billing_route(model, provider=provider, base_url=base_url)
+        if getattr(route, "billing_mode", "") == "subscription_included":
+            return usage_details, cost_details
 
         cost = estimate_usage_cost(
             model,
