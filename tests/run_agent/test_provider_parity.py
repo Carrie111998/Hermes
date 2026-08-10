@@ -830,6 +830,30 @@ class TestProviderRouting:
         kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
         assert kwargs["extra_body"]["provider"]["sort"] == "throughput"
 
+    def test_latency_performance_thresholds(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.provider_sort = "latency"
+        agent.provider_preferred_min_throughput = {"p50": 70}
+        agent.provider_preferred_max_latency = {"p50": 0.8, "p90": 3}
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+        assert kwargs["extra_body"]["provider"] == {
+            "sort": "latency",
+            "preferred_min_throughput": {"p50": 70.0},
+            "preferred_max_latency": {"p50": 0.8, "p90": 3.0},
+        }
+
+    def test_preferences_do_not_leak_to_non_aggregator_base_url(self, monkeypatch):
+        agent = _make_agent(monkeypatch, "openrouter")
+        agent.base_url = "https://example.invalid/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent.provider_sort = "latency"
+        agent.provider_preferred_min_throughput = {"p50": 70}
+        agent.provider_preferred_max_latency = {"p50": 0.8}
+
+        kwargs = agent._build_api_kwargs([{"role": "user", "content": "hi"}])
+
+        assert "provider" not in (kwargs.get("extra_body") or {})
+
 
 
 

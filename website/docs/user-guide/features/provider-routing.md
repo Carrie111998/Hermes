@@ -27,6 +27,8 @@ provider_routing:
   order: []               # Explicit provider priority order
   require_parameters: false  # Only use providers that support all parameters
   data_collection: null   # Control data collection ("allow" or "deny")
+  preferred_min_throughput: null  # Soft tokens/second preference
+  preferred_max_latency: null     # Soft latency preference in seconds
 ```
 
 :::info
@@ -101,6 +103,27 @@ Controls whether providers can use your prompts for training. Options are `"allo
 provider_routing:
   data_collection: "deny"
 ```
+
+### Performance thresholds
+
+`preferred_min_throughput` and `preferred_max_latency` are soft preferences.
+They prioritize providers meeting the requested rolling performance threshold
+without disabling fallbacks when no provider currently qualifies. Each accepts
+a positive number or percentile cutoffs (`p50`, `p75`, `p90`, `p99`):
+
+```yaml
+provider_routing:
+  sort: "latency"
+  preferred_min_throughput:
+    p50: 70
+  preferred_max_latency:
+    p50: 0.8
+    p90: 3
+```
+
+Use latency sorting for interactive/tool calls. The `:nitro` model suffix is
+equivalent to `sort: "throughput"` and is better suited to long-form output;
+do not combine it with latency sorting.
 
 ## Practical Examples
 
@@ -181,6 +204,8 @@ providers_order    ← from provider_routing.order
 provider_sort      ← from provider_routing.sort
 provider_require_parameters ← from provider_routing.require_parameters
 provider_data_collection    ← from provider_routing.data_collection
+provider_preferred_min_throughput ← from provider_routing.preferred_min_throughput
+provider_preferred_max_latency    ← from provider_routing.preferred_max_latency
 ```
 
 :::tip
