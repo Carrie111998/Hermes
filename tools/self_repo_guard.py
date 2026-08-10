@@ -715,8 +715,8 @@ def detect_self_repo_git_mutation(
 
 def _block_message(operation: str, root: Path) -> str:
     return (
-        f"Blocked: `{operation}` would rewrite Hermes's live source checkout "
+        f"Blocked: `{operation}` would rewrite Nastech's live source checkout "
         f"({root}) and can mix module versions in this running process. "
         "Use a separate worktree or temporary clone. To change this checkout, "
-        "stop Hermes, run the command externally, then restart Hermes."
+        "stop Nastech, run the command externally, then restart Nastech."
     )

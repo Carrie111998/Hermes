@@ -10,8 +10,8 @@ import {
   recoverInFlightTurnJournal
 } from '@/lib/inflight-turn-journal'
 
-const STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v2:'
-const LEGACY_STORAGE_KEY = 'hermes.desktop.inflightTurnJournal.v1'
+const STORAGE_PREFIX = 'nastech.desktop.inflightTurnJournal.v2:'
+const LEGACY_STORAGE_KEY = 'nastech.desktop.inflightTurnJournal.v1'
 
 function user(id: string, text: string): ChatMessage {
   return { id, role: 'user', parts: [{ type: 'text', text }] }

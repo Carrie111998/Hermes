@@ -55,8 +55,8 @@ vi.mock('@/store/gateway', () => ({
 
 vi.mock('@/lib/desktop-git', () => ({ desktopGit: vi.fn() }))
 
-vi.mock('@/hermes', () => ({
-  getHermesConfig: vi.fn(),
+vi.mock('@/nastech', () => ({
+  getNastechConfig: vi.fn(),
   getProfiles: vi.fn(),
   setApiRequestProfile: vi.fn(),
   STARTUP_REQUEST_TIMEOUT_MS: 1000
@@ -74,8 +74,8 @@ const gatewayAtom = gw.$gateway
 const git = await import('@/lib/desktop-git')
 const desktopGit = vi.mocked(git.desktopGit)
 
-const hermes = await import('@/hermes')
-const getHermesConfig = vi.mocked(hermes.getHermesConfig)
+const nastech = await import('@/nastech')
+const getNastechConfig = vi.mocked(nastech.getNastechConfig)
 const notifications = await import('@/store/notifications')
 const notify = vi.mocked(notifications.notify)
 
@@ -109,7 +109,7 @@ describe('project scope', () => {
 
   it('persists the scope to localStorage', () => {
     enterProject('p_abc')
-    expect(window.localStorage.getItem('hermes.desktop.projectScope')).toBe('p_abc')
+    expect(window.localStorage.getItem('nastech.desktop.projectScope')).toBe('p_abc')
   })
 })
 
@@ -405,7 +405,7 @@ describe('repository discovery policy', () => {
     gatewayWith(request)
     const scanRepos = vi.fn()
     desktopGit.mockReturnValue({ scanRepos } as never)
-    getHermesConfig.mockResolvedValue({
+    getNastechConfig.mockResolvedValue({
       desktop: {
         repo_scan_enabled: false,
         repo_scan_exclude_paths: [],
@@ -432,7 +432,7 @@ describe('repository discovery policy', () => {
     gatewayWith(request)
     const scanRepos = vi.fn().mockResolvedValue([{ label: 'repo', root: '/work/repo' }])
     desktopGit.mockReturnValue({ scanRepos } as never)
-    getHermesConfig.mockResolvedValue({
+    getNastechConfig.mockResolvedValue({
       desktop: {
         repo_scan_enabled: true,
         repo_scan_exclude_paths: ['/work/vendor'],
@@ -442,7 +442,7 @@ describe('repository discovery policy', () => {
 
     await scanAndRecordRepos()
 
-    expect(getHermesConfig).toHaveBeenCalledWith('default')
+    expect(getNastechConfig).toHaveBeenCalledWith('default')
     expect(scanRepos).toHaveBeenCalledWith(['/work'], {
       enabled: true,
       excludePaths: ['/work/vendor']
@@ -465,7 +465,7 @@ describe('repository discovery policy', () => {
     await scanAndRecordRepos(true)
 
     expect(scanRepos).not.toHaveBeenCalled()
-    expect(getHermesConfig).not.toHaveBeenCalled()
+    expect(getNastechConfig).not.toHaveBeenCalled()
   })
 })
 

@@ -40,7 +40,7 @@ const TYPING_SELECTOR = '[data-slot="composer-rich-input"]:focus'
 export function useHudGlass(rootRef: RefObject<HTMLElement | null>, engaged: boolean, backing: boolean): void {
   useEffect(() => {
     const root = rootRef.current
-    const setVibrancy = window.hermesDesktop?.hud?.setVibrancy
+    const setVibrancy = window.nastechDesktop?.hud?.setVibrancy
 
     if (!root || !setVibrancy) {
       return

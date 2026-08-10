@@ -24,7 +24,7 @@ def sample_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     _git(repo, "init")
-    _git(repo, "config", "user.name", "Hermes Tests")
+    _git(repo, "config", "user.name", "Nastech Tests")
     _git(repo, "config", "user.email", "tests@example.com")
 
     (repo / "src").mkdir()
@@ -130,13 +130,13 @@ def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path:
     """
     from agent.context_references import preprocess_context_references
 
-    hermes_home = tmp_path / ".hermes"
-    attachments = hermes_home / "attachments"
+    nastech_home = tmp_path / ".nastech"
+    attachments = nastech_home / "attachments"
     attachments.mkdir(parents=True)
     payload = attachments / "archive.zip"
     payload.write_bytes(b"PK\x03\x04binary-zip-bytes")
 
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("NASTECH_HOME", str(nastech_home))
     monkeypatch.setenv("TERMINAL_ENV", "docker")
 
     result = preprocess_context_references(
@@ -146,8 +146,8 @@ def test_binary_reference_block_maps_host_attachment_to_container_path(tmp_path:
     )
 
     assert result.expanded
-    # Default container base for the docker backend is /root/.hermes.
-    assert "/root/.hermes/attachments/archive.zip" in result.message
+    # Default container base for the docker backend is /root/.nastech.
+    assert "/root/.nastech/attachments/archive.zip" in result.message
     assert "binary file, not inlined" in result.message
 
 
@@ -155,13 +155,13 @@ def test_binary_reference_block_keeps_host_path_on_local_backend(tmp_path: Path,
     """Local backend: no translation — the agent's tools run on the host."""
     from agent.context_references import preprocess_context_references
 
-    hermes_home = tmp_path / ".hermes"
-    attachments = hermes_home / "attachments"
+    nastech_home = tmp_path / ".nastech"
+    attachments = nastech_home / "attachments"
     attachments.mkdir(parents=True)
     payload = attachments / "archive.zip"
     payload.write_bytes(b"PK\x03\x04binary-zip-bytes")
 
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("NASTECH_HOME", str(nastech_home))
     monkeypatch.setenv("TERMINAL_ENV", "local")
 
     result = preprocess_context_references(
@@ -172,7 +172,7 @@ def test_binary_reference_block_keeps_host_path_on_local_backend(tmp_path: Path,
 
     assert result.expanded
     assert str(payload) in result.message
-    assert "/root/.hermes/attachments/" not in result.message
+    assert "/root/.nastech/attachments/" not in result.message
 
 
 
@@ -196,25 +196,25 @@ async def test_blocks_canonical_read_denylist_credential_stores(tmp_path: Path, 
     The narrow in-module list historically missed the real credential stores
     (provider keys, OAuth tokens, MCP tokens, project-local .env). Because the
     gateway routes untrusted remote message text through reference expansion,
-    a chat peer could otherwise attach `@file:~/.hermes/auth.json` and read the
+    a chat peer could otherwise attach `@file:~/.nastech/auth.json` and read the
     operator's keys into context. These must all be refused, with their secret
     bodies kept out of the expanded message.
     """
     from agent.context_references import preprocess_context_references_async
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("NASTECH_HOME", str(tmp_path / ".nastech"))
 
-    hermes_home = tmp_path / ".hermes"
-    (hermes_home).mkdir(parents=True)
+    nastech_home = tmp_path / ".nastech"
+    (nastech_home).mkdir(parents=True)
 
-    auth_json = hermes_home / "auth.json"
+    auth_json = nastech_home / "auth.json"
     auth_json.write_text('{"openai": "sk-AUTHJSON-SECRET"}\n', encoding="utf-8")
 
-    oauth = hermes_home / ".anthropic_oauth.json"
+    oauth = nastech_home / ".anthropic_oauth.json"
     oauth.write_text('{"access_token": "OAUTH-SECRET"}\n', encoding="utf-8")
 
-    mcp_token = hermes_home / "mcp-tokens" / "github.json"
+    mcp_token = nastech_home / "mcp-tokens" / "github.json"
     mcp_token.parent.mkdir(parents=True)
     mcp_token.write_text('{"token": "MCP-TOKEN-SECRET"}\n', encoding="utf-8")
 
@@ -223,8 +223,8 @@ async def test_blocks_canonical_read_denylist_credential_stores(tmp_path: Path, 
     project_env.write_text("DB_PASSWORD=ENV-SECRET\n", encoding="utf-8")
 
     result = await preprocess_context_references_async(
-        "inspect @file:.hermes/auth.json and @file:.hermes/.anthropic_oauth.json "
-        "and @file:.hermes/mcp-tokens/github.json and @file:project/.env",
+        "inspect @file:.nastech/auth.json and @file:.nastech/.anthropic_oauth.json "
+        "and @file:.nastech/mcp-tokens/github.json and @file:project/.env",
         cwd=tmp_path,
         allowed_root=tmp_path,
         context_length=100_000,
@@ -255,11 +255,11 @@ async def test_canonical_guard_fails_closed_when_lookup_raises(tmp_path: Path, m
     from agent.context_references import preprocess_context_references_async
 
     monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("NASTECH_HOME", str(tmp_path / ".nastech"))
 
-    hermes_home = tmp_path / ".hermes"
-    hermes_home.mkdir(parents=True)
-    auth_json = hermes_home / "auth.json"
+    nastech_home = tmp_path / ".nastech"
+    nastech_home.mkdir(parents=True)
+    auth_json = nastech_home / "auth.json"
     auth_json.write_text('{"openai": "sk-AUTHJSON-SECRET"}\n', encoding="utf-8")
 
     def _boom(_path):
@@ -268,7 +268,7 @@ async def test_canonical_guard_fails_closed_when_lookup_raises(tmp_path: Path, m
     monkeypatch.setattr("agent.file_safety.get_read_block_error", _boom)
 
     result = await preprocess_context_references_async(
-        "inspect @file:.hermes/auth.json",
+        "inspect @file:.nastech/auth.json",
         cwd=tmp_path,
         allowed_root=tmp_path,
         context_length=100_000,
@@ -285,7 +285,7 @@ async def test_canonical_guard_fails_closed_when_lookup_raises(tmp_path: Path, m
     "value",
     [
         "/tmp/plain.png",
-        "/Users/me/Library/Application Support/Hermes/composer-images/a.png",
+        "/Users/me/Library/Application Support/Nastech/composer-images/a.png",
         r"C:\Users\John Doe\Pictures\cat.png",
         "/tmp/report (final).pdf",
         "/tmp/it's here.png",

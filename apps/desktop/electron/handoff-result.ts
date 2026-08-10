@@ -2,7 +2,7 @@
  * Consume the detached update hand-off's result file (#82328 follow-up).
  *
  * scripts/desktop-update.ps1 runs hidden/detached — the user never sees its
- * console. It writes HERMES_HOME/.hermes-update-result.json on every exit
+ * console. It writes NASTECH_HOME/.nastech-update-result.json on every exit
  * path; the relaunched Desktop reads it exactly once on boot and surfaces
  * failures (a silent failed update looks identical to "nothing happened",
  * which is how the 2026-08-09 'closed the app then nothing' report was
@@ -23,15 +23,15 @@ export interface HandoffResult {
   branch: string
 }
 
-export function handoffResultPath(hermesHome: string): string {
-  return path.join(hermesHome, '.hermes-update-result.json')
+export function handoffResultPath(nastechHome: string): string {
+  return path.join(nastechHome, '.nastech-update-result.json')
 }
 
 export function readAndConsumeHandoffResult(
-  hermesHome: string,
+  nastechHome: string,
   { now = Date.now, maxAgeMs = HANDOFF_RESULT_MAX_AGE_MS }: { now?: () => number; maxAgeMs?: number } = {}
 ): HandoffResult | null {
-  const file = handoffResultPath(hermesHome)
+  const file = handoffResultPath(nastechHome)
   let raw: string
 
   try {

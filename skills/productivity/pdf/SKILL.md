@@ -2,11 +2,11 @@
 name: pdf
 description: Create, read, merge, fill, and secure PDF files.
 version: 1.0.0
-author: Nous Research
+author: Nastech Research
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
-  hermes:
+  nastech:
     tags: [pdf, documents, forms, reportlab, pypdf, pdfplumber]
     category: productivity
     related_skills: [docx, xlsx, powerpoint, ocr-and-documents]

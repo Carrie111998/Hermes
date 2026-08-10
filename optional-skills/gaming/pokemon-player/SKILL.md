@@ -2,7 +2,7 @@
 name: pokemon-player
 description: "Play Pokemon via headless emulator + RAM reads."
 version: 1.0.0
-author: Teknium (teknium1), Hermes Agent
+author: Teknium (teknium1), Nastech Agent
 license: MIT
 tags: [gaming, pokemon, emulator, pyboy, gameplay, gameboy]
 platforms: [linux, macos, windows]
@@ -20,7 +20,7 @@ Play Pokemon games via headless emulation using the `pokemon-agent` package.
 ## Startup Procedure
 
 ### 1. First-time setup (clone, venv, install)
-The repo is NousResearch/pokemon-agent on GitHub. Clone it, then
+The repo is NastechResearch/pokemon-agent on GitHub. Clone it, then
 set up a Python 3.10+ virtual environment. Use uv (preferred for speed)
 to create the venv and install the package in editable mode with the
 pyboy extra. If uv is not available, fall back to python3 -m venv + pip.

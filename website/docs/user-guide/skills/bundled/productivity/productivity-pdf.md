@@ -17,7 +17,7 @@ Create, read, merge, fill, and secure PDF files.
 | Source | Bundled (installed by default) |
 | Path | `skills/productivity/pdf` |
 | Version | `1.0.0` |
-| Author | Nous Research |
+| Author | Nastech Research |
 | License | MIT |
 | Platforms | linux, macos, windows |
 | Tags | `pdf`, `documents`, `forms`, `reportlab`, `pypdf`, `pdfplumber` |
@@ -26,7 +26,7 @@ Create, read, merge, fill, and secure PDF files.
 ## Reference: full SKILL.md
 
 :::info
-The following is the complete skill definition that Hermes loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
+The following is the complete skill definition that Nastech loads when this skill is triggered. This is what the agent sees as instructions when the skill is active.
 :::
 
 # PDF Skill

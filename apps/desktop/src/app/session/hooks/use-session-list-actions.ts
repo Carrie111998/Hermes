@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef } from 'react'
 
-import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/nastech'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,

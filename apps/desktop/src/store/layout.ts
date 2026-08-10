@@ -27,30 +27,30 @@ export const SIDEBAR_SESSIONS_PAGE_SIZE = 50
 // among the last 50 rows" — so narrowing the view widens the window it reads.
 export const SIDEBAR_FILTERED_PAGE_SIZE = 300
 
-const SIDEBAR_PINNED_STORAGE_KEY = 'hermes.desktop.pinnedSessions'
-const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'hermes.desktop.agentsGroupedByWorkspace'
-const SIDEBAR_CRON_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarCronOpen'
-const SIDEBAR_MESSAGING_OPEN_STORAGE_KEY = 'hermes.desktop.sidebarMessagingOpen'
-const SIDEBAR_SESSION_ORDER_STORAGE_KEY = 'hermes.desktop.sessionOrder'
-const SIDEBAR_SESSION_ORDER_MANUAL_STORAGE_KEY = 'hermes.desktop.sessionOrder.manual'
-const SIDEBAR_GROUPING_STORAGE_KEY = 'hermes.desktop.sidebarGrouping'
-const SIDEBAR_ALL_PROFILES_GROUPING_STORAGE_KEY = 'hermes.desktop.sidebarGrouping.allProfiles'
-const SIDEBAR_SORT_KEY_STORAGE_KEY = 'hermes.desktop.sidebarSortKey'
-const SIDEBAR_ROW_META_STORAGE_KEY = 'hermes.desktop.sidebarRowMeta'
-const SIDEBAR_STATUS_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarStatusFilter'
-const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'hermes.desktop.sidebarShowArchived'
-const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProjectFilter'
-const SIDEBAR_PROFILE_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarProfileFilter'
-const SIDEBAR_PR_FILTER_STORAGE_KEY = 'hermes.desktop.sidebarPrFilter'
-const SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceOrder'
-const SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY = 'hermes.desktop.workspaceParentOrder'
-const SIDEBAR_PROJECT_ORDER_STORAGE_KEY = 'hermes.desktop.projectOrder'
-const SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY = 'hermes.desktop.workspaceCollapsed'
-const SIDEBAR_WORKSPACE_NODE_OPEN_STORAGE_KEY = 'hermes.desktop.workspaceNodeOpen'
-const SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY = 'hermes.desktop.dismissedAutoProjects'
-const SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY = 'hermes.desktop.dismissedWorktrees'
-const PANES_FLIPPED_STORAGE_KEY = 'hermes.desktop.panesFlipped'
-const RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY = 'hermes.desktop.rightRailActiveTab'
+const SIDEBAR_PINNED_STORAGE_KEY = 'nastech.desktop.pinnedSessions'
+const SIDEBAR_AGENTS_GROUPED_STORAGE_KEY = 'nastech.desktop.agentsGroupedByWorkspace'
+const SIDEBAR_CRON_OPEN_STORAGE_KEY = 'nastech.desktop.sidebarCronOpen'
+const SIDEBAR_MESSAGING_OPEN_STORAGE_KEY = 'nastech.desktop.sidebarMessagingOpen'
+const SIDEBAR_SESSION_ORDER_STORAGE_KEY = 'nastech.desktop.sessionOrder'
+const SIDEBAR_SESSION_ORDER_MANUAL_STORAGE_KEY = 'nastech.desktop.sessionOrder.manual'
+const SIDEBAR_GROUPING_STORAGE_KEY = 'nastech.desktop.sidebarGrouping'
+const SIDEBAR_ALL_PROFILES_GROUPING_STORAGE_KEY = 'nastech.desktop.sidebarGrouping.allProfiles'
+const SIDEBAR_SORT_KEY_STORAGE_KEY = 'nastech.desktop.sidebarSortKey'
+const SIDEBAR_ROW_META_STORAGE_KEY = 'nastech.desktop.sidebarRowMeta'
+const SIDEBAR_STATUS_FILTER_STORAGE_KEY = 'nastech.desktop.sidebarStatusFilter'
+const SIDEBAR_SHOW_ARCHIVED_STORAGE_KEY = 'nastech.desktop.sidebarShowArchived'
+const SIDEBAR_PROJECT_FILTER_STORAGE_KEY = 'nastech.desktop.sidebarProjectFilter'
+const SIDEBAR_PROFILE_FILTER_STORAGE_KEY = 'nastech.desktop.sidebarProfileFilter'
+const SIDEBAR_PR_FILTER_STORAGE_KEY = 'nastech.desktop.sidebarPrFilter'
+const SIDEBAR_WORKSPACE_ORDER_STORAGE_KEY = 'nastech.desktop.workspaceOrder'
+const SIDEBAR_WORKSPACE_PARENT_ORDER_STORAGE_KEY = 'nastech.desktop.workspaceParentOrder'
+const SIDEBAR_PROJECT_ORDER_STORAGE_KEY = 'nastech.desktop.projectOrder'
+const SIDEBAR_WORKSPACE_COLLAPSED_STORAGE_KEY = 'nastech.desktop.workspaceCollapsed'
+const SIDEBAR_WORKSPACE_NODE_OPEN_STORAGE_KEY = 'nastech.desktop.workspaceNodeOpen'
+const SIDEBAR_DISMISSED_AUTO_PROJECTS_STORAGE_KEY = 'nastech.desktop.dismissedAutoProjects'
+const SIDEBAR_DISMISSED_WORKTREES_STORAGE_KEY = 'nastech.desktop.dismissedWorktrees'
+const PANES_FLIPPED_STORAGE_KEY = 'nastech.desktop.panesFlipped'
+const RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY = 'nastech.desktop.rightRailActiveTab'
 
 export const CHAT_SIDEBAR_PANE_ID = 'chat-sidebar'
 export const FILE_BROWSER_PANE_ID = 'file-browser'
@@ -492,7 +492,7 @@ export function revealFileInTree(path: string): void {
 
 // Hotkey → focus the sessions search field. Opens the sidebar first, then lets
 // the field (which only mounts when the sidebar is open) subscribe + focus.
-export const SESSION_SEARCH_FOCUS_EVENT = 'hermes:focus-session-search'
+export const SESSION_SEARCH_FOCUS_EVENT = 'nastech:focus-session-search'
 
 export function requestSessionSearchFocus() {
   setSidebarOpen(true)

@@ -2,11 +2,11 @@
 name: xlsx
 description: Create, read, edit Excel .xlsx workbooks and CSVs.
 version: 1.1.0
-author: Nous Research
+author: Nastech Research
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
-  hermes:
+  nastech:
     tags: [excel, spreadsheet, xlsx, csv, openpyxl, productivity]
     category: productivity
     related_skills: [docx, pdf, powerpoint]

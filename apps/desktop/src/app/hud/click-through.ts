@@ -71,7 +71,7 @@ export function hudIgnoresMouse(
 export function useHudClickThrough(rootRef: RefObject<HTMLElement | null>): void {
   useEffect(() => {
     const root = rootRef.current
-    const setIgnoreMouse = window.hermesDesktop?.hud?.setIgnoreMouse
+    const setIgnoreMouse = window.nastechDesktop?.hud?.setIgnoreMouse
 
     if (!root || !setIgnoreMouse) {
       return
@@ -110,7 +110,7 @@ export function useHudClickThrough(rootRef: RefObject<HTMLElement | null>): void
     // test; only where the point came from differs, and on macOS and Windows
     // this never fires. `null` is the cursor leaving the window, which is the
     // `onLost` answer.
-    const offCursor = window.hermesDesktop?.hud?.onCursor?.(next => {
+    const offCursor = window.nastechDesktop?.hud?.onCursor?.(next => {
       point = next
       apply()
     })

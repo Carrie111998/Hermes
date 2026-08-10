@@ -2,11 +2,11 @@
 name: ascii-video
 description: "ASCII video: convert video/audio to colored ASCII MP4/GIF."
 version: 1.0.0
-author: SHL0MS, Hermes Agent
+author: SHL0MS, Nastech Agent
 license: MIT
 platforms: [linux, macos, windows]
 metadata:
-  hermes:
+  nastech:
     tags: [ASCII, Video, FFmpeg, Terminal-Art]
     related_skills: []
 ---
@@ -121,7 +121,7 @@ Don't just pick from the catalog. The catalog is vocabulary — you write the po
 
 Before any code, articulate the creative concept:
 
-- **Mood/atmosphere**: What should the viewer feel? Energetic, meditative, chaotic, elegant, ominous?
+- **Mood/atmosphere**: What should the viewer feel? Energetic, meditative, chaotic, elegant, ominastech?
 - **Visual story**: What happens over the duration? Build tension? Transform? Dissolve?
 - **Color world**: Warm/cool? Monochrome? Neon? Earth tones? What's the dominant hue?
 - **Character texture**: Dense data? Sparse stars? Organic dots? Geometric blocks?

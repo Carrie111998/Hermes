@@ -1,6 +1,6 @@
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
-import type { HermesBranchPullRequest } from '@/global'
+import type { NastechBranchPullRequest } from '@/global'
 import { cn } from '@/lib/utils'
 import { pullRequestBucket } from '@/store/pull-requests'
 
@@ -14,16 +14,16 @@ const PR_STYLE: Record<string, { className: string; icon: string }> = {
   open: { className: 'text-(--ui-green)', icon: 'git-pull-request' }
 }
 
-export function openPullRequest(pr: HermesBranchPullRequest): void {
+export function openPullRequest(pr: NastechBranchPullRequest): void {
   if (pr.url) {
-    void window.hermesDesktop?.openExternal?.(pr.url)
+    void window.nastechDesktop?.openExternal?.(pr.url)
   }
 }
 
 /** The branch's PR as a row chip: state glyph plus number, tooltipped with the
  *  title, and a link to the PR on click. Identity like {@link ProfileTag} —
  *  never a status dot. */
-export function PrTag({ className, pr }: { className?: string; pr: HermesBranchPullRequest }) {
+export function PrTag({ className, pr }: { className?: string; pr: NastechBranchPullRequest }) {
   const style = PR_STYLE[pullRequestBucket(pr)] ?? PR_STYLE.open
 
   return (

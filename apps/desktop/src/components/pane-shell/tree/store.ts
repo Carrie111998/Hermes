@@ -44,9 +44,9 @@ import { rootChildSide } from './renderer/track-model'
 
 // v2: v1 trees were saved against placeholder panes with index-order zone
 // assignment (chat could land in a corner cell). Retire them wholesale.
-const STORAGE_KEY = 'hermes.desktop.layoutTree.v2'
+const STORAGE_KEY = 'nastech.desktop.layoutTree.v2'
 
-writeKey('hermes.desktop.layoutTree.v1', null)
+writeKey('nastech.desktop.layoutTree.v1', null)
 
 let defaultTree: LayoutNode | null = null
 
@@ -77,11 +77,11 @@ export const $layoutTree = atom<LayoutNode | null>(isSecondaryWindow() ? null : 
  * Which layout preset the current tree came from; `'custom'` after the user
  * rearranges anything. Drives the picker's active highlight.
  */
-export const $activePresetId = atom<string>(readKey('hermes.desktop.layoutPreset.active') ?? 'default')
+export const $activePresetId = atom<string>(readKey('nastech.desktop.layoutPreset.active') ?? 'default')
 
 export function markActivePreset(id: string) {
   $activePresetId.set(id)
-  writeKey('hermes.desktop.layoutPreset.active', id)
+  writeKey('nastech.desktop.layoutPreset.active', id)
 }
 
 /** Pane id being dragged (tree drag session), null when idle. Also set to the
@@ -176,7 +176,7 @@ function frontPaneInGroup(paneId: string) {
  *    from the tree and remembered so adoption doesn't re-add it. Reveal
  *    intent (a preview target, ⌘G) or a layout reset un-dismisses.
  */
-const DISMISSED_KEY = 'hermes.desktop.dismissedPanes.v1'
+const DISMISSED_KEY = 'nastech.desktop.dismissedPanes.v1'
 
 function loadDismissed(): ReadonlySet<string> {
   return new Set(readJson<string[]>(DISMISSED_KEY) ?? [])
@@ -202,7 +202,7 @@ function setDismissed(paneId: string, dismissed: boolean) {
 // re-opening it docks at the size the user left it. Without this every
 // re-open split the anchor zone [1, 1] again: each agent-triggered browser
 // open re-took half the chat, whatever the user had resized it to.
-const PANE_SHARE_KEY = 'hermes.desktop.paneShare.v1'
+const PANE_SHARE_KEY = 'nastech.desktop.paneShare.v1'
 
 const paneShares: Record<string, number> = readJson<Record<string, number>>(PANE_SHARE_KEY) ?? {}
 
@@ -1210,7 +1210,7 @@ function commit(next: LayoutNode | null) {
 // Presets and resets hand placement back to the app.
 // ---------------------------------------------------------------------------
 
-const USER_PLACED_KEY = 'hermes.desktop.userPlacedPanes.v1'
+const USER_PLACED_KEY = 'nastech.desktop.userPlacedPanes.v1'
 
 export const $userPlacedPanes = atom<ReadonlySet<string>>(new Set(readJson<string[]>(USER_PLACED_KEY) ?? []))
 
@@ -1731,7 +1731,7 @@ export function resetLayoutTree() {
 
 // Dev hook for automation.
 if ((import.meta.env.DEV || import.meta.env.VITE_PERF_PROBE === '1') && typeof window !== 'undefined') {
-  ;(window as unknown as Record<string, unknown>).__HERMES_LAYOUT_TREE__ = {
+  ;(window as unknown as Record<string, unknown>).__NASTECH_LAYOUT_TREE__ = {
     close: closeTreePane,
     dismissed: () => $dismissedPanes.get(),
     get: () => $layoutTree.get(),

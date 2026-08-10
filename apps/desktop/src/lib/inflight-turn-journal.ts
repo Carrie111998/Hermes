@@ -21,8 +21,8 @@ import { type ChatMessage, type ChatMessagePart, chatMessageText } from '@/lib/c
  *  with a grid of concurrent streams that was a whole-store JSON round-trip
  *  dozens of times a second, all on the main thread. Per-session keys make a
  *  write O(own tail) regardless of how many other sessions are streaming. */
-const STORAGE_PREFIX = 'hermes.desktop.inflightTurnJournal.v2:'
-const LEGACY_STORAGE_KEY = 'hermes.desktop.inflightTurnJournal.v1'
+const STORAGE_PREFIX = 'nastech.desktop.inflightTurnJournal.v2:'
+const LEGACY_STORAGE_KEY = 'nastech.desktop.inflightTurnJournal.v1'
 const MAX_ENTRIES = 24
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
 /** Streaming repaints arrive every ~33ms; localStorage writes are synchronous.
