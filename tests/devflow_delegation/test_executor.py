@@ -341,6 +341,48 @@ def test_non_explicit_source_real_target_is_skipped(tmp_path):
     assert ledger.get_request(rejected.request_id)["state"] == "PLANNED"
 
 
+def test_canary_pr_budget_is_fail_closed_after_one_pr(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    ledger, first = _planned_ledger(tmp_path)
+
+    # A second explicit PLANNED request on the same target.
+    second = _request()
+    second.idempotency_key = "test:second:v1"
+    ledger.insert_request(second)
+    transition(ledger, None, second.request_id, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(
+        second.request_id, "operator", "approve", "fixture setup", f"token-{second.request_id}"
+    )
+    transition(ledger, None, second.request_id, "PLANNED", actor="operator")
+
+    allowlist = _allowlist(_canary_target(repo, tmp_path, command=_write_source_command()))
+
+    # First canary consumes the budget of 1.
+    r1 = run_executor_tick(ledger, allowlist, None, pr_client=FakePrClient(), mode="canary", request_id=first.request_id)
+    assert r1["processed"] == 1
+    assert ledger.get_request(first.request_id)["state"] == "MERGE_PENDING"
+
+    # Second canary is refused with no transition (still PLANNED, no new PR artifact).
+    r2 = run_executor_tick(ledger, allowlist, None, pr_client=FakePrClient(), mode="canary", request_id=second.request_id)
+    assert r2 == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(second.request_id)["state"] == "PLANNED"
+    assert [i["kind"] for i in ledger.artifacts_for(second.request_id)] == []
+
+
+def test_shadow_ignores_pr_budget(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    # Pre-seed a PR artifact so the budget of 1 is already spent.
+    ledger.add_artifact(request.request_id, "pr", "https://example.test/pr/already")
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+    )  # default shadow — budget must not block
+
+    assert result["processed"] == 1
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+
+
 def test_executor_metadata_file_is_not_committed(tmp_path):
     repo = _fixture_repo(tmp_path)
     ledger, request = _planned_ledger(tmp_path)

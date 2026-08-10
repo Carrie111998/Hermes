@@ -310,6 +310,17 @@ def _stage_commit_push(
     )
 
 
+def _pr_budget_exhausted(ledger: DelegationLedger, target: TargetConfig, target_repo: str) -> bool:
+    """True when the durable per-window PR budget for a target is spent.
+
+    Fail-closed and independent of the gate.py merge/deploy window budget.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=target.pr_budget_window_hours)).isoformat()
+    return ledger.count_prs_for_target_since(target_repo, since) >= target.pr_budget
+
+
 def _planned_rows(ledger: DelegationLedger) -> list[Dict[str, Any]]:
     # Scan the entire bounded window so an ineligible row cannot starve an
     # eligible explicit synthetic request. Stable oldest-first order aids audit.
@@ -433,6 +444,14 @@ def run_executor_tick(
     request_id = row["request_id"]
     target = resolve_target(allowlist, row["target_repo"])
     assert target is not None  # established by _target_is_eligible
+
+    # Canary-only precondition: a durable per-window PR budget, checked before
+    # any mutation so an exhausted budget leaves the request PLANNED (no
+    # transition, fail-closed). Shadow never opens a PR, so it never consumes it.
+    if mode == "canary" and _pr_budget_exhausted(ledger, target, row["target_repo"]):
+        logger.warning("canary refused: PR budget exhausted for %s", row["target_repo"])
+        return {"processed": 0, "errors": 0, "skipped": skipped}
+
     checkout_path: Optional[Path] = None
     worktree_path: Optional[Path] = None
     branch = ""
