@@ -8711,6 +8711,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             )
 
+        if not removed_ids and not updates:
+            return
+
         def _do(conn):
             if removed_ids:
                 placeholders = ",".join("?" for _ in removed_ids)
