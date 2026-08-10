@@ -3450,8 +3450,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return err
         db = await self._ensure_session_db_async()
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
-        if not fork_id or re.search(r'[\r\n\x00]', fork_id):
+        if not fork_id:
             return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
+        rejected = self._reject_unsafe_session_id(fork_id)
+        if rejected is not None:
+            return rejected
         if await asyncio.to_thread(db.get_session, fork_id):
             return web.json_response(_openai_error(f"Session already exists: {fork_id}", code="session_exists"), status=409)
 
