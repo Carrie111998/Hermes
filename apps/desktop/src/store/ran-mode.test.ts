@@ -1960,6 +1960,28 @@ describe('Ran Mode state transaction', () => {
     expect(window.localStorage.getItem('hermes.desktop.statusbarVisible')).toBe(durableBefore.statusbar)
   })
 
+  it('isolates panes flipped while preserving upstream right-rail persistence in auxiliary renderers', async () => {
+    vi.doMock('@/store/windows', async importOriginal => {
+      const actual = await importOriginal<Record<string, unknown>>()
+
+      return { ...actual, isAuxiliaryWindow: () => true }
+    })
+
+    window.localStorage.setItem('hermes.desktop.panesFlipped', 'true')
+    window.localStorage.setItem('hermes.desktop.rightRailActiveTab', 'url:https://example.com/primary')
+
+    const layout = await import('@/store/layout')
+
+    expect(layout.$panesFlipped.get()).toBe(false)
+    expect(layout.$rightRailActiveTabId.get()).toBe('url:https://example.com/primary')
+
+    layout.$panesFlipped.set(true)
+    layout.selectRightRailTab('file:C:/work/auxiliary.md')
+
+    expect(window.localStorage.getItem('hermes.desktop.panesFlipped')).toBe('true')
+    expect(window.localStorage.getItem('hermes.desktop.rightRailActiveTab')).toBe('file:C:/work/auxiliary.md')
+  })
+
   it('does not let a delayed live-record removal overwrite newer non-layout owned state', async () => {
     const { ran, review } = await loadHarness()
 

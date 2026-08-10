@@ -78,12 +78,10 @@ export const $fileBrowserOpen: ReadableAtom<boolean> = computed(
 
 // Persisted so a relaunch reopens the same rail tab. Null when the rail has no
 // tabs; a restored id with no matching tab is reconciled in the preview store.
-export const $rightRailActiveTabId = isAuxiliaryWindow()
-  ? atom<RightRailTabId | null>(null)
-  : persistentAtom<RightRailTabId | null>(RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY, null, {
-      decode: raw => (raw ? (raw as RightRailTabId) : null),
-      encode: tabId => tabId ?? ''
-    })
+export const $rightRailActiveTabId = persistentAtom<RightRailTabId | null>(RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY, null, {
+  decode: raw => (raw ? (raw as RightRailTabId) : null),
+  encode: tabId => tabId ?? ''
+})
 
 export const $sidebarWidth: ReadableAtom<number> = computed($paneStates, states => {
   const override = states[CHAT_SIDEBAR_PANE_ID]?.widthOverride
