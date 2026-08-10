@@ -11644,7 +11644,7 @@ function terminalShellEnv() {
   delete env.COLORFGBG
 
   env.COLORTERM = 'truecolor'
-  env.LC_CTYPE = env.LC_CTYPE || 'UTF-8'
+  env.LC_CTYPE = env.LC_CTYPE || 'C.UTF-8'
   env.TERM = 'xterm-256color'
   env.TERM_PROGRAM = 'Hermes'
   env.TERM_PROGRAM_VERSION = app.getVersion()
