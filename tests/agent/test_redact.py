@@ -2,6 +2,7 @@
 
 import json
 import logging
+import tracemalloc
 
 import pytest
 
@@ -155,6 +156,19 @@ class TestJsonFields:
         parsed = json.loads(result)
         assert "password" in parsed
         assert "long_secret" not in parsed["password"]
+
+    def test_json_long_value_uses_bounded_auxiliary_memory(self):
+        value_size = 250_000
+        text = '{"password": "' + ("x" * value_size) + '"}'
+        tracemalloc.start()
+        try:
+            result = redact_sensitive_text(text, force=True)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert result == '{"password": "xxxxxx...xxxx"}'
+        assert peak < value_size * 12
 
 
 class TestAuthHeaders:

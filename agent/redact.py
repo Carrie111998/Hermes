@@ -259,14 +259,13 @@ def _key_has_secret_keyword(key: str) -> bool:
             return True
     return False
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
-# Value match is escape-aware (``(?:\\.|[^"\\])+``): a naive ``[^"]+`` stops at
-# the first raw ``"`` inside an escaped quote (``\"``), masking only the prefix
-# and leaving the remainder in cleartext while corrupting JSON shape
-# (``"***"bar...``). See RD-005 / sibling escape-aware JSON matchers.
+# JSON field prefixes: "apiKey": ", "token": ", etc.  Values are scanned by
+# _redact_json_fields rather than captured by a repeated regex alternation.  CPython's
+# regex engine retains a large amount of state for ``(?:\\.|[^"\\])+`` on long
+# attacker-controlled values, while the scanner uses constant auxiliary memory.
 _JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
-_JSON_FIELD_RE = re.compile(
-    rf'("{_JSON_KEY_NAMES}")\s*:\s*"((?:\\.|[^"\\])+)"',
+_JSON_FIELD_START_RE = re.compile(
+    rf'("{_JSON_KEY_NAMES}")\s*:\s*"',
     re.IGNORECASE,
 )
 
@@ -496,9 +495,11 @@ def _json_raw_escape_len(s: str, i: int) -> int:
     return 2
 
 
-def _json_raw_safe_cuts(s: str) -> list[int]:
-    """Indices where a cut does not land inside a JSON escape sequence."""
-    cuts = [0]
+def _json_raw_safe_cuts(s: str, head: int, tail: int) -> tuple[int, int]:
+    """Return prefix/suffix cuts without retaining per-character boundaries."""
+    prefix_end = 0
+    suffix_start = len(s)
+    suffix_target = len(s) - tail
     i = 0
     while i < len(s):
         if s[i] == "\\":
@@ -508,8 +509,11 @@ def _json_raw_safe_cuts(s: str) -> list[int]:
             i += elen
         else:
             i += 1
-        cuts.append(i)
-    return cuts
+        if i <= head:
+            prefix_end = i
+        if suffix_start == len(s) and i >= suffix_target:
+            suffix_start = i
+    return prefix_end, suffix_start
 
 
 def _mask_json_field_value(value: str, *, head: int = 6, tail: int = 4, floor: int = 18) -> str:
@@ -524,14 +528,44 @@ def _mask_json_field_value(value: str, *, head: int = 6, tail: int = 4, floor: i
         return "***"
     if len(value) < floor:
         return "***"
-    cuts = _json_raw_safe_cuts(value)
-    prefix_end = max(c for c in cuts if c <= head)
-    target = len(value) - tail
-    suffix_candidates = [c for c in cuts if c >= target]
-    suffix_start = suffix_candidates[0] if suffix_candidates else cuts[-1]
+    prefix_end, suffix_start = _json_raw_safe_cuts(value, head, tail)
     if prefix_end >= suffix_start:
         return "***"
     return f"{value[:prefix_end]}...{value[suffix_start:]}"
+
+
+def _redact_json_fields(text: str) -> str:
+    """Mask sensitive quoted JSON fields with bounded auxiliary memory."""
+    parts: list[str] = []
+    copied_to = 0
+    search_from = 0
+    while match := _JSON_FIELD_START_RE.search(text, search_from):
+        value_start = match.end()
+        i = value_start
+        while i < len(text):
+            if text[i] == "\\":
+                if i + 1 >= len(text):
+                    i = len(text)
+                    break
+                i += 2
+                continue
+            if text[i] == '"':
+                break
+            i += 1
+        if i >= len(text):
+            break
+
+        value = text[value_start:i]
+        search_from = i + 1
+        if _ENV_LOOKUP_VALUE_RE.match(value):
+            continue
+        parts.extend((text[copied_to:value_start], _mask_json_field_value(value)))
+        copied_to = i
+
+    if not parts:
+        return text
+    parts.append(text[copied_to:])
+    return "".join(parts)
 
 
 def _redact_query_string(query: str) -> str:
@@ -797,17 +831,7 @@ def redact_sensitive_text(
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
-            def _redact_json(m):
-                key, value = m.group(1), m.group(2)
-                # Same programmatic-env-lookup exception as _redact_env above
-                # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
-                # not a leaked secret value.
-                if _ENV_LOOKUP_VALUE_RE.match(value):
-                    return m.group(0)
-                # Escape-safe head/tail so re-quoted output stays parseable
-                # (prefix must not end mid-``\"`` / ``\\`` / ``\\uXXXX``).
-                return f'{key}: "{_mask_json_field_value(value)}"'
-            text = _JSON_FIELD_RE.sub(_redact_json, text)
+            text = _redact_json_fields(text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
