@@ -1,10 +1,17 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
 
 import type { ContextBreakdown, UsageStats } from '@/types/hermes'
 
 import { ContextUsagePanel } from './context-usage-panel'
+
+// Radix Select relies on browser APIs that jsdom does not implement.
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  Element.prototype.hasPointerCapture = vi.fn(() => false)
+  Element.prototype.releasePointerCapture = vi.fn()
+})
 
 const initialUsage: UsageStats = {
   calls: 1,
@@ -71,14 +78,37 @@ describe('ContextUsagePanel', () => {
       expect(screen.getByText('Automatic compression near 92% (250k tokens)')).not.toBeNull()
       expect(screen.getByText('8.6k tokens remaining')).not.toBeNull()
       expect(screen.getByRole('button', { name: 'Compress now' })).not.toBeNull()
+      expect(screen.getByRole('combobox', { name: 'Keep recent turns' })).not.toBeNull()
     })
 
+    fireEvent.click(screen.getByRole('combobox', { name: 'Keep recent turns' }))
+    fireEvent.click(await screen.findByRole('option', { name: '4 turns' }))
     fireEvent.click(screen.getByRole('button', { name: 'Compress now' }))
-    expect(compressNow).toHaveBeenCalledOnce()
+    expect(compressNow).toHaveBeenCalledWith(4)
     await act(async () => {})
 
     expect(requestGateway).toHaveBeenCalledTimes(1)
     expect(requestGateway).toHaveBeenCalledWith('session.context_breakdown', { session_id: 'runtime-1' })
+  })
+
+  it('can retain the existing summarize-all behavior', async () => {
+    const compressNow = vi.fn()
+
+    render(
+      <ContextUsagePanel
+        currentUsage={initialUsage}
+        onCompressNow={compressNow}
+        requestGateway={vi.fn().mockResolvedValue(breakdown)}
+        sessionId="runtime-1"
+      />
+    )
+
+    const keepRecent = await screen.findByRole('combobox', { name: 'Keep recent turns' })
+    fireEvent.click(keepRecent)
+    fireEvent.click(await screen.findByRole('option', { name: 'Summarize all' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Compress now' }))
+
+    expect(compressNow).toHaveBeenCalledWith(null)
   })
 
   it('refetches when the session or gateway requester changes', async () => {
@@ -117,7 +147,9 @@ describe('ContextUsagePanel', () => {
     )
 
     const button = await screen.findByRole('button', { name: 'Compress now' })
+    const keepRecent = screen.getByRole('combobox', { name: 'Keep recent turns' })
     expect((button as HTMLButtonElement).disabled).toBe(true)
+    expect((keepRecent as HTMLButtonElement).disabled).toBe(true)
 
     fireEvent.click(button)
     expect(compressNow).not.toHaveBeenCalled()

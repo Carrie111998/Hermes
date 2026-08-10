@@ -2113,6 +2113,10 @@ export const ar = defineLocale({
         compressNow: 'ضغط السياق الآن',
         compressNowTitle: 'اضغط سياق هذه الجلسة قبل الرسالة التالية',
         compressUnavailable: 'انتظر حتى ينتهي نشاط الجلسة الحالي.',
+        keepRecent: 'الاحتفاظ بآخر الجولات',
+        keepRecentAll: 'تلخيص الكل',
+        keepRecentTitle: 'الاحتفاظ بآخر تبادلات المستخدم وHermes المحددة دون تغيير',
+        keepRecentTurns: turns => `آخر ${turns} جولة`,
         tokensRemaining: tokens => `متبقٍ ${tokens} رمزًا حتى الضغط التلقائي`
       },
       session: 'الجلسة',

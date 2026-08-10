@@ -2151,6 +2151,10 @@ export interface Translations {
         compressNow: string
         compressNowTitle: string
         compressUnavailable: string
+        keepRecent: string
+        keepRecentAll: string
+        keepRecentTitle: string
+        keepRecentTurns: (turns: number) => string
         percentFull: (percent: number) => string
         title: string
         tokensRemaining: (tokens: string) => string

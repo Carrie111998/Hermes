@@ -1,6 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import {
+  DEFAULT_KEEP_RECENT_TURNS,
+  KEEP_RECENT_TURN_OPTIONS,
+  type KeepRecentTurns
+} from '@/app/shell/context-compression-action'
 import { Button } from '@/components/ui/button'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { useI18n } from '@/i18n'
 import { compactNumber } from '@/lib/format'
 import { AlertTriangle } from '@/lib/icons'
@@ -11,7 +17,9 @@ import type { ContextBreakdown, ContextUsageCategory, UsageStats } from '@/types
 interface ContextUsagePanelProps {
   compressNowDisabled?: boolean
   currentUsage: UsageStats
-  onCompressNow?: () => void
+  keepRecentTurns?: KeepRecentTurns
+  onCompressNow?: (keepRecentTurns: KeepRecentTurns) => void
+  onKeepRecentTurnsChange?: (keepRecentTurns: KeepRecentTurns) => void
   onUsageSnapshot?: (
     usage: Pick<
       UsageStats,
@@ -29,7 +37,9 @@ interface ContextUsagePanelProps {
 export function ContextUsagePanel({
   compressNowDisabled = false,
   currentUsage,
+  keepRecentTurns: controlledKeepRecentTurns,
   onCompressNow,
+  onKeepRecentTurnsChange,
   onUsageSnapshot,
   requestGateway,
   sessionId
@@ -38,6 +48,8 @@ export function ContextUsagePanel({
   const copy = t.shell.statusbar.contextUsagePanel
   const [breakdown, setBreakdown] = useState<ContextBreakdown | null>(null)
   const [loading, setLoading] = useState(false)
+  const [internalKeepRecentTurns, setInternalKeepRecentTurns] = useState<KeepRecentTurns>(DEFAULT_KEEP_RECENT_TURNS)
+  const keepRecentTurns = controlledKeepRecentTurns === undefined ? internalKeepRecentTurns : controlledKeepRecentTurns
   const onUsageSnapshotRef = useRef(onUsageSnapshot)
   onUsageSnapshotRef.current = onUsageSnapshot
 
@@ -148,19 +160,50 @@ export function ContextUsagePanel({
           data-pressure={compressionPressure}
           data-slot="context-compression-threshold"
         >
-          <div className="flex items-start justify-between gap-2">
-            <p className="flex min-w-0 items-center gap-1.5 font-medium">
-              {compressionPressure !== 'normal' && <AlertTriangle className="size-3 shrink-0" />}
-              <span>
-                {copy.automaticCompression(compressionThresholdPercent, compactNumber(compressionThresholdTokens))}
-              </span>
-            </p>
+          <p className="flex min-w-0 items-center gap-1.5 font-medium">
+            {compressionPressure !== 'normal' && <AlertTriangle className="size-3 shrink-0" />}
+            <span>
+              {copy.automaticCompression(compressionThresholdPercent, compactNumber(compressionThresholdTokens))}
+            </span>
+          </p>
+          <p className="mt-1 opacity-80">
+            {tokensUntilCompression === 0
+              ? copy.compressionDue
+              : copy.tokensRemaining(compactNumber(tokensUntilCompression))}
+          </p>
 
-            {compressionPressure !== 'normal' && onCompressNow && (
+          {compressionPressure !== 'normal' && onCompressNow && (
+            <div className="mt-2 flex items-center justify-end gap-1">
+              <Select
+                disabled={compressNowDisabled}
+                onValueChange={value => {
+                  const next = value === 'all' ? null : Number(value)
+                  setInternalKeepRecentTurns(next)
+                  onKeepRecentTurnsChange?.(next)
+                }}
+                value={keepRecentTurns === null ? 'all' : String(keepRecentTurns)}
+              >
+                <SelectTrigger
+                  aria-label={copy.keepRecent}
+                  className="h-6 w-24 px-2 text-[0.6875rem]"
+                  size="xs"
+                  title={copy.keepRecentTitle}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="end">
+                  <SelectItem value="all">{copy.keepRecentAll}</SelectItem>
+                  {KEEP_RECENT_TURN_OPTIONS.map(turns => (
+                    <SelectItem key={turns} value={String(turns)}>
+                      {copy.keepRecentTurns(turns)}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <Button
                 className="h-6 shrink-0 px-2 text-[0.6875rem]"
                 disabled={compressNowDisabled}
-                onClick={onCompressNow}
+                onClick={() => onCompressNow(keepRecentTurns)}
                 size="xs"
                 title={compressNowDisabled ? copy.compressUnavailable : copy.compressNowTitle}
                 type="button"
@@ -168,13 +211,8 @@ export function ContextUsagePanel({
               >
                 {copy.compressNow}
               </Button>
-            )}
-          </div>
-          <p className="mt-1 opacity-80">
-            {tokensUntilCompression === 0
-              ? copy.compressionDue
-              : copy.tokensRemaining(compactNumber(tokensUntilCompression))}
-          </p>
+            </div>
+          )}
         </div>
       )}
 

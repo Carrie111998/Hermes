@@ -1,9 +1,13 @@
 import { useStore } from '@nanostores/react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
-import { requestPrimarySessionCompression } from '@/app/shell/context-compression-action'
+import {
+  DEFAULT_KEEP_RECENT_TURNS,
+  type KeepRecentTurns,
+  requestPrimarySessionCompression
+} from '@/app/shell/context-compression-action'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/store'
@@ -123,6 +127,7 @@ export function useStatusbarItems({
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
   const compactingSessions = useStore($compactingSessions)
+  const [keepRecentTurns, setKeepRecentTurns] = useState<KeepRecentTurns>(DEFAULT_KEEP_RECENT_TURNS)
 
   // The FOCUSED session (interacted tile, else the primary — the same
   // derivation the titlebar title follows): every session-scoped readout
@@ -573,7 +578,9 @@ export function useStatusbarItems({
           <ContextUsagePanel
             compressNowDisabled={manualCompressionDisabled}
             currentUsage={currentUsage}
+            keepRecentTurns={keepRecentTurns}
             onCompressNow={manualCompressionAvailable ? requestPrimarySessionCompression : undefined}
+            onKeepRecentTurnsChange={setKeepRecentTurns}
             onUsageSnapshot={publishContextUsage}
             requestGateway={requestGateway}
             sessionId={activeSessionId}
@@ -590,7 +597,7 @@ export function useStatusbarItems({
         id: 'context-compress-now',
         label: copy.contextUsagePanel.compressNow,
         lockedVisible: true,
-        onSelect: requestPrimarySessionCompression,
+        onSelect: () => requestPrimarySessionCompression(keepRecentTurns),
         title: manualCompressionDisabled
           ? copy.contextUsagePanel.compressUnavailable
           : copy.contextUsagePanel.compressNowTitle,
@@ -644,6 +651,7 @@ export function useStatusbarItems({
       requestGateway,
       sessionStartedAt,
       gatewayState,
+      keepRecentTurns,
       terminalShowing,
       turnStartedAt
     ]

@@ -114,10 +114,12 @@ describe('useComposerSubmit busy-turn routing', () => {
     const { hook, onSubmit } = renderSubmitHook({ text: 'unfinished user draft' })
 
     act(() => {
-      hook.result.current.dispatchSubmit('/compress', undefined, { preserveDraft: true })
+      hook.result.current.dispatchSubmit('/compress here 4', undefined, { preserveDraft: true })
     })
 
-    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('/compress', { composerScope: 'stored-session' }))
+    await waitFor(() =>
+      expect(onSubmit).toHaveBeenCalledWith('/compress here 4', { composerScope: 'stored-session' })
+    )
     expect(takeSessionDraft('stored-session').text).toBe('unfinished user draft')
   })
 
@@ -127,7 +129,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     onSubmit.mockResolvedValueOnce(false)
 
     act(() => {
-      hook.result.current.dispatchSubmit('/compress', undefined, { preserveDraft: true })
+      hook.result.current.dispatchSubmit('/compress here 2', undefined, { preserveDraft: true })
     })
 
     await waitFor(() => expect(onSubmit).toHaveBeenCalled())
