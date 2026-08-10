@@ -89,6 +89,10 @@ Rules:
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
+  - A single tool-only script run (a title like ``run gen_scene.py`` or a
+    body starting ``Run: <command>``) is ONE task. Never split it into
+    separate run + verify/analysis children for the same terminal call;
+    emit the full command and a read-only classification in the one task.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -122,6 +126,47 @@ Default assignee (used when no profile fits a task): {default_assignee}
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
+
+# A triage card that is exactly one tool-only script run (the coding gate's
+# `Run: <command>` scope format) must promote directly as a single task —
+# no fanout, no LLM.  `run <interpreter> <script>` titles match when the
+# script is an absolute path or a relative path with a known extension;
+# prose titles like `run the marketing campaign` / `run tests` do not.
+_RUN_TITLE_RE = re.compile(
+    r"^run(?:ning)?\s+"
+    r"(?:(?:python|python3|bash|sh|node|ruby|perl|php|deno|bun|go)\s+)?"
+    r"(?:/\S+|[\w./-]+\.(?:py|sh|js|ts|rb|pl|php|bash|zsh|fish|go))\b",
+    re.IGNORECASE,
+)
+
+
+def _tool_only_run_command(task) -> Optional[str]:
+    """Return the single script-run command when ``task`` is exactly one
+    tool-only script run, else ``None``.
+
+    Recognized shapes:
+    - body first line starts ``Run: <command>`` (the gate's tool-only scope),
+    - title matches ``run [interpreter] <script>`` where ``<script>`` is an
+      absolute path or a relative path with a known script extension.
+
+    Only the matched script-run prefix is returned from a title, so a card
+    titled ``Run gen_scene.py in /home/solo and verify change`` yields the
+    command ``gen_scene.py`` — never the trailing prose.
+    """
+    body_first = next(
+        (line.strip() for line in (task.body or "").splitlines() if line.strip()),
+        "",
+    )
+    if re.match(r"^Run:\s+\S", body_first, re.IGNORECASE):
+        return body_first[4:].strip() or None
+    title = (task.title or "").strip()
+    match = _RUN_TITLE_RE.match(title)
+    if not match:
+        return None
+    command = re.sub(
+        r"^run(?:ning)?\s+", "", match.group(0), count=1, flags=re.IGNORECASE,
+    ).strip()
+    return command or None
 
 
 @dataclass
@@ -204,8 +249,15 @@ def _resolve_default_assignee(cfg: dict) -> str:
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit:
         try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
+            from hermes_cli.kanban_assignees import resolve_assignee
+
+            resolved = resolve_assignee(
+                explicit,
+                allow_unassigned=False,
+                config={"kanban": kanban_cfg},
+            )
+            if resolved.canonical:
+                return resolved.canonical
         except Exception:
             pass
     try:
@@ -236,6 +288,26 @@ def _build_roster() -> tuple[list[dict], set[str]]:
             "has_description": bool(desc),
         })
         valid.add(p.name)
+    # The model may select configured aliases, but the persisted task must
+    # still use the resolver's canonical target.  Include aliases and lanes
+    # in the prompt without duplicating profile discovery logic here.
+    try:
+        from hermes_cli.kanban_assignees import configured_assignee_choices
+
+        for choice in configured_assignee_choices():
+            name = str(choice.input_value)
+            if name in valid:
+                continue
+            roster.append({
+                "name": name,
+                "description": (
+                    f"{choice.category.value}; routes to {choice.canonical!r}"
+                ),
+                "has_description": True,
+            })
+            valid.add(name)
+    except Exception as exc:
+        logger.warning("decompose: failed to list configured assignees: %s", exc)
     return roster, valid
 
 
@@ -263,9 +335,14 @@ def _normalize_assignee_choice(
     if not isinstance(assignee, str) or not assignee.strip():
         return default_assignee
     chosen = assignee.strip()
-    if chosen not in valid_names:
+    if chosen.casefold() not in {name.casefold() for name in valid_names}:
         return default_assignee
-    return chosen
+    try:
+        from hermes_cli.kanban_assignees import resolve_assignee
+
+        return resolve_assignee(chosen, allow_unassigned=False).canonical or default_assignee
+    except Exception:
+        return default_assignee
 
 
 def decompose_task(
@@ -296,6 +373,38 @@ def decompose_task(
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster()
+
+    # Deterministic pre-check BEFORE the auxiliary-LLM call: a triage card
+    # that is exactly one tool-only script run promotes directly as a single
+    # task (no fanout, no LLM).  This stops the coding gate's `Run:` scope
+    # cards from being split into overlapping run+verify duplicates.
+    run_command = _tool_only_run_command(task)
+    if run_command is not None:
+        audit_author = author or _profile_author()
+        with kb.connect_closing() as conn:
+            ok = kb.specify_triage_task(
+                conn,
+                task_id,
+                title=None,
+                body=(
+                    f"Run the following command and report the output:\n\n"
+                    f"    {run_command}\n\n"
+                    "Acceptance criteria:\n"
+                    "- Execute the command exactly as given in the recorded workspace.\n"
+                    "- Do not modify repository files.\n"
+                    "- Report the exit code and relevant output."
+                ),
+                assignee=default_assignee,
+                author=audit_author,
+            )
+        if not ok:
+            return DecomposeOutcome(
+                task_id, False, "task moved out of triage before promotion",
+            )
+        return DecomposeOutcome(
+            task_id, True, "single script run (no fanout)",
+            fanout=False, new_title=None,
+        )
 
     try:
         from agent.auxiliary_client import call_llm  # type: ignore
@@ -457,7 +566,13 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return dispatchable task ids currently in the triage column.
+
+    GitHub draft-ingestion cards are intentionally parked in triage until the
+    PR is ready for review.  They are untrusted producer records, not
+    decomposition requests, so keep them out of the list consumed by the
+    gateway's auto-decompose tick (and by manual decomposition callers).
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +580,12 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+    return [
+        row.id
+        for row in rows
+        if not (
+            isinstance(row.metadata, dict)
+            and row.metadata.get("source") == "github_pull_request"
+            and row.metadata.get("draft") is True
+        )
+    ]

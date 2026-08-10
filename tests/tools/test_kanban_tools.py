@@ -21,7 +21,7 @@ import pytest
 
 def test_kanban_tools_hidden_without_env_var(monkeypatch, tmp_path):
     """Normal `hermes chat` sessions (no HERMES_KANBAN_TASK) must have
-    zero kanban_* tools in their schema."""
+    zero kanban_* tools in their schema; intake stays service-gated."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -158,6 +158,59 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
         assert kb.get_task(conn, worker_env).status == "done"
     finally:
         conn.close()
+
+
+def test_complete_blocked_review_required_surfaces_clear_error(worker_env):
+    """An implementation card completing with PR evidence but no
+    review_submitted event gets a clear, actionable error from the tool —
+    the task stays in-flight and the worker can route the PR through the
+    native review handoff instead of completing directly."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    # Stamp the card as a canonical implementation card (the gate reads
+    # the task's metadata column, mirroring how the coding gate stamps
+    # canonical cards).
+    conn = kb.connect()
+    try:
+        conn.execute(
+            "UPDATE tasks SET metadata=? WHERE id=?",
+            (
+                '{"canonical": true, "lane": "DEV", "coding_agent": "codex"}',
+                worker_env,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = json.loads(kt._handle_complete({
+        "summary": "opened PR #391",
+        "metadata": {
+            "pr": 391,
+            "pr_url": "https://github.com/acme/repo/pull/391",
+        },
+    }))
+    assert out.get("ok") is not True
+    assert "kanban_complete blocked" in (out.get("error") or "")
+    assert "review_submitted" in (out.get("error") or "")
+    assert "review_waiver" in (out.get("error") or "")
+
+    # Task is still in-flight; a waiver then completes.
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+    ok = json.loads(kt._handle_complete({
+        "summary": "opened PR but waived review",
+        "metadata": {
+            "pr_url": "https://github.com/acme/repo/pull/391",
+            "review_waiver": "docs-only",
+        },
+    }))
+    assert ok.get("ok") is True
 
 
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):

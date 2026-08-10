@@ -367,10 +367,39 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kb.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_allows_requeued_review_card_with_existing_pr(kanban_home):
+    """Review/remediation cards must not be stranded by active-PR protection."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review card", assignee="dev")
+        implementation = kb.claim_task(conn, tid, claimer="worker:dev")
+        assert implementation is not None
+        assert kb.submit_for_review(
+            conn,
+            tid,
+            reviewer="reviewer",
+            summary="PR opened",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/42",
+                "repo": "acme/repo",
+                "number": 42,
+                "head_sha": "a" * 40,
+                "verification_evidence": {"tests_passed": 1},
+            },
+            expected_run_id=implementation.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid, claimer="worker:reviewer")
+        assert review is not None
+        assert kb.request_review_changes(
+            conn, tid, summary="Fix requested", expected_run_id=review.current_run_id
+        ) == tid
+        kb.add_comment(
+            conn,
+            tid,
+            author="dev",
+            body="Updating existing PR https://github.com/acme/repo/pull/42",
+        )
 
-
-
-
+        assert kb.check_respawn_guard(conn, tid) is None
 
 
 # ---------------------------------------------------------------------------
@@ -610,6 +639,130 @@ def test_complete_task_persists_scratch_artifacts_before_cleanup(kanban_home):
     assert [(a.filename, a.stored_path) for a in attachments] == [
         ("chart.png", str(persisted.resolve()))
     ]
+
+
+# ---------------------------------------------------------------------------
+# Review-required completion gate (submit-for-review before complete)
+# ---------------------------------------------------------------------------
+
+
+def test_complete_task_blocks_implementation_card_with_open_pr(kanban_home):
+    """An implementation card that declares an open PR but has no
+    review_submitted event must not complete (incident class t_3a2a1d3d /
+    PR #391). The task stays running and an auditable blocked event lands.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="implement thing", assignee="dev",
+            metadata={"canonical": True, "lane": "DEV", "coding_agent": "codex"},
+        )
+        kb.claim_task(conn, tid)
+
+        with pytest.raises(kb.ReviewRequiredError):
+            kb.complete_task(
+                conn, tid,
+                summary="opened PR",
+                metadata={
+                    "pr": 391,
+                    "pr_url": "https://github.com/acme/repo/pull/391",
+                },
+            )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (tid,),
+            )
+        ]
+        assert kinds.count("completion_blocked_review_required") == 1
+        assert "completed" not in kinds
+
+
+def test_complete_task_allows_implementation_card_after_review_submitted(kanban_home):
+    """Once a review_submitted event exists (native submit-for-review), the
+    same card completes normally."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="implement thing", assignee="dev",
+            metadata={"canonical": True, "lane": "DEV", "coding_agent": "codex"},
+        )
+        kb.claim_task(conn, tid)
+        kb._append_event(
+            conn, tid, "review_submitted",
+            {"reviewer": "orion", "review_identity": "github-pr:acme/repo:1:abcd"},
+        )
+
+        ok = kb.complete_task(
+            conn, tid,
+            summary="PR reviewed and approved",
+            metadata={
+                "pr": 391,
+                "pr_url": "https://github.com/acme/repo/pull/391",
+            },
+        )
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_task_allows_explicit_review_waiver(kanban_home):
+    """An explicit waiver in the completion metadata bypasses the gate."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="implement thing", assignee="dev",
+            metadata={"canonical": True, "lane": "DEV", "coding_agent": "codex"},
+        )
+        kb.claim_task(conn, tid)
+
+        ok = kb.complete_task(
+            conn, tid,
+            summary="no review needed",
+            metadata={
+                "pr_url": "https://github.com/acme/repo/pull/391",
+                "review_waiver": "docs-only change, no review required",
+            },
+        )
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_task_skips_non_implementation_cards(kanban_home):
+    """Research/docs cards are never gated, even with PR evidence in the
+    handoff metadata."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="research the API", assignee="researcher",
+            metadata={"lane": "RESEARCH"},
+        )
+        kb.claim_task(conn, tid)
+
+        ok = kb.complete_task(
+            conn, tid,
+            summary="research complete",
+            metadata={"pr_url": "https://github.com/acme/repo/pull/391"},
+        )
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_complete_task_skips_implementation_card_without_pr_evidence(kanban_home):
+    """An implementation card completing without PR evidence (local-only
+    work, no PR opened) is not gated."""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="implement thing", assignee="dev",
+            metadata={"canonical": True, "lane": "DEV", "coding_agent": "codex"},
+        )
+        kb.claim_task(conn, tid)
+
+        ok = kb.complete_task(
+            conn, tid,
+            summary="local change, no PR",
+            metadata={"changed_files": ["local.txt"]},
+        )
+        assert ok is True
+        assert kb.get_task(conn, tid).status == "done"
 
 
 
