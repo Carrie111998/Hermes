@@ -29,16 +29,6 @@ describe('resolveDeepLinkAction', () => {
     ).toMatchObject({ type: 'plugin-install', legacyHint: 'agent' })
   })
 
-  it('routes settings plugins navigation', () => {
-    expect(
-      resolveDeepLinkAction({
-        kind: 'settings',
-        name: 'plugins',
-        params: {}
-      })
-    ).toEqual({ type: 'navigate-settings-plugins' })
-  })
-
   it('routes blueprint composer inserts', () => {
     expect(
       resolveDeepLinkAction({

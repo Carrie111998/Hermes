@@ -189,7 +189,7 @@ export function useDesktopIntegrations({
     return () => unsubscribe?.()
   }, [])
 
-  // hermes:// deep links -> composer inserts, plugin install modal, or settings routes.
+  // hermes:// deep links -> composer inserts or plugin install modal.
   useEffect(() => {
     const unsubscribe = window.hermesDesktop?.onDeepLink?.(payload => {
       const action = resolveDeepLinkAction(payload)
@@ -210,12 +210,6 @@ export function useDesktopIntegrations({
         return
       }
 
-      if (action.type === 'navigate-settings-plugins') {
-        navigate('/settings?tab=plugins')
-
-        return
-      }
-
       if (action.type === 'plugin-install') {
         openPluginInstallRequest({
           repo: action.repo,
@@ -229,7 +223,7 @@ export function useDesktopIntegrations({
     void window.hermesDesktop?.signalDeepLinkReady?.()
 
     return () => unsubscribe?.()
-  }, [navigate])
+  }, [])
 
   // ⌘W via the macOS menu accelerator → close the focused tab; if nothing is
   // closeable, fall back to closing the window (so ⌘W still works as the

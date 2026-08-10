@@ -8,7 +8,6 @@ export interface DeepLinkPayload {
 
 export type DeepLinkAction =
   | { type: 'plugin-install'; repo: string; enable: boolean; force: boolean; legacyHint: PluginInstallLegacyHint }
-  | { type: 'navigate-settings-plugins' }
   | { type: 'composer-blueprint'; name: string; params: Record<string, string> }
   | { type: 'ignore' }
 
@@ -29,10 +28,6 @@ export function resolveDeepLinkAction(payload: DeepLinkPayload | null | undefine
 
   if (payload.kind === 'blueprint' && payload.name) {
     return { type: 'composer-blueprint', name: payload.name, params: payload.params || {} }
-  }
-
-  if (payload.kind === 'settings' && payload.name === 'plugins') {
-    return { type: 'navigate-settings-plugins' }
   }
 
   const repo = (payload.params?.repo || payload.params?.identifier || payload.name || '').trim()
