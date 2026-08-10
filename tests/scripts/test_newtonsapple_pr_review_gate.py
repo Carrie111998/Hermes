@@ -24,6 +24,30 @@ HEAD_SHA = "b" * 40
 REVIEW_REQUEST_ID = 123456
 
 
+def test_buzz_tracking_markers_are_hidden_markdown_reference_definitions():
+    review_tuple = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        request_id=REVIEW_REQUEST_ID,
+    )
+    markers = [
+        gate._requested_marker(review_tuple),
+        gate._started_marker(review_tuple),
+        gate._summary_marker(review_tuple),
+        gate._blocker_marker(review_tuple),
+        gate._dead_letter_marker(review_tuple),
+        gate._retry_marker(review_tuple, 2),
+    ]
+
+    for marker in markers:
+        assert marker.startswith("[//]: # (newtonsapple-pr-review-")
+        assert marker.endswith(")")
+        assert "<!--" not in marker
+        assert "-->" not in marker
+
+
 def _execution_request(operation):
     return {
         "operation": operation,

@@ -1322,56 +1322,56 @@ def _bot_bodies(items: list[dict], expected_login: str) -> list[str]:
 
 def _summary_marker(review_tuple: ReviewTuple) -> str:
     return (
-        "<!-- newtonsapple-pr-review-summary:v2 "
+        "[//]: # (newtonsapple-pr-review-summary:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
-        f"request={review_tuple.request_id} -->"
+        f"request={review_tuple.request_id})"
     )
 
 
 def _requested_marker(review_tuple: ReviewTuple) -> str:
     return (
-        "<!-- newtonsapple-pr-review-requested:v2 "
+        "[//]: # (newtonsapple-pr-review-requested:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
-        f"request={review_tuple.request_id} -->"
+        f"request={review_tuple.request_id})"
     )
 
 
 def _started_marker(review_tuple: ReviewTuple) -> str:
     return (
-        "<!-- newtonsapple-pr-review-started:v2 "
+        "[//]: # (newtonsapple-pr-review-started:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
-        f"request={review_tuple.request_id} -->"
+        f"request={review_tuple.request_id})"
     )
 
 
 def _blocker_marker(review_tuple: ReviewTuple) -> str:
     return (
-        "<!-- newtonsapple-pr-review-blocker:v2 "
+        "[//]: # (newtonsapple-pr-review-blocker:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
-        f"request={review_tuple.request_id} -->"
+        f"request={review_tuple.request_id})"
     )
 
 
 def _dead_letter_marker(review_tuple: ReviewTuple) -> str:
     return (
-        "<!-- newtonsapple-pr-review-dead-letter:v2 "
+        "[//]: # (newtonsapple-pr-review-dead-letter:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
-        f"request={review_tuple.request_id} -->"
+        f"request={review_tuple.request_id})"
     )
 
 
 def _retry_marker(review_tuple: ReviewTuple, attempt: int) -> str:
     return (
-        "<!-- newtonsapple-pr-review-retry:v2 "
+        "[//]: # (newtonsapple-pr-review-retry:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
         f"request={review_tuple.request_id} "
-        f"attempt={attempt} -->"
+        f"attempt={attempt})"
     )
 
 
