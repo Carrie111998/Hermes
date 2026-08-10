@@ -351,10 +351,15 @@ Top-level model-facing `delegate_task` calls run in the background automatically
 - A child that completed before restart but whose result was not delivered is restored and routed back through the owning session's normal checks.
 - Cancelled children return a structured result (`status="interrupted"`, `exit_reason="interrupted"`), but because the parent was interrupted too, that result often never makes it into a user-visible reply.
 
-For **durable execution** that must survive session closure or process restart, use:
+For work that must continue outside a delegation turn, choose between a
+scheduled rerun and a tracked shell process:
 
 - `cronjob` (action=`create`) — schedules a separate agent run; immune to parent-turn interrupts.
-- `terminal(background=True, notify_on_complete=True)` — long-running shell commands that keep running while the agent does other things.
+- `terminal(background=True, notify_on_complete=True)` — a tracked shell process that keeps running after a successful turn. Add `persist_on_abandon=True` only to exempt it from selective abandoned-turn cleanup through `kill_started_since()`.
+
+`persist_on_abandon` grants no exemption from explicit process kill, broad
+`kill_all()` cleanup, or other lifecycle cleanup. It does not transfer
+ownership or provide durability.
 :::
 
 ## Key Properties

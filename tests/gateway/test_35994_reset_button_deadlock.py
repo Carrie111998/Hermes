@@ -12,7 +12,10 @@ The fix offloads _cleanup_agent_resources to a worker thread with a bounded
 timeout, so the loop is never blocked and a stuck teardown degrades gracefully.
 """
 import asyncio
+import json
 import logging
+import shlex
+import sys
 import threading
 import time
 from datetime import datetime
@@ -38,6 +41,27 @@ def _make_source() -> SessionSource:
 
 def _make_event(text: str) -> MessageEvent:
     return MessageEvent(text=text, source=_make_source(), message_id="m1")
+
+
+@pytest.fixture(autouse=True)
+def _run_unrelated_reset_helpers_inline(monkeypatch):
+    """Inline only inert presentation helpers; keep cleanup off-loop."""
+    real_to_thread = asyncio.to_thread
+
+    async def selective_to_thread(func, *args, **kwargs):
+        if getattr(func, "_test_inline_reset_helper", False):
+            return func(*args, **kwargs)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", selective_to_thread)
+
+
+def _inline_reset_helper(value):
+    def helper(_source):
+        return value
+
+    setattr(helper, "_test_inline_reset_helper", True)
+    return helper
 
 
 def _make_runner_with_cached_agent(close_fn):
@@ -79,6 +103,9 @@ def _make_runner_with_cached_agent(close_fn):
     runner._session_db = None
     runner._is_user_authorized = lambda _source: True
     runner._format_session_info = lambda: ""
+    runner._reset_notice_session_info = _inline_reset_helper("")
+    runner._telegram_topic_new_header = _inline_reset_helper("")
+    runner._is_telegram_topic_lane = _inline_reset_helper(False)
 
     # Enable the cache-lock path (this is what the button callback exercises)
     runner._agent_cache_lock = threading.RLock()
@@ -142,6 +169,229 @@ async def test_reset_does_not_block_event_loop_during_cleanup():
         f"{ticks_during_block} ticks while close() was running"
     )
     runner.session_store.reset_session.assert_called_once()
+
+
+def test_reset_broad_process_cleanup_uses_stable_session_key(monkeypatch):
+    """Reset cleans a stable-key snapshot without touching a replacement."""
+    import tools.process_registry as process_registry_module
+    from gateway.slash_commands import (
+        _kill_processes_for_session_reset,
+        _snapshot_processes_for_session_reset,
+    )
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    target = ProcessSession(
+        id="proc_old_compression_owner",
+        command="sleep 60",
+        task_id="session-before-compression",
+        environment_task_id="default",
+        session_key=build_session_key(_make_source()),
+        persist_on_abandon=True,
+    )
+    foreign = ProcessSession(
+        id="proc_foreign",
+        command="sleep 60",
+        task_id="other-session",
+        environment_task_id="default",
+        session_key="agent:main:telegram:dm:other",
+        persist_on_abandon=True,
+    )
+    registry._running = {target.id: target, foreign.id: foreign}
+    kill_calls = []
+
+    def fake_kill(session_id, **kwargs):
+        kill_calls.append((session_id, kwargs))
+        registry._running[session_id].exited = True
+        return {"status": "killed"}
+
+    monkeypatch.setattr(registry, "kill_process", fake_kill)
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+
+    reset_snapshot = _snapshot_processes_for_session_reset(target.session_key)
+    assert reset_snapshot == (target.id,)
+
+    replacement = ProcessSession(
+        id="proc_replacement_turn",
+        command="sleep 60",
+        task_id="replacement-session",
+        environment_task_id="default",
+        session_key=target.session_key,
+        persist_on_abandon=True,
+    )
+    registry._running[replacement.id] = replacement
+
+    assert _kill_processes_for_session_reset(reset_snapshot) == 1
+
+    assert target.exited is True
+    assert foreign.exited is False
+    assert replacement.exited is False
+    assert kill_calls == [
+        (
+            target.id,
+            {"source": "kill_all", "consume_output": False},
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.linux_only
+async def test_busy_reset_kills_background_process_registered_after_snapshot(
+    monkeypatch,
+    tmp_path,
+):
+    """A busy /new and a blocked local spawn cannot straddle the reset boundary."""
+    import tools.process_registry as process_registry_module
+    import tools.terminal_tool as terminal_tool_module
+    from tools.interrupt import set_interrupt
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+
+    spawn_entered = threading.Event()
+    release_spawn = threading.Event()
+    interrupt_requested = threading.Event()
+    reset_snapshots = []
+    created = {}
+    real_spawn_local = registry.spawn_local
+    real_snapshot = registry.snapshot_running_ids_for_session
+
+    def blocked_spawn_local(**kwargs):
+        spawn_entered.set()
+        if not release_spawn.wait(timeout=10):
+            raise RuntimeError("reset never released the blocked spawn")
+        session = real_spawn_local(**kwargs)
+        created["session"] = session
+        return session
+
+    def snapshot_then_release(session_key):
+        snapshot = real_snapshot(session_key)
+        reset_snapshots.append(snapshot)
+        # The process is deliberately still absent from this immutable reset
+        # snapshot. Its tool thread must own the complementary cleanup.
+        release_spawn.set()
+        return snapshot
+
+    monkeypatch.setattr(registry, "spawn_local", blocked_spawn_local)
+    monkeypatch.setattr(
+        registry,
+        "snapshot_running_ids_for_session",
+        snapshot_then_release,
+    )
+
+    config = {
+        "env_type": "local",
+        "cwd": str(tmp_path),
+        "timeout": 60,
+        "lifetime_seconds": 3600,
+    }
+    environment = SimpleNamespace(env={}, cwd=str(tmp_path))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_active_environments",
+        {"default": environment},
+    )
+    monkeypatch.setattr(terminal_tool_module, "_last_activity", {})
+    monkeypatch.setattr(terminal_tool_module, "_task_env_overrides", {})
+    monkeypatch.setattr(terminal_tool_module, "_container_aliases", {})
+    monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
+    monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+    session_key = build_session_key(_make_source())
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": session_key,
+    )
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+
+    tool_result = {}
+    command = (
+        f"{shlex.quote(sys.executable)} -c "
+        f"{shlex.quote('import time; time.sleep(60)')}"
+    )
+
+    def run_background_tool():
+        set_interrupt(False)
+        try:
+            tool_result["value"] = terminal_tool_module.terminal_tool(
+                command=command,
+                background=True,
+                notify_on_complete=True,
+                persist_on_abandon=True,
+                task_id="sess-old",
+            )
+        finally:
+            set_interrupt(False)
+
+    tool_thread = threading.Thread(target=run_background_tool, daemon=True)
+    tool_thread.start()
+    for _ in range(500):
+        if spawn_entered.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert spawn_entered.is_set(), "background tool never reached its spawn boundary"
+
+    class BusyAgent:
+        _gateway_turn_process_task_id = "sess-old"
+        _gateway_turn_process_baseline = frozenset()
+
+        def __init__(self):
+            self.interrupt_reasons = []
+
+        def hard_interrupt(self, reason=None):
+            self.interrupt_reasons.append(reason)
+            set_interrupt(True, thread_id=tool_thread.ident)
+            interrupt_requested.set()
+
+        def release_clients(self):
+            return None
+
+    agent = BusyAgent()
+    runner = _make_runner_with_cached_agent(lambda: None)
+    runner._agent_cache = {session_key: agent}
+    runner._session_state(session_key).turn.agent = agent
+    runner._persist_active_agents = lambda: None
+
+    try:
+        reset_result = await asyncio.wait_for(
+            runner._busy_new_command(
+                _make_event("/new"),
+                session_key,
+                _make_source(),
+            ),
+            timeout=10,
+        )
+    finally:
+        release_spawn.set()
+        tool_thread.join(timeout=15)
+        set_interrupt(False, thread_id=tool_thread.ident)
+        registry.kill_all()
+
+    assert not tool_thread.is_alive(), "background tool did not drain after /new"
+    assert interrupt_requested.is_set()
+    assert agent.interrupt_reasons
+    assert reset_snapshots == [()]
+    assert reset_result is not None
+
+    result = json.loads(tool_result["value"])
+    session = created["session"]
+    assert result["exit_code"] == 130, result
+    assert result["output"] == "[Command interrupted]"
+    assert "session_id" not in result
+    assert session.exited is True
+    assert session.completion_reason == "killed"
+    assert session.termination_source == "terminal_interrupt"
+    assert registry.is_completion_consumed(session.id) is True
+    assert registry.pending_watchers == []
+    assert registry.completion_queue.empty()
+    assert session.process is not None
+    assert session.process.wait(timeout=5) is not None
 
 
 @pytest.mark.asyncio

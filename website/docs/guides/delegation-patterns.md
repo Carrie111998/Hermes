@@ -25,7 +25,7 @@ For the full feature reference, see [Subagent Delegation](/user-guide/features/d
 - Mechanical multi-step work with logic between steps → `execute_code`
 - Tasks needing user interaction → subagents can't use `clarify`
 - Quick file edits → do them directly
-- Durable long-running work that must survive session closure or process restart → `cronjob` or `terminal(background=True, notify_on_complete=True)`. Top-level delegation is asynchronous but still process-local.
+- A shell process that should be exempt only from selective abandoned-turn `kill_started_since()` cleanup → `terminal(background=True, notify_on_complete=True, persist_on_abandon=True)`. The flag does not transfer ownership or provide durability. For scheduled reruns use `cronjob`; top-level delegation and terminal processes remain process-local.
 
 ---
 
@@ -221,7 +221,7 @@ delegation:
 - **Separate terminals** — each subagent gets its own terminal session with separate working directory and state
 - **No conversation history** — subagents see only the `goal` and `context` the parent agent passes when calling `delegate_task`
 - **Default 50 iterations** — set `max_iterations` lower for simple tasks to save cost
-- **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` or `terminal(background=True, notify_on_complete=True)` for work that must survive those boundaries.
+- **Not durable** — top-level delegation runs in the background and posts its result back later, but it remains tied to the owning session and Hermes process. Session closure, `/stop`, `/new`, or a process restart can cancel or strand in-progress work. Use `cronjob` for scheduled reruns. For a shell process, `persist_on_abandon=True` exempts it only from selective `kill_started_since()` cleanup. It does not transfer ownership, exempt explicit kill or broad `kill_all()` cleanup, or provide durability.
 
 ---
 
