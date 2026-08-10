@@ -283,9 +283,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
-def recover_pending_to_db(
-    session_db=None,
-) -> int:
+def _recover_pending_to_db(session_db, flush_files) -> int:
     """Recover flushed pending messages into state.db via SessionDB.
 
     Reads all ``*.json`` files from the flush directory, inserts messages
@@ -296,26 +294,13 @@ def recover_pending_to_db(
     Parameters
     ----------
     session_db:
-        An existing ``SessionDB`` instance.  If ``None``, a new one is
-        opened on the default ``state.db`` path.
+        An existing ``SessionDB`` instance owned by the caller.
 
     Returns
     -------
     int
         Number of messages recovered.
     """
-    flush_dir = _get_flush_dir()
-    flush_files = sorted(flush_dir.glob("*.json"))
-    if not flush_files:
-        return 0
-
-    # Use the provided SessionDB or open one on the default path.
-    own_db = False
-    if session_db is None:
-        from hermes_state import SessionDB
-        session_db = SessionDB()
-        own_db = True
-
     recovered = 0
     for path in flush_files:
         try:
@@ -396,17 +381,32 @@ def recover_pending_to_db(
             )
             # Leave the file for next startup retry.
 
-    if own_db:
-        try:
-            session_db.close()
-        except Exception:
-            pass
-
     if recovered:
         logger.info(
             "Recovered %d pending message(s) from shutdown flush", recovered,
         )
     return recovered
+
+
+def recover_pending_to_db(session_db=None) -> int:
+    """Recover pending messages while preserving DB ownership on failure."""
+    flush_dir = _get_flush_dir()
+    flush_files = sorted(flush_dir.glob("*.json"))
+    if not flush_files:
+        return 0
+    if session_db is not None:
+        return _recover_pending_to_db(session_db, flush_files)
+
+    from hermes_state import SessionDB
+
+    owned_db = SessionDB()
+    try:
+        return _recover_pending_to_db(owned_db, flush_files)
+    finally:
+        try:
+            owned_db.close()
+        except Exception:
+            pass
 
 
 def flush_agent_history_to_file(

@@ -97,6 +97,33 @@ def test_recover_inserts_via_append_message_and_deletes_file(tmp_path, monkeypat
     assert not flush_file.exists()
 
 
+def test_recover_closes_owned_db_on_unexpected_error(tmp_path, monkeypatch):
+    flush_dir = _make_flush_dir(tmp_path)
+    monkeypatch.setattr(
+        "gateway.shutdown_flush._get_flush_dir", lambda: flush_dir
+    )
+    payload = {
+        "session_key": "agent:main:telegram:dm:123",
+        "reason": "shutdown",
+        "data": {"text": "lost message", "session_id": "session-1"},
+    }
+    (flush_dir / "pending.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    class UnexpectedRecoveryError(BaseException):
+        pass
+
+    owned_db = MagicMock()
+    owned_db.append_message.side_effect = UnexpectedRecoveryError
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda: owned_db)
+
+    with pytest.raises(UnexpectedRecoveryError):
+        recover_pending_to_db()
+
+    owned_db.close.assert_called_once_with()
+
+
 def test_serialise_object_with_text():
     obj = MagicMock()
     obj.text = "msg"
