@@ -619,9 +619,11 @@ class TestTerminalToolGatewayLifecycleGuard:
             "import subprocess\n"
             'subprocess.run(["neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true"], executable="/bin/launchctl")\n',
             "import os\n"
-            'os.execle("/bin/launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            'os.execle("/bin/launchctl", "neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
             "from os import execlpe as launch\n"
-            'launch("launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            'launch("launchctl", "neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            "import os\n"
+            'os.execv("/bin/launchctl", ["neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
             "from subprocess import *\n"
             'run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
             "from os import *\n"
@@ -645,6 +647,30 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "Blocked" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                'import os\nos.execle("/bin/launchctl", "neutral-name", "submit", "-l", "com.example.helper", {})\n',
+                "/bin/launchctl submit -l com.example.helper",
+            ),
+            (
+                'from os import execlpe as launch\nlaunch("launchctl", "neutral-name", "submit", "-l", "com.example.helper", {})\n',
+                "launchctl submit -l com.example.helper",
+            ),
+            (
+                'import os\nos.execv("/bin/launchctl", ["neutral-name", "submit", "-l", "com.example.helper"])\n',
+                "/bin/launchctl submit -l com.example.helper",
+            ),
+        ],
+    )
+    def test_python_exec_payload_uses_real_executable_not_argv0(
+        self, source, expected
+    ):
+        from cron.lifecycle_guard import _iter_python_command_payloads
+
+        assert list(_iter_python_command_payloads(source)) == [expected]
 
     def test_python_shell_walk_keeps_nonregular_forced_shell_reference_fail_closed(
         self, monkeypatch, tmp_path

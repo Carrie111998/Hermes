@@ -597,6 +597,24 @@ def _literal_python_command(node: ast.AST) -> Optional[str]:
     return None
 
 
+def _effective_python_exec_argv(executable: ast.AST, argv: ast.AST) -> ast.AST:
+    """Reconstruct what an ``os.exec*`` call executes when literals permit it.
+
+    Python's exec APIs choose the program from their first argument; ``argv[0]``
+    is caller-controlled process metadata and may be neutral.  Scan the real
+    executable followed by semantic arguments, while retaining the original
+    argv when the executable is dynamic so an existing dangerous argv cannot
+    disappear from inspection.
+    """
+    if not isinstance(argv, (ast.List, ast.Tuple)):
+        return argv
+    if not isinstance(executable, ast.Constant) or not isinstance(
+        executable.value, str
+    ):
+        return argv
+    return ast.List(elts=[executable, *argv.elts[1:]], ctx=ast.Load())
+
+
 def _iter_python_command_payloads(text: str) -> Iterator[str]:
     """Yield statically literal commands passed to Python execution APIs."""
     try:
@@ -668,14 +686,16 @@ def _iter_python_command_payloads(text: str) -> Iterator[str]:
                 None,
             )
         elif call_name in os_vector_calls and len(node.args) > 1:
-            argument = node.args[1]
+            argument = _effective_python_exec_argv(node.args[0], node.args[1])
         elif call_name in os_list_calls and len(node.args) > 1:
-            argument = ast.List(elts=node.args[1:], ctx=ast.Load())
+            argv = ast.List(elts=node.args[1:], ctx=ast.Load())
+            argument = _effective_python_exec_argv(node.args[0], argv)
         elif call_name in os_list_with_env_calls and len(node.args) > 2:
             # execle/execlepe's final argument is the environment mapping,
             # not part of argv. Including it makes an otherwise literal argv
             # fail the all-string extraction below.
-            argument = ast.List(elts=node.args[1:-1], ctx=ast.Load())
+            argv = ast.List(elts=node.args[1:-1], ctx=ast.Load())
+            argument = _effective_python_exec_argv(node.args[0], argv)
         if argument is None:
             continue
         if call_name in subprocess_calls and isinstance(argument, (ast.List, ast.Tuple)):
