@@ -30,13 +30,55 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useState } from 'react'
+import { type ChangeEvent, useEffect, useState } from 'react'
 
-import { $boardSlug, BOARDS_KEY, createBoard, fetchBoards, fetchProjects, PROJECTS_KEY, updateBoard } from './api'
+import {
+  $boardSlug,
+  BOARDS_KEY,
+  createBoard,
+  fetchBoards,
+  fetchProjects,
+  PROJECTS_KEY,
+  updateBoard
+} from './api'
 import type { BoardMeta } from './types'
 import { errText, FIELD_LABEL, useKanban } from './ui'
 
 const NO_PROJECT = '__none__'
+
+/**
+ * Resolve a typed workdir value to an absolute path the backend will accept.
+ * - Absolute paths pass through unchanged.
+ * - Relative paths are anchored on the app's current cwd (the opened
+ *   workspace) when available, else the platform home's `HermesWorkspace`.
+ * - Empty string → inherit (returns '' so the caller omits/sends '').
+ * `~/` tildes are expanded. The backend still validates that the directory
+ * exists, so this only handles the relative→absolute normalization.
+ */
+function resolveWorkdir(value: string): string {
+  const trimmed = value.trim()
+
+  if (!trimmed) {
+    return ''
+  }
+
+  const expanded = trimmed.replace(/^~(?=$|\/)/, host.state.cwd.get() || '')
+
+  if (expanded.startsWith('/') || /^[A-Za-z]:[\\/]/.test(expanded)) {
+    return expanded
+  }
+
+  const base = host.state.cwd.get() || ''
+
+  if (base) {
+    return `${base.replace(/\/$/, '')}/${expanded.replace(/^\//, '')}`
+  }
+
+  // Fall back to a HermesWorkspace dir under the user home when no cwd is set.
+  const home = (typeof process !== 'undefined' && process.env?.HOME) || ''
+
+  return `${home}/HermesWorkspace/${expanded.replace(/^\//, '')}`
+}
 
 /** Board scope = a first-class Hermes project. Its primary repo becomes the
  *  board's default workspace root; new tasks inherit it as a worktree with a
@@ -70,11 +112,55 @@ function ProjectPicker({ onChange, value }: { onChange: (id: string) => void; va
   )
 }
 
+/** Work directory row: text input + native Browse button. Powers the board's
+ *  default workspace — tasks without an explicit override inherit this. */
+function WorkdirField({
+  onChange,
+  value
+}: {
+  onChange: (path: string) => void
+  value: string
+}) {
+  const k = useKanban()
+
+  const browse = async () => {
+    // host.pickFolder → Electron showOpenDialog({ properties:
+    // ['openDirectory','createDirectory'] }); returns an absolute path or null.
+    const picked = await host.pickFolder(k.defaultWorkdir)
+
+    if (picked) {
+      onChange(picked)
+    }
+  }
+
+  return (
+    <label className="flex flex-col gap-1">
+      <span className={FIELD_LABEL}>{k.defaultWorkdir}</span>
+      <div className="flex items-center gap-2">
+        <Input
+          className="flex-1"
+          onChange={(event: ChangeEvent<HTMLInputElement>) => onChange(event.target.value)}
+          placeholder={k.defaultWorkdirPlaceholder}
+          value={value}
+        />
+        <Button onClick={browse} size="sm" type="button" variant="outline">
+          <Codicon name="folder-opened" size="0.8rem" />
+          {k.browse}
+        </Button>
+      </div>
+      <span className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">
+        {k.workspaceRelativeHint}
+      </span>
+    </label>
+  )
+}
+
 function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean }) {
   const k = useKanban()
   const qc = useQueryClient()
   const [name, setName] = useState('')
   const [project, setProject] = useState('')
+  const [workdir, setWorkdir] = useState('')
 
   const slug = name
     .trim()
@@ -86,11 +172,12 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
     if (open) {
       setName('')
       setProject('')
+      setWorkdir('')
     }
   }, [open])
 
   const create = useMutation({
-    mutationFn: () => createBoard(slug, name.trim(), project || undefined),
+    mutationFn: () => createBoard(slug, name.trim(), project || undefined, resolveWorkdir(workdir) || undefined),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: result => {
       $boardSlug.set(result.board.slug)
@@ -111,13 +198,14 @@ function NewBoardDialog({ onClose, open }: { onClose: () => void; open: boolean 
             <Input
               autoFocus
               onChange={event => setName(event.target.value)}
-              onKeyDown={event => event.key === 'Enter' && slug && !project && create.mutate()}
+              onKeyDown={event => event.key === 'Enter' && slug && create.mutate()}
               placeholder={k.boardNamePlaceholder}
               value={name}
             />
             {slug && <span className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.slug(slug)}</span>}
           </label>
           <ProjectPicker onChange={setProject} value={project} />
+          <WorkdirField onChange={setWorkdir} value={workdir} />
         </div>
         <DialogFooter>
           <Button onClick={onClose} variant="text">
@@ -137,18 +225,26 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
   const qc = useQueryClient()
   const [name, setName] = useState('')
   const [project, setProject] = useState('')
+  const [workdir, setWorkdir] = useState('')
 
   useEffect(() => {
     if (board) {
       setName(board.name || '')
       setProject(board.project_id || '')
+      setWorkdir(board.default_workdir || '')
     }
   }, [board])
 
   const save = useMutation({
     // Slug is immutable; send name + project_id ('' clears the scope, which
-    // also drops the mirrored default_workdir on the backend).
-    mutationFn: () => updateBoard(board!.slug, { name: name.trim(), project_id: project }),
+    // also drops the mirrored default_workdir on the backend) + default_workdir
+    // ('' clears it, an absolute path sets it).
+    mutationFn: () =>
+      updateBoard(board!.slug, {
+        name: name.trim(),
+        project_id: project,
+        default_workdir: workdir.trim() ? resolveWorkdir(workdir) : ''
+      }),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: BOARDS_KEY })
@@ -169,6 +265,7 @@ function BoardSettingsDialog({ board, onClose }: { board: BoardMeta | null; onCl
             {board && <span className="text-[0.6875rem] text-(--ui-text-quaternary)">{k.slug(board.slug)}</span>}
           </label>
           <ProjectPicker onChange={setProject} value={project} />
+          <WorkdirField onChange={setWorkdir} value={workdir} />
         </div>
         <DialogFooter>
           <Button onClick={onClose} variant="text">

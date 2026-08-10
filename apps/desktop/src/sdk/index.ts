@@ -23,6 +23,7 @@ import { atom, type ReadableAtom } from 'nanostores'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
+import { selectDesktopPaths } from '@/lib/desktop-fs'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -94,6 +95,17 @@ export const host = {
 
   /** Restart the backend gateway (progress surfaces in the core statusbar). */
   restartGateway: async () => runGatewayRestart(),
+
+  /** Open the OS folder picker (Electron `showOpenDialog` with
+   *  `openDirectory` + `createDirectory`). Resolves to the chosen absolute
+   *  directory path, or `null` if the user cancelled. Plugins use this for
+   *  path inputs (e.g. a board's default work directory) instead of reaching
+   *  into `@/lib/desktop-fs` directly — this is the sanctioned bridge. */
+  pickFolder: async (title?: string): Promise<null | string> => {
+    const paths = await selectDesktopPaths({ title: title ?? 'Select folder', directories: true })
+
+    return paths?.length ? paths[0] : null
+  },
 
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),

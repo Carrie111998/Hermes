@@ -175,6 +175,10 @@ type KanbanMessages = {
   noProject: string
   projectHintPre: string
   projectHintCmd: string
+  defaultWorkdir: string
+  defaultWorkdirPlaceholder: string
+  browse: string
+  workspaceRelativeHint: string
   createBoard: string
   // orchestration
   orchestratorProfile: string
@@ -367,6 +371,11 @@ const en: KanbanMessages = {
   projectHintPre:
     'New tasks run in the project’s repo (a worktree per task); each task can still override its workspace at creation. Manage projects with ',
   projectHintCmd: 'hermes project',
+  defaultWorkdir: 'Default work directory',
+  defaultWorkdirPlaceholder: 'Absolute path, or relative to HermesWorkspace',
+  browse: 'Browse',
+  workspaceRelativeHint:
+    'Leave blank to inherit from the project above, or enter a path. Relative paths resolve against HermesWorkspace. Use Browse to pick a folder.',
   createBoard: 'Create board',
   orchestratorProfile: 'Orchestrator profile',
   defaultAssignee: 'Default assignee',
@@ -558,6 +567,11 @@ const ja: KanbanMessages = {
   projectHintPre:
     '新しいタスクはプロジェクトのリポジトリで実行されます（タスクごとに worktree）。各タスクは作成時にワークスペースを上書きできます。プロジェクトの管理は ',
   projectHintCmd: 'hermes project',
+  defaultWorkdir: '既定の作業ディレクトリ',
+  defaultWorkdirPlaceholder: '絶対パス、または HermesWorkspace からの相対パス',
+  browse: '参照',
+  workspaceRelativeHint:
+    '上のプロジェクトから継承するには空のままにするか、パスを入力します。相対パスは HermesWorkspace から解決されます。フォルダーを選ぶには「参照」を使用します。',
   createBoard: 'ボードを作成',
   orchestratorProfile: 'オーケストレータープロフィール',
   defaultAssignee: 'デフォルトの担当',
@@ -747,6 +761,11 @@ const zh: KanbanMessages = {
   projectHintPre:
     '新任务将在项目的仓库中运行（每个任务一个 worktree）；每个任务在创建时仍可覆盖其工作区。管理项目请使用 ',
   projectHintCmd: 'hermes project',
+  defaultWorkdir: '默认工作目录',
+  defaultWorkdirPlaceholder: '绝对路径，或相对于 HermesWorkspace 的路径',
+  browse: '浏览',
+  workspaceRelativeHint:
+    '留空以继承上方的项目，或输入一个路径。相对路径会基于 HermesWorkspace 解析。点击“浏览”选择文件夹。',
   createBoard: '创建面板',
   orchestratorProfile: '编排者配置档',
   defaultAssignee: '默认负责人',
@@ -935,6 +954,11 @@ const zhHant: KanbanMessages = {
   projectHintPre:
     '新任務將在專案的儲存庫中執行（每個任務一個 worktree）；每個任務在建立時仍可覆寫其工作區。管理專案請使用 ',
   projectHintCmd: 'hermes project',
+  defaultWorkdir: '預設工作目錄',
+  defaultWorkdirPlaceholder: '絕對路徑，或相對於 HermesWorkspace 的路徑',
+  browse: '瀏覽',
+  workspaceRelativeHint:
+    '留空以繼承上方的專案，或輸入一個路徑。相對路徑會以 HermesWorkspace 為基準解析。點擊「瀏覽」選擇資料夾。',
   createBoard: '建立面板',
   orchestratorProfile: '編排者設定檔',
   defaultAssignee: '預設負責人',
