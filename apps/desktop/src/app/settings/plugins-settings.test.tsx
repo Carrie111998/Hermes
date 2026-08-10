@@ -58,7 +58,7 @@ describe('PluginsSettings', () => {
 
     expect(screen.getByText('Legacy plugin')).toBeTruthy()
 
-    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'pre-key' } })
+    fireEvent.change(screen.getByPlaceholderText('Search plugins…'), { target: { value: 'pre-key' } })
 
     expect(screen.getByText('Legacy plugin')).toBeTruthy()
   })
