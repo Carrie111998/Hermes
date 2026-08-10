@@ -14675,7 +14675,17 @@ const hudIpc = registerHudIpc({
   closeHudWindow,
   resetHudLayout: resetHudWindowLayout,
   setHudSessionId: value => {
+    // Every window decides "switch the HUD to this tab" vs "dismiss it" by
+    // comparing against its own copy of this id, so a conversation switched
+    // from INSIDE the HUD has to reach them too. Without this the app window
+    // keeps the id the HUD was opened on, and the toggle reads a retarget
+    // where the user meant a dismiss.
+    if (value === hudSessionId) {
+      return
+    }
+
     hudSessionId = value
+    broadcastHudState(true)
   }
 })
 
