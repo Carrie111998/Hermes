@@ -5,6 +5,11 @@ lands on the **shared open file description** — not just the child's descripto
 The gateway's next ``read()`` returns ``EAGAIN``, which CPython's buffered
 ``TextIOWrapper`` converts to ``b''`` (apparent EOF), killing the gateway.
 
+``SO_RCVTIMEO`` is the second route to the same symptom.  It is a socket option
+rather than a file-status flag, but it lives on the same shared description, and
+when it expires the read returns ``''`` with ``O_NONBLOCK`` **clear** — so the
+flag alone is not enough to tell tampering from a real peer close.
+
 This module provides:
 - :func:`diagnose_stdin_state` — forensic diagnostic (``O_NONBLOCK`` / ``SO_RCVTIMEO``)
 - :func:`handle_spurious_eof` — check whether an empty ``readline()`` is a genuine
@@ -89,12 +94,28 @@ def _read_stdin_rcvtimeo() -> bytes | None:
         s.close()
 
 
+def _stdin_rcvtimeo_is_set() -> bool:
+    """Return ``True`` only when stdin carries a **non-zero** receive timeout.
+
+    A zeroed timeval means "block forever", which is the default and is not
+    tampering.  An unreadable probe (``None``) is deliberately reported as
+    ``False``: on a tty or an anonymous pipe there is no timeout to detect, and
+    guessing ``True`` there would make every genuine peer-close look spurious.
+
+    The byte-wise test avoids unpacking, so it holds regardless of the
+    platform's timeval width or endianness.
+    """
+    tv = _read_stdin_rcvtimeo()
+    return tv is not None and any(tv)
+
+
 def diagnose_stdin_state() -> str:
     """Return a diagnostic string about stdin's current state.
 
     Used for crash-log forensics when stdin iteration falls through.
-    Distinguishes genuine peer-close (flag clear) from spurious EOF
-    caused by a child setting ``O_NONBLOCK`` on the shared file description.
+    Distinguishes a genuine peer-close from a spurious EOF caused by a child
+    mutating the shared file description — either ``O_NONBLOCK`` or a non-zero
+    ``SO_RCVTIMEO``.
     """
     parts: list[str] = []
     if _HAS_FCNTL and _fcntl is not None:
@@ -138,7 +159,10 @@ def handle_spurious_eof(
     except Exception:
         is_nonblock = False
 
-    if not is_nonblock:
+    # ``SO_RCVTIMEO`` reaches the same symptom by a different route: the read
+    # expires and returns ``''`` with ``O_NONBLOCK`` **clear**, so the flag
+    # alone cannot distinguish it from a peer close.  Probe it too.
+    if not is_nonblock and not _stdin_rcvtimeo_is_set():
         # Genuine peer-close — no subprocess flag tampering detected.
         log_fn("stdin EOF (peer closed)")  # type: ignore[operator]
         return False
@@ -157,7 +181,7 @@ def handle_spurious_eof(
         return False
 
     diag = diagnose_stdin_state()
-    log_fn(f"stdin spurious EOF (subprocess O_NONBLOCK flip), recovering: {diag}")  # type: ignore[operator]
+    log_fn(f"stdin spurious EOF (subprocess O_NONBLOCK / SO_RCVTIMEO), recovering: {diag}")  # type: ignore[operator]
 
     # Clear ``O_NONBLOCK`` on the shared file description.
     os.set_blocking(0, True)
