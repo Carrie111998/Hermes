@@ -1,400 +1,194 @@
 <p align="center">
-  <img src="assets/banner.png" alt="Hermes Agent" width="100%">
+  <img src="docs/ares-workbench.svg" width="100%" alt="Ares architecture: Hermes-compatible interaction layer feeding an evidence boundary, with optional governed services such as Recursive Agent, Agent Graph, semantic memory, and Claim Ledger.">
 </p>
 
-# Hermes Agent ☤
-<p align="center">
-  <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
-</p>
-<p align="center">
-  <a href="https://hermes-agent.nousresearch.com/docs/"><img src="https://img.shields.io/badge/Docs-hermes--agent.nousresearch.com-FFD700?style=for-the-badge" alt="Documentation"></a>
-  <a href="https://discord.gg/NousResearch"><img src="https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord"></a>
-  <a href="https://github.com/NousResearch/hermes-agent/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License: MIT"></a>
-  <a href="https://nousresearch.com"><img src="https://img.shields.io/badge/Built%20by-Nous%20Research-blueviolet?style=for-the-badge" alt="Built by Nous Research"></a>
-  <a href="README.zh-CN.md"><img src="https://img.shields.io/badge/Lang-中文-red?style=for-the-badge" alt="中文"></a>
-  <a href="README.ur-pk.md"><img src="https://img.shields.io/badge/Lang-اردو-green?style=for-the-badge" alt="اردو"></a>
-  <a href="README.es.md"><img src="https://img.shields.io/badge/Lang-Español-orange?style=for-the-badge" alt="Español"></a>
-</p>
+# Ares
 
-**The self-improving AI agent built by [Nous Research](https://nousresearch.com).** It's the only agent with a built-in learning loop — it creates skills from experience, improves them during use, nudges itself to persist knowledge, searches its own past conversations, and builds a deepening model of who you are across sessions. Run it on a $5 VPS, a GPU cluster, or serverless infrastructure that costs nearly nothing when idle. It's not tied to your laptop — talk to it from Telegram while it works on a cloud VM.
+**An evidence-native, Hermes-compatible AI workbench for bounded execution, inspectable state, and explicit operator control.**
 
-Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenRouter, OpenAI, your own endpoint, and [many others](https://hermes-agent.nousresearch.com/docs/integrations/providers). Switch with `hermes model` — no code changes, no lock-in.
+Ares is a **downstream distribution** of [Hermes Agent](https://github.com/NousResearch/hermes-agent), maintained by [RecursiveIntell](https://github.com/RecursiveIntell). It keeps the established Python package and `hermes` CLI so existing Hermes integrations remain usable, while adding a separately maintained integration layer for evidence-oriented local workflows.
 
-<table>
-<tr><td><b>A real terminal interface</b></td><td>Full TUI with multiline editing, slash-command autocomplete, conversation history, interrupt-and-redirect, and streaming tool output.</td></tr>
-<tr><td><b>Lives where you do</b></td><td>Telegram, Discord, Slack, WhatsApp, Signal, and CLI — all from a single gateway process. Voice memo transcription, cross-platform conversation continuity.</td></tr>
-<tr><td><b>A closed learning loop</b></td><td>Agent-curated memory with periodic nudges. Autonomous skill creation after complex tasks. Skills self-improve during use. FTS5 session search with LLM summarization for cross-session recall. <a href="https://github.com/plastic-labs/honcho">Honcho</a> dialectic user modeling. Compatible with the <a href="https://agentskills.io">agentskills.io</a> open standard.</td></tr>
-<tr><td><b>Scheduled automations</b></td><td>Built-in cron scheduler with delivery to any platform. Daily reports, nightly backups, weekly audits — all in natural language, running unattended.</td></tr>
-<tr><td><b>Delegates and parallelizes</b></td><td>Spawn isolated subagents for parallel workstreams. Write Python scripts that call tools via RPC, collapsing multi-step pipelines into zero-context-cost turns.</td></tr>
-<tr><td><b>Runs anywhere, not just your laptop</b></td><td>Six terminal backends — local, Docker, SSH, Singularity, Modal, and Daytona. Daytona and Modal offer serverless persistence — your agent's environment hibernates when idle and wakes on demand, costing nearly nothing between sessions. Run it on a $5 VPS or a GPU cluster.</td></tr>
-<tr><td><b>Research-ready</b></td><td>Batch trajectory generation, trajectory compression for training the next generation of tool-calling models.</td></tr>
-</table>
+> [!IMPORTANT]
+> **Ares is not regular Hermes and is not an official Nous Research product.** It is a distinct fork with its own installer, default home directory, documentation front door, and optional RecursiveIntell integrations. Upstream Hermes remains the compatibility base; Ares-specific claims apply only to this fork and the explicitly installed components described below.
 
----
+[Install Ares](#quick-start) · [What changes](#what-makes-ares-distinct) · [Integration boundaries](#integration-boundaries) · [Security model](#security-and-trust-boundaries) · [Upstream Hermes](https://github.com/NousResearch/hermes-agent)
 
-## Quick Install
+## Who Ares is for
 
-### Linux, macOS, WSL2, Termux
+Use Ares when you want a local agent workbench where important work can be bounded, inspected, and connected to durable evidence—not merely summarized after the fact. It is aimed at technical operators working on code, research, or automation who are willing to make model/provider, service, and authority choices explicitly.
 
-```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-```
+Ares is **not** a claim of autonomous production operations, a replacement for operating-system isolation, or a bundled guarantee that every optional service is present. If you only want the standard Hermes experience, use upstream Hermes.
 
-### Windows (native, PowerShell)
+## What makes Ares distinct
 
-> **Heads up:** Native Windows runs Hermes without WSL — CLI, gateway, TUI, and tools all work natively. If you'd rather use WSL2, the Linux/macOS one-liner above works there too. Found a bug? Please [file issues](https://github.com/NousResearch/hermes-agent/issues).
+| Surface | Upstream compatibility retained | Ares position |
+|---|---|---|
+| Agent runtime | Python package and `hermes` CLI remain intact | Ares adds an `ares` launcher and uses `~/.ares` by default, avoiding accidental mutation of an existing `~/.hermes` profile. |
+| Capability model | Plugins, skills, MCP, and toolsets still define extension boundaries | Ares favors explicit, separately installed services over silently widening core authority. |
+| Execution evidence | Hermes can run tools through its normal approval and toolset model | The optional Recursive Agent plugin submits one canonical bounded action through local authenticated IPC and returns daemon-derived verification facts. |
+| Memory and orchestration | Hermes’s normal providers and MCP client remain available | Semantic memory, Agent Graph, Claim Ledger, CEA Graph, and Pilot Bridge remain opt-in external services with independent lifecycle and configuration. |
+| Documentation | Existing Hermes documentation remains useful for compatible surfaces | This README and the Ares guide state what is fork-owned, optional, locally verified, or unverified. |
 
-Run this in PowerShell:
+## Quick start
 
-```powershell
-iex (irm https://hermes-agent.nousresearch.com/install.ps1)
-```
+### Prerequisites
 
-The installer handles everything: uv, Python 3.11, Node.js, ripgrep, ffmpeg, **and a portable Git Bash** (MinGit, unpacked to `%LOCALAPPDATA%\hermes\git` — no admin required, completely isolated from any system Git install). Hermes uses this bundled Git Bash to run shell commands.
+- Git
+- [uv](https://docs.astral.sh/uv/)
+- Python **3.11–3.13** (the project metadata rejects Python 3.14)
+- A model provider configured through the normal Hermes setup flow
 
-If you already have Git installed, the installer detects it and uses that instead. Otherwise a ~45MB MinGit download is all you need — it won't touch or interfere with any system Git.
+The Ares bootstrap targets Unix-like shells (Linux, macOS, and WSL). The standard Hermes package and CLI remain the compatibility interface; the bootstrap adds the `ares` launcher.
 
-> **Android / Termux:** The tested manual path is documented in the [Termux guide](https://hermes-agent.nousresearch.com/docs/getting-started/termux). On Termux, Hermes installs a curated `.[termux]` extra because the full `.[all]` extra currently pulls Android-incompatible voice dependencies.
->
-> **Windows:** Native Windows is fully supported — the PowerShell one-liner above installs everything. If you'd rather use WSL2, the Linux command works there too. Native Windows install lives under `%LOCALAPPDATA%\hermes`; WSL2 installs under `~/.hermes` as on Linux.
+### Install from this fork
 
-After installation:
+Review the installer before executing it, then clone and run it locally:
 
 ```bash
-source ~/.bashrc    # reload shell (or: source ~/.zshrc)
-hermes              # start chatting!
+git clone https://github.com/RecursiveIntell/hermes-agent.git ares
+cd ares
+bash install.sh
 ```
 
-### Troubleshooting
+The installer creates:
 
-#### Windows Defender or antivirus flags `uv.exe` as malware
+- source checkout: `~/.ares/ares-agent`
+- isolated runtime: `~/.ares/ares-agent/.venv`
+- Ares data home: `~/.ares`
+- launcher: `~/.local/bin/ares`
 
-If your antivirus (Bitdefender, Windows Defender, etc.) quarantines `uv.exe` from the Hermes `bin` folder (`%LOCALAPPDATA%\hermes\bin\uv.exe`), this is a **false positive**. The file is Astral's `uv` — the Rust Python package manager Hermes bundles to manage its Python environment. ML-based antivirus engines commonly flag unsigned Rust binaries that download and install packages.
+It deliberately **does not** create credentials, configure a provider, enable MCP servers, change an existing Hermes home, or start background services.
 
-**To verify your copy is authentic:**
-
-```powershell
-# Install GitHub CLI if needed
-winget install --id GitHub.cli
-
-# Login to GitHub
-gh auth login
-
-# Run verification
-$uv = "$env:LOCALAPPDATA\hermes\bin\uv.exe"
-$ver = (& $uv --version).Split(' ')[1]
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$zip = "$env:TEMP\uv.zip"
-Invoke-WebRequest "https://github.com/astral-sh/uv/releases/download/$ver/uv-x86_64-pc-windows-msvc.zip" -OutFile $zip -UseBasicParsing
-gh attestation verify $zip --repo astral-sh/uv
-Expand-Archive $zip "$env:TEMP\uv_x" -Force
-(Get-FileHash "$env:TEMP\uv_x\uv.exe").Hash -eq (Get-FileHash $uv).Hash
-```
-
-If attestation says "Verification succeeded" and the last line prints `True`, you're good.
-
-**To whitelist Hermes:**
-- **Windows Defender:** Run PowerShell as Admin → `Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\hermes\bin"`
-- **Bitdefender:** Add an exception in the Bitdefender console (Protection > Antivirus > Settings > Manage Exceptions)
-- Whitelist the **folder**, not the file hash — Hermes updates `uv` and the hash changes every version
-
-For more context, see the upstream Astral reports: [astral-sh/uv#13553](https://github.com/astral-sh/uv/issues/13553), [astral-sh/uv#15011](https://github.com/astral-sh/uv/issues/15011), [astral-sh/uv#10079](https://github.com/astral-sh/uv/issues/10079).
-
----
-
-## Getting Started
+If `~/.local/bin` is not on your `PATH`, add it using your shell’s normal profile mechanism. Then configure a provider and verify the runtime:
 
 ```bash
-hermes              # Interactive CLI — start a conversation
-hermes model        # Choose your LLM provider and model
-hermes tools        # Configure which tools are enabled
-hermes config set   # Set individual config values
-hermes config get   # Print individual config values
-hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
-hermes setup        # Run the full setup wizard (configures everything at once)
-hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)
-hermes update       # Update to the latest version
-hermes doctor       # Diagnose any issues
+ares setup
+ares --version
+ares doctor
 ```
 
-📖 **[Full documentation →](https://hermes-agent.nousresearch.com/docs/)**
+A successful `ares --version` proves the generated launcher can reach the installed Hermes-compatible runtime. `ares doctor` is the next diagnostic gate; provider setup is not complete until you have supplied your own provider credentials through the supported local flow.
 
----
+### Install the Recursive Agent plugin (optional)
 
-## Skip the API-key collection — Nous Portal
+The Recursive Agent integration is a standalone plugin, not a bundled core tool. It needs a separately built and running local Recursive Agent daemon before it can execute a request.
 
-Hermes works with whatever provider you want — that's not changing. But if you'd rather not collect five separate API keys for the model, web search, image generation, TTS, and a cloud browser, **[Nous Portal](https://portal.nousresearch.com)** covers all of them under one subscription:
-
-- **300+ models** — pick any of them with `/model <name>`
-- **Tool Gateway** — web search (Firecrawl), image generation (FAL), text-to-speech (OpenAI), cloud browser (Browser Use), all routed through your sub. No extra accounts.
-
-One command from a fresh install:
+From an existing `RecursiveIntell/recursive-agent` checkout:
 
 ```bash
-hermes setup --portal
+cd /path/to/ares
+bash install.sh --with-recursive-agent-source /path/to/recursive-agent
 ```
 
-That logs you in via OAuth, sets Nous as your provider, and turns on the Tool Gateway. Check what's wired up any time with `hermes portal info`. Full details on the [Tool Gateway docs page](https://hermes-agent.nousresearch.com/docs/user-guide/features/tool-gateway).
+This copies the plugin’s declared runtime package into `~/.ares/plugins/recursive-agent-native`. It does **not** build, configure, start, or grant authority to the daemon. After the daemon is independently running, start a fresh Ares/Hermes session so plugin discovery can occur.
 
-You can still bring your own keys per-tool whenever you want — the gateway is per-backend, not all-or-nothing.
+For the daemon contract, allowed operation envelope, socket requirements, receipts, and verification semantics, see the [Ares Recursive Agent integration guide](docs/ares-recursive-agent.md).
 
----
+## Integration boundaries
 
-## CLI vs Messaging Quick Reference
+Ares intentionally keeps the following layers separate:
 
-Hermes has two entry points: start the terminal UI with `hermes`, or run the gateway and talk to it from Telegram, Discord, Slack, WhatsApp, Signal, or Email. Once you're in a conversation, many slash commands are shared across both interfaces.
-
-| Action                         | CLI                                           | Messaging platforms                                                              |
-| ------------------------------ | --------------------------------------------- | -------------------------------------------------------------------------------- |
-| Start chatting                 | `hermes`                                      | Run `hermes gateway setup` + `hermes gateway start`, then send the bot a message |
-| Start fresh conversation       | `/new` or `/reset`                            | `/new` or `/reset`                                                               |
-| Change model                   | `/model [provider:model]`                     | `/model [provider:model]`                                                        |
-| Set a personality              | `/personality [name]`                         | `/personality [name]`                                                            |
-| Retry or undo the last turn    | `/retry`, `/undo`                             | `/retry`, `/undo`                                                                |
-| Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]`                                        |
-| Browse skills                  | `/skills` or `/<skill-name>`                  | `/<skill-name>`                                                                  |
-| Interrupt current work         | `Ctrl+C` or send a new message                | `/stop` or send a new message                                                    |
-| Platform-specific status       | `/platforms`                                  | `/status`, `/sethome`                                                            |
-
-For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
-
----
-
-## Documentation
-
-All documentation lives at **[hermes-agent.nousresearch.com/docs](https://hermes-agent.nousresearch.com/docs/)**:
-
-| Section                                                                                             | What's Covered                                             |
-| --------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| [Quickstart](https://hermes-agent.nousresearch.com/docs/getting-started/quickstart)                 | Install → setup → first conversation in 2 minutes          |
-| [CLI Usage](https://hermes-agent.nousresearch.com/docs/user-guide/cli)                              | Commands, keybindings, personalities, sessions             |
-| [Configuration](https://hermes-agent.nousresearch.com/docs/user-guide/configuration)                | Config file, providers, models, all options                |
-| [Messaging Gateway](https://hermes-agent.nousresearch.com/docs/user-guide/messaging)                | Telegram, Discord, Slack, WhatsApp, Signal, Home Assistant |
-| [Security](https://hermes-agent.nousresearch.com/docs/user-guide/security)                          | Command approval, DM pairing, container isolation          |
-| [Tools & Toolsets](https://hermes-agent.nousresearch.com/docs/user-guide/features/tools)            | 40+ tools, toolset system, terminal backends               |
-| [Skills System](https://hermes-agent.nousresearch.com/docs/user-guide/features/skills)              | Procedural memory, Skills Hub, creating skills             |
-| [Memory](https://hermes-agent.nousresearch.com/docs/user-guide/features/memory)                     | Persistent memory, user profiles, best practices           |
-| [MCP Integration](https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp)               | Connect any MCP server for extended capabilities           |
-| [Cron Scheduling](https://hermes-agent.nousresearch.com/docs/user-guide/features/cron)              | Scheduled tasks with platform delivery                     |
-| [Context Files](https://hermes-agent.nousresearch.com/docs/user-guide/features/context-files)       | Project context that shapes every conversation             |
-| [Architecture](https://hermes-agent.nousresearch.com/docs/developer-guide/architecture)             | Project structure, agent loop, key classes                 |
-| [Contributing](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing)             | Development setup, PR process, code style                  |
-| [CLI Reference](https://hermes-agent.nousresearch.com/docs/reference/cli-commands)                  | All commands and flags                                     |
-| [Environment Variables](https://hermes-agent.nousresearch.com/docs/reference/environment-variables) | Complete env var reference                                 |
-
----
-
-## Migrating from OpenClaw
-
-If you're coming from OpenClaw, Hermes can automatically import your settings, memories, skills, and API keys.
-
-**During first-time setup:** The setup wizard (`hermes setup`) automatically detects `~/.openclaw` and offers to migrate before configuration begins.
-
-**Anytime after install:**
-
-```bash
-hermes claw migrate              # Interactive migration (full preset)
-hermes claw migrate --dry-run    # Preview what would be migrated
-hermes claw migrate --preset user-data   # Migrate without secrets
-hermes claw migrate --overwrite  # Overwrite existing conflicts
+```text
+operator ──> Ares / Hermes-compatible runtime ──> plugins, MCP servers, approved tools
+                         │
+                         └── optional Recursive Agent plugin
+                                  │ local authenticated IPC
+                                  v
+                           Recursive Agent daemon
+                                  │
+                                  └── bounded run + receipt chain + verification result
 ```
 
-What gets imported:
+- **Hermes-compatible runtime** owns conversation, model routing, tool selection, approvals, plugins, and normal persistence.
+- **Ares** owns the downstream distribution identity, installer behavior, documentation boundaries, and integration policy in this repository.
+- **Recursive Agent** owns its run contract, state machine, receipt chain, and verification result. The plugin does not manufacture evidence or bypass the daemon.
+- **MCP services** remain separate processes/services. Configure each one intentionally; a registered tool is not proof that its backend is available or exercised.
 
-- **SOUL.md** — persona file
-- **Memories** — MEMORY.md and USER.md entries
-- **Skills** — user-created skills → `~/.hermes/skills/openclaw-imports/`
-- **Command allowlist** — approval patterns
-- **Messaging settings** — platform configs, allowed users, working directory
-- **API keys** — allowlisted secrets (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **TTS assets** — workspace audio files
-- **Workspace instructions** — AGENTS.md (with `--workspace-target`)
+The repository includes optional RecursiveIntell transport modules for `llm-pipeline`, `context-governor`, `agent-graph`, and `poly-kv`. Their presence in source is **not** a promise that native extensions are installed, active, or applicable to every provider. Each path must be admitted and verified in the environment where it is used.
 
-See `hermes claw migrate --help` for all options, or use the `openclaw-migration` skill for an interactive agent-guided migration with dry-run previews.
+## A concrete evidence workflow
 
----
+A bounded certification run is the clearest current use case:
 
-## RecursiveIntell Edition
+1. Define one admissible operation, such as a repository validation bundle.
+2. Submit it through the optional Recursive Agent plugin.
+3. Let the daemon record the terminal state and receipt-chain facts.
+4. Verify the returned chain before using the result to support a decision or claim.
+5. Export or attach the resulting evidence through the relevant governed service only when that integration is separately configured.
 
-This fork ships with [RecursiveIntell](https://github.com/RecursiveIntell)'s full Rust stack, MCP server infrastructure, 70+ agent skills, and a one-line installer that configures everything automatically.
+This is different from treating a chat summary as proof. Ares can expose a path to durable run evidence; it does not make a result trustworthy unless the relevant run and verification actually succeeded.
 
-### One-line install
+## Configuration and operations
 
-```bash
-curl -fsSL https://recursiveintell.com/hermes/install.sh | bash
-```
+Ares preserves normal Hermes configuration semantics. The `ares` launcher sets `HERMES_HOME=~/.ares` by default; you can choose a different home at bootstrap time with `--hermes-home PATH`.
 
-That gives you Hermes Agent with Rust acceleration active by default (`llm-pipeline`, `context-governor`, `poly-kv`). No config needed — the context-governor plugin is auto-enabled.
+Do not copy structured configuration blindly between homes. In particular:
 
-### Full Josh's setup
+- keep provider secrets in the local secret mechanism, never in this repository or in shell history;
+- configure MCP server mappings and argument lists as typed YAML, not ad-hoc strings;
+- install and review plugins before loading them—they run with agent-process authority;
+- restart or start a new session after changing plugin, toolset, MCP, or credential configuration because the tool schema is session-scoped;
+- prove a capability at the right layer: selected, registered, exposed, then exercised.
 
-```bash
-curl -fsSL https://recursiveintell.com/hermes/install.sh | bash -s -- --with-josh-setup
-```
+The bootstrap has intentionally narrow flags:
 
-This installs everything — the complete Hermes experience:
+| Flag | Effect |
+|---|---|
+| `--branch NAME` | Clone or update a specific branch. |
+| `--dir PATH` | Select the source checkout directory. |
+| `--hermes-home PATH` | Select the Ares data directory. |
+| `--ares-bin-dir PATH` | Select where the `ares` launcher is written. |
+| `--no-venv` | Use the active Python environment instead of a managed virtual environment. |
+| `--with-recursive-agent-source PATH` | Install only the standalone plugin from an existing Recursive Agent checkout; the daemon remains operator-managed. |
 
-| Layer | What you get | Where |
-|-------|-------------|-------|
-| **Rust acceleration** | `llm-pipeline` (LLM transport), `context-governor` (prompt compaction), `poly-kv` (vector scoring) | Active by default, silent Python fallback on error |
-| **Skills pack** | 70+ skills — README generation, code review, GPU benchmarking, council deliberation, email automation, device maintenance, research synthesis, and more | `~/.hermes/skills/` |
-| **Agent hooks** | 12 hooks — memory recall/capture, context compaction, CEA edit telemetry, knowledge-router classification, council trimming | `~/.hermes/agent-hooks/` (auto-discovered) |
-| **semantic-memory MCP** | Persistent knowledge base with semantic search, graph edges, factor-graph belief propagation, contradiction detection. Auto-starts on boot via systemd | `~/.local/bin/semantic-memory-mcp` |
-| **agent-graph MCP** | Multi-agent graph orchestration — run 9+ LLM nodes in parallel fan-out, council deliberation, plan→critique→refine pipelines, HITL approvals | `~/.local/bin/agent-graph-mcp` + daemon |
+Run `bash install.sh --help` for the current installer contract. The bootstrap refuses to update a dirty existing checkout and refuses to overwrite a non-Ares launcher.
 
-### What the installer configures automatically
+## Security and trust boundaries
 
-When you use `--with-josh-setup` (or the individual flags), the installer wires everything into your Hermes config:
+Ares inherits Hermes’s fundamental security posture: **the operating system or an explicit whole-process sandbox is the real boundary against adversarial model output.** Approval prompts, tool allowlists, plugin review, redaction, and receipts are useful controls; they are not containment.
 
-| Config change | Why |
-|---------------|-----|
-| `context.engine: ri-context-governor` | Rust prompt compaction replaces Python summarizer |
-| `agent.disabled_toolsets: [memory]` | Built-in memory disabled — semantic-memory replaces it |
-| `mcp_servers.semantic_memory` registered + args | Knowledge base with `--memory-dir` for persistent storage |
-| `mcp_servers.agent_graph` registered + socket args | Graph orchestration, socket matches systemd unit |
-| `~/.config/systemd/user/semantic-memory.service` | Auto-starts on boot, restarts on failure, candle embedder (zero deps) |
-| `~/.config/systemd/user/agent-graph-mcpd.service` | Auto-starts on boot, `MemoryMax=4G`, reads API key from `~/.hermes/agent-graph.env` |
-| `~/.hermes/agent-graph.env` (placeholder) | API key file — edit with your `OPENAI_API_KEY` |
-| Hooks auto-discovered from `~/.hermes/agent-hooks/` | No config needed — any `.py` file is loaded |
+Important consequences:
 
-**How this affects the learning loop:** Hermes' built-in learning loop (skill creation, memory recall, knowledge capture, session search) is **enhanced**, not broken. The agent hooks intercept memory operations at the hook level and route them to semantic-memory's vector + graph backend — giving you semantic search, knowledge graph edges, and factor-graph belief propagation instead of basic FTS5 keyword search. Skill creation and cron nudges are unchanged.
+- a plugin runs with the authority of the agent process; review it before installation;
+- a local IPC socket or a verified receipt does not contain a compromised process;
+- do not give an agent access to files, credentials, network destinations, or destructive tools you would not delegate to it;
+- use a whole-process wrapper or a deliberately constrained account when handling untrusted content or higher-risk workloads.
 
-**Caveat:** If the semantic-memory daemon is down AND built-in memory is disabled, the agent has no memory backend. Keep the daemon running, or re-enable the built-in `memory` toolset as a fallback:
+Read [SECURITY.md](SECURITY.md) before exposing Ares to untrusted inputs or shared environments.
 
-```bash
-hermes config unset agent.disabled_toolsets
-```
+## Status and claim boundary
 
-### Installer flags
+**Observed locally (2026-08-10):** the standalone Recursive Agent plugin loaded through a fresh Hermes plugin registry, registered `recursive_agent_execute` in the `recursive_agent` toolset, reached a private local Unix socket, and returned a terminal verified run with a receipt chain.
 
-| Flag | What it does |
-|------|-------------|
-| *(none)* | Hermes Agent + Rust acceleration (llm-pipeline, context-governor, poly-kv) |
-| `--with-semantic-memory` | + semantic-memory MCP server (prebuilt binary) + auto-register + disable built-in memory |
-| `--with-agent-graph` | + agent-graph MCP server (prebuilt binary) + auto-register + systemd unit |
-| `--with-claim-ledger` | + claim-ledger MCP server (prebuilt binary) + auto-register |
-| `--with-cea-graph` | + cea-graph MCP server (binary + Python relay) + auto-register |
-| `--with-pilot-bridge` | + pilot-bridge MCP server (binary + Python relay) + auto-register |
-| `--with-all-mcp` | + all five MCP servers above |
-| `--with-josh-setup` | + everything: all 5 MCP servers + 70+ skills + 12 hooks + full auto-config |
-| `--skip-rust` | Skip PyO3 wheels (Python-only fallback) |
-| `--no-venv` | Use system Python instead of uv-managed venv |
-| `--skip-setup` | Skip post-install setup wizard |
-| `--branch NAME` | Install from a specific git branch |
+**Not established by that local smoke:** cross-platform support, public release packaging for the Recursive Agent daemon, a managed service installer, production readiness, security certification, or performance superiority. Treat those as separate verification projects.
 
-All flags are additive and independent — you can combine them. Downloads are best-effort; a failed MCP binary or skills tarball won't block the install.
+## Repository map
 
-### After install — what you need to provide
+| Path | Role |
+|---|---|
+| `install.sh` | Ares bootstrap installer; keeps configuration and optional services explicit. |
+| `agent/transports/ri_*.py` | Optional RecursiveIntell transport/acceleration integration modules. |
+| `docs/ares-recursive-agent.md` | Standalone Recursive Agent boundary and operator guide. |
+| `website/` | Ares documentation front door plus Hermes-compatible reference material. |
+| `tests/test_ares_distribution.py` | Contract checks for fork identity and installer scope. |
 
-The installer sets up everything except secrets. Two daemons are configured to auto-start on next login (semantic-memory + agent-graph). After installation:
+## Development and validation
+
+Ares is a fork of a large Python, TypeScript, and desktop codebase. Start with the repository instructions and upstream-compatible development contract:
 
 ```bash
-# 1. Add your API key for the agent-graph daemon
-echo 'OPENAI_API_KEY=sk-...' >> ~/.hermes/agent-graph.env
-
-# 2. Start the daemons now (or reboot — they'll auto-start)
-systemctl --user start semantic-memory
-systemctl --user start agent-graph-mcpd
-
-# 3. Set your LLM provider API key for Hermes itself
-export OPENAI_API_KEY=sk-...
-
-# 4. Run setup to configure providers
-hermes setup
-
-# 5. Restart Hermes to pick up MCP servers
-hermes
-```
-
-**Daemons that auto-start on boot:**
-
-| Daemon | Unit | Port/socket |
-|--------|------|------------|
-| semantic-memory | `semantic-memory.service` | stdio MCP or `--http-port 1738` |
-| agent-graph | `agent-graph-mcpd.service` | `~/.local/share/agent-graph/run/mcp.sock` |
-
-**Additional MCP servers** (stdio, spawned by Hermes — no daemon needed):
-
-| Server | Flag | What it does |
-|--------|------|-------------|
-| claim-ledger | `--with-claim-ledger` | Hash-chained proof debt tracking, claim verification, cryptographic receipts |
-| cea-graph | `--with-cea-graph` | Causal Edit Attribution — predicts code edit risk from real causal graph |
-| pilot-bridge | `--with-pilot-bridge` | Forge-pilot OODA loops — observe, bootstrap, evaluate Rust workspaces |
-
-### Rust acceleration — active paths
-
-| Path | What it accelerates | Rust crate | Status |
-|------|-------------------|------------|--------|
-| LLM transport | All chat completions (OpenAI-compatible providers) | [`llm-pipeline`](https://crates.io/crates/llm-pipeline) | ✅ Wired into `chat_completion_helpers.py` |
-| Context compaction | Deterministic prompt trimming before LLM summarization | [`context-governor`](https://crates.io/crates/context-governor) | ✅ Active via `ri-context-governor` plugin |
-| Agent-graph reads | Direct SQLite reads for MCP agent-graph state | [`agent-graph-mcp`](https://crates.io/crates/agent-graph-mcp) | ⚠️ Transport built, consumer pending |
-| Vector scoring | Semantic-memory similarity scoring | [`poly-kv`](https://crates.io/crates/poly-kv) | ⚠️ Transport built, consumer pending |
-
-### Disable a path
-
-Set the corresponding env var to `0`:
-
-```bash
-HERMES_RI_PIPELINE=0     # fall back to Python httpx for LLM calls
-HERMES_RI_AGENT_GRAPH=0  # fall back to MCP for agent-graph reads
-HERMES_RI_POLY_KV=0      # fall back to pure Python vector scoring
-```
-
-### Install Rust wheels manually
-
-```bash
-pip install llm-pipeline context-governor poly-kv
-```
-
-All three are published on crates.io with precompiled PyO3 wheels.
-
----
-
-## Contributing
-
-We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
-
-Quick start for contributors — use the standard installer, then work from the
-full git checkout it creates at `$HERMES_HOME/hermes-agent` (usually
-`~/.hermes/hermes-agent`). This matches the layout used by `hermes update`, the
-managed venv, lazy dependencies, gateway, and docs tooling.
-
-```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
-cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
-uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
+python3 /home/sikmindz/.hermes/skills/software-development/ultimate-readme/scripts/readme_audit.py README.md --repo-root .
+bash -n install.sh
+bash install.sh --help
 ```
 
-Manual clone fallback (for throwaway clones/CI where you intentionally do not
-want the managed install layout):
+The README audit is a static guard, not proof that a full installation, model provider, or optional service worked. For contribution setup and test conventions, read [AGENTS.md](AGENTS.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
-Create the venv outside the cloned source tree — a venv inside the directory
-the agent operates from can be wiped by a relative-path command the agent runs
-against its own checkout, destroying the running runtime mid-session.
+## Upstream provenance, contributions, and license
 
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv ~/.hermes/venvs/hermes-dev --python 3.11
-source ~/.hermes/venvs/hermes-dev/bin/activate
-uv pip install -e ".[all,dev]"
-scripts/run_tests.sh
-```
+Ares is derived from [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent). Preserve upstream attribution and license notices when redistributing or contributing changes. Ares-specific issues belong in the [RecursiveIntell fork issue tracker](https://github.com/RecursiveIntell/hermes-agent/issues); upstream Hermes behavior should be checked against upstream before filing a downstream-only report.
 
----
-
-## Community
-
-- 💬 [Discord](https://discord.gg/NousResearch)
-- 📚 [Skills Hub](https://agentskills.io)
-- 🐛 [Issues](https://github.com/NousResearch/hermes-agent/issues)
-- 🔌 [computer-use-linux](https://github.com/avifenesh/computer-use-linux) — Linux desktop-control MCP server for Hermes and other MCP hosts, with AT-SPI accessibility trees, Wayland/X11 input, screenshots, and compositor window targeting.
-- 🔌 [HermesClaw](https://github.com/AaronWong1999/hermesclaw) — Community WeChat bridge: Run Hermes Agent and OpenClaw on the same WeChat account.
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
-
-Built by [Nous Research](https://nousresearch.com).
+- Security reporting: [SECURITY.md](SECURITY.md)
+- Contribution process: [CONTRIBUTING.md](CONTRIBUTING.md)
+- License: [MIT](LICENSE)
