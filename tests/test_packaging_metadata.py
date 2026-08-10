@@ -37,6 +37,24 @@ def _packages_find_include():
     return data["tool"]["setuptools"]["packages"]["find"]["include"]
 
 
+def test_activity_packages_and_policy_data_are_packaged():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    include = data["tool"]["setuptools"]["packages"]["find"]["include"]
+    for package in (
+        "activity_policy",
+        "activity_policy.*",
+        "activity_telemetry",
+        "activity_telemetry.*",
+    ):
+        assert package in include
+
+    package_data = data["tool"]["setuptools"]["package-data"]
+    assert "policies.yaml" in package_data.get("activity_policy", [])
+
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "recursive-include activity_policy policies.yaml" in manifest
+
+
 def test_every_on_disk_subpackage_is_covered_by_packages_find():
     """Regression test for #34701 (and the bug class behind #34034 / #28149).
 
