@@ -608,7 +608,8 @@ def _iter_python_command_payloads(text: str) -> Iterator[str]:
     }
     os_single_argument_calls = {"os.popen", "os.system"}
     os_vector_calls = {"os.execv", "os.execve", "os.execvp", "os.execvpe"}
-    os_list_calls = {"os.execl", "os.execle", "os.execlp", "os.execlpe"}
+    os_list_calls = {"os.execl", "os.execlp"}
+    os_list_with_env_calls = {"os.execle", "os.execlpe"}
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -637,8 +638,31 @@ def _iter_python_command_payloads(text: str) -> Iterator[str]:
             argument = node.args[1]
         elif call_name in os_list_calls and len(node.args) > 1:
             argument = ast.List(elts=node.args[1:], ctx=ast.Load())
+        elif call_name in os_list_with_env_calls and len(node.args) > 2:
+            # execle/execlepe's final argument is the environment mapping,
+            # not part of argv. Including it makes an otherwise literal argv
+            # fail the all-string extraction below.
+            argument = ast.List(elts=node.args[1:-1], ctx=ast.Load())
         if argument is None:
             continue
+        if call_name in subprocess_calls and isinstance(argument, (ast.List, ast.Tuple)):
+            executable = next(
+                (
+                    keyword.value
+                    for keyword in node.keywords
+                    if keyword.arg == "executable"
+                    and isinstance(keyword.value, ast.Constant)
+                    and isinstance(keyword.value.value, str)
+                ),
+                None,
+            )
+            if executable is not None:
+                # subprocess executes this override while preserving argv[1:].
+                # Scan the effective command, not the caller-selected argv[0].
+                argument = ast.List(
+                    elts=[executable, *argument.elts[1:]],
+                    ctx=ast.Load(),
+                )
         payload = _literal_python_command(argument)
         if payload:
             yield payload

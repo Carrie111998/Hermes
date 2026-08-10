@@ -607,6 +607,12 @@ class TestTerminalToolGatewayLifecycleGuard:
             'subprocess.run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
             "import subprocess\n"
             'subprocess.run(args=["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "import subprocess\n"
+            'subprocess.run(["neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true"], executable="/bin/launchctl")\n',
+            "import os\n"
+            'os.execle("/bin/launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            "from os import execlpe as launch\n"
+            'launch("launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
         ],
     )
     def test_executable_python_shebang_neutral_launchctl_submit_stays_blocked(
