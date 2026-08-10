@@ -24,6 +24,7 @@ from gateway.api_server_shared import (
 from gateway.api_server_runtime import (
     APIServerRuntimeMixin,
     RuntimeBridgeSession,
+    _allowed_skills_prompt,
     _failed_tool_result_projection,
     _normalize_runtime_messages,
     _pin_run_model,
@@ -297,7 +298,8 @@ class _RuntimeAdapter(_TestRuntimeAdapter):
         )
         skill_envelope = json.loads(skill_result)
         assert skill_envelope["success"] is True
-        assert skill_envelope["content"] == "workflow instructions"
+        assert "description: Inspect generated media." in skill_envelope["content"]
+        assert skill_envelope["content"].endswith("workflow instructions\n")
         assert "skill_dir" not in skill_envelope
         assert skill_envelope["linked_files"] == {
             "references": ["references/guide.md"],
@@ -821,15 +823,7 @@ def _runtime_skill_file(path: str, body: bytes) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypatch):
-    monkeypatch.setattr(runtime_module, "_discover_skill_metadata", lambda: [
-        {"name": "media-qa", "description": "Inspect generated media.", "category": "creative"},
-        {
-            "name": "planning-only",
-            "description": "Plan media without a delegated tool.",
-            "category": "creative",
-        },
-    ])
+async def test_runtime_driver_streams_tool_request_and_waits_for_result():
     adapter = _RuntimeAdapter()
     app = web.Application()
     app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
@@ -845,7 +839,21 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
             f"{version}\n{mode}\n{stable}".encode("utf-8"),
         ).hexdigest()
         package_digest = "sha256:" + hashlib.sha256(b"complete skill bundle").hexdigest()
-        root_skill_digest = "sha256:" + hashlib.sha256(b"workflow instructions").hexdigest()
+        media_skill = b"""---
+name: media-qa
+kind: method
+description: Inspect generated media.
+---
+workflow instructions
+"""
+        planning_skill = b"""---
+name: planning-only
+kind: method
+description: Plan media without a delegated tool.
+---
+planning instructions
+"""
+        root_skill_digest = "sha256:" + hashlib.sha256(media_skill).hexdigest()
         response = await client.post("/v1/runtime/runs", json={
             "run_id": "run_test",
             "intent": "bootstrap",
@@ -867,7 +875,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                         "content_digest": package_digest,
                         "path": "/orchestrator-only/media-qa",
                         "files": [
-                            _runtime_skill_file("SKILL.md", b"workflow instructions"),
+                            _runtime_skill_file("SKILL.md", media_skill),
                             _runtime_skill_file(
                                 "references/guide.md",
                                 b"reference instructions",
@@ -879,7 +887,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                         "content_digest": "sha256:" + hashlib.sha256(b"planning bundle").hexdigest(),
                         "path": "/orchestrator-only/planning-only",
                         "files": [
-                            _runtime_skill_file("SKILL.md", b"planning instructions"),
+                            _runtime_skill_file("SKILL.md", planning_skill),
                         ],
                     },
                 ],
@@ -1060,6 +1068,41 @@ def test_runtime_skill_projections_require_verified_inline_files():
     manifest["skills"][0].pop("files")
     with pytest.raises(ValueError, match="files are required for tool-guided"):
         _runtime_skill_projections(manifest)
+
+
+def test_allowed_skill_prompt_uses_run_bound_projection_metadata():
+    skill_body = b"""---
+name: storyboard-quick-preview
+kind: workflow
+description: Legacy conversation-bound storyboard preview.
+routing:
+  mode: primary
+  priority: 72
+  triggers:
+    - storyboard quick preview
+    - quick campaign board video
+    - legacy storyboard preview
+  negative:
+    - generic single video
+---
+instructions
+"""
+    manifest = {
+        "skills": [{
+            "runtime_alias": "storyboard-quick-preview",
+            "content_digest": "sha256:" + hashlib.sha256(skill_body).hexdigest(),
+            "files": [_runtime_skill_file("SKILL.md", skill_body)],
+        }],
+    }
+
+    prompt = _allowed_skills_prompt(
+        {"storyboard-quick-preview"},
+        _runtime_skill_projections(manifest),
+    )
+
+    assert "- storyboard-quick-preview:" in prompt
+    assert "priority=72" in prompt
+    assert "applies=storyboard quick preview" in prompt
 
 
 def test_bound_skill_view_rejects_traversal_and_binary_files(monkeypatch):

@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 
 from gateway.runtime_skill_projection import (
     RuntimeSkillProjection,
+    projection_skill_metadata,
     resolve_skill_projections,
     view_skill,
 )
@@ -654,16 +655,16 @@ def _runtime_skill_projections(skill_manifest: Any) -> dict[str, RuntimeSkillPro
     return resolve_skill_projections(skill_manifest, _NO_SKILL_MANIFEST)
 
 
-def _discover_skill_metadata() -> list[dict[str, Any]]:
-    from gateway.ultrastudio_skill_routing import discover_skill_metadata
-
-    return discover_skill_metadata()
-
-
-def _allowed_skills_prompt(allowed_names: set[str]) -> str:
+def _allowed_skills_prompt(
+    allowed_names: set[str],
+    projections: dict[str, RuntimeSkillProjection],
+) -> str:
     from gateway.ultrastudio_skill_routing import format_allowed_skills
 
-    return format_allowed_skills(allowed_names, _discover_skill_metadata())
+    return format_allowed_skills(
+        allowed_names,
+        projection_skill_metadata(projections),
+    )
 
 
 def _message_text(content: Any) -> str:
@@ -1947,7 +1948,10 @@ class APIServerRuntimeMixin:
             allowed_skill_projections = _runtime_skill_projections(skill_manifest)
             instructions = (
                 _replacement_system_prompt(system_context)
-                + _allowed_skills_prompt(allowed_skill_names)
+                + _allowed_skills_prompt(
+                    allowed_skill_names,
+                    allowed_skill_projections,
+                )
                 + _run_state_prompt(body.get("run_state"))
                 + _runtime_verified_activity_prompt(
                     body.get("runtime_context"),
