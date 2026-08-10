@@ -5111,6 +5111,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _npm_lockfile_changed,
     _npm_manifest_paths,
     _npm_manifests_digest,
+    _orphaned_desktop_backend_pids,
     _pause_windows_gateways_for_update,
     _print_curator_first_run_notice,
     _print_curator_recent_run_notice,
@@ -5120,6 +5121,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _record_npm_lockfile_hash,
     _refresh_active_lazy_features,
     _refresh_active_memory_provider_dependencies,
+    _refresh_bootstrap_cache_scripts,
     _refresh_windows_gateway_launchers,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
@@ -5131,6 +5133,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _should_skip_upstream_prompt,
     _stash_apply_failed_only_on_existing_untracked,
     _stash_local_changes_if_needed,
+    _stop_process_trees,
     _sync_fork_with_upstream,
     _sync_with_upstream_if_needed,
     _update_node_dependencies,
@@ -12322,6 +12325,36 @@ def main():
         "--no-backup",
         action="store_true",
         help="Skip the timestamped backup copy (not recommended)",
+    )
+
+    sessions_repair_routing = sessions_subparsers.add_parser(
+        "repair-routing",
+        help="Re-stamp gateway sessions that lost their routing identity",
+        description=(
+            "Find gateway conversations stranded in session rows whose "
+            "routing identity (session_key/chat_id/origin) was never "
+            "written — the damage a corrupt state.db write path leaves "
+            "behind (#82616). Such a row is invisible to restart recovery, "
+            "so the chat resumes an older session instead. Re-stamps each "
+            "orphan from the keyed predecessor it continues, and only when "
+            "that predecessor is unambiguous. Reports without touching the "
+            "database unless --apply is given."
+        ),
+    )
+    sessions_repair_routing.add_argument(
+        "--apply",
+        action="store_true",
+        help="Perform the adoptions (default: report only)",
+    )
+    sessions_repair_routing.add_argument(
+        "--max-gap-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Window between a keyed predecessor's last activity and an "
+            "orphan's start for them to count as the same conversation "
+            "(default: 900)"
+        ),
     )
 
     sessions_recover = sessions_subparsers.add_parser(
