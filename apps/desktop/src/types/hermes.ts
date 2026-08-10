@@ -723,9 +723,11 @@ export interface AccountUsageWindow {
 
 export interface AccountUsageQuota {
   details?: string[]
+  fetched_at?: string
   plan?: null | string
   reason?: string
   source?: 'provider_reported'
+  stale?: boolean
   status: AccountUsageState
   windows: AccountUsageWindow[]
 }

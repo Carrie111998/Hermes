@@ -526,9 +526,9 @@ export function useStatusbarItems({
       },
       {
         detail: contextBar || undefined,
-        hidden: !contextUsage,
+        hidden: gatewayState !== 'open',
         id: 'context-usage',
-        label: contextUsage,
+        label: contextUsage || copy.contextUsage,
         menuAlign: 'end',
         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
         menuContent: (
