@@ -651,12 +651,22 @@ _RESIZE_TARGET_BYTES = 5 * 1024 * 1024
 
 
 def _is_image_size_error(error: Exception) -> bool:
-    """Detect if an API error is related to image or payload size."""
+    """Detect if an API error is related to image or payload size.
+
+    Includes Ollama's "prompt too long; exceeded max context length by N
+    tokens" which fires when the image tokenizer produces an excessive
+    number of image tokens for certain image content (observed with
+    gemma4 on Ollama 0.32.x — a 483 KB JPEG at 1920x1080 generates
+    ~437K tokens while a 1.4 MB JPEG at the same resolution produces only
+    288). The resize-and-retry path converts the image to a smaller
+    dimension that the tokenizer handles sanely.
+    """
     err_str = str(error).lower()
     return any(hint in err_str for hint in (
         "too large", "payload", "413", "content_too_large",
         "request_too_large", "image_url", "invalid_request",
-        "exceeds", "size limit",
+        "exceeds", "exceeded", "size limit",
+        "prompt too long", "context length",
     ))
 
 
@@ -1434,17 +1444,25 @@ async def vision_analyze_tool(
         try:
             response = await async_call_llm(**call_kwargs)
         except Exception as _api_err:
-            if (_is_image_size_error(_api_err)
-                    and len(image_data_url) > _RESIZE_TARGET_BYTES):
+            _is_ctx_len_err = "context length" in str(_api_err).lower() or "prompt too long" in str(_api_err).lower()
+            if _is_image_size_error(_api_err) and (
+                    len(image_data_url) > _RESIZE_TARGET_BYTES or _is_ctx_len_err):
                 logger.info(
                     "API rejected image (%.1f MB, likely too large); "
-                    "auto-resizing to ~%.0f MB and retrying...",
+                    "auto-resizing to ~%.0f MB and retrying...%s",
                     len(image_data_url) / (1024 * 1024),
                     _RESIZE_TARGET_BYTES / (1024 * 1024),
+                    " [context-length triggered resize]" if _is_ctx_len_err else "",
                 )
+                # For context-length errors, force a dimension cap to reduce
+                # image token count (Ollama's image tokenizer can produce
+                # hundreds of thousands of tokens for certain image content
+                # even at modest file sizes).
+                _retry_max_dim = 1024 if _is_ctx_len_err else None
                 image_data_url = await _run_encode_on_cpu_executor(
                     _resize_image_for_vision,
-                    temp_image_path, mime_type=detected_mime_type)
+                    temp_image_path, mime_type=detected_mime_type,
+                    max_dimension=_retry_max_dim)
                 messages[0]["content"][1]["image_url"]["url"] = image_data_url
                 response = await async_call_llm(**call_kwargs)
             else:
