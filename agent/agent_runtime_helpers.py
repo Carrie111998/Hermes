@@ -3336,6 +3336,32 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             dropped_empty_tool_calls,
         )
 
+    # --- Drop assistant messages left with no content and no tool_calls ---
+    # After stripping empty tool_calls arrays above, an assistant message
+    # that originally had no text content (normal for tool-only turns) is
+    # left as a completely empty shell.  Strict providers reject this with
+    # HTTP 400.  Drop such messages entirely — they carry no information.
+    # (#82924)
+    _pruned: List[Dict[str, Any]] = []
+    _dropped_empty_assistant = 0
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and not msg.get("tool_calls")
+            and not (msg.get("content") or "").strip()
+        ):
+            _dropped_empty_assistant += 1
+            continue
+        _pruned.append(msg)
+    if _dropped_empty_assistant:
+        messages = _pruned
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d empty assistant message(s) "
+            "(no content, no tool_calls)",
+            _dropped_empty_assistant,
+        )
+
     # --- Repair tool_calls whose function.name is empty/missing ---
     # Some providers (and partially-streamed responses) emit a tool_call with
     # id="call_xxx" but function.name="". Downstream Responses-API adapters
