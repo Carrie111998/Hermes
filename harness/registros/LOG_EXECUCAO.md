@@ -181,3 +181,29 @@ Handoff em `registros/RETOMADA_SESSAO.md`.
 | Aviso title gen | OK — não deve mais aparecer após restart do CLI |
 
 **Nota:** `config.yaml` vive em `%LOCALAPPDATA%\hermes\`; espelho em `Denispds/hermes-local`.
+
+### 2026-08-10 17:33 — Fluxo 1 sync origin/main (+47)
+
+| Passo | Resultado |
+|---|---|
+| `git fetch origin main` | OK — tip `b614f70361` |
+| patch-guard baseline | **OK** |
+| `git merge origin/main` | OK — ort, sem conflito (+47) |
+| patch-guard pós-merge | **OK** — Hermes One + OpenRouter prune |
+| `hermes doctor` | OK exit 0 — 2 avisos setup (API keys) |
+| Merge commit | `2027ea6279` |
+
+**Versões pós-sync:**
+
+| Campo | Valor |
+|---|---|
+| Branch tip | `local/harness` @ `2027ea6279` (0 atrás / 13 à frente) |
+| origin/main | `b614f70361` |
+| pyproject | 0.20.0 |
+| config | v34 |
+| SQLite | 3.53.1 |
+| model | minimax-oauth / MiniMax-M3 |
+
+Destaques do sync: kanban review lifecycle, browser_use_cli, skills `sdlc-review` + `merge-reconciler`, remoção blender-mcp.
+
+**Próximo passo:** commit merge + docs (humano); opcional OpenRouter prune upstream.

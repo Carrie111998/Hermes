@@ -1,6 +1,6 @@
 # Retomada de Sessão — Harness Hermes Agent
 
-**Salvo em:** 2026-08-10 11:50 (sync origin/main + MiniMax + SQLite 3.53.1)  
+**Salvo em:** 2026-08-10 17:33 (sync origin/main +47 commits)  
 **Objetivo:** reiniciar Cursor sem perder contexto.
 
 ---
@@ -20,15 +20,14 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
 ---
 
-## Feito nesta sessão (update)
+## Feito nesta sessão (sync 17:33)
 
-1. Gateways parados (default + data-analyst + security-auditor)
-2. `hermes update` — already up to date; trocou temporariamente para `main`; auto-start gateway
-3. Branch restaurada: `local/harness` @ `b34f1a28b9`
-4. patch-guard ✅
-5. Descoberta: **SQLite prod já era 3.53.1** (`venv` + `.hermes-runtime`); aviso do doctor vinha do **`.venv` (3.50.4)**
-6. Gateways re-subidos via `venv\Scripts\hermes.exe` — telegram + api_server + slack + 2 profiles
-7. cron-audit ✅ 0 overdue
+1. `git fetch origin main` — tip `b614f70361`
+2. patch-guard baseline ✅
+3. `git merge origin/main` — ort, sem conflito (+47 commits)
+4. patch-guard pós-merge ✅ (Hermes One + OpenRouter prune)
+5. `hermes doctor` ✅ exit 0 — 2 avisos setup (API keys opcionais)
+6. Docs STATUS / RETOMADA / LOG atualizados
 
 ---
 
@@ -36,11 +35,13 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
 | Item | Valor |
 |---|---|
-| Branch | `local/harness` @ `667c85c773` (0 atrás / 8 à frente de origin/main) |
+| Branch | `local/harness` @ `2027ea6279` (**0** atrás / **13** à frente de origin/main) |
+| Upstream | `origin/main` @ `b614f70361` |
+| Pacote | pyproject **0.20.0** |
 | Config | v34 · `minimax-oauth` / `MiniMax-M3` |
 | SQLite prod | **3.53.1** |
-| Gateway | ✅ PID principal + profiles |
-| Cron | ✅ healthy |
+| Gateway | (não reiniciado nesta sync — restart só com `--confirm`) |
+| Cron | fleet anterior intacta |
 
 ### Cron fleet
 
@@ -59,11 +60,13 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
 | # | Item | Prioridade |
 |---|---|---|
-| 1 | (Opcional) PR upstream OpenRouter prune | Baixa |
-| 2 | (Opcional) hook `register_api_mount` p/ plugin puro | Baixa |
-| 3 | ~~Fix avaliacao-agente-dande~~ ✅ | — |
-| 4 | ~~D-004 extração modular~~ ✅ | — |
-| 5 | ~~Remover Gemini (title_generation)~~ ✅ | — |
+| 1 | Commit merge + docs sync (humano) | Média |
+| 2 | (Opcional) PR upstream OpenRouter prune | Baixa |
+| 3 | (Opcional) hook `register_api_mount` p/ plugin puro | Baixa |
+| 4 | ~~Sync origin/main +47~~ ✅ | — |
+| 5 | ~~Fix avaliacao-agente-dande~~ ✅ | — |
+| 6 | ~~D-004 extração modular~~ ✅ | — |
+| 7 | ~~Remover Gemini (title_generation)~~ ✅ | — |
 
 ---
 
