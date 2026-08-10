@@ -219,6 +219,17 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             for participant in self._parse_chat_allowlist(_required_participants)
             if self._participant_key(participant)
         }
+        # The exact-chat / required-participant gate runs synchronously at
+        # webhook intake before the event reaches GatewayRunner. When either
+        # restriction is configured, it is the authoritative access boundary:
+        # every sender in an admitted group may address Hermes, while chats
+        # outside the scope never reach gateway authorization or acknowledgements.
+        self._enforces_own_access_policy = bool(
+            self._allowed_chat_keys or self._required_participant_keys
+        )
+        _scope_policy = "allowlist" if self._enforces_own_access_policy else "open"
+        self._group_policy = _scope_policy
+        self._dm_policy = _scope_policy
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
@@ -234,6 +245,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
         self._seen_message_guids: OrderedDict[str, None] = OrderedDict()
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """Whether configured chat/participant scope gates intake authoritatively."""
+        return self._enforces_own_access_policy
 
     # ------------------------------------------------------------------
     # API helpers
@@ -1192,6 +1208,21 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 )
                 return web.Response(text="ok")
             text = self._clean_mention_text(text)
+        sender_authorized = self._is_sender_authorized(
+            sender,
+            "group" if is_group else "dm",
+            session_chat_id,
+        )
+        if sender_authorized is False:
+            # on_processing_start runs before the gateway message handler. Gate
+            # here so an unauthorized sender receives neither the standalone
+            # working acknowledgement nor an agent turn.
+            logger.info(
+                "[bluebubbles] ignoring message from unauthorized sender=%s chat=%s",
+                _redact(str(sender)),
+                _redact(str(session_chat_id)),
+            )
+            return web.Response(text="ok")
         source = self.build_source(
             chat_id=session_chat_id,
             chat_name=chat_identifier or sender,

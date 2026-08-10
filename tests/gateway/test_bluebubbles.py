@@ -5,6 +5,7 @@ import json
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import SendResult
 
 
 def _make_adapter(monkeypatch, **extra):
@@ -267,6 +268,23 @@ class TestBlueBubblesWebhookParsing:
         assert await adapter._chat_has_required_participant("any;+;bryan-present")
         assert not await adapter._chat_has_required_participant("any;+;bryan-absent")
 
+    def test_required_participant_policy_is_authoritative_at_gateway(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            required_participants=["+15550000001"],
+        )
+
+        assert adapter.enforces_own_access_policy is True
+        assert adapter._group_policy == "allowlist"
+        assert adapter._dm_policy == "allowlist"
+
+    def test_open_adapter_does_not_claim_authoritative_access_policy(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+
+        assert adapter.enforces_own_access_policy is False
+        assert adapter._group_policy == "open"
+        assert adapter._dm_policy == "open"
+
     @pytest.mark.asyncio
     async def test_webhook_silently_blocks_chat_without_required_participant(self, monkeypatch):
         adapter = _make_adapter(
@@ -307,6 +325,56 @@ class TestBlueBubblesWebhookParsing:
 
         assert response.status == 200
         assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_webhook_blocks_before_ack_when_gateway_auth_rejects_sender(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            send_read_receipts=False,
+            working_ack_emoji="👀",
+            required_participants=["+15550000001"],
+        )
+        handled = []
+        sent = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        async def fake_send(*args, **kwargs):
+            sent.append((args, kwargs))
+            return SendResult(success=True)
+
+        async def has_required_participant(chat_id):
+            return True
+
+        adapter.set_authorization_check(lambda user_id, chat_type, chat_id: False)
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(adapter, "send", fake_send)
+        monkeypatch.setattr(
+            adapter,
+            "_chat_has_required_participant",
+            has_required_participant,
+        )
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                {
+                    "type": "new-message",
+                    "data": {
+                        "guid": "unauthorized-group-message",
+                        "text": "Rico, can you help?",
+                        "handle": {"address": "+15550000002"},
+                        "isFromMe": False,
+                        "isGroup": True,
+                        "chats": [{"guid": "any;+;group-with-bryan"}],
+                    },
+                }
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+        assert sent == []
 
     @pytest.mark.asyncio
     async def test_group_privacy_prompt_is_attached_only_to_group_turns(self, monkeypatch):

@@ -172,7 +172,7 @@ platforms:
         - "+15550000001"
 ```
 
-Hermes responds only when at least one configured identity is a current participant. Direct-chat identity is read from the chat GUID; group membership is fetched from the local BlueBubbles server on every inbound message so leaving a group takes effect immediately. If `allowed_chat_guids` is also configured, both checks must pass. `BLUEBUBBLES_REQUIRED_PARTICIPANTS` accepts a JSON or comma-separated list.
+Hermes responds only when at least one configured identity is a current participant. Direct-chat identity is read from the chat GUID; group membership is fetched from the local BlueBubbles server on every inbound message so leaving a group takes effect immediately. When this scope is configured, the adapter treats it as the authoritative intake allowlist: any participant in an admitted group may address Hermes without separate per-sender pairing, while messages from chats outside the scope are dropped before acknowledgement. If `allowed_chat_guids` is also configured, both checks must pass. `BLUEBUBBLES_REQUIRED_PARTICIPANTS` accepts a JSON or comma-separated list.
 
 Add an ephemeral system prompt to every BlueBubbles group turn with `group_prompt`:
 
