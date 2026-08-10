@@ -8145,6 +8145,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         A GitHub PR URL appears in a recent task comment (within
         ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        Like ``recent_success``, this is bypassed by a later explicit
+        re-queue event: the operator has deliberately asked for another run.
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8227,12 +8229,45 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    A later *explicit* re-queue supersedes historical PR evidence. Automatic
+    #    promotion/reclaim events do not: they are recovery machinery, not an
+    #    operator asking to duplicate prior work. Direct status changes only
+    #    count when they move the task to ready.
+    explicit_requeue_at = None
+    for event in conn.execute(
+        "SELECT kind, payload, created_at FROM task_events "
+        "WHERE task_id = ? "
+        "AND kind IN ('status', 'promoted_manual', 'unblocked') "
+        "ORDER BY id DESC",
+        (task_id,),
+    ):
+        if event["kind"] in ("promoted_manual", "unblocked"):
+            explicit_requeue_at = int(event["created_at"])
+            break
+        try:
+            payload = json.loads(event["payload"]) if event["payload"] else None
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("status") == "ready":
+            explicit_requeue_at = int(event["created_at"])
+            break
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
         (task_id, pr_cutoff),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+        if (
+            c["body"]
+            and _RESPAWN_GUARD_PR_URL_RE.search(c["body"])
+            # Cross-table timestamps have one-second resolution. Fail closed on
+            # equality rather than risk treating a same-second new PR as stale.
+            and (
+                explicit_requeue_at is None
+                or explicit_requeue_at <= int(c["created_at"])
+            )
+        ):
             return "active_pr"
 
     return None
