@@ -1056,6 +1056,7 @@ export const en: Translations = {
     archive: 'Archive',
     skillArchivedTitle: 'Skill archived',
     skillArchivedMessage: 'Restorable via hermes curator restore.',
+    recentSessions: 'Recent sessions',
     hub: {
       searchPlaceholder: 'Search the skill hub',
       search: 'Search',

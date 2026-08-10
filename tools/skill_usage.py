@@ -656,7 +656,26 @@ def _empty_record() -> Dict[str, Any]:
         "state": STATE_ACTIVE,
         "pinned": False,
         "archived_at": None,
+        "recent_session_ids": [],
     }
+
+
+# Bounded so long-lived skills don't grow the sidecar unboundedly; mirrors
+# the patch_generation rollover already in bump_use/bump_patch.
+_MAX_RECENT_SESSION_IDS = 10
+
+
+def _with_recent_session_id(rec: Dict[str, Any], session_id: Optional[str]) -> None:
+    """Move *session_id* to the front of ``rec["recent_session_ids"]``, bounded.
+
+    No-op when session_id is falsy (CLI sessions without an id skip this,
+    same as today's use_count/last_used_at-only behavior).
+    """
+    if not session_id:
+        return
+    recent = [s for s in rec.get("recent_session_ids") or [] if s != session_id]
+    recent.insert(0, session_id)
+    rec["recent_session_ids"] = recent[:_MAX_RECENT_SESSION_IDS]
 
 
 def load_usage() -> Dict[str, Dict[str, Any]]:
@@ -887,6 +906,7 @@ def bump_use(
         rec["last_reused_patch_generation"] = last_reused_generation
         if reuse_after_patch:
             rec["last_reused_patch_generation"] = patch_generation
+        _with_recent_session_id(rec, session_id)
         return {
             "created_by": rec.get("created_by"),
             "use_count": rec["use_count"],
