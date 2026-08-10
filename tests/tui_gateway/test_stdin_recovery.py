@@ -37,6 +37,13 @@ from tui_gateway import _stdin_recovery
 # Same layout the production recovery tail packs with.
 _TIMEVAL = "ll"
 
+# ``os.O_NONBLOCK`` is POSIX-only — the repo's platform-safe idiom is
+# ``getattr(os, "O_NONBLOCK", ...)`` (see ``cron/lifecycle_guard.py:430``).
+# Every OS collaborator here is stubbed, so these tests are pure logic and can
+# run anywhere; they only need the stub and the module under test to agree on
+# which bit means "non-blocking", which ``_install`` arranges below.
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0o4000)
+
 
 class _FakeSocket:
     """Stand-in for the ``socket.fromfd`` dup of fd 0."""
@@ -105,7 +112,10 @@ class _FakeFcntl:
 
 def _install(monkeypatch, *, nonblock: bool, socket_mod: _FakeSocketModule) -> list:
     """Bind stub collaborators onto the module; return the set_blocking log."""
-    flags = os.O_RDWR | (os.O_NONBLOCK if nonblock else 0)
+    # The module reads ``os.O_NONBLOCK`` to mask the flags; bind the same value
+    # it is being handed so the pair agrees even where the attribute is absent.
+    monkeypatch.setattr(_stdin_recovery.os, "O_NONBLOCK", _O_NONBLOCK, raising=False)
+    flags = os.O_RDWR | (_O_NONBLOCK if nonblock else 0)
     monkeypatch.setattr(_stdin_recovery, "_HAS_FCNTL", True)
     monkeypatch.setattr(_stdin_recovery, "_fcntl", _FakeFcntl(flags))
     monkeypatch.setattr(_stdin_recovery, "_HAS_SOCKET", True)
