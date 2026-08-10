@@ -1,10 +1,13 @@
 """OpenCode Zen free-only default policy (#82764).
 
 Zen's model picker intentionally exposes its full free+paid catalog, but the
-model-switch pipeline must not let an ordinary (non-explicit-provider)
-``/model`` switch land on a paid or unknown-cost Zen model without the user
-asking for it by name (``--provider opencode-zen``) or opting in via
-``model.allow_paid_opencode_zen: true``.
+model-switch pipeline must not let a ``/model`` switch land on a paid or
+unknown-cost Zen model without the user asking for it by name
+(hand-typed ``--provider opencode-zen``) or opting in via
+``model.allow_paid_opencode_zen: true``. Picker selections pass
+explicit_provider too (it's the row's own slug), so ``picker_selected=True``
+marks that case and keeps the gate active even though explicit_provider is
+set.
 """
 
 from unittest.mock import patch
@@ -35,7 +38,14 @@ def _paid_model_info(model_id: str) -> ModelInfo:
     )
 
 
-def _run_zen_switch(raw_input: str, *, model_info, explicit_provider: str = "", allow_paid=None):
+def _run_zen_switch(
+    raw_input: str,
+    *,
+    model_info,
+    explicit_provider: str = "",
+    allow_paid=None,
+    picker_selected: bool = False,
+):
     cfg = {"model": {"allow_paid_opencode_zen": allow_paid}} if allow_paid is not None else {}
     with (
         patch("hermes_cli.model_switch.resolve_alias", return_value=None),
@@ -61,6 +71,7 @@ def _run_zen_switch(raw_input: str, *, model_info, explicit_provider: str = "", 
             current_base_url="https://opencode.ai/zen/v1",
             current_api_key="sk-zen-fake",
             explicit_provider=explicit_provider,
+            picker_selected=picker_selected,
         )
 
 
@@ -86,7 +97,9 @@ class TestOpenCodeZenFreeOnlyPolicy:
         assert result.success, f"switch_model failed: {result.error_message}"
         assert result.new_model == "deepseek-v4-flash-free"
 
-    def test_explicit_provider_flag_overrides_paid_block(self):
+    def test_explicit_provider_cli_flag_overrides_paid_block(self):
+        """A hand-typed ``--provider opencode-zen`` is the override; no
+        picker involved (picker_selected defaults to False)."""
         result = _run_zen_switch(
             "gpt-5.6-luna",
             model_info=_paid_model_info("gpt-5.6-luna"),
@@ -98,6 +111,42 @@ class TestOpenCodeZenFreeOnlyPolicy:
     def test_config_override_allows_paid_model(self):
         result = _run_zen_switch(
             "gpt-5.6-luna", model_info=_paid_model_info("gpt-5.6-luna"), allow_paid=True
+        )
+
+        assert result.success, f"switch_model failed: {result.error_message}"
+
+    def test_picker_selection_of_paid_model_is_blocked(self):
+        """Both interactive pickers (cli.py, gateway/slash_commands.py) pass
+        explicit_provider=<row's own slug> on every selection, paid or free,
+        since Zen's picker intentionally shows its full catalog. That must
+        not be treated as an override the way a hand-typed --provider is."""
+        result = _run_zen_switch(
+            "gpt-5.6-luna",
+            model_info=_paid_model_info("gpt-5.6-luna"),
+            explicit_provider="opencode-zen",
+            picker_selected=True,
+        )
+
+        assert not result.success
+        assert "gpt-5.6-luna" in result.error_message
+
+    def test_picker_selection_of_free_model_is_allowed(self):
+        result = _run_zen_switch(
+            "deepseek-v4-flash-free",
+            model_info=_free_model_info("deepseek-v4-flash-free"),
+            explicit_provider="opencode-zen",
+            picker_selected=True,
+        )
+
+        assert result.success, f"switch_model failed: {result.error_message}"
+
+    def test_picker_selection_of_paid_model_allowed_via_config(self):
+        result = _run_zen_switch(
+            "gpt-5.6-luna",
+            model_info=_paid_model_info("gpt-5.6-luna"),
+            explicit_provider="opencode-zen",
+            picker_selected=True,
+            allow_paid=True,
         )
 
         assert result.success, f"switch_model failed: {result.error_message}"

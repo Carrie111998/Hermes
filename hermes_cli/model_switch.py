@@ -296,8 +296,9 @@ def _check_hermes_model_warning(model_name: str) -> str:
 # The picker intentionally exposes Zen's full free+paid catalog (see
 # _UNCAPPED_PICKER_PROVIDERS above), but switching onto a paid or
 # unknown-cost model without the user asking for it by name is a silent
-# billing surprise. Ordinary /model switches (no --provider flag) are
-# gated to verified-zero-cost models unless the user opts in via
+# billing surprise. /model switches (no hand-typed --provider flag, and
+# picker selections — see picker_selected in switch_model) are gated to
+# verified-zero-cost models unless the user opts in via
 # ``model.allow_paid_opencode_zen: true``.
 
 def _model_info_is_verified_free(info: Optional[ModelInfo]) -> bool:
@@ -324,9 +325,10 @@ def _opencode_zen_paid_model_blocked(new_model: str, model_info: Optional[ModelI
     """Return an error message if the free-only Zen policy blocks *new_model*.
 
     Returns "" when the switch is allowed. Callers must only invoke this
-    when the target provider is "opencode-zen" and the switch was not an
-    explicit ``--provider opencode-zen`` request (that flag is itself the
-    override).
+    when the target provider is "opencode-zen" and the switch was not a
+    hand-typed ``--provider opencode-zen`` request (that flag is itself the
+    override; a picker selection reusing the same parameter is not — see
+    picker_selected in switch_model).
     """
     if _model_info_is_verified_free(model_info):
         return ""
@@ -1350,6 +1352,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    picker_selected: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1381,9 +1384,14 @@ def switch_model(
         current_base_url: The currently active base URL.
         current_api_key: The currently active API key.
         is_global: Whether to persist the switch.
-        explicit_provider: From --provider flag (empty = no explicit provider).
+        explicit_provider: From --provider flag (empty = no explicit provider),
+            or the picker's own row slug when picker_selected is True.
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        picker_selected: True when explicit_provider came from an interactive
+            model picker selecting a catalog row, not from the user typing
+            --provider. Callers set this so provider-scoped policy gates
+            (e.g. the OpenCode Zen free-only default) still apply.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1973,10 +1981,21 @@ def switch_model(
     model_info = get_model_info(target_provider, new_model)
 
     # --- OpenCode Zen free-only default policy (#82764) ---
-    # An explicit --provider opencode-zen selection is itself the override;
-    # only gate ordinary switches (bare model name, aggregator resolution,
-    # alias fallback) that land on opencode-zen.
-    if target_provider == "opencode-zen" and not explicit_provider:
+    # A user typing --provider opencode-zen on the command line is itself
+    # the override. But the interactive pickers (cli.py, gateway/
+    # slash_commands.py) also pass explicit_provider — set to the picker's
+    # own row slug — on every model selection, paid or free, since
+    # _UNCAPPED_PICKER_PROVIDERS deliberately shows Zen's full catalog.
+    # picker_selected distinguishes that case so a paid model chosen from
+    # the picker is still gated instead of riding through on
+    # explicit_provider alone.
+    #
+    # target_provider is "opencode-zen" when it comes straight from
+    # current_provider (PATH B, no --provider), but resolve_provider_full()
+    # normalizes an explicit "opencode-zen" to models.dev's canonical id
+    # "opencode" (PATH A, which both the CLI flag and the pickers go
+    # through) — check both so the gate still recognizes the provider.
+    if target_provider in ("opencode-zen", "opencode") and (not explicit_provider or picker_selected):
         block_msg = _opencode_zen_paid_model_blocked(new_model, model_info)
         if block_msg:
             return ModelSwitchResult(
