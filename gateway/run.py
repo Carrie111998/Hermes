@@ -14744,8 +14744,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     gateway=_gw_view,
                 )
             except Exception as _hook_exc:
+                # DEV-0141: fail-closed — if the hook invocation itself
+                # raises, treat the message as denied.  The hook runs
+                # BEFORE user authorization; a broken hook should not
+                # silently pass every message through.
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
+                return None
 
             for _result in _hook_results:
                 if not isinstance(_result, dict):
