@@ -1332,7 +1332,10 @@ def setup_terminal_backend(config: dict):
     print_info(f"   Guide: {_DOCS_BASE}/user-guide/configuration#terminal-backend-configuration")
     print()
 
+    terminal_config = config.setdefault("terminal", {})
     current_backend = cfg_get(config, "terminal", "backend", default="local")
+    _missing_modal_mode = object()
+    previous_modal_mode = terminal_config.get("modal_mode", _missing_modal_mode)
     is_linux = _platform.system() == "Linux"
 
     # Build backend choices with descriptions
@@ -1478,18 +1481,30 @@ def setup_terminal_backend(config: dict):
             config["terminal"]["modal_mode"] = "direct"
             print_info("Requires a Modal account: https://modal.com")
 
-            # Check if modal SDK is installed
+            # Use the canonical lazy feature contract so the direct SDK is
+            # installed together with its patched aiohttp closure. This also
+            # repairs stale metadata when modal is already importable.
+            print_info("Ensuring modal SDK and runtime closure...")
             try:
-                __import__("modal")
-            except ImportError:
-                print_info("Installing modal SDK...")
-                from hermes_cli.tools_config import _pip_install
+                from tools.lazy_deps import ensure
 
-                result = _pip_install(["modal"])
-                if result.returncode == 0:
-                    print_success("modal SDK installed")
+                ensure("terminal.modal", prompt=False)
+                print_success("modal SDK ready")
+            except Exception as exc:
+                # Do not persist a backend whose exact SDK/runtime contract
+                # was not verified. Continue setup only after a successful
+                # lazy repair; credentials for a failed backend are not useful
+                # and can make the next startup fail less clearly.
+                config["terminal"]["backend"] = current_backend
+                if previous_modal_mode is _missing_modal_mode:
+                    config["terminal"].pop("modal_mode", None)
                 else:
-                    print_warning("Install failed — run manually: uv pip install modal")
+                    config["terminal"]["modal_mode"] = previous_modal_mode
+                print_error(
+                    "Modal SDK security contract unavailable; keeping the previous terminal backend."
+                )
+                print_info(f"  Error: {exc}")
+                return
 
             # Modal token
             print()
@@ -1519,20 +1534,23 @@ def setup_terminal_backend(config: dict):
         print_info("Each session gets a dedicated sandbox with filesystem persistence.")
         print_info("Sign up at: https://daytona.io")
 
-        # Check if daytona SDK is installed
+        # Use the canonical lazy feature contract so the direct SDK is
+        # installed together with its patched aiohttp closure. This also
+        # repairs stale metadata when daytona is already importable.
+        print_info("Ensuring daytona SDK and runtime closure...")
         try:
-            __import__("daytona")
-        except ImportError:
-            print_info("Installing daytona SDK...")
-            from hermes_cli.tools_config import _pip_install
+            from tools.lazy_deps import ensure
 
-            result = _pip_install(["daytona"])
-            if result.returncode == 0:
-                print_success("daytona SDK installed")
-            else:
-                print_warning("Install failed — run manually: uv pip install daytona")
-                if result.stderr:
-                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
+            ensure("terminal.daytona", prompt=False)
+            print_success("daytona SDK ready")
+        except Exception as exc:
+            # Keep configuration aligned with the verified runtime state.
+            config["terminal"]["backend"] = current_backend
+            print_error(
+                "Daytona SDK security contract unavailable; keeping the previous terminal backend."
+            )
+            print_info(f"  Error: {exc}")
+            return
 
         # Daytona API key
         print()
@@ -1561,37 +1579,21 @@ def setup_terminal_backend(config: dict):
         print_info("Requires the optional SDK: pip install 'hermes-agent[vercel]'")
 
         try:
-            __import__("vercel")
-        except ImportError:
-            print_info("Installing vercel SDK...")
-            import subprocess
+            # Use the canonical lazy contract so an importable but stale SDK
+            # is repaired and every resolver tier targets vercel==0.7.2.
+            # In particular, do not let a uv resolver failure fall through to
+            # an unpinned direct-pip install.
+            from tools.lazy_deps import ensure
 
-            # Managed uv first: $HERMES_HOME/bin is never on PATH, so a bare
-            # which() misses the uv Hermes installed. Bootstrapping one is
-            # welcome here — this is the interactive setup wizard, already
-            # mid-install, and the alternative tier is a pip that a `uv venv`
-            # venv may not even have.
-            from hermes_cli.managed_uv import ensure_uv
-
-            uv_bin = ensure_uv()
-            if uv_bin:
-                result = subprocess.run(
-                    [uv_bin, "pip", "install", "--python", sys.executable, "vercel"],
-                    capture_output=True,
-                    text=True,
-                )
-            else:
-                result = subprocess.run(
-                    [sys.executable, "-m", "pip", "install", "vercel"],
-                    capture_output=True,
-                    text=True,
-                )
-            if result.returncode == 0:
-                print_success("vercel SDK installed")
-            else:
-                print_warning("Install failed — run manually: pip install 'hermes-agent[vercel]'")
-                if result.stderr:
-                    print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
+            ensure("terminal.vercel", prompt=False)
+            print_success("vercel SDK ready")
+        except Exception as exc:
+            # Keep the previously selected backend rather than persisting a
+            # Vercel configuration whose exact SDK contract was not verified.
+            config["terminal"]["backend"] = current_backend
+            print_error("Vercel SDK security contract unavailable; keeping the previous terminal backend.")
+            print_info(f"  Error: {exc}")
+            return
 
         _prompt_vercel_sandbox_settings(config)
 

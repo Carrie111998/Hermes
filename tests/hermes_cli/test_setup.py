@@ -4,6 +4,7 @@ import os
 import json
 import types
 
+import pytest
 
 from hermes_cli.config import load_config, save_config
 from hermes_cli import setup as setup_mod
@@ -160,6 +161,11 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
         ),
     )
     monkeypatch.setitem(sys.modules, "swe_rex", object())
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: ensured.append((feature, kwargs)),
+    )
 
     from hermes_cli.setup import setup_terminal_backend
 
@@ -167,6 +173,97 @@ def test_modal_setup_persists_direct_mode_when_user_chooses_their_own_account(tm
 
     assert config["terminal"]["backend"] == "modal"
     assert config["terminal"]["modal_mode"] == "direct"
+    assert ensured == [("terminal.modal", {"prompt": False})]
+
+
+def test_daytona_setup_uses_lazy_runtime_closure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    config = load_config()
+
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_choice",
+        lambda question, choices, default=0: (
+            4 if question == "Select terminal backend:" else default
+        ),
+    )
+    monkeypatch.setattr("hermes_cli.setup.prompt", lambda *args, **kwargs: "daytona-key")
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: ensured.append((feature, kwargs)),
+    )
+
+    from hermes_cli.setup import setup_terminal_backend
+
+    setup_terminal_backend(config)
+
+    assert config["terminal"]["backend"] == "daytona"
+    assert ensured == [("terminal.daytona", {"prompt": False})]
+
+
+@pytest.mark.parametrize(
+    ("backend_index", "feature", "message"),
+    [
+        (2, "terminal.modal", "Modal SDK security contract unavailable"),
+        (4, "terminal.daytona", "Daytona SDK security contract unavailable"),
+    ],
+)
+def test_terminal_sdk_failure_restores_previous_backend(
+    tmp_path, monkeypatch, backend_index, feature, message, capsys
+):
+    """A failed exact SDK repair must not persist or continue a backend."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.setup.managed_nous_tools_enabled", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_choice",
+        lambda question, choices, default=0: (
+            backend_index if question == "Select terminal backend:" else default
+        ),
+    )
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature_name, **kwargs: (_ for _ in ()).throw(
+            RuntimeError(f"{feature_name} resolver failed")
+        ),
+    )
+    monkeypatch.setattr(
+        setup_mod,
+        "prompt",
+        lambda *args, **kwargs: pytest.fail("credentials must not be requested after SDK failure"),
+    )
+    config = load_config()
+
+    setup_mod.setup_terminal_backend(config)
+
+    assert config["terminal"]["backend"] == "local"
+    out = capsys.readouterr().out
+    assert message in out
+
+
+def test_modal_sdk_failure_restores_previous_modal_mode(tmp_path, monkeypatch):
+    """A failed Modal repair must not leave a half-applied mode selection."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("hermes_cli.setup.managed_nous_tools_enabled", lambda: False)
+    monkeypatch.setattr(
+        "hermes_cli.setup.prompt_choice",
+        lambda question, choices, default=0: (
+            2 if question == "Select terminal backend:" else default
+        ),
+    )
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature_name, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("modal resolver failed")
+        ),
+    )
+    config = load_config()
+    config["terminal"]["modal_mode"] = "managed"
+
+    setup_mod.setup_terminal_backend(config)
+
+    assert config["terminal"]["backend"] == "local"
+    assert config["terminal"]["modal_mode"] == "managed"
 
 
 # test_setup_slack_* moved to tests/gateway/test_slack_plugin_setup.py — the
@@ -178,6 +275,11 @@ def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
     _clear_vercel_env(monkeypatch)
     monkeypatch.setenv("VERCEL_OIDC_TOKEN", "old-oidc")
     monkeypatch.setitem(sys.modules, "vercel", types.ModuleType("vercel"))
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: ensured.append((feature, kwargs)),
+    )
     config = load_config()
 
     def fake_prompt_choice(question, choices, default=0):
@@ -202,6 +304,7 @@ def test_vercel_setup_configures_access_token_auth(tmp_path, monkeypatch):
     assert os.environ["VERCEL_TOKEN"] == "token"
     assert os.environ["VERCEL_PROJECT_ID"] == "project"
     assert os.environ["VERCEL_TEAM_ID"] == "team"
+    assert ensured == [("terminal.vercel", {"prompt": False})]
 
 
 def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeypatch):
@@ -218,6 +321,11 @@ def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeyp
     )
     monkeypatch.chdir(nested)
     monkeypatch.setitem(sys.modules, "vercel", types.ModuleType("vercel"))
+    ensured = []
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: ensured.append((feature, kwargs)),
+    )
     config = load_config()
     config["terminal"]["container_disk"] = 999
 
@@ -250,3 +358,34 @@ def test_vercel_setup_prefills_project_and_team_from_link_file(tmp_path, monkeyp
     assert os.environ["VERCEL_TEAM_ID"] == "linked-team"
     assert defaults["    Vercel project ID"] == "linked-project"
     assert defaults["    Vercel team ID"] == "linked-team"
+    assert ensured == [("terminal.vercel", {"prompt": False})]
+
+
+def test_vercel_setup_refuses_unverified_sdk_and_preserves_backend(tmp_path, monkeypatch):
+    """A failed exact contract must not persist a Vercel backend."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_vercel_env(monkeypatch)
+    monkeypatch.delitem(sys.modules, "vercel", raising=False)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("uv resolver policy rejected vercel==0.7.2")
+        ),
+    )
+    monkeypatch.setattr(
+        setup_mod,
+        "_prompt_vercel_sandbox_settings",
+        lambda *_args, **_kwargs: pytest.fail("Vercel settings must not run after SDK failure"),
+    )
+    monkeypatch.setattr(
+        setup_mod,
+        "prompt_choice",
+        lambda question, choices, default=0: (
+            5 if question == "Select terminal backend:" else default
+        ),
+    )
+    config = load_config()
+
+    setup_mod.setup_terminal_backend(config)
+
+    assert config["terminal"]["backend"] == "local"

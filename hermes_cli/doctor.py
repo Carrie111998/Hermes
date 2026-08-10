@@ -22,6 +22,7 @@ from hermes_cli.config import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
 from hermes_constants import agent_browser_runnable
+from hermes_cli._subprocess_compat import windows_hide_flags
 
 PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
@@ -823,11 +824,33 @@ def check_certificates(should_fix: bool = False, issues: "list | None" = None) -
     check_fail("SSL CA certificate bundle is broken", first_error)
     print("    → Repairing: force-reinstalling certifi...")
     try:
+        from hermes_cli import _pip_security
+
+        pip_cmd = [sys.executable, "-m", "pip"]
+        pip_ok, pip_error = _pip_security.ensure_pip_floor(
+            pip_cmd,
+            runner=subprocess.run,
+            timeout=300,
+            creationflags=windows_hide_flags(),
+        )
+        if not pip_ok:
+            # Keep a floor refusal distinct from a certifi transaction error;
+            # the former requires repairing pip before this command can make
+            # any package change.
+            check_fail("pip security floor unavailable", pip_error)
+            if issues is not None:
+                issues.append(
+                    f"Upgrade pip to >=26.1.2, then reinstall certifi: {sys.executable} -m pip install "
+                    "--force-reinstall certifi"
+                )
+            return
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--force-reinstall", "certifi"],
+            [*pip_cmd, "install", "--force-reinstall", "certifi"],
             capture_output=True,
             text=True,
             timeout=300,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
     except Exception as exc:
         check_fail("certifi repair could not run pip", str(exc))

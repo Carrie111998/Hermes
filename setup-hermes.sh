@@ -34,9 +34,50 @@ cd "$SCRIPT_DIR"
 export UV_NO_CONFIG=1
 
 PYTHON_VERSION="3.11"
+MIN_PIP_VERSION="26.1.2"
 
 is_termux() {
     [ -n "${TERMUX_VERSION:-}" ] || [[ "${PREFIX:-}" == *"com.termux/files/usr"* ]]
+}
+
+verify_pip_floor() {
+    local pip_version_output
+    if ! pip_version_output="$("$SETUP_PYTHON" -m pip --version 2>&1)"; then
+        return 1
+    fi
+    "$SETUP_PYTHON" - "$MIN_PIP_VERSION" "$pip_version_output" <<'PY'
+import re
+import sys
+
+minimum = tuple(int(part) for part in sys.argv[1].split("."))
+output = sys.argv[2]
+canonical_versions = []
+for line in output.splitlines():
+    line_match = re.fullmatch(
+        r"\s*pip\s+([^\s]+)\s+from\s+"
+        r"(?:(?:/|[A-Za-z]:[\\/]|\\\\)[^\r\n\"]*[\\/]pip)"
+        r"(?:\s+\(python\s+\d+(?:\.\d+){1,3}\))?\s*",
+        line,
+        re.IGNORECASE,
+    )
+    if not line_match:
+        continue
+    token = line_match.group(1)
+    release_match = re.fullmatch(r"(\d+(?:\.\d+){1,3})(.*)", token)
+    if not release_match:
+        raise SystemExit(1)
+    suffix = release_match.group(2)
+    if suffix and not re.fullmatch(r"\.post\d+", suffix, re.IGNORECASE):
+        raise SystemExit(1)
+    try:
+        version = tuple(int(part) for part in release_match.group(1).split("."))
+    except ValueError:
+        raise SystemExit(1)
+    canonical_versions.append(version)
+if len(canonical_versions) == 1 and canonical_versions[0] >= minimum:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
 }
 
 get_command_link_dir() {
@@ -193,7 +234,11 @@ echo -e "${CYAN}→${NC} Installing dependencies..."
 if is_termux; then
     export ANDROID_API_LEVEL="$(getprop ro.build.version.sdk 2>/dev/null || printf '%s' "${ANDROID_API_LEVEL:-}")"
     echo -e "${CYAN}→${NC} Termux detected — installing the tested Android bundle"
-    "$SETUP_PYTHON" -m pip install --upgrade pip setuptools wheel
+    "$SETUP_PYTHON" -m pip install --upgrade "pip>=${MIN_PIP_VERSION}" setuptools wheel
+    if ! verify_pip_floor; then
+        echo -e "${RED}✗${NC} pip floor verification failed; need stable pip >= ${MIN_PIP_VERSION}."
+        exit 1
+    fi
     if [ -f "constraints-termux.txt" ]; then
         "$SETUP_PYTHON" -m pip install -e ".[termux]" -c constraints-termux.txt || {
             echo -e "${YELLOW}⚠${NC} Termux bundle install failed, falling back to base install..."

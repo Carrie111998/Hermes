@@ -88,6 +88,8 @@ except ImportError:
 # lark_oapi takes a noticeable amount of time to import.  Keep the gateway
 # configuration path responsive by importing it only when Feishu connects.
 lark = None  # type: ignore[assignment]
+
+_FEISHU_ACTIVE_CHECK_FAILED = False
 GetApplicationRequest = None  # type: ignore[assignment]
 CreateFileRequest = None  # type: ignore[assignment]
 CreateFileRequestBody = None  # type: ignore[assignment]
@@ -114,6 +116,7 @@ EventDispatcherHandler = None  # type: ignore[assignment]
 FeishuWSClient = None  # type: ignore[assignment]
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
+_FEISHU_ACTIVE_CHECK_LOCK = threading.Lock()
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -1458,27 +1461,63 @@ def feishu_deps_present() -> bool:
     ``ensure_deps_fn`` and runs from ``create_adapter()`` when this
     returns False (#79812).
     """
-    if FEISHU_AVAILABLE:
-        return True
     try:
         from tools.lazy_deps import is_available
-        return is_available("platform.feishu")
+        return (
+            is_available("platform.feishu")
+            and FEISHU_WEBHOOK_AVAILABLE
+            and FEISHU_WEBSOCKET_AVAILABLE
+            and not _FEISHU_ACTIVE_CHECK_FAILED
+        )
     except Exception:  # pragma: no cover — defensive
         return False
 
 
-def check_feishu_requirements() -> bool:
-    """Ensure Feishu dependencies are installed without importing the SDK."""
-    if FEISHU_AVAILABLE:
-        return True
+def _clear_feishu_transport_bindings() -> None:
+    """Record failed verification without tearing down live bindings."""
+    global _FEISHU_ACTIVE_CHECK_FAILED
+    _FEISHU_ACTIVE_CHECK_FAILED = True
 
-    from tools.lazy_deps import ensure
+
+def check_feishu_requirements() -> bool:
+    # Transport bindings and the failure latch are process-global.  Keep the
+    # lazy-repair transaction serialized across profile reconnects.
+    with _FEISHU_ACTIVE_CHECK_LOCK:
+        return _check_feishu_requirements()
+
+
+def _check_feishu_requirements() -> bool:
+    """Ensure Feishu dependencies and both transport runtimes are importable."""
+    global aiohttp, web, websockets
+    global FEISHU_WEBHOOK_AVAILABLE, FEISHU_WEBSOCKET_AVAILABLE
+    global _FEISHU_ACTIVE_CHECK_FAILED
 
     try:
+        # Keep the helper import inside the fail-closed boundary. Standalone
+        # or partially updated environments may not have tools.lazy_deps yet;
+        # that state must clear stale transport globals just like a resolver
+        # failure does.
+        from tools.lazy_deps import ensure
+
         ensure("platform.feishu", prompt=False)
-        return True
     except Exception:
+        _clear_feishu_transport_bindings()
         return False
+
+    try:
+        import aiohttp as _aiohttp
+        from aiohttp import web as _web
+        import websockets as _websockets
+    except Exception:
+        _clear_feishu_transport_bindings()
+        return False
+    aiohttp = _aiohttp
+    web = _web
+    websockets = _websockets
+    FEISHU_WEBHOOK_AVAILABLE = True
+    FEISHU_WEBSOCKET_AVAILABLE = True
+    _FEISHU_ACTIVE_CHECK_FAILED = False
+    return True
 
 
 class FeishuAdapter(BasePlatformAdapter):

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket as _socket
+import threading
 import time
 from typing import Any, Dict, List, Optional
 # Security: parse untrusted, pre-auth request bodies (WeCom callbacks) with
@@ -74,35 +75,81 @@ def check_wecom_callback_requirements() -> bool:
     Registry ``check_fn`` — must never install anything.  The ACTIVE
     lazy-installer is ``ensure_wecom_callback_requirements`` below.
     """
-    return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE and DEFUSEDXML_AVAILABLE
+    return (
+        AIOHTTP_AVAILABLE
+        and HTTPX_AVAILABLE
+        and DEFUSEDXML_AVAILABLE
+        and not _WECOM_CALLBACK_ACTIVE_CHECK_FAILED
+    )
+
+
+_WECOM_CALLBACK_ACTIVE_CHECK_FAILED = False
+_WECOM_CALLBACK_ACTIVE_CHECK_LOCK = threading.Lock()
+
+
+def _clear_wecom_callback_bindings() -> None:
+    """Record failed verification without tearing down live bindings."""
+    global _WECOM_CALLBACK_ACTIVE_CHECK_FAILED
+    _WECOM_CALLBACK_ACTIVE_CHECK_FAILED = True
 
 
 def ensure_wecom_callback_requirements() -> bool:
+    # Callback SDK aliases and the failure latch are process-global.  Keep
+    # bind/validate/rollback atomic across concurrent profile startups.
+    with _WECOM_CALLBACK_ACTIVE_CHECK_LOCK:
+        return _ensure_wecom_callback_requirements()
+
+
+def _ensure_wecom_callback_requirements() -> bool:
     """ACTIVE lazy-installer for the ``platform.wecom_callback`` feature.
 
     Registered as ``ensure_deps_fn``: the registry's ``create_adapter()``
     runs it when the passive probe fails, right before the gateway connects
-    the platform (#79812).  Installs ``defusedxml`` (the only non-core dep;
-    aiohttp/httpx ship with every messaging install) and rebinds the module
-    globals.  Before this hook existed, the passive ``check_fn`` returned
+    the platform (#79812).  Installs the explicit ``defusedxml`` and aiohttp
+    closure (callback mode can be enabled without another messaging extra)
+    and rebinds the module globals.  Before this hook existed, the passive ``check_fn`` returned
     False forever on installs without the ``wecom`` extra and the
     ``platform.wecom_callback`` LAZY_DEPS entry was never exercised.
     """
-    if check_wecom_callback_requirements():
-        return True
+    global _WECOM_CALLBACK_ACTIVE_CHECK_FAILED
 
     def _import() -> dict:
         import defusedxml.ElementTree as _ET
+        from aiohttp import web as _web
+        import httpx as _httpx
 
-        return {"ET": _ET, "DEFUSEDXML_AVAILABLE": True}
+        return {
+            "ET": _ET,
+            "DEFUSEDXML_AVAILABLE": True,
+            "web": _web,
+            "AIOHTTP_AVAILABLE": True,
+            "httpx": _httpx,
+            "HTTPX_AVAILABLE": True,
+        }
 
     try:
         from tools.lazy_deps import ensure_and_bind
     except Exception:  # pragma: no cover — defensive
+        _clear_wecom_callback_bindings()
         return False
-    if not ensure_and_bind("platform.wecom_callback", _import, globals(), prompt=False):
+    try:
+        bound = ensure_and_bind(
+            "platform.wecom_callback", _import, globals(), prompt=False
+        )
+    except Exception:
+        _clear_wecom_callback_bindings()
         return False
-    return check_wecom_callback_requirements()
+    if not bound:
+        _clear_wecom_callback_bindings()
+        return False
+    # A prior failed active attempt intentionally makes the passive probe
+    # fail closed.  Clear that marker only after a new bind has completed so
+    # this retry validates the rebound globals rather than its old latch.
+    _WECOM_CALLBACK_ACTIVE_CHECK_FAILED = False
+    if not check_wecom_callback_requirements():
+        _clear_wecom_callback_bindings()
+        return False
+    return True
 
 
 class WecomCallbackAdapter(BasePlatformAdapter):

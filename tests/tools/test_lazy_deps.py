@@ -13,6 +13,9 @@ call is mocked — we never actually shell out during unit tests.
 from __future__ import annotations
 
 
+import sys
+from types import SimpleNamespace
+
 import pytest
 
 import tools.lazy_deps as ld
@@ -75,6 +78,11 @@ class TestSpecSafety:
 
 
 class TestAllowlist:
+    def test_discord_carries_the_pynacl_security_pin(self):
+        specs = ld.feature_specs("platform.discord")
+        assert "PyNaCl==1.6.2" in specs
+        assert "cffi" in specs
+
     def test_unknown_feature_raises(self, monkeypatch):
         monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
         with pytest.raises(ld.FeatureUnavailable, match="not in LAZY_DEPS"):
@@ -156,6 +164,65 @@ class TestEnsure:
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
 
+    def test_aiohttp_repair_requires_restart_when_submodule_is_preloaded(
+        self, monkeypatch
+    ):
+        sentinel = object()
+        monkeypatch.setitem(sys.modules, "aiohttp.web", sentinel)
+        monkeypatch.setitem(ld.LAZY_DEPS, "test.aiohttp", ("aiohttp==3.14.3",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+
+        with pytest.raises(ld.FeatureUnavailable, match="restart required"):
+            ld.ensure("test.aiohttp", prompt=False)
+
+    def test_feishu_lark_repair_requires_restart_when_sdk_is_preloaded(
+        self, monkeypatch
+    ):
+        sentinel = object()
+        monkeypatch.setitem(sys.modules, "lark_oapi", sentinel)
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+
+        with pytest.raises(ld.FeatureUnavailable, match="restart required") as exc_info:
+            ld.ensure("platform.feishu", prompt=False)
+
+        assert "lark-oapi==1.6.8" in str(exc_info.value)
+        assert "lark_oapi" in str(exc_info.value)
+
+    @pytest.mark.parametrize("module_name", ["nacl", "_cffi_backend"])
+    def test_discord_compiled_repair_requires_restart_before_ensure_and_bind(
+        self, monkeypatch, module_name
+    ):
+        sentinel = object()
+        for loaded_name in tuple(sys.modules):
+            if loaded_name == module_name or loaded_name.startswith(
+                f"{module_name}."
+            ):
+                monkeypatch.delitem(sys.modules, loaded_name, raising=False)
+        monkeypatch.setitem(sys.modules, module_name, sentinel)
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+        imported = []
+
+        with pytest.raises(
+            ld.FeatureUnavailable, match="restart required"
+        ) as exc_info:
+            ld.ensure("platform.discord", prompt=False)
+        assert module_name in str(exc_info.value)
+
+        def importer():
+            imported.append(True)
+            return {}
+
+        assert (
+            ld.ensure_and_bind(
+                "platform.discord",
+                importer,
+                {},
+                prompt=False,
+            )
+            is False
+        )
+        assert imported == []
+
 
 # ---------------------------------------------------------------------------
 # is_available
@@ -202,6 +269,83 @@ class TestIsSatisfiedVersionAware:
         self._fake_version(monkeypatch, {"honcho-ai": "2.2.0"})
         assert ld._is_satisfied("honcho-ai==2.2.0") is True
 
+    def test_discord_repairs_an_already_installed_old_pynacl(self, monkeypatch):
+        self._fake_version(
+            monkeypatch,
+            {
+                "discord.py": "2.7.1",
+                "brotlicffi": "1.2.0.1",
+                "aiohttp": "3.14.3",
+                "PyNaCl": "1.5.0",
+            },
+        )
+        assert "PyNaCl==1.6.2" in ld.feature_missing("platform.discord")
+
+    @pytest.mark.parametrize(
+        "installed",
+        ["1.6.2+local", "1.6.2.dev0", "1.6.2rc1", "not-a-version"],
+    )
+    def test_security_pin_rejects_unstable_or_malformed_pynacl_metadata(
+        self, monkeypatch, installed
+    ):
+        self._fake_version(monkeypatch, {"PyNaCl": installed})
+
+        assert "PyNaCl==1.6.2" in ld.feature_missing("platform.discord")
+
+    def test_security_pin_fails_closed_when_packaging_is_unavailable(
+        self, monkeypatch
+    ):
+        self._fake_version(monkeypatch, {"PyNaCl": "1.6.2"})
+        import builtins
+
+        real_import = builtins.__import__
+
+        def block_packaging(name, *args, **kwargs):
+            if name == "packaging" or name.startswith("packaging."):
+                raise ImportError("packaging intentionally unavailable")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", block_packaging)
+
+        assert "PyNaCl==1.6.2" in ld.feature_missing("platform.discord")
+
+    def test_security_pin_accepts_stable_pynacl_post_release(self, monkeypatch):
+        self._fake_version(monkeypatch, {"PyNaCl": "1.6.2.post1"})
+
+        assert ld._is_satisfied("PyNaCl==1.6.2") is True
+
+    def test_ensure_repairs_local_pynacl_metadata(self, monkeypatch):
+        for name in tuple(sys.modules):
+            if name in {"nacl", "_cffi_backend", "aiohttp"} or name.startswith(
+                ("nacl.", "aiohttp.")
+            ):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+        installed_versions = {
+            "discord.py": "2.7.1",
+            "davey": "0.1.4",
+            "brotlicffi": "1.2.0.1",
+            "cffi": "2.0.0",
+            "PyNaCl": "1.6.2+local",
+            "aiohttp": "3.14.3",
+        }
+        self._fake_version(monkeypatch, installed_versions)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        installed = []
+
+        def fake_install(specs, **kwargs):
+            installed.extend(specs)
+            for spec in specs:
+                if "==" in spec:
+                    package, wanted = spec.split("==", 1)
+                    installed_versions[package] = wanted
+            return ld._InstallResult(True, "ok", "")
+
+        monkeypatch.setattr(ld, "_venv_pip_install", fake_install)
+
+        ld.ensure("platform.discord", prompt=False)
+
+        assert installed == ["PyNaCl==1.6.2"]
+
 
     def test_range_within_returns_true(self, monkeypatch):
         self._fake_version(monkeypatch, {"slack-bolt": "1.27.0"})
@@ -222,6 +366,7 @@ class TestIsSatisfiedVersionAware:
     def test_extras_block_mismatch_returns_false(self, monkeypatch):
         self._fake_version(monkeypatch, {"mautrix": "0.20.0"})
         assert ld._is_satisfied("mautrix[encryption]==0.21.0") is False
+
 
     def test_trace_upload_hub_at_core_locked_version_is_current(self, monkeypatch):
         """#60783 regression: refresh must not churn the shared hub install.
@@ -291,6 +436,230 @@ class TestIsSatisfiedVersionAware:
         ld.ensure(feature, prompt=False)
 
         assert tuple(installed) == expected_repairs
+
+
+def test_pip_fallback_upgrades_and_verifies_the_security_floor(monkeypatch):
+    """A vulnerable ensurepip result cannot flow into a lazy package install."""
+    import hermes_cli.managed_uv as managed_uv
+
+    calls = []
+    version_outputs = iter(
+        [
+            (1, "", "pip is not installed"),
+            (0, "pip 24.0 from /venv/lib/python3.11/site-packages/pip (python 3.11)", ""),
+            (0, "pip 26.1.2 from /venv/lib/python3.11/site-packages/pip (python 3.11)", ""),
+        ]
+    )
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "--version":
+            returncode, stdout, stderr = next(version_outputs)
+            return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+        if "ensurepip" in cmd:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        return SimpleNamespace(returncode=0, stdout="installed", stderr="")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr(ld.shutil, "which", lambda name: None)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+    result = ld._venv_pip_install(("left-pad",))
+
+    assert result.success is True
+    assert any(
+        cmd[-3:] == ["install", "--upgrade", "pip>=26.1.2"] for cmd in calls
+    )
+    assert any(cmd[-2:] == ["install", "left-pad"] for cmd in calls)
+
+
+def test_pip_fallback_fails_closed_when_floor_upgrade_fails(monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "--version":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="pip 24.0 from /venv/lib/python3.11/site-packages/pip (python 3.11)",
+                stderr="",
+            )
+        if cmd[-3:] == ["install", "--upgrade", "pip>=26.1.2"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="network down")
+        pytest.fail(f"package install must not run before pip floor verification: {cmd}")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr(ld.shutil, "which", lambda name: None)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+    result = ld._venv_pip_install(("left-pad",))
+
+    assert result.success is False
+    assert "pip floor upgrade failed" in result.stderr
+
+
+def test_pip_fallback_applies_pynacl_override_after_discord_resolution(monkeypatch):
+    import hermes_cli.managed_uv as managed_uv
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "--version":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="pip 26.1.2 from /venv/lib/python3.11/site-packages/pip (python 3.11)",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="installed", stderr="")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr(ld.shutil, "which", lambda name: None)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+    monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: True)
+    monkeypatch.setattr(ld, "_is_present", lambda _spec: True)
+
+    result = ld._venv_pip_install(ld.feature_specs("platform.discord"))
+
+    assert result.success is True
+    discord_install = next(cmd for cmd in calls if "discord.py==2.7.1" in cmd)
+    pynacl_install = next(cmd for cmd in calls if "PyNaCl==1.6.2" in cmd)
+    assert "PyNaCl==1.6.2" not in discord_install
+    assert "discord.py==2.7.1" not in pynacl_install
+    assert "davey==0.1.4" in discord_install
+
+
+def test_uv_fallback_applies_pynacl_override_in_a_second_transaction(monkeypatch):
+    """uv pip does not consume the project's uv override metadata."""
+    import subprocess
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, "installed", "")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: "uv")
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+    monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: True)
+    monkeypatch.setattr(ld, "_is_present", lambda _spec: True)
+
+    result = ld._venv_pip_install(ld.feature_specs("platform.discord"))
+
+    assert result.success is True
+    installs = [cmd for cmd in calls if cmd[:3] == ["uv", "pip", "install"]]
+    assert len(installs) == 2
+    assert "PyNaCl==1.6.2" not in installs[0]
+    assert installs[1][-1] == "PyNaCl==1.6.2"
+    assert "discord.py==2.7.1" not in installs[1]
+
+
+def test_pip_fallback_runs_override_when_pynacl_is_the_only_missing_spec(monkeypatch):
+    """A singleton security repair must not issue an empty pip install."""
+    import hermes_cli.managed_uv as managed_uv
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "--version":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="pip 26.1.2 from /venv/site-packages/pip (python 3.13)",
+                stderr="",
+            )
+        return SimpleNamespace(returncode=0, stdout="installed", stderr="")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr(ld.shutil, "which", lambda name: None)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+    monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: True)
+    monkeypatch.setattr(ld, "_is_present", lambda _spec: True)
+
+    result = ld._venv_pip_install(("PyNaCl==1.6.2",))
+
+    assert result.success is True
+    installs = [cmd for cmd in calls if "install" in cmd]
+    assert len(installs) == 1
+    assert installs[0][-2:] == ["install", "PyNaCl==1.6.2"]
+
+
+def test_pip_override_failure_retries_exact_repair_and_fails_closed(monkeypatch):
+    """A failed second transaction cannot report success with old PyNaCl."""
+    import hermes_cli.managed_uv as managed_uv
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd[-1] == "--version":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="pip 26.1.2 from /venv/site-packages/pip (python 3.13)",
+                stderr="",
+            )
+        if "PyNaCl==1.6.2" in cmd and "--no-deps" not in cmd:
+            return SimpleNamespace(returncode=1, stdout="", stderr="resolver failed")
+        if "--no-deps" in cmd:
+            return SimpleNamespace(returncode=1, stdout="", stderr="repair failed")
+        return SimpleNamespace(returncode=0, stdout="installed", stderr="")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr(ld.shutil, "which", lambda _: None)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: None)
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        ld,
+        "_is_satisfied",
+        lambda spec: spec != "PyNaCl==1.6.2",
+    )
+    monkeypatch.setattr(ld, "_is_present", lambda _spec: True)
+
+    result = ld._venv_pip_install(ld.feature_specs("platform.discord"))
+
+    assert result.success is False
+    assert any("--no-deps" in cmd and "PyNaCl==1.6.2" in cmd for cmd in calls)
+    assert "remains below PyNaCl==1.6.2" in result.stderr
+
+
+@pytest.mark.parametrize("use_uv", [False, True])
+def test_exact_pynacl_success_fails_closed_without_runtime_cffi(monkeypatch, use_uv):
+    """Both installer tiers must reject a PyNaCl-only repair without cffi."""
+    import subprocess
+
+    import hermes_cli.managed_uv as managed_uv
+
+    calls = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        if not use_uv and cmd[-1] == "--version":
+            return SimpleNamespace(
+                returncode=0,
+                stdout="pip 26.1.2 from /venv/site-packages/pip",
+                stderr="",
+            )
+        return subprocess.CompletedProcess(cmd, 0, "installed", "")
+
+    monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+    monkeypatch.setattr(ld.shutil, "which", lambda _: None)
+    monkeypatch.setattr(managed_uv, "resolve_uv", lambda: "uv" if use_uv else None)
+    monkeypatch.setattr(ld.subprocess, "run", fake_run)
+    monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: True)
+    monkeypatch.setattr(ld, "_is_present", lambda spec: spec != "cffi")
+
+    result = ld._venv_pip_install(("PyNaCl==1.6.2",))
+
+    assert result.success is False
+    assert "cffi" in result.stderr
+    assert any("PyNaCl==1.6.2" in cmd for cmd in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +781,55 @@ class TestRefreshActiveFeatures:
         assert result["a.ok"] == "current"
         assert result["b.fail"].startswith("failed:")
 
+    def test_preloaded_module_reports_restart_required(self, monkeypatch):
+        monkeypatch.setattr(ld, "active_features", lambda: ["a.stale"])
+        monkeypatch.setitem(ld.LAZY_DEPS, "a.stale", ("PyNaCl==1.6.2",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+        monkeypatch.setitem(sys.modules, "nacl", object())
+
+        result = ld.refresh_active_features(prompt=False)
+
+        assert result["a.stale"].startswith("restart-required:")
+        assert "restart required" in result["a.stale"]
+
+    def test_preloaded_aiohttp_reports_restart_required(self, monkeypatch):
+        """A stale aiohttp module must not survive an in-process repair."""
+        monkeypatch.setattr(ld, "active_features", lambda: ["a.stale"])
+        monkeypatch.setitem(ld.LAZY_DEPS, "a.stale", ("aiohttp==3.14.3",))
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+        monkeypatch.setitem(sys.modules, "aiohttp", object())
+
+        result = ld.refresh_active_features(prompt=False)
+
+        assert result["a.stale"].startswith("restart-required:")
+        assert "aiohttp" in result["a.stale"]
+
+    def test_pynacl_override_is_split_with_pep503_spelling(self, monkeypatch):
+        """Case/underscore spelling must still get the exact repair step."""
+        import subprocess
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, "installed", "")
+
+        monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: "uv")
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: True)
+        monkeypatch.setattr(ld, "_is_present", lambda _spec: True)
+
+        result = ld._venv_pip_install(
+            ("discord.py==2.7.1", "pynacl==1.6.2", "cffi==2.0.0")
+        )
+
+        assert result.success is True
+        installs = [cmd for cmd in calls if cmd[:3] == ["uv", "pip", "install"]]
+        assert len(installs) == 2
+        assert "pynacl==1.6.2" not in installs[0]
+        assert installs[1][-1] == "pynacl==1.6.2"
+
 
 # ---------------------------------------------------------------------------
 # install_specs — manifest-driven installs (dashboard memory providers etc.)
@@ -467,6 +885,62 @@ class TestInstallSpecs:
         )
         result = ld.install_specs(["honcho-ai==2.2.0", "pkg; rm -rf /"])
         assert result.blocked is True
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "PyNaCl==1.5.0",
+            "aiohttp==3.14.1",
+            "idna==3.14",
+            "pip==24.0",
+            "PyNaCl",
+            "aiohttp",
+            "idna",
+            "pip",
+            "idna<4",
+        ],
+    )
+    def test_security_managed_manifest_specs_reject_vulnerable_floors(
+        self, monkeypatch, spec
+    ):
+        """Manifest installs cannot bypass the shared dependency floors."""
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *a, **kw: pytest.fail("vulnerable spec must be blocked before pip"),
+        )
+
+        result = ld.install_specs([spec])
+
+        assert result.ok is False
+        assert result.blocked is True
+        assert "security floor" in result.reason
+
+    @pytest.mark.parametrize(
+        "spec",
+        [
+            "PyNaCl==1.6.2",
+            "aiohttp>=3.14.3",
+            "idna>=3.15,<4",
+            "pip>=26.1.2",
+            "honcho-ai==2.2.0",
+        ],
+    )
+    def test_security_managed_manifest_specs_accept_safe_requirements(
+        self, monkeypatch, spec
+    ):
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *a, **kw: ld._InstallResult(True, "installed", ""),
+        )
+
+        result = ld.install_specs([spec])
+
+        assert result.ok is True
+        assert result.blocked is False
 
 
     def test_never_raises_on_unexpected_error(self, monkeypatch):

@@ -55,6 +55,12 @@ class TestInstallDependenciesRunner:
             calls.append(cmd)
             if run_behavior:
                 return run_behavior(cmd)
+            if cmd[-1] == "--version":
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="pip 26.1.2 from /venv/site-packages/pip (python 3.13)",
+                    stderr="",
+                )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         # The hermetic conftest sets HERMES_DISABLE_LAZY_INSTALLS=1 so no test
@@ -86,9 +92,18 @@ class TestInstallDependenciesRunner:
 
     def test_bootstraps_pip_via_ensurepip_when_missing(self, tmp_path):
         """Neither uv nor pip -> ensurepip bootstrap, then pip install."""
+        probes = {"count": 0}
+
         def behavior(cmd):
             if cmd[-1] == "--version":
-                return SimpleNamespace(returncode=1, stdout="", stderr="")
+                probes["count"] += 1
+                if probes["count"] == 1:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="pip 26.1.2 from /venv/site-packages/pip (python 3.13)",
+                    stderr="",
+                )
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
         calls, py = self._run_with_missing_dep(tmp_path, lambda b: None, behavior)

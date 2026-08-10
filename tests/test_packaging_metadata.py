@@ -64,6 +64,7 @@ def test_faster_whisper_is_not_a_base_dependency():
 # [dev]) so we pin it directly in every extra that exposes a server surface and
 # enforce the floor in both pyproject and the committed lockfile.
 _STARLETTE_CVE_FLOOR = (1, 0, 1)
+_IDNA_CVE_FLOOR = (3, 15)
 _UPDATE_DOWNGRADE_GUARD_FLOORS = {
     # `hermes update` reinstalls exact pins from pyproject/lazy_deps. These
     # reviewed CVE pins must not slide back to stale versions that downgrade
@@ -74,16 +75,45 @@ _UPDATE_DOWNGRADE_GUARD_FLOORS = {
 }
 
 
+_STABLE_VERSION_RE = re.compile(
+    r"^(?P<release>\d+(?:\.\d+)*)(?:\.post\d+)?$",
+    re.IGNORECASE,
+)
+
+
 def _version_tuple(spec: str) -> tuple[int, ...]:
-    # "1.0.1" -> (1, 0, 1); tolerant of pre/post suffixes by truncating.
-    head = spec.split("+", 1)[0]
-    parts = []
-    for chunk in head.split("."):
-        digits = "".join(ch for ch in chunk if ch.isdigit())
-        if not digits:
-            break
-        parts.append(int(digits))
-    return tuple(parts)
+    """Parse a stable release, preserving optional post-release semantics.
+
+    Security-floor checks must not turn a prerelease suffix into digits (for
+    example, ``3.15rc1`` must not become ``(3, 151)``). Post releases are
+    stable and compare at the same release floor.
+    """
+    match = _STABLE_VERSION_RE.fullmatch(spec.strip())
+    if not match:
+        raise ValueError(f"unsupported non-stable version: {spec!r}")
+    return tuple(int(part) for part in match.group("release").split("."))
+
+
+@pytest.mark.parametrize(
+    ("version", "expected"),
+    [
+        ("3.15", (3, 15)),
+        ("3.15.0", (3, 15, 0)),
+        ("3.15.post1", (3, 15)),
+        ("3.15.0.post2", (3, 15, 0)),
+    ],
+)
+def test_version_tuple_accepts_stable_releases(version, expected):
+    assert _version_tuple(version) == expected
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["3.15rc1", "3.15.0.dev1", "3.15.0a1", "3.15.0+local", "3.15-beta1"],
+)
+def test_version_tuple_rejects_prerelease_and_local_versions(version):
+    with pytest.raises(ValueError, match="non-stable"):
+        _version_tuple(version)
 
 
 def test_starlette_pinned_above_cve_2026_48710_floor_in_pyproject():
@@ -209,6 +239,33 @@ def _pyproject_pinned_specs():
     return specs
 
 
+def test_idna_security_floor_is_direct_and_locked():
+    """Keep the #41374 IDNA floor durable across future lock refreshes.
+
+    IDNA is normally pulled transitively by HTTP clients.  A transitive
+    resolution at the fixed version is not enough: without a direct core pin,
+    a later resolver change can select a vulnerable version while the
+    application still appears to have the same top-level dependencies.
+    """
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    core_pins = _pins_from_specs(data["project"]["dependencies"])
+    idna_pins = core_pins.get("idna")
+
+    assert idna_pins and len(idna_pins) == 1, (
+        "idna must have one exact core pin so the CVE-fixed floor is not only "
+        "an incidental transitive resolution"
+    )
+    pinned_version = next(iter(idna_pins))
+    assert _version_tuple(pinned_version) >= _IDNA_CVE_FLOOR, (
+        f"idna=={pinned_version} is below the #41374 fixed floor "
+        f"{'.'.join(map(str, _IDNA_CVE_FLOOR))}"
+    )
+    assert _locked_versions("idna") == {pinned_version}, (
+        "uv.lock must resolve the same idna version enforced by the direct "
+        "pyproject pin"
+    )
+
+
 def _lazy_deps_pinned_specs():
     """Extract every string literal inside the LAZY_DEPS dict via AST.
 
@@ -332,16 +389,24 @@ def _lazy_deps_by_feature():
 # each security package -> the lazy features that bundle an SDK pulling it and
 # must therefore carry the same pin as the pyproject extra.
 _REQUIRED_SECURITY_PINS = {
-    # Every lazy messaging feature whose SDK pulls aiohttp transitively must
-    # carry the patched floor directly: discord.py (aiohttp<4), slack-bolt,
-    # mautrix/aiohttp-socks (aiohttp<4 / >=3.10), and microsoft-teams-apps —
-    # none of those upper/lower bounds excludes a vulnerable already-installed
-    # aiohttp, so the lazy path would not upgrade it without an explicit pin.
+    # Every supported lazy SDK root whose runtime can use aiohttp must carry
+    # the patched floor directly. Resolver ranges on messaging SDKs do not
+    # exclude a vulnerable already-installed aiohttp, and independent lazy
+    # roots (search, TTS, memory, terminal, and callback mode) cannot rely on
+    # another feature having repaired the package first.
     "aiohttp": {
         "platform.discord",
         "platform.slack",
         "platform.matrix",
         "platform.teams",
+        "platform.dingtalk",
+        "platform.feishu",
+        "platform.wecom_callback",
+        "search.firecrawl",
+        "tts.edge",
+        "memory.hindsight",
+        "terminal.modal",
+        "terminal.daytona",
     },
 }
 

@@ -26,18 +26,170 @@ from __future__ import annotations  # allow PEP 604 `X | None` on Python 3.9+
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 from importlib.metadata import version as _distribution_version
 from pathlib import Path
 
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.9 standalone copies
+    tomllib = None  # type: ignore[assignment]
+
 # Ensure sibling modules (_hermes_home) are importable when run standalone.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+
+def _find_repo_root(script_path: Path) -> Path | None:
+    """Find a genuine Hermes checkout without trusting a sibling package.
+
+    Copied skill scripts may live below arbitrary directories.  A directory
+    that merely happens to contain ``hermes_cli`` is not enough evidence: a
+    fake package there could change the pip-floor behavior before the bundled
+    stdlib guard runs.  Require the repository's project metadata and the
+    shared early-import helper before importing anything from the ancestor.
+    """
+
+    for parent in script_path.parents:
+        pyproject = parent / "pyproject.toml"
+        helper = parent / "hermes_cli" / "_pip_security.py"
+        if tomllib is None or not pyproject.is_file() or not helper.is_file():
+            continue
+        try:
+            with pyproject.open("rb") as handle:
+                project = tomllib.load(handle).get("project", {})
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if (
+            project.get("name") == "hermes-agent"
+            and project.get("scripts", {}).get("hermes") == "hermes_cli.main:main"
+        ):
+            return parent
+    return None
+
+
+_REPO_ROOT = _find_repo_root(Path(__file__).resolve())
+if _REPO_ROOT is not None and str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
 from _hermes_home import display_hermes_home, get_hermes_home
+
+try:
+    from hermes_cli._pip_security import ensure_pip_floor as _ensure_pip_floor
+except (ImportError, ModuleNotFoundError):  # standalone skill copy without repo
+    _ensure_pip_floor = None
+
+try:
+    from hermes_cli._subprocess_compat import windows_hide_flags as _windows_hide_flags
+except (ImportError, ModuleNotFoundError):  # standalone skill copy without repo
+    def _windows_hide_flags() -> int:
+        """Return the local no-console flag without importing Hermes."""
+        return int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) if sys.platform == "win32" else 0
+
+_MIN_PIP_VERSION = (26, 1, 2)
+_MIN_PIP_SPEC = "pip>=26.1.2"
+_PIP_CANONICAL_VERSION_RE = re.compile(
+    r"^\s*pip\s+([^\s]+)\s+from\s+"
+    r"(?:(?:/|[A-Za-z]:[\\/]|\\\\)[^\r\n\"]*[\\/]pip)"
+    r"(?:\s+\(python\s+\d+(?:\.\d+){1,3}\))?\s*$",
+    re.IGNORECASE,
+)
+_PIP_RELEASE_RE = re.compile(r"^(\d+(?:\.\d+){1,3})(.*)$")
+
+
+def _bundled_pip_version_meets_floor(output: str) -> bool:
+    """Check a pip version using only stdlib code for standalone skill copies."""
+    versions = []
+    for line in (output or "").splitlines():
+        match = _PIP_CANONICAL_VERSION_RE.fullmatch(line)
+        if not match:
+            continue
+        token = match.group(1)
+        release_match = _PIP_RELEASE_RE.fullmatch(token)
+        if not release_match:
+            return False
+        suffix = release_match.group(2)
+        if suffix and not re.fullmatch(r"\.post\d+", suffix, re.IGNORECASE):
+            return False
+        try:
+            release = tuple(int(part) for part in release_match.group(1).split("."))
+        except ValueError:
+            return False
+        versions.append(release)
+    return len(versions) == 1 and versions[0] >= _MIN_PIP_VERSION
+
+
+def _bundled_ensure_pip_floor(
+    pip_cmd: list[str],
+    *,
+    timeout: int = 120,
+    creationflags: int | None = None,
+    runner=subprocess.run,
+) -> tuple[bool, str]:
+    """Upgrade and verify pip without importing the repository helper."""
+    hide_flags = _windows_hide_flags() if creationflags is None else creationflags
+    try:
+        probe = runner(
+            pip_cmd + ["--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            stdin=subprocess.DEVNULL,
+            creationflags=hide_flags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"pip floor probe failed: {exc}"
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "").strip()
+        return False, f"pip floor probe failed: {detail or 'pip --version failed'}"
+    if _bundled_pip_version_meets_floor(probe.stdout or ""):
+        return True, ""
+
+    try:
+        upgrade = runner(
+            pip_cmd + ["install", "--upgrade", _MIN_PIP_SPEC],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+            creationflags=hide_flags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"pip floor upgrade failed: {exc}"
+    if upgrade.returncode != 0:
+        detail = (upgrade.stderr or upgrade.stdout or "").strip()
+        return False, f"pip floor upgrade failed: {detail or 'pip install failed'}"
+
+    try:
+        verified = runner(
+            pip_cmd + ["--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            stdin=subprocess.DEVNULL,
+            creationflags=hide_flags,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"pip floor verification failed: {exc}"
+    if verified.returncode != 0 or not _bundled_pip_version_meets_floor(
+        verified.stdout or ""
+    ):
+        detail = (verified.stderr or verified.stdout or "").strip()
+        return False, (
+            f"pip remains below {_MIN_PIP_SPEC} after upgrade: "
+            f"{detail or 'version was not reported'}"
+        )
+    return True, ""
 
 HERMES_HOME = get_hermes_home()
 TOKEN_PATH = HERMES_HOME / "google_token.json"
@@ -134,20 +286,39 @@ def install_deps():
 
     print("Installing Google API dependencies...")
 
-    # First choice: pip in the current interpreter. Works for most installs.
-    try:
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet"] + missing,
-            stdout=subprocess.DEVNULL,
-        )
-        remaining = _missing_required_packages()
-        if remaining:
-            print(f"ERROR: Dependencies remain stale after pip install: {' '.join(remaining)}")
-            return False
-        print("Dependencies installed.")
-        return True
-    except subprocess.CalledProcessError as e:
-        pip_error = e
+    # First choice: floor-verified pip in the current interpreter. Works for
+    # most installs, but a missing/unverifiable floor falls through to uv.
+    pip_cmd = [sys.executable, "-m", "pip"]
+    ensure_pip_floor = _ensure_pip_floor or _bundled_ensure_pip_floor
+    pip_ok, pip_detail = ensure_pip_floor(
+        pip_cmd,
+        runner=subprocess.run,
+        timeout=120,
+        creationflags=_windows_hide_flags(),
+    )
+    if pip_ok:
+        try:
+            subprocess.check_call(
+                pip_cmd + ["install", "--quiet"] + missing,
+                timeout=300,
+                stdout=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=_windows_hide_flags(),
+            )
+            remaining = _missing_required_packages()
+            if remaining:
+                print(f"ERROR: Dependencies remain stale after pip install: {' '.join(remaining)}")
+                return False
+            print("Dependencies installed.")
+            return True
+        except (
+            subprocess.CalledProcessError,
+            FileNotFoundError,
+            subprocess.TimeoutExpired,
+        ) as e:
+            pip_error = e
+    else:
+        pip_error = RuntimeError(pip_detail)
 
     # Fallback: the interpreter has no pip (the Hermes Docker image's venv is
     # built with `uv sync`, which does not bootstrap pip). `uv pip install
@@ -161,6 +332,8 @@ def install_deps():
                 [uv, "pip", "install", "--python", sys.executable, "--quiet"]
                 + missing,
                 stdout=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=_windows_hide_flags(),
             )
             remaining = _missing_required_packages()
             if remaining:

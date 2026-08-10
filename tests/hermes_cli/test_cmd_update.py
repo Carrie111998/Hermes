@@ -16,6 +16,17 @@ def _make_run_side_effect(branch="main", verify_ok=True, commit_count="0"):
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
+        # The update path now verifies the venv pip security floor before
+        # installing dependencies. Model a healthy pip for these git-focused
+        # command-flow tests instead of returning empty mocked output.
+        if "-m" in cmd and "pip" in cmd:
+            if "--version" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="pip 26.1.2 from /venv/site-packages/pip\n", stderr=""
+                )
+            if "install" in cmd and "--upgrade" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
         # git rev-parse --abbrev-ref HEAD  (get current branch)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
@@ -94,9 +105,6 @@ class TestCmdUpdateNpmLockfileCache:
     def _cache_file(hermes_root, project_root):
         cache_key = hashlib.sha256(str(project_root).encode()).hexdigest()[:12]
         return hermes_root / f".npm_lock_hash_{cache_key}"
-
-
-
     def test_record_npm_lockfile_hash(self, tmp_path, monkeypatch):
         from hermes_cli import main as hm
 
@@ -267,6 +275,104 @@ class TestUpdateManagedPythonEnvIsolation:
         assert ".hermes-runtime" in uv_env.get("UV_PYTHON_INSTALL_DIR", "")
         assert uv_env.get("UV_MANAGED_PYTHON") == "1"
         assert uv_env.get("UV_NO_CONFIG") == "1"
+
+
+def test_update_pip_floor_bounds_probe_and_ensurepip(monkeypatch):
+    """Update floor probes cannot hang before their friendly error path."""
+    from hermes_cli import update_cmd
+    import tools.lazy_deps as lazy_deps
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if cmd[-1] == "--version":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="missing")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+    monkeypatch.setattr(lazy_deps, "_ensure_pip_floor", lambda _cmd: (True, ""))
+
+    update_cmd._ensure_update_pip_floor(["python", "-m", "pip"])
+
+    assert calls[0][1]["timeout"] == 15
+    assert calls[1][1]["timeout"] == 120
+    assert all(call[1]["stdin"] is subprocess.DEVNULL for call in calls)
+    assert all("creationflags" in call[1] for call in calls)
+
+
+def test_update_pip_floor_reports_ensurepip_output(monkeypatch):
+    """A failed ensurepip bootstrap includes its diagnostic output."""
+    from hermes_cli import _pip_security, update_cmd
+    import tools.lazy_deps as lazy_deps
+
+    def fake_run(cmd, **kwargs):
+        if cmd[-1] == "--version":
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="missing")
+        return subprocess.CompletedProcess(
+            cmd, 1, stdout="bootstrap stdout", stderr="bootstrap stderr"
+        )
+
+    monkeypatch.setattr(update_cmd.subprocess, "run", fake_run)
+    monkeypatch.setattr(lazy_deps, "_ensure_pip_floor", lambda _cmd: (True, ""))
+
+    with pytest.raises(_pip_security.PipFloorError, match="bootstrap stderr"):
+        update_cmd._ensure_update_pip_floor(["python", "-m", "pip"])
+
+
+def test_update_pip_floor_helper_import_failure_is_friendly(monkeypatch):
+    """A broken lazy-deps import must remain an update floor failure."""
+    import builtins
+    from hermes_cli import _pip_security, update_cmd
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "tools.lazy_deps":
+            raise ImportError("lazy dependency helper unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    with pytest.raises(_pip_security.PipFloorError, match="floor helper import failed"):
+        update_cmd._ensure_update_pip_floor(["python", "-m", "pip"])
+
+
+def test_lazy_refresh_pip_upgrade_ignores_helper_import_failure(monkeypatch):
+    """Lazy-refresh upgrade is best effort and must never raise."""
+    import builtins
+    from hermes_cli import update_cmd
+
+    real_import = builtins.__import__
+
+    def blocked_import(name, *args, **kwargs):
+        if name == "tools.lazy_deps":
+            raise ImportError("lazy dependency helper unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_import)
+    update_cmd._upgrade_pip_before_lazy_refresh(["python", "-m", "pip"])
+
+
+def test_lazy_refresh_pip_upgrade_ignores_floor_failure(monkeypatch):
+    """Best-effort lazy-refresh pip upgrade must swallow floor failures too."""
+    from hermes_cli import update_cmd
+
+    def raise_floor(*_args, **_kwargs):
+        raise update_cmd._pip_security.PipFloorError("pip floor unavailable")
+
+    monkeypatch.setattr(update_cmd._m(), "_run_package_only_install", raise_floor)
+    update_cmd._upgrade_pip_before_lazy_refresh(["python", "-m", "pip"])
+
+
+def test_lazy_refresh_pip_upgrade_ignores_timeout(monkeypatch):
+    """Best-effort lazy-refresh pip upgrade must swallow timeouts too."""
+    from hermes_cli import update_cmd
+
+    def raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(["python", "-m", "pip"], 120)
+
+    monkeypatch.setattr(update_cmd._m(), "_run_package_only_install", raise_timeout)
+    update_cmd._upgrade_pip_before_lazy_refresh(["python", "-m", "pip"])
 
 
 class TestCmdUpdateBranchFallback:
@@ -659,6 +765,19 @@ class TestCmdUpdateBranchFlag:
         def side_effect(cmd, **kwargs):
             joined = " ".join(str(c) for c in cmd)
 
+            # Keep the shared pip-floor guard out of this branch-targeting
+            # test's git command assertions by modelling compliant pip output.
+            if "-m" in cmd and "pip" in cmd:
+                if "--version" in cmd:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        0,
+                        stdout="pip 26.1.2 from /venv/site-packages/pip\n",
+                        stderr="",
+                    )
+                if "install" in cmd and "--upgrade" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
             if "rev-parse" in joined and "--abbrev-ref" in joined:
                 return subprocess.CompletedProcess(cmd, 0, stdout=f"{current_branch}\n", stderr="")
 
@@ -873,6 +992,82 @@ class TestCmdUpdateZipBranchRefusal:
         assert "not supported" in out
         # No actual download attempted.
         assert "Downloading latest version" not in out
+
+
+def _patch_update_preamble(monkeypatch, tmp_path, *, git_checkout: bool):
+    """Keep floor-failure branch tests away from real update side effects."""
+    from hermes_cli import main as hm
+    from hermes_cli import update_cmd
+
+    monkeypatch.setattr(update_cmd.sys, "platform", "win32")
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(hm, "_is_windows", lambda: True)
+    if git_checkout:
+        (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+    monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(hm, "_resume_windows_gateways_after_update", lambda _token: None)
+    monkeypatch.setattr(hm, "_venv_scripts_dir", lambda: tmp_path)
+    monkeypatch.setattr(hm, "_detect_concurrent_hermes_instances", lambda _dir: [])
+    monkeypatch.setattr(hm, "_detect_venv_python_processes", lambda: [])
+    monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "https://github.com/NousResearch/hermes-agent.git")
+    monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *_args: None)
+    monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *_args: None)
+    if git_checkout:
+        monkeypatch.setattr(
+            update_cmd.subprocess,
+            "run",
+            lambda cmd, **_kwargs: subprocess.CompletedProcess(
+                cmd, 0, stdout="", stderr=""
+            ),
+        )
+    return hm, update_cmd
+
+
+def test_update_zip_floor_failure_is_friendly_and_fail_closed(monkeypatch, tmp_path, capsys):
+    """A ZIP update must not report success when security repair is blocked."""
+    hm, update_cmd = _patch_update_preamble(monkeypatch, tmp_path, git_checkout=False)
+    monkeypatch.setattr(
+        update_cmd,
+        "_update_via_zip",
+        lambda _args, **_kwargs: (_ for _ in ()).throw(
+            update_cmd._pip_security.PipFloorError("pip 26.1.2 could not be verified")
+        ),
+    )
+
+    args = SimpleNamespace(yes=True, force=True, force_venv=True)
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Update blocked" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert hm.PROJECT_ROOT == tmp_path
+
+
+def test_update_git_floor_failure_is_friendly_and_fail_closed(monkeypatch, tmp_path, capsys):
+    """A Git/update path must convert a floor failure to its normal error path."""
+    hm, update_cmd = _patch_update_preamble(monkeypatch, tmp_path, git_checkout=True)
+    monkeypatch.setattr(
+        hm,
+        "_resolve_update_branch",
+        lambda _args: (_ for _ in ()).throw(
+            update_cmd._pip_security.PipFloorError("pip upgrade refused")
+        ),
+    )
+
+    args = SimpleNamespace(yes=True, force=True, force_venv=True)
+    with pytest.raises(SystemExit) as exc_info:
+        update_cmd._cmd_update_impl(args, gateway_mode=False)
+
+    assert exc_info.value.code == 1
+    captured = capsys.readouterr()
+    assert "Update blocked" in captured.out
+    assert "Traceback" not in captured.out
+    assert "Traceback" not in captured.err
+    assert hm.PROJECT_ROOT == tmp_path
 
 
 def test_is_termux_env_true_for_termux_prefix():
@@ -1372,3 +1567,26 @@ class TestUpdateNodeDependencies:
         assert cwd_calls, "expected at least one npm call"
         for cwd in cwd_calls:
             assert cwd == tmp_path, f"npm must run from PROJECT_ROOT; got cwd={cwd}"
+
+
+def test_lazy_refresh_reports_failures_before_restart_required_return(
+    monkeypatch, capsys
+):
+    """A restart boundary must not hide another feature's failed refresh."""
+    import hermes_cli.update_cmd as update_cmd
+    import tools.lazy_deps as lazy_deps
+
+    monkeypatch.setattr(lazy_deps, "active_features", lambda: ["a", "b"])
+    monkeypatch.setattr(
+        lazy_deps,
+        "refresh_active_features",
+        lambda **_kwargs: {
+            "a": "restart-required: restart required before lazy repair: nacl",
+            "b": "failed: resolver failed",
+        },
+    )
+
+    assert update_cmd._refresh_active_lazy_features() is False
+    out = capsys.readouterr().out
+    assert "restart required" in out
+    assert "b failed to refresh: resolver failed" in out

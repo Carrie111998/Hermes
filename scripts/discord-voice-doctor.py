@@ -10,8 +10,9 @@ Usage:
 """
 
 import os
-import sys
+import re
 import shutil
+import sys
 from pathlib import Path
 
 # Resolve project root
@@ -28,6 +29,24 @@ WARN = "\033[93m!\033[0m"
 
 # Track whether discord.py is available for later sections
 _discord_available = False
+_PYNACL_SECURITY_FLOOR = (1, 6, 2)
+
+
+def _pynacl_meets_security_floor(version):
+    """Return whether *version* is a stable PyNaCl release at the fixed floor."""
+    if not isinstance(version, str):
+        return False
+    # Future stable releases may add or remove release components. Require at
+    # least two numeric components, while retaining the strict stable-only and
+    # optional post-release contract.
+    match = re.fullmatch(r"(\d+(?:\.\d+)+)(?:\.post\d+)?", version)
+    if not match:
+        return False
+    try:
+        release = tuple(int(part) for part in match.group(1).split("."))
+    except ValueError:
+        return False
+    return release >= _PYNACL_SECURITY_FLOOR
 
 
 def mask(value):
@@ -69,22 +88,30 @@ def check_packages():
         _discord_available = True
         check("discord.py", True, f"v{discord.__version__}")
     except ImportError:
-        check("discord.py", False, "pip install discord.py[voice]")
+        check(
+            "discord.py",
+            False,
+            "pip install discord.py==2.7.1 davey==0.1.4 PyNaCl==1.6.2",
+        )
         ok = False
 
     # PyNaCl
     try:
         import nacl
         ver = getattr(nacl, "__version__", "unknown")
-        try:
-            import nacl.secret
-            nacl.secret.Aead(bytes(32))
-            check("PyNaCl", True, f"v{ver}")
-        except (AttributeError, Exception):
-            check("PyNaCl (Aead)", False, f"v{ver} — need >=1.5.0")
+        if not _pynacl_meets_security_floor(ver):
+            check("PyNaCl", False, f"v{ver} — need >=1.6.2")
             ok = False
+        else:
+            try:
+                import nacl.secret
+                nacl.secret.Aead(bytes(32))
+                check("PyNaCl", True, f"v{ver}")
+            except Exception:
+                check("PyNaCl (Aead)", False, f"v{ver} — Aead unavailable")
+                ok = False
     except ImportError:
-        check("PyNaCl", False, "pip install PyNaCl>=1.5.0")
+        check("PyNaCl", False, "pip install PyNaCl==1.6.2")
         ok = False
 
     # davey (DAVE E2EE)

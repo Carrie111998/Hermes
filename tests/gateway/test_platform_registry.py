@@ -119,7 +119,8 @@ class TestEnsureDepsFn:
     so create_adapter() returned None before connect() could lazy-install —
     the SDK never installed.  The inverse wiring (active installer as
     check_fn) made status displays pip-install SDKs as a side effect.
-    create_adapter() now runs ensure_deps_fn when check_fn is False.
+    create_adapter() now runs ensure_deps_fn for configured adapters, while
+    status/config loading continues to use only the passive check_fn.
     """
 
     def _entry(self, name, *, check_fn, ensure_deps_fn=None):
@@ -134,8 +135,8 @@ class TestEnsureDepsFn:
         )
         return entry, adapter
 
-    def test_deps_present_skips_installer(self):
-        """check_fn True → adapter created, ensure_deps_fn never called."""
+    def test_deps_present_runs_active_verifier(self):
+        """Passive importability must not bypass exact active verification."""
         reg = PlatformRegistry()
         installer = MagicMock(return_value=True)
         entry, adapter = self._entry(
@@ -143,7 +144,24 @@ class TestEnsureDepsFn:
         )
         reg.register(entry)
         assert reg.create_adapter("ready", MagicMock()) is adapter
-        installer.assert_not_called()
+        installer.assert_called_once()
+
+    def test_importable_but_stale_metadata_runs_active_repair(self):
+        """An importable stub must not bypass a stale exact-pin repair."""
+        reg = PlatformRegistry()
+        state = {"stale": True}
+
+        def repair():
+            assert state["stale"] is True
+            state["stale"] = False
+            return True
+
+        entry, adapter = self._entry(
+            "stale", check_fn=lambda: True, ensure_deps_fn=repair
+        )
+        reg.register(entry)
+        assert reg.create_adapter("stale", MagicMock()) is adapter
+        assert state["stale"] is False
 
     def test_missing_deps_runs_installer_then_creates(self):
         """check_fn False + ensure_deps_fn True → install runs, adapter created."""

@@ -2,6 +2,7 @@
 
 import json
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -203,14 +204,62 @@ def _make_config(**extra):
 class TestTeamsRequirements:
 
 
+    def test_dotenv_suppression_restores_original_after_overlapping_checks(
+        self, monkeypatch
+    ):
+        """Overlapping threaded SDK imports must not leak the dotenv no-op."""
+        original_load_dotenv = lambda *args, **kwargs: "original"
+        fake_dotenv = types.ModuleType("dotenv")
+        fake_dotenv.load_dotenv = original_load_dotenv
+        monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+        first_ready = threading.Event()
+        second_entered = threading.Event()
+        first_finished = threading.Event()
+        errors = []
+
+        def first_worker():
+            try:
+                with _teams_mod._suppress_third_party_dotenv():
+                    first_ready.set()
+                    # If the second worker can enter concurrently, it saves
+                    # the first worker's temporary lambda as its original.
+                    second_entered.wait(timeout=2)
+                first_finished.set()
+            except BaseException as exc:  # pragma: no cover - assertion below
+                errors.append(exc)
+
+        def second_worker():
+            try:
+                with _teams_mod._suppress_third_party_dotenv():
+                    second_entered.set()
+                    first_finished.wait(timeout=2)
+            except BaseException as exc:  # pragma: no cover - assertion below
+                errors.append(exc)
+
+        first = threading.Thread(target=first_worker)
+        second = threading.Thread(target=second_worker)
+        first.start()
+        assert first_ready.wait(timeout=2)
+        second.start()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+        assert not first.is_alive()
+        assert not second.is_alive()
+        assert errors == []
+        assert fake_dotenv.load_dotenv is original_load_dotenv
+
+
     def test_returns_true_when_deps_available(self, monkeypatch):
         monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", True)
         monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
         assert check_requirements() is True
 
-    def test_check_teams_requirements_shortcircuits_when_present(self, monkeypatch):
-        # When SDK symbols are already bound and aiohttp is available, the
-        # active lazy-installer returns True immediately without re-importing.
+    def test_check_teams_requirements_rechecks_present_metadata(self, monkeypatch):
+        # Even when symbols are already bound, the active hook must re-run
+        # feature_missing/ensure so stale security pins are repaired or fail
+        # closed instead of being silently accepted.
         monkeypatch.setattr(_teams_mod, "App", object())
         monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
         called = {"ensure_and_bind": 0}
@@ -223,7 +272,7 @@ class TestTeamsRequirements:
             "tools.lazy_deps.ensure_and_bind", _fake_ensure_and_bind
         )
         assert check_teams_requirements() is True
-        assert called["ensure_and_bind"] == 0
+        assert called["ensure_and_bind"] == 1
 
     def test_check_teams_requirements_lazy_installs_when_missing(self, monkeypatch):
         # When deps are missing, the active installer delegates to
@@ -347,8 +396,44 @@ class TestTeamsInteractiveSetup:
 
 class TestTeamsConnect:
     @pytest.mark.anyio
+    async def test_connect_fails_closed_when_active_requirement_check_fails(
+        self, monkeypatch
+    ):
+        """Stale/restart-required SDK state must not construct a server."""
+        monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", True)
+        monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
+        monkeypatch.setattr(
+            _teams_mod, "check_teams_requirements", lambda **_kwargs: False
+        )
+        server_constructed = False
+
+        def _unexpected_application(*_args, **_kwargs):
+            nonlocal server_constructed
+            server_constructed = True
+            raise AssertionError("server must not be constructed")
+
+        monkeypatch.setattr(
+            _teams_mod.web,
+            "Application",
+            _unexpected_application,
+        )
+        adapter = TeamsAdapter(_make_config(
+            client_id="id", client_secret="secret", tenant_id="tenant",
+        ))
+
+        result = await adapter.connect()
+
+        assert result is False
+        assert server_constructed is False
+        assert adapter.fatal_error_code == "MISSING_SDK"
+
+    @pytest.mark.anyio
     async def test_connect_fails_without_sdk(self, monkeypatch):
         monkeypatch.setattr(_teams_mod, "TEAMS_SDK_AVAILABLE", False)
+        # Keep the transport dependency available so the active-hook cleanup
+        # exercised by this test does not leak a cleared AIOHTTP flag into
+        # later standalone-send cases.
+        monkeypatch.setattr(_teams_mod, "AIOHTTP_AVAILABLE", True)
         # Simulate the SDK being unavailable AND not installable (offline /
         # locked-down env): the lazy-installer can't rebind the globals, so
         # TEAMS_SDK_AVAILABLE stays False and connect() must fail.
@@ -747,5 +832,3 @@ class TestTeamsMediaAttachments:
         result = await adapter.send_document("19:abc@thread.v2", str(doc))
         assert result.success
         adapter._app.send.assert_awaited_once()
-
-

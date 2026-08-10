@@ -1104,12 +1104,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f7/a7/17208c3b3f92319e7fad259f1c6d5a5baf8fd0654c54846ced329f83c3eb/discord_py-2.7.1-py3-none-any.whl", hash = "sha256:849dca2c63b171146f3a7f3f8acc04248098e9e6203412ce3cf2745f284f7439", size = 1227550, upload-time = "2026-03-03T18:40:44.492Z" },
 ]
 
-[package.optional-dependencies]
-voice = [
-    { name = "davey" },
-    { name = "pynacl" },
-]
-
 [[package]]
 name = "distro"
 version = "1.9.0"
@@ -1579,6 +1573,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "fire" },
     { name = "httpx", extra = ["socks"] },
+    { name = "idna" },
     { name = "jinja2" },
     { name = "markdown" },
     { name = "nemo-relay", marker = "(platform_machine == 'aarch64' and 'android' not in platform_release and sys_platform == 'linux') or (platform_machine == 'x86_64' and 'android' not in platform_release and sys_platform == 'linux') or (platform_machine == 'arm64' and sys_platform == 'darwin') or (platform_machine == 'AMD64' and sys_platform == 'win32') or (platform_machine == 'ARM64' and sys_platform == 'win32')" },
@@ -1642,6 +1637,7 @@ computer-use = [
     { name = "starlette" },
 ]
 daytona = [
+    { name = "aiohttp" },
     { name = "daytona" },
 ]
 dev = [
@@ -1656,11 +1652,13 @@ dev = [
     { name = "ty" },
 ]
 dingtalk = [
+    { name = "aiohttp" },
     { name = "alibabacloud-dingtalk" },
     { name = "dingtalk-stream" },
     { name = "qrcode" },
 ]
 edge-tts = [
+    { name = "aiohttp" },
     { name = "edge-tts" },
 ]
 exa = [
@@ -1670,10 +1668,13 @@ fal = [
     { name = "fal-client" },
 ]
 feishu = [
+    { name = "aiohttp" },
     { name = "lark-oapi" },
     { name = "qrcode" },
+    { name = "websockets" },
 ]
 firecrawl = [
+    { name = "aiohttp" },
     { name = "firecrawl-py" },
 ]
 google = [
@@ -1685,6 +1686,7 @@ google = [
     { name = "pyasn1" },
 ]
 hindsight = [
+    { name = "aiohttp" },
     { name = "hindsight-client" },
 ]
 homeassistant = [
@@ -1711,7 +1713,9 @@ mem0 = [
 messaging = [
     { name = "aiohttp" },
     { name = "brotlicffi" },
-    { name = "discord-py", extra = ["voice"] },
+    { name = "davey" },
+    { name = "discord-py" },
+    { name = "pynacl" },
     { name = "python-telegram-bot", extra = ["webhooks"] },
     { name = "qrcode" },
     { name = "slack-bolt" },
@@ -1721,6 +1725,7 @@ mistral = [
     { name = "mistralai" },
 ]
 modal = [
+    { name = "aiohttp" },
     { name = "modal" },
 ]
 otlp = [
@@ -1802,6 +1807,7 @@ web = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 wecom = [
+    { name = "aiohttp" },
     { name = "defusedxml" },
 ]
 youtube = [
@@ -1812,12 +1818,20 @@ youtube = [
 requires-dist = [
     { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = "==0.9.0" },
     { name = "ai-edge-litert", marker = "sys_platform == 'darwin' and extra == 'wake'", specifier = "==2.1.6" },
+    { name = "aiohttp", marker = "extra == 'feishu'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'daytona'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'dingtalk'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'edge-tts'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'firecrawl'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'hindsight'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'homeassistant'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'matrix'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'messaging'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'modal'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'slack'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'sms'", specifier = "==3.14.3" },
     { name = "aiohttp", marker = "extra == 'teams'", specifier = "==3.14.3" },
+    { name = "aiohttp", marker = "extra == 'wecom'", specifier = "==3.14.3" },
     { name = "aiohttp-socks", marker = "extra == 'matrix'", specifier = "==0.11.0" },
     { name = "aiosqlite", marker = "extra == 'matrix'", specifier = "==0.22.1" },
     { name = "alibabacloud-dingtalk", marker = "extra == 'dingtalk'", specifier = "==2.2.42" },
@@ -1830,11 +1844,12 @@ requires-dist = [
     { name = "concurrent-log-handler", marker = "sys_platform == 'win32'", specifier = "==0.9.29" },
     { name = "croniter", specifier = "==6.0.0" },
     { name = "cryptography", specifier = "==50.0.0" },
+    { name = "davey", marker = "extra == 'messaging'", specifier = "==0.1.4" },
     { name = "daytona", marker = "extra == 'daytona'", specifier = "==0.155.0" },
     { name = "debugpy", marker = "extra == 'dev'", specifier = "==1.8.20" },
     { name = "defusedxml", marker = "extra == 'wecom'", specifier = "==0.7.1" },
     { name = "dingtalk-stream", marker = "extra == 'dingtalk'", specifier = "==0.24.3" },
-    { name = "discord-py", extras = ["voice"], marker = "extra == 'messaging'", specifier = "==2.7.1" },
+    { name = "discord-py", marker = "extra == 'messaging'", specifier = "==2.7.1" },
     { name = "edge-tts", marker = "extra == 'edge-tts'", specifier = "==7.2.7" },
     { name = "elevenlabs", marker = "extra == 'tts-premium'", specifier = "==1.59.0" },
     { name = "exa-py", marker = "extra == 'exa'", specifier = "==2.10.2" },
@@ -1875,6 +1890,7 @@ requires-dist = [
     { name = "httpx2", marker = "extra == 'computer-use'", specifier = "==2.7.0" },
     { name = "httpx2", marker = "extra == 'dev'", specifier = "==2.7.0" },
     { name = "httpx2", marker = "extra == 'mcp'", specifier = "==2.7.0" },
+    { name = "idna", specifier = "==3.18" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = "==1.6.8" },
     { name = "markdown", specifier = "==3.10.2" },
@@ -1905,6 +1921,7 @@ requires-dist = [
     { name = "pyasn1", marker = "extra == 'google'", specifier = "==0.6.4" },
     { name = "pydantic", specifier = "==2.13.4" },
     { name = "pyjwt", extras = ["crypto"], specifier = "==2.13.0" },
+    { name = "pynacl", marker = "extra == 'messaging'", specifier = "==1.6.2" },
     { name = "pytest", marker = "extra == 'dev'", specifier = "==9.1.1" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = "==1.3.0" },
     { name = "python-dotenv", specifier = "==1.2.2" },
@@ -1917,6 +1934,7 @@ requires-dist = [
     { name = "pyyaml", specifier = "==6.0.3" },
     { name = "qrcode", marker = "extra == 'dingtalk'", specifier = "==7.4.2" },
     { name = "qrcode", marker = "extra == 'feishu'", specifier = "==7.4.2" },
+    { name = "websockets", marker = "extra == 'feishu'", specifier = "==15.0.1" },
     { name = "qrcode", marker = "extra == 'messaging'", specifier = "==7.4.2" },
     { name = "requests", specifier = "==2.33.0" },
     { name = "rich", specifier = "==14.3.3" },

@@ -109,11 +109,17 @@ def test_install_psutil_android_script_uses_patched_tree(tmp_path, monkeypatch, 
         shutil.copyfile(archive, dest)
         return str(dest), None
 
-    def fake_subprocess_run(cmd: list[str]):
+    def fake_subprocess_run(cmd: list[str], **_kwargs):
+        if cmd[-1] == "--version":
+            return type(
+                "RunResult",
+                (),
+                {"returncode": 0, "stdout": "pip 26.1.2 from /venv/lib/python3.13/site-packages/pip", "stderr": ""},
+            )()
         src_root = Path(cmd[-1])
         patched = (src_root / "psutil" / "_common.py").read_text(encoding="utf-8")
         assert REPLACEMENT in patched
-        return type("RunResult", (), {"returncode": 0})()
+        return type("RunResult", (), {"returncode": 0, "stdout": "", "stderr": ""})()
 
     monkeypatch.setattr(installer.sys, "argv", ["install_psutil_android.py"])
     monkeypatch.setattr(installer, "_resolve_install_cmd", lambda *_args: ["python", "-m", "pip"])
@@ -124,3 +130,67 @@ def test_install_psutil_android_script_uses_patched_tree(tmp_path, monkeypatch, 
 
     captured = capsys.readouterr()
     assert "psutil installed via Android compatibility shim" in captured.out
+
+
+def test_install_psutil_android_direct_pip_requires_security_floor(monkeypatch, capsys):
+    """The standalone direct-pip fallback must fail closed below the floor."""
+    import scripts.install_psutil_android as installer
+
+    monkeypatch.setattr(installer.sys, "argv", ["install_psutil_android.py"])
+    monkeypatch.setattr(
+        installer,
+        "_resolve_install_cmd",
+        lambda *_args: ["python", "-m", "pip"],
+    )
+    monkeypatch.setattr(
+        installer._pip_security,
+        "ensure_pip_floor",
+        lambda *_args, **_kwargs: (False, "pip remains below pip>=26.1.2"),
+    )
+    monkeypatch.setattr(
+        installer.urllib.request,
+        "urlretrieve",
+        lambda *_args, **_kwargs: pytest.fail("download must not start below pip floor"),
+    )
+
+    assert installer.main() == 1
+    assert "pip security floor unavailable" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        (["python", "-m", "pip"], True),
+        (["pip"], True),
+        (["pip3"], True),
+        (["pip3.13"], True),
+        (["pip3.13.exe"], True),
+        (["/usr/local/bin/pip3.13"], True),
+        (["uv", "pip"], False),
+        (["pipx", "runpip"], False),
+    ],
+)
+def test_install_psutil_android_recognizes_versioned_pip_launchers(command, expected):
+    import scripts.install_psutil_android as installer
+
+    assert installer._is_direct_pip_command(command) is expected
+
+
+def test_install_psutil_android_preserves_pip_executable_paths_with_spaces():
+    import scripts.install_psutil_android as installer
+
+    command = installer._resolve_install_cmd(
+        "/srv/Hermes Agent/venv/bin/python -m pip",
+        prefer_uv=False,
+    )
+
+    assert command == ["/srv/Hermes Agent/venv/bin/python", "-m", "pip"]
+    assert installer._is_direct_pip_command(command) is True
+
+
+def test_install_psutil_android_detects_pip_marker_before_install_args():
+    import scripts.install_psutil_android as installer
+
+    assert installer._is_direct_pip_command(
+        ["python", "-E", "-m", "pip", "install"]
+    ) is True

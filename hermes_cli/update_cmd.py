@@ -37,6 +37,8 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli.config import get_hermes_home
+from hermes_cli import _pip_security
+from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_constants import venv_python_path
 
 logger = logging.getLogger(__name__)
@@ -1725,6 +1727,11 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
 
     pip_cmd = [_m().sys.executable, "-m", "pip"]
     if not uv_bin:
+        # Termux's uv bootstrap itself invokes pip.  Prove the floor before
+        # allowing that command to run so a successful bootstrap cannot bypass
+        # the security gate by taking the uv branch.
+        if _m()._is_termux_env():
+            _ensure_update_pip_floor(pip_cmd)
         uv_bin = _ensure_uv_for_termux(pip_cmd)
     if uv_bin:
         # Same third-party UV-env isolation as the main update path (#83914):
@@ -1749,19 +1756,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False) -> boo
         # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
         # Some environments lose pip inside the venv; bootstrap it back with
         # ensurepip before trying the editable install.
-        try:
-            subprocess.run(
-                pip_cmd + ["--version"],
-                cwd=_m().PROJECT_ROOT,
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError:
-            subprocess.run(
-                [_m().sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                cwd=_m().PROJECT_ROOT,
-                check=True,
-            )
+        _ensure_update_pip_floor(pip_cmd)
         _m()._install_python_dependencies_with_optional_fallback(pip_cmd)
 
     install_prefix = [uv_bin, "pip"] if uv_bin else pip_cmd
@@ -2590,11 +2585,19 @@ def _upgrade_pip_before_lazy_refresh(
     Never raises.
     """
     try:
+        from tools.lazy_deps import _MIN_PIP_SPEC
+
         _m()._run_package_only_install(
-            install_cmd_prefix + ["install", "--upgrade", "pip"],
+            install_cmd_prefix + ["install", "--upgrade", _MIN_PIP_SPEC],
             env=env,
         )
-    except subprocess.CalledProcessError as exc:
+    except (
+        ImportError,
+        OSError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        _pip_security.PipFloorError,
+    ) as exc:
         logger.debug("pip upgrade before lazy refresh failed: %s", exc)
 
 
@@ -2699,6 +2702,61 @@ def _restore_active_tool_dependencies(
         print(f"  ⚠ {name} failed to restore: {reason}")
 
 
+def _ensure_update_pip_floor(pip_cmd: list[str]) -> None:
+    """Fail closed before any update-managed direct-pip transaction."""
+    try:
+        from tools.lazy_deps import _ensure_pip_floor
+    except (ImportError, OSError) as exc:
+        raise _pip_security.PipFloorError(
+            f"pip security floor unavailable: floor helper import failed: {exc}"
+        ) from exc
+
+    try:
+        probe = subprocess.run(
+            pip_cmd + ["--version"],
+            cwd=_m().PROJECT_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _pip_security.PipFloorError(f"pip security floor unavailable: {exc}") from exc
+    if probe.returncode != 0:
+        try:
+            bootstrap = subprocess.run(
+                pip_cmd[:-2]
+                + ["-m", "ensurepip", "--upgrade", "--default-pip"],
+                cwd=_m().PROJECT_ROOT,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+                timeout=120,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise _pip_security.PipFloorError(
+                f"pip security floor unavailable: ensurepip failed: {exc}"
+            ) from exc
+        if bootstrap.returncode != 0:
+            detail = (bootstrap.stderr or bootstrap.stdout or "").strip()
+            raise _pip_security.PipFloorError(
+                "pip security floor unavailable: ensurepip failed: "
+                f"{detail or 'no output'}"
+            )
+
+    ok, detail = _ensure_pip_floor(pip_cmd)
+    if not ok:
+        raise _pip_security.PipFloorError(f"pip security floor unavailable: {detail}")
+
+
 def _refresh_active_lazy_features(
     install_cmd_prefix: list[str] | None = None,
     *,
@@ -2763,6 +2821,9 @@ def _refresh_active_lazy_features(
     current = [f for f, s in results.items() if s == "current"]
     failed = [(f, s) for f, s in results.items() if s.startswith("failed:")]
     skipped = [(f, s) for f, s in results.items() if s.startswith("skipped:")]
+    restart_required = [
+        (f, s) for f, s in results.items() if s.startswith("restart-required:")
+    ]
 
     if refreshed:
         print(f"  ↑ {len(refreshed)} refreshed: {', '.join(refreshed)}")
@@ -2775,15 +2836,27 @@ def _refresh_active_lazy_features(
         reason = skipped[0][1].split(": ", 1)[-1]
         print(f"  · {len(skipped)} skipped ({reason}): {names}")
 
-    if not failed and not unexpected_failure:
-        return True
+    if restart_required:
+        names = ", ".join(f for f, _ in restart_required)
+        reason = restart_required[0][1].split(": ", 1)[-1]
+        print(f"  ⚠ {len(restart_required)} restart required ({reason}): {names}")
 
+    # Report ordinary failed refreshes before returning for a restart boundary
+    # so one stale loaded module does not hide independent feature failures.
     for feature, status in failed:
         reason = status.split(": ", 1)[-1]
-        # Clip noisy pip stderr to keep update output legible.
         if len(reason) > 200:
             reason = reason[:200] + "..."
         print(f"  ⚠ {feature} failed to refresh: {reason}")
+
+    if not failed and not restart_required and not unexpected_failure:
+        return True
+
+    # A stale module already resident in this process cannot be safely
+    # reloaded after its distribution is replaced. Leave the incomplete
+    # marker in place and require a fresh Hermes process before retrying.
+    if restart_required:
+        return False
 
     if install_cmd_prefix is None:
         print("  ⚠ Lazy refresh failed; rerun `hermes update` once resolved.")
@@ -6060,6 +6133,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 args,
                 had_desktop_app_before_update=had_desktop_app_before_update,
             )
+        except _pip_security.PipFloorError as exc:
+            print(f"✗ Update blocked: {exc}")
+            _m().sys.exit(1)
         finally:
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
         if gateway_mode:
@@ -6753,6 +6829,10 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         pip_cmd = [sys.executable, "-m", "pip"]
         if not uv_bin:
+            # `_ensure_uv_for_termux` installs uv through this pip command;
+            # prove the floor before permitting that bootstrap.
+            if _m()._is_termux_env():
+                _ensure_update_pip_floor(pip_cmd)
             uv_bin = _ensure_uv_for_termux(pip_cmd)
         install_group = "all"
 
@@ -6781,20 +6861,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # avoiding PEP 668 'externally-managed-environment' errors on Debian/Ubuntu.
             # Some environments lose pip inside the venv; bootstrap it back with
             # ensurepip before trying the editable install.
-            pip_cmd = [sys.executable, "-m", "pip"]
-            try:
-                subprocess.run(
-                    pip_cmd + ["--version"],
-                    cwd=_m().PROJECT_ROOT,
-                    check=True,
-                    capture_output=True,
-                )
-            except subprocess.CalledProcessError:
-                subprocess.run(
-                    [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                    cwd=_m().PROJECT_ROOT,
-                    check=True,
-                )
+            _ensure_update_pip_floor(pip_cmd)
             if _m()._is_termux_env():
                 install_group = "termux-all"
                 print("  → Termux detected: using curated termux-all optional profile...")
@@ -8382,10 +8449,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print(f"⚠ {stage}: {e}")
             print("→ Falling back to ZIP download...")
             print()
-            desktop_build_ok = _update_via_zip(
-                args,
-                had_desktop_app_before_update=had_desktop_app_before_update,
-            )
+            try:
+                desktop_build_ok = _update_via_zip(
+                    args,
+                    had_desktop_app_before_update=had_desktop_app_before_update,
+                )
+            except _pip_security.PipFloorError as floor_exc:
+                print(f"✗ Update blocked: {floor_exc}")
+                _m().sys.exit(1)
             if gateway_mode:
                 _write_gateway_update_exit_code(desktop_build_ok)
         else:
@@ -8410,6 +8481,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             except Exception:
                 pass
             sys.exit(1)
+    except _pip_security.PipFloorError as e:
+        # A security-floor failure is an update dependency failure, not a git
+        # failure. Keep it on the normal friendly error path and never turn it
+        # into a traceback or an unsafe Windows ZIP fallback.
+        print(f"✗ Update blocked: {e}")
+        sys.exit(1)
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 

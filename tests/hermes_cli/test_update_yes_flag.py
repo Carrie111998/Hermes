@@ -23,6 +23,13 @@ def _make_run_side_effect(
     def side_effect(cmd, **kwargs):
         joined = " ".join(str(c) for c in cmd)
 
+        if cmd and cmd[-1] == "--version" and "pip" in cmd:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="pip 26.1.2 from /venv/site-packages/pip (python 3.13)",
+                stderr="",
+            )
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return subprocess.CompletedProcess(cmd, 0, stdout=f"{branch}\n", stderr="")
         if "rev-parse" in joined and "--verify" in joined:

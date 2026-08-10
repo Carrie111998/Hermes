@@ -27,3 +27,18 @@ class TestTelegramUnconfiguredNonRetryable:
         assert adapter.fatal_error_retryable is False
         assert adapter.fatal_error_code == "missing_dependency"
 
+
+def test_active_telegram_check_revalidates_exact_lazy_contract(monkeypatch):
+    """Importability must not bypass the exact active Telegram contract."""
+    ensure_calls = []
+    stale_alias = object()
+    monkeypatch.setattr(telegram_mod, "TELEGRAM_AVAILABLE", True)
+    monkeypatch.setattr(telegram_mod, "Update", stale_alias)
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure",
+        lambda feature, **kwargs: ensure_calls.append((feature, kwargs)),
+    )
+
+    assert telegram_mod.check_telegram_requirements() is True
+    assert ensure_calls == [("platform.telegram", {"prompt": False})]
+    assert telegram_mod.Update is not stale_alias

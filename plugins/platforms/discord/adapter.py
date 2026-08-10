@@ -487,36 +487,90 @@ def discord_deps_present() -> bool:
     (``check_discord_requirements``) is registered as ``ensure_deps_fn``
     and runs from ``create_adapter()`` when this returns False (#79812).
     """
-    return DISCORD_AVAILABLE
+    return DISCORD_AVAILABLE and not _DISCORD_ACTIVE_CHECK_FAILED
+
+
+_DISCORD_ACTIVE_CHECK_FAILED = False
+_DISCORD_ACTIVE_CHECK_LOCK = threading.Lock()
+
+_DISCORD_VIEW_CLASS_NAMES = (
+    "ExecApprovalView",
+    "SlashConfirmView",
+    "UpdatePromptView",
+    "ModelPickerView",
+    "ClarifyChoiceView",
+    "ChoicePickerView",
+)
+
+
+def _clear_discord_bindings() -> None:
+    """Record failed verification without tearing down live bindings."""
+    global _DISCORD_ACTIVE_CHECK_FAILED
+    _DISCORD_ACTIVE_CHECK_FAILED = True
 
 
 def check_discord_requirements() -> bool:
+    # SDK bindings and view classes are process-global while checks can run
+    # concurrently for multiplexed profiles.  Serialize the complete
+    # ensure/import/commit-or-rollback transaction so a failed candidate
+    # cannot restore over a concurrent successful binding.
+    with _DISCORD_ACTIVE_CHECK_LOCK:
+        return _check_discord_requirements()
+
+
+def _check_discord_requirements() -> bool:
     """Check if Discord dependencies are available.
 
-    Lazy-installs discord.py via ``tools.lazy_deps.ensure("platform.discord")``
-    on first call if not present. After successful install, re-binds module
-    globals so ``DISCORD_AVAILABLE`` becomes True.
+    Runs the feature contract on every active check so stale security pins are
+    repaired or fail closed even when discord.py is already importable. After
+    success, re-binds module globals so ``DISCORD_AVAILABLE`` is current.
     """
     global DISCORD_AVAILABLE, discord, DiscordMessage, Intents, commands
-    if DISCORD_AVAILABLE:
-        return True
+    global _DISCORD_ACTIVE_CHECK_FAILED
+    previous_bindings = {
+        name: globals().get(name)
+        for name in ("DISCORD_AVAILABLE", "discord", "DiscordMessage", "Intents", "commands")
+    }
+    _missing = object()
+    previous_view_classes = {
+        name: globals().get(name, _missing)
+        for name in _DISCORD_VIEW_CLASS_NAMES
+    }
+
+    def _restore_bindings() -> None:
+        global DISCORD_AVAILABLE, discord, DiscordMessage, Intents, commands
+        DISCORD_AVAILABLE = previous_bindings["DISCORD_AVAILABLE"]
+        discord = previous_bindings["discord"]
+        DiscordMessage = previous_bindings["DiscordMessage"]
+        Intents = previous_bindings["Intents"]
+        commands = previous_bindings["commands"]
+        for name, previous in previous_view_classes.items():
+            if previous is _missing:
+                globals().pop(name, None)
+            else:
+                globals()[name] = previous
+
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("platform.discord", prompt=False)
     except Exception:
+        _clear_discord_bindings()
         return False
     try:
         import discord as _discord
         from discord import Message as _DM, Intents as _Intents
         from discord.ext import commands as _commands
-    except ImportError:
+        discord = _discord
+        DiscordMessage = _DM
+        Intents = _Intents
+        commands = _commands
+        _define_discord_view_classes()
+    except Exception:
+        _restore_bindings()
+        _clear_discord_bindings()
         return False
-    discord = _discord
-    DiscordMessage = _DM
-    Intents = _Intents
-    commands = _commands
     DISCORD_AVAILABLE = True
-    _define_discord_view_classes()
+    _DISCORD_ACTIVE_CHECK_FAILED = False
     return True
 
 

@@ -377,6 +377,10 @@ $script:ResolvedPathReport = @{
 $RepoUrlSsh = "git@github.com:NousResearch/hermes-agent.git"
 $RepoUrlHttps = "https://github.com/NousResearch/hermes-agent.git"
 $PythonVersion = "3.11"
+# Minimum pip for every venv-managed fallback install.  `ensurepip` only
+# guarantees presence and may bundle an older, vulnerable pip.
+$MinimumPipVersion = "26.1.2"
+$MinimumPipSpec = "pip>=$MinimumPipVersion"
 # Minor versions the installer accepts when the requested $PythonVersion isn't
 # available, in preference order.  uv discovers both uv-managed and system
 # interpreters, so this list also matches a pre-existing system Python.  Single
@@ -1081,6 +1085,165 @@ function Resolve-UvCmd {
     }
 
     throw "uv is not installed. Run install.ps1 -Stage uv first."
+}
+
+function Get-VenvPipVersion {
+    param([string]$PythonExe)
+
+    $output = & $PythonExe -m pip --version 2>&1
+    if ($LASTEXITCODE -ne 0) { return $null }
+    $canonicalVersions = @()
+    foreach ($rawLine in @($output)) {
+        $line = [string]$rawLine
+        # Warnings may mention another pip version; only trust one canonical
+        # ``pip <version> from <path>`` record emitted by ``pip --version``.
+        if ($line -notmatch '^\s*pip\s+([^\s]+)\s+from\s+(?:/|[A-Za-z]:[\\/]|\\\\)[^\r\n"]*[\\/]pip(?:\s+\(python\s+\d+(?:\.\d+){1,3}\))?\s*$') { continue }
+        $token = $Matches[1]
+        if ($token -notmatch '^(?<release>\d+(?:\.\d+){1,3})(?<suffix>.*)$') { return $null }
+        $release = $Matches['release']
+        $suffix = $Matches['suffix']
+        # A numeric prefix is not proof of the final release: reject dev,
+        # alpha, beta, rc, local, and unknown suffixes. Post releases remain
+        # stable and are valid when they are at or above the floor.
+        if ($suffix -and $suffix -notmatch '^\.post\d+$') { return $null }
+        try { $canonicalVersions += [version]$release } catch { return $null }
+    }
+    if ($canonicalVersions.Count -ne 1) { return $null }
+    return $canonicalVersions[0]
+}
+
+function Ensure-VenvPipFloor {
+    param([string]$PythonExe)
+
+    $minimum = [version]$MinimumPipVersion
+    $current = Get-VenvPipVersion $PythonExe
+    if ($current -and $current -ge $minimum) { return $true }
+
+    Write-Info "Ensuring venv pip >= $MinimumPipVersion ..."
+    & $PythonExe -m pip install --upgrade $MinimumPipSpec 2>&1 | ForEach-Object {
+        Write-Host "    $_"
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "Could not upgrade pip to >= $MinimumPipVersion. Refusing venv package installation."
+        return $false
+    }
+
+    $current = Get-VenvPipVersion $PythonExe
+    if (-not $current -or $current -lt $minimum) {
+        Write-Warn "pip floor verification failed: venv has $($current -as [string]); need >= $MinimumPipVersion."
+        return $false
+    }
+    Write-Success "Venv pip floor verified ($current)"
+    return $true
+}
+
+function Test-VenvPackageExactVersion {
+    param(
+        [string]$PythonExe,
+        [string]$Spec
+    )
+
+    if ($Spec -notmatch '^([A-Za-z0-9_.-]+)==([0-9]+(?:\.[0-9]+){1,3})$') {
+        throw "Unsupported security package spec syntax: $Spec"
+    }
+    $package = $Matches[1]
+    $wanted = $Matches[2]
+    $probe = "from importlib.metadata import version; raise SystemExit(0 if version('$package') == '$wanted' else 1)"
+    & $PythonExe -c $probe 2>&1 | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+function Test-VenvPackageSpecSatisfied {
+    param(
+        [string]$PythonExe,
+        [string]$Spec
+    )
+
+    if ($Spec -notmatch '^([A-Za-z0-9_.-]+)(?:\[[A-Za-z0-9_,.-]+\])?((?:===|==|!=|>=|<=|~=|>|<).+)$') {
+        throw "Unsupported package spec syntax: $Spec"
+    }
+    $package = $Matches[1]
+    $specifier = $Matches[2]
+    $probe = @"
+from importlib.metadata import version
+try:
+    from packaging.specifiers import SpecifierSet
+    from packaging.version import Version
+except Exception:
+    raise SystemExit(3)
+try:
+    installed = Version(version('$package'))
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0 if installed in SpecifierSet('$specifier') else 1)
+"@
+    & $PythonExe -c $probe 2>&1 | Out-Null
+    $probeExit = $LASTEXITCODE
+    if ($probeExit -eq 3) {
+        throw "Cannot verify '$Spec': the venv has no usable 'packaging' module"
+    }
+    return $probeExit -eq 0
+}
+
+function Test-VenvRuntimeImports {
+    param(
+        [string]$PythonExe,
+        [object[]]$Sdks
+    )
+
+    $failures = @()
+    $prevEAP = $ErrorActionPreference
+    $ErrorActionPreference = "SilentlyContinue"
+    try {
+        foreach ($sdk in $Sdks) {
+            $runtimeImports = @($sdk.Import)
+            $securitySpecs = @($sdk.SecuritySpecs | Where-Object { $_ })
+            $securityNames = @(
+                $securitySpecs | ForEach-Object {
+                    ($_ -replace '\s*(?:===|==|!=|>=|<=|~=|>|<).*$','').Trim()
+                }
+            )
+            $extraNames = @(
+                @($sdk.ExtraSpecs | Where-Object { $_ }) | ForEach-Object {
+                    ($_ -replace '\s*(?:===|==|!=|>=|<=|~=|>|<).*$','').Trim()
+                }
+            )
+            if ($securityNames -contains "aiohttp") {
+                # aiohttp's runtime import path exercises the closure, while
+                # these direct imports catch a partial --no-deps repair that
+                # leaves its metadata present but drops native/runtime deps.
+                $runtimeImports += @(
+                    "aiohttp",
+                    "aiohappyeyeballs",
+                    "aiosignal",
+                    "attrs",
+                    "frozenlist",
+                    "multidict",
+                    "propcache",
+                    "yarl"
+                )
+            }
+            if ($securityNames -contains "PyNaCl") {
+                $runtimeImports += @("nacl", "cffi")
+            }
+            if ($extraNames -contains "davey") {
+                $runtimeImports += "davey"
+            }
+            if ($extraNames -contains "brotlicffi") {
+                $runtimeImports += "brotlicffi"
+            }
+            foreach ($runtimeImport in @($runtimeImports | Where-Object { $_ } | Select-Object -Unique)) {
+                & $PythonExe -c "import $runtimeImport" 2>&1 | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Warn "  Runtime import failed: $runtimeImport (needed for $($sdk.Var))"
+                    $failures += "$($sdk.Var):$runtimeImport"
+                }
+            }
+        }
+    } finally {
+        $ErrorActionPreference = $prevEAP
+    }
+    return @($failures)
 }
 
 function Resolve-AvailablePythonVersion {
@@ -3172,6 +3335,28 @@ function Write-BootstrapMarker {
     Write-Success "Bootstrap marker written: $markerPath"
 }
 
+function Remove-BootstrapMarker {
+    <#
+    A marker written before the platform-SDK stage is only valid if that
+    required stage also succeeds.  Invalidate it on any SDK-stage failure so
+    the desktop cannot skip its bootstrap recovery loop after a partial
+    install.
+    #>
+    $markerPath = Join-Path $InstallDir ".hermes-bootstrap-complete"
+    if (-not (Test-Path $markerPath)) {
+        return
+    }
+    try {
+        Remove-Item -LiteralPath $markerPath -Force -ErrorAction Stop
+    } catch {
+        throw "Could not invalidate bootstrap marker after platform-SDK failure: $_"
+    }
+    if (Test-Path $markerPath) {
+        throw "Bootstrap marker still exists after platform-SDK failure: $markerPath"
+    }
+    Write-Warn "Invalidated bootstrap marker after platform-SDK failure: $markerPath"
+}
+
 function Copy-ConfigTemplates {
     Write-Info "Setting up configuration files..."
     
@@ -4252,12 +4437,15 @@ function Install-PlatformSdks {
     $envLines = Get-Content $envPath -ErrorAction SilentlyContinue
 
     # Map: env var set in .env -> (import name, pip spec matching [messaging] extra).
-    # Specs mirror pyproject.toml to avoid version drift.
+    # Specs mirror pyproject.toml to avoid version drift. cffi is an
+    # intentional recovery-only direct closure pin for PyNaCl: it is
+    # transitive in the published messaging extra but must be explicit here
+    # because PyNaCl is repaired with --no-deps below.
     $sdkMap = @(
         @{ Var = "TELEGRAM_BOT_TOKEN"; Import = "telegram";  Spec = "python-telegram-bot[webhooks]>=22.6,<23" },
-        @{ Var = "DISCORD_BOT_TOKEN";  Import = "discord";   Spec = "discord.py[voice]>=2.7.1,<3" },
-        @{ Var = "SLACK_BOT_TOKEN";    Import = "slack_sdk"; Spec = "slack-sdk>=3.27.0,<4" },
-        @{ Var = "SLACK_APP_TOKEN";    Import = "slack_bolt";Spec = "slack-bolt>=1.18.0,<2" },
+        @{ Var = "DISCORD_BOT_TOKEN";  Import = "discord";   Spec = "discord.py==2.7.1"; ExtraSpecs = @("davey==0.1.4", "brotlicffi==1.2.0.1", "cffi==2.0.0"); SecuritySpecs = @("PyNaCl==1.6.2", "aiohttp==3.14.3") },
+        @{ Var = "SLACK_BOT_TOKEN";    Import = "slack_sdk"; Spec = "slack-sdk==3.43.0"; SecuritySpecs = @("aiohttp==3.14.3") },
+        @{ Var = "SLACK_APP_TOKEN";    Import = "slack_bolt";Spec = "slack-bolt==1.29.0"; SecuritySpecs = @("aiohttp==3.14.3") },
         @{ Var = "WHATSAPP_ENABLED";   Import = "qrcode";    Spec = "qrcode>=7.0,<8" }
     )
 
@@ -4285,19 +4473,64 @@ function Install-PlatformSdks {
     $ErrorActionPreference = "SilentlyContinue"
     try {
         $missing = @()
+        $missingRegularSpecs = @()
+        $allRegularSpecs = @()
+        $missingSecuritySpecs = @()
+        $allSecuritySpecs = @()
         foreach ($sdk in $needed) {
+            if ($allRegularSpecs -notcontains $sdk.Spec) {
+                $allRegularSpecs += $sdk.Spec
+            }
             & $pythonExe -c "import $($sdk.Import)" 2>&1 | Out-Null
-            if ($LASTEXITCODE -ne 0) {
+            $mainImportFailed = $LASTEXITCODE -ne 0
+            if ($mainImportFailed -or -not (Test-VenvPackageSpecSatisfied $pythonExe $sdk.Spec)) {
                 $missing += $sdk
-                Write-Warn "  $($sdk.Import) NOT importable (needed for $($sdk.Var))"
+                if ($missingRegularSpecs -notcontains $sdk.Spec) {
+                    $missingRegularSpecs += $sdk.Spec
+                }
+                if ($mainImportFailed) {
+                    Write-Warn "  $($sdk.Import) NOT importable (needed for $($sdk.Var))"
+                } else {
+                    Write-Warn "  $($sdk.Spec) NOT satisfied (needed for $($sdk.Var))"
+                }
             } else {
                 Write-Success "  $($sdk.Import) OK"
+            }
+            foreach ($extraSpec in @($sdk.ExtraSpecs | Where-Object { $_ })) {
+                if ($allRegularSpecs -notcontains $extraSpec) {
+                    $allRegularSpecs += $extraSpec
+                }
+                if (-not (Test-VenvPackageExactVersion $pythonExe $extraSpec)) {
+                    if ($missingRegularSpecs -notcontains $extraSpec) {
+                        $missingRegularSpecs += $extraSpec
+                    }
+                    Write-Warn "  $extraSpec NOT satisfied (needed for $($sdk.Var))"
+                }
+            }
+            foreach ($securitySpec in @($sdk.SecuritySpecs | Where-Object { $_ })) {
+                if ($allSecuritySpecs -notcontains $securitySpec) {
+                    $allSecuritySpecs += $securitySpec
+                }
+                if (-not (Test-VenvPackageExactVersion $pythonExe $securitySpec)) {
+                    if ($missingSecuritySpecs -notcontains $securitySpec) {
+                        $missingSecuritySpecs += $securitySpec
+                    }
+                    Write-Warn "  $securitySpec NOT satisfied (needed for $($sdk.Var))"
+                }
             }
         }
     } finally {
         $ErrorActionPreference = $prevEAP
     }
-    if ($missing.Count -eq 0) { return }
+    $runtimeImportFailures = @(Test-VenvRuntimeImports -PythonExe $pythonExe -Sdks $needed)
+    if ($missingRegularSpecs.Count -eq 0 -and $missingSecuritySpecs.Count -eq 0) {
+        if ($runtimeImportFailures.Count -gt 0) {
+            throw "Platform-SDK runtime verification failed for: $($runtimeImportFailures -join ', ')"
+        }
+        return
+    }
+
+    $manualSpec = if ($missingRegularSpecs.Count -gt 0) { $missingRegularSpecs[0] } else { $missingSecuritySpecs[0] }
 
     # Bootstrap pip into the venv if it isn't there.  `uv` creates venvs
     # without pip; ensurepip is the stdlib-blessed way to add it.
@@ -4310,19 +4543,81 @@ function Install-PlatformSdks {
             & $pythonExe -m ensurepip --upgrade 2>&1 | Out-Null
             if ($LASTEXITCODE -ne 0) {
                 Write-Warn "ensurepip failed -- can't auto-install missing SDKs."
-                Write-Info "Manual recovery: $UvCmd pip install `"$($missing[0].Spec)`""
-                return
+                Write-Info "Manual recovery: `"$pythonExe`" -m ensurepip --upgrade; `"$pythonExe`" -m pip install `"$manualSpec`""
+                throw "Platform-SDK security repair blocked: ensurepip failed"
             }
         }
 
-        foreach ($sdk in $missing) {
-            Write-Info "  Installing $($sdk.Spec) ..."
-            & $pythonExe -m pip install $sdk.Spec 2>&1 | ForEach-Object { Write-Host "    $_" }
+        if (-not (Ensure-VenvPipFloor $pythonExe)) {
+            Write-Warn "Refusing to install platform SDKs with a pip below the security floor."
+            Write-Info "Manual recovery: install pip >= $MinimumPipVersion, then rerun the installer."
+            throw "Platform-SDK security repair blocked: pip floor unavailable"
+        }
+
+        $regularInstallFailures = @()
+        foreach ($regularSpec in $missingRegularSpecs) {
+            Write-Info "  Installing $regularSpec ..."
+            & $pythonExe -m pip install $regularSpec 2>&1 | ForEach-Object { Write-Host "    $_" }
             if ($LASTEXITCODE -eq 0) {
-                Write-Success "  Installed $($sdk.Import)"
+                Write-Success "  Installed $regularSpec"
             } else {
-                Write-Warn "  Failed to install $($sdk.Spec). Recover manually: $pythonExe -m pip install `"$($sdk.Spec)`""
+                Write-Warn "  Failed to install $regularSpec. Recover manually: $pythonExe -m pip install `"$regularSpec`""
+                $regularInstallFailures += $regularSpec
             }
+        }
+        $remainingRegularSpecs = @(
+            $allRegularSpecs | Where-Object {
+                -not (Test-VenvPackageSpecSatisfied $pythonExe $_)
+            }
+        )
+        if ($regularInstallFailures.Count -gt 0 -or $remainingRegularSpecs.Count -gt 0) {
+            $failedRegularSpecs = @(
+                $regularInstallFailures + $remainingRegularSpecs | Select-Object -Unique
+            )
+            throw "Platform-SDK regular dependency repair failed for: $($failedRegularSpecs -join ', ')"
+        }
+        # Installing a Discord SDK can downgrade an initially-correct
+        # PyNaCl to its stale <1.6 dependency. Re-check every security spec
+        # after the regular SDK transaction, not only specs that were missing
+        # before it, and repair any downgrade before reporting success.
+        $securitySpecsToRepair = @(
+            $allSecuritySpecs | Where-Object {
+                -not (Test-VenvPackageExactVersion $pythonExe $_)
+            }
+        )
+        $securityInstallFailures = @()
+        foreach ($securitySpec in $securitySpecsToRepair) {
+            Write-Info "  Installing $securitySpec ..."
+            $securityInstallArgs = @()
+            $securityPackageName = (
+                $securitySpec -replace '\s*(?:===|==|!=|>=|<=|~=|>|<).*$', ''
+            ).Trim()
+            if ($securityPackageName -ieq "PyNaCl") {
+                # Only PyNaCl uses --no-deps: discord.py's stale voice
+                # metadata would otherwise reintroduce PyNaCl<1.6.  aiohttp
+                # must resolve its runtime closure (multidict, yarl, etc.).
+                $securityInstallArgs = @("--no-deps")
+            }
+            & $pythonExe -m pip install @securityInstallArgs $securitySpec 2>&1 | ForEach-Object { Write-Host "    $_" }
+            if ($LASTEXITCODE -eq 0) {
+                Write-Success "  Installed security floor $securitySpec"
+            } else {
+                Write-Warn "  Failed to install $securitySpec. Recover manually: $pythonExe -m pip install `"$securitySpec`""
+                $securityInstallFailures += $securitySpec
+            }
+        }
+        $remainingSecuritySpecs = @(
+            $allSecuritySpecs | Where-Object {
+                -not (Test-VenvPackageExactVersion $pythonExe $_)
+            }
+        )
+        if ($securityInstallFailures.Count -gt 0 -or $remainingSecuritySpecs.Count -gt 0) {
+            $failedSpecs = @($securityInstallFailures + $remainingSecuritySpecs | Select-Object -Unique)
+            throw "Platform-SDK security repair failed for: $($failedSpecs -join ', ')"
+        }
+        $runtimeImportFailures = @(Test-VenvRuntimeImports -PythonExe $pythonExe -Sdks $needed)
+        if ($runtimeImportFailures.Count -gt 0) {
+            throw "Platform-SDK runtime verification failed for: $($runtimeImportFailures -join ', ')"
         }
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -4588,6 +4883,8 @@ $InstallStages += @(
     @{ Name = "path";             Title = "Adding Hermes to PATH";                Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-Path" }
     @{ Name = "config-templates"; Title = "Writing configuration templates";      Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-ConfigTemplates" }
     @{ Name = "platform-sdks";    Title = "Installing messaging platform SDKs";   Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-PlatformSdks" }
+    # Only mark the installation complete after platform SDK verification;
+    # otherwise an interrupted SDK stage can leave a false-complete marker.
     @{ Name = "bootstrap-marker"; Title = "Marking install complete";              Category = "finalize";     NeedsUserInput = $false; Worker = "Stage-BootstrapMarker" }
     # Interactive stages.  In non-interactive mode these become no-ops; the
     # caller (GUI / CI) handles the equivalent UX themselves.
@@ -4633,7 +4930,21 @@ function Stage-NodeDeps         { Install-NodeDeps }
 function Stage-Desktop          { Install-DesktopVoiceDeps; Install-Desktop }
 function Stage-Path             { Set-PathVariable }
 function Stage-ConfigTemplates  { Copy-ConfigTemplates }
-function Stage-PlatformSdks     { Resolve-UvCmd; Install-PlatformSdks }
+function Stage-PlatformSdks     {
+    try {
+        Resolve-UvCmd
+        Install-PlatformSdks
+    } catch {
+        $failure = $_
+        try {
+            Remove-BootstrapMarker
+        } catch {
+            $markerFailure = $_
+            throw ("Platform SDK stage failed: {0}; bootstrap marker invalidation also failed: {1}" -f $failure.Exception.Message, $markerFailure.Exception.Message)
+        }
+        throw $failure
+    }
+}
 function Stage-BootstrapMarker  { Write-BootstrapMarker }
 function Stage-Configure        { Invoke-SetupWizard }
 function Stage-Gateway          { Start-GatewayIfConfigured }

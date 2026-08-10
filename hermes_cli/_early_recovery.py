@@ -31,6 +31,9 @@ import sys
 import time
 from pathlib import Path
 
+from hermes_cli import _pip_security
+from hermes_cli._subprocess_compat import windows_hide_flags
+
 # Core packages a failed lazy ``uv pip install`` is known to leave with intact
 # distribution metadata but wiped import files (#57828).  ``module`` is what we
 # probe via a real import; ``attr`` guards against an empty/stub module.
@@ -337,7 +340,7 @@ def _base_interpreter_is_externally_managed() -> bool:
 
 
 def _run_repair_install(specs: list[str], project_root: Path) -> bool:
-    """``uv pip`` (or stdlib ``pip``) force-reinstall of the given specs.
+    """``uv pip`` or floor-verified stdlib ``pip`` repair of the specs.
 
     Streams nothing to stdout (``hermes acp`` speaks JSON-RPC on stdout);
     output is captured and replayed to stderr only on failure.  Never raises.
@@ -383,24 +386,39 @@ def _run_repair_install(specs: list[str], project_root: Path) -> bool:
             file=sys.stderr,
         )
 
+    pip_cmd = [sys.executable, "-m", "pip"]
     try:
         subprocess.run(
             [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
             cwd=project_root,
             capture_output=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
     except Exception:
         pass
-    pip_cmd = [sys.executable, "-m", "pip", "install", "--force-reinstall"]
+    pip_ok, pip_error = _pip_security.ensure_pip_floor(
+        pip_cmd,
+        runner=subprocess.run,
+        cwd=str(project_root),
+        creationflags=windows_hide_flags(),
+    )
+    if not pip_ok:
+        print(f"  ✗ Early venv repair refused: {pip_error}", file=sys.stderr)
+        return False
+    install_cmd = [*pip_cmd, "install", "--force-reinstall"]
     if externally_managed:
-        pip_cmd.append("--break-system-packages")
-    pip_cmd.extend(specs)
+        install_cmd.append("--break-system-packages")
     try:
         result = subprocess.run(
-            pip_cmd,
+            [*install_cmd, *specs],
             cwd=project_root,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
+            timeout=600,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
         )
     except Exception as exc:
         print(f"  ✗ Early venv repair could not run pip: {exc}", file=sys.stderr)

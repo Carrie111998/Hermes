@@ -15,24 +15,33 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, ClassVar, Dict, Optional, Any, Tuple, List
 
-import aiohttp
-
+# Keep this module importable when the optional Slack extra is absent.  The
+# caller's lazy dependency path can then install aiohttp before retrying the
+# import; importing it unconditionally here would fail before that recovery
+# path is reachable.
+aiohttp: Any = None
 try:
+    import aiohttp as _aiohttp
     from slack_bolt.async_app import AsyncApp
     from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
     from slack_sdk.web.async_client import AsyncWebClient
 
+    aiohttp = _aiohttp
     SLACK_AVAILABLE = True
 except ImportError:
     SLACK_AVAILABLE = False
     AsyncApp = Any
     AsyncSocketModeHandler = Any
     AsyncWebClient = Any
+
+_SLACK_ACTIVE_CHECK_FAILED = False
+_SLACK_ACTIVE_CHECK_LOCK = threading.Lock()
 
 import sys
 from pathlib import Path as _Path
@@ -307,7 +316,16 @@ def slack_deps_present() -> bool:
     (``check_slack_requirements``) is registered as ``ensure_deps_fn``
     and runs from ``create_adapter()`` when this returns False (#79812).
     """
-    return SLACK_AVAILABLE
+    # PlatformRegistry.create_adapter() always invokes the registered active
+    # ensure_deps_fn after this passive result, even when it is True.  Keep
+    # this probe side-effect free for status/configuration callers.
+    return SLACK_AVAILABLE and not _SLACK_ACTIVE_CHECK_FAILED
+
+
+def _clear_slack_bindings() -> None:
+    """Record failed verification without tearing down live bindings."""
+    global _SLACK_ACTIVE_CHECK_FAILED
+    _SLACK_ACTIVE_CHECK_FAILED = True
 
 
 @dataclass
@@ -323,13 +341,20 @@ class _NativeTaskCardStream:
 
 
 def check_slack_requirements() -> bool:
+    # SDK globals and the availability latch are process-global.  Keep the
+    # lazy-repair transaction atomic across multiplexed profile checks.
+    with _SLACK_ACTIVE_CHECK_LOCK:
+        return _check_slack_requirements()
+
+
+def _check_slack_requirements() -> bool:
     """Check if Slack dependencies are available.
 
-    Lazy-installs slack-bolt/slack-sdk via ``tools.lazy_deps.ensure("platform.slack")``
-    on first call if not present. Rebinds all module-level globals on success.
+    Runs the feature contract on every active check so stale security pins are
+    repaired or fail closed even when Slack is already importable. Rebinds all
+    module-level globals on success.
     """
-    if SLACK_AVAILABLE:
-        return True
+    global _SLACK_ACTIVE_CHECK_FAILED
 
     def _import():
         from slack_bolt.async_app import AsyncApp
@@ -345,9 +370,17 @@ def check_slack_requirements() -> bool:
             "SLACK_AVAILABLE": True,
         }
 
-    from tools.lazy_deps import ensure_and_bind
+    try:
+        from tools.lazy_deps import ensure_and_bind
 
-    return ensure_and_bind("platform.slack", _import, globals(), prompt=False)
+        if not ensure_and_bind("platform.slack", _import, globals(), prompt=False):
+            _clear_slack_bindings()
+            return False
+    except Exception:
+        _clear_slack_bindings()
+        return False
+    _SLACK_ACTIVE_CHECK_FAILED = False
+    return True
 
 
 def _collect_slack_block_mentions(blocks: list) -> list:

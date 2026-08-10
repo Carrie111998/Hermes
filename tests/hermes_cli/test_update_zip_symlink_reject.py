@@ -122,7 +122,20 @@ def test_update_via_zip_accepts_normal_member(tmp_path, monkeypatch, capsys):
     with patch("urllib.request.urlretrieve", side_effect=fake_urlretrieve), \
          patch("subprocess.run") as fake_run, \
          patch("subprocess.check_call"):
-        fake_run.return_value = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        def fake_run_result(cmd, **_kwargs):
+            if cmd and cmd[-1] == "--version" and "pip" in cmd:
+                return type(
+                    "R",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": "pip 26.1.2 from /venv/site-packages/pip (python 3.13)",
+                        "stderr": "",
+                    },
+                )()
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        fake_run.side_effect = fake_run_result
         try:
             hermes_main._update_via_zip(args)
         except SystemExit:

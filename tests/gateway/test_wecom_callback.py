@@ -10,6 +10,38 @@ from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt
 
 
+def test_wecom_lazy_requirements_rebind_all_optional_modules(monkeypatch):
+    """A post-install bind must refresh every optional runtime global."""
+    import plugins.platforms.wecom.callback_adapter as module
+
+    for name, value in (
+        ("ET", None),
+        ("web", None),
+        ("httpx", None),
+        ("DEFUSEDXML_AVAILABLE", False),
+        ("AIOHTTP_AVAILABLE", False),
+        ("HTTPX_AVAILABLE", False),
+    ):
+        monkeypatch.setattr(module, name, value)
+
+    def fake_ensure_and_bind(feature, importer, target_globals, **kwargs):
+        assert feature == "platform.wecom_callback"
+        target_globals.update(importer())
+        return True
+
+    monkeypatch.setattr(
+        "tools.lazy_deps.ensure_and_bind", fake_ensure_and_bind
+    )
+
+    assert module.ensure_wecom_callback_requirements() is True
+    assert module.ET is not None
+    assert module.web is not None
+    assert module.httpx is not None
+    assert module.DEFUSEDXML_AVAILABLE
+    assert module.AIOHTTP_AVAILABLE
+    assert module.HTTPX_AVAILABLE
+
+
 def _app(name="test-app", corp_id="ww1234567890", agent_id="1000002"):
     return {
         "name": name,
@@ -197,5 +229,4 @@ class TestWecomCallbackBodySizeLimit:
         oversized = b"<xml>" + b"A" * (_MAX_BODY + 1) + b"</xml>"
         response = await adapter._handle_callback(self._request(oversized))
         assert response.status == 413
-
 

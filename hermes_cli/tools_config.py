@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -23,6 +24,7 @@ from hermes_cli.config import (
     cfg_get,
     load_config, save_config, get_env_value, save_env_value,
 )
+from hermes_cli import _pip_security
 from hermes_cli.colors import Colors, color
 from hermes_cli.nous_subscription import (
     MANAGED_FEATURE_COVERAGE_CATEGORY,
@@ -905,20 +907,46 @@ def _pip_install(
             pass
 
     pip_cmd = [sys.executable, "-m", "pip"]
+    # Keep the direct-pip recovery path within one caller-owned budget. The
+    # floor helper performs a probe, optional upgrade, and verification before
+    # the package install; independent per-process timeouts could otherwise
+    # make a failed uv attempt hang for several minutes more.
+    pip_deadline = time.monotonic() + max(float(timeout), 1.0)
+
+    def _remaining_timeout(limit: float, *, reserve: float = 0.0) -> int | None:
+        remaining = pip_deadline - time.monotonic() - reserve
+        if remaining <= 0:
+            return None
+        return max(1, min(int(limit), int(remaining)))
+
+    def _budget_failure(detail: str) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            pip_cmd,
+            returncode=1,
+            stdout="",
+            stderr=f"pip install timed out: {detail}",
+        )
+
     try:
         # Probe for pip; bootstrap via ensurepip if missing (uv venv lacks it).
+        probe_timeout = _remaining_timeout(15)
+        if probe_timeout is None:
+            return _budget_failure("direct-pip budget exhausted before probe")
         probe = subprocess.run(
             pip_cmd + ["--version"],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=probe_timeout,
             creationflags=_post_setup_no_window_flags(),
         )
         if probe.returncode != 0:
             raise FileNotFoundError("pip not in venv")
     except (subprocess.TimeoutExpired, FileNotFoundError):
         try:
+            ensurepip_timeout = _remaining_timeout(120)
+            if ensurepip_timeout is None:
+                return _budget_failure("direct-pip budget exhausted before ensurepip")
             subprocess.run(
                 [sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"],
-                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=True,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=ensurepip_timeout, check=True,
                 creationflags=_post_setup_no_window_flags(),
             )
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
@@ -928,9 +956,32 @@ def _pip_install(
                 stderr=f"pip not available and ensurepip failed: {e}",
             )
 
+    # Reserve the helper's fixed 15-second probe and verification windows so
+    # the subsequent package install still has a bounded slice of the same
+    # caller-owned budget.
+    floor_timeout = _remaining_timeout(timeout, reserve=30)
+    if floor_timeout is None:
+        return _budget_failure("direct-pip budget exhausted before floor verification")
+    pip_ok, pip_error = _pip_security.ensure_pip_floor(
+        pip_cmd,
+        runner=subprocess.run,
+        creationflags=_post_setup_no_window_flags(),
+        timeout=floor_timeout,
+    )
+    if not pip_ok:
+        return subprocess.CompletedProcess(
+            pip_cmd,
+            returncode=1,
+            stdout="",
+            stderr=pip_error,
+        )
+
+    install_timeout = _remaining_timeout(timeout)
+    if install_timeout is None:
+        return _budget_failure("direct-pip budget exhausted before package install")
     return subprocess.run(
         pip_cmd + ["install", *args],
-        capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        capture_output=capture_output, text=True, encoding="utf-8", errors="replace", timeout=install_timeout,
         creationflags=_post_setup_no_window_flags(
             streams_to_console=not capture_output
         ),

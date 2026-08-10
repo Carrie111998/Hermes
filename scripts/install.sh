@@ -57,6 +57,11 @@ else
     INSTALL_DIR_EXPLICIT=false
 fi
 PYTHON_VERSION="3.11"
+# The non-Termux installer uses uv for every dependency transaction (including
+# the fallback ``uv pip`` tiers), so it never invokes the environment's pip.
+# The floor below is therefore applied only to the direct-pip Termux path;
+# runtime direct-pip recovery paths enforce the same floor independently.
+MIN_PIP_VERSION="26.1.2"
 NODE_VERSION="26"
 
 # FHS-style root install layout (set by resolve_install_layout when applicable):
@@ -1505,7 +1510,54 @@ install_deps() {
             log_info "Using ANDROID_API_LEVEL=$ANDROID_API_LEVEL for Android wheel builds"
         fi
 
-        "$PIP_PYTHON" -m pip install --upgrade pip setuptools wheel >/dev/null
+        local pip_upgrade_output
+        local pip_version_output
+        if ! pip_upgrade_output="$("$PIP_PYTHON" -m pip install --upgrade "pip>=${MIN_PIP_VERSION}" setuptools wheel 2>&1)"; then
+            log_error "pip floor bootstrap failed; refusing to install Termux dependencies."
+            if [ -n "$pip_upgrade_output" ]; then
+                log_info "$pip_upgrade_output"
+            fi
+            exit 1
+        fi
+        if ! pip_version_output="$("$PIP_PYTHON" -m pip --version 2>&1)"; then
+            log_error "pip --version failed; refusing to install Termux dependencies."
+            exit 1
+        fi
+        if ! "$PIP_PYTHON" -c '
+import re
+import sys
+
+minimum = tuple(int(part) for part in sys.argv[1].split("."))
+canonical_versions = []
+for line in sys.argv[2].splitlines():
+    line_match = re.fullmatch(
+        r"\s*pip\s+([^\s]+)\s+from\s+"
+        r"(?:(?:/|[A-Za-z]:[\\/]|\\\\)[^\r\n\"]*[\\/]pip)"
+        r"(?:\s+\(python\s+\d+(?:\.\d+){1,3}\))?\s*",
+        line,
+        re.IGNORECASE,
+    )
+    if not line_match:
+        continue
+    token = line_match.group(1)
+    release_match = re.fullmatch(r"(\d+(?:\.\d+){1,3})(.*)", token)
+    if not release_match:
+        raise SystemExit(1)
+    suffix = release_match.group(2)
+    if suffix and not re.fullmatch(r"\.post\d+", suffix, re.IGNORECASE):
+        raise SystemExit(1)
+    try:
+        version = tuple(int(part) for part in release_match.group(1).split("."))
+    except ValueError:
+        raise SystemExit(1)
+    canonical_versions.append(version)
+if len(canonical_versions) == 1 and canonical_versions[0] >= minimum:
+    raise SystemExit(0)
+raise SystemExit(1)
+' "$MIN_PIP_VERSION" "$pip_version_output"; then
+            log_error "pip floor verification failed: need pip >= ${MIN_PIP_VERSION}."
+            exit 1
+        fi
 
         # On Android, psutil's setup.py rejects sys.platform == 'android' before
         # it ever invokes the C build, so the next pip install would fail at

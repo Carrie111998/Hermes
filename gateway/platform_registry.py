@@ -86,13 +86,12 @@ class PlatformEntry:
     # fail at connect() time with a descriptive error.
     validate_config: Optional[Callable[[Any], bool]] = None
 
-    # ACTIVE dependency installer: make the platform's dependencies available,
-    # installing them (pip / lazy_deps) if needed.  Returns True once deps are
-    # importable, False if they could not be installed.  Called by
-    # ``create_adapter()`` when ``check_fn`` returns False — i.e. exactly at
-    # the moment the gateway is about to bring the platform up and the user
-    # has it enabled/configured.  None = no auto-install; a False ``check_fn``
-    # is then a hard block (correct for platforms with no optional deps).
+    # ACTIVE dependency verifier/installer: make the platform's dependencies
+    # available, installing them (pip / lazy_deps) if needed. Returns True once
+    # deps are importable, False if they could not be installed. Called by
+    # ``create_adapter()`` for configured adapters even when the passive probe
+    # is already true, because importability alone cannot prove exact security
+    # pins. None = no auto-install; a False ``check_fn`` is then a hard block.
     #
     # Why two fields (#79812): when the ACTIVE installer was registered as
     # ``check_fn``, every status display pip-installed SDKs as a side effect
@@ -620,14 +619,32 @@ class PlatformRegistry:
 
         Returns None if:
         - No entry registered for *name*
-        - check_fn() returns False and deps can't be installed
-          (no ensure_deps_fn, or ensure_deps_fn() returned False)
+        - dependencies can't be installed or verified
         - validate_config() returns False (misconfigured)
         - The factory raises an exception
         """
         entry = self.get(name)
         if entry is None:
             return None
+
+        # Validate configuration before any active dependency hook. This keeps
+        # passive status/configuration reads side-effect free and limits the
+        # active verifier to adapters the gateway is actually about to create.
+        if entry.validate_config is not None:
+            try:
+                if not entry.validate_config(config):
+                    logger.warning(
+                        "Platform '%s' config validation failed",
+                        entry.label,
+                    )
+                    return None
+            except Exception as e:
+                logger.warning(
+                    "Platform '%s' config validation error: %s",
+                    entry.label,
+                    e,
+                )
+                return None
 
         deps_ok = False
         try:
@@ -636,15 +653,13 @@ class PlatformRegistry:
             logger.warning(
                 "Platform '%s' check_fn raised: %s", entry.label, e
             )
-        if not deps_ok and entry.ensure_deps_fn is not None:
-            # Deps missing but the platform can install them on demand.
-            # This is the ONE place the active installer runs in the adapter
-            # path: the platform is enabled+configured and the gateway is
-            # about to connect it, so an install is what the user wants
-            # (#79812 — Teams' installer previously lived behind this very
-            # gate inside connect(), which could never be reached).
+        if entry.ensure_deps_fn is not None:
+            # The passive probe remains side-effect free for status displays,
+            # but configured adapter creation always runs the active verifier.
+            # A true passive result proves importability only; the active hook
+            # also proves exact security pins and rebinds stale module globals.
             logger.info(
-                "Platform '%s' dependencies missing — attempting install...",
+                "Platform '%s' dependencies require active verification...",
                 entry.label,
             )
             try:
@@ -664,22 +679,6 @@ class PlatformRegistry:
                 hint,
             )
             return None
-
-        if entry.validate_config is not None:
-            try:
-                if not entry.validate_config(config):
-                    logger.warning(
-                        "Platform '%s' config validation failed",
-                        entry.label,
-                    )
-                    return None
-            except Exception as e:
-                logger.warning(
-                    "Platform '%s' config validation error: %s",
-                    entry.label,
-                    e,
-                )
-                return None
 
         try:
             adapter = entry.adapter_factory(config)

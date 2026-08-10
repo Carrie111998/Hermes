@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, Optional
 from urllib.parse import quote
@@ -63,6 +64,13 @@ try:
 except ValueError:
     # Test stubs may inject a module without ``__spec__``.
     TEAMS_SDK_AVAILABLE = "microsoft_teams" in _sys.modules
+
+_TEAMS_ACTIVE_CHECK_FAILED = False
+_TEAMS_ACTIVE_CHECK_LOCK = threading.Lock()
+
+
+class _TeamsActiveCheckBusy(RuntimeError):
+    """The process-global Teams verifier could not be acquired in time."""
 ClientOptions = None  # type: ignore[assignment,misc]
 App = None  # type: ignore[assignment,misc]
 ActivityContext = None  # type: ignore[assignment,misc]
@@ -130,6 +138,14 @@ _MAX_BODY_BYTES = 1_048_576
 # (d542894ad). Pin a host via TEAMS_HOST or extra.host.
 _DEFAULT_HOST = None
 _WEBHOOK_PATH = "/api/messages"
+
+# ``microsoft_teams`` imports ``dotenv`` at module import time.  The import
+# guard below temporarily replaces the process-global ``load_dotenv`` hook so
+# that third-party import cannot mutate Hermes' environment.  Teams reconnects
+# run the guard in worker threads, so the patch and its restoration must be a
+# single process-level critical section; otherwise an overlapping worker can
+# restore another worker's temporary no-op and leave dotenv suppressed.
+_DOTENV_SUPPRESSION_LOCK = threading.RLock()
 
 
 def _parse_bool(value: Any, *, default: bool = False) -> bool:
@@ -425,7 +441,11 @@ def check_requirements() -> bool:
     ``is_connected``/``validate_config``.  The ACTIVE lazy-installer is
     ``check_teams_requirements`` (registered as ``ensure_deps_fn``).
     """
-    return TEAMS_SDK_AVAILABLE and AIOHTTP_AVAILABLE
+    return (
+        TEAMS_SDK_AVAILABLE
+        and AIOHTTP_AVAILABLE
+        and not _TEAMS_ACTIVE_CHECK_FAILED
+    )
 
 
 def validate_config(config) -> bool:
@@ -664,36 +684,46 @@ def _suppress_third_party_dotenv() -> Iterator[None]:
     whatever ``.env`` sits above cwd — typically a root profile's secrets.
     Hermes owns dotenv loading; third-party import side effects must not.
     """
+    with _DOTENV_SUPPRESSION_LOCK:
+        try:
+            import dotenv as _dotenv
+        except ImportError:
+            yield
+            return
+        original = getattr(_dotenv, "load_dotenv", None)
+        if original is None:
+            yield
+            return
+        _dotenv.load_dotenv = lambda *args, **kwargs: False  # type: ignore[assignment]
+        try:
+            yield
+        finally:
+            _dotenv.load_dotenv = original  # type: ignore[assignment]
+
+
+def check_teams_requirements(*, timeout: Optional[float] = None) -> bool:
+    # The SDK bindings and failure latch are process-global.  Teams invokes
+    # this check from worker threads, so serialize the full transaction.
+    acquired = _TEAMS_ACTIVE_CHECK_LOCK.acquire(
+        timeout=-1 if timeout is None else max(0.0, float(timeout))
+    )
+    if not acquired:
+        raise _TeamsActiveCheckBusy
     try:
-        import dotenv as _dotenv
-    except ImportError:
-        yield
-        return
-    original = getattr(_dotenv, "load_dotenv", None)
-    if original is None:
-        yield
-        return
-    _dotenv.load_dotenv = lambda *args, **kwargs: False  # type: ignore[assignment]
-    try:
-        yield
+        return _check_teams_requirements()
     finally:
-        _dotenv.load_dotenv = original  # type: ignore[assignment]
+        _TEAMS_ACTIVE_CHECK_LOCK.release()
 
 
-def check_teams_requirements() -> bool:
+def _check_teams_requirements() -> bool:
     """Ensure the Teams SDK is importable, lazy-installing it on first use.
 
-    Lazy-installs ``microsoft-teams-apps`` via
-    ``tools.lazy_deps.ensure("platform.teams")`` if not present, then rebinds
-    all module-level SDK globals on success. Returns True once the SDK (and
-    aiohttp) are importable, False if they couldn't be installed/imported.
+    Runs the feature contract on every active check so stale security pins are
+    repaired or fail closed, then rebinds all module-level SDK globals on
+    success. Returns True once the SDK (and aiohttp) are importable, False if
+    they couldn't be installed/imported.
 
-    ``App is not None`` means symbols are already bound — ``TEAMS_SDK_AVAILABLE``
-    alone can be True from ``find_spec`` without an import having run yet.
     """
-    if App is not None and AIOHTTP_AVAILABLE:
-        return True
-
     def _import() -> dict:
         from aiohttp import web as _web
 
@@ -745,9 +775,24 @@ def check_teams_requirements() -> bool:
             "TEAMS_SDK_AVAILABLE": True,
         }
 
-    from tools.lazy_deps import ensure_and_bind
+    def _clear_bindings() -> None:
+        global _TEAMS_ACTIVE_CHECK_FAILED
+        _TEAMS_ACTIVE_CHECK_FAILED = True
 
-    return ensure_and_bind("platform.teams", _import, globals(), prompt=False)
+    try:
+        from tools.lazy_deps import ensure_and_bind
+        bound = ensure_and_bind(
+            "platform.teams", _import, globals(), prompt=False
+        )
+    except Exception:
+        _clear_bindings()
+        return False
+    if not bound:
+        _clear_bindings()
+        return False
+    global _TEAMS_ACTIVE_CHECK_FAILED
+    _TEAMS_ACTIVE_CHECK_FAILED = False
+    return True
 
 
 class TeamsAdapter(BasePlatformAdapter):
@@ -779,7 +824,25 @@ class TeamsAdapter(BasePlatformAdapter):
         # Defensive re-check: create_adapter() already ran the installer
         # (ensure_deps_fn) if deps were missing, but connect() can also be
         # reached via reconnect paths — re-run to bind SDK globals.
-        check_teams_requirements()
+        try:
+            deps_ok = await asyncio.to_thread(
+                check_teams_requirements, timeout=300.0
+            )
+        except _TeamsActiveCheckBusy:
+            self._set_fatal_error(
+                "MISSING_SDK",
+                "Microsoft Teams dependency verification is busy; retrying later.",
+                retryable=True,
+            )
+            return False
+        if not deps_ok:
+            self._set_fatal_error(
+                "MISSING_SDK",
+                "Microsoft Teams dependencies could not be verified or imported. "
+                "Restart Hermes after a lazy-install repair, then retry.",
+                retryable=False,
+            )
+            return False
         if not TEAMS_SDK_AVAILABLE:
             self._set_fatal_error(
                 "MISSING_SDK",

@@ -1,5 +1,7 @@
 """Tests for DingTalk platform adapter."""
 import asyncio
+import sys
+import types
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -89,6 +91,90 @@ def _fake_dingtalk_optional_sdks(monkeypatch):
 
 
 class TestDingTalkRequirements:
+
+    def test_lazy_requirements_rebinds_optional_card_sdk_globals(self, monkeypatch):
+        """A post-install check must refresh Card/OpenAPI globals too."""
+        import plugins.platforms.dingtalk.adapter as dt
+
+        def module(name, **attrs):
+            value = types.ModuleType(name)
+            for key, item in attrs.items():
+                setattr(value, key, item)
+            return value
+
+        card_client = object()
+        card_models = object()
+        robot_client = object()
+        robot_models = object()
+        open_api_models = object()
+        tea_util_models = object()
+        card = module(
+            "alibabacloud_dingtalk.card_1_0",
+            client=card_client,
+            models=card_models,
+        )
+        robot = module(
+            "alibabacloud_dingtalk.robot_1_0",
+            client=robot_client,
+            models=robot_models,
+        )
+        dingtalk_pkg = module(
+            "alibabacloud_dingtalk",
+            card_1_0=card,
+            robot_1_0=robot,
+        )
+        tea_openapi = module(
+            "alibabacloud_tea_openapi", models=open_api_models
+        )
+        tea_util = module("alibabacloud_tea_util", models=tea_util_models)
+        stream_frames = module(
+            "dingtalk_stream.frames",
+            CallbackMessage=object,
+            AckMessage=object,
+        )
+        stream = module(
+            "dingtalk_stream",
+            ChatbotMessage=object,
+            frames=stream_frames,
+        )
+        for name, value in {
+            "alibabacloud_dingtalk": dingtalk_pkg,
+            "alibabacloud_dingtalk.card_1_0": card,
+            "alibabacloud_dingtalk.robot_1_0": robot,
+            "alibabacloud_tea_openapi": tea_openapi,
+            "alibabacloud_tea_util": tea_util,
+            "dingtalk_stream": stream,
+            "dingtalk_stream.frames": stream_frames,
+            "httpx": module("httpx"),
+        }.items():
+            monkeypatch.setitem(sys.modules, name, value)
+        monkeypatch.setattr(dt, "CARD_SDK_AVAILABLE", False)
+        monkeypatch.setattr(dt, "dingtalk_card_client", None)
+        monkeypatch.setattr(dt, "dingtalk_card_models", None)
+        monkeypatch.setattr(dt, "dingtalk_robot_client", None)
+        monkeypatch.setattr(dt, "dingtalk_robot_models", None)
+        monkeypatch.setattr(dt, "open_api_models", None)
+        monkeypatch.setattr(dt, "tea_util_models", None)
+        monkeypatch.setattr(dt, "DINGTALK_STREAM_AVAILABLE", False)
+        monkeypatch.setattr(dt, "HTTPX_AVAILABLE", False)
+        # ensure_dingtalk_deps() also rebinds these module globals; register
+        # them so monkeypatch restores the real SDK objects after the test.
+        monkeypatch.setattr(dt, "dingtalk_stream", None)
+        monkeypatch.setattr(dt, "ChatbotMessage", None)
+        monkeypatch.setattr(dt, "CallbackMessage", None)
+        monkeypatch.setattr(dt, "AckMessage", None)
+        monkeypatch.setattr(dt, "httpx", None)
+
+        with patch("tools.lazy_deps.ensure", autospec=True):
+            assert dt.ensure_dingtalk_deps() is True
+
+        assert dt.CARD_SDK_AVAILABLE is True
+        assert dt.dingtalk_card_client is card_client
+        assert dt.dingtalk_card_models is card_models
+        assert dt.dingtalk_robot_client is robot_client
+        assert dt.dingtalk_robot_models is robot_models
+        assert dt.open_api_models is open_api_models
+        assert dt.tea_util_models is tea_util_models
 
 
     def test_returns_false_when_env_vars_missing(self, monkeypatch):
@@ -200,6 +286,66 @@ class TestSend:
 
 
 class TestConnect:
+
+    @pytest.mark.asyncio
+    async def test_optional_card_repair_is_offloaded_and_attempted_once(
+        self, monkeypatch
+    ):
+        import plugins.platforms.dingtalk.adapter as dt
+
+        class FakeStreamMessage:
+            TOPIC = "topic"
+
+        class FakeStreamClient:
+            def __init__(self, credential):
+                self.credential = credential
+                self.handlers = []
+
+            def register_callback_handler(self, topic, handler):
+                self.handlers.append((topic, handler))
+
+        fake_stream = SimpleNamespace(
+            Credential=lambda client_id, client_secret: (client_id, client_secret),
+            DingTalkStreamClient=FakeStreamClient,
+            ChatbotMessage=FakeStreamMessage,
+        )
+        monkeypatch.setattr(dt, "dingtalk_stream", fake_stream)
+        monkeypatch.setattr(dt, "DINGTALK_STREAM_AVAILABLE", True)
+        monkeypatch.setattr(dt, "HTTPX_AVAILABLE", True)
+        monkeypatch.setattr(dt, "CARD_SDK_AVAILABLE", False)
+        fake_http = AsyncMock()
+        monkeypatch.setattr(
+            dt,
+            "httpx",
+            SimpleNamespace(AsyncClient=MagicMock(return_value=fake_http)),
+        )
+        calls = []
+
+        def fake_card_repair():
+            calls.append("repair")
+            return False
+
+        monkeypatch.setattr(dt, "ensure_dingtalk_card_deps", fake_card_repair)
+
+        async def _noop_stream(_adapter):
+            return None
+
+        monkeypatch.setattr(dt.DingTalkAdapter, "_run_stream", _noop_stream)
+        adapter = dt.DingTalkAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "client_id": "client",
+                    "client_secret": "secret",
+                    "card_template_id": "template",
+                },
+            )
+        )
+
+        assert await adapter.connect() is True
+        assert await adapter.connect() is True
+        assert calls == ["repair"]
+        assert adapter._card_sdk_attempted is True
 
 
     @pytest.mark.asyncio

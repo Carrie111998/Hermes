@@ -71,7 +71,6 @@ import logging
 import os
 import re
 import shutil
-import site
 import subprocess
 import sys
 import sysconfig
@@ -80,8 +79,61 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli import _pip_security
 
 logger = logging.getLogger(__name__)
+
+# pip is only used as a fallback when uv is unavailable.  Keep that
+# venv-managed path on the security floor from issue #41374 instead of
+# trusting whatever version ensurepip happened to bundle with Python.
+_MIN_PIP_VERSION = _pip_security.MIN_PIP_VERSION
+_MIN_PIP_SPEC = _pip_security.MIN_PIP_SPEC
+_PYNACL_SECURITY_SPEC = "PyNaCl==1.6.2"
+# A stale core PyNaCl installation must not constrain the ordinary durable
+# transaction.  The target is append-only, so the install path separately
+# rejects stale core copies of every explicitly managed package rather than
+# allowing a target copy to be reported as active when core wins on sys.path.
+_CONSTRAINT_EXCLUDED_PACKAGES = frozenset({"pynacl"})
+# These packages carry security-sensitive exact/floor contracts in
+# ``LAZY_DEPS`` or the published extras.  Their metadata is evidence for a
+# repair decision, so a missing ``packaging`` module or an unstable/malformed
+# version must fail closed instead of falling back to presence-only behavior.
+_SECURITY_VERSIONED_PACKAGES = frozenset(
+    {
+        "aiohttp",
+        "anthropic",
+        "cryptography",
+        "httplib2",
+        "idna",
+        "pynacl",
+        "pyasn1",
+        "python-multipart",
+        "requests",
+        "starlette",
+        "urllib3",
+    }
+)
+
+# Manifest-driven installs do not go through the static ``LAZY_DEPS`` map, so
+# keep the small set of dependency floors that must hold for every runtime
+# install in one explicit policy table.  A manifest may still choose a newer
+# version or a compatible range, but it must prove that every candidate is at
+# or above the floor before it reaches pip.
+_SECURITY_INSTALL_FLOORS = {
+    "pynacl": "1.6.2",
+    "aiohttp": "3.14.3",
+    "idna": "3.15",
+    "pip": "26.1.2",
+}
+
+# Core metadata is normally produced by trusted build tooling, but the
+# durable-target constraint file is later parsed by pip as an argument-like
+# requirements file.  Keep the interpolation boundary deliberately narrower
+# than Core Metadata: only canonical package names and stable release tokens
+# may cross it.  In particular, a metadata name beginning with ``--`` must
+# never become a pip option such as ``--index-url``.
+_CONSTRAINT_NAME_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*\Z")
+_CONSTRAINT_VERSION_RE = re.compile(r"\d+(?:\.\d+)*(?:\.post\d+)?\Z")
 
 
 # =============================================================================
@@ -116,7 +168,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Web search backends ───────────────────────────────────────────────
     "search.exa": ("exa-py==2.10.2",),
-    "search.firecrawl": ("firecrawl-py==4.17.0",),
+    "search.firecrawl": ("firecrawl-py==4.17.0", "aiohttp==3.14.3"),
     "search.parallel": ("parallel-web==0.4.2",),
 
     # ─── Monitoring ─────────────────────────────────────────────────────────
@@ -138,7 +190,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # 2.4.6 was removed and clean releases resumed (2.4.7, 2.4.8). Voxtral
     # STT + TTS share the same SDK.
     "tts.mistral": ("mistralai==2.4.8",),
-    "tts.edge": ("edge-tts==7.2.7",),
+    "tts.edge": ("edge-tts==7.2.7", "aiohttp==3.14.3"),
     "tts.elevenlabs": ("elevenlabs==1.59.0",),
 
     # ─── Speech-to-text providers ──────────────────────────────────────────
@@ -191,7 +243,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    "memory.hindsight": ("hindsight-client==0.6.1", "aiohttp==3.14.3"),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
@@ -209,9 +261,21 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # back to google's `Brotli` package (1-arg API), and any .txt/.md/.doc
     # uploaded to the Discord gateway fails to decode at att.read() with
     # "Can not decode content-encoding: br" — see #12511 / #15744.
+    # Keep the voice-only dependencies explicit instead of requesting
+    # discord.py[voice].  discord.py 2.7.1's published voice metadata still
+    # declares PyNaCl<1.6, which conflicts with the security floor below;
+    # davey is the only additional voice dependency needed by the adapter.
     "platform.discord": (
-        "discord.py[voice]==2.7.1",
+        "discord.py==2.7.1",
+        "davey==0.1.4",
         "brotlicffi==1.2.0.1",
+        # PyNaCl's runtime imports cffi. Keep presence explicit because the
+        # exact PyNaCl --no-deps recovery cannot install transitive packages.
+        "cffi",
+        # Keep this direct pin because the lazy uv/pip invocation may run
+        # outside the project root and therefore cannot rely on pyproject's
+        # resolver metadata or uv override-dependencies.
+        "PyNaCl==1.6.2",
         # discord.py pulls aiohttp transitively (>=3.7.4,<4) as its HTTP
         # backbone. Pin the patched floor here too so the lazy Discord path
         # can't keep an already-installed vulnerable aiohttp satisfying that
@@ -235,17 +299,28 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     "platform.dingtalk": (
         "dingtalk-stream==0.24.3",
-        "alibabacloud-dingtalk==2.2.42",
         "qrcode==7.4.2",
+        "aiohttp==3.14.3",
     ),
+    # DingTalk's AI-card/robot SDK is optional.  Keep it out of the core
+    # Stream Mode contract so a missing or broken card dependency cannot
+    # prevent ordinary text messaging from starting.  The adapter requests
+    # this feature only when a card template is configured.
+    "platform.dingtalk_card": ("alibabacloud-dingtalk==2.2.42",),
     "platform.feishu": (
         "lark-oapi==1.6.8",
         "qrcode==7.4.2",
+        # The webhook transport imports aiohttp.web independently of lark-oapi.
+        "aiohttp==3.14.3",
+        # Websocket mode is the default Feishu transport and must remain
+        # usable after a lazy install, even when it was absent at import time.
+        "websockets==15.0.1",
     ),
     # WeCom callback-mode adapter — parses untrusted XML POST bodies. Pulls
-    # defusedxml only; aiohttp/httpx are core dependencies of every messaging
-    # adapter and ship via `platform.discord` / `platform.slack` / etc.
-    "platform.wecom_callback": ("defusedxml==0.7.1",),
+    # defusedxml protects callback XML and aiohttp provides the callback web
+    # server. Keep both explicit because callback-mode can be lazy-installed
+    # independently of the broader messaging extras.
+    "platform.wecom_callback": ("defusedxml==0.7.1", "aiohttp==3.14.3"),
     # Microsoft Teams adapter — microsoft-teams-apps pulls a heavy tree
     # (microsoft-teams-api/cards/common, dependency-injector, msal). Lazy-
     # installed on demand like every other messaging platform; also exposed
@@ -253,8 +328,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.3"),  # aiohttp 3.14.3: prior CVEs + GHSA-cq5v-8q36-5273/GHSA-mfx4-hv73-q22v/GHSA-mq44-7p77-q5h7
 
     # ─── Terminal backends ─────────────────────────────────────────────────
-    "terminal.modal": ("modal==1.3.4",),
-    "terminal.daytona": ("daytona==0.155.0",),
+    "terminal.modal": ("modal==1.3.4", "aiohttp==3.14.3"),
+    "terminal.daytona": ("daytona==0.155.0", "aiohttp==3.14.3"),
     "terminal.vercel": ("vercel==0.7.2",),
 
     # ─── Skills ────────────────────────────────────────────────────────────
@@ -369,6 +444,30 @@ class _InstallResult:
 # =============================================================================
 
 
+def _pip_version_meets_floor(output: str) -> bool:
+    """Return whether ``pip --version`` output proves the required floor."""
+    return _pip_security.pip_version_meets_floor(output)
+
+
+def _ensure_pip_floor(
+    pip_cmd: list[str], *, timeout: int = 120
+) -> tuple[bool, str]:
+    """Require a venv-managed pip at or above the security floor.
+
+    ``ensurepip`` only guarantees that *some* pip is present.  If its bundled
+    version is below the floor, upgrade it explicitly and verify the result;
+    an unavailable or unverifiable floor is a hard failure for the fallback
+    install path.
+    """
+
+    return _pip_security.ensure_pip_floor(
+        pip_cmd,
+        timeout=timeout,
+        runner=subprocess.run,
+        creationflags=windows_hide_flags(),
+    )
+
+
 # Environment variable that redirects lazy installs away from the (sealed)
 # agent venv and into a writable directory on a durable volume. Set by the
 # Docker image to /opt/data/lazy-packages. This is an internal bridge var,
@@ -412,11 +511,13 @@ def _lazy_install_target() -> Optional[Path]:
 def _ensure_target_ready(target: Path) -> Optional[str]:
     """Create the target dir and validate its ABI stamp.
 
-    If the stamp is missing it is written. If it is present but records a
+    If the stamp is missing, any existing contents are treated as untrusted
+    and wiped before the target is used. If it is present but records a
     different interpreter ABI than the one now running (e.g. the container
     image was rebuilt onto a newer Python), the directory's contents are
-    wiped and the stamp rewritten, so stale compiled wheels can't be
-    imported against an incompatible interpreter.
+    likewise wiped and the stamp rewritten, so stale compiled wheels can't
+    be imported against an incompatible interpreter. Every wipe is verified;
+    a target that cannot be cleared fails closed.
 
     Returns ``None`` on success, or an error string if the directory can't
     be created / written (e.g. read-only mount, permission error).
@@ -424,26 +525,42 @@ def _ensure_target_ready(target: Path) -> Optional[str]:
     want = _python_abi_tag()
     stamp = target / _TARGET_STAMP_NAME
     try:
+        # Never follow a user-controlled target-root symlink.  The unstamped
+        # and ABI-mismatch paths below recursively remove the target contents;
+        # accepting a symlink here would let that wipe an unrelated directory.
+        if target.is_symlink():
+            return f"lazy install target {target} must not be a symlink"
         if target.exists():
             have = ""
             try:
                 have = stamp.read_text(encoding="utf-8").strip()
             except (OSError, FileNotFoundError):
                 have = ""
-            if have and have != want:
+            if not have:
+                logger.info(
+                    "Lazy install target %s has no ABI stamp; wiping "
+                    "untrusted contents before activation.",
+                    target,
+                )
+            elif have != want:
                 logger.info(
                     "Lazy install target %s was built for ABI %r but running "
                     "ABI is %r; wiping stale packages.",
                     target, have, want,
                 )
+            if not have or have != want:
                 for child in target.iterdir():
                     if child.is_dir() and not child.is_symlink():
-                        shutil.rmtree(child, ignore_errors=True)
+                        shutil.rmtree(child)
                     else:
-                        try:
-                            child.unlink()
-                        except OSError:
-                            pass
+                        child.unlink()
+                remaining = tuple(target.iterdir())
+                if remaining:
+                    names = ", ".join(str(child.name) for child in remaining[:3])
+                    return (
+                        f"lazy install target {target} could not be cleared; "
+                        f"remaining entries: {names}"
+                    )
         target.mkdir(parents=True, exist_ok=True)
         stamp.write_text(want, encoding="utf-8")
     except OSError as e:
@@ -456,21 +573,15 @@ def _activate_target_on_syspath(target: Path) -> None:
 
     Appended to the END (never prepended) so the agent's own venv
     site-packages takes precedence on every name collision. Idempotent.
-    Uses :func:`site.addsitedir` so ``.pth`` files (namespace packages,
-    editable installs) inside the target are honoured, then enforces the
-    append ordering — ``addsitedir`` would otherwise insert near the front.
+    Deliberately do not use :func:`site.addsitedir`: processing a ``.pth``
+    file executes arbitrary import statements, which would turn a writable
+    durable package directory into a code-execution hook at every startup.
+    Packages and namespace packages directly under the target remain
+    importable through the ordinary ``sys.path`` entry.
     """
     target_str = str(target)
-    # Snapshot existing entries so we can restore precedence afterwards.
-    before = list(sys.path)
-    if target_str not in before:
-        site.addsitedir(target_str)
-    # site.addsitedir may have inserted target (and any .pth-added dirs) at
-    # the front. Move every newly-added entry to the end, preserving the
-    # core venv's precedence. New entries are those not present `before`.
-    new_entries = [p for p in sys.path if p not in before]
-    if new_entries:
-        sys.path[:] = [p for p in sys.path if p not in new_entries] + new_entries
+    if target_str not in sys.path:
+        sys.path.append(target_str)
     # importlib.metadata caches the path-based distribution finder; clear it
     # so a just-activated dir is visible to version() checks this process.
     try:
@@ -492,8 +603,13 @@ def activate_durable_lazy_target() -> None:
     if target is None:
         return
     try:
-        if target.exists():
-            _activate_target_on_syspath(target)
+        if not target.exists():
+            return
+        error = _ensure_target_ready(target)
+        if error:
+            logger.debug("Refusing to activate durable lazy target: %s", error)
+            return
+        _activate_target_on_syspath(target)
     except Exception as e:  # pragma: no cover - defensive
         logger.debug("Failed to activate durable lazy target %s: %s", target, e)
 
@@ -573,6 +689,11 @@ def _pkg_name_from_spec(spec: str) -> str:
     return m.group(1) if m else spec
 
 
+def _normalize_distribution_name(name: str) -> str:
+    """Normalize distribution names according to the PEP 503 spelling."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def _specifier_from_spec(spec: str) -> str:
     """Extract just the version-specifier portion of a pip spec.
 
@@ -587,6 +708,61 @@ def _specifier_from_spec(spec: str) -> str:
     return spec[m.end():]
 
 
+def _is_security_versioned_spec(spec: str) -> bool:
+    """Whether ``spec`` requires strict stable-version evidence."""
+
+    package = _pkg_name_from_spec(spec).replace("_", "-").lower()
+    return package in _SECURITY_VERSIONED_PACKAGES
+
+
+def _security_install_spec_error(spec: str) -> str | None:
+    """Return a reason when an arbitrary manifest spec misses a security floor.
+
+    ``install_specs`` accepts package names from runtime manifests rather than
+    the checked-in allowlist.  For the packages with known security floors, a
+    bare name or an upper-bound-only requirement is not enough evidence: pip
+    could resolve a vulnerable release.  Require an explicit lower-bound,
+    compatible, or exact requirement whose version is at least the floor.
+    ``packaging`` is already a normal Hermes dependency; if it is unavailable
+    while validating an untrusted manifest, fail closed instead of guessing.
+    """
+    package = _normalize_distribution_name(_pkg_name_from_spec(spec))
+    floor_text = _SECURITY_INSTALL_FLOORS.get(package)
+    if floor_text is None:
+        return None
+
+    spec_tail = _specifier_from_spec(spec)
+    if not spec_tail:
+        return f"{package} requires an explicit security floor >= {floor_text}"
+
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from packaging.version import InvalidVersion, Version
+
+        floor = Version(floor_text)
+        specifiers = SpecifierSet(spec_tail)
+    except (ImportError, InvalidSpecifier, InvalidVersion, TypeError, ValueError):
+        return f"{package} has an unverifiable security floor >= {floor_text}"
+
+    # A lower-bound, compatible, or exact clause at/above the floor proves
+    # that pip cannot select a vulnerable release.  Wildcard exact matches
+    # (for example ``==3.14.*``) are intentionally rejected because they also
+    # admit releases below the fixed floor.
+    for requirement in specifiers:
+        if requirement.operator not in {">=", ">", "~=", "==", "==="}:
+            continue
+        if "*" in requirement.version:
+            continue
+        try:
+            bound = Version(requirement.version)
+        except InvalidVersion:
+            continue
+        if bound >= floor:
+            return None
+
+    return f"{package} requires an explicit security floor >= {floor_text}"
+
+
 def _is_satisfied(spec: str) -> bool:
     """Is ``spec`` already satisfied in the current env?
 
@@ -596,14 +772,15 @@ def _is_satisfied(spec: str) -> bool:
     ``hermes update`` propagate pin bumps in :data:`LAZY_DEPS` to already-
     installed backends instead of silently leaving stale versions in place.
 
-    If ``packaging`` is unavailable for any reason (it's a transitive of
-    pip so this should never happen), we fall back to a presence-only check
-    so we err on the side of "don't churn".
+    Ordinary non-security specs retain the historical presence-only fallback
+    when ``packaging`` is unavailable. Security-managed specs do not: their
+    installed metadata must prove a stable release, otherwise the caller must
+    perform the repair.
     """
     pkg = _pkg_name_from_spec(spec)
     try:
         from importlib.metadata import PackageNotFoundError, version
-    except ImportError:
+    except Exception:
         return False
     try:
         installed = version(pkg)
@@ -617,18 +794,48 @@ def _is_satisfied(spec: str) -> bool:
         # Bare ``"package"`` — no version constraint, presence is enough.
         return True
 
+    strict_security = _is_security_versioned_spec(spec)
+
     try:
         from packaging.specifiers import InvalidSpecifier, SpecifierSet
         from packaging.version import InvalidVersion, Version
     except ImportError:
-        # packaging unavailable — fall back to "installed counts as satisfied".
-        return True
+        # A security repair cannot be skipped without version evidence.
+        return False if strict_security else True
+
+    if strict_security and _pip_security.stable_version_tuple(installed) is None:
+        # PEP 440 equality accepts local versions (e.g. 1.6.2+vendor), while
+        # prerelease/dev/unknown suffixes can also be numerically misleading.
+        # Accept only a stable release, with optional .postN, as evidence.
+        return False
+
+    if strict_security and spec_tail.startswith("==") and "," not in spec_tail:
+        # ``packaging`` treats ``==1.6.2.post1`` as distinct from
+        # ``==1.6.2``. For the security floor, a stable post-release of the
+        # pinned release is intentionally acceptable; it contains the same
+        # release line plus the post-release fixes. Keep this narrow and only
+        # apply it when both sides are otherwise stable.
+        expected_text = spec_tail[2:]
+        if _pip_security.stable_version_tuple(expected_text) is not None:
+            try:
+                installed_version = Version(installed)
+                expected_version = Version(expected_text)
+            except InvalidVersion:
+                return False
+            if (
+                expected_version.post is None
+                and installed_version.post is not None
+                and installed_version.release == expected_version.release
+            ):
+                return True
 
     try:
         return Version(installed) in SpecifierSet(spec_tail)
     except (InvalidSpecifier, InvalidVersion, Exception):
-        # Malformed spec or installed version we can't parse — don't churn.
-        return True
+        # Malformed spec or installed version we can't parse. A security
+        # contract must repair/fail closed; ordinary lazy specs retain the
+        # historical no-churn fallback.
+        return False if strict_security else True
 
 
 def _is_present(spec: str) -> bool:
@@ -640,7 +847,7 @@ def _is_present(spec: str) -> bool:
     pkg = _pkg_name_from_spec(spec)
     try:
         from importlib.metadata import PackageNotFoundError, version
-    except ImportError:
+    except Exception:
         return False
     try:
         version(pkg)
@@ -651,7 +858,120 @@ def _is_present(spec: str) -> bool:
         return False
 
 
-def _core_constraints_file() -> Optional[Path]:
+_PACKAGE_IMPORT_ROOT_ALIASES: dict[str, tuple[str, ...]] = {
+    # Distribution names do not always match their import package.
+    "alibabacloud-dingtalk": ("alibabacloud_dingtalk",),
+    "alibabacloud-tea-openapi": ("alibabacloud_tea_openapi",),
+    "alibabacloud-tea-util": ("alibabacloud_tea_util",),
+    "discord.py": ("discord",),
+    "google-api-python-client": ("googleapiclient",),
+    "google-auth-httplib2": ("google_auth_httplib2",),
+    "google-auth-oauthlib": ("google_auth_oauthlib",),
+    "lark-oapi": ("lark_oapi",),
+    "microsoft-teams-apps": ("microsoft_teams",),
+    "python-telegram-bot": ("telegram",),
+    "slack-bolt": ("slack_bolt",),
+    "slack-sdk": ("slack_sdk",),
+}
+
+# Only compiled/security-critical roots need a process-restart boundary when
+# their distribution is repaired. Pure-Python packages such as aiohttp can be
+# rebound by their active adapter hooks; blocking every aiohttp submodule here
+# would turn ordinary lazy refreshes into unnecessary restart requirements.
+_PRELOADED_COMPILED_IMPORT_ROOTS: dict[str, tuple[str, ...]] = {
+    "pynacl": ("nacl",),
+    "cffi": ("_cffi_backend",),
+    # Feishu's deferred SDK is imported only at connect time, but adapters
+    # retain its module-level request/client classes for their whole process
+    # lifetime.  A lazy repair cannot safely replace an already-loaded stale
+    # lark-oapi tree in place; require a fresh Hermes process instead.
+    "lark-oapi": ("lark_oapi",),
+    # aiohttp is pure Python, but its active adapters retain module-level
+    # references across a lazy repair.  Replacing its distribution in-process
+    # can therefore leave stale web/client classes bound just like a compiled
+    # package. Require a fresh Hermes process before reporting readiness.
+    "aiohttp": ("aiohttp",),
+}
+
+
+def _managed_import_roots(spec: str) -> tuple[str, ...]:
+    """Return import roots whose objects can be left stale by a repair."""
+    package = _pkg_name_from_spec(spec).lower()
+    aliases = _PACKAGE_IMPORT_ROOT_ALIASES.get(package)
+    if aliases is not None:
+        return aliases
+    normalized = package.replace("-", "_").replace(".", "_")
+    roots = [normalized]
+    if package == "pynacl":
+        roots.append("nacl")
+    elif package == "cffi":
+        roots.append("_cffi_backend")
+    return tuple(dict.fromkeys(roots))
+
+
+def _preloaded_stale_module_conflicts(
+    specs: tuple[str, ...],
+) -> tuple[tuple[str, str], ...]:
+    """Find stale managed packages already loaded in this interpreter.
+
+    Pip can replace a distribution's files and metadata without changing
+    module objects already present in sys.modules. Rebinding those objects in
+    place is unsafe, especially for compiled packages, so a lazy repair must
+    stop at an explicit process-restart boundary.
+    """
+    conflicts: list[tuple[str, str]] = []
+    loaded_names = tuple(
+        name for name, module in sys.modules.items() if module is not None
+    )
+    for spec in specs:
+        if _is_satisfied(spec):
+            continue
+        package = _pkg_name_from_spec(spec).replace("_", "-").lower()
+        roots = _PRELOADED_COMPILED_IMPORT_ROOTS.get(package, ())
+        if not roots:
+            continue
+        for name in loaded_names:
+            if any(name == root or name.startswith(f"{root}.") for root in roots):
+                conflicts.append((spec, name))
+    return tuple(conflicts)
+
+
+def _preloaded_stale_module_reason(
+    conflicts: tuple[tuple[str, str], ...],
+) -> str:
+    details = ", ".join(f"{spec} ({name})" for spec, name in conflicts)
+    return (
+        "restart required before lazy repair: managed package module(s) "
+        f"already loaded with stale metadata: {details}; restart Hermes "
+        "before retrying so imports bind the repaired files"
+    )
+
+
+def _distribution_is_target_owned(spec: str, target: Path) -> bool:
+    """Return whether the visible distribution for ``spec`` lives in target.
+
+    Durable targets are appended to ``sys.path`` and may already be active in
+    this process. A stale target-owned distribution is repairable in place;
+    only a stale distribution resolved from outside the target is core-owned
+    and must fail closed because the append-only target cannot shadow it.
+    """
+
+    try:
+        from importlib.metadata import distribution
+
+        location = Path(distribution(_pkg_name_from_spec(spec)).locate_file(""))
+        target_root = target.resolve()
+        location = location.resolve()
+        return location == target_root or target_root in location.parents
+    except Exception:
+        # Unknown ownership is unsafe to treat as target-owned. The caller
+        # therefore preserves the core fail-closed behavior.
+        return False
+
+
+def _core_constraints_file(
+    exclude_packages: tuple[str, ...] = (),
+) -> Optional[Path]:
     """Write a pip constraints file pinning every package already importable
     in the core environment to its installed version.
 
@@ -666,6 +986,14 @@ def _core_constraints_file() -> Optional[Path]:
       at install time (resolver conflict) rather than silently installing a
       shadowed copy that can never win on sys.path anyway.
 
+    The PyNaCl security override is intentionally excluded. Explicitly
+    managed backend packages supplied by the caller are excluded as well:
+    their requested versions must not be turned into stale core constraints.
+    Because the durable target is append-only, the caller rejects an already
+    installed but stale core copy before running the transaction; otherwise
+    the target copy would lose on sys.path and the stale core package would
+    silently remain active.
+
     Returns the path to a temp constraints file, or None if enumeration
     failed (in which case the caller installs without constraints — still
     safe, just less tidy).
@@ -678,16 +1006,34 @@ def _core_constraints_file() -> Optional[Path]:
         import tempfile
         lines = []
         seen = set()
+        excluded = {
+            _normalize_distribution_name(name)
+            for name in _CONSTRAINT_EXCLUDED_PACKAGES
+        }
+        excluded.update(
+            _normalize_distribution_name(_pkg_name_from_spec(spec))
+            for spec in exclude_packages
+        )
         for dist in distributions():
             name = dist.metadata["Name"] if dist.metadata else None
             ver = dist.version
-            if not name or not ver:
+            if not isinstance(name, str) or not isinstance(ver, str):
                 continue
-            key = name.lower()
+            key = _normalize_distribution_name(name)
+            if not _CONSTRAINT_NAME_RE.fullmatch(key):
+                continue
+            version_text = ver.strip()
+            if (
+                not _CONSTRAINT_VERSION_RE.fullmatch(version_text)
+                or _pip_security.stable_version_tuple(version_text) is None
+            ):
+                continue
+            if key in excluded:
+                continue
             if key in seen:
                 continue
             seen.add(key)
-            lines.append(f"{name}=={ver}")
+            lines.append(f"{key}=={version_text}")
         if not lines:
             return None
         fd, path = tempfile.mkstemp(prefix="hermes-core-constraints-", suffix=".txt")
@@ -718,14 +1064,72 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     if not specs:
         return _InstallResult(True, "", "")
 
+    preloaded_conflicts = _preloaded_stale_module_conflicts(specs)
+    if preloaded_conflicts:
+        return _InstallResult(
+            False,
+            "",
+            _preloaded_stale_module_reason(preloaded_conflicts),
+        )
+
     target = _lazy_install_target()
     constraints: Optional[Path] = None
+    # Keep the exact security override in a separate transaction.  In
+    # particular, a durable target may be paired with a stale core venv, and
+    # uv/pip invoked outside the project do not consume pyproject's
+    # override-dependencies.  The ordinary Discord requirements intentionally
+    # omit discord.py's stale [voice] metadata; the exact transaction still
+    # makes the security invariant explicit and repairs pre-existing installs.
+    # Match the managed override by normalized distribution name and exact
+    # version, not by spelling. Pip/metadata accept case and ``-_.``
+    # variations (for example ``pynacl==1.6.2``), and leaving one of those
+    # spellings in the regular resolver transaction can reintroduce the
+    # discord.py voice upper bound before the exact repair runs.
+    override_specs = tuple(
+        spec
+        for spec in specs
+        if _normalize_distribution_name(_pkg_name_from_spec(spec))
+        == _normalize_distribution_name(_pkg_name_from_spec(_PYNACL_SECURITY_SPEC))
+        and _specifier_from_spec(spec) == "==1.6.2"
+    )
+    regular_specs = tuple(spec for spec in specs if spec not in override_specs)
 
     if target is not None:
+        # Create/validate the target and clear ABI-incompatible contents before
+        # inspecting ownership. A stale target-only distribution is then
+        # eligible for repair; a stale core distribution remains protected by
+        # the append-only sys.path invariant.
         err = _ensure_target_ready(target)
         if err:
             return _InstallResult(False, "", err)
-        constraints = _core_constraints_file()
+        # An append-only durable target cannot override a package that is
+        # already present in the sealed/core venv. Excluding these packages
+        # from the generated constraints lets the resolver proceed when the
+        # core version is absent or already compatible; this preflight makes
+        # an incompatible core-owned package fail closed instead of silently
+        # winning over the requested target version at import time.
+        stale_core_specs = tuple(
+            spec
+            for spec in specs
+            if (
+                _is_present(spec)
+                and not _is_satisfied(spec)
+                and not _distribution_is_target_owned(spec, target)
+            )
+        )
+        if stale_core_specs:
+            return _InstallResult(
+                False,
+                "",
+                "core package(s) "
+                f"{', '.join(stale_core_specs)} must be repaired before "
+                "durable lazy install; append-only sys.path cannot replace "
+                "them, so refresh the core environment before enabling this "
+                "feature",
+            )
+        constraints = _core_constraints_file(
+            tuple(_pkg_name_from_spec(spec) for spec in specs)
+        )
 
     target_args: list[str] = []
     if target is not None:
@@ -734,6 +1138,32 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
     constraint_args: list[str] = []
     if constraints is not None:
         constraint_args = ["--constraint", str(constraints)]
+
+    def _security_specs_satisfied() -> bool:
+        """Re-read the active environment's exact security override state."""
+        try:
+            import importlib
+            importlib.invalidate_caches()
+            import importlib.metadata as _md
+            if hasattr(_md, "_cache_clear"):
+                _md._cache_clear()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        if not override_specs:
+            return True
+        # PyNaCl imports cffi at runtime. The exact --no-deps retry cannot
+        # supply that transitive dependency, so do not report a repaired
+        # Discord feature unless cffi is present too.
+        return all(_is_satisfied(spec) for spec in override_specs) and _is_present(
+            "cffi"
+        )
+
+    project_root = Path(__file__).resolve().parents[1]
+    project_args = (
+        ["--project", str(project_root)]
+        if (project_root / "pyproject.toml").is_file()
+        else []
+    )
 
     try:
         venv_root = Path(sys.executable).parent.parent
@@ -756,21 +1186,90 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
             uv_bin = shutil.which("uv")
         if uv_bin:
             try:
-                r = subprocess.run(
-                    [uv_bin, "pip", "install", *target_args, *constraint_args, *specs],
-                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=windows_hide_flags(),
+                stdout = ""
+                stderr = ""
+                transactions = (
+                    ((regular_specs, constraint_args), (override_specs, []))
+                    if override_specs
+                    else ((regular_specs, constraint_args),)
                 )
-                if r.returncode == 0:
-                    if target is not None:
-                        _activate_target_on_syspath(target)
-                    return _InstallResult(True, r.stdout or "", r.stderr or "")
-                logger.debug("uv pip install failed: %s", r.stderr)
-                # A resolver failure is authoritative. Falling through to pip
-                # here would silently discard uv policy such as exclude-newer
-                # and could install a release that the project quarantined.
-                return _InstallResult(False, r.stdout or "", r.stderr or "")
+                for transaction_specs, transaction_constraints in transactions:
+                    if not transaction_specs:
+                        continue
+                    r = subprocess.run(
+                        [
+                            uv_bin,
+                            "pip",
+                            "install",
+                            *project_args,
+                            *target_args,
+                            *transaction_constraints,
+                            *transaction_specs,
+                        ],
+                        capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout, env=uv_env,
+                        stdin=subprocess.DEVNULL,
+                        creationflags=windows_hide_flags(),
+                    )
+                    stdout += r.stdout or ""
+                    stderr += r.stderr or ""
+                    if r.returncode != 0:
+                        if transaction_specs == override_specs and override_specs:
+                            # A failed resolver/network attempt must not leave
+                            # the feature looking repaired. Retry the exact
+                            # package without dependency resolution: this is
+                            # both a useful transient-network recovery and a
+                            # final guard against discord.py's stale voice
+                            # upper bound re-entering the transaction.
+                            retry = subprocess.run(
+                                [
+                                    uv_bin,
+                                    "pip",
+                                    "install",
+                                    "--no-deps",
+                                    *project_args,
+                                    *target_args,
+                                    *override_specs,
+                                ],
+                                capture_output=True,
+                                text=True,
+                                encoding="utf-8",
+                                errors="replace",
+                                timeout=timeout,
+                                env=uv_env,
+                                stdin=subprocess.DEVNULL,
+                                creationflags=windows_hide_flags(),
+                            )
+                            stdout += retry.stdout or ""
+                            stderr += retry.stderr or ""
+                            if retry.returncode == 0:
+                                if target is not None:
+                                    _activate_target_on_syspath(target)
+                                if _security_specs_satisfied():
+                                    continue
+                            if not _security_specs_satisfied():
+                                stderr += (
+                                    "\nExact PyNaCl security repair failed or "
+                                    "the active environment remains below "
+                                    "PyNaCl==1.6.2 or is missing runtime cffi."
+                                )
+                        logger.debug("uv pip install failed: %s", r.stderr)
+                        # A resolver failure is authoritative. Falling through
+                        # to pip here would silently discard uv policy such as
+                        # exclude-newer and could install a quarantined release.
+                        return _InstallResult(False, stdout, stderr)
+                    if transaction_specs == override_specs and override_specs:
+                        if target is not None:
+                            _activate_target_on_syspath(target)
+                        if not _security_specs_satisfied():
+                            stderr += (
+                                "\nExact PyNaCl security repair succeeded but "
+                                "the active environment is missing PyNaCl's "
+                                "runtime cffi dependency."
+                            )
+                            return _InstallResult(False, stdout, stderr)
+                if target is not None:
+                    _activate_target_on_syspath(target)
+                return _InstallResult(True, stdout, stderr)
             except subprocess.TimeoutExpired as e:
                 logger.debug("uv invocation failed: %s", e)
                 return _InstallResult(False, "", f"uv pip install timed out: {e}")
@@ -803,16 +1302,80 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
                 return _InstallResult(False, "",
                                       f"pip not available and ensurepip failed: {e}")
 
+        pip_ok, pip_error = _ensure_pip_floor(pip_cmd, timeout=120)
+        if not pip_ok:
+            return _InstallResult(False, "", pip_error)
+
+        # Apply the same split transaction strategy as uv above.  In
+        # particular, skip an empty regular transaction when PyNaCl is the
+        # only missing spec; ``pip install`` with no requirements fails before
+        # the exact security repair can run.
         try:
-            r = subprocess.run(
-                pip_cmd + ["install", *target_args, *constraint_args, *specs],
-                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
-                stdin=subprocess.DEVNULL,
-                creationflags=windows_hide_flags(),
-            )
-            if r.returncode == 0 and target is not None:
+            stdout = ""
+            stderr = ""
+            if regular_specs:
+                r = subprocess.run(
+                    pip_cmd + ["install", *target_args, *constraint_args, *regular_specs],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
+                )
+                stdout += r.stdout or ""
+                stderr += r.stderr or ""
+                if r.returncode != 0:
+                    return _InstallResult(False, stdout, stderr)
+            if override_specs:
+                override = subprocess.run(
+                    pip_cmd + ["install", *target_args, *override_specs],
+                    capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
+                    stdin=subprocess.DEVNULL,
+                    creationflags=windows_hide_flags(),
+                )
+                stdout += override.stdout or ""
+                stderr += override.stderr or ""
+                if override.returncode != 0:
+                    # The regular transaction is deliberately allowed to
+                    # complete before this exact repair, but a failed second
+                    # step must be retried and verified rather than returning
+                    # a successful install with a vulnerable PyNaCl left in
+                    # the venv.  ``--no-deps`` avoids re-entering stale voice
+                    # metadata on the repair attempt.
+                    retry = subprocess.run(
+                        pip_cmd + ["install", "--no-deps", *target_args, *override_specs],
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=timeout,
+                        stdin=subprocess.DEVNULL,
+                        creationflags=windows_hide_flags(),
+                    )
+                    stdout += retry.stdout or ""
+                    stderr += retry.stderr or ""
+                    if retry.returncode == 0:
+                        if target is not None:
+                            _activate_target_on_syspath(target)
+                        if _security_specs_satisfied():
+                            return _InstallResult(True, stdout, stderr)
+                    if not _security_specs_satisfied():
+                        stderr += (
+                            "\nExact PyNaCl security repair failed or the active "
+                            "environment remains below PyNaCl==1.6.2 or is missing "
+                            "runtime cffi."
+                        )
+                    return _InstallResult(False, stdout, stderr)
+                if target is not None:
+                    _activate_target_on_syspath(target)
+                if not _security_specs_satisfied():
+                    stderr += (
+                        "\nExact PyNaCl security repair succeeded but the "
+                        "active environment is missing PyNaCl's runtime cffi "
+                        "dependency."
+                    )
+                    return _InstallResult(False, stdout, stderr)
+            if target is not None:
                 _activate_target_on_syspath(target)
-            return _InstallResult(r.returncode == 0, r.stdout or "", r.stderr or "")
+            return _InstallResult(True, stdout, stderr)
         except subprocess.TimeoutExpired as e:
             return _InstallResult(False, "", f"pip install timed out: {e}")
         except Exception as e:
@@ -862,6 +1425,14 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     missing = feature_missing(feature)
     if not missing:
         return
+
+    preloaded_conflicts = _preloaded_stale_module_conflicts(missing)
+    if preloaded_conflicts:
+        raise FeatureUnavailable(
+            feature,
+            missing,
+            _preloaded_stale_module_reason(preloaded_conflicts),
+        )
 
     unsupported = _unsupported_feature_reason(feature)
     if unsupported:
@@ -1054,6 +1625,13 @@ def install_specs(specs: list[str] | tuple[str, ...], *, timeout: int = 300) -> 
                 ok=False, blocked=True,
                 reason=f"refusing to install unsafe spec {spec!r}",
             )
+        security_error = _security_install_spec_error(spec)
+        if security_error is not None:
+            return InstallSpecsResult(
+                ok=False,
+                blocked=True,
+                reason=f"refusing to install insecure spec {spec!r}: {security_error}",
+            )
 
     if not _allow_lazy_installs():
         target = _lazy_install_target()
@@ -1130,6 +1708,8 @@ def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:
         ``"failed: <reason>"`` — install attempt failed; caller decides
                                   whether to surface it (we don't raise)
         ``"skipped: <reason>"`` — gated off (config flag, user decline)
+        ``"restart-required: <reason>"`` — a stale loaded module requires a
+                                             fresh Hermes process
 
     Intended for ``hermes update``. Never raises; lazy-install failures
     here must not block the rest of the update flow.
@@ -1182,6 +1762,8 @@ def _refresh_features(
                 or e.reason.startswith("unsupported ")
             ):
                 results[feature] = f"skipped: {e.reason}"
+            elif e.reason.startswith("restart required before lazy repair:"):
+                results[feature] = f"restart-required: {e.reason}"
             else:
                 results[feature] = f"failed: {e.reason}"
         except Exception as e:
@@ -1235,7 +1817,7 @@ def ensure_and_bind(
 
     try:
         bindings = importer()
-    except ImportError:
+    except Exception:
         return False
 
     target_globals.update(bindings)

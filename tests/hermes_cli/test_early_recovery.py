@@ -283,7 +283,11 @@ def test_repair_install_falls_back_to_break_system_packages_without_uv(
         class R:
             returncode = 0
             stderr = ""
-            stdout = ""
+            stdout = (
+                "pip 26.1.2 from /venv/site-packages/pip"
+                if "--version" in cmd
+                else ""
+            )
 
         return R()
 
@@ -317,7 +321,11 @@ def test_repair_install_uses_plain_pip_when_not_externally_managed(
         class R:
             returncode = 0
             stderr = ""
-            stdout = ""
+            stdout = (
+                "pip 26.1.2 from /venv/site-packages/pip"
+                if "--version" in cmd
+                else ""
+            )
 
         return R()
 
@@ -535,9 +543,6 @@ def test_bump_marker_attempts_handles_missing_and_corrupt_bodies(tmp_path):
 
     m.write_text('{"attempts": 2}', encoding="utf-8")
     assert ir.bump_marker_attempts(m) == 3
-
-
-
 
 
 

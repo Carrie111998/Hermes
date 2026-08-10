@@ -31,6 +31,7 @@ import json
 import logging
 import os
 import re
+import threading
 import traceback
 import uuid
 from datetime import datetime, timezone
@@ -93,6 +94,68 @@ except Exception:
     dingtalk_robot_models = None
     open_api_models = None
     tea_util_models = None
+
+
+def _load_optional_card_sdk() -> bool:
+    """Rebind the optional AI-card/OpenAPI SDK globals after lazy install."""
+    global CARD_SDK_AVAILABLE
+    global dingtalk_card_client, dingtalk_card_models
+    global dingtalk_robot_client, dingtalk_robot_models
+    global open_api_models, tea_util_models
+    try:
+        from alibabacloud_dingtalk.card_1_0 import (
+            client as _card_client,
+            models as _card_models,
+        )
+        from alibabacloud_dingtalk.robot_1_0 import (
+            client as _robot_client,
+            models as _robot_models,
+        )
+        from alibabacloud_tea_openapi import models as _open_api_models
+        from alibabacloud_tea_util import models as _tea_util_models
+    except Exception:
+        # Keep the last known-good bindings alive for adapters already using
+        # them.  The caller receives False and can keep the optional feature
+        # disabled for a new adapter; tearing down process globals here would
+        # break healthy profiles that reconnect concurrently.
+        return False
+    dingtalk_card_client = _card_client
+    dingtalk_card_models = _card_models
+    dingtalk_robot_client = _robot_client
+    dingtalk_robot_models = _robot_models
+    open_api_models = _open_api_models
+    tea_util_models = _tea_util_models
+    CARD_SDK_AVAILABLE = True
+    return True
+
+
+# Active verification may run from concurrent profile reconnects.  Serialize
+# the optional package transaction and cache its result so waiting adapters do
+# not launch duplicate pip/uv repairs against the same environment.
+_CARD_DEPS_LOCK = threading.Lock()
+_CARD_DEPS_REPAIR_RESULT: Optional[bool] = None
+
+
+def ensure_dingtalk_card_deps() -> bool:
+    """Install and bind the optional card SDK when cards are configured."""
+    global _CARD_DEPS_REPAIR_RESULT
+    if CARD_SDK_AVAILABLE:
+        return True
+    with _CARD_DEPS_LOCK:
+        if CARD_SDK_AVAILABLE:
+            return True
+        if _CARD_DEPS_REPAIR_RESULT is not None:
+            return _CARD_DEPS_REPAIR_RESULT
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+
+            _lazy_ensure("platform.dingtalk_card", prompt=False)
+        except Exception as exc:
+            logger.debug("DingTalk card SDK is unavailable: %s", exc)
+            _CARD_DEPS_REPAIR_RESULT = False
+            return False
+        _CARD_DEPS_REPAIR_RESULT = _load_optional_card_sdk()
+        return _CARD_DEPS_REPAIR_RESULT
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns
@@ -171,13 +234,41 @@ def dingtalk_deps_present() -> bool:
     and runs from ``create_adapter()`` when this returns False (#79812).
     Credentials are gated separately via ``is_connected``/``validate_config``.
     """
-    return DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE
+    return (
+        DINGTALK_STREAM_AVAILABLE
+        and HTTPX_AVAILABLE
+        and not _DINGTALK_ACTIVE_CHECK_FAILED
+    )
+
+
+_DINGTALK_ACTIVE_CHECK_FAILED = False
+_DINGTALK_ACTIVE_CHECK_LOCK = threading.Lock()
+
+
+def _clear_dingtalk_bindings() -> None:
+    """Record failed verification without tearing down live bindings.
+
+    SDK modules are process-global while adapters are per profile.  A failed
+    repair for a new profile must fail closed for that candidate, but cannot
+    invalidate module objects still used by healthy adapters.
+    """
+    global _DINGTALK_ACTIVE_CHECK_FAILED
+    _DINGTALK_ACTIVE_CHECK_FAILED = True
 
 
 def ensure_dingtalk_deps() -> bool:
+    # Stream/HTTPX bindings and the availability latch are process-global;
+    # serialize active repair so concurrent profile checks cannot interleave
+    # a failed latch update with a successful rebind.
+    with _DINGTALK_ACTIVE_CHECK_LOCK:
+        return _ensure_dingtalk_deps()
+
+
+def _ensure_dingtalk_deps() -> bool:
     """ACTIVE deps-only installer (registry ``ensure_deps_fn``).
 
-    Lazy-installs dingtalk-stream/httpx and rebinds module globals.
+    Runs the feature contract on every active check so stale security pins are
+    repaired or fail closed, then rebinds module globals.
     Deliberately does NOT check credentials — ``ensure_deps_fn``'s contract
     is deps-only ("Returns True once deps are importable"); credentials are
     gated by ``is_connected``/``validate_config``.  Otherwise a platform
@@ -188,12 +279,12 @@ def ensure_dingtalk_deps() -> bool:
     """
     global DINGTALK_STREAM_AVAILABLE, dingtalk_stream, ChatbotMessage, CallbackMessage, AckMessage
     global HTTPX_AVAILABLE, httpx
-    if DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE:
-        return True
+    global _DINGTALK_ACTIVE_CHECK_FAILED
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("platform.dingtalk", prompt=False)
     except Exception:
+        _clear_dingtalk_bindings()
         return False
     try:
         import dingtalk_stream as _ds
@@ -201,15 +292,20 @@ def ensure_dingtalk_deps() -> bool:
         from dingtalk_stream.frames import CallbackMessage as _CBM, AckMessage as _AM
         import httpx as _httpx
     except Exception:
+        _clear_dingtalk_bindings()
         return False
     dingtalk_stream = _ds
     ChatbotMessage = _CM
     CallbackMessage = _CBM
     AckMessage = _AM
     httpx = _httpx
+    # The card/OpenAPI SDK is an optional capability.  A missing or broken
+    # card dependency must not take down the core Stream Mode transport.
+    _load_optional_card_sdk()
     DINGTALK_STREAM_AVAILABLE = True
     HTTPX_AVAILABLE = True
-    return True
+    _DINGTALK_ACTIVE_CHECK_FAILED = False
+    return DINGTALK_STREAM_AVAILABLE and HTTPX_AVAILABLE
 
 
 def check_dingtalk_requirements() -> bool:
@@ -296,6 +392,10 @@ class DingTalkAdapter(BasePlatformAdapter):
         # multiple conversations run concurrently.
         self._message_contexts: Dict[str, Any] = {}
         self._card_template_id: Optional[str] = extra.get("card_template_id")
+        # A missing optional card SDK must not block the event loop or cause a
+        # long package-manager retry on every reconnect. One attempted repair
+        # per adapter lifetime is enough; a later process restart can retry.
+        self._card_sdk_attempted = False
 
         # Chats for which we've already fired the Done reaction — prevents
         # double-firing across segment boundaries or parallel flows
@@ -346,6 +446,22 @@ class DingTalkAdapter(BasePlatformAdapter):
                 self._client_id, self._client_secret
             )
             self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
+
+            # AI cards are an optional capability.  Do not make the core
+            # Stream Mode transport depend on their SDK; install it only for
+            # an adapter explicitly configured with a card template.
+            if (
+                self._card_template_id
+                and not CARD_SDK_AVAILABLE
+                and not self._card_sdk_attempted
+            ):
+                self._card_sdk_attempted = True
+                if not await asyncio.to_thread(ensure_dingtalk_card_deps):
+                    logger.warning(
+                        "[%s] DingTalk card SDK unavailable; continuing "
+                        "without card streaming",
+                        self.name,
+                    )
 
             # Initialize card SDK if available and configured
             if CARD_SDK_AVAILABLE and self._card_template_id:

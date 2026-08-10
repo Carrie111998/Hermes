@@ -20,6 +20,7 @@ import subprocess
 import sys
 import sysconfig
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -104,6 +105,85 @@ class TestAbiStamp:
         finally:
             os.chmod(ro_parent, 0o700)  # let pytest clean up
 
+    def test_unstamped_nonempty_target_is_cleared_and_stamped(self, tmp_path):
+        target = tmp_path / "lazy"
+        target.mkdir()
+        (target / "untrusted-package").mkdir()
+        (target / "untrusted-package" / "module.py").write_text(
+            "SENTINEL = True\n", encoding="utf-8"
+        )
+
+        assert ld._ensure_target_ready(target) is None
+        assert not (target / "untrusted-package").exists()
+        assert (
+            (target / ld._TARGET_STAMP_NAME).read_text().strip()
+            == ld._python_abi_tag()
+        )
+
+    def test_stale_abi_target_is_wiped_before_stamp_rewrite(self, tmp_path):
+        target = tmp_path / "lazy"
+        target.mkdir()
+        (target / ld._TARGET_STAMP_NAME).write_text("stale-abi", encoding="utf-8")
+        (target / "stale-package").mkdir()
+
+        assert ld._ensure_target_ready(target) is None
+        assert not (target / "stale-package").exists()
+        assert (
+            (target / ld._TARGET_STAMP_NAME).read_text().strip()
+            == ld._python_abi_tag()
+        )
+
+    def test_symlink_target_is_rejected_without_wiping_link_target(self, tmp_path):
+        victim = tmp_path / "victim"
+        victim.mkdir()
+        sentinel = victim / "sentinel"
+        sentinel.write_text("keep", encoding="utf-8")
+        target = tmp_path / "lazy"
+        target.symlink_to(victim, target_is_directory=True)
+
+        error = ld._ensure_target_ready(target)
+
+        assert error is not None
+        assert "must not be a symlink" in error
+        assert sentinel.read_text(encoding="utf-8") == "keep"
+        assert not (victim / ld._TARGET_STAMP_NAME).exists()
+
+
+class TestDurableTargetActivation:
+    def test_activation_runs_readiness_before_append(self, tmp_path, monkeypatch):
+        target = tmp_path / "lazy"
+        target.mkdir()
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        calls = []
+        monkeypatch.setattr(
+            ld, "_ensure_target_ready", lambda _target: calls.append("ready") or None
+        )
+        monkeypatch.setattr(
+            ld, "_activate_target_on_syspath", lambda _target: calls.append("append")
+        )
+
+        ld.activate_durable_lazy_target()
+
+        assert calls == ["ready", "append"]
+
+    def test_activation_refuses_unready_target(self, tmp_path, monkeypatch):
+        target = tmp_path / "lazy"
+        target.mkdir()
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        calls = []
+        monkeypatch.setattr(
+            ld,
+            "_ensure_target_ready",
+            lambda _target: "lazy install target could not be cleared",
+        )
+        monkeypatch.setattr(
+            ld, "_activate_target_on_syspath", lambda _target: calls.append("append")
+        )
+
+        ld.activate_durable_lazy_target()
+
+        assert calls == []
+
 
 # ---------------------------------------------------------------------------
 # sys.path append ordering (the core-wins invariant, unit level)
@@ -137,6 +217,23 @@ class TestSysPathAppend:
         finally:
             sys.path[:] = saved
 
+    def test_activation_does_not_execute_target_pth_code(self, tmp_path):
+        target = tmp_path / "lazy"
+        target.mkdir()
+        marker = tmp_path / "pth-ran"
+        (target / "untrusted.pth").write_text(
+            f"import pathlib; pathlib.Path({str(marker)!r}).write_text('ran')\n",
+            encoding="utf-8",
+        )
+        saved = list(sys.path)
+        try:
+            ld._activate_target_on_syspath(target)
+            assert str(target) in sys.path
+            assert sys.path.index(str(target)) >= len(saved)
+            assert not marker.exists()
+        finally:
+            sys.path[:] = saved
+
 
 # ---------------------------------------------------------------------------
 # Install path: arg construction (network-free) + a real install (opt-in).
@@ -160,7 +257,9 @@ class TestInstallArgConstruction:
         def fake_run(cmd, *a, **k):
             # The pip --version probe must look healthy so we reach install.
             if "--version" in cmd:
-                return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+                return subprocess.CompletedProcess(
+                    cmd, 0, "pip 26.1.2 from /venv/site-packages/pip", ""
+                )
             captured["cmd"] = cmd
             return subprocess.CompletedProcess(cmd, 0, "ok", "")
 
@@ -179,6 +278,168 @@ class TestInstallArgConstruction:
         # ...and the spec is last.
         assert cmd[-1] == "somepkg==1.2.3"
 
+    def test_core_constraints_exclude_stale_pynacl_override(self, monkeypatch):
+        """A stale core PyNaCl pin must not block the exact repair transaction."""
+        distributions = [
+            SimpleNamespace(metadata={"Name": "PyNaCl"}, version="1.5.0"),
+            SimpleNamespace(metadata={"Name": "aiohttp"}, version="3.14.3"),
+        ]
+        monkeypatch.setattr(
+            "importlib.metadata.distributions", lambda: distributions
+        )
+
+        constraints = ld._core_constraints_file()
+        assert constraints is not None
+        try:
+            content = constraints.read_text(encoding="utf-8")
+        finally:
+            constraints.unlink(missing_ok=True)
+
+        assert "pynacl" not in content.lower()
+        assert "aiohttp==3.14.3" in content
+
+    def test_core_constraints_exclude_explicit_backend_pins(self, monkeypatch):
+        """Explicit backend specs must not inherit conflicting core pins."""
+        distributions = [
+            SimpleNamespace(metadata={"Name": "davey"}, version="0.1.6"),
+            SimpleNamespace(metadata={"Name": "aiohttp"}, version="3.14.2"),
+            SimpleNamespace(metadata={"Name": "slack-bolt"}, version="1.27.0"),
+            SimpleNamespace(metadata={"Name": "slack-sdk"}, version="3.40.1"),
+            SimpleNamespace(metadata={"Name": "packaging"}, version="25.0"),
+        ]
+        monkeypatch.setattr(
+            "importlib.metadata.distributions", lambda: distributions
+        )
+
+        constraints = ld._core_constraints_file(
+            ("davey==0.1.4", "aiohttp==3.14.3", "slack-bolt==1.29.0", "slack-sdk==3.43.0")
+        )
+        assert constraints is not None
+        try:
+            content = constraints.read_text(encoding="utf-8")
+        finally:
+            constraints.unlink(missing_ok=True)
+
+        assert "packaging==25.0" in content
+        for package in ("davey", "aiohttp", "slack-bolt", "slack-sdk"):
+            assert not any(line.lower().startswith(f"{package}==") for line in content.splitlines())
+
+    def test_core_constraints_normalize_underscore_and_hyphen_names(self, monkeypatch):
+        """PEP 503-equivalent spellings must exclude the same core pin."""
+        distributions = [
+            SimpleNamespace(metadata={"Name": "slack_sdk"}, version="3.40.1"),
+            SimpleNamespace(metadata={"Name": "davey"}, version="0.1.6"),
+        ]
+        monkeypatch.setattr(
+            "importlib.metadata.distributions", lambda: distributions
+        )
+
+        constraints = ld._core_constraints_file(("slack-sdk==3.43.0",))
+        assert constraints is not None
+        try:
+            content = constraints.read_text(encoding="utf-8")
+        finally:
+            constraints.unlink(missing_ok=True)
+
+        assert "slack_sdk==3.40.1" not in content
+        assert "davey==0.1.6" in content
+
+    def test_core_constraints_skip_unsafe_metadata(self, monkeypatch):
+        """Metadata cannot inject pip options or unstable constraint pins."""
+        distributions = [
+            SimpleNamespace(
+                metadata={"Name": "--index-url https://evil.example/simple"},
+                version="1.0",
+            ),
+            SimpleNamespace(metadata={"Name": "unsafe-name"}, version="1.2.3.dev1"),
+            SimpleNamespace(metadata={"Name": "safe_package"}, version="1.2.3.post1"),
+        ]
+        monkeypatch.setattr(
+            "importlib.metadata.distributions", lambda: distributions
+        )
+
+        constraints = ld._core_constraints_file()
+        assert constraints is not None
+        try:
+            content = constraints.read_text(encoding="utf-8")
+        finally:
+            constraints.unlink(missing_ok=True)
+
+        assert "--index-url" not in content
+        assert "evil.example" not in content
+        assert "unsafe-name" not in content
+        assert "safe-package==1.2.3.post1" in content
+
+    def test_durable_install_rejects_stale_core_backend_specs(self, monkeypatch, tmp_path):
+        """Append-only targets must not claim to repair stale core packages."""
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(tmp_path / "lazy"))
+        # This regression targets durable-target ownership, not the separate
+        # restart boundary for already-loaded stale modules.
+        monkeypatch.setattr(ld, "_preloaded_stale_module_conflicts", lambda _specs: ())
+        stale = {"davey", "aiohttp", "slack-bolt", "slack-sdk"}
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) in stale,
+        )
+        monkeypatch.setattr(ld, "_is_satisfied", lambda _spec: False)
+        monkeypatch.setattr(
+            ld,
+            "_ensure_target_ready",
+            lambda _target: None,
+        )
+
+        result = ld._venv_pip_install(
+            (
+                "davey==0.1.4",
+                "aiohttp==3.14.3",
+                "slack-bolt==1.29.0",
+                "slack-sdk==3.43.0",
+            )
+        )
+
+        assert result.success is False
+        assert "core package(s)" in result.stderr
+        assert "must be repaired before durable lazy install" in result.stderr
+        assert "append-only sys.path" in result.stderr
+        assert "davey==0.1.4" in result.stderr
+
+    def test_durable_install_repairs_target_owned_stale_distribution(
+        self, monkeypatch, tmp_path
+    ):
+        """A stale package already in the target is repairable in place."""
+        target = tmp_path / "lazy"
+        dist_info = target / "stale_pkg-0.5.0.dist-info"
+        dist_info.mkdir(parents=True)
+        (dist_info / "METADATA").write_text(
+            "Metadata-Version: 2.1\nName: stale-pkg\nVersion: 0.5.0\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        monkeypatch.syspath_prepend(str(target))
+        monkeypatch.setattr(ld.shutil, "which", lambda _: None)
+        monkeypatch.setattr(
+            "hermes_cli.managed_uv.resolve_uv", lambda: None
+        )
+        captured = {}
+
+        def fake_run(cmd, *args, **kwargs):
+            if "--version" in cmd:
+                return subprocess.CompletedProcess(
+                    cmd, 0, "pip 26.1.2 from /venv/site-packages/pip", ""
+                )
+            captured["cmd"] = cmd
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+        monkeypatch.setattr(ld, "_activate_target_on_syspath", lambda _t: None)
+
+        result = ld._venv_pip_install(("stale-pkg==1.0.0",))
+
+        assert result.success, result.stderr
+        assert captured["cmd"][-1] == "stale-pkg==1.0.0"
+        assert "core package(s)" not in result.stderr
+
     def test_no_target_args_in_venv_scoped_mode(self, monkeypatch):
         # Env unset → plain venv-scoped install, no --target / --constraint.
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
@@ -187,7 +448,9 @@ class TestInstallArgConstruction:
 
         def fake_run(cmd, *a, **k):
             if "--version" in cmd:
-                return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+                return subprocess.CompletedProcess(
+                    cmd, 0, "pip 26.1.2 from /venv/site-packages/pip", ""
+                )
             captured["cmd"] = cmd
             return subprocess.CompletedProcess(cmd, 0, "ok", "")
 

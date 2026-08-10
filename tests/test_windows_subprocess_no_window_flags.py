@@ -392,6 +392,7 @@ def test_lazy_deps_uv_install_hides_console_window(monkeypatch):
     assert len(spawns) == 1, captured
     cmd, kwargs = spawns[0]
     assert cmd[:3] == ["/usr/bin/uv", "pip", "install"]
+    assert "--project" in cmd
     assert kwargs["creationflags"] == _CREATE_NO_WINDOW
     assert kwargs["stdin"] == subprocess.DEVNULL
 

@@ -36,6 +36,10 @@ def _args(**over):
 
 
 def _wire_common(main_mod, monkeypatch):
+    # Dashboard startup now rechecks the lazy dependency contract before
+    # importing FastAPI.  These tests isolate web-dist validation, so keep
+    # that dependency policy out of their filesystem assertions.
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
     monkeypatch.setattr(
         "hermes_cli.profiles.get_active_profile_name", lambda: "default"
     )
@@ -138,7 +142,6 @@ def test_skip_build_missing_dist_attempts_one_recovery_build(
 # ---------------------------------------------------------------------------
 # Desktop-inherited env isolation (issue #52945 / supersedes #52948, #67402)
 # ---------------------------------------------------------------------------
-
 
 
 

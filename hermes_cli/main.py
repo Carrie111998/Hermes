@@ -66,7 +66,7 @@ except ModuleNotFoundError:
 # any dependency touching ``platform.uname()`` at import time flashes a
 # visible console when this process is windowless (pythonw gateway + every
 # kanban worker).  No-op on POSIX; never raises.
-from hermes_cli._subprocess_compat import suppress_platform_ver_console
+from hermes_cli._subprocess_compat import suppress_platform_ver_console, windows_hide_flags
 from hermes_cli.cli_output import line_input
 
 suppress_platform_ver_console()
@@ -96,6 +96,7 @@ from hermes_cli import _startup_fast  # noqa: E402
 # either. It is also the canonical home of the probe/repair tables reused by
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
+from hermes_cli import _pip_security
 
 try:
     _early_recovery_mod.recover_if_needed()
@@ -9364,6 +9365,82 @@ _LAZY_REFRESH_REPAIR_PACKAGES: dict[str, str] = (
 )
 
 
+def _direct_pip_prefix(command: list[str]) -> list[str] | None:
+    """Extract the full interpreter prefix ending at the ``-m pip`` marker."""
+    for index in range(len(command) - 1):
+        if command[index : index + 2] == ["-m", "pip"]:
+            return command[: index + 2]
+    return None
+
+
+def _is_direct_pip_prefix(prefix: list[str]) -> bool:
+    """Return whether an install prefix invokes this interpreter's pip."""
+    return _direct_pip_prefix(prefix) == prefix
+
+
+def _ensure_direct_pip_floor(
+    install_cmd_prefix: list[str],
+    *,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Bootstrap and verify a direct-pip install target before use.
+
+    uv prefixes do not need this guard.  Direct prefixes may point at a venv
+    without pip (``uv venv`` deliberately omits it), so restore pip with
+    ensurepip before asking the shared floor helper to upgrade and verify it.
+    """
+    if not _is_direct_pip_prefix(install_cmd_prefix):
+        return
+
+    pip_cmd = list(install_cmd_prefix)
+    try:
+        probe = subprocess.run(
+            pip_cmd + ["--version"],
+            cwd=PROJECT_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _pip_security.PipFloorError(f"pip security floor unavailable: {exc}") from exc
+    if probe.returncode != 0:
+        try:
+            subprocess.run(
+                pip_cmd[:-2]
+                + ["-m", "ensurepip", "--upgrade", "--default-pip"],
+                cwd=PROJECT_ROOT,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=120,
+                check=True,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise _pip_security.PipFloorError(
+                f"pip security floor unavailable: ensurepip failed: {exc}"
+            ) from exc
+
+    ok, detail = _pip_security.ensure_pip_floor(
+        pip_cmd,
+        runner=subprocess.run,
+        creationflags=windows_hide_flags(),
+        cwd=str(PROJECT_ROOT),
+        env=env,
+    )
+    if not ok:
+        raise _pip_security.PipFloorError(f"pip security floor unavailable: {detail}")
+
+
 def _run_package_only_install(
     cmd: list[str],
     *,
@@ -9375,6 +9452,9 @@ def _run_package_only_install(
     rewrite ``hermes.exe``. The editable-install quarantine path would rename
     shims without uv recreating them on Windows (#57828).
     """
+    direct_pip_prefix = _direct_pip_prefix(cmd)
+    if direct_pip_prefix is not None:
+        _ensure_direct_pip_floor(direct_pip_prefix, env=env)
     _run_install_with_heartbeat(cmd, env=env)
 
 
@@ -9513,7 +9593,7 @@ def _repair_broken_lazy_refresh_imports(
             install_cmd_prefix + ["install", "--force-reinstall", *specs],
             env=env,
         )
-    except subprocess.CalledProcessError as exc:
+    except (subprocess.CalledProcessError, _pip_security.PipFloorError) as exc:
         logger.warning("lazy refresh venv repair failed: %s", exc)
         return False
 
@@ -9645,6 +9725,10 @@ def _install_python_dependencies_with_optional_fallback(
     installs (#71510 fixed the ZIP path, #83335 fixed lazy-deps; this closes the
     shared helper for the remaining callers).
     """
+    # Every direct-pip branch, including update repair and interrupted-install
+    # recovery, must prove the stable pip security floor before installing any
+    # project dependency.  uv-managed branches remain on uv's resolver path.
+    _ensure_direct_pip_floor(install_cmd_prefix, env=env)
     scripts_dir = _venv_scripts_dir() if _is_windows() else None
 
     # A pip / site-packages install has no PROJECT_ROOT/venv; the caller still
@@ -11639,6 +11723,18 @@ def cmd_dashboard(args):
         _setup_logging_gui(mode="gui")
     except Exception:
         pass
+
+    # Re-check the complete dashboard contract before importing the modules.
+    # FastAPI can remain importable while its Starlette dependency is stale;
+    # relying on ImportError alone would then skip the security-floor repair.
+    try:
+        from tools.lazy_deps import ensure as _ensure_dashboard_deps
+
+        _ensure_dashboard_deps("tool.dashboard", prompt=False)
+    except Exception as e:
+        print("Web UI dependency security contract is unavailable.")
+        print(f"Dashboard dependency check failed: {e}")
+        sys.exit(1)
 
     try:
         import fastapi  # noqa: F401

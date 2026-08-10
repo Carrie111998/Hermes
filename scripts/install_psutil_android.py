@@ -24,6 +24,8 @@ https://github.com/giampaolo/psutil/pull/2762 and ships a release.
 from __future__ import annotations
 
 import argparse
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -42,12 +44,44 @@ from hermes_cli.psutil_android import (
     PsutilAndroidInstallError,
     prepare_patched_psutil_sdist,
 )
-
+from hermes_cli import _pip_security
+from hermes_cli._subprocess_compat import windows_hide_flags
 
 
 def _resolve_install_cmd(pip_arg: str | None, prefer_uv: bool) -> list[str]:
     if pip_arg:
-        return pip_arg.split()
+        try:
+            parts = shlex.split(pip_arg)
+        except ValueError as exc:
+            raise SystemExit(f"invalid --pip command quoting: {exc}") from exc
+        if not parts:
+            raise SystemExit("--pip command must not be empty")
+
+        # The shell caller passes the interpreter and ``-m pip`` as one
+        # argument.  An unquoted executable path containing spaces is split by
+        # shlex before we can inspect it, so reconstruct that path when the
+        # prefix clearly begins with an absolute path and ends in Python.
+        marker = next(
+            (
+                index
+                for index in range(len(parts) - 1)
+                if parts[index : index + 2] == ["-m", "pip"]
+            ),
+            None,
+        )
+        if marker is not None and marker > 1:
+            first = parts[0]
+            last = parts[marker - 1].lower()
+            first_is_path = first.startswith(("/", "\\")) or re.match(
+                r"^[A-Za-z]:[\\/]", first
+            )
+            last_is_python = bool(
+                re.search(r"(?:^|[\\/])python(?:\d(?:\.\d+)?)?(?:\.exe)?$", last)
+            )
+            has_option = any(token.startswith("-") for token in parts[:marker])
+            if first_is_path and last_is_python and not has_option:
+                parts = [" ".join(parts[:marker]), *parts[marker:]]
+        return parts
     if prefer_uv:
         uv = shutil.which("uv")
         if not uv:
@@ -57,6 +91,19 @@ def _resolve_install_cmd(pip_arg: str | None, prefer_uv: bool) -> list[str]:
     if auto_uv:
         return [auto_uv, "pip"]
     return [sys.executable, "-m", "pip"]
+
+
+def _is_direct_pip_command(command: list[str]) -> bool:
+    """Return whether *command* invokes pip rather than uv's pip frontend."""
+    launcher = Path(command[0]).name.lower() if command else ""
+    if launcher in {"uv", "uv.exe"}:
+        return False
+    if any(
+        command[index : index + 2] == ["-m", "pip"]
+        for index in range(len(command) - 1)
+    ):
+        return True
+    return bool(re.fullmatch(r"pip(?:3(?:\.\d+)?)?(?:\.exe)?", launcher))
 
 
 def main() -> int:
@@ -73,6 +120,17 @@ def main() -> int:
     args = parser.parse_args()
 
     install_cmd_prefix = _resolve_install_cmd(args.pip, args.uv)
+    if _is_direct_pip_command(install_cmd_prefix):
+        pip_ok, pip_error = _pip_security.ensure_pip_floor(
+            install_cmd_prefix,
+            creationflags=windows_hide_flags(),
+        )
+        if not pip_ok:
+            print(
+                f"✗ Refusing Android psutil install: pip security floor unavailable: {pip_error}",
+                file=sys.stderr,
+            )
+            return 1
 
     print(
         "→ Termux/Android: prebuilding psutil with Linux source path "
@@ -90,7 +148,11 @@ def main() -> int:
 
         cmd = install_cmd_prefix + ["install", "--no-build-isolation", str(src_root)]
         print(f"  $ {' '.join(cmd)}")
-        result = subprocess.run(cmd)
+        result = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
         if result.returncode != 0:
             return result.returncode
 

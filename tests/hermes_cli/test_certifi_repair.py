@@ -158,7 +158,11 @@ class TestDoctorCertificates:
 
             class _R:
                 returncode = 0
-                stdout = ""
+                stdout = (
+                    "pip 26.1.2 from /venv/site-packages/pip (python 3.13)"
+                    if cmd[-1] == "--version"
+                    else ""
+                )
                 stderr = ""
 
             return _R()
@@ -173,8 +177,12 @@ class TestDoctorCertificates:
         out = capsys.readouterr().out
 
         assert calls["pip"], "--fix must run a pip force-reinstall of certifi"
-        pip_cmd = calls["pip"][0]
-        assert "--force-reinstall" in pip_cmd and "certifi" in pip_cmd
+        pip_cmd = next(
+            (cmd for cmd in calls["pip"] if "--force-reinstall" in cmd),
+            None,
+        )
+        assert pip_cmd is not None, "--fix must run a pip force-reinstall of certifi"
+        assert "certifi" in pip_cmd
         assert calls["verify"] == 2, "must re-verify after the reinstall"
         assert "repaired" in out.lower()
         assert not issues
@@ -190,6 +198,29 @@ class TestDoctorCertificates:
         doctor_mod.check_certificates(should_fix=True, issues=[])
         out = capsys.readouterr().out
         assert "valid" in out.lower()
+
+    def test_floor_failure_is_reported_as_floor_failure(self, monkeypatch, capsys):
+        from hermes_cli import doctor as doctor_mod
+        from hermes_cli import _pip_security
+        from agent.errors import SSLConfigurationError
+
+        monkeypatch.setattr(
+            "agent.ssl_guard.verify_ca_bundle_with_fallback",
+            lambda: (_ for _ in ()).throw(SSLConfigurationError("broken bundle")),
+        )
+        monkeypatch.setattr(
+            _pip_security,
+            "ensure_pip_floor",
+            lambda *args, **kwargs: (False, "pip 24.0 is below the required floor"),
+        )
+        issues = []
+
+        doctor_mod.check_certificates(should_fix=True, issues=issues)
+
+        out = capsys.readouterr().out.lower()
+        assert "pip security floor unavailable" in out
+        assert "certifi repair could not run pip" not in out
+        assert issues and "upgrade pip" in issues[0].lower()
 
 
 # =========================================================================

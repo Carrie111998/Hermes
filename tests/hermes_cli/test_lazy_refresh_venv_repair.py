@@ -15,6 +15,92 @@ import pytest
 
 
 
+def test_package_only_install_detects_interpreter_flags_before_pip_marker(
+    monkeypatch,
+):
+    floor_prefixes: list[list[str]] = []
+    install_commands: list[list[str]] = []
+
+    monkeypatch.setattr(
+        m,
+        "_ensure_direct_pip_floor",
+        lambda prefix, *, env=None: floor_prefixes.append(prefix),
+    )
+    monkeypatch.setattr(
+        m,
+        "_run_install_with_heartbeat",
+        lambda cmd, *, env=None: install_commands.append(cmd),
+    )
+
+    command = ["python", "-E", "-m", "pip", "install", "pkg==1.0"]
+    m._run_package_only_install(command)
+
+    assert floor_prefixes == [["python", "-E", "-m", "pip"]]
+    assert install_commands == [command]
+
+
+def test_direct_pip_prefix_marker_extracts_full_prefix():
+    assert m._direct_pip_prefix(["python", "-E", "-m", "pip", "install"]) == [
+        "python",
+        "-E",
+        "-m",
+        "pip",
+    ]
+    assert m._direct_pip_prefix(["uv", "pip", "install"]) is None
+
+
+def test_direct_pip_floor_preserves_interpreter_flags_for_ensurepip(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        if command[-1] == "--version":
+            return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "missing"})()
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        m._pip_security,
+        "ensure_pip_floor",
+        lambda *args, **kwargs: (True, ""),
+    )
+
+    m._ensure_direct_pip_floor(["python", "-E", "-m", "pip"])
+
+    assert calls[1] == [
+        "python",
+        "-E",
+        "-m",
+        "ensurepip",
+        "--upgrade",
+        "--default-pip",
+    ]
+
+
+def test_early_repair_bounds_ensurepip_and_force_reinstall(monkeypatch, tmp_path):
+    import hermes_cli._early_recovery as early_recovery
+
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(early_recovery.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        early_recovery._pip_security,
+        "ensure_pip_floor",
+        lambda *args, **kwargs: (True, ""),
+    )
+
+    assert early_recovery._run_repair_install(["PyYAML==6.0.3"], tmp_path) is True
+
+    ensure_call = next(call for call in calls if "ensurepip" in call[0])
+    repair_call = next(call for call in calls if "--force-reinstall" in call[0])
+    assert ensure_call[1]["timeout"] == 120
+    assert repair_call[1]["timeout"] == 600
+
+
 def test_detect_returns_none_when_probe_subprocess_fails(tmp_path, monkeypatch):
     python = tmp_path / "python"
     python.write_text("", encoding="utf-8")
@@ -81,6 +167,26 @@ def test_repair_runs_force_reinstall_with_pyproject_pins(
         ]
     ]
     assert detect_calls["count"] == 1
+
+
+def test_repair_handles_pip_floor_failure_without_raising(monkeypatch):
+    """A floor refusal is a failed repair, not an uncaught update traceback."""
+    monkeypatch.setattr(
+        m,
+        "_run_package_only_install",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            m._pip_security.PipFloorError("pip floor unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        m,
+        "_lazy_refresh_repair_specs",
+        lambda _packages: ["pyyaml==6.0.3"],
+    )
+
+    assert m._repair_broken_lazy_refresh_imports(
+        ["python", "-m", "pip"], ["PyYAML"]
+    ) is False
 
 
 def test_refresh_repairs_venv_after_lazy_failure(tmp_path, monkeypatch, capsys):
@@ -253,10 +359,6 @@ def test_cmd_update_captures_and_propagates_pre_rebuild_snapshot(
             expected_env,
         )
     ]
-
-
-
-
 
 
 

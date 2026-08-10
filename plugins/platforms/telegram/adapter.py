@@ -422,27 +422,49 @@ def telegram_deps_present() -> bool:
     (``check_telegram_requirements``) is registered as ``ensure_deps_fn``
     and runs from ``create_adapter()`` when this returns False (#79812).
     """
-    return TELEGRAM_AVAILABLE
+    # PlatformRegistry.create_adapter() always invokes the registered active
+    # ensure_deps_fn after this passive result, even when it is True.  Keep
+    # this probe side-effect free for status/configuration callers.
+    return TELEGRAM_AVAILABLE and not _TELEGRAM_ACTIVE_CHECK_FAILED
+
+
+_TELEGRAM_ACTIVE_CHECK_FAILED = False
+_TELEGRAM_ACTIVE_CHECK_LOCK = threading.Lock()
+
+
+def _clear_telegram_bindings() -> None:
+    """Record failed verification without tearing down live bindings."""
+    global _TELEGRAM_ACTIVE_CHECK_FAILED
+    _TELEGRAM_ACTIVE_CHECK_FAILED = True
 
 
 def check_telegram_requirements() -> bool:
+    # Telegram SDK aliases and the availability latch are process-global;
+    # serialize the complete active verification and rebind transaction.
+    with _TELEGRAM_ACTIVE_CHECK_LOCK:
+        return _check_telegram_requirements()
+
+
+def _check_telegram_requirements() -> bool:
     """Check if Telegram dependencies are available.
 
-    If python-telegram-bot is missing, attempts to lazy-install it via
-    ``tools.lazy_deps.ensure("platform.telegram")``. After a successful
-    install, re-imports the SDK and flips ``TELEGRAM_AVAILABLE`` to True
-    so the adapter's class-level type aliases get rebound.
+    Runs the canonical lazy feature contract on every active verification,
+    even when the SDK was importable during module discovery. That lets the
+    exact ``python-telegram-bot[webhooks]==22.6`` pin repair stale metadata
+    instead of treating an importable but vulnerable distribution as ready.
+    After a successful check, re-imports the SDK and rebinds every module-level
+    alias so a lazy install cannot leave stale globals behind.
     """
     global TELEGRAM_AVAILABLE, Update, Bot, Message, InlineKeyboardButton
     global InlineKeyboardMarkup, LinkPreviewOptions, Application
     global CommandHandler, CallbackQueryHandler, TelegramMessageHandler
     global ContextTypes, filters, ParseMode, ChatType, HTTPXRequest, TypeHandler
-    if TELEGRAM_AVAILABLE:
-        return True
+    global _TELEGRAM_ACTIVE_CHECK_FAILED
     try:
         from tools.lazy_deps import ensure as _lazy_ensure
         _lazy_ensure("platform.telegram", prompt=False)
     except Exception:
+        _clear_telegram_bindings()
         return False
     try:
         from telegram import Update as _Update, Bot as _Bot, Message as _Message
@@ -460,25 +482,31 @@ def check_telegram_requirements() -> bool:
         )
         from telegram.constants import ParseMode as _PM, ChatType as _CtT
         from telegram.request import HTTPXRequest as _HR
-    except ImportError:
+    except Exception:
+        _clear_telegram_bindings()
         return False
-    Update = _Update
-    Bot = _Bot
-    Message = _Message
-    InlineKeyboardButton = _IKB
-    InlineKeyboardMarkup = _IKM
-    LinkPreviewOptions = _LPO
-    Application = _App
-    CommandHandler = _CH
-    CallbackQueryHandler = _CQH
-    TelegramMessageHandler = _MH
-    ContextTypes = _CT
-    filters = _filters
-    ParseMode = _PM
-    ChatType = _CtT
-    HTTPXRequest = _HR
-    TypeHandler = _TH
+    try:
+        Update = _Update
+        Bot = _Bot
+        Message = _Message
+        InlineKeyboardButton = _IKB
+        InlineKeyboardMarkup = _IKM
+        LinkPreviewOptions = _LPO
+        Application = _App
+        CommandHandler = _CH
+        CallbackQueryHandler = _CQH
+        TelegramMessageHandler = _MH
+        ContextTypes = _CT
+        filters = _filters
+        ParseMode = _PM
+        ChatType = _CtT
+        HTTPXRequest = _HR
+        TypeHandler = _TH
+    except Exception:
+        _clear_telegram_bindings()
+        return False
     TELEGRAM_AVAILABLE = True
+    _TELEGRAM_ACTIVE_CHECK_FAILED = False
     return True
 
 
