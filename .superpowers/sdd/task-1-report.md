@@ -26,4 +26,4 @@ Implemented the strict, immutable, observational `activity_policy` registry, fro
 - Fix: `_load_yaml()` now preserves existing `PolicyError` declarations and normalizes all other YAML parsing/construction failures to `PolicyError("invalid policy YAML")` using `raise ... from exc`, retaining the original cause. Focused tests call `ActivityRegistry.load()` and assert both the public exception and concrete cause type/content.
 - Exact verification command: `python -m pytest tests/activity_policy/test_registry.py tests/test_packaging_metadata.py -q && python -m ruff check activity_policy/registry.py tests/activity_policy/test_registry.py tests/test_packaging_metadata.py`
 - Output: **39 passed in 6.85s**; **All checks passed!**
-- Review-fix commit: `ac6b36d455d627be8216189a80f8f9bbb27d8d87`.
+- Review-fix commit: `5e38c3546`.
