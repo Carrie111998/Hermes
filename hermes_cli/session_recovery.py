@@ -1501,7 +1501,17 @@ def write_recovery_report(path: Path, report: dict[str, Any]) -> Path:
     """Write a JSON report without overwriting an existing file."""
 
     destination = _resolved_output_path(path)
-    with destination.open("x", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2, sort_keys=True)
-        handle.write("\n")
+    # Opened before the guard so a FileExistsError — the report an earlier run
+    # already wrote — can never reach the unlink below.
+    handle = destination.open("x", encoding="utf-8")
+    try:
+        with handle:
+            json.dump(report, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+    except BaseException:
+        # ``hermes sessions recover`` refuses the whole command when this path
+        # exists, so a dump that dies part way blocks the next run before
+        # recovery even starts.
+        _unlink_if_present(destination)
+        raise
     return destination
