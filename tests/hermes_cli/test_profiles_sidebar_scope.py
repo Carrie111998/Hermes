@@ -185,7 +185,7 @@ class TestProfileSessionReadPressure:
             finally:
                 release_reads.set()
 
-            assert response.status_code == 503
+            assert response.status_code == 429
             assert response.headers["retry-after"] == "1"
             assert [future.result().status_code for future in active] == [200, 200]
 

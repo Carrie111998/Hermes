@@ -69,7 +69,7 @@ def _limit_profile_session_reads(handler):
         )
         if not acquired:
             raise HTTPException(
-                status_code=503,
+                status_code=429,
                 detail="Profile session reads are busy; retry shortly",
                 headers={"Retry-After": "1"},
             )
