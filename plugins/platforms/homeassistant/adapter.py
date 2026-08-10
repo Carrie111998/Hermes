@@ -488,6 +488,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[list] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Send a notification via the HA ``notify.notify`` service without a
     live gateway adapter.
@@ -532,6 +533,8 @@ async def _standalone_send(
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=30)
         ) as session:
+            if on_provider_contact:
+                on_provider_contact()
             async with session.post(url, headers=headers, json=payload) as resp:
                 if resp.status not in {200, 201}:
                     body = await resp.text()

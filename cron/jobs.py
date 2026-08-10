@@ -31,7 +31,7 @@ try:
     import msvcrt
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
@@ -815,6 +815,11 @@ def _compute_grace_seconds(schedule: dict) -> int:
                 pass
 
     return MIN_GRACE
+
+
+def _canonical_fire_datetime(value: datetime) -> str:
+    """Serialize scheduler-owned nominal time at exact UTC second precision."""
+    return _ensure_aware(value).astimezone(timezone.utc).replace(microsecond=0).isoformat()
 
 
 def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
@@ -2142,7 +2147,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
-                # be claimed again on its next fire (Phase 4C CAS).
+                # be claimed again on its next fire (Phase 4C CAS). The claim
+                # already advanced recurring next_run_at atomically; preserve
+                # that exact successor instead of recomputing from completion time.
+                had_fire_claim = job.get("fire_claim") is not None
                 job["fire_claim"] = None
                 # Clear the one-shot running-claim (#59229): the run is over, so
                 # a re-armed recurring job or a re-dispatched one-shot recovery
@@ -2188,8 +2196,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
-                # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                # Compute next run unless the external claim already advanced it.
+                if not had_fire_claim:
+                    job["next_run_at"] = compute_next_run(job["schedule"], now)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -2455,7 +2464,52 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def canonicalize_fire_at(value: Optional[str]) -> str:
+    """Return one canonical UTC identity for a scheduler-owned fire instant."""
+    if not isinstance(value, str) or not value:
+        raise ValueError("missing fire_at")
+    from cron.executions import require_canonical_scheduled_for
+
+    try:
+        return require_canonical_scheduled_for(value)
+    except ValueError as exc:
+        raise ValueError("invalid fire_at") from exc
+
+
+def canonicalize_stored_fire_at(value: Any) -> str:
+    """Upgrade an older persisted scheduler timestamp to current authority form."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("missing stored fire_at")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("invalid stored fire_at") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("stored fire_at must include a timezone")
+    return _canonical_fire_datetime(parsed)
+
+
+def fire_claims_match_body(
+    claims: Dict[str, Any], *, job_id: Any, fire_at: str,
+) -> bool:
+    """Bind verified signed authority to the exact requested job and fire."""
+    if not isinstance(job_id, str) or not job_id:
+        return False
+    if not isinstance(claims, dict) or claims.get("job_id") != job_id:
+        return False
+    try:
+        claimed_fire_at = canonicalize_fire_at(claims.get("fire_at"))
+    except ValueError:
+        return False
+    return claimed_fire_at == fire_at
+
+
+def claim_job_for_fire(
+    job_id: str,
+    *,
+    nominal_fire_at: Optional[str] = None,
+    claim_ttl_seconds: int = 300,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -2485,6 +2539,18 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             # (enabled=true, state=paused/paused_at set) must not claim.
             if not is_job_runnable(job):
                 return False
+            current_fire_at = job.get("next_run_at") or ""
+            try:
+                expected_fire_at = canonicalize_stored_fire_at(current_fire_at)
+                requested_fire_at = (
+                    canonicalize_fire_at(nominal_fire_at)
+                    if nominal_fire_at is not None
+                    else expected_fire_at
+                )
+            except ValueError:
+                return False
+            if requested_fire_at != expected_fire_at:
+                return False
             now = _hermes_now()
             existing = job.get("fire_claim")
             if existing:
@@ -2501,10 +2567,14 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "scheduled_for": requested_fire_at,
+            }
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
+                nxt = compute_next_run(job["schedule"], requested_fire_at)
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
@@ -2596,6 +2666,21 @@ def _sweep_completed_oneshots(
                 exc_info=True,
             )
     return removed
+
+
+def release_job_fire_claim(job_id: str, expected_claim: Dict[str, Any]) -> bool:
+    """Release only the exact external-fire claim whose dispatch never began."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            if job.get("fire_claim") != expected_claim:
+                return False
+            job["fire_claim"] = None
+            save_jobs(jobs)
+            return True
+        return False
 
 
 def get_due_jobs() -> List[Dict[str, Any]]:
@@ -3053,7 +3138,7 @@ def save_job_output(job_id: str, output: str):
     _secure_dir(job_output_dir)
 
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
+    output_file = job_output_dir / f"{timestamp}-{uuid.uuid4().hex}.md"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:
@@ -3074,6 +3159,32 @@ def save_job_output(job_id: str, output: str):
     _prune_job_output(job_output_dir, _cron_output_keep())
 
     return output_file
+
+
+def save_delivery_payload(job_id: str, execution_id: str, content: str) -> Path:
+    """Persist exact delivered text under an execution-owned immutable path."""
+    safe_job_id = str(job_id)
+    safe_execution_id = str(execution_id)
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", safe_job_id):
+        raise ValueError("job id is invalid for delivery payload storage")
+    if not re.fullmatch(r"[a-f0-9]{32}", safe_execution_id):
+        raise ValueError("execution id is invalid for delivery payload storage")
+    ensure_dirs()
+    delivery_dir = _job_output_dir(safe_job_id) / "deliveries"
+    delivery_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(delivery_dir)
+    payload_file = delivery_dir / f"{safe_execution_id}.txt"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(payload_file, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(str(content))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except Exception:
+        payload_file.unlink(missing_ok=True)
+        raise
+    return payload_file
 
 
 # =============================================================================

@@ -4460,6 +4460,7 @@ class MessageSender:
         chat_id: str,
         message: str,
         media_files: Optional[List[Tuple[str, bool]]] = None,
+        on_provider_contact=None,
     ) -> Dict[str, Any]:
         """Send text + media via Yuanbao (used by the ``send_message`` tool).
 
@@ -4473,6 +4474,8 @@ class MessageSender:
 
         # 1. Send text
         if message.strip():
+            if on_provider_contact is not None:
+                on_provider_contact()
             last_result = await adapter.send(chat_id, message)
             if not last_result.success:
                 return {"error": f"Yuanbao send failed: {last_result.error}"}
@@ -4480,6 +4483,8 @@ class MessageSender:
         # 2. Iterate media_files, dispatch by file extension
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
+            if on_provider_contact is not None:
+                on_provider_contact()
             if ext in self.IMAGE_EXTS:
                 last_result = await adapter.send_image_file(chat_id, media_path)
             else:
@@ -4818,9 +4823,13 @@ class OutboundManager:
     async def send_direct(
         self, chat_id: str, message: str,
         media_files: Optional[List[Tuple[str, bool]]] = None,
+        on_provider_contact=None,
     ) -> Dict[str, Any]:
         """Send text + media (used by send_message tool)."""
-        return await self.sender.send_direct(chat_id, message, media_files)
+        return await self.sender.send_direct(
+            chat_id, message, media_files,
+            on_provider_contact=on_provider_contact,
+        )
 
     async def start_typing(self, chat_id: str) -> None:
         """Start reply heartbeat (RUNNING)."""
@@ -5293,6 +5302,10 @@ async def send_yuanbao_direct(
     chat_id: str,
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Delegate to ``OutboundManager.send_direct``."""
-    return await adapter._outbound.send_direct(chat_id, message, media_files)
+    return await adapter._outbound.send_direct(
+        chat_id, message, media_files,
+        on_provider_contact=on_provider_contact,
+    )

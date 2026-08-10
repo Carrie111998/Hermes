@@ -10,11 +10,23 @@ Covers two layers:
 
 import asyncio
 import os
+import sys
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+# _standalone_send imports aiohttp lazily and every request is replaced below.
+# Supply the optional module only for this mocked boundary in core-only test
+# environments; real delivery still reports the missing dependency normally.
+try:
+    import aiohttp as _aiohttp  # noqa: F401
+except ImportError:
+    _aiohttp = ModuleType("aiohttp")
+    _aiohttp.ClientSession = MagicMock()
+    _aiohttp.ClientTimeout = MagicMock()
+    sys.modules["aiohttp"] = _aiohttp
 
 from plugins.platforms.whatsapp.adapter import _bridge_media_type, _standalone_send
 
@@ -155,3 +167,39 @@ def test_missing_captioned_file_falls_back_to_text():
     assert len(calls) == 1
     assert calls[0][0].endswith("/send")
     assert calls[0][1]["message"] == "floor plan"
+
+
+@pytest.mark.parametrize("caption", [None, "native caption"])
+def test_contact_callback_fires_at_each_bridge_request(caption):
+    image = _tmpfile(".png")
+    events = []
+    try:
+        session_ctx, calls = _session_with(
+            [_resp(200, {"messageId": "text"}), _resp(200, {"messageId": "media"})]
+        )
+        session = session_ctx.__aenter__.return_value
+        original_post = session.post.side_effect
+
+        def recording_post(*args, **kwargs):
+            events.append("request")
+            return original_post(*args, **kwargs)
+
+        session.post.side_effect = recording_post
+        with patch("aiohttp.ClientSession", return_value=session_ctx):
+            result = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    "12345",
+                    "hello" if caption is None else "",
+                    media_files=[(image, False)],
+                    caption=caption,
+                    on_provider_contact=lambda: events.append("contact"),
+                )
+            )
+
+        assert result["success"] is True
+        expected_requests = 2 if caption is None else 1
+        assert len(calls) == expected_requests
+        assert events == [item for _ in range(expected_requests) for item in ("contact", "request")]
+    finally:
+        os.unlink(image)

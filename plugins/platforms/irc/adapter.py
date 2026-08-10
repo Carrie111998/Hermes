@@ -748,6 +748,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Open an ephemeral IRC connection, send a PRIVMSG, and quit.
 
@@ -814,7 +815,9 @@ async def _standalone_send(
     except Exception as e:
         return {"error": f"IRC standalone connect failed: {e}"}
 
-    async def _raw(line: str) -> None:
+    async def _raw(line: str, *, delivery_contact: bool = False) -> None:
+        if delivery_contact and on_provider_contact:
+            on_provider_contact()
         writer.write((line + "\r\n").encode("utf-8"))
         await writer.drain()
 
@@ -905,7 +908,7 @@ async def _standalone_send(
             while paragraph:
                 encoded = paragraph.encode("utf-8")
                 if len(encoded) <= max_bytes:
-                    await _raw(f"PRIVMSG {target} :{paragraph}")
+                    await _raw(f"PRIVMSG {target} :{paragraph}", delivery_contact=True)
                     await asyncio.sleep(0.3)
                     sent_any = True
                     break
@@ -922,7 +925,10 @@ async def _standalone_send(
                 space = paragraph.rfind(" ", 0, split_at)
                 if space > split_at // 3:
                     split_at = space
-                await _raw(f"PRIVMSG {target} :{paragraph[:split_at].rstrip()}")
+                await _raw(
+                    f"PRIVMSG {target} :{paragraph[:split_at].rstrip()}",
+                    delivery_contact=True,
+                )
                 await asyncio.sleep(0.3)
                 sent_any = True
                 paragraph = paragraph[split_at:].lstrip()

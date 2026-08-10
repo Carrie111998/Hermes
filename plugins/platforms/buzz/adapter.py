@@ -283,6 +283,7 @@ async def _exec_buzz(
     private_key: str,
     input_text: Optional[str] = None,
     timeout: float = _CLI_TIMEOUT,
+    on_provider_contact=None,
 ) -> Tuple[int, str, str]:
     """Run the buzz CLI with an argument list (never a shell) and return
     ``(returncode, stdout, stderr)``.
@@ -293,6 +294,8 @@ async def _exec_buzz(
     env = os.environ.copy()
     env["BUZZ_RELAY_URL"] = relay_url
     env["BUZZ_PRIVATE_KEY"] = private_key
+    if on_provider_contact:
+        on_provider_contact()
     proc = await asyncio.create_subprocess_exec(
         cli_path,
         *args,
@@ -1364,6 +1367,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """One-shot send without a live adapter (out-of-process cron delivery).
 
@@ -1391,8 +1395,18 @@ async def _standalone_send(
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
+        contact_kwargs = (
+            {"on_provider_contact": on_provider_contact}
+            if on_provider_contact is not None
+            else {}
+        )
         code, out, err = await _exec_buzz(
-            cli_path, args, relay_url=relay, private_key=private_key, input_text=message
+            cli_path,
+            args,
+            relay_url=relay,
+            private_key=private_key,
+            input_text=message,
+            **contact_kwargs,
         )
     except asyncio.CancelledError:
         raise

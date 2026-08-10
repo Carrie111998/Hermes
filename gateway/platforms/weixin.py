@@ -2325,6 +2325,7 @@ async def send_weixin_direct(
     chat_id: str,
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """
     One-shot send helper for ``send_message`` and cron delivery.
@@ -2352,12 +2353,16 @@ async def send_weixin_direct(
         last_result: Optional[SendResult] = None
         cleaned = live_adapter.format_message(message)
         if cleaned:
+            if on_provider_contact is not None:
+                on_provider_contact()
             last_result = await live_adapter.send(chat_id, cleaned)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
+            if on_provider_contact is not None:
+                on_provider_contact()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
                 last_result = await live_adapter.send_image_file(chat_id, media_path)
             else:
@@ -2397,12 +2402,16 @@ async def send_weixin_direct(
         last_result: Optional[SendResult] = None
         cleaned = adapter.format_message(message)
         if cleaned:
+            if on_provider_contact is not None:
+                on_provider_contact()
             last_result = await adapter.send(chat_id, cleaned)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
+            if on_provider_contact is not None:
+                on_provider_contact()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
                 last_result = await adapter.send_image_file(chat_id, media_path)
             else:

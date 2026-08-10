@@ -1718,6 +1718,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process WeCom delivery via the adapter's WebSocket send pipeline.
 
@@ -1734,6 +1735,8 @@ async def _standalone_send(
         if not connected:
             return {"error": f"WeCom: failed to connect - {getattr(adapter, 'fatal_error_message', None) or 'unknown error'}"}
         try:
+            if on_provider_contact:
+                on_provider_contact()
             result = await adapter.send(chat_id, message)
             if not result.success:
                 return {"error": f"WeCom send failed: {result.error}"}

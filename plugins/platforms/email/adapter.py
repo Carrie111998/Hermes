@@ -1280,6 +1280,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process Email delivery via SMTP (one-shot). Implements the
     standalone_sender_fn contract; replaces the legacy _send_email helper."""
@@ -1310,6 +1311,8 @@ async def _standalone_send(
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=_ssl.create_default_context())
         server.login(address, password)
+        if on_provider_contact:
+            on_provider_contact()
         server.send_message(msg)
         server.quit()
         return {"success": True, "platform": "email", "chat_id": chat_id}

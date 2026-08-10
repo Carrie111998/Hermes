@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -77,8 +77,11 @@ class DeliveryTransport:
         chat_id: str,
         content: str,
         metadata: Optional[Dict[str, Any]],
+        on_provider_contact: Optional[Callable[[], None]] = None,
     ) -> Any:
         """Send through this transport while preserving the logical platform."""
+        if on_provider_contact is not None:
+            on_provider_contact()
         if self.is_relay:
             return await self.adapter.send_for_platform(
                 logical_platform,
@@ -461,7 +464,8 @@ class DeliveryRouter:
         self,
         target: DeliveryTarget,
         content: str,
-        metadata: Optional[Dict[str, Any]]
+        metadata: Optional[Dict[str, Any]],
+        on_provider_contact: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Deliver content to a messaging platform."""
         transport = resolve_delivery_transport(target.platform, self.config, self.adapters)
@@ -574,6 +578,8 @@ class DeliveryRouter:
                     raise RuntimeError(
                         "Telegram adapter cannot create named private DM topics"
                     )
+                if on_provider_contact is not None:
+                    on_provider_contact()
                 created_thread_id = await ensure_dm_topic(target.chat_id, target_thread_id)
                 if not created_thread_id:
                     raise RuntimeError(
@@ -608,6 +614,7 @@ class DeliveryRouter:
             target.chat_id,
             content,
             metadata=send_metadata or None,
+            on_provider_contact=on_provider_contact,
         )
         if _send_result_failed(result):
             if (
@@ -620,6 +627,8 @@ class DeliveryRouter:
                     raise RuntimeError(
                         "Telegram adapter cannot refresh named private DM topics"
                     )
+                if on_provider_contact is not None:
+                    on_provider_contact()
                 refreshed_thread_id = await ensure_dm_topic(
                     target.chat_id,
                     named_telegram_private_topic_name,
@@ -636,11 +645,11 @@ class DeliveryRouter:
                     target.chat_id,
                     content,
                     metadata=send_metadata or None,
+                    on_provider_contact=on_provider_contact,
                 )
             if _send_result_failed(result):
                 raise RuntimeError(_send_result_error(result) or f"{target.platform.value} delivery failed")
         return result
-
 
 
 

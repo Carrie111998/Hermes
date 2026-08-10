@@ -146,9 +146,12 @@ class ChronosCronScheduler(CronScheduler):
         fire is a no-op NAS-side.
         """
         job_id = job["id"]
-        fire_at = job.get("next_run_at")
-        if not fire_at:
+        stored_fire_at = job.get("next_run_at")
+        if not stored_fire_at:
             return
+        from cron.jobs import canonicalize_stored_fire_at
+
+        fire_at = canonicalize_stored_fire_at(stored_fire_at)
         dedup_key = f"{job_id}:{fire_at}"
         self._get_client().provision(
             job_id=job_id,
@@ -194,13 +197,20 @@ class ChronosCronScheduler(CronScheduler):
     def reconcile(self) -> None:
         """Converge the NAS-armed one-shots toward jobs.json (desired state):
         arm missing / re-arm changed-time, cancel orphaned."""
-        from cron.jobs import load_jobs
+        from cron.jobs import canonicalize_stored_fire_at, load_jobs
 
-        desired: Dict[str, str] = {
-            j["id"]: j["next_run_at"]
-            for j in load_jobs()
-            if j.get("enabled") and j.get("next_run_at") and j.get("state") != "paused"
-        }
+        desired: Dict[str, str] = {}
+        for job in load_jobs():
+            if (not job.get("enabled") or not job.get("next_run_at")
+                    or job.get("state") == "paused"):
+                continue
+            try:
+                desired[job["id"]] = canonicalize_stored_fire_at(job["next_run_at"])
+            except ValueError as exc:
+                logger.warning(
+                    "Chronos skipped job %s with invalid next_run_at: %s",
+                    job.get("id"), exc,
+                )
         observed = self._list_armed()
 
         # Arm missing or changed-time.
@@ -225,7 +235,14 @@ class ChronosCronScheduler(CronScheduler):
 
     # -- fire -------------------------------------------------------------
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        nominal_fire_at: str | None = None,
+        adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
         """Run the due job (claim + run_one_job via the ABC default), then
         re-arm the NEXT one-shot through NAS.
 
@@ -233,7 +250,12 @@ class ChronosCronScheduler(CronScheduler):
         If the job is gone (one-shot completed / repeat-N exhausted), get_job
         returns None → nothing to re-arm (the schedule naturally stops).
         """
-        ran = super().fire_due(job_id, adapters=adapters, loop=loop)
+        ran = super().fire_due(
+            job_id,
+            nominal_fire_at=nominal_fire_at,
+            adapters=adapters,
+            loop=loop,
+        )
         if ran:
             from cron.jobs import get_job
             job = get_job(job_id)

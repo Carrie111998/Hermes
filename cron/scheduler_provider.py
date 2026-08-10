@@ -98,7 +98,14 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        nominal_fire_at: str | None = None,
+        adapters: Any = None,
+        loop: Any = None,
+    ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -110,17 +117,35 @@ class CronScheduler(ABC):
         Returns True if THIS caller claimed and ran the job, False if the claim
         was lost (another machine/retry won it) or the job no longer exists.
         """
-        from cron.jobs import claim_job_for_fire, get_job
+        from cron.jobs import claim_job_for_fire, get_job, release_job_fire_claim
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        claimed = (
+            claim_job_for_fire(job_id, nominal_fire_at=nominal_fire_at)
+            if nominal_fire_at is not None
+            else claim_job_for_fire(job_id)
+        )
+        if not claimed:
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        fire_claim = dict(job.get("fire_claim") or {})
+        scheduled_for = str(fire_claim.get("scheduled_for") or "")
+        try:
+            execution = create_execution(
+                job_id,
+                source=self.name,
+                scheduled_for=scheduled_for,
+            )
+            job["execution_id"] = execution["id"]
+            job["execution_source"] = execution["source"]
+            job["scheduled_for"] = execution.get("scheduled_for") or ""
+            return run_one_job(job, adapters=adapters, loop=loop)
+        except Exception:
+            release_job_fire_claim(job_id, fire_claim)
+            raise
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

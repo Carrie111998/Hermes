@@ -3527,6 +3527,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[List[str]] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """POST a single Google Chat message via the REST API without the SDK.
 
@@ -3645,6 +3646,8 @@ async def _standalone_send(
 
     try:
         async with _aiohttp.ClientSession(timeout=_aiohttp.ClientTimeout(total=30.0), trust_env=True) as session:
+            if on_provider_contact:
+                on_provider_contact()
             async with session.post(
                 url,
                 json=body,

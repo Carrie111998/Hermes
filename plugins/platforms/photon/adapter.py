@@ -2747,6 +2747,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,  # noqa: ARG001 — Spectrum has no threads yet
     media_files: Optional[list] = None,
     force_document: bool = False,  # noqa: ARG001 — iMessage auto-detects file kind
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     if not HTTPX_AVAILABLE:
         return {"error": "httpx not installed"}
@@ -2791,6 +2792,8 @@ async def _standalone_send(
             if message:
                 rich_url = _richlink_candidate(message)
                 if rich_url:
+                    if on_provider_contact:
+                        on_provider_contact()
                     resp = await client.post(
                         f"{base}/send-richlink",
                         json={"spaceId": chat_id, "url": rich_url},
@@ -2811,6 +2814,8 @@ async def _standalone_send(
                     }
                     if _markdown_enabled() and not _richlink_candidate(message):
                         send_body["format"] = "markdown"
+                    if on_provider_contact:
+                        on_provider_contact()
                     resp = await client.post(
                         f"{base}/send", json=send_body, headers=headers,
                     )
@@ -2839,6 +2844,8 @@ async def _standalone_send(
                 }
                 if guessed:
                     att_body["mimeType"] = guessed
+                if on_provider_contact:
+                    on_provider_contact()
                 resp = await client.post(
                     f"{base}/send-attachment", json=att_body, headers=headers,
                 )

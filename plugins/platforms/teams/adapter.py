@@ -534,6 +534,7 @@ async def _standalone_send(
     thread_id: Optional[str] = None,
     media_files: Optional[list] = None,
     force_document: bool = False,
+    on_provider_contact=None,
 ) -> Dict[str, Any]:
     """Acquire a Bot Framework bearer token and POST a single message activity.
 
@@ -624,6 +625,8 @@ async def _standalone_send(
                 "text": message,
                 "textFormat": "markdown",
             }
+            if on_provider_contact:
+                on_provider_contact()
             async with session.post(
                 activities_url,
                 json=activity,

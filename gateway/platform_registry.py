@@ -170,8 +170,12 @@ class PlatformEntry:
     #
     # Signature:
     #     async (pconfig, chat_id, message, *, thread_id=None,
-    #            media_files=None, force_document=False) -> dict
+    #            media_files=None, force_document=False,
+    #            on_provider_contact=None) -> dict
     #
+    # ``on_provider_contact`` is optional for backward compatibility. Invoke
+    # it immediately before every external send/upload/request, after local
+    # validation, dependency checks, client setup, and media reads.
     # Returns ``{"success": True, "message_id": ...}`` on success or
     # ``{"error": str}`` on failure.  Plugin authors typically open an
     # ephemeral connection / acquire a fresh OAuth token, send, and close.

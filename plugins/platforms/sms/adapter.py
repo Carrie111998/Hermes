@@ -456,6 +456,7 @@ async def _standalone_send(
     thread_id=None,
     media_files=None,
     force_document=False,
+    on_provider_contact=None,
 ):
     """Out-of-process SMS delivery via the Twilio REST API. Implements the
     standalone_sender_fn contract; replaces the legacy _send_sms helper."""
@@ -493,6 +494,8 @@ async def _standalone_send(
             form_data.add_field("From", from_number)
             form_data.add_field("To", chat_id)
             form_data.add_field("Body", message)
+            if on_provider_contact:
+                on_provider_contact()
             async with session.post(url, data=form_data, headers=headers, **_req_kw) as resp:
                 body = await resp.json()
                 if resp.status >= 400:

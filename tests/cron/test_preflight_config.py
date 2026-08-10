@@ -44,6 +44,7 @@ def _job(**overrides):
         "enabled": True,
         "state": "scheduled",
         "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
+        "next_run_at": "2026-08-09T12:00:00+00:00",
         "deliver": "local",
         "model": None,
         "provider": None,
@@ -129,9 +130,20 @@ class TestMissingProviderKeyBlocks:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(job, content, *, targets, receipts, **_kwargs):
             deliveries.append(content)
-            return None
+            receipt = {
+                "requested_target": targets[0],
+                "actual_target": targets[0],
+                "status": "delivered",
+                "transport": "live",
+                "error": None,
+                "provider_receipt_id": f"preflight-alert-{len(deliveries)}",
+            }
+            receipts.append(receipt)
+            return sched.DeliveryOutcome(
+                sched.DeliveryState.DELIVERED, tuple(receipts),
+            )
 
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])
@@ -144,6 +156,9 @@ class TestMissingProviderKeyBlocks:
                      patch("hermes_cli.env_loader.reset_secret_source_cache"), \
                      patch("hermes_state.SessionDB", return_value=fake_db), \
                      patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+                     patch.object(sched, "_resolve_delivery_targets", return_value=[{
+                         "platform": "telegram", "chat_id": "test-alert", "thread_id": None,
+                     }]), \
                      patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                            side_effect=_AuthErrorFactory()), \
                      patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
@@ -233,9 +248,20 @@ class TestOptOut:
         job = _job()
         deliveries = []
 
-        def fake_deliver(job, content, adapters=None, loop=None):
+        def fake_deliver(job, content, *, targets, receipts, **_kwargs):
             deliveries.append(content)
-            return None
+            receipt = {
+                "requested_target": targets[0],
+                "actual_target": targets[0],
+                "status": "delivered",
+                "transport": "live",
+                "error": None,
+                "provider_receipt_id": f"preflight-alert-{len(deliveries)}",
+            }
+            receipts.append(receipt)
+            return sched.DeliveryOutcome(
+                sched.DeliveryState.DELIVERED, tuple(receipts),
+            )
 
         with cron_jobs.use_cron_store(tmp_path):
             cron_jobs.save_jobs([job])
@@ -248,6 +274,9 @@ class TestOptOut:
                      patch("hermes_cli.env_loader.reset_secret_source_cache"), \
                      patch("hermes_state.SessionDB", return_value=fake_db), \
                      patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+                     patch.object(sched, "_resolve_delivery_targets", return_value=[{
+                         "platform": "telegram", "chat_id": "test-alert", "thread_id": None,
+                     }]), \
                      patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                            side_effect=_AuthErrorFactory()), \
                      patch.object(sched, "_deliver_result", side_effect=fake_deliver), \
