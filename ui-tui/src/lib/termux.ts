@@ -1,6 +1,6 @@
 const TERMUX_PREFIX = '/data/data/com.termux/files/usr'
 
-const truthy = (value?: string) => /^(?:1|true|yes|on)$/i.test(String(value ?? '').trim())
+import { truthy } from './envFlags.js'
 
 export const isTermuxEnv = (env: NodeJS.ProcessEnv = process.env): boolean => {
   const prefix = String(env.PREFIX ?? '')
