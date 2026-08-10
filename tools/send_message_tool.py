@@ -487,6 +487,11 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        start_agent_task = (
+            platform_name == "discord"
+            and thread_id is None
+            and _is_discord_agent_task_forum(pconfig, chat_id)
+        )
         result = _run_async(
             _send_to_platform(
                 platform,
@@ -496,13 +501,19 @@ def _handle_send(args):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
+                start_agent_task=start_agent_task,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
             result["note"] = f"Sent to {platform_name} home channel (chat_id: {chat_id})"
 
         # Mirror the sent message into the target's gateway session
-        if isinstance(result, dict) and result.get("success") and mirror_text:
+        if (
+            isinstance(result, dict)
+            and result.get("success")
+            and mirror_text
+            and not start_agent_task
+        ):
             try:
                 from gateway.mirror import mirror_to_session
                 from gateway.session_context import get_session_env
@@ -685,6 +696,19 @@ def _maybe_skip_cron_duplicate_send(platform_name: str, chat_id: str, thread_id:
     }
 
 
+def _is_discord_agent_task_forum(pconfig, chat_id) -> bool:
+    """Return whether ``chat_id`` is configured as an agent-only task forum."""
+    extra = getattr(pconfig, "extra", None)
+    raw = extra.get("agent_task_forum_channels") if isinstance(extra, dict) else None
+    if isinstance(raw, (list, tuple, set)):
+        configured = {str(value).strip() for value in raw if str(value).strip()}
+    else:
+        configured = {
+            value.strip() for value in str(raw or "").split(",") if value.strip()
+        }
+    return str(chat_id) in configured
+
+
 async def _send_via_adapter(
     platform,
     pconfig,
@@ -694,6 +718,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    start_agent_task=False,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -726,6 +751,8 @@ async def _send_via_adapter(
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
+                if start_agent_task:
+                    metadata["start_agent_task"] = True
                 if not metadata:
                     metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
@@ -734,8 +761,19 @@ async def _send_via_adapter(
             except Exception as e:
                 return {"error": f"Plugin platform send failed: {e}"}
             if result.success:
-                return {"success": True, "message_id": result.message_id}
+                response = {"success": True, "message_id": result.message_id}
+                if isinstance(getattr(result, "raw_response", None), dict):
+                    response.update(result.raw_response)
+                return response
             return {"error": f"Adapter send failed: {result.error}"}
+
+    if start_agent_task:
+        return {
+            "error": (
+                "Starting a live Discord task requires the running gateway; "
+                "static task-forum delivery is blocked."
+            )
+        }
 
     entry = None
     try:
@@ -780,7 +818,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    start_agent_task=False,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -870,6 +917,31 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # historically went straight to the HTTP path; we preserve that by
     # explicitly invoking the registry hook here so behavior is unchanged.
     if platform == Platform.DISCORD:
+        is_task_forum = thread_id is None and _is_discord_agent_task_forum(
+            pconfig, chat_id
+        )
+        if is_task_forum and not start_agent_task:
+            return {
+                "error": (
+                    "Direct bot delivery to this Discord task forum is blocked. "
+                    "Use a live agent task thread instead."
+                )
+            }
+        if start_agent_task:
+            if media_files:
+                return {
+                    "error": (
+                        "Live Discord task-thread starts currently require a text-only "
+                        "prompt; attach files after the thread starts."
+                    )
+                }
+            return await _send_via_adapter(
+                platform,
+                pconfig,
+                chat_id,
+                message,
+                start_agent_task=True,
+            )
         from gateway.platform_registry import platform_registry
         entry = platform_registry.get("discord")
         if entry is None or entry.standalone_sender_fn is None:

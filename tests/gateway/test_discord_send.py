@@ -21,6 +21,7 @@ def _ensure_discord_mock():
     discord_mod.DMChannel = type("DMChannel", (), {})
     discord_mod.Thread = type("Thread", (), {})
     discord_mod.ForumChannel = type("ForumChannel", (), {})
+    discord_mod.ChannelType = SimpleNamespace(public_thread="public_thread")
     discord_mod.ui = SimpleNamespace(View=object, button=lambda *a, **k: (lambda fn: fn), Button=object)
     discord_mod.ButtonStyle = SimpleNamespace(success=1, primary=2, secondary=2, danger=3, green=1, grey=2, blurple=2, red=3)
     discord_mod.Color = SimpleNamespace(orange=lambda: 1, green=lambda: 2, blue=lambda: 3, red=lambda: 4, purple=lambda: 5)
@@ -44,7 +45,7 @@ def _ensure_discord_mock():
 
 _ensure_discord_mock()
 
-from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from plugins.platforms.discord.adapter import DiscordAdapter, _standalone_send  # noqa: E402
 
 
 @pytest.mark.asyncio
@@ -172,6 +173,241 @@ class TestIsForumParent:
             _discord_mod.ForumChannel = forum_cls
         ch = forum_cls()
         assert adapter._is_forum_parent(ch) is True
+
+
+@pytest.mark.asyncio
+async def test_task_forum_rejects_static_bot_delivery():
+    """Configured task forums must never receive inert bot-authored posts."""
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    ))
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.create_thread = AsyncMock()
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("999", "do the task")
+
+    assert result.success is False
+    assert "task channel" in (result.error or "").lower()
+    forum_channel.create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_text_channel_rejects_static_bot_delivery():
+    """Configured task parents are protected even when they are text channels."""
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    ))
+    text_channel = SimpleNamespace(
+        id=999,
+        send=AsyncMock(),
+        create_thread=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: text_channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("999", "do the task")
+
+    assert result.success is False
+    assert "task channel" in (result.error or "").lower()
+    text_channel.send.assert_not_awaited()
+    text_channel.create_thread.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_parent_cannot_be_smuggled_as_thread_id():
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    ))
+    task_parent = SimpleNamespace(id=999, send=AsyncMock())
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: task_parent,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "123",
+        "smuggled delivery",
+        metadata={"thread_id": "999"},
+    )
+
+    assert result.success is False
+    task_parent.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_task_parent_rejects_direct_media_and_standalone_delivery(tmp_path):
+    pconfig = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    )
+    adapter = DiscordAdapter(pconfig)
+    media_result = await adapter._send_file_attachment(
+        "999",
+        str(tmp_path / "unused.png"),
+    )
+    standalone_result = await _standalone_send(pconfig, "999", "blocked")
+
+    assert media_result.success is False
+    assert "task channel" in (media_result.error or "").lower()
+    assert "error" in standalone_result
+    assert "task channel" in standalone_result["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_task_forum_explicit_agent_task_starts_live_thread():
+    """An explicit agent task creates a labeled post and dispatches a session."""
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    ))
+    starter = SimpleNamespace(id=800)
+    thread_channel = SimpleNamespace(
+        id=777,
+        name="do the task",
+        parent=None,
+        guild=SimpleNamespace(id=55, name="My House"),
+        send=AsyncMock(),
+    )
+    forum_channel = _discord_mod.ForumChannel()
+    forum_channel.id = 999
+    forum_channel.name = "tasks"
+    forum_channel.topic = "Give the agent work."
+    forum_channel.guild = SimpleNamespace(id=55, name="My House")
+    thread_channel.parent = forum_channel
+    forum_channel.create_thread = AsyncMock(return_value=SimpleNamespace(
+        id=777,
+        thread=thread_channel,
+        message=starter,
+    ))
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=42),
+        get_channel=lambda _chat_id: forum_channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter.handle_message = AsyncMock()
+
+    result = await adapter.send(
+        "999",
+        "do the task",
+        metadata={"start_agent_task": True},
+    )
+
+    assert result.success is True
+    call = forum_channel.create_thread.await_args
+    assert call.kwargs["content"].startswith("🤖 **Hermes started this task**")
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "777"
+    assert event.source.thread_id == "777"
+    assert event.source.parent_chat_id == "999"
+    assert event.source.user_id == "system:hermes-task"
+    assert event.source.is_bot is True
+    assert event.source.role_authorized is True
+    assert event.text.startswith("[Hermes-started task; not authored by the user]")
+
+
+@pytest.mark.asyncio
+async def test_task_text_channel_explicit_agent_task_starts_live_thread():
+    """A text task parent creates a standalone live thread without a parent post."""
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    ))
+    starter = SimpleNamespace(id=800)
+    parent = SimpleNamespace(
+        id=999,
+        name="tasks",
+        topic="Give the agent work.",
+        guild=SimpleNamespace(id=55, name="My House"),
+        send=AsyncMock(),
+    )
+    thread_channel = SimpleNamespace(
+        id=777,
+        name="do the task",
+        parent=parent,
+        guild=parent.guild,
+        send=AsyncMock(return_value=starter),
+    )
+    parent.create_thread = AsyncMock(return_value=thread_channel)
+    adapter._client = SimpleNamespace(
+        user=SimpleNamespace(id=42),
+        get_channel=lambda channel_id: parent if channel_id == 999 else thread_channel,
+        fetch_channel=AsyncMock(),
+    )
+    adapter.handle_message = AsyncMock()
+
+    result = await adapter.send(
+        "999",
+        "do the task",
+        metadata={"start_agent_task": True},
+    )
+
+    assert result.success is True
+    parent.send.assert_not_awaited()
+    parent.create_thread.assert_awaited_once()
+    assert (
+        parent.create_thread.await_args.kwargs["type"]
+        == sys.modules["discord"].ChannelType.public_thread
+    )
+    assert thread_channel.send.await_args.kwargs["content"].startswith(
+        "🤖 **Hermes started this task**"
+    )
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "777"
+    assert event.source.parent_chat_id == "999"
+    assert event.source.user_id == "system:hermes-task"
+    assert event.source.role_authorized is True
+
+
+@pytest.mark.asyncio
+async def test_task_text_channel_starter_failure_removes_empty_thread():
+    adapter = DiscordAdapter(PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"agent_task_forum_channels": ["999"]},
+    ))
+    parent = SimpleNamespace(
+        id=999,
+        name="tasks",
+        guild=SimpleNamespace(id=55, name="My House"),
+    )
+    thread_channel = SimpleNamespace(
+        id=777,
+        send=AsyncMock(side_effect=RuntimeError("starter failed")),
+        delete=AsyncMock(),
+    )
+    parent.create_thread = AsyncMock(return_value=thread_channel)
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _channel_id: parent,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send(
+        "999",
+        "do the task",
+        metadata={"start_agent_task": True},
+    )
+
+    assert result.success is False
+    assert "starter failed" in (result.error or "")
+    thread_channel.delete.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -416,5 +652,3 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
-

@@ -3099,7 +3099,37 @@ class DiscordAdapter(BasePlatformAdapter):
                 if not channel:
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
-            # Forum channels reject channel.send() — create a thread post instead.
+            # Configured task parents must never receive inert bot-authored
+            # messages.  A task parent may be either a ForumChannel or a
+            # normal TextChannel, so enforce this before the forum-only path.
+            effective_channel_id = str(thread_id or chat_id)
+            is_task_parent = (
+                effective_channel_id in self._get_agent_task_forum_channels()
+            )
+            if is_task_parent:
+                start_agent_task = bool(metadata and metadata.get("start_agent_task"))
+                if thread_id is not None or not start_agent_task:
+                    return SendResult(
+                        success=False,
+                        error=(
+                            "Direct bot delivery to this Discord task channel is blocked. "
+                            "Start a live agent task thread instead."
+                        ),
+                    )
+                if self._is_forum_parent(channel):
+                    result = await self._start_agent_task_in_forum(channel, content)
+                else:
+                    result = await self._start_agent_task_in_text_channel(channel, content)
+                await asyncio.to_thread(
+                    self._record_discord_response,
+                    reply_to=reply_to,
+                    result=result,
+                    content=content,
+                    final=final_delivery,
+                )
+                return result
+
+            # Non-task forum channels use ordinary forum-post delivery.
             if self._is_forum_parent(channel):
                 result = await self._send_to_forum(channel, content)
                 await asyncio.to_thread(
@@ -3190,7 +3220,196 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _start_agent_task_in_forum(
+        self,
+        forum_channel: Any,
+        task_text: str,
+    ) -> SendResult:
+        """Create a clearly bot-authored forum post and dispatch a live session."""
+        visible_text = f"🤖 **Hermes started this task**\n\n{task_text}"
+        result = await self._send_to_forum(
+            forum_channel,
+            visible_text,
+            thread_name=_derive_forum_thread_name(task_text),
+        )
+        return await self._dispatch_agent_task_thread(
+            forum_channel,
+            task_text,
+            result,
+        )
+
+    async def _start_agent_task_in_text_channel(
+        self,
+        parent_channel: Any,
+        task_text: str,
+    ) -> SendResult:
+        """Create a standalone public thread without posting in its parent."""
+        thread_name = _derive_forum_thread_name(task_text)
+        thread_channel = None
+        try:
+            thread_channel = await parent_channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=1440,
+                reason="Hermes live agent task",
+            )
+            starter = await thread_channel.send(
+                content=f"🤖 **Hermes started this task**\n\n{task_text}"
+            )
+        except Exception as exc:
+            logger.error(
+                "[%s] Failed to create live task thread under %s: %s",
+                self.name,
+                getattr(parent_channel, "id", "?"),
+                exc,
+                exc_info=True,
+            )
+            delete_thread = getattr(thread_channel, "delete", None)
+            if callable(delete_thread):
+                try:
+                    await delete_thread(
+                        reason="Hermes task starter failed; removing empty thread"
+                    )
+                except Exception as cleanup_exc:
+                    logger.error(
+                        "[%s] Failed to remove empty task thread %s: %s",
+                        self.name,
+                        getattr(thread_channel, "id", "?"),
+                        cleanup_exc,
+                        exc_info=True,
+                    )
+            return SendResult(
+                success=False,
+                error=f"Live task thread creation failed: {exc}",
+            )
+
+        result = SendResult(
+            success=True,
+            message_id=str(getattr(starter, "id", "") or "") or None,
+            raw_response={
+                "message_ids": [str(getattr(starter, "id", "") or "")],
+                "thread_id": str(getattr(thread_channel, "id", "") or ""),
+            },
+        )
+        return await self._dispatch_agent_task_thread(
+            parent_channel,
+            task_text,
+            result,
+            thread_channel=thread_channel,
+        )
+
+    async def _dispatch_agent_task_thread(
+        self,
+        parent_channel: Any,
+        task_text: str,
+        result: SendResult,
+        *,
+        thread_channel: Any = None,
+    ) -> SendResult:
+        """Bind a newly-created Discord task thread to a live Hermes session."""
+        if not result.success:
+            return result
+
+        raw = result.raw_response if isinstance(result.raw_response, dict) else {}
+        thread_id = str(raw.get("thread_id") or "")
+        if not thread_id:
+            return SendResult(
+                success=False,
+                message_id=result.message_id,
+                error="Task thread was created without a thread id; live session not started.",
+                raw_response=raw,
+            )
+
+        if thread_channel is None:
+            thread_channel = self._client.get_channel(int(thread_id)) if self._client else None
+            if thread_channel is None and self._client:
+                try:
+                    thread_channel = await self._client.fetch_channel(int(thread_id))
+                except Exception:
+                    thread_channel = None
+
+        self._threads.mark(thread_id)
+        guild = (
+            getattr(thread_channel, "guild", None)
+            or getattr(parent_channel, "guild", None)
+        )
+        chat_name = (
+            self._format_thread_chat_name(thread_channel)
+            if thread_channel is not None
+            else f"{getattr(parent_channel, 'name', 'tasks')} / {_derive_forum_thread_name(task_text)}"
+        )
+        source = self.build_source(
+            chat_id=thread_id,
+            chat_name=chat_name,
+            chat_type="thread",
+            user_id="system:hermes-task",
+            user_name="Hermes task launcher",
+            thread_id=thread_id,
+            chat_topic=self._get_effective_topic(
+                thread_channel or parent_channel,
+                is_thread=thread_channel is not None,
+            ),
+            is_bot=True,
+            guild_id=str(getattr(guild, "id", "") or "") or None,
+            parent_chat_id=str(getattr(parent_channel, "id", "") or "") or None,
+            message_id=result.message_id,
+            role_authorized=True,
+        )
+        parent_id = str(getattr(parent_channel, "id", "") or "")
+        event = MessageEvent(
+            text=(
+                "[Hermes-started task; not authored by the user]\n\n"
+                f"{task_text}"
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=None,
+            auto_skill=self._resolve_channel_skills(thread_id, parent_id or None),
+            channel_prompt=self._resolve_channel_prompt(thread_id, parent_id or None),
+        )
+        try:
+            await self.handle_message(event)
+        except Exception as exc:
+            logger.error(
+                "[%s] Created task thread %s but failed to dispatch its session: %s",
+                self.name,
+                thread_id,
+                exc,
+                exc_info=True,
+            )
+            cleanup_error = None
+            delete_thread = getattr(thread_channel, "delete", None)
+            if callable(delete_thread):
+                try:
+                    await delete_thread(
+                        reason="Hermes live task dispatch failed; removing inert task thread"
+                    )
+                except Exception as cleanup_exc:
+                    cleanup_error = str(cleanup_exc)
+                    logger.error(
+                        "[%s] Failed to remove inert task thread %s: %s",
+                        self.name,
+                        thread_id,
+                        cleanup_exc,
+                        exc_info=True,
+                    )
+            if cleanup_error:
+                raw = {**raw, "cleanup_error": cleanup_error}
+            return SendResult(
+                success=False,
+                message_id=result.message_id,
+                error=f"Task thread created but live session dispatch failed: {exc}",
+                raw_response=raw,
+            )
+        return result
+
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        *,
+        thread_name: Optional[str] = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3205,7 +3424,7 @@ class DiscordAdapter(BasePlatformAdapter):
         formatted = self.format_message(content)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
-        thread_name = _derive_forum_thread_name(content)
+        thread_name = thread_name or _derive_forum_thread_name(content)
 
         starter_content = chunks[0] if chunks else thread_name
 
@@ -3352,6 +3571,11 @@ class DiscordAdapter(BasePlatformAdapter):
         re-split, looping forever (the Telegram #48648 lesson).  The complete
         text is delivered when ``finalize=True`` via ``_edit_overflow_split``.
         """
+        if str(chat_id) in self._get_agent_task_forum_channels():
+            return SendResult(
+                success=False,
+                error="Editing messages in this Discord task channel is blocked.",
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
@@ -3573,6 +3797,11 @@ class DiscordAdapter(BasePlatformAdapter):
         message with zero attachments — a silent drop for video/document
         MEDIA tags (#66797).
         """
+        if str(chat_id) in self._get_agent_task_forum_channels():
+            return SendResult(
+                success=False,
+                error="Direct media delivery to this Discord task channel is blocked.",
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -3646,6 +3875,13 @@ class DiscordAdapter(BasePlatformAdapter):
         if not self._client:
             return
         if not images:
+            return
+        if str(chat_id) in self._get_agent_task_forum_channels():
+            logger.warning(
+                "[%s] Blocked direct multi-image delivery to task channel %s",
+                self.name,
+                chat_id,
+            )
             return
 
         try:
@@ -3785,6 +4021,11 @@ class DiscordAdapter(BasePlatformAdapter):
         **kwargs,
     ) -> SendResult:
         """Send audio as a Discord file attachment."""
+        if str(chat_id) in self._get_agent_task_forum_channels():
+            return SendResult(
+                success=False,
+                error="Direct media delivery to this Discord task channel is blocked.",
+            )
         try:
             import io
 
@@ -4999,6 +5240,11 @@ class DiscordAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image natively as a Discord file attachment."""
+        if str(chat_id) in self._get_agent_task_forum_channels():
+            return SendResult(
+                success=False,
+                error="Direct media delivery to this Discord task channel is blocked.",
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -5081,6 +5327,11 @@ class DiscordAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an animated GIF natively as a Discord file attachment."""
+        if str(chat_id) in self._get_agent_task_forum_channels():
+            return SendResult(
+                success=False,
+                error="Direct media delivery to this Discord task channel is blocked.",
+            )
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
@@ -5192,6 +5443,13 @@ class DiscordAdapter(BasePlatformAdapter):
         default), and continues — it does NOT die on a single rate-limit
         hit.  Only CancelledError (from stop_typing) stops the loop.
         """
+        chat_id = str(
+            (metadata or {}).get("thread_id")
+            or (metadata or {}).get("message_thread_id")
+            or chat_id
+        )
+        if chat_id in self._get_agent_task_forum_channels():
+            return
         if not self._client:
             return
         # Don't start a duplicate loop
@@ -6264,6 +6522,12 @@ class DiscordAdapter(BasePlatformAdapter):
         """This adapter's DISCORD_NO_THREAD_CHANNELS list (per-profile)."""
         return self._gate_csv_set(self._gate_raw("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS"))
 
+    def _get_agent_task_forum_channels(self) -> set:
+        """Forums where bot-authored posts must launch a real agent session."""
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        raw = extra.get("agent_task_forum_channels") if isinstance(extra, dict) else None
+        return self._gate_csv_set(raw)
+
     def _get_allowed_users(self) -> set:
         """This adapter's DISCORD_ALLOWED_USERS entries (per-profile, cleaned)."""
         raw = self._gate_raw("allow_from", "DISCORD_ALLOWED_USERS")
@@ -6772,6 +7036,14 @@ class DiscordAdapter(BasePlatformAdapter):
                 "thread_name": getattr(thread, "name", None) or name,
             }
         except Exception as direct_error:
+            if str(getattr(parent_channel, "id", "")) in self._get_agent_task_forum_channels():
+                return {
+                    "success": False,
+                    "error": (
+                        "Thread creation failed and the protected task channel "
+                        "does not allow a seed-message fallback."
+                    ),
+                }
             try:
                 seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
                 seed_msg = await parent_channel.send(seed_content)
@@ -6843,6 +7115,13 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
+                if str(getattr(message.channel, "id", "")) in self._get_agent_task_forum_channels():
+                    logger.warning(
+                        "[%s] Auto-thread: refusing seed-message fallback in protected task channel %s",
+                        self.name,
+                        getattr(message.channel, "id", "?"),
+                    )
+                    break
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
@@ -6994,6 +7273,17 @@ class DiscordAdapter(BasePlatformAdapter):
                 self.name, direct_error,
             )
 
+        # A seed-message fallback would itself be a bot post in the protected
+        # task parent. Fail closed; callers can surface the thread-creation
+        # failure without violating the parent-channel contract.
+        if str(parent_chat_id) in self._get_agent_task_forum_channels():
+            logger.warning(
+                "[%s] Handoff thread: refusing seed-message fallback in task channel %s",
+                self.name,
+                parent_chat_id,
+            )
+            return None
+
         # Fallback: post a seed message and create the thread from it.
         try:
             send = getattr(parent, "send", None)
@@ -7072,6 +7362,9 @@ class DiscordAdapter(BasePlatformAdapter):
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
+
+            if str(target_id) in self._get_agent_task_forum_channels():
+                return SendResult(success=False, error="Direct task-channel prompts are blocked.")
 
             channel = self._client.get_channel(int(target_id))
             if not channel:
@@ -7165,6 +7458,9 @@ class DiscordAdapter(BasePlatformAdapter):
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
 
+            if str(target_id) in self._get_agent_task_forum_channels():
+                return SendResult(success=False, error="Direct task-channel prompts are blocked.")
+
             channel = self._client.get_channel(int(target_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(target_id))
@@ -7231,6 +7527,9 @@ class DiscordAdapter(BasePlatformAdapter):
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
+
+            if str(target_id) in self._get_agent_task_forum_channels():
+                return SendResult(success=False, error="Direct task-channel prompts are blocked.")
 
             channel = self._client.get_channel(int(target_id))
             if not channel:
@@ -7337,6 +7636,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
         try:
             target_id = metadata.get("thread_id") if metadata and metadata.get("thread_id") else chat_id
+            if str(target_id) in self._get_agent_task_forum_channels():
+                return SendResult(success=False, error="Direct task-channel prompts are blocked.")
             channel = self._client.get_channel(int(target_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(target_id))
@@ -7388,6 +7689,9 @@ class DiscordAdapter(BasePlatformAdapter):
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
+
+            if str(target_id) in self._get_agent_task_forum_channels():
+                return SendResult(success=False, error="Direct task-channel prompts are blocked.")
 
             channel = self._client.get_channel(int(target_id))
             if not channel:
@@ -7449,6 +7753,9 @@ class DiscordAdapter(BasePlatformAdapter):
             target_id = chat_id
             if metadata and metadata.get("thread_id"):
                 target_id = metadata["thread_id"]
+
+            if str(target_id) in self._get_agent_task_forum_channels():
+                return SendResult(success=False, error="Direct task-channel prompts are blocked.")
 
             channel = self._client.get_channel(int(target_id))
             if not channel:
@@ -9568,6 +9875,21 @@ async def _standalone_send(
     ``force_document`` is accepted for signature parity but unused — Discord
     treats every uploaded file as a generic attachment.
     """
+    extra = getattr(pconfig, "extra", None)
+    protected_raw = (
+        extra.get("agent_task_forum_channels")
+        if isinstance(extra, dict)
+        else None
+    )
+    protected_ids = DiscordAdapter._gate_csv_set(protected_raw)
+    if str(thread_id or chat_id) in protected_ids:
+        return {
+            "error": (
+                "Direct standalone delivery to this Discord task channel is blocked. "
+                "Use the running gateway to start a live agent task thread."
+            )
+        }
+
     try:
         import aiohttp
     except ImportError:
