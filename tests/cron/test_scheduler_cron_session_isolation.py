@@ -50,6 +50,7 @@ class _FakeCronAgent:
         assert origin["version"] == "hermes.scheduler-origin.v1"
         assert origin["proposer_kind"] == "service"
         assert origin["job_id"] == "ctx-isolation"
+        assert origin["run_id"] == "0123456789abcdef0123456789abcdef"
         assert origin["runtime_attested"] is True
         return {
             "completed": True,
@@ -126,6 +127,7 @@ def test_run_job_cron_execute_code_deny_does_not_pollute_later_gateway_execute_c
     success, _output, final_response, error = cron_scheduler.run_job(
         {
             "id": "ctx-isolation",
+            "execution_id": "0123456789abcdef0123456789abcdef",
             "name": "Context Isolation",
             "prompt": "Run safely",
             "schedule_display": "manual",

@@ -378,7 +378,9 @@ def reset_session_vars() -> None:
         pass
 
 
-def bind_scheduler_service_origin(job_id: str, profile_ref: str):
+def bind_scheduler_service_origin(
+    job_id: str, profile_ref: str, *, run_id: str | None = None,
+):
     """Bind one unforgeable, task-local autonomous scheduler run.
 
     The returned ContextVar token must be passed to
@@ -392,12 +394,20 @@ def bind_scheduler_service_origin(job_id: str, profile_ref: str):
         raise ValueError("scheduler service origin requires a bounded job id")
     if not clean_profile or len(clean_profile) > 80:
         raise ValueError("scheduler service origin requires a bounded profile reference")
+    clean_run = str(run_id or "").strip()
+    if not clean_run:
+        clean_run = secrets.token_urlsafe(24)
+    if (
+        not 16 <= len(clean_run) <= 128
+        or any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for ch in clean_run)
+    ):
+        raise ValueError("scheduler service origin requires a bounded opaque run id")
     origin = {
         "version": "hermes.scheduler-origin.v1",
         "proposer_kind": "service",
         "profile_ref": clean_profile,
         "job_id": clean_job,
-        "run_id": secrets.token_urlsafe(24),
+        "run_id": clean_run,
         "started_at": int(time.time()),
         "nonce": secrets.token_urlsafe(24),
         "runtime_attested": True,

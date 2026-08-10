@@ -49,9 +49,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             delivery_outcome TEXT
            )"""
     )
+    existing_columns = {
+        str(row[1]) for row in conn.execute("PRAGMA table_info(executions)")
+    }
+    if "delivery_outcome" not in existing_columns:
+        conn.execute("ALTER TABLE executions ADD COLUMN delivery_outcome TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -182,9 +188,10 @@ def finish_execution(
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
+            """UPDATE executions SET status=?, finished_at=?, error=?,
+               delivery_outcome=?
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (status, now, detail, delivery_outcome, execution_id),
         )
         if cur.rowcount != 1:
             return None

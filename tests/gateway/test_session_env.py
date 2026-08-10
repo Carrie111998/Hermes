@@ -285,7 +285,9 @@ def test_scheduler_service_origin_is_task_local_core_state_without_env_fallback(
 
     session_tokens = set_session_vars(cron_session="1")
     assert get_scheduler_service_origin() is None
-    service_token = bind_scheduler_service_origin("job-123", "cadence")
+    service_token = bind_scheduler_service_origin(
+        "job-123", "cadence", run_id="0123456789abcdef0123456789abcdef",
+    )
     try:
         origin = get_scheduler_service_origin()
         assert origin is not None
@@ -293,7 +295,7 @@ def test_scheduler_service_origin_is_task_local_core_state_without_env_fallback(
         assert origin["profile_ref"] == "cadence"
         assert origin["job_id"] == "job-123"
         assert origin["runtime_attested"] is True
-        assert len(origin["run_id"]) >= 24
+        assert origin["run_id"] == "0123456789abcdef0123456789abcdef"
         assert len(origin["nonce"]) >= 24
 
         # Callers receive a copy and cannot rewrite the bound authority.
@@ -303,6 +305,11 @@ def test_scheduler_service_origin_is_task_local_core_state_without_env_fallback(
         clear_scheduler_service_origin(service_token)
         clear_session_vars(session_tokens)
     assert get_scheduler_service_origin() is None
+
+
+def test_scheduler_service_origin_rejects_invalid_explicit_run_id():
+    with __import__("pytest").raises(ValueError):
+        bind_scheduler_service_origin("job-123", "cadence", run_id="../state.db")
 
 
 def test_ordinary_session_binding_clears_inherited_scheduler_origin():

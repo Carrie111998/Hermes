@@ -3628,8 +3628,12 @@ def run_job(
             _service_profile_ref = get_active_profile_name()
         except Exception:
             _service_profile_ref = "default"
+        # The durable execution id is also the trusted scheduler run id. This
+        # gives downstream action transports one correlation seam without a
+        # second run ledger or a model-authored identifier.
         _service_origin_token = bind_scheduler_service_origin(
-            str(job_id), _service_profile_ref
+            str(job_id), _service_profile_ref,
+            run_id=str(job.get("execution_id") or "") or None,
         )
 
         # Mark this job as NOT the dispatcher-owned kanban worker.
@@ -4608,7 +4612,7 @@ def run_one_job(
         _deferred_agents: list = []
         try:
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents,
+                dict(job, execution_id=execution_id), defer_agent_teardown=_deferred_agents,
                 extra_prompt=extra_prompt,
             )
         except BaseException:

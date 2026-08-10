@@ -30,10 +30,13 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
     assert running["status"] == "running"
     assert running["started_at"]
 
-    completed = executions.finish_execution(claimed["id"], success=True)
+    completed = executions.finish_execution(
+        claimed["id"], success=True, delivery_outcome="delivered",
+    )
     assert completed["status"] == "completed"
     assert completed["finished_at"]
     assert completed["error"] is None
+    assert completed["delivery_outcome"] == "delivered"
 
     persisted = executions.list_executions(job_id="job-1")
     assert persisted == [completed]
@@ -103,6 +106,22 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
 
     assert failed["status"] == "failed"
     assert failed["error"] == "provider exploded"
+
+
+def test_existing_execution_ledger_is_upgraded_in_place(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as db:
+        db.execute("""create table executions(
+          id text primary key, job_id text not null, source text not null,
+          process_id text not null, pid integer not null, process_started_at integer,
+          status text not null, claimed_at text not null, started_at text,
+          finished_at text, error text)""")
+    record = executions.create_execution("upgraded", source="builtin")
+    finished = executions.finish_execution(
+        record["id"], success=True, delivery_outcome="suppressed",
+    )
+    assert finished["delivery_outcome"] == "suppressed"
 
 
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
@@ -212,19 +231,24 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(
-        scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
-    )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+
+    captured = []
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None, **_kw: (
+            captured.append(job) or (True, "output", "response", None)
+        ),
+    )
 
     assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+    assert captured[0]["execution_id"] == "exec-3"
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
