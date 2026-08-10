@@ -4051,6 +4051,21 @@ def uninstall_skill(skill_name: str) -> Tuple[bool, str]:
     lock.record_uninstall(skill_name)
     append_audit_log("UNINSTALL", skill_name, entry["source"], entry["trust_level"], "n/a", "user_request")
 
+    try:
+        from tools.skill_usage import forget
+
+        forget(
+            skill_name,
+            lifecycle_action="uninstalled",
+            provenance="installed",
+        )
+    except Exception:
+        logger.debug(
+            "Unable to record skill uninstall lifecycle for %s",
+            skill_name,
+            exc_info=True,
+        )
+
     return True, f"Uninstalled '{skill_name}' from {entry['install_path']}"
 
 

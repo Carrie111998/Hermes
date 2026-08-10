@@ -1575,6 +1575,7 @@ def skill_manage(
     if gate_result is not None:
         return gate_result
 
+    delete_provenance = None
     if action == "create":
         if not content:
             return tool_error("content is required for 'create'. Provide the full SKILL.md text (frontmatter + body).", success=False)
@@ -1593,6 +1594,15 @@ def skill_manage(
         result = _patch_skill(name, old_string, new_string, file_path, replace_all)
 
     elif action == "delete":
+        # Capture provenance before the path disappears. The lifecycle event is
+        # emitted only after a successful hard delete below; curator archives
+        # keep their existing ``archived`` event instead.
+        try:
+            from tools.skill_usage import telemetry_provenance
+
+            delete_provenance = telemetry_provenance(name)
+        except Exception:
+            pass
         result = _delete_skill(name, absorbed_into=absorbed_into)
 
     elif action == "write_file":
@@ -1644,7 +1654,13 @@ def skill_manage(
                 # keeps its usage record as STATE_ARCHIVED so `hermes curator
                 # status`/`restore` still see it. Only a hard delete forgets.
                 if not result.get("_archived"):
-                    forget(name)
+                    forget(
+                        name,
+                        lifecycle_action="deleted",
+                        provenance=delete_provenance,
+                        task_id=task_id,
+                        session_id=session_id,
+                    )
         except Exception:
             pass
 
