@@ -900,30 +900,41 @@ class ShellFileOperations(FileOperations):
 
         File operations run through a terminal backend (possibly remote), so
         raw bytes cannot cross the transport directly — the terminal decodes
-        stdout with ``errors="replace"`` and manufactures U+FFFD at every
-        byte it cannot decode, including a multibyte character cut in half by
-        ``head -c``. Wrapping the sample in base64 lets the original bytes
-        survive the transport, so binary detection can happen at the byte
-        layer where it is well-defined (#80308 and friends).
+        stdout with ``errors="replace"``. Base64 is preferred, with a
+        byte-safe hexadecimal fallback for environments without a working
+        ``base64`` command. Both transports preserve the original bytes so
+        binary detection never depends on an arbitrary UTF-8 boundary.
 
-        Returns the sample bytes, or ``None`` when the transport could not
-        produce clean base64 (exotic shells without ``base64``); callers fall
-        back to the legacy text-sample heuristic in that case.
+        Returns the sample bytes, or ``None`` when neither transport can
+        produce a clean byte representation.
         """
-        result = self._exec(
-            f"head -c {length} {self._escape_shell_arg(path)} 2>/dev/null | base64"
+        escaped_path = self._escape_shell_arg(path)
+        result = self._exec(f"head -c {length} {escaped_path} 2>/dev/null | base64")
+        if result.exit_code == 0:
+            encoded = _strip_terminal_fence_leaks(result.stdout)
+            encoded = "".join(encoded.split())
+            if not encoded:
+                return b""
+            if re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+                try:
+                    return base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError):
+                    pass
+
+        # Keep the fallback byte-safe: terminal stdout may be decoded as text,
+        # but ASCII hex survives that boundary without introducing U+FFFD.
+        hex_result = self._exec(
+            f"od -An -v -tx1 -N {length} {escaped_path} 2>/dev/null"
         )
-        if result.exit_code != 0:
+        if hex_result.exit_code != 0:
             return None
-        encoded = _strip_terminal_fence_leaks(result.stdout)
-        encoded = "".join(encoded.split())
-        if not encoded:
-            return b""
-        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+        hex_text = _strip_terminal_fence_leaks(hex_result.stdout)
+        tokens = hex_text.split()
+        if not tokens or any(not re.fullmatch(r"[0-9A-Fa-f]{2}", token) for token in tokens):
             return None
         try:
-            return base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError):
+            return bytes.fromhex("".join(tokens))
+        except ValueError:
             return None
 
     @staticmethod

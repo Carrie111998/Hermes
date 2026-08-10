@@ -767,6 +767,25 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         assert ops._sample_file_bytes("/tmp/x.txt") is None
 
+    def test_sample_falls_back_to_byte_safe_hex_transport(self, mock_env):
+        payload = b"a" * 1002 + "中".encode("utf-8") + b" text"
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "| base64" in command:
+                return {"output": "not base64", "returncode": 0}
+            if command.startswith("od -An -v -tx1"):
+                hex_bytes = " ".join(f"{byte:02x}" for byte in payload[:1000])
+                return {"output": hex_bytes, "returncode": 0}
+            return {"output": "", "returncode": 1}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+
+        assert ops._sample_file_bytes("/tmp/x.txt") == payload[:1000]
+        assert any("od -An -v -tx1" in command for command in commands)
+
     def test_sample_falls_back_on_nonzero_exit(self, mock_env):
         mock_env.execute.return_value = {"output": "", "returncode": 127}
         ops = ShellFileOperations(mock_env)
@@ -806,20 +825,18 @@ class TestByteLayerBinaryDetection:
         result = ops.read_file("/tmp/a.out")
         assert result.is_binary is True
 
-    def test_fallback_sample_completes_utf8_boundary(self, mock_env):
-        content = (b"a" * 999 + "中".encode("utf-8") + b" text")
+    def test_fallback_sample_preserves_utf8_boundary(self, mock_env):
+        content = (b"a" * 1002 + "中".encode("utf-8") + b" text")
         commands = []
 
         def side_effect(command, **kwargs):
             commands.append(command)
             if command.startswith("wc -c"):
                 return {"output": f"{len(content)}\n", "returncode": 0}
-            if command.startswith("head -c 1003"):
-                # Force the legacy text fallback rather than byte-layer
-                # detection, then return the complete 1003-byte sample.
-                return {"output": content[:1003].decode("utf-8"), "returncode": 0}
-            if command.startswith("head -c 1000"):
+            if "| base64" in command:
                 return {"output": "not base64", "returncode": 0}
+            if command.startswith("od -An -v -tx1"):
+                return {"output": " ".join(f"{byte:02x}" for byte in content[:1000]), "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": content.decode("utf-8"), "returncode": 0}
             if command.startswith("wc -l"):
@@ -832,20 +849,20 @@ class TestByteLayerBinaryDetection:
 
         assert result.is_binary is False
         assert result.error is None
-        assert any("head -c 1003" in command for command in commands)
+        assert any("od -An -v -tx1" in command for command in commands)
 
-    def test_read_file_raw_fallback_completes_utf8_boundary(self, mock_env):
-        content = (b"a" * 999 + "中".encode("utf-8") + b" text")
+    def test_read_file_raw_fallback_preserves_utf8_boundary(self, mock_env):
+        content = (b"a" * 1002 + "中".encode("utf-8") + b" text")
         commands = []
 
         def side_effect(command, **kwargs):
             commands.append(command)
             if command.startswith("wc -c"):
                 return {"output": f"{len(content)}\n", "returncode": 0}
-            if command.startswith("head -c 1003"):
-                return {"output": content[:1003].decode("utf-8"), "returncode": 0}
-            if command.startswith("head -c 1000"):
+            if "| base64" in command:
                 return {"output": "not base64", "returncode": 0}
+            if command.startswith("od -An -v -tx1"):
+                return {"output": " ".join(f"{byte:02x}" for byte in content[:1000]), "returncode": 0}
             if command.startswith("cat "):
                 return {"output": content.decode("utf-8"), "returncode": 0}
             return {"output": "", "returncode": 0}
@@ -857,5 +874,5 @@ class TestByteLayerBinaryDetection:
         assert result.is_binary is False
         assert result.error is None
         assert result.content == content.decode("utf-8")
-        assert any("head -c 1003" in command for command in commands)
+        assert any("od -An -v -tx1" in command for command in commands)
 
