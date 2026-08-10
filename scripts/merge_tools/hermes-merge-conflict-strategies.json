@@ -82,6 +82,21 @@
       "note": "Official new creative skill; no fork-local counterpart exists."
     },
     {
+      "pattern": "skills/creative/ascii-video/SKILL.md",
+      "action": "upstream",
+      "note": "The fork deleted this equivalent creative skill; restore the official metadata-maintained implementation."
+    },
+    {
+      "pattern": "skills/creative/manim-video/SKILL.md",
+      "action": "upstream",
+      "note": "The fork deleted this equivalent creative skill; restore the official metadata-maintained implementation."
+    },
+    {
+      "pattern": "skills/creative/p5js/SKILL.md",
+      "action": "upstream",
+      "note": "The fork deleted this equivalent creative skill; restore the official metadata-maintained implementation."
+    },
+    {
       "pattern": "skills/creative/comfyui/tests/README.md",
       "action": "upstream",
       "note": "Official ComfyUI suite guidance follows the current test runner; restore the upstream documentation."
