@@ -1375,3 +1375,112 @@ class TestSubagentTracing:
         )
 
         assert spans == []
+
+
+# ---------------------------------------------------------------------------
+# MoA fan-out: one generation per advisor, priced at the advisor's own model
+# ---------------------------------------------------------------------------
+
+class TestMoAReferenceGenerations:
+    """MoA returns only the aggregator's response, so without per-advisor
+    generations the whole fan-out collapses into one line priced at the
+    aggregator's model. Advisors routinely run on a different provider."""
+
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def _state(self, mod, monkeypatch, gens):
+        class _Obs:
+            def __init__(self, kw):
+                self.kw = kw
+                self.updates = {}
+                self.ended = False
+
+            def update(self, **kw):
+                self.updates.update(kw)
+
+            def end(self, **kw):
+                self.ended = True
+
+        class _Root:
+            def start_observation(self, **kw):
+                obs = _Obs(kw)
+                gens.append(obs)
+                return obs
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        return mod.TraceState(trace_id="t", root_ctx=None, root_span=_Root())
+
+    def _refs(self):
+        return [
+            {
+                "label": "anthropic:claude-sonnet-4-6",
+                "model": "claude-sonnet-4-6",
+                "provider": "anthropic",
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "cost_usd": 0.001,
+                "cost_status": "ok",
+                "cost_source": "pricing_table",
+            },
+            {
+                "label": "openai:gpt-5",
+                "model": "gpt-5",
+                "provider": "openai",
+                "usage": {"input_tokens": 80, "output_tokens": 40, "reasoning_tokens": 10},
+                "cost_usd": 0.002,
+            },
+        ]
+
+    def test_one_generation_per_advisor_with_own_model_and_cost(self, monkeypatch):
+        mod = self._fresh_plugin()
+        gens = []
+        state = self._state(mod, monkeypatch, gens)
+
+        mod._emit_moa_reference_generations(state, client=object(), references=self._refs())
+
+        assert len(gens) == 2
+        assert gens[0].kw["model"] == "claude-sonnet-4-6"
+        assert gens[1].kw["model"] == "gpt-5"
+        # Each advisor's dollars, not the aggregator's rate applied to all.
+        assert gens[0].updates["cost_details"]["total"] == pytest.approx(0.001)
+        assert gens[1].updates["cost_details"]["total"] == pytest.approx(0.002)
+        assert gens[0].updates["usage_details"] == {"input": 100, "output": 50}
+        assert gens[1].updates["usage_details"]["reasoning_tokens"] == 10
+        assert all(g.ended for g in gens)
+
+    def test_repeat_emit_is_deduped_within_a_turn(self, monkeypatch):
+        mod = self._fresh_plugin()
+        gens = []
+        state = self._state(mod, monkeypatch, gens)
+
+        # The MoA client holds its last fan-out until the next one, so a
+        # tool-loop turn delivers the same references on every API call.
+        refs = self._refs()
+        mod._emit_moa_reference_generations(state, client=object(), references=refs)
+        mod._emit_moa_reference_generations(state, client=object(), references=refs)
+        mod._emit_moa_reference_generations(state, client=object(), references=list(refs))
+
+        assert len(gens) == 2
+
+    def test_a_new_fanout_emits_again(self, monkeypatch):
+        mod = self._fresh_plugin()
+        gens = []
+        state = self._state(mod, monkeypatch, gens)
+
+        mod._emit_moa_reference_generations(state, client=object(), references=self._refs())
+        second = self._refs()
+        second[0]["usage"]["output_tokens"] = 999
+        mod._emit_moa_reference_generations(state, client=object(), references=second)
+
+        assert len(gens) == 4
+
+    def test_non_moa_turn_emits_nothing(self, monkeypatch):
+        mod = self._fresh_plugin()
+        gens = []
+        state = self._state(mod, monkeypatch, gens)
+
+        for value in (None, [], "not-a-list", [None, "junk"]):
+            mod._emit_moa_reference_generations(state, client=object(), references=value)
+
+        assert gens == []

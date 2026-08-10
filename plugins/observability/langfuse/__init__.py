@@ -55,6 +55,10 @@ class TraceState:
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     # Keyed by child_session_id: subagent_stop carries no child_subagent_id.
     subagents: Dict[str, Any] = field(default_factory=dict)
+    # Fingerprints of MoA fan-outs already recorded. The client holds its last
+    # fan-out until the next one, so a tool-loop turn would re-emit the same
+    # advisors on every API call without this.
+    moa_emitted: set = field(default_factory=set)
     last_updated_at: float = field(default_factory=time.time)
 
 
@@ -953,6 +957,77 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
         state.last_updated_at = time.time()
 
 
+def _emit_moa_reference_generations(state: TraceState, *, client: Langfuse,
+                                    references: Any) -> None:
+    """Record each MoA advisor as its own generation under the turn.
+
+    MoA returns only the aggregator's response, so without this the whole
+    fan-out collapses into one generation priced at the aggregator's model.
+    Each advisor carries its own model, usage, and dollars — advisors routinely
+    run on a different provider than the aggregator, so their spend cannot be
+    priced at the aggregator's rate.
+    """
+    if not isinstance(references, list) or not references:
+        return
+    fingerprint = json.dumps(
+        [
+            [r.get("label"), r.get("model"), (r.get("usage") or {}).get("output_tokens")]
+            for r in references
+            if isinstance(r, dict)
+        ],
+        sort_keys=True,
+        default=str,
+    )
+    with _STATE_LOCK:
+        if fingerprint in state.moa_emitted:
+            return
+        state.moa_emitted.add(fingerprint)
+
+    for ref in references:
+        if not isinstance(ref, dict):
+            continue
+        usage = ref.get("usage") or {}
+        usage_details = {}
+        if isinstance(usage, dict):
+            if usage.get("input_tokens"):
+                usage_details["input"] = usage["input_tokens"]
+            if usage.get("output_tokens"):
+                usage_details["output"] = usage["output_tokens"]
+            if usage.get("cache_read_tokens"):
+                usage_details["cache_read_input_tokens"] = usage["cache_read_tokens"]
+            if usage.get("cache_write_tokens"):
+                usage_details["cache_creation_input_tokens"] = usage["cache_write_tokens"]
+            if usage.get("reasoning_tokens"):
+                usage_details["reasoning_tokens"] = usage["reasoning_tokens"]
+        cost_details = {}
+        cost_usd = ref.get("cost_usd")
+        if isinstance(cost_usd, (int, float)):
+            cost_details["total"] = float(cost_usd)
+
+        label = ref.get("label") or "advisor"
+        metadata = {"moa_role": "reference", "label": label}
+        for key in ("provider", "cost_status", "cost_source", "temperature"):
+            if ref.get(key) is not None:
+                metadata[key] = ref[key]
+
+        observation = _start_child_observation(
+            state,
+            client=client,
+            name=f"MoA advisor: {label}",
+            as_type="generation",
+            input_value=None,
+            metadata=metadata,
+            model=ref.get("model"),
+        )
+        _end_observation(
+            observation,
+            output=_capture_content(ref.get("output")),
+            usage_details=usage_details,
+            cost_details=cost_details,
+            metadata=metadata,
+        )
+
+
 def on_pre_llm_request(
     *,
     task_id: str = "",
@@ -1054,7 +1129,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      usage: Any = None, assistant_content_chars: int = 0,
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
                      turn_id: str = "", api_request_id: str = "",
-                     response_model: Any = None,
+                     response_model: Any = None, moa_references: Any = None,
                      **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
@@ -1079,6 +1154,9 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         generation = state.generations.pop(req_key, None) if state else None
     if state is None or generation is None:
         return
+
+    if moa_references:
+        _emit_moa_reference_generations(state, client=client, references=moa_references)
 
     # Handle both call patterns:
     # 1. post_api_request: passes usage (dict), assistant_content_chars, assistant_tool_call_count
