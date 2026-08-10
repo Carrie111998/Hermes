@@ -8,7 +8,13 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from devflow_delegation.decision_service import DdpDecisionTelemetryError, StagedDdpDecision
+from devflow_delegation.decision_service import (
+    DdpDecisionConflict,
+    DdpDecisionExpired,
+    DdpDecisionTelemetryError,
+    DdpDecisionUnauthorized,
+    StagedDdpDecision,
+)
 from gateway.config import PlatformConfig
 from gateway.devflow_auth import DevflowLoginGrantStore
 from gateway.platforms.api_server import APIServerAdapter, cors_middleware, security_headers_middleware
@@ -295,3 +301,88 @@ async def test_post_commit_telemetry_failure_reports_committed_degraded() -> Non
         "request_id": "request-1",
         "state": "PLANNED",
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (DdpDecisionUnauthorized("not authorized"), 403),
+        (DdpDecisionConflict("request state changed"), 409),
+        (RuntimeError("ledger unavailable"), 503),
+    ],
+)
+async def test_stage_maps_typed_domain_and_outage_failures(
+    error: Exception,
+    expected_status: int,
+) -> None:
+    adapter, service = _adapter()
+    subject = adapter._devflow_grant_store.redeem(
+        grant=adapter._devflow_grant_store.mint(
+            authenticated_actor="telegram:admin-42", audience="devflow-local"
+        ),
+        audience="devflow-local",
+    ).subject
+
+    def fail_stage(**_kwargs):
+        raise error
+
+    service.stage = fail_stage
+    async with TestClient(TestServer(_app(adapter))) as client:
+        response = await client.post(
+            "/api/devflow/decisions/stage",
+            headers=_headers(subject=subject),
+            json={"request_id": "request-1", "decision": "approve", "rationale": "reviewed"},
+        )
+        payload = await response.json()
+
+    assert response.status == expected_status
+    assert payload == {"error": "request unavailable"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (DdpDecisionUnauthorized("stale confirmation"), 409),
+        (DdpDecisionExpired("confirmation expired"), 409),
+        (DdpDecisionConflict("request state changed"), 409),
+        (RuntimeError("ledger unavailable"), 503),
+    ],
+)
+async def test_confirm_maps_typed_domain_and_outage_failures(
+    error: Exception,
+    expected_status: int,
+) -> None:
+    adapter, service = _adapter()
+    subject = adapter._devflow_grant_store.redeem(
+        grant=adapter._devflow_grant_store.mint(
+            authenticated_actor="telegram:admin-42", audience="devflow-local"
+        ),
+        audience="devflow-local",
+    ).subject
+
+    def fail_confirm(**_kwargs):
+        raise error
+
+    service.confirm = fail_confirm
+    async with TestClient(TestServer(_app(adapter))) as client:
+        staged = await client.post(
+            "/api/devflow/decisions/stage",
+            headers=_headers(subject=subject),
+            json={"request_id": "request-1", "decision": "approve", "rationale": "reviewed"},
+        )
+        token = (await staged.json())["staged_token"]
+        response = await client.post(
+            "/api/devflow/decisions/confirm",
+            headers=_headers(subject=subject),
+            json={
+                "request_id": "request-1",
+                "decision": "approve",
+                "staged_token": token,
+            },
+        )
+        payload = await response.json()
+
+    assert response.status == expected_status
+    assert payload == {"error": "request unavailable"}

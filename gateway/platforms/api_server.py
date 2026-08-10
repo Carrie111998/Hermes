@@ -1412,6 +1412,25 @@ class APIServerAdapter(BasePlatformAdapter):
         subject = request.headers.get("X-Devflow-Operator-Subject", "").strip()
         return self._get_devflow_grant_store().actor_for_subject(subject)
 
+    @staticmethod
+    def _devflow_decision_error_response(
+        error: Exception, *, confirming: bool
+    ) -> tuple[int, str]:
+        from devflow_delegation.decision_service import (
+            DdpDecisionConflict,
+            DdpDecisionExpired,
+            DdpDecisionUnauthorized,
+        )
+        from gateway.devflow_decisions import DevflowDecisionRequestError
+
+        if isinstance(error, DevflowDecisionRequestError):
+            return 400, "invalid request"
+        if isinstance(error, (DdpDecisionConflict, DdpDecisionExpired)):
+            return 409, "request unavailable"
+        if isinstance(error, DdpDecisionUnauthorized):
+            return (409 if confirming else 403), "request unavailable"
+        return 503, "request unavailable"
+
     async def _handle_devflow_decision_stage(self, request: "web.Request") -> "web.Response":
         origin_err = self._devflow_reject_browser_origin(request)
         if origin_err:
@@ -1425,8 +1444,11 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response({"error": "request unavailable"}, status=403)
         try:
             staged = await self._get_devflow_decision_adapter().stage(actor=actor, body=body)
-        except Exception:
-            return web.json_response({"error": "invalid request"}, status=400)
+        except Exception as error:
+            status, message = self._devflow_decision_error_response(
+                error, confirming=False
+            )
+            return web.json_response({"error": message}, status=status)
         return web.json_response(staged.as_dict())
 
     async def _handle_devflow_decision_confirm(self, request: "web.Request") -> "web.Response":
@@ -1444,8 +1466,11 @@ class APIServerAdapter(BasePlatformAdapter):
             result, staged = await self._get_devflow_decision_adapter().confirm(
                 actor=actor, body=body
             )
-        except Exception:
-            return web.json_response({"error": "invalid request"}, status=400)
+        except Exception as error:
+            status, message = self._devflow_decision_error_response(
+                error, confirming=True
+            )
+            return web.json_response({"error": message}, status=status)
         return web.json_response(
             {"result": result, "request_id": staged.request_id, "state": staged.target_state}
         )
