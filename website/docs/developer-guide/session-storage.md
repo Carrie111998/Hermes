@@ -192,21 +192,34 @@ _CHECKPOINT_EVERY_N_WRITES = 50
 
 ## Connection Ownership and Failure Cleanup
 
-`SessionDB` owns every SQLite connection it opens. A constructor that fails
-after opening SQLite closes the partial writer before re-raising, including
-schema, pragma, FTS, repair, and lock-retry failures. WAL read connections are
-also closed when setup fails before registration, and can be drained by
-`SessionDB.close()` from a different worker thread.
+SQLite connections are resources, not ordinary Python values. A connection can
+keep descriptors for `state.db`, `state.db-wal`, and `state.db-shm` open. The
+descriptor lifetime must therefore be tied to an explicit owner and an
+explicit shutdown path. Python garbage collection is not a correctness
+mechanism here: a failed constructor may never return an object whose
+destructor could clean up, and `SessionDB` intentionally keeps strong tracking
+references for lock-safety.
 
-Callers that open a temporary or dedicated handle must close it in a
-`finally` block. A caller-supplied shared handle remains owned by its caller;
-agent teardown must not close it. This distinction matters for session search,
-cross-profile reads, trace export, CLI probes, and cron startup.
+### Ownership model
 
-Timeouts need explicit ownership too. If cron stops waiting for a background
-`SessionDB()` construction, the late future result is closed by its completion
-callback. Otherwise a connection that arrives after the timeout has no owner
-and leaks its `state.db`, `-wal`, and `-shm` descriptors.
+`SessionDB` owns every SQLite connection it opens. The caller owns the
+`SessionDB` instance and must call `close()` when that instance is no longer
+needed.
+
+| Resource | Created by | Owner after creation | Cleanup |
+| --- | --- | --- | --- |
+| Writable connection (`_conn`) | `SessionDB.__init__` | `SessionDB` instance | Constructor `finally` on failed init; `SessionDB.close()` after successful init |
+| Read-only connection (`_conn` for `read_only=True`) | `SessionDB.__init__` | `SessionDB` instance | Same as writable connection; no WAL checkpoint on close |
+| Per-thread WAL reader | `_get_read_conn()` | `SessionDB` instance, held in `_read_conns` | Setup `finally` before registration; `SessionDB.close()` after registration |
+| Background token writer | `SessionDB` instance | `SessionDB` instance | `_stop_token_writer()` during `close()` before writer connection closes |
+| `SessionDB` supplied by a caller | Caller | Original caller | The callee must not close it |
+
+The last row is the important boundary for reusable helpers. A helper that
+receives a database handle did not create that handle and must not close it.
+A helper that opens its own handle must close it, including when the query or
+formatter raises.
+
+The safe default shape is:
 
 ```python
 db = SessionDB(db_path=path, read_only=True)
@@ -216,10 +229,202 @@ finally:
     db.close()
 ```
 
-Do not rely on garbage collection for cleanup. Tracked connections unregister
-only after SQLite `close()` succeeds; an unclosed or cross-thread-invalid
-handle therefore remains visible to the live-connection guard and can turn a
-long-running gateway into an `EMFILE` failure.
+For an optional injected handle, keep ownership explicit:
+
+```python
+def load_rows(*, db=None, db_path=None):
+    owns_db = db is None
+    db = db or SessionDB(db_path=db_path, read_only=True)
+    try:
+        return db.list_sessions_rich(limit=20)
+    finally:
+        if owns_db:
+            db.close()
+```
+
+Do not use a blanket `finally: db.close()` when `db` can be supplied by a
+caller. That fixes one leak by closing a resource still in use by another
+owner.
+
+### Constructor failure safety
+
+Opening a connection is only the first step of initialization. The writable
+path can still fail while enabling WAL, applying pragmas, loading the optional
+FTS tokenizer, reconciling schema, repairing malformed schema, or retrying a
+contended open. The read-only path can fail while applying read pragmas or
+probing FTS tables.
+
+The lifecycle is deliberately two-phase:
+
+```text
+allocate SessionDB state
+        |
+        v
+connect and register SQLite resource
+        |
+        v
+WAL / pragmas / FTS / schema / repair setup
+        |
+   success? -------------------- no
+        |                         |
+        v                         v
+mark initialization complete   detach connection, close it, re-raise
+        |
+        v
+return owned SessionDB to caller
+```
+
+`__init__` starts with `initialization_complete = False`. Its outer
+`finally` detaches and closes `_conn` unless initialization reaches the
+success point. Detaching first (`self._conn = None`) prevents later cleanup
+from treating a failed, partially initialized object as usable. The close
+helper is best-effort so a cleanup error never hides the original database
+error. The `finally` also runs for `BaseException` paths such as interruption;
+cleanup must not depend on an `except Exception` branch being entered.
+
+Lock retries follow the same rule. When one initialization attempt opens a
+connection and then receives a retryable `locked`/`busy` error, that attempt's
+connection is closed before the next attempt sleeps. Otherwise a 20-second
+patience window can create one leaked descriptor per retry.
+
+The read-only setup has an additional local guard. If a reader is opened but
+fails during pragma or FTS probing, it is removed from the instance and closed
+immediately. If setup succeeds far enough to register it, `close()` owns the
+remaining cleanup.
+
+### WAL readers and worker threads
+
+WAL reads use a separate read-only connection per reader thread so search and
+browse operations do not queue behind the shared writer lock. This creates a
+second lifecycle that a writer-only cleanup cannot see:
+
+1. `_get_read_conn()` opens the reader with `check_same_thread=False`.
+2. The connection is added to the instance-wide `_read_conns` set under
+   `_read_conns_lock`.
+3. The thread-local reference is used for later reads.
+4. `SessionDB.close()` sets `_read_conns_closed`, snapshots and clears the set,
+   closes every registered reader, and clears the current thread's local
+   reference.
+
+The strong set is intentional. Thread-local storage alone would allow a short
+lived worker thread to disappear while the tracked SQLite connection remains
+open. The registration lock closes the race where `close()` drains the set
+while another thread is still finishing connection setup: a late opener sees
+`_read_conns_closed`, does not register, and closes itself in its local
+`finally` block.
+
+`check_same_thread=False` is used for this managed reader lifecycle so the
+owner can drain a reader created on another worker. It does not make cursors or
+arbitrary concurrent operations safe. The normal contract remains: one
+`SessionDB` owner controls shutdown, and query code uses the connection only
+for its read operation.
+
+When WAL is unavailable and SQLite falls back to DELETE journal mode, the
+read path uses the legacy locked writer connection instead of opening a
+per-thread reader. That fallback has fewer descriptors, but it does not remove
+the requirement to close the writer.
+
+### Timeout and future ownership
+
+Cancellation of a wait is not cancellation of a Python thread. If a worker
+constructing `SessionDB()` outlives the caller's timeout, the worker can still
+return a live database after the caller has already degraded or moved on.
+
+The owner of the future must handle both outcomes:
+
+```python
+future = executor.submit(SessionDB, db_path)
+try:
+    db = future.result(timeout=timeout)
+except TimeoutError:
+    future.add_done_callback(_close_late_session_db)
+    db = None
+```
+
+The callback closes a successful late result and ignores a future that failed
+before returning a database. Dropping the future, calling `cancel()`, or
+closing only the database received before the timeout is insufficient.
+
+### Caller ownership matrix
+
+The following paths are representative and define the expected pattern for
+new code:
+
+| Caller | Handle type | Required behavior |
+| --- | --- | --- |
+| `tools/session_search_tool.py` | Lazy local handle | Close in the wrapper `finally` after discovery, scroll, or browse |
+| `tools/session_search_tool.py` | Caller-injected shared handle | Use it; leave it open for the caller |
+| Cross-profile session search | Dedicated read-only handle | Close after the single operation |
+| `tools/react_to_message_tool.py` | Per-reaction local handle | Close even when the reaction write raises |
+| `agent/trace_upload.py` | Loader-owned handle | Close after messages and metadata are read, before upload continues |
+| `mcp_serve.py` | Per-request read or poll handle | Close at the request boundary; do not retain it in an event result |
+| CLI and gateway insights | Command-local handle | Close when report generation or formatting raises |
+| `hermes_cli/sessions_cmd.py` | Repair/statistics probe | Close after the probe, including error paths |
+| `cron/scheduler.py` | Future-created handle | Close normal results and late results after timeout |
+
+This matrix is an ownership rule, not a list of optional cleanup suggestions.
+Every new `SessionDB()` call should answer two questions in code review:
+"Who owns this instance?" and "Which `finally` closes it if the next line
+raises?"
+
+### What `close()` does
+
+`SessionDB.close()` performs shutdown in dependency order:
+
+1. Stop the background token writer and drain work that still needs `_conn`.
+2. Unregister the atexit drain hook so a closed instance is not retained until
+   interpreter exit.
+3. Mark reader registration closed, drain registered WAL readers, and close
+   them outside the reader-set lock.
+4. For writable stores, attempt a best-effort `PRAGMA wal_checkpoint(TRUNCATE)`
+   to reduce sidecar size. Read-only stores never request a checkpoint.
+5. Close and clear the writer connection.
+
+Checkpoint failure is logged and does not prevent descriptor cleanup. Shutdown
+must remain idempotent enough for error paths: a caller may close an instance
+after a partial operation or while another subsystem is already degrading.
+
+### Diagnosing `EMFILE`
+
+`EMFILE` (`Too many open files`) is usually the final symptom, not the first
+failure. Inspect the sequence that precedes it:
+
+| Observation | Likely ownership bug |
+| --- | --- |
+| Live connection count rises after repeated failed `SessionDB()` opens | Constructor failure path did not close a partial writer or read-only probe |
+| `state.db-wal` and `state.db-shm` descriptors grow during search/browse | Per-thread WAL readers were not closed or were not retained for shutdown |
+| Leak appears only after worker timeout | Late future result was returned without a completion callback |
+| Shared session search starts failing after a helper returns | Helper closed an injected handle it did not own |
+| `close()` logs cross-thread SQLite errors | Reader connection was thread-bound or shutdown raced registration |
+
+Do not delete `state.db-wal` or `state.db-shm` while Hermes or another process
+may still have the database open. Stop the owning process, allow its
+`SessionDB.close()` path to run, then inspect remaining descriptors with the
+OS-appropriate process/file-handle tool. Removing sidecars while a live WAL
+writer exists can destroy uncheckpointed transactions.
+
+### Regression contract
+
+Connection cleanup is part of the storage contract. Changes to initialization,
+WAL readers, async token accounting, or helpers that open `SessionDB` should
+preserve tests for:
+
+- failed writable initialization;
+- failed WAL reader setup;
+- failed read-only initialization;
+- a reader created on a worker thread and closed by its owner;
+- lazy, cross-profile, CLI, gateway, MCP, reaction, and trace-upload cleanup;
+- a late `SessionDB` result after a timeout.
+
+The focused tests live in `tests/test_hermes_state.py` and the caller-specific
+tests under `tests/tools/`, `tests/agent/`, `tests/cli/`, `tests/cron/`, and
+`tests/test_mcp_serve.py`. A new connection path without a matching failure
+test is incomplete, even if the happy-path query passes.
+
+Do not solve this class of bug with `__del__`, a process-wide connection cache,
+or a broad `except` that hides the original SQLite error. Keep ownership local,
+close in `finally`, preserve the original exception, and test the failure
+point immediately after the connection is opened.
 
 
 ## Common Operations
