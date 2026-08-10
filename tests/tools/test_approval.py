@@ -24,6 +24,72 @@ from tools.approval import (
 )
 
 
+def test_run_approval_policy_reports_exact_bypass_posture(monkeypatch):
+    from tools import approval as approval_module
+
+    monkeypatch.setattr(
+        approval_module,
+        "_load_run_approval_security_config",
+        lambda: {
+            "approvals": {"mode": "manual"},
+            "delegation": {"subagent_auto_approve": False},
+        },
+    )
+    monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+    with approval_module._lock:
+        approval_module._session_yolo.clear()
+        approval_module._session_approved.clear()
+        approval_module._permanent_approved.clear()
+        approval_module._session_yolo.add("session-yolo")
+        approval_module._session_approved["session-approved"] = {"rm"}
+        approval_module._permanent_approved.add("git_push")
+
+    try:
+        assert approval_module.get_run_approval_policy() == {
+            "version": 1,
+            "mode": "manual",
+            "frozen_yolo": False,
+            "session_yolo_count": 1,
+            "session_approved_count": 1,
+            "permanent_approved_count": 1,
+            "subagent_auto_approve": False,
+        }
+    finally:
+        with approval_module._lock:
+            approval_module._session_yolo.clear()
+            approval_module._session_approved.clear()
+            approval_module._permanent_approved.clear()
+
+
+def test_run_approval_policy_fails_when_config_is_unreadable(monkeypatch):
+    from tools import approval as approval_module
+
+    def fail_config_load():
+        raise OSError("config unavailable")
+
+    monkeypatch.setattr(
+        approval_module,
+        "_load_run_approval_security_config",
+        fail_config_load,
+    )
+
+    with pytest.raises(OSError, match="config unavailable"):
+        approval_module.get_run_approval_policy()
+
+
+def test_run_approval_policy_rejects_non_object_policy_blocks(monkeypatch):
+    from tools import approval as approval_module
+
+    monkeypatch.setattr(
+        approval_module,
+        "_load_run_approval_security_config",
+        lambda: {"approvals": "manual", "delegation": {}},
+    )
+
+    with pytest.raises(RuntimeError, match="must be objects"):
+        approval_module.get_run_approval_policy()
+
+
 class TestApprovalModeParsing:
     def test_normalization_table(self):
         # Unquoted YAML `off`/`on` arrive as booleans; unknown/empty fall back

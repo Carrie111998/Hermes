@@ -877,6 +877,28 @@ class TestCapabilitiesEndpoint:
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
+    @pytest.mark.asyncio
+    async def test_capabilities_attests_run_approval_policy(self, adapter):
+        expected = {
+            "version": 1,
+            "mode": "manual",
+            "frozen_yolo": False,
+            "session_yolo_count": 0,
+            "session_approved_count": 0,
+            "permanent_approved_count": 0,
+            "subagent_auto_approve": False,
+        }
+        with patch(
+            "tools.approval.get_run_approval_policy",
+            return_value=expected,
+        ):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/capabilities")
+                assert resp.status == 200
+                data = await resp.json()
+                assert data["security"]["run_approval_policy"] == expected
+
 
 # ---------------------------------------------------------------------------
 # /v1/skills and /v1/toolsets endpoints
