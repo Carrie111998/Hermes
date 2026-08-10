@@ -74,3 +74,25 @@ class TestSkillsRecentSessions:
         resp = client.get("/api/skills")
         skills = {s["name"]: s for s in resp.json()}
         assert skills["my-skill"]["recent_sessions"] == []
+
+    def test_survives_session_db_open_failure(self, client, monkeypatch):
+        """A corrupt/irreparable state.db must degrade recent_sessions to []
+        rather than 500ing the whole endpoint (previously resilient to
+        session-db failures — regression from the recent_sessions feature).
+        """
+        from tools import skill_usage
+
+        skill_usage.bump_use("my-skill", session_id="session-a")
+
+        import hermes_cli.web_routers.skills as skills_router
+
+        monkeypatch.setattr(
+            skills_router,
+            "_open_session_db_for_profile",
+            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("corrupt state.db")),
+        )
+
+        resp = client.get("/api/skills")
+        assert resp.status_code == 200
+        skills = {s["name"]: s for s in resp.json()}
+        assert skills["my-skill"]["recent_sessions"] == []

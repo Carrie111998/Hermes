@@ -439,18 +439,23 @@ async def get_skills(profile: Optional[str] = None):
             # the user may edit/delete from the UI.
             bundled_names = _read_bundled_manifest_names()
             hub_names = _read_hub_installed_names()
-        db = _open_session_db_for_profile(profile, read_only=True)
+        for s in skills:
+            s["enabled"] = s["name"] not in disabled
+            record = usage.get(s["name"], {})
+            s["usage"] = activity_count(record)
+            s["provenance"] = (
+                "hub" if s["name"] in hub_names
+                else "bundled" if s["name"] in bundled_names
+                else "agent"
+            )
+            s["recent_sessions"] = []
+        try:
+            db = _open_session_db_for_profile(profile, read_only=True)
+        except Exception:
+            return skills
         try:
             for s in skills:
-                s["enabled"] = s["name"] not in disabled
-                record = usage.get(s["name"], {})
-                s["usage"] = activity_count(record)
-                s["provenance"] = (
-                    "hub" if s["name"] in hub_names
-                    else "bundled" if s["name"] in bundled_names
-                    else "agent"
-                )
-                s["recent_sessions"] = _resolve_recent_sessions(db, record)
+                s["recent_sessions"] = _resolve_recent_sessions(db, usage.get(s["name"], {}))
         finally:
             db.close()
         return skills

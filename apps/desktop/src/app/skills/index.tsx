@@ -9,6 +9,7 @@ import { CodeEditor } from '@/components/chat/code-editor'
 import { PageLoader } from '@/components/page-loader'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { CountSkeleton } from '@/components/ui/skeleton'
 import {
   editLearningNode,
@@ -734,32 +735,41 @@ function DetailHeader({
 function RecentSessions({ sessions }: { sessions: SkillRecentSession[] }) {
   const { t } = useI18n()
   const navigate = useNavigate()
+  const [open, setOpen] = useState(true)
 
   return (
     <div className="grid gap-1.5">
-      <p className="text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+      <button
+        className="flex items-center gap-1 text-left text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)"
+        onClick={() => setOpen(o => !o)}
+        type="button"
+      >
+        <DisclosureCaret open={open} size="0.625rem" />
         {t.skills.recentSessions}
-      </p>
-      <div className="flex flex-col gap-0.5">
-        {sessions.map(session => {
-          const sourceLabel = sessionSourceLabel(session.source)
+      </button>
+      {open && (
+        <div className="flex flex-col gap-0.5">
+          {sessions.map(session => {
+            const sourceLabel = sessionSourceLabel(session.source)
 
-          return (
-            <button
-              className="flex items-center justify-between gap-2 rounded px-1.5 py-1 text-left hover:bg-(--ui-bg-hover)"
-              key={session.session_id}
-              onClick={() => void navigate(sessionRoute(session.session_id))}
-              type="button"
-            >
-              <span className="truncate">{session.title || session.session_id}</span>
-              <span className="flex shrink-0 items-center gap-1.5 text-(--ui-text-tertiary)">
-                {sourceLabel && <PanelPill tone="muted">{sourceLabel}</PanelPill>}
-                {session.started_at != null && <span>{relativeTime(session.started_at * 1000)}</span>}
-              </span>
-            </button>
-          )
-        })}
-      </div>
+            return (
+              <button
+                className="flex items-center justify-between gap-2 rounded px-1.5 py-1 text-left hover:bg-(--ui-bg-hover)"
+                key={session.session_id}
+                onClick={() => void navigate(sessionRoute(session.session_id))}
+                type="button"
+              >
+                <span className="truncate">{session.title || session.session_id}</span>
+                <span className="flex shrink-0 items-center gap-1.5 text-(--ui-text-tertiary)">
+                  {session.model && <PanelPill tone="muted">{session.model}</PanelPill>}
+                  {sourceLabel && <PanelPill tone="muted">{sourceLabel}</PanelPill>}
+                  {session.started_at != null && <span>{relativeTime(session.started_at * 1000)}</span>}
+                </span>
+              </button>
+            )
+          })}
+        </div>
+      )}
     </div>
   )
 }

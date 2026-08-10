@@ -179,8 +179,8 @@ class TestBuildBundleInvocationMessage:
 
         assert result is not None
         assert calls == [
-            ("skill-a", {"task_id": "task-bundle"}),
-            ("skill-b", {"task_id": "task-bundle"}),
+            ("skill-a", {"task_id": "task-bundle", "session_id": "task-bundle"}),
+            ("skill-b", {"task_id": "task-bundle", "session_id": "task-bundle"}),
         ]
 
     def test_skips_missing_skills(self, bundles_env):

@@ -209,4 +209,39 @@ describe('SkillsView skill detail — recent sessions', () => {
     await screen.findByText('A test skill')
     expect(screen.queryByText('Recent sessions')).toBeNull()
   })
+
+  it('shows the model used alongside each session', async () => {
+    getSkills.mockResolvedValue([
+      skill({
+        recent_sessions: [
+          { session_id: 'sess-1', title: 'Debugging the parser', source: 'cli', model: 'gpt-5', started_at: 1000 }
+        ]
+      })
+    ])
+
+    await renderSkillsTab()
+
+    await screen.findByText('Debugging the parser')
+    expect(screen.getByText('gpt-5')).toBeTruthy()
+  })
+
+  it('collapses the section on toggle, hiding the session rows', async () => {
+    getSkills.mockResolvedValue([
+      skill({
+        recent_sessions: [
+          { session_id: 'sess-1', title: 'Debugging the parser', source: 'cli', model: 'gpt-5', started_at: 1000 }
+        ]
+      })
+    ])
+
+    await renderSkillsTab()
+
+    await screen.findByText('Debugging the parser')
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Recent sessions'))
+    })
+
+    expect(screen.queryByText('Debugging the parser')).toBeNull()
+  })
 })
