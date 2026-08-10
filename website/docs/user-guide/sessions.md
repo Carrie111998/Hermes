@@ -614,7 +614,7 @@ routing is the only thing the repair changes. Back up first
 
 The agent has a built-in `session_search` tool that performs full-text search across all past conversations using SQLite's FTS5 engine — and lets the agent scroll through any session it finds. No LLM calls, no summarization, no truncation. Every shape returns actual messages from the DB.
 
-### Three calling shapes
+### Four calling shapes
 
 The tool infers what you want from which arguments you set. There's no `mode` parameter.
 
@@ -650,7 +650,15 @@ Returns a window of ±`window` messages centered on the anchor. No FTS5, no book
 
 Typical wall time: 1–2ms per scroll call.
 
-**3. Browse — no args:**
+**3. Read — pass `session_id` only:**
+
+```python
+session_search(session_id="20260510_174648_805cc2")
+```
+
+Reads the full session by id. Returns the first 20 messages plus the last 10 for large sessions; small sessions return complete. This is how you resolve an `@session:<profile>/<id>` link — split on `/` into profile + id and call with both arguments. No FTS5, no bookends — just the transcript.
+
+**4. Browse — no args:**
 
 ```python
 session_search()
