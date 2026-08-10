@@ -2372,28 +2372,26 @@ function Install-Venv {
         # one immediately even if some straggler still holds a .pyd from the
         # old tree; the renamed dir is deleted best-effort (now, and by the
         # cleanup pass below on the NEXT install if a handle outlives this one).
+        #
+        # NEVER fall back to in-place delete when rename is denied (#83149):
+        # Remove-Item -Recurse can delete most of site-packages and then fail on
+        # one locked .pyd, leaving a gutted venv with no rollback. Abort with the
+        # previous install intact so the user can close holders and retry.
         $staleName = "venv.stale.{0}" -f (Get-Date -Format "yyyyMMddHHmmss")
-        $renamed = $false
         try {
             Rename-Item -Path "venv" -NewName $staleName -ErrorAction Stop
-            $renamed = $true
         } catch {
-            Write-Warn "Could not rename venv aside ($($_.Exception.Message)); falling back to in-place delete"
+            $renameErr = $_.Exception.Message
+            throw (
+                "Could not move the existing venv aside ($renameErr). " +
+                "A process still has the install directory open (often a non-Hermes " +
+                "python.exe that resolved into this venv via PATH). Close those " +
+                "processes and retry - the previous install was left intact."
+            )
         }
-        if ($renamed) {
-            Remove-Item -Recurse -Force $staleName -ErrorAction SilentlyContinue
-            if (Test-Path $staleName) {
-                Write-Warn "Old venv parked at $staleName (a process still holds files in it); it will be cleaned up on the next install"
-            }
-        } else {
-            Remove-Item -Recurse -Force "venv" -ErrorAction SilentlyContinue
-            # A killed process can take a moment to release its file handles, so a
-            # first Remove-Item may still hit a locked .pyd. Retry once after a short
-            # pause before giving up and letting the stage fail loudly.
-            if (Test-Path "venv") {
-                Start-Sleep -Seconds 2
-                Remove-Item -Recurse -Force "venv"
-            }
+        Remove-Item -Recurse -Force $staleName -ErrorAction SilentlyContinue
+        if (Test-Path $staleName) {
+            Write-Warn "Old venv parked at $staleName (a process still holds files in it); it will be cleaned up on the next install"
         }
     }
 
