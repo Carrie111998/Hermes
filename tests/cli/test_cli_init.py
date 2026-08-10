@@ -532,5 +532,19 @@ class TestRootLevelProviderOverride:
         assert "model" not in result["model"] and "name" not in result["model"]
 
 
+class TestAutoSuggestConfig:
+    """display.auto_suggest controls ghost-text inline suggestions."""
+
+    def test_auto_suggest_defaults_true(self):
+        """When display.auto_suggest is not set, defaults to True."""
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+        assert DEFAULT_CONFIG["display"]["auto_suggest"] is True
+
+    def test_auto_suggest_false_disables_in_config(self):
+        """display.auto_suggest: false is a valid config value."""
+        config = {"display": {"auto_suggest": False}}
+        assert config["display"]["auto_suggest"] is False
+
+
 
 

@@ -1450,6 +1450,14 @@ display:
   #   false: Hide reasoning (default)
   show_reasoning: false
 
+  # Inline ghost-text auto-suggestions while typing.
+  # When enabled, slash-command completions and history-based suggestions
+  # appear as dim ghost text as you type (press Tab to accept). Set to false
+  # to disable all ghost-text suggestions.
+  #   true:  Show ghost-text suggestions (default)
+  #   false: Disable all inline suggestions
+  auto_suggest: true
+
   # Stream tokens to the terminal as they arrive instead of waiting for the
   # full response. The response box opens on first token and text appears
   # line-by-line. Tool calls are still captured silently.

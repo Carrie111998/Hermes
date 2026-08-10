@@ -16679,6 +16679,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             command_filter=cli_ref._command_available,
             skill_bundles_provider=lambda: get_skill_bundles(),
         )
+        _auto_suggest = None
+        if CLI_CONFIG["display"].get("auto_suggest", True):
+            _auto_suggest = SlashCommandAutoSuggest(
+                history_suggest=AutoSuggestFromHistory(),
+                completer=_completer,
+            )
         input_area = TextArea(
             height=Dimension(min=1, max=8, preferred=1),
             prompt=get_prompt,
@@ -16695,10 +16701,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # the UI event loop, keeping typing responsive.
             completer=ThreadedCompleter(_completer),
             complete_while_typing=True,
-            auto_suggest=SlashCommandAutoSuggest(
-                history_suggest=AutoSuggestFromHistory(),
-                completer=_completer,
-            ),
+            auto_suggest=_auto_suggest,
         )
         # Keep prompt_toolkit on its simple tempfile path. Setting
         # buffer.tempfile = "prompt.md" triggers its complex-tempfile branch,
