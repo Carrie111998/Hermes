@@ -10992,6 +10992,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name in {
                 "ddp-approve", "ddp-decline",
                 "ddp-approve-confirm", "ddp-decline-confirm",
+                "devflow-login",
             }:
                 if _cmd_def_inner.name == "ddp-approve":
                     return await self._handle_ddp_approve_command(event)
@@ -10999,7 +11000,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_ddp_decline_command(event)
                 if _cmd_def_inner.name == "ddp-approve-confirm":
                     return await self._handle_ddp_approve_confirm_command(event)
-                return await self._handle_ddp_decline_confirm_command(event)
+                if _cmd_def_inner.name == "ddp-decline-confirm":
+                    return await self._handle_ddp_decline_confirm_command(event)
+                return await self._handle_devflow_login_command(event)
 
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
@@ -11540,6 +11543,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "ddp-decline-confirm":
             return await self._handle_ddp_decline_confirm_command(event)
+
+        if canonical == "devflow-login":
+            return await self._handle_devflow_login_command(event)
 
         if canonical == "update":
             return await self._handle_update_command(event)

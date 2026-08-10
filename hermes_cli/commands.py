@@ -107,6 +107,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("ddp_approve_confirm",), args_hint="<confirmation-token>"),
     CommandDef("ddp-decline-confirm", "Confirm one staged DevFlow decline", "Session",
                gateway_only=True, aliases=("ddp_decline_confirm",), args_hint="<confirmation-token>"),
+    CommandDef("devflow-login", "Get a one-time code to sign in to DevFlow Mission Control (:3040)",
+               "Session", gateway_only=True, aliases=("devflow_login",)),
     CommandDef("background", "Run a prompt in the background", "Session",
                aliases=("bg", "btw"), args_hint="<prompt>"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
@@ -1179,6 +1181,7 @@ _SLACK_VIA_HERMES_ONLY = frozenset({
     # commands off the 50-slot native manifest preserves parity for existing
     # Telegram-visible operational commands.
     "ddp-approve", "ddp-decline", "ddp-approve-confirm", "ddp-decline-confirm",
+    "devflow-login",
 })
 
 

@@ -4802,6 +4802,40 @@ class GatewaySlashCommandsMixin:
     async def _handle_ddp_decline_confirm_command(self, event: MessageEvent) -> str:
         return await self._handle_ddp_confirm_command(event, "decline")
 
+    async def _handle_devflow_login_command(self, event: MessageEvent) -> str:
+        """Issue a one-time code to sign in to the loopback Mission Control UI.
+
+        The loopback :3040 browser has no login front door and grants are minted
+        only from an authenticated admin identity. This command mints a login
+        grant (via the same API-server grant store the browser redeem reads) and
+        hands the operator a one-time code to paste at :3040/auth. Same
+        explicit-admin, fail-closed gate as the DDP decision commands.
+        """
+        actor = self._ddp_actor_for_source(event.source)
+        if actor is None:
+            return (
+                "⛔ DevFlow Mission Control login is not enabled for this caller. "
+                "Configure an explicit allow_admin_from policy for this platform scope."
+            )
+        adapter = self.adapters.get(Platform.API_SERVER)
+        get_store = getattr(adapter, "_get_devflow_grant_store", None)
+        if adapter is None or not callable(get_store):
+            return "❌ DevFlow Mission Control API is offline; cannot issue a login code."
+        try:
+            grant = get_store().mint(
+                authenticated_actor=actor,
+                audience="devflow-mission-control",
+            )
+        except Exception as exc:
+            logger.warning("DevFlow login grant mint failed: %s", exc)
+            return "❌ Could not issue a DevFlow login code; please try again."
+        return (
+            "DevFlow Mission Control — one-time login code (single use, ~60s):\n\n"
+            f"`{grant}`\n\n"
+            "Open http://localhost:3040/auth on this machine and paste the code to "
+            "sign in. Re-run /devflow-login for a fresh code if it expires."
+        )
+
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).
 

@@ -832,3 +832,50 @@ async def test_ddp_lazy_emitter_uses_fixture_control_plane_paths(tmp_path, monke
     finally:
         ledger.close()
         bus.close()
+
+
+@pytest.mark.asyncio
+async def test_devflow_login_mints_redeemable_code_for_admin(tmp_path):
+    from gateway.devflow_auth import DevflowLoginGrantStore
+
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    try:
+        runner = _make_runner(ledger)
+        store = DevflowLoginGrantStore(
+            secret=b"pepper",
+            token_factory=iter(("login-grant", "opaque-subject")).__next__,
+        )
+        runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+            _get_devflow_grant_store=lambda: store
+        )
+
+        result = await runner._handle_devflow_login_command(_make_event("/devflow-login"))
+
+        # The one-time code is delivered with paste instructions.
+        assert "login-grant" in result
+        assert "localhost:3040/auth" in result
+        # It is redeemable via the same store the browser redeem path uses.
+        redeemed = store.redeem(grant="login-grant", audience="devflow-mission-control")
+        assert redeemed.subject == "opaque-subject"
+    finally:
+        ledger.close()
+
+
+@pytest.mark.asyncio
+async def test_devflow_login_denies_non_admin_caller(tmp_path):
+    from gateway.devflow_auth import DevflowLoginGrantStore
+
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    try:
+        runner = _make_runner(ledger, admin_ids=("someone-else",))
+        runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+            _get_devflow_grant_store=lambda: DevflowLoginGrantStore(
+                secret=b"pepper", token_factory=iter(("x", "y")).__next__
+            )
+        )
+
+        result = await runner._handle_devflow_login_command(_make_event("/devflow-login"))
+
+        assert "not enabled for this caller" in result
+    finally:
+        ledger.close()
