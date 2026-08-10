@@ -159,9 +159,16 @@ class TestCleanupStaleAsyncClients:
 
         key = ("test_shutdown_lock", False, "", "", "", (), False)
         with _client_cache_lock:
+            previous = dict(_client_cache)
+            _client_cache.clear()
             _client_cache[key] = (Client(), "test-model", None)
 
-        shutdown_cached_clients()
+        try:
+            shutdown_cached_clients()
+        finally:
+            with _client_cache_lock:
+                _client_cache.clear()
+                _client_cache.update(previous)
 
         assert lock_observations == [True]
 
