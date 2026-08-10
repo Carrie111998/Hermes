@@ -197,25 +197,39 @@ def _strip_quotes_preserve_windows_path(raw_word: str) -> str:
     return _unquote_raw_preserve(raw_word)
 
 
+_GIT_PATH_OPTIONS_WITH_ARG = frozenset({
+    "-C",
+    "--git-dir",
+    "--work-tree",
+    "--namespace",
+    "--exec-path",
+})
+_GIT_PATH_ENV_VARS = frozenset({"GIT_DIR", "GIT_WORK_TREE"})
+
+
 def _path_aware_shell_word(raw_word: str) -> str:
     """Deobfuscate a shell word, preserving native Windows path separators.
 
     approval.py's escape strip treats `\\` as a shell escape, which mangles
     quoted paths like ``"D:\\work\\hermes-agent"`` into ``D:workhermes-agent``.
     For explicit filesystem operands we keep those separators instead.
+
+    Callers must only invoke this for Git path-operand positions (see
+    ``_shell_words_at``); it is not safe to apply to every shell token.
     """
     assign = _ASSIGNMENT_RE.fullmatch(raw_word)
     if assign:
         name, _, value_raw = raw_word.partition("=")
-        if _raw_looks_like_windows_path(value_raw):
+        if name in _GIT_PATH_ENV_VARS and _raw_looks_like_windows_path(value_raw):
             return f"{name}={_strip_quotes_preserve_windows_path(value_raw)}"
         return _deobfuscate_shell_word_for_detection(raw_word)
 
-    if raw_word.startswith("--work-tree="):
-        value = raw_word[len("--work-tree=") :]
-        if _raw_looks_like_windows_path(value):
-            return "--work-tree=" + _strip_quotes_preserve_windows_path(value)
-        return _deobfuscate_shell_word_for_detection(raw_word)
+    for prefix in ("--work-tree=", "--git-dir="):
+        if raw_word.startswith(prefix):
+            value = raw_word[len(prefix) :]
+            if _raw_looks_like_windows_path(value):
+                return prefix + _strip_quotes_preserve_windows_path(value)
+            return _deobfuscate_shell_word_for_detection(raw_word)
 
     if (
         raw_word.startswith("-C")
@@ -230,6 +244,25 @@ def _path_aware_shell_word(raw_word: str) -> str:
     if _raw_looks_like_windows_path(raw_word):
         return _strip_quotes_preserve_windows_path(raw_word)
     return _deobfuscate_shell_word_for_detection(raw_word)
+
+
+def _is_glued_git_path_option(raw_word: str) -> bool:
+    """True for ``-Cpath`` / ``--git-dir=`` / ``--work-tree=`` glued forms."""
+    if raw_word.startswith("--work-tree=") or raw_word.startswith("--git-dir="):
+        return True
+    return (
+        raw_word.startswith("-C")
+        and len(raw_word) > 2
+        and not raw_word.startswith("--")
+    )
+
+
+def _is_git_path_env_assignment(raw_word: str) -> bool:
+    """True for ``GIT_DIR=...`` / ``GIT_WORK_TREE=...`` assignment words."""
+    if not _ASSIGNMENT_RE.fullmatch(raw_word):
+        return False
+    name, _, _ = raw_word.partition("=")
+    return name in _GIT_PATH_ENV_VARS
 
 
 def _windows_git_bash_to_drive(path: str) -> str | None:
@@ -286,15 +319,42 @@ def _executable_name(value: str) -> str:
 
 
 def _shell_words_at(command: str, start: int) -> list[str]:
+    """Tokenize a shell command start, path-preserving only Git path operands.
+
+    Windows backslash preservation applies solely to:
+    - the next word after bare ``-C`` / ``--git-dir`` / ``--work-tree`` /
+      ``--namespace`` / ``--exec-path``
+    - glued ``--work-tree=VALUE`` / ``--git-dir=VALUE`` / ``-CVALUE``
+    - ``GIT_DIR=`` / ``GIT_WORK_TREE=`` assignment values (when Windows-looking)
+
+    Every other token uses ``_deobfuscate_shell_word_for_detection`` unchanged
+    so non-path words (aliases, subcommands, ordinary args) are not rewritten.
+    """
     words: list[str] = []
     cursor = start
+    expect_path_operand = False
     for _ in range(64):
         word_start, word_end, raw_word = _read_shell_word(command, cursor)
         if word_start == word_end:
             break
         if words and "\n" in command[cursor:word_start]:
             break
-        words.append(_path_aware_shell_word(raw_word))
+
+        if (
+            expect_path_operand
+            or _is_glued_git_path_option(raw_word)
+            or _is_git_path_env_assignment(raw_word)
+        ):
+            word = _path_aware_shell_word(raw_word)
+        else:
+            word = _deobfuscate_shell_word_for_detection(raw_word)
+        words.append(word)
+
+        if expect_path_operand:
+            expect_path_operand = False
+        else:
+            expect_path_operand = word in _GIT_PATH_OPTIONS_WITH_ARG
+
         cursor = word_end
     return words
 

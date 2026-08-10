@@ -5,11 +5,13 @@ from pathlib import Path
 
 import pytest
 
+from tools.approval import _deobfuscate_shell_word_for_detection
 from tools.self_repo_guard import (
     _explicit_git_path,
     _is_mangled_windows_drive,
     _normalize_git_path_operand,
     _path_aware_shell_word,
+    _shell_words_at,
     _strip_quotes_preserve_windows_path,
     _windows_git_bash_to_drive,
     detect_self_repo_git_mutation,
@@ -370,6 +372,10 @@ class TestExplicitGitTargetPaths:
         preserved = _strip_quotes_preserve_windows_path(raw)
         assert preserved == r"D:\work\hermes-agent"
         assert "\\" in preserved
+        # Path preserve applies in -C operand position via _shell_words_at,
+        # not to bare quoted Windows paths in arbitrary token slots.
+        words = _shell_words_at(f"git -C {raw} status", 0)
+        assert words[2] == r"D:\work\hermes-agent"
         assert _path_aware_shell_word(raw) == r"D:\work\hermes-agent"
         normalized = _normalize_git_path_operand(r"D:\work\hermes-agent")
         assert normalized == r"D:\work\hermes-agent"
@@ -451,11 +457,35 @@ class TestExplicitGitTargetPaths:
 
     def test_path_aware_word_recovers_quoted_windows_path(self):
         # Simulates the raw token _read_shell_word returns for a double-quoted
-        # Windows path; approval deobfuscation would mangle it.
-        from tools.approval import _deobfuscate_shell_word_for_detection
-
+        # Windows path; approval deobfuscation would mangle it. Recovery is
+        # via the path-operand helper / -C position — not every shell token.
         raw = r'"D:\work\hermes-agent"'
         mangled = _deobfuscate_shell_word_for_detection(raw)
         assert mangled == "D:workhermes-agent" or "\\" not in mangled
+        words = _shell_words_at(f"git -C {raw} checkout main", 0)
+        assert words[2] == r"D:\work\hermes-agent"
+        assert not _is_mangled_windows_drive(words[2])
         assert _path_aware_shell_word(raw) == r"D:\work\hermes-agent"
-        assert not _is_mangled_windows_drive(_path_aware_shell_word(raw))
+
+    def test_configured_alias_still_blocks_in_source_repo(self, repo):
+        """Regression: operand-only path-aware words must not break aliases."""
+        subprocess.run(
+            ["git", "-C", str(repo), "config", "alias.co", "checkout"],
+            check=True,
+        )
+        hit, _ = _detect("git co main", repo, repo)
+        assert hit is True
+
+    def test_non_path_words_use_normal_deobfuscation(self):
+        """Path-aware preserve must not blanket every shell token."""
+        raw_path = r'"D:\work\hermes-agent"'
+        # Outside a Git path-operand position, the quoted Windows path is
+        # normal-deobfuscated (backslashes stripped as shell escapes).
+        words = _shell_words_at(f"echo {raw_path}", 0)
+        assert words[0] == "echo"
+        assert words[1] == _deobfuscate_shell_word_for_detection(raw_path)
+        assert "\\" not in words[1]
+        # Contrast: the same token after bare -C keeps separators.
+        git_words = _shell_words_at(f"git -C {raw_path} status", 0)
+        assert git_words[2] == r"D:\work\hermes-agent"
+        assert "\\" in git_words[2]
