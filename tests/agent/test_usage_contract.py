@@ -1151,3 +1151,51 @@ def test_submit_failure_releases_admission_and_recovers(tmp_path, monkeypatch):
     assert handle2["mode"] == "owner"
     outcome2 = usage_contract._finish_fetch(job, handle2)
     assert outcome2["status"] == "available"
+
+
+def test_completed_future_callback_keeps_counts_balanced(tmp_path, monkeypatch):
+    """ImmediateExecutor returns an already-settled Future, so the done
+    callback fires synchronously inside _begin_fetch. The submission counter
+    and admission permit must end balanced (parent race review)."""
+    from concurrent.futures import Future as _Future
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+
+    entry = {"id": "a", "source": "manual", "access_token": "tok"}
+    key = usage_contract._cache_identity("openrouter", entry, "tok")
+    job = {
+        "account": {"account_id": "acct_a"},
+        "provider": "openrouter",
+        "api_key": "tok",
+        "base_url": None,
+        "cache_key": key,
+        "stale": None,
+    }
+
+    class ImmediateExecutor:
+        def submit(self, fn, *args, **kwargs):
+            future = _Future()
+            future.set_result(fn(*args, **kwargs))
+            return future
+
+    monkeypatch.setattr(usage_contract, "_EXECUTOR", ImmediateExecutor())
+    handle = usage_contract._begin_fetch(job, lambda p, **kw: _available_snapshot(p), usage_contract._monotonic() + 1.0)
+    assert handle["mode"] == "owner"
+    # The synchronous callback already ran: counter back to 0, permit released.
+    assert usage_contract._usage_fetch_stats_for_tests()["in_flight_submitted"] == 0
+
+    outcome = usage_contract._finish_fetch(job, handle)
+    assert outcome["status"] == "available"
+
+    stats = usage_contract._usage_fetch_stats_for_tests()
+    assert stats["in_flight_submitted"] == 0
+    assert stats["registered_flights"] == 0
+    # Full admission capacity restored (no leak through the sync callback).
+    assert usage_contract._ADMISSION._value == usage_contract._MAX_IN_FLIGHT
+    # Result was cached by the owner: a second begin serves it, no refetch.
+    handle2 = usage_contract._begin_fetch(job, lambda p, **kw: (_ for _ in ()).throw(AssertionError("refetch")), usage_contract._monotonic() + 1.0)
+    assert handle2["mode"] == "done"
+    assert handle2["outcome"]["status"] == "available"
