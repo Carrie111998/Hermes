@@ -804,6 +804,33 @@ def test_review_fork_uses_runtime_model_and_output_cap(curator_env, monkeypatch)
     assert captured["max_tokens"] == 1234
 
 
+def test_review_fork_preserves_structured_conversation_failure(curator_env, monkeypatch):
+    curator = curator_env["curator"]
+    import importlib
+    importlib.reload(curator)
+
+    class _StubAgent:
+        def __init__(self, **_kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **_kwargs):
+            return {
+                "final_response": "",
+                "failed": True,
+                "error": "provider rejected credentials",
+            }
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
+
+    result = curator._run_llm_review("review")
+
+    assert result["error"] == "provider rejected credentials"
+    assert result["summary"] == "error (provider rejected credentials)"
+
+
 
 
 def test_review_fork_restricts_toolsets_to_skills_and_terminal(curator_env, monkeypatch):

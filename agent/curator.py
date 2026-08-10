@@ -1961,7 +1961,18 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if isinstance(conv_result, dict):
             final = str(conv_result.get("final_response") or "").strip()
         result_meta["final"] = final
-        result_meta["summary"] = (final[:240] + "…") if len(final) > 240 else (final or "no change")
+        conversation_error = conv_result.get("error") if isinstance(conv_result, dict) else None
+        conversation_failed = (
+            bool(conv_result.get("failed")) if isinstance(conv_result, dict) else False
+        )
+        if conversation_failed or conversation_error:
+            error = str(conversation_error or "conversation failed")
+            result_meta["error"] = error
+            result_meta["summary"] = f"error ({error})"
+        else:
+            result_meta["summary"] = (
+                (final[:240] + "…") if len(final) > 240 else (final or "no change")
+            )
 
         # Collect tool calls for the report. Walk the forked agent's
         # session messages and extract every tool_call made during the
