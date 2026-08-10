@@ -77,3 +77,20 @@ def test_managed_folder_must_be_relative_and_inside_vault(tmp_path: Path):
         ObsidianVault(tmp_path / "vault", "../outside")
     with pytest.raises(ValueError, match="managed_folder"):
         ObsidianVault(tmp_path / "vault", str(tmp_path / "outside"))
+
+
+def test_scan_rejects_unsupported_memory_type_frontmatter(tmp_path: Path):
+    vault = ObsidianVault(tmp_path / "vault", "Hermes Memory")
+    store = __import__("plugins.memory.obsidian_duo.store", fromlist=["SqliteMemoryStore"]).SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    path = vault.managed_root / "Entities" / "bad.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "---\nmemory_id: bad\nmemory_type: ../outside\nscope: global\n---\nunsafe\n",
+        encoding="utf-8",
+    )
+
+    result = vault.scan_managed_changes(store)
+
+    assert result.reparsed_paths == ()
+    assert result.malformed_paths == (path,)

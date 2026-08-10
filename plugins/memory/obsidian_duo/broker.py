@@ -298,6 +298,7 @@ class EmbeddedMemoryBroker:
                     continue
                 from .security import assert_safe_to_persist
                 assert_safe_to_persist(parsed.body)
+                self.vault._canonical_folder(parsed.metadata.get("memory_type") or old.memory_type)
                 updated = self.policy.apply_user_edit(old, parsed)
                 self.store.upsert_memory(updated, "manual user edit")
                 self.store.set_note_index(str(path), updated.memory_id, stat.st_mtime_ns, stat.st_size, content_hash)

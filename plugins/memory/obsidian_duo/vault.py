@@ -77,6 +77,14 @@ class ObsidianVault:
         except ValueError as exc:
             raise ValueError(f"{label} escapes the configured vault") from exc
 
+    @classmethod
+    def _canonical_folder(cls, memory_type: str) -> str:
+        normalized = str(memory_type or "").strip().lower()
+        try:
+            return cls.MEMORY_TYPE_FOLDERS[normalized]
+        except KeyError as exc:
+            raise ValueError(f"unsupported memory_type: {memory_type!r}") from exc
+
     def ensure_managed_structure(self) -> None:
         for name in (
             "Projects", "Decisions", "Research", "People", "Preferences",
@@ -101,10 +109,7 @@ class ObsidianVault:
             yield path
 
     def _managed_path(self, record: MemoryRecord) -> Path:
-        memory_type = str(record.memory_type or "").strip().lower()
-        if memory_type not in self.MEMORY_TYPE_FOLDERS:
-            raise ValueError(f"unsupported memory_type: {record.memory_type!r}")
-        folder = (self.managed_root / self.MEMORY_TYPE_FOLDERS[memory_type]).resolve()
+        folder = (self.managed_root / self._canonical_folder(record.memory_type)).resolve()
         self._assert_inside(folder, self.managed_root, "managed memory folder")
         self._assert_inside(folder, self.vault_root, "managed memory folder")
         folder.mkdir(parents=True, exist_ok=True)
@@ -204,10 +209,12 @@ class ObsidianVault:
                     changed.append(path)
                     continue
                 metadata = note.metadata
+                memory_type = str(metadata.get("memory_type") or "")
+                self._canonical_folder(memory_type)
                 record = MemoryRecord(
                     memory_id=note.memory_id,
                     content=note.body,
-                    memory_type=str(metadata.get("memory_type") or path.parent.name),
+                    memory_type=memory_type,
                     scope=str(metadata.get("scope") or "global"),
                     status=MemoryStatus(str(metadata.get("status") or "active")),
                     authority=Authority(str(metadata.get("authority") or "agent")),
