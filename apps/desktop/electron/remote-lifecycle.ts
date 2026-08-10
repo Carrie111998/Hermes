@@ -1146,9 +1146,11 @@ async function withOwnershipMutex(ssh, ownershipId, fn, options: any = {}) {
     '    fcntl.flock(fd,fcntl.LOCK_EX)\n' +
     '   st=os.fstat(fd)\n' +
     '   age=(time.time()-st.st_mtime)*1000\n' +
+    '   os.lseek(fd,0,os.SEEK_SET)\n' +
+    '   previous=os.read(fd,4096).decode().strip()\n' +
     '   # Owner-epoch reclaim: rewrite the same inode under flock. Never\n' +
     '   # pathname-unlink a lease we have not proven stale while holding it.\n' +
-    '   if age>stale_ms:\n' +
+    '   if previous=="RELEASED" or age>stale_ms:\n' +
     '    os.lseek(fd,0,os.SEEK_SET); os.ftruncate(fd,0)\n' +
     '    os.write(fd,token.encode()); os.fsync(fd)\n' +
     '    try:os.utime(p,None)\n' +
@@ -1318,11 +1320,14 @@ async function withOwnershipMutex(ssh, ownershipId, fn, options: any = {}) {
             '   fcntl.flock(fd,fcntl.LOCK_EX)\n' +
             '  data=os.read(fd,4096).decode().strip()\n' +
             '  if data==token:\n' +
-            '   os.close(fd)\n' +
-            '   try:os.unlink(p)\n' +
+            '   # Publish a reclaimable epoch on the same inode. Unlinking after\n' +
+            '   # unlock lets a queued waiter rewrite the old inode while a third\n' +
+            '   # owner creates the pathname, producing two concurrent owners.\n' +
+            '   os.lseek(fd,0,os.SEEK_SET); os.ftruncate(fd,0)\n' +
+            '   os.write(fd,b"RELEASED"); os.fsync(fd)\n' +
+            '   try:os.utime(p,(0,0))\n' +
             '   except OSError:pass\n' +
-            '  else:\n' +
-            '   os.close(fd)\n' +
+            '  os.close(fd)\n' +
             ' except Exception:\n' +
             '  try:os.close(fd)\n' +
             '  except OSError:pass'
