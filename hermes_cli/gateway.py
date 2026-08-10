@@ -7,6 +7,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -15,6 +16,7 @@ import subprocess
 import sys
 import textwrap
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -3289,12 +3291,72 @@ def _get_restart_drain_timeout() -> float:
     if not raw:
         cfg = read_raw_config()
         agent_cfg = cfg.get("agent", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(agent_cfg, Mapping):
+            agent_cfg = {}
         raw = str(
             agent_cfg.get(
                 "restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
             )
         )
     return parse_restart_drain_timeout(raw)
+
+
+# macOS accepts larger ExitTimeOut values in a plist, but launchd clamps the
+# effective stop timeout to 60 seconds (verified via ``launchctl print`` on a
+# loaded gateway job and an isolated LaunchAgent). Keep 30 seconds of cleanup
+# headroom after the gateway's force-interrupt budget. Longer *pre-stop* waits
+# belong in ``agent.restart_after_turn_timeout`` because that phase runs before
+# launchd starts its stop clock.
+LAUNCHD_MAX_EFFECTIVE_EXIT_TIMEOUT = 60
+LAUNCHD_EXIT_TIMEOUT_HEADROOM = 30
+LAUNCHD_MIN_EXIT_TIMEOUT = 30
+LAUNCHD_MAX_SAFE_DRAIN_TIMEOUT = (
+    LAUNCHD_MAX_EFFECTIVE_EXIT_TIMEOUT - LAUNCHD_EXIT_TIMEOUT_HEADROOM
+)
+
+
+def _get_launchd_exit_timeout() -> int:
+    """Return a truthful ExitTimeOut within launchd's effective 60s limit."""
+    requested = math.ceil(
+        _get_restart_drain_timeout() + LAUNCHD_EXIT_TIMEOUT_HEADROOM
+    )
+    return min(
+        LAUNCHD_MAX_EFFECTIVE_EXIT_TIMEOUT,
+        max(LAUNCHD_MIN_EXIT_TIMEOUT, requested),
+    )
+
+
+def launchd_timing_is_safe(drain_timeout: float | None = None) -> bool:
+    """Whether launchd can cover the configured drain plus cleanup headroom."""
+    if drain_timeout is None:
+        drain_timeout = _get_restart_drain_timeout()
+    return drain_timeout <= LAUNCHD_MAX_SAFE_DRAIN_TIMEOUT
+
+
+def _print_launchd_timing_alignment_warning() -> bool:
+    """Report an unsafe launchd drain contract without mutating user config."""
+    drain_timeout = _get_restart_drain_timeout()
+    if launchd_timing_is_safe(drain_timeout):
+        return False
+
+    print(
+        "⚠ Unsafe launchd shutdown timing: "
+        f"agent.restart_drain_timeout={drain_timeout:g}s exceeds the "
+        f"{LAUNCHD_MAX_SAFE_DRAIN_TIMEOUT}s safe maximum."
+    )
+    print(
+        "  macOS launchd caps the effective ExitTimeOut at "
+        f"{LAUNCHD_MAX_EFFECTIVE_EXIT_TIMEOUT}s; Hermes reserves "
+        f"{LAUNCHD_EXIT_TIMEOUT_HEADROOM}s for final cleanup."
+    )
+    print(
+        f"  Set agent.restart_drain_timeout: {LAUNCHD_MAX_SAFE_DRAIN_TIMEOUT} "
+        "(or lower) in config.yaml."
+    )
+    print(
+        "  Use agent.restart_after_turn_timeout for long waits before shutdown begins."
+    )
+    return True
 
 
 def _get_restart_after_turn_timeout() -> float:
@@ -4094,6 +4156,7 @@ def generate_launchd_plist() -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
+    exit_timeout = _get_launchd_exit_timeout()
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
     # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
@@ -4168,13 +4231,13 @@ def generate_launchd_plist() -> str:
 
     <!-- ThrottleInterval raises launchd's default 10s minimum respawn interval
          to 30s so a crash-looping gateway can't hammer launchd into a rapid
-         respawn storm; ExitTimeOut gives the gateway 25s of graceful-drain
-         headroom before launchd escalates from SIGTERM to SIGKILL on stop. -->
+         respawn storm. macOS caps the effective ExitTimeOut at 60s; the value
+         below covers up to 30s of drain plus 30s of final-cleanup headroom. -->
     <key>ThrottleInterval</key>
     <integer>30</integer>
 
     <key>ExitTimeOut</key>
-    <integer>25</integer>
+    <integer>{exit_timeout}</integer>
 
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
@@ -4727,6 +4790,8 @@ def launchd_status(deep: bool = False):
     else:
         print("⚠ Service definition is stale relative to the current Hermes install")
         print("  Run: hermes gateway start")
+
+    _print_launchd_timing_alignment_warning()
 
     if service_listed:
         if launchd_pid is not None:

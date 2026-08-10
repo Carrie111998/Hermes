@@ -1,5 +1,6 @@
 """Shared gateway restart constants and supervisor detection helpers."""
 
+import math
 import os
 from collections.abc import Mapping
 
@@ -67,10 +68,12 @@ def is_container_restart_context() -> bool:
 
 
 def parse_restart_drain_timeout(raw: object) -> float:
-    """Parse a configured drain timeout, falling back to the shared default."""
+    """Parse a finite drain timeout, falling back to the shared default."""
     try:
         value = float(raw) if str(raw or "").strip() else DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     except (TypeError, ValueError):
+        return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
+    if not math.isfinite(value):
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
     return max(0.0, value)
 

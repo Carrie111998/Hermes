@@ -1,6 +1,7 @@
 """Tests for gateway service management helpers."""
 
 import os
+import plistlib
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,207 @@ from gateway.restart import (
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
 )
+
+
+class TestLaunchdExitTimeout:
+    @pytest.mark.parametrize(
+        ("drain_timeout", "expected_exit_timeout"),
+        [
+            (DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT, 30),
+            (0, 30),
+            (12.25, 43),
+            (30, 60),
+            (30.0001, 60),
+            (31, 60),
+            (900, 60),
+        ],
+        ids=[
+            "default",
+            "zero",
+            "fractional-safe",
+            "safe-maximum",
+            "fractional-over-safe",
+            "one-over-safe",
+            "configured-900",
+        ],
+    )
+    def test_exit_timeout_tracks_drain_with_headroom_up_to_launchd_cap(
+        self, monkeypatch, drain_timeout, expected_exit_timeout
+    ):
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: drain_timeout
+        )
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ExitTimeOut"] == expected_exit_timeout
+
+    def test_installed_timeout_above_launchd_cap_is_definition_drift(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 900)
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(
+            gateway_cli.generate_launchd_plist().replace(
+                "<key>ExitTimeOut</key>\n    <integer>60</integer>",
+                "<key>ExitTimeOut</key>\n    <integer>930</integer>",
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        assert gateway_cli.launchd_plist_is_current() is False
+
+    @pytest.mark.parametrize(
+        ("source", "raw_timeout"),
+        [
+            ("env", "inf"),
+            ("env", "nan"),
+            ("env", "1e309"),
+            ("env", "not-a-number"),
+            ("config", "inf"),
+            ("config", "nan"),
+            ("config", "1e309"),
+            ("config", "not-a-number"),
+        ],
+    )
+    def test_exit_timeout_invalid_values_fall_back_to_default(
+        self, monkeypatch, source, raw_timeout
+    ):
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+        if source == "env":
+            monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", raw_timeout)
+        else:
+            monkeypatch.setattr(
+                gateway_cli,
+                "read_raw_config",
+                lambda: {"agent": {"restart_drain_timeout": raw_timeout}},
+            )
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ExitTimeOut"] == 30
+
+    def test_exit_timeout_nonmapping_agent_config_falls_back_to_default(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {"agent": []})
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["ExitTimeOut"] == 30
+
+    def test_drain_timeout_nonfinite_config_keeps_default_plist_current(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("HERMES_RESTART_DRAIN_TIMEOUT", raising=False)
+        monkeypatch.setattr(gateway_cli, "read_raw_config", lambda: {})
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli,
+            "read_raw_config",
+            lambda: {"agent": {"restart_drain_timeout": "1e309"}},
+        )
+
+        assert gateway_cli.launchd_plist_is_current() is True
+
+    def test_exit_timeout_nonfinite_env_installs_with_default(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_RESTART_DRAIN_TIMEOUT", "nan")
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(
+            gateway_cli, "_refuse_temp_home_service_write", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_launchctl_bootstrap", lambda *_args, **_kwargs: None
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_clear_launchd_unsupported_marker", lambda: None
+        )
+
+        gateway_cli.launchd_install(force=True)
+
+        plist = plistlib.loads(plist_path.read_bytes())
+        assert plist["ExitTimeOut"] == 30
+
+    @pytest.mark.parametrize(
+        ("drain_timeout", "is_safe"),
+        [(0, True), (30, True), (31, False), (900, False)],
+    )
+    def test_launchd_timing_alignment_enforces_effective_sixty_second_limit(
+        self, monkeypatch, drain_timeout, is_safe
+    ):
+        monkeypatch.setattr(
+            gateway_cli, "_get_restart_drain_timeout", lambda: drain_timeout
+        )
+
+        assert gateway_cli.launchd_timing_is_safe() is is_safe
+
+    def test_status_reports_unsafe_drain_with_actionable_separation_guidance(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 900)
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout='{\n    "PID" = 4242;\n}',
+                stderr="",
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda cleanup_stale=False: 4242
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_unsupported_marker_exists", lambda: False
+        )
+
+        gateway_cli.launchd_status()
+
+        out = capsys.readouterr().out
+        assert "Service definition matches the current Hermes install" in out
+        assert "Unsafe launchd shutdown timing" in out
+        assert "restart_drain_timeout=900" in out
+        assert "restart_drain_timeout: 30" in out
+        assert "restart_after_turn_timeout" in out
+        assert "effective ExitTimeOut at 60s" in out
+
+    def test_status_does_not_warn_for_safe_thirty_second_drain(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 30)
+        plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout='{\n    "PID" = 4242;\n}',
+                stderr="",
+            ),
+        )
+        monkeypatch.setattr(
+            "gateway.status.get_running_pid", lambda cleanup_stale=False: 4242
+        )
+        monkeypatch.setattr(
+            gateway_cli, "_launchd_unsupported_marker_exists", lambda: False
+        )
+
+        gateway_cli.launchd_status()
+
+        assert "Unsafe launchd shutdown timing" not in capsys.readouterr().out
 
 
 class TestUserSystemdPrivateSocketPreflight:
@@ -2005,4 +2207,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is False
         assert list_calls["n"] >= 1
-
