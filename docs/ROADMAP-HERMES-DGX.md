@@ -16,11 +16,12 @@
 
 | Reference | Current evidence | Meaning |
 |---|---|---|
-| `origin/main` | `7fa1865f7` | Canonical Hermes mainline. |
+| `origin/main` | `ec50a154eeb44e7206f24b7703f9032b8f97069c` | Canonical Hermes mainline with ARCH-001 merged. |
 | `origin/ticket/T0127-v2026.8.3-merged` | release staging branch | DGX release input; not the ARCH merge target. |
 | live DGX checkout | `/home/cwliao/.hermes/hermes-agent` | Claude-owned; do not edit or reset. |
-| ARCH-001 deployed snapshot | `v2026.8.3-arch-001-f0dd130c8` | Deployed evidence, but not mainline-complete. |
-| current reconciliation worktree | `agent/arch-001-mainline-reconciliation` | Clean `origin/main` base for isolated integration. |
+| ARCH-001 deployed snapshot | `v2026.8.3-arch-001-f0dd130c8` | Historical release evidence; superseded on DGX by the merged mainline commit. |
+| live DGX deployed commit | `ec50a154eeb44e7206f24b7703f9032b8f97069c` | Fast-forward deployed to `/home/cwliao/.hermes/hermes-agent`; gateway verified active. |
+| rollback ref | `backup/pre-arch-001-deploy-20260810T031625Z` | DGX-local pre-deploy commit ref; preserved for rollback. |
 
 ## Goals and ticket order
 
@@ -35,11 +36,12 @@
 
 | Ticket | Status | Gate |
 |---|---|---|
-| `ARCH-001` | deployed, mainline incomplete | Mainline reconciliation and independent review. |
-| `ARCH-001-MAINLINE-001` | `READY_FOR_COMMIT` (Codex READY; AGY waived by owner) | Clean-main diff and tests pass; owner-approved AGY waiver recorded. |
-| `ARCH-002` to `ARCH-004` | proposed | Depend on ARCH-001 mainline merge. |
+| `ARCH-001` | complete | Merged to Hermes `main` and deployed to DGX; service active after restart. |
+| `ARCH-001-MAINLINE-001` | `COMPLETE` (Codex READY; AGY waived by owner) | Merge `ec50a154…`; compile and 35 targeted tests passed; runtime restart verified. |
+| `ARCH-002` to `ARCH-004` | proposed | Ready for ticket planning now that ARCH-001 is on mainline. |
 
-The current worktree contains an isolated main-based port of ARCH-001. Codex
-self-review is READY, and the owner explicitly waived the unavailable AGY
-cross-review for this ticket. It is ready for commit, but is not yet pushed,
-merged, or deployed from this branch.
+ARCH-001 was merged by owner-authorized admin merge because the repository's
+baseline CI still has unrelated pre-existing failures. The ARCH-001 targeted
+checks passed, including compile, lint/security checks, attribution, and the
+runtime-state test set. The DGX checkout was fast-forwarded without touching
+Claude's unrelated untracked files; the user service is active after restart.

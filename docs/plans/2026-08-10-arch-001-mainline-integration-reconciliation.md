@@ -1,7 +1,7 @@
 # ARCH-001-MAINLINE-001: Mainline integration reconciliation
 
 **Status:** Codex self-review READY; owner-approved AGY cross-review waiver;
-ready for commit. Merge and deployment remain separate gates.
+complete: merged to Hermes main and deployed to the DGX runtime.
 
 ## Objective
 
@@ -21,7 +21,13 @@ do not modify the live DGX checkout.
 ## Non-goals
 
 - No merge to `main` in this worktree.
-- No push, release rebuild, service restart or deployment.
+- Push: completed on the integration branch.
+- Merge: owner-authorized admin merge completed as commit `ec50a154eeb44e7206f24b7703f9032b8f97069c`.
+- Deployment: DGX `/home/cwliao/.hermes/hermes-agent` fast-forwarded from
+  `7fa1865f70` to `ec50a154ee`; compile and 35 targeted tests passed; the
+  user service restarted and was verified `active/running`.
+- Rollback: DGX-local ref
+  `backup/pre-arch-001-deploy-20260810T031625Z` preserved.
 - No edits to `/home/cwliao/.hermes/hermes-agent` or Claude-owned worktrees.
 - No import of unrelated commits from the release or ARCH branches.
 
