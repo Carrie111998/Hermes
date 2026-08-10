@@ -402,7 +402,6 @@ describe('SidebarSessionRow', () => {
       <SidebarSessionRow
         isPinned={false}
         isSelected={false}
-        isWorking={false}
         onArchive={onArchive}
         onDelete={noop}
         onPin={noop}
@@ -439,7 +438,6 @@ describe('SidebarSessionRow', () => {
         <SidebarSessionRow
           isPinned={false}
           isSelected={false}
-          isWorking={false}
           onArchive={onArchive}
           onDelete={noop}
           onPin={noop}
