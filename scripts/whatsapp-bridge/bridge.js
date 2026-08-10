@@ -33,6 +33,7 @@ import qrcode from 'qrcode-terminal';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { bridgeAuthProof, createBridgeAuthMiddleware } from './bridge_auth.js';
 import {
   buildPollPayload,
   createReconnectScheduler,
@@ -110,6 +111,7 @@ try {
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
+const BRIDGE_TOKEN = process.env.HERMES_WHATSAPP_BRIDGE_TOKEN || '';
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
@@ -780,7 +782,6 @@ async function startSocket() {
 
 // HTTP server
 const app = express();
-app.use(express.json());
 
 // Host-header validation — defends against DNS rebinding.
 // The bridge binds loopback-only (127.0.0.1) but a victim browser on
@@ -812,6 +813,11 @@ app.use((req, res, next) => {
   }
   next();
 });
+
+// Loopback binding does not establish the caller's identity: another local
+// process can bind the configured port or call this API directly.
+app.use(createBridgeAuthMiddleware(BRIDGE_TOKEN));
+app.use(express.json());
 
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
@@ -1105,12 +1111,17 @@ app.get('/chat/:id', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  const challenge = req.headers['x-hermes-bridge-challenge'];
+  if (typeof challenge !== 'string' || !challenge) {
+    return res.status(400).json({ error: 'Missing bridge challenge' });
+  }
   res.json({
     status: connectionState,
     queueLength: messageQueue.length,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    authProof: bridgeAuthProof(BRIDGE_TOKEN, challenge),
   });
 });
 
@@ -1132,6 +1143,10 @@ if (PAIR_ONLY) {
     process.exit(1);
   });
 } else {
+  if (!BRIDGE_TOKEN) {
+    console.error('WhatsApp bridge authentication token is required.');
+    process.exit(1);
+  }
   app.listen(PORT, '127.0.0.1', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);

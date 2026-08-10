@@ -16,10 +16,13 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import platform
 import re
+import secrets
 import signal
 import subprocess
 
@@ -355,6 +358,56 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _load_or_create_bridge_token(session_path: Path) -> str:
+    """Return the persistent per-session secret used to authenticate bridge IPC."""
+    session_path.mkdir(parents=True, exist_ok=True)
+    token_path = session_path / ".bridge-token"
+    try:
+        existing = token_path.read_text(encoding="utf-8").strip()
+        if len(existing) >= 32:
+            return existing
+    except OSError:
+        pass
+
+    token = secrets.token_urlsafe(32)
+    temp_path = token_path.with_name(
+        f"{token_path.name}.{secrets.token_hex(8)}.tmp"
+    )
+    fd = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(token)
+        try:
+            temp_path.chmod(0o600)
+        except OSError:
+            pass
+        os.replace(temp_path, token_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+    return token
+
+
+def _bridge_auth_headers(token: str, challenge: str = "") -> Dict[str, str]:
+    headers = {"Authorization": f"Bearer {token}"}
+    if challenge:
+        headers["X-Hermes-Bridge-Challenge"] = challenge
+    return headers
+
+
+def _bridge_auth_proof(token: str, challenge: str) -> str:
+    return hmac.new(token.encode(), challenge.encode(), hashlib.sha256).hexdigest()
+
+
+def _health_response_is_authenticated(data: Any, token: str, challenge: str) -> bool:
+    if not isinstance(data, dict):
+        return False
+    proof = data.get("authProof")
+    return isinstance(proof, str) and hmac.compare_digest(
+        proof,
+        _bridge_auth_proof(token, challenge),
+    )
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -461,6 +514,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._bridge_log: Optional[Path] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._http_session: Optional["aiohttp.ClientSession"] = None
+        self._bridge_token: str = ""
         # Set to True by disconnect() before we SIGTERM our child bridge so
         # _check_managed_bridge_exit() can distinguish an intentional
         # shutdown-time exit (returncode -15 / -2 / 0) from a real crash.
@@ -613,17 +667,26 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
+            self._bridge_token = _load_or_create_bridge_token(self._session_path)
             
             # Check if bridge is already running and connected
             import aiohttp
             try:
                 async with aiohttp.ClientSession() as session:
+                    challenge = secrets.token_urlsafe(24)
                     async with session.get(
                         f"http://127.0.0.1:{self._bridge_port}/health",
+                        headers=_bridge_auth_headers(self._bridge_token, challenge),
                         timeout=aiohttp.ClientTimeout(total=2)
                     ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
+                            if not _health_response_is_authenticated(
+                                data, self._bridge_token, challenge
+                            ):
+                                raise PermissionError(
+                                    "existing WhatsApp bridge failed authentication"
+                                )
                             bridge_status = data.get("status", "unknown")
                             if bridge_status == "connected":
                                 # Staleness handshake: only reuse a running
@@ -648,7 +711,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                                     self._mark_connected()
                                     self._bridge_process = None  # Not managed by us
-                                    self._http_session = aiohttp.ClientSession()
+                                    self._http_session = aiohttp.ClientSession(
+                                        headers=_bridge_auth_headers(self._bridge_token)
+                                    )
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
                                 stale_reason = (
@@ -680,6 +745,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # can use it without the user needing to set a separate env var.
             # with_hermes_node_path() copies os.environ when called with no arg.
             bridge_env = with_hermes_node_path()
+            bridge_env["HERMES_WHATSAPP_BRIDGE_TOKEN"] = self._bridge_token
             if self._reply_prefix is not None:
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
@@ -752,13 +818,19 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     return False
                 try:
                     async with aiohttp.ClientSession() as session:
+                        challenge = secrets.token_urlsafe(24)
                         async with session.get(
                             f"http://127.0.0.1:{self._bridge_port}/health",
+                            headers=_bridge_auth_headers(self._bridge_token, challenge),
                             timeout=aiohttp.ClientTimeout(total=2)
                         ) as resp:
                             if resp.status == 200:
-                                http_ready = True
                                 data = await resp.json()
+                                if not _health_response_is_authenticated(
+                                    data, self._bridge_token, challenge
+                                ):
+                                    continue
+                                http_ready = True
                                 if data.get("status") == "connected":
                                     print(f"[{self.name}] Bridge ready (status: connected)")
                                     break
@@ -784,12 +856,18 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                         return False
                     try:
                         async with aiohttp.ClientSession() as session:
+                            challenge = secrets.token_urlsafe(24)
                             async with session.get(
                                 f"http://127.0.0.1:{self._bridge_port}/health",
+                                headers=_bridge_auth_headers(self._bridge_token, challenge),
                                 timeout=aiohttp.ClientTimeout(total=2)
                             ) as resp:
                                 if resp.status == 200:
                                     data = await resp.json()
+                                    if not _health_response_is_authenticated(
+                                        data, self._bridge_token, challenge
+                                    ):
+                                        continue
                                     if data.get("status") == "connected":
                                         print(f"[{self.name}] Bridge ready (status: connected)")
                                         break
@@ -803,7 +881,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     print(f"[{self.name}]   If session expired, re-pair: hermes whatsapp")
             
             # Create a persistent HTTP session for all bridge communication
-            self._http_session = aiohttp.ClientSession()
+            self._http_session = aiohttp.ClientSession(
+                headers=_bridge_auth_headers(self._bridge_token)
+            )
 
             # Start message polling task
             self._poll_task = asyncio.create_task(self._poll_messages())
