@@ -24,8 +24,8 @@ import {
   loadAgentPlugins,
   toggleAgentPlugin
 } from '@/store/agent-plugins'
-import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { notifyError } from '@/store/notifications'
+import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { $connection, $gatewayState } from '@/store/session'
 
 import { EmptyState, ListRowSkeleton, Pill, SettingsContent, SettingsSection } from './primitives'

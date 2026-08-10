@@ -79,6 +79,7 @@ import {
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
 import { loadOrCreateInstallationId, sshOwnershipId } from './desktop-installation'
+import { installDesktopPluginFromGit, probePluginRepo } from './desktop-plugin-install'
 import {
   buildPosixCleanupScript,
   buildWindowsCleanupScript,
@@ -88,7 +89,6 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
-import { installDesktopPluginFromGit, probePluginRepo } from './desktop-plugin-install'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
