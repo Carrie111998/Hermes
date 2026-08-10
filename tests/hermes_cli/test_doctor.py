@@ -220,6 +220,31 @@ def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path):
     assert "snapshot filesystem only" in out
 
 
+def test_doctor_preserves_explicit_vercel_backend_in_container(monkeypatch, tmp_path):
+    """An explicit Vercel backend must not be rewritten to local in containers."""
+    monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
+    monkeypatch.setenv("TERMINAL_VERCEL_RUNTIME", "python3.13")
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", tmp_path / ".hermes")
+    monkeypatch.setattr(doctor_mod, "_DHH", "~/.hermes")
+    monkeypatch.setattr(doctor_mod, "_is_termux", lambda: False)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: True)
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "Vercel runtime" in out
+    assert "python3.13" in out
+
+
 # ── Memory provider section (doctor should only check the *active* provider) ──
 
 
