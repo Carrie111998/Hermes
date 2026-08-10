@@ -115,6 +115,37 @@ def test_runtime_identity_appears_once_in_session_context():
     assert prompt.count("**Provider:** `provider-test`") == 1
 
 
+def test_redaction_preserves_telegram_group_chat_id_only():
+    group_context = SessionContext(
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-1003914667905",
+            chat_type="group",
+            user_id="123456",
+        ),
+        connected_platforms=[Platform.TELEGRAM],
+        home_channels={},
+    )
+    group_prompt = build_session_context_prompt(group_context, redact_pii=True)
+
+    assert '**Chat_ID:** `"-1003914667905"`' in group_prompt
+    assert "123456" not in group_prompt
+
+    dm_context = SessionContext(
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123456",
+            chat_type="dm",
+        ),
+        connected_platforms=[Platform.TELEGRAM],
+        home_channels={},
+    )
+    dm_prompt = build_session_context_prompt(dm_context, redact_pii=True)
+
+    assert "123456" not in dm_prompt
+    assert '**Chat_ID:** `"8d969eef6eca"`' in dm_prompt
+
+
 def test_topic_policy_is_frozen_for_existing_session(monkeypatch):
     class MetadataStore:
         def __init__(self):

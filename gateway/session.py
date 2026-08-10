@@ -597,9 +597,20 @@ def build_session_context_prompt(
     # Durable/runtime identity belongs only in this session-scoped block. Keep
     # it out of the generic timestamp tail so it is neither duplicated nor
     # confused with provider-authored content.
+    # Telegram group IDs are operational routing identities (for example
+    # ``-1003914667905``), not participant IDs.  The model needs the real
+    # value when targeting group-scoped messaging tools, and labelling a hash
+    # as ``Chat_ID`` is actively misleading.  Keep the exception narrow:
+    # private Telegram chat IDs and every other PII-safe platform continue to
+    # use the configured redaction policy.
+    _telegram_group_chat = (
+        context.source.platform == Platform.TELEGRAM
+        and str(context.source.chat_type or "").lower()
+        in {"group", "supergroup", "channel"}
+    )
     chat_id = (
         _hash_chat_id(context.source.chat_id)
-        if redact_pii
+        if redact_pii and not _telegram_group_chat
         else context.source.chat_id
     )
     if context.session_id:
