@@ -599,6 +599,72 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
+    async def _mention_pubkeys_for(self, chat_id: str, content: str) -> List[str]:
+        """Resolve ``@Name`` references in *content* to member pubkeys.
+
+        The CLI hard-fails a publish when any @token fails to resolve to a
+        current member, and LLM prose is full of @-shaped tokens — including
+        real mentions with trailing punctuation ("@Riley!!") the CLI's own
+        parser rejects.  Passing explicit ``--mention`` pubkeys for every
+        member name we find keeps genuine mentions notifying (p-tags intact)
+        while downgrading everything unresolvable to presentation-only text.
+
+        Bare ``users get`` may return only our own profile (relay-dependent),
+        so candidate pubkeys are harvested from recent channel traffic
+        (authors plus prior mention tags) and resolved to display names one
+        at a time via ``users get --pubkey``, cached for the process
+        lifetime.
+        """
+        if "@" not in content:
+            return []
+        cache: Dict[str, str] = getattr(self, "_profile_name_cache", {})
+        self._profile_name_cache = cache
+        candidates: List[str] = []
+        code, out, _err = await self._run_cli(
+            ["messages", "get", "--channel", str(chat_id), "--limit", "50"]
+        )
+        if code == 0:
+            try:
+                for msg in json.loads(out or "[]"):
+                    pk = str(msg.get("pubkey") or "").lower()
+                    if pk and pk not in candidates:
+                        candidates.append(pk)
+                    for t in msg.get("tags") or []:
+                        if isinstance(t, list) and len(t) > 1 and t[0] == "p":
+                            tpk = str(t[1]).lower()
+                            if tpk and tpk not in candidates:
+                                candidates.append(tpk)
+            except ValueError:
+                pass
+        low = content.lower()
+        found: List[str] = []
+        self_pk = getattr(self, "_self_pubkey", None)
+        for pk in candidates:
+            if pk == self_pk:
+                continue
+            name = cache.get(pk)
+            if name is None:
+                name = ""
+                code, out, _err = await self._run_cli(["users", "get", "--pubkey", pk])
+                if code == 0:
+                    try:
+                        profiles = json.loads(out or "[]")
+                    except ValueError:
+                        profiles = []
+                    if profiles and isinstance(profiles[0], dict):
+                        p0 = profiles[0]
+                        name = str(p0.get("display_name") or p0.get("name") or "").strip()
+                        if not name and p0.get("content"):
+                            try:
+                                prof = json.loads(p0["content"])
+                                name = str(prof.get("display_name") or prof.get("name") or "").strip()
+                            except ValueError:
+                                pass
+                cache[pk] = name
+            if name and ("@" + name.lower()) in low and pk not in found:
+                found.append(pk)
+        return found
+
     async def send(
         self,
         chat_id: str,
@@ -612,7 +678,21 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
             args += ["--reply-to", str(reply_target)]
+        for pk in await self._mention_pubkeys_for(chat_id, content):
+            args += ["--mention", pk]
         code, out, err = await self._run_cli(args, input_text=content)
+        if code != 0 and "does not match a current channel member" in (err or ""):
+            # Even with resolved mentions attached, prose can still contain
+            # @-shaped tokens that resolve to nothing ("just @-mention me").
+            # Supplying any explicit identity downgrades unresolvable @names
+            # to presentation-only text while uniquely resolved member names
+            # still notify, so retry once mentioning our own pubkey —
+            # self-mentions are already suppressed by the echo de-dupe in
+            # the poll loop.
+            if getattr(self, "_self_pubkey", None):
+                code, out, err = await self._run_cli(
+                    args + ["--mention", self._self_pubkey], input_text=content
+                )
         if code != 0:
             return SendResult(
                 success=False,
