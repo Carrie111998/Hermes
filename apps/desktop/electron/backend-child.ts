@@ -40,6 +40,12 @@ export interface KillableChild extends BackendProcessRoot {
   kill: (signal: string) => void
 }
 
+export interface WaitableChild extends KillableChild {
+  exitCode?: number | null
+  signalCode?: string | null
+  once: (event: 'close' | 'exit', listener: () => void) => unknown
+}
+
 /**
  * Stop a managed child process, choosing the right strategy for the platform.
  * No-ops silently if `child` is falsy, already killed, or the kill attempt
@@ -62,6 +68,41 @@ export function stopBackendChild(child: KillableChild | null | undefined, deps: 
   } catch {
     // Already gone.
   }
+}
+
+/** Wait for graceful exit, then force-kill a backend that ignored SIGTERM. */
+export async function waitForBackendExit(
+  child: WaitableChild | null | undefined,
+  deps: StopBackendChildDeps,
+  timeoutMs = 5000
+): Promise<void> {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return
+  }
+
+  await new Promise<void>(resolve => {
+    const timer = setTimeout(() => {
+      try {
+        const isWindows = deps.isWindows ?? process.platform === 'win32'
+
+        if (isWindows && Number.isInteger(child.pid)) {
+          deps.forceKillProcessTree(child.pid as number)
+        } else {
+          child.kill('SIGKILL')
+        }
+      } catch {
+        // Already gone.
+      }
+    }, timeoutMs)
+
+    const finish = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+
+    child.once('exit', finish)
+    child.once('close', finish)
+  })
 }
 
 /**

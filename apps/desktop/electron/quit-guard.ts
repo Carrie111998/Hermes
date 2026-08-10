@@ -90,3 +90,47 @@ export function quitPromptFor(work: ActiveWork, quittingForHandoff: boolean): nu
     message: work.count === 1 ? 'Hermes is still working on 1 chat.' : `Hermes is still working on ${work.count} chats.`
   }
 }
+
+/** One authorized quit owns every asynchronous teardown branch and one retry. */
+export function createQuitTeardownBarrier() {
+  let teardown: Promise<void> | null = null
+  let done = false
+  const tracked = new Set<Promise<unknown>>()
+
+  return {
+    get done() {
+      return done
+    },
+    get pending() {
+      return teardown !== null && !done
+    },
+    get started() {
+      return teardown !== null
+    },
+    get tracked() {
+      return [...tracked]
+    },
+    track<T>(branch: Promise<T>): Promise<T> {
+      tracked.add(branch)
+      void branch.then(
+        () => tracked.delete(branch),
+        () => tracked.delete(branch)
+      )
+
+      return branch
+    },
+    start(run: () => Promise<void>, retryQuit: () => void): Promise<void> {
+      if (!teardown) {
+        teardown = Promise.resolve()
+          .then(run)
+          .then(async () => {
+            await Promise.allSettled([...tracked])
+            done = true
+            retryQuit()
+          })
+      }
+
+      return teardown
+    }
+  }
+}

@@ -47,11 +47,13 @@ export function updateGateReason(deps: UpdateGateDeps): UpdateGateReason {
   return null
 }
 
-export type UpdateClearanceOutcome = 'clear' | 'finished' | 'timeout'
+export type UpdateClearanceOutcome = 'clear' | 'finished' | 'timeout' | 'cancelled'
 
 export interface WaitForUpdateClearanceOptions {
   timeoutMs: number
   pollMs: number
+  /** Stops a no-longer-owned launch instead of waiting out an update. */
+  isCancelled?: () => boolean
   /** Invoked once per poll while parked (boot progress / logging). */
   onWaitTick?: (reason: Exclude<UpdateGateReason, null>) => void | Promise<void>
   now?: () => number
@@ -73,6 +75,11 @@ export async function waitForUpdateClearance(
 ): Promise<UpdateClearanceOutcome> {
   const now = options.now || Date.now
   const sleep = options.sleep || (ms => new Promise<void>(r => setTimeout(r, ms)))
+  const isCancelled = options.isCancelled || (() => false)
+
+  if (isCancelled()) {
+    return 'cancelled'
+  }
 
   let reason = updateGateReason(deps)
 
@@ -83,11 +90,24 @@ export async function waitForUpdateClearance(
   const deadline = now() + options.timeoutMs
 
   while (reason && now() < deadline) {
+    if (isCancelled()) {
+      return 'cancelled'
+    }
+
     if (options.onWaitTick) {
       await options.onWaitTick(reason)
     }
 
+    if (isCancelled()) {
+      return 'cancelled'
+    }
+
     await sleep(options.pollMs)
+
+    if (isCancelled()) {
+      return 'cancelled'
+    }
+
     reason = updateGateReason(deps)
   }
 

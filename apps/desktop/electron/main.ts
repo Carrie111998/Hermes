@@ -32,7 +32,11 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
-import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
+import {
+  stopBackendChild as stopBackendChildImpl,
+  stopBackendTreesForUpdate,
+  waitForBackendExit as waitForBackendExitImpl
+} from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
@@ -165,7 +169,13 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import {
+  type ActiveWork,
+  createQuitTeardownBarrier,
+  mergeActiveWork,
+  normalizeActiveWork,
+  quitPromptFor
+} from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -1075,6 +1085,9 @@ let softRehomeInProgress = false
 // with no named profiles never populates this map, so their experience is
 // byte-for-byte the single-backend behavior.
 const backendPool = new Map() // profile -> { process, port, token, connectionPromise, lastActiveAt }
+// Process entries are deliberately removed before their children have exited in
+// re-home/idle paths; keep that physical teardown inventory until exit/close.
+const pendingBackendExits = new Map<any, Promise<void>>()
 // Keep the pool light: cap concurrent profile backends (LRU eviction) and reap
 // idle ones. A user idles at exactly the primary backend; pool backends only
 // exist while a non-primary profile is actively being chatted through.
@@ -1789,10 +1802,11 @@ function updateGateDeps() {
 // Block until no live update is in progress (or we hit the wait timeout).
 // Emits a boot-progress phase so the renderer shows "Update in progress…"
 // rather than a frozen splash. Returns true if it parked at all.
-async function waitForUpdateToFinish() {
+async function waitForUpdateToFinish(isCancelled = () => false) {
   let announced = false
 
   const outcome = await waitForUpdateClearance(updateGateDeps(), {
+    isCancelled,
     onWaitTick: async reason => {
       if (!announced) {
         announced = true
@@ -1829,6 +1843,10 @@ async function waitForUpdateToFinish() {
     }
   } catch (err) {
     rememberLog(`[updates] could not read hand-off result: ${err.message}`)
+  }
+
+  if (outcome === 'cancelled') {
+    throw new Error('Hermes backend start was cancelled because the Desktop is quitting.')
   }
 
   if (outcome === 'clear') {
@@ -2650,6 +2668,7 @@ let isQuittingForHandoff = false
 // (the app.quit() that follows re-enters before-quit and must pass through).
 let quitPromptOpen = false
 let quitConfirmedWithActiveWork = false
+const quitTeardown = createQuitTeardownBarrier()
 
 // Resolve the staged updater binary the desktop may hand an update to. On
 // Windows that binary owns ALL repo mutation — running `hermes update` +
@@ -7353,11 +7372,10 @@ async function buildRemoteConnection(
 }
 
 const sshConnections = new Map<string, any>()
+const pendingSshTeardowns = new Set<Promise<void>>()
 const desktopInstallationId = loadOrCreateInstallationId(DESKTOP_INSTALLATION_PATH)
 
 const sshBootstrapCoordinator = createBootstrapCoordinator()
-
-let sshQuitTeardownDone = false
 
 function sshScopeKey(profile) {
   return connectionScopeKey(profile) || ''
@@ -7387,35 +7405,41 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
-async function teardownSshConnection(profile) {
+function teardownSshConnection(profile) {
   const scope = sshScopeKey(profile)
   const state = sshConnections.get(scope)
 
   if (!state) {
-    return
+    return Promise.resolve()
   }
 
   sshConnections.delete(scope)
 
-  for (const [id, info] of [...terminalSessions.entries()]) {
-    if (info.sshScope === scope) {
-      disposeTerminalSession(id)
+  const teardown = (async () => {
+    for (const [id, info] of [...terminalSessions.entries()]) {
+      if (info.sshScope === scope) {
+        disposeTerminalSession(id)
+      }
     }
-  }
 
-  try {
-    if (state.localPort && state.remotePort) {
-      await state.ssh.cancelForward(state.localPort, state.remotePort)
+    try {
+      if (state.localPort && state.remotePort) {
+        await state.ssh.cancelForward(state.localPort, state.remotePort)
+      }
+    } catch {
+      // best effort
     }
-  } catch {
-    // best effort
-  }
 
-  try {
-    await state.ssh.close()
-  } catch {
-    // best effort
-  }
+    try {
+      await state.ssh.close()
+    } catch {
+      // best effort
+    }
+  })()
+
+  pendingSshTeardowns.add(teardown)
+
+  return teardown.finally(() => pendingSshTeardowns.delete(teardown))
 }
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
@@ -8014,6 +8038,7 @@ function resetHermesConnection({ soft = false } = {}) {
   remoteLiveness.clear()
   const hermesProcess = backendConnectionState.invalidate()
   stopBackendChild(hermesProcess)
+  void waitForBackendExit(hermesProcess).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
 
   if (!soft) {
     resetBootProgressForReconnect()
@@ -8057,35 +8082,25 @@ function sendConnectionApplied() {
   webContents.send('hermes:connection:applied')
 }
 
-async function waitForBackendExit(child, timeoutMs = 5000) {
-  if (!child) {
-    return
+function waitForBackendExit(child, timeoutMs = 5000) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve()
   }
 
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return
+  const existing = pendingBackendExits.get(child)
+
+  if (existing) {
+    return existing
   }
 
-  await new Promise<void>(resolve => {
-    const timer = setTimeout(() => {
-      try {
-        if (IS_WINDOWS && Number.isInteger(child.pid)) {
-          forceKillProcessTree(child.pid)
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch {
-        // Already gone.
-      }
+  const waiting = waitForBackendExitImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS }, timeoutMs)
+  pendingBackendExits.set(child, waiting)
+  void waiting.then(
+    () => pendingBackendExits.delete(child),
+    () => pendingBackendExits.delete(child)
+  )
 
-      resolve()
-    }, timeoutMs)
-
-    child.once('exit', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-  })
+  return waiting
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -8108,6 +8123,10 @@ function profileRouteOptions(profile) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
+  if (quitTeardown.started) {
+    throw new Error('Hermes Desktop is quitting.')
+  }
+
   const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
@@ -8138,10 +8157,17 @@ async function ensureBackend(profile) {
     remoteBaseUrl: null
   }
 
-  entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    backendPool.delete(key)
-    throw error
-  })
+  entry.connectionPromise = quitTeardown.track(
+    spawnPoolBackend(key, entry).catch(error => {
+      if (backendPool.get(key) === entry) {
+        backendPool.delete(key)
+      }
+
+      stopBackendChild(entry.process)
+      void waitForBackendExit(entry.process).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
+      throw error
+    })
+  )
   backendPool.set(key, entry)
   startPoolIdleReaper()
 
@@ -8256,7 +8282,8 @@ async function spawnPoolBackend(profile, entry) {
   {
     let poolAnnounced = false
 
-    await waitForUpdateClearance(updateGateDeps(), {
+    const updateClearance = await waitForUpdateClearance(updateGateDeps(), {
+      isCancelled: () => quitTeardown.started || backendPool.get(profile) !== entry,
       onWaitTick: reason => {
         if (!poolAnnounced) {
           poolAnnounced = true
@@ -8266,6 +8293,10 @@ async function spawnPoolBackend(profile, entry) {
       pollMs: UPDATE_WAIT_POLL_MS,
       timeoutMs: UPDATE_WAIT_TIMEOUT_MS
     })
+
+    if (updateClearance === 'cancelled') {
+      throw new Error('Hermes backend start was cancelled because its profile connection changed or the Desktop is quitting.')
+    }
   }
 
   // --profile wins over the inherited HERMES_HOME env (see _apply_profile_override
@@ -8280,6 +8311,10 @@ async function spawnPoolBackend(profile, entry) {
   const readyFile = backend.readyFile ? makeDashboardReadyFile() : null
 
   rememberLog(`Starting Hermes backend for profile "${profile}" via ${backend.label}`)
+
+  if (quitTeardown.started || backendPool.get(profile) !== entry) {
+    throw new Error('Hermes backend start was cancelled because the Desktop is quitting.')
+  }
 
   const child = spawn(
     backend.command,
@@ -8321,12 +8356,19 @@ async function spawnPoolBackend(profile, entry) {
 
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
-    backendPool.delete(profile)
+
+    if (backendPool.get(profile) === entry) {
+      backendPool.delete(profile)
+    }
+
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
-    backendPool.delete(profile)
+
+    if (backendPool.get(profile) === entry) {
+      backendPool.delete(profile)
+    }
 
     if (!ready) {
       rejectStart?.(
@@ -8389,6 +8431,7 @@ function stopPoolBackend(profile) {
 
   backendPool.delete(profile)
   stopBackendChild(entry.process)
+  void waitForBackendExit(entry.process).catch(error => rememberLog(`Backend teardown failed: ${error.message}`))
 }
 
 async function teardownPoolBackendAndWait(profile) {
@@ -8446,6 +8489,10 @@ async function prepareProfileDeleteRequest(request) {
 }
 
 async function startHermes() {
+  if (quitTeardown.started) {
+    throw new Error('Hermes Desktop is quitting.')
+  }
+
   // Latched-failure short-circuit: once bootstrap has failed in this
   // process, every subsequent startHermes() call re-throws the same error
   // without re-running install.ps1. This prevents the renderer's
@@ -8490,7 +8537,7 @@ async function startHermes() {
   // a local failure latches to break install-restart loops.
   let attemptedRemote = primaryBackendIsRemote()
 
-  const connectionPromise = (async () => {
+  const connectionPromise = quitTeardown.track((async () => {
     const connectRemote = async remote => {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
       await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
@@ -8552,7 +8599,7 @@ async function startHermes() {
       waitForDecision: waitForFirstRunSetupChoice,
       // Mutual exclusion with an in-app update (#50238). Remote connections
       // return before this waiter; local starts park until the updater exits.
-      waitForLocalStart: waitForUpdateToFinish
+      waitForLocalStart: () => waitForUpdateToFinish(() => quitTeardown.started)
     })
 
     if (setup.kind === 'remote') {
@@ -8568,6 +8615,10 @@ async function startHermes() {
 
     await advanceBootProgress('backend.spawn', `Starting Hermes backend via ${backend.label}`, 84)
     rememberLog(`Starting Hermes backend via ${backend.label}`)
+
+    if (quitTeardown.started) {
+      throw new Error('Hermes backend start was cancelled because the Desktop is quitting.')
+    }
 
     const hermesProcess = spawn(
       backend.command,
@@ -8603,6 +8654,7 @@ async function startHermes() {
 
     if (!processOwner) {
       stopBackendChild(hermesProcess)
+      await waitForBackendExit(hermesProcess)
       throw new Error('Hermes backend start was superseded by a newer connection attempt.')
     }
 
@@ -8764,6 +8816,7 @@ async function startHermes() {
     )
     throw error
   })
+  );
 
   backendConnectionState.setPromise(connectionAttempt, connectionPromise)
 
@@ -12564,7 +12617,13 @@ function configureSpellChecker() {
 // and the confirmation is on screen; "Quit Anyway" re-enters before-quit with
 // the latch set and falls straight through to the teardown below.
 function heldQuitForActiveWork(event: Electron.Event): boolean {
-  if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
+  if (quitPromptOpen) {
+    event.preventDefault()
+
+    return true
+  }
+
+  if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork) {
     return false
   }
 
@@ -12606,27 +12665,90 @@ function heldQuitForActiveWork(event: Electron.Event): boolean {
 }
 
 app.on('before-quit', event => {
-  // Runs ahead of every teardown below, so "Keep Running" leaves the app
-  // exactly as it was.
+  // A retry from one teardown branch must not bypass another branch whose
+  // registry was already cleared while physical cleanup is still pending.
+  if (quitTeardown.pending) {
+    event.preventDefault()
+
+    return
+  }
+
+  // Runs ahead of the first teardown so "Keep Running" leaves the app exactly
+  // as it was. Once teardown starts, quitConfirmedWithActiveWork is the
+  // authorization latch for the one internal retry.
   if (heldQuitForActiveWork(event)) {
     return
   }
 
-  if ((sshConnections.size > 0 || sshBootstrapCoordinator.promises().length > 0) && !sshQuitTeardownDone) {
+  const primaryStart = backendConnectionState.getPromise()
+  const poolEntries = [...backendPool.values()]
+  const pendingBackendStarts = quitTeardown.tracked
+  const pendingBackendDrains = [...pendingBackendExits.values()]
+  const pendingSshDrains = [...pendingSshTeardowns]
+
+  const backendProcesses = [
+    backendConnectionState.getProcess(),
+    ...poolEntries.map(entry => entry.process),
+    ...pendingBackendExits.keys()
+  ].filter((child, index, processes) => {
+    return child && child.exitCode === null && child.signalCode === null && processes.indexOf(child) === index
+  })
+
+  const backendStarts = [primaryStart, ...poolEntries.map(entry => entry.connectionPromise), ...pendingBackendStarts].filter(
+    (start, index, starts) => start && starts.indexOf(start) === index
+  )
+
+  const sshScopes = [...sshConnections.keys()]
+  const sshBootstraps = sshBootstrapCoordinator.promises()
+
+  if (
+    !quitTeardown.done &&
+    (
+      backendProcesses.length > 0 ||
+      backendStarts.length > 0 ||
+      pendingBackendDrains.length > 0 ||
+      sshScopes.length > 0 ||
+      sshBootstraps.length > 0 ||
+      pendingSshDrains.length > 0
+    )
+  ) {
     event.preventDefault()
+    quitConfirmedWithActiveWork = true
+
+    // Fence starts before the event loop can resume. Pending primary attempts
+    // lose attachProcess(), while pending pool attempts lose their entry check.
+    backendConnectionState.invalidate()
+    backendPool.clear()
     sshBootstrapCoordinator.cancelAll()
-    const scopes = [...sshConnections.keys()]
 
-    const pending = Promise.allSettled([
-      ...scopes.map(scope => teardownSshConnection(scope || null)),
-      ...sshBootstrapCoordinator.promises()
-    ])
+    void quitTeardown
+      .start(async () => {
+        for (const child of backendProcesses) {
+          stopBackendChild(child)
+        }
 
-    void Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))]).then(async () => {
-      await sshBootstrapCoordinator.forceCleanupAll()
-      sshQuitTeardownDone = true
-      app.quit()
-    })
+        const backendTeardown = Promise.allSettled([
+          ...backendProcesses.map(child => waitForBackendExit(child)),
+          ...pendingBackendDrains
+        ])
+
+        const sshTeardown = (async () => {
+          if (sshScopes.length === 0 && sshBootstraps.length === 0 && pendingSshDrains.length === 0) {
+            return
+          }
+
+          const established = sshScopes.map(scope => teardownSshConnection(scope || null))
+          const branches = [...established, ...sshBootstraps, ...pendingSshDrains]
+          const pending = Promise.allSettled(branches)
+
+          await Promise.race([pending, new Promise(resolve => setTimeout(resolve, 4_000))])
+          await sshBootstrapCoordinator.forceCleanupAll()
+          await Promise.allSettled(branches)
+        })()
+
+        await Promise.all([backendTeardown, sshTeardown])
+      }, () => app.quit())
+      .catch(error => rememberLog(`Quit teardown failed: ${error instanceof Error ? error.message : String(error)}`))
   }
 
   // Clean quit mid-boot should not trip next-launch --no-sandbox (#38216).

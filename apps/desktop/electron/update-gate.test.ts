@@ -142,3 +142,21 @@ test('returns timeout when the gate never opens', async () => {
 
   assert.equal(outcome, 'timeout')
 })
+
+test('returns cancelled when a parked start is cancelled', async () => {
+  let cancelled = false
+  let clock = 0
+
+  const outcome = await waitForUpdateClearance(deps(true, false), {
+    isCancelled: () => cancelled,
+    now: () => clock,
+    pollMs: 10,
+    sleep: async ms => {
+      clock += ms
+      cancelled = true
+    },
+    timeoutMs: 50
+  })
+
+  assert.equal(outcome, 'cancelled')
+})
