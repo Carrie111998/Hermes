@@ -761,6 +761,25 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    def test_referenced_script_handles_short_reads(self, tmp_path, monkeypatch):
+        import cron.lifecycle_guard as lifecycle_guard
+
+        script = tmp_path / "short-read.sh"
+        content = b"#!/bin/sh\n" + b"#" * (32 * 1024)
+        script.write_bytes(content)
+
+        real_read = lifecycle_guard.os.read
+
+        def short_read(descriptor, length):
+            return real_read(descriptor, min(length, 1))
+
+        monkeypatch.setattr(lifecycle_guard.os, "read", short_read)
+
+        text, unsafe = lifecycle_guard._read_referenced_script(script)
+
+        assert text == content.decode()
+        assert unsafe is False
+
     # -- Whole-class regression tests (tilllt's T1-T4 on PR #79454) --------
 
     def test_tilde_nul_candidate_does_not_crash_terminal_walk(self):

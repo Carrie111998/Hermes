@@ -457,7 +457,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # WITHOUT reading the rest — reading a
         # megabyte of machine code just to discard it wastes the guard's
         # budget and (pre-#77703) fed decoded garbage into the recursion.
-        data = os.read(descriptor, _BINARY_SNIFF_BYTES)
+        # Keep accumulation amortized-linear when a filesystem returns short
+        # reads. Bytes concatenation can copy the full prefix on every chunk,
+        # turning a bounded read into quadratic work under that condition.
+        # bytearray avoids relying on implementation-specific concatenation
+        # optimizations.
+        data = bytearray(os.read(descriptor, _BINARY_SNIFF_BYTES))
         if data.startswith(_BINARY_MAGIC_PREFIXES):
             return None, False
         # Read the remainder (bounded). Loop because os.read may return
