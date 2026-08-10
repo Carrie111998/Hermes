@@ -268,4 +268,20 @@ describe('SidebarSessionRow', () => {
     expect(avatar).toBeTruthy()
     expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
   })
+
+  // #82807: the age used to fade in `absolute`, spilling left over the title
+  // track instead of living in the actions column, while the title's own
+  // padding only grew `group-hover:*` — so hovering shrank the truncate point
+  // at the same moment the age painted over it. Both must hold at rest, not
+  // just conditionally on hover, so the row's shape (and the title's
+  // truncation point) never changes on hover.
+  it('reserves the age in the actions column at rest instead of overlaying it only on hover', () => {
+    const { container } = renderRow(makeSession({ title: 'A long session title that runs toward the row edge' }))
+
+    const body = container.querySelector<HTMLElement>('[data-slot="row-button"]')
+    const age = screen.getByText('5m')
+
+    expect(body?.className).not.toMatch(/group-hover:pr-/)
+    expect(age.className).not.toMatch(/absolute/)
+  })
 })
