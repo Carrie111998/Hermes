@@ -907,6 +907,7 @@ _WINDOWS_TERMINAL_PATH_RE = re.compile(
     r"(?:[A-Za-z]:[\\/]+|[\\/]{2}(?:\?[\\/]+(?:UNC[\\/]+)?|[^\\/\s]+[\\/]+))"
     r"[^\r\n'\"<>|]*$"
 )
+_POSIX_TERMINAL_PATH_RE = re.compile(r"/(?:[^\r\n'\"<>|/]+/)*[^\r\n'\"<>|]*$")
 _PATH_FRAGMENT_RE = re.compile(
     r"(?:[A-Za-z]:[\\/]|/|(?:\.{1,2}|~)[\\/]|\b[^\s'\"<>|\\/]+[\\/])"
     r"(?:[^\s'\"<>|\\/]+[\\/])*[^\s'\"<>|]*"
@@ -5078,6 +5079,7 @@ def _redacted_codex_diagnostic_text(value: object) -> str:
         return ""
     redacted = redact_sensitive_text(value, force=True, redact_url_credentials=True)
     redacted = _WINDOWS_TERMINAL_PATH_RE.sub("[REDACTED_PATH]", redacted)
+    redacted = _POSIX_TERMINAL_PATH_RE.sub("[REDACTED_PATH]", redacted)
     redacted = _PATH_FRAGMENT_RE.sub("[REDACTED_PATH]", redacted)
     return redacted[:_CODEX_DIAGNOSTIC_MAX_CHARS]
 

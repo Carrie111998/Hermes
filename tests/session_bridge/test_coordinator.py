@@ -1685,6 +1685,24 @@ def test_codex_scan_diagnostic_redacts_entire_terminal_windows_path(
     )
 
 
+@pytest.mark.parametrize(
+    "native_path",
+    (
+        "/home/Private Owner",
+        "/home/Private Owner/Codex Logs/thread.jsonl",
+        "/var/lib/Private Workspace/Session Data",
+    ),
+)
+def test_codex_scan_diagnostic_redacts_entire_terminal_posix_path(
+    native_path: str,
+) -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    assert _redacted_codex_diagnostic_text(f"failed at {native_path}") == (
+        "failed at [REDACTED_PATH]"
+    )
+
+
 def test_codex_scan_diagnostic_does_not_over_redact_ordinary_prose() -> None:
     from session_bridge.coordinator import _redacted_codex_diagnostic_text
 
