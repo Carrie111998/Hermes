@@ -1,7 +1,7 @@
 # Retomada de Sessão — Harness Hermes Agent
 
-**Salvo em:** 2026-08-10 (fim de sessão — cron-audit + v34 + fix Codex)  
-**Objetivo:** reiniciar Cursor em outra janela sem perder contexto.
+**Salvo em:** 2026-08-10 11:15 (pós `hermes update` + gateways no SQLite 3.53.1)  
+**Objetivo:** reiniciar Cursor sem perder contexto.
 
 ---
 
@@ -12,130 +12,70 @@ Retomar harness Hermes Agent — ler harness/registros/RETOMADA_SESSAO.md e exec
 python "$env:LOCALAPPDATA\hermes\hermes-agent\harness\scripts\hermes_patch_guard.py"
 ```
 
----
+CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
-## O que foi feito nesta sessão (completo)
-
-### Harness + config
-1. **patch-guard** ✅
-2. **`hermes doctor --fix`** — config v33→v34 ✅
-3. Skill **`hermes-cron-audit`** — script + skill Cursor ✅
-4. **`hermes update`** — tentado; interrompido em um momento; SQLite ainda 3.50.4 ⚠️
-5. **Gateway restart** — default running (telegram + api_server)
-
-### Cron jobs — fix model Codex
-6. Jobs `4709e6e007c8` e `0c6cbfc15cae` pinados com **`openai-codex` / `gpt-5.5`**
-   - `gpt-5.2-codex` **não funciona** com conta ChatGPT (HTTP 400)
-7. **`hermes cron run 4709e6e007c8`** — ✅ succeeded (validado 10:26)
-
-### Erros corrigidos nesta sessão
-- `tool_delay` nos jobs MiniMax → gateway restart resolveu (`cliente-perfil-dande` ok)
-- Model inválido `gpt-5.2-codex` → trocado para `gpt-5.5`
+```powershell
+& "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe" gateway status
+```
 
 ---
 
-## Estado atual (snapshot)
+## Feito nesta sessão (update)
+
+1. Gateways parados (default + data-analyst + security-auditor)
+2. `hermes update` — already up to date; trocou temporariamente para `main`; auto-start gateway
+3. Branch restaurada: `local/harness` @ `b34f1a28b9`
+4. patch-guard ✅
+5. Descoberta: **SQLite prod já era 3.53.1** (`venv` + `.hermes-runtime`); aviso do doctor vinha do **`.venv` (3.50.4)**
+6. Gateways re-subidos via `venv\Scripts\hermes.exe` — telegram + api_server + slack + 2 profiles
+7. cron-audit ✅ 0 overdue
+
+---
+
+## Estado atual
 
 | Item | Valor |
 |---|---|
-| Repo | `C:\Users\User\AppData\Local\hermes\hermes-agent` |
-| Branch | `local/harness` @ `6e280e85e6` |
-| HERMES_HOME | `%LOCALAPPDATA%\hermes\` |
-| Config | **v34** |
-| Active provider | `openai-codex` (model default ainda não setado globalmente) |
-| patch-guard | ✅ ok |
-| doctor | ✅ exit 0 |
-| Gateway | ✅ running — telegram + api_server |
-| Slack | ⚠️ retrying (não bloqueante) |
+| Branch | `local/harness` @ `b34f1a28b9` |
+| Config | v34 · `minimax-oauth` / `MiniMax-M3` |
+| SQLite prod | **3.53.1** |
+| Gateway | ✅ PID principal + profiles |
+| Cron | ✅ healthy |
 
-### Cron fleet (default — 6 jobs)
+### Cron fleet
 
-| Job | Nome | Model | Status |
-|---|---|---|---|
-| ed20e10042e4 | relatorio-repos-18h | MiniMax-M3 | ✅ ok |
-| 05725b06c694 | inbox-listar-dande | MiniMax-M3 | ⏸ pausado |
-| 89874976ef5b | cliente-perfil-dande | MiniMax-M3 | ✅ ok |
-| 619f7053817f | avaliacao-agente-dande | MiniMax-M3 | ⚠️ erro stale (`tool_delay` 09:00; semanal) |
-| 4709e6e007c8 | v1-inbox-snapshot-30min | **gpt-5.5** | ✅ ok (validado manual) |
-| 0c6cbfc15cae | cerebro-faxina | **gpt-5.5** | ✅ ok (próximo 01/09) |
-
-Ticker cron: ✅ healthy (~1s heartbeat)
-
-### Git (não commitado)
-
-```
-?? harness/scripts/hermes_cron_audit.py
- M harness/README.md
- M harness/registros/DECISOES.md
- M harness/registros/LOG_EXECUCAO.md
- M harness/registros/RETOMADA_SESSAO.md
- M harness/registros/STATUS.md
-```
-
-Skill Cursor (fora do repo): `~/.cursor/skills/hermes-cron-audit/SKILL.md`
+| Job | Model | Nota |
+|---|---|---|
+| relatorio-repos-18h | MiniMax-M3 | ok |
+| inbox-listar-dande | MiniMax-M3 | pausado |
+| cliente-perfil-dande | MiniMax-M3 | ok |
+| avaliacao-agente-dande | MiniMax-M3 | last_error stale `tool_delay` |
+| v1-inbox-snapshot-30min | gpt-5.5 | ok |
+| cerebro-faxina | gpt-5.5 | ok |
 
 ---
 
-## Comandos rápidos (PowerShell)
-
-```powershell
-# Ativar venv
-& "$env:LOCALAPPDATA\hermes\hermes-agent\.venv\Scripts\Activate.ps1"
-
-# Validar patches
-python "$env:LOCALAPPDATA\hermes\hermes-agent\harness\scripts\hermes_patch_guard.py"
-
-# Audit cron
-python "$env:LOCALAPPDATA\hermes\hermes-agent\harness\scripts\hermes_cron_audit.py" --include-disabled
-
-# Status gateway
-python "$env:LOCALAPPDATA\hermes\hermes-agent\harness\scripts\hermes_gateway_ops.py" status
-
-# Auditoria credenciais
-python "$env:LOCALAPPDATA\hermes\hermes-agent\harness\scripts\hermes_credential_audit.py" --all-profiles
-
-# Doctor
-hermes doctor
-```
-
----
-
-## Skills Cursor (`~/.cursor/skills/`)
-
-| Skill | Script |
-|---|---|
-| hermes-patch-guard | `harness/scripts/hermes_patch_guard.py` |
-| hermes-test-slice | `harness/scripts/hermes_test_slice.py` |
-| hermes-gateway-ops | `harness/scripts/hermes_gateway_ops.py` |
-| hermes-credential-audit | `harness/scripts/hermes_credential_audit.py` |
-| **hermes-cron-audit** | `harness/scripts/hermes_cron_audit.py` |
-
----
-
-## Pendências (próxima sessão)
+## Pendências
 
 | # | Item | Prioridade |
 |---|---|---|
-| 1 | **Commit** harness (cron-audit + docs) na `local/harness` | Alta |
-| 2 | Definir `model.default: gpt-5.5` no config.yaml | Média |
-| 3 | `hermes update` — SQLite WAL-reset (parar gateway antes) | Média |
-| 4 | Re-subir gateway profile `security-auditor` se necessário | Baixa |
-| 5 | Pluginizar patches Hermes One (D-004) | Baixa |
+| 1 | Sync 5 commits de `origin/main` (com patch-guard) | Média |
+| 2 | Evitar doctor/gateway via `.venv` (SQLite 3.50.4) | Baixa |
+| 3 | Fix/revalidar `avaliacao-agente-dande` | Baixa |
+| 4 | Pluginizar patches Hermes One (D-004) | Baixa |
 
 ---
 
-## Modelos Codex — conta ChatGPT
+## Modelos Codex (ChatGPT)
 
 **Usar:** `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`  
-**Não usar:** `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini` (HTTP 400)  
-Referência: `hermes_cli/codex_models.py`
+**Não usar:** `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`
 
 ---
 
-## Restrições (não esquecer)
+## Restrições
 
 - Nunca `git add .`
-- **`hermes update` pode trocar para `main`** — voltar para `local/harness` depois
-- Restart gateway exige `--confirm` no script gateway-ops
-- Branch `local/harness` é **local only**
-- Testes via `scripts/run_tests.sh`, não pytest direto
+- `hermes update` pode checkoutar `main` — voltar para `local/harness`
+- Restart gateway: `--confirm` no gateway-ops
+- `hermes.cmd` já corrigido; se voltar a abrir agent chat, apontar de novo para `hermes.exe`

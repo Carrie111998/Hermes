@@ -107,6 +107,40 @@
 
 **Próximo passo:** commit harness (cron-audit + docs) na `local/harness`
 
-### 2026-08-10 — Fim de sessão
+### 2026-08-10 — Commit harness (entre sessões)
 
-Handoff completo em `registros/RETOMADA_SESSAO.md`. Continuar em nova janela Cursor.
+| Passo | Resultado |
+|---|---|
+| Commit `b34f1a28b9` | OK — `feat(harness): add hermes-cron-audit skill and update session docs` |
+| `model.default: gpt-5.5` | OK — já presente em `%LOCALAPPDATA%\hermes\config.yaml` |
+
+### 2026-08-10 — Retomada (nova janela)
+
+| Passo | Resultado |
+|---|---|
+| patch-guard | **OK** |
+| git status | **OK** — working tree limpa @ `b34f1a28b9` |
+| gateway status | **OK** — telegram + api_server + slack; profiles up |
+| cron-audit `--include-disabled` | **OK** — 6 jobs, 0 overdue, ticker healthy |
+
+**Próximo passo:** `hermes update` (SQLite) — exige aprovação (para gateway + possível checkout `main`)
+
+### 2026-08-10 — hermes update + SQLite esclarecido
+
+| Passo | Resultado |
+|---|---|
+| Stop gateways (default + 2 profiles) | OK — via `venv\Scripts\hermes.exe` |
+| PATH `hermes.cmd` | ⚠ quebrado — cai no agent chat; não usar |
+| `hermes update` | OK — already up to date; switch temporário `main`; auto-start gateway |
+| Checkout `local/harness` | OK — `b34f1a28b9` |
+| patch-guard | OK |
+| SQLite `venv` / `.hermes-runtime` | ✅ **3.53.1** (já estava fixed) |
+| SQLite `.venv` (dev) | ⚠ ainda **3.50.4** — doctor via `.venv` gerava falso alarme |
+| Restart gateways via `venv` | OK — telegram + api_server + slack + profiles |
+| cron-audit | OK — 0 overdue, ticker healthy |
+
+**Próximo passo:** commit docs harness (opcional) ou alinhar `.venv` / evitar PATH `hermes.cmd`
+
+### 2026-08-10 — Fim de sessão / handoff
+
+Handoff em `registros/RETOMADA_SESSAO.md`.
