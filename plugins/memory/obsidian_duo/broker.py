@@ -27,6 +27,7 @@ from .retrieval import MemoryRetriever
 from .store import SqliteMemoryStore
 from .vault import ObsidianVault
 from .store import new_id
+from .security import redact_secrets
 
 
 @dataclass(frozen=True)
@@ -129,7 +130,7 @@ class EmbeddedMemoryBroker:
 
     def _retain_event(self, event: MemoryEvent) -> None:
         """Keep only bounded, non-secret lifecycle context for later consolidation."""
-        content = (event.content or "")[:4000]
+        content = redact_secrets((event.content or "")[:4000])
         if not content and event.event_type == "turn":
             return
         retained = MemoryEvent(

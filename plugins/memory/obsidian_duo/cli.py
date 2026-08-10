@@ -82,8 +82,12 @@ def obsidian_duo_command(args) -> None:
                     broker.store, full=bool(getattr(args, "full", False))
                 ).__dict__}
             elif command == "reconcile":
-                broker.vault.scan_managed_changes(broker.store)
-                result = {"reconciled": broker.process_manual_changes()}
+                recovery = broker.recover()
+                result = {
+                    "reconciled": broker.process_manual_changes(),
+                    "recovered": recovery.recovered,
+                    "malformed": recovery.malformed,
+                }
             elif command == "pending":
                 rows = broker.store.connection().execute(
                     "SELECT candidate_id, payload, status, created_at FROM candidates ORDER BY created_at"

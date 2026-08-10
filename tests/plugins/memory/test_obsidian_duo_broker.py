@@ -137,6 +137,17 @@ def test_staged_candidate_retains_evidence_references(tmp_path):
     assert "t1" in payload
 
 
+def test_event_buffer_redacts_secrets_before_retention(tmp_path):
+    broker = make_broker(tmp_path)
+    broker._retain_event(MemoryEvent(
+        "turn", "API_KEY=sk-proj-1234567890abcdefghijklmnop", session_id="s1"
+    ))
+
+    retained = broker._event_buffers["s1"][0].content
+
+    assert "sk-proj-1234567890abcdefghijklmnop" not in retained
+
+
 def test_promotion_runs_conflict_policy_before_writing(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()
