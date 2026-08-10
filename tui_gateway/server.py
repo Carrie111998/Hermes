@@ -12658,6 +12658,7 @@ _LIVE_SESSION_DIRECT_COMMANDS = frozenset(
         "history",
         "models",
         "prompt",
+        "refine",
         "rename",
         "status",
         "usage",
@@ -12875,6 +12876,47 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
         if session is None:
             return "No active agent -- send a message first."
         return _format_live_prompt_output(session)
+    if name == "refine":
+        if session is None:
+            return "Refine unavailable (no session)."
+        if session.get("running"):
+            return "Agent is running — wait for the turn to finish, then /refine."
+        agent = session.get("agent")
+        if agent is None:
+            return "Nothing to refine yet — send a message first."
+
+        snapshot = []
+        session_key = str(session.get("session_key") or "")
+        if session_key:
+            try:
+                with _session_db(session) as db:
+                    if db is not None:
+                        snapshot = db.get_messages_as_conversation(
+                            session_key, include_ancestors=True
+                        )
+            except Exception:
+                logger.debug("failed to load persisted /refine transcript", exc_info=True)
+        if not snapshot:
+            with session["history_lock"]:
+                snapshot = list(session.get("history", []))
+        if not snapshot:
+            return "Nothing to refine yet — the conversation is empty."
+
+        review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
+        try:
+            agent._spawn_background_review(
+                messages_snapshot=list(snapshot),
+                review_memory=True,
+                review_skills=review_skills,
+                focus=arg.strip() or None,
+            )
+        except Exception as exc:
+            return f"/refine failed to start: {exc}"
+        tail = f" (focus: {arg.strip()})" if arg.strip() else ""
+        return (
+            f"⚗ Reviewing this conversation in the background{tail} — "
+            "any memory/skill updates will be reported when done."
+        )
     if name == "status":
         response = _methods["session.status"]("status", {"session_id": sid})
         if response.get("error"):
