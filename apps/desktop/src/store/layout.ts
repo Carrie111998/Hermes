@@ -11,6 +11,7 @@ import { $paneStates, ensurePaneRegistered, setPaneOpen, setPaneWidthOverride, t
 import { $showAllProfiles, setShowAllProfiles } from './profile'
 import type { PullRequestBucket } from './pull-requests'
 import type { SessionStatusBucket } from './session-dot-state'
+import { isAuxiliaryWindow } from './windows'
 
 export const SIDEBAR_DEFAULT_WIDTH = 237
 export const SIDEBAR_MAX_WIDTH = 360
@@ -77,10 +78,12 @@ export const $fileBrowserOpen: ReadableAtom<boolean> = computed(
 
 // Persisted so a relaunch reopens the same rail tab. Null when the rail has no
 // tabs; a restored id with no matching tab is reconciled in the preview store.
-export const $rightRailActiveTabId = persistentAtom<RightRailTabId | null>(RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY, null, {
-  decode: raw => (raw ? (raw as RightRailTabId) : null),
-  encode: tabId => tabId ?? ''
-})
+export const $rightRailActiveTabId = isAuxiliaryWindow()
+  ? atom<RightRailTabId | null>(null)
+  : persistentAtom<RightRailTabId | null>(RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY, null, {
+      decode: raw => (raw ? (raw as RightRailTabId) : null),
+      encode: tabId => tabId ?? ''
+    })
 
 export const $sidebarWidth: ReadableAtom<number> = computed($paneStates, states => {
   const override = states[CHAT_SIDEBAR_PANE_ID]?.widthOverride
@@ -345,7 +348,9 @@ export const $sidebarViewCustomized: ReadableAtom<boolean> = computed(
 
 // When true, the sessions sidebar moves to the right and the file browser +
 // preview rail move to the left — a mirror of the default layout.
-export const $panesFlipped = persistentAtom(PANES_FLIPPED_STORAGE_KEY, false, Codecs.bool)
+export const $panesFlipped = isAuxiliaryWindow()
+  ? atom(false)
+  : persistentAtom(PANES_FLIPPED_STORAGE_KEY, false, Codecs.bool)
 export const $isSidebarResizing = atom(false)
 export const $sessionsLimit = atom(SIDEBAR_SESSIONS_PAGE_SIZE)
 

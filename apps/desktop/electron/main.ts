@@ -89,6 +89,7 @@ import {
   uninstallArgsForMode
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
+import { installE2ERendererStartupObserver } from './e2e-renderer-startup-observer'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
@@ -1019,6 +1020,8 @@ const STREAMABLE_MEDIA_EXTS = new Set([
   '.wav',
   '.webm'
 ])
+
+installE2ERendererStartupObserver(app)
 
 protocol.registerSchemesAsPrivileged([
   {

@@ -29,7 +29,7 @@ const rowPadX = 'pl-2 pr-1'
 const rowGap = 'gap-1.5'
 const rowLead = 'grid size-3.5 shrink-0 place-items-center'
 const rowInset = cn(rowPadX, rowGap, 'flex h-full min-w-0 items-center self-stretch py-0.5')
-const rowLabel = 'min-w-0 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)'
+const rowLabel = 'min-w-0 truncate text-start text-[0.8125rem] leading-none text-(--ui-text-secondary)'
 
 /** Codicon size in sidebar row leads — matches the file tree (`tree.tsx`). */
 export const SIDEBAR_LEAD_ICON_SIZE = '0.875rem' as const
@@ -108,7 +108,9 @@ export function SidebarRowLink({
 }: React.ComponentProps<'button'> & { labelClassName?: string }) {
   return (
     <RowButton className={cn('min-w-0 shrink bg-transparent p-0 text-left', className)} {...props}>
-      <span className={cn(rowLabel, labelClassName)}>{children}</span>
+      <span className={cn(rowLabel, labelClassName)} dir="auto">
+        {children}
+      </span>
     </RowButton>
   )
 }
@@ -120,7 +122,7 @@ export function SidebarRowLead({ className, ...props }: React.ComponentProps<'sp
 
 /** Standard row label typography. */
 export function SidebarRowLabel({ className, ...props }: React.ComponentProps<'span'>) {
-  return <span className={cn(rowLabel, className)} {...props} />
+  return <span className={cn(rowLabel, className)} dir="auto" {...props} />
 }
 
 /** What a group's sessions add up to, for the Show options that count something. */

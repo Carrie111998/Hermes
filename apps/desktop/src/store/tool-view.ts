@@ -1,6 +1,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { persistBoolean, storedBoolean } from '@/lib/storage'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 export type ToolViewMode = 'product' | 'technical'
 
@@ -9,16 +10,19 @@ type ToolDisclosureStates = Record<string, boolean>
 const TOOL_VIEW_TECHNICAL_STORAGE_KEY = 'hermes.desktop.toolView.technical'
 const TOOL_DISCLOSURE_STORAGE_KEY = 'hermes.desktop.toolDisclosure.v1'
 const MAX_DISCLOSURE_STATES = 240
+const toolViewStorageEnabled = !isAuxiliaryWindow()
 
 export const $toolViewMode = atom<ToolViewMode>(
-  storedBoolean(TOOL_VIEW_TECHNICAL_STORAGE_KEY, false) ? 'technical' : 'product'
+  toolViewStorageEnabled && storedBoolean(TOOL_VIEW_TECHNICAL_STORAGE_KEY, false) ? 'technical' : 'product'
 )
-export const $toolDisclosureStates = atom<ToolDisclosureStates>(loadToolDisclosureStates())
+export const $toolDisclosureStates = atom<ToolDisclosureStates>(toolViewStorageEnabled ? loadToolDisclosureStates() : {})
 const disclosureOpenCache = new Map<string, ReadableAtom<boolean | undefined>>()
 const anyDisclosureOpenCache = new Map<string, ReadableAtom<boolean>>()
 
-$toolViewMode.subscribe(mode => persistBoolean(TOOL_VIEW_TECHNICAL_STORAGE_KEY, mode === 'technical'))
-$toolDisclosureStates.subscribe(persistToolDisclosureStates)
+if (toolViewStorageEnabled) {
+  $toolViewMode.subscribe(mode => persistBoolean(TOOL_VIEW_TECHNICAL_STORAGE_KEY, mode === 'technical'))
+  $toolDisclosureStates.subscribe(persistToolDisclosureStates)
+}
 
 export function setToolViewMode(mode: ToolViewMode) {
   $toolViewMode.set(mode)

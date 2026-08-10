@@ -79,7 +79,7 @@ import {
   $updateStatus,
   requestActiveUpdate
 } from '@/store/updates'
-import { canOpenNewWindow, openNewWindow } from '@/store/windows'
+import { canOpenNewWindow, isAuxiliaryWindow, openNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -635,7 +635,10 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   // Deep-link into a nested page (e.g. `/pet list` → pets picker).
   useEffect(() => {
     if (pendingPage) {
-      setPage(pendingPage)
+      if (!isAuxiliaryWindow()) {
+        setPage(pendingPage)
+      }
+
       $commandPalettePage.set(null)
     }
   }, [pendingPage])
@@ -769,13 +772,17 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                 }
               ]
             : []),
-          {
-            action: 'nav.settings',
-            icon: Settings,
-            id: 'nav-settings',
-            label: cc.nav.settings.title,
-            run: go(SETTINGS_ROUTE)
-          },
+          ...(!isAuxiliaryWindow()
+            ? [
+                {
+                  action: 'nav.settings',
+                  icon: Settings,
+                  id: 'nav-settings',
+                  label: cc.nav.settings.title,
+                  run: go(SETTINGS_ROUTE)
+                }
+              ]
+            : []),
           {
             action: 'nav.skills',
             icon: Wrench,
@@ -881,61 +888,65 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           }
         ]
       },
-      {
-        // Declared before Settings: cmdk keeps group order, so this keeps the
-        // theme/mode pickers on top for "theme"/"color" queries instead of
-        // buried under a fuzzy Settings match.
-        heading: cc.appearance,
-        items: [
-          {
-            icon: Palette,
-            id: 'appearance-theme',
-            keywords: ['theme', 'appearance', 'color', 'palette', 'skin', 'dark', 'light', 'look'],
-            label: cc.changeTheme,
-            to: 'theme'
-          },
-          {
-            icon: Sun,
-            id: 'appearance-mode',
-            keywords: ['appearance', 'color mode', 'brightness', 'dark', 'light', 'system'],
-            label: cc.changeColorMode,
-            to: 'color-mode'
-          },
-          {
-            icon: PawPrint,
-            id: 'appearance-pets',
-            keywords: ['pet', 'petdex', 'mascot', 'pets', '/pet', 'paw'],
-            label: cc.pets.title,
-            to: 'pets'
-          },
-          {
-            icon: Egg,
-            id: 'appearance-generate-pet',
-            keywords: ['pet', 'generate', 'create', 'make', 'new pet', 'mascot', 'hatch', 'ai'],
-            label: cc.generatePet.title,
-            run: () => openPetGenerate()
-          }
-        ]
-      },
-      {
-        heading: cc.settings,
-        items: [
-          ...SECTIONS.map(section => ({
-            icon: section.icon,
-            id: `set-config-${section.id}`,
-            keywords: ['settings', section.label, settingsSectionLabel(section)],
-            label: settingsSectionLabel(section),
-            run: go(settingsTab(`config:${section.id}`))
-          })),
-          ...NON_CONFIG_SETTINGS.map(entry => ({
-            icon: entry.icon,
-            id: `set-${entry.tab}`,
-            keywords: ['settings', ...(entry.keywords ?? [])],
-            label: t.settings.nav[entry.labelKey],
-            run: go(settingsTab(entry.tab))
-          }))
-        ]
-      }
+      ...(!isAuxiliaryWindow()
+        ? [
+            {
+              // Declared before Settings: cmdk keeps group order, so this keeps the
+              // theme/mode pickers on top for "theme"/"color" queries instead of
+              // buried under a fuzzy Settings match.
+              heading: cc.appearance,
+              items: [
+                {
+                  icon: Palette,
+                  id: 'appearance-theme',
+                  keywords: ['theme', 'appearance', 'color', 'palette', 'skin', 'dark', 'light', 'look'],
+                  label: cc.changeTheme,
+                  to: 'theme'
+                },
+                {
+                  icon: Sun,
+                  id: 'appearance-mode',
+                  keywords: ['appearance', 'color mode', 'brightness', 'dark', 'light', 'system'],
+                  label: cc.changeColorMode,
+                  to: 'color-mode'
+                },
+                {
+                  icon: PawPrint,
+                  id: 'appearance-pets',
+                  keywords: ['pet', 'petdex', 'mascot', 'pets', '/pet', 'paw'],
+                  label: cc.pets.title,
+                  to: 'pets'
+                },
+                {
+                  icon: Egg,
+                  id: 'appearance-generate-pet',
+                  keywords: ['pet', 'generate', 'create', 'make', 'new pet', 'mascot', 'hatch', 'ai'],
+                  label: cc.generatePet.title,
+                  run: () => openPetGenerate()
+                }
+              ]
+            },
+            {
+              heading: cc.settings,
+              items: [
+                ...SECTIONS.map(section => ({
+                  icon: section.icon,
+                  id: `set-config-${section.id}`,
+                  keywords: ['settings', section.label, settingsSectionLabel(section)],
+                  label: settingsSectionLabel(section),
+                  run: go(settingsTab(`config:${section.id}`))
+                })),
+                ...NON_CONFIG_SETTINGS.map(entry => ({
+                  icon: entry.icon,
+                  id: `set-${entry.tab}`,
+                  keywords: ['settings', ...(entry.keywords ?? [])],
+                  label: t.settings.nav[entry.labelKey],
+                  run: go(settingsTab(entry.tab))
+                }))
+              ]
+            }
+          ]
+        : [])
     ]
     // `selectTick` is a deliberate re-read trigger, not a value: rows report
     // live state through `detail()`, so the groups must rebuild after a select
@@ -1126,6 +1137,17 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           run: go(`${SETTINGS_ROUTE}?tab=sessions&session=${encodeURIComponent(session.id)}`)
         }))
       })
+    }
+
+    if (isAuxiliaryWindow()) {
+      const settingsItemPrefixes = ['search-theme-', 'search-mode-', 'field-', 'archived-']
+
+      return result
+        .map(group => ({
+          ...group,
+          items: group.items.filter(item => !settingsItemPrefixes.some(prefix => item.id.startsWith(prefix)))
+        }))
+        .filter(group => group.items.length > 0)
     }
 
     return result

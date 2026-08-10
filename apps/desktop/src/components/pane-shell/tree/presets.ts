@@ -10,9 +10,10 @@
 
 import { registry } from '@/contrib/registry'
 import { readJson, writeJson, writeKey } from '@/lib/storage'
+import { applyLayoutPresetWithRanMode } from '@/store/ran-mode'
 
 import { isLayoutNode, type LayoutNode } from './model'
-import { $layoutTree, applyTree, markActivePreset } from './store'
+import { $layoutTree, markActivePreset } from './store'
 
 export const LAYOUTS_AREA = 'layouts'
 
@@ -107,5 +108,5 @@ export const isUserPreset = (id: string) => id in userPresets
 
 /** Apply a preset's tree (deep-cloned so live edits never mutate the preset). */
 export function applyLayoutPreset(id: string, tree: LayoutNode) {
-  applyTree(structuredClone(tree), id)
+  return applyLayoutPresetWithRanMode(id, tree)
 }

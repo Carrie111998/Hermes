@@ -1,5 +1,7 @@
 import { atom, computed, type ReadableAtom } from 'nanostores'
 
+import { isAuxiliaryWindow } from './windows'
+
 export interface PaneStateSnapshot {
   open: boolean
   widthOverride?: number
@@ -13,6 +15,7 @@ export interface PaneRegisterDefaults {
 }
 
 const STORAGE_KEY = 'hermes.desktop.paneStates.v1'
+const paneStorageEnabled = !isAuxiliaryWindow()
 
 function isSnapshot(value: unknown): value is PaneStateSnapshot {
   if (!value || typeof value !== 'object') {
@@ -35,7 +38,7 @@ function isSnapshot(value: unknown): value is PaneStateSnapshot {
 }
 
 function load(): Record<string, PaneStateSnapshot> {
-  if (typeof window === 'undefined') {
+  if (typeof window === 'undefined' || !paneStorageEnabled) {
     return {}
   }
 
@@ -66,7 +69,7 @@ function load(): Record<string, PaneStateSnapshot> {
 
 // Persists both open state and resize width; load() validates each snapshot.
 function persist(states: Record<string, PaneStateSnapshot>) {
-  if (typeof window === 'undefined') {
+  if (typeof window === 'undefined' || !paneStorageEnabled) {
     return
   }
 

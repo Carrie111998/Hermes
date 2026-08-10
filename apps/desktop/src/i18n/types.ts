@@ -359,6 +359,10 @@ export interface Translations {
       colorModeDesc: string
       toolViewTitle: string
       toolViewDesc: string
+      ranModeTitle: string
+      ranModeDesc: string
+      statusBarTitle: string
+      statusBarDesc: string
       uiScaleTitle: string
       uiScaleDesc: (percent: number) => string
       terminalFontTitle: string

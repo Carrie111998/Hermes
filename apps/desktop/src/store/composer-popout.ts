@@ -2,12 +2,15 @@ import { atom, computed, type ReadableAtom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 
+import { isAuxiliaryWindow } from './windows'
+
 const POPOUT_STORAGE_KEY = 'hermes.desktop.composerPopout.zones.v1'
 
 // Pre-zone keys: one flag + one position for the whole window. Read at load to
 // seed the first zone the user touches (see `legacySeed`), never written again.
 const LEGACY_ENABLED_KEY = 'hermes.desktop.composerPopout.enabled'
 const LEGACY_POSITION_KEY = 'hermes.desktop.composerPopout.position'
+const composerStorageEnabled = !isAuxiliaryWindow()
 
 /** Where the floating composer's bottom-right corner sits, measured as an inset
  *  from the viewport's bottom/right edges. Anchoring to the bottom-right keeps
@@ -26,6 +29,14 @@ export interface PopoutZoneState {
   position: PopoutPosition
 }
 
+/** Transactional composer placement captured by temporary layout modes.
+ * `storageValue` preserves absent-vs-explicitly-empty durable semantics while
+ * `zones` preserves the canonical in-memory placement map. */
+export interface ComposerPopoutSnapshot {
+  storageValue: null | string
+  zones: Record<string, PopoutZoneState>
+}
+
 // Floating composer width (rem). Shared by the inline style that sets
 // --composer-popout-width and the peel-off drag math.
 export const POPOUT_WIDTH_REM = 19.5
@@ -42,6 +53,25 @@ const isPosition = (value: unknown): value is PopoutPosition => {
   return typeof r?.bottom === 'number' && typeof r?.right === 'number'
 }
 
+const isZoneState = (value: unknown): value is PopoutZoneState => {
+  const zone = value as null | Partial<PopoutZoneState>
+
+  return typeof zone?.poppedOut === 'boolean' && isPosition(zone.position)
+}
+
+export function isComposerPopoutSnapshot(value: unknown): value is ComposerPopoutSnapshot {
+  const snapshot = value as null | Partial<ComposerPopoutSnapshot>
+
+  return (
+    (snapshot?.storageValue === null || typeof snapshot?.storageValue === 'string') &&
+    typeof snapshot?.zones === 'object' &&
+    snapshot.zones !== null &&
+    !Array.isArray(snapshot.zones) &&
+    Object.values(snapshot.zones).every(isZoneState) &&
+    (snapshot.storageValue === null || snapshot.storageValue === JSON.stringify(snapshot.zones))
+  )
+}
+
 /** The pre-zone position, if the user had one. */
 function legacyPosition(): PopoutPosition {
   try {
@@ -56,13 +86,17 @@ function legacyPosition(): PopoutPosition {
 function load(): Record<string, PopoutZoneState> {
   const out: Record<string, PopoutZoneState> = {}
 
+  if (!composerStorageEnabled) {
+    return out
+  }
+
   try {
     const parsed = JSON.parse(storedString(POPOUT_STORAGE_KEY) || 'null') as unknown
 
     for (const [id, value] of Object.entries((parsed as Record<string, unknown>) ?? {})) {
       const zone = value as null | Partial<PopoutZoneState>
 
-      if (typeof zone?.poppedOut === 'boolean' && isPosition(zone.position)) {
+      if (isZoneState(zone)) {
         out[id] = { poppedOut: zone.poppedOut, position: { ...zone.position } }
       }
     }
@@ -81,17 +115,55 @@ function load(): Record<string, PopoutZoneState> {
  *  left doesn't fling a composer out of the right. */
 export const $composerPopoutZones = atom<Record<string, PopoutZoneState>>(load())
 
+export function captureComposerPopoutSnapshot(): ComposerPopoutSnapshot {
+  const zones = structuredClone($composerPopoutZones.get())
+  const persisted = composerStorageEnabled ? window.localStorage.getItem(POPOUT_STORAGE_KEY) : null
+
+  return { storageValue: persisted === null ? null : JSON.stringify(zones), zones }
+}
+
+export function restoreComposerPopoutSnapshot(snapshot: ComposerPopoutSnapshot): void {
+  if (!composerStorageEnabled) {
+    return
+  }
+
+  $composerPopoutZones.set(structuredClone(snapshot.zones))
+  persistString(POPOUT_STORAGE_KEY, snapshot.storageValue)
+}
+
+/** Apply the same filtering semantics as `pruneComposerPopoutZones` without
+ * mutating the store. Used to verify explicit preset/reset exit outcomes. */
+export function reconcileComposerPopoutSnapshot(
+  snapshot: ComposerPopoutSnapshot,
+  liveGroupIds: Iterable<string>
+): ComposerPopoutSnapshot {
+  const live = new Set(liveGroupIds)
+  const zones = Object.fromEntries(Object.entries(snapshot.zones).filter(([id]) => live.has(id)))
+  const removed = Object.keys(zones).length !== Object.keys(snapshot.zones).length
+
+  return {
+    storageValue: removed ? JSON.stringify(zones) : snapshot.storageValue,
+    zones
+  }
+}
+
 /** Write-through to storage. Called explicitly — NOT on every store change: a
  *  drag updates the position once per frame, and serializing every zone to
  *  localStorage at 60Hz is exactly the IO the drag path was built to avoid. */
-const persistZones = () => persistString(POPOUT_STORAGE_KEY, JSON.stringify($composerPopoutZones.get()))
+const persistZones = () => {
+  if (composerStorageEnabled) {
+    persistString(POPOUT_STORAGE_KEY, JSON.stringify($composerPopoutZones.get()))
+  }
+}
 
 /** Whether the user had a float before zones existed. Seeds a zone's first read
  *  so an upgrade doesn't silently dock someone who left their composer floating
  *  — but ONLY until they touch any zone. Once real per-zone state exists, that
  *  is the truth, and a zone split later starts docked like any other. */
 let legacySeed: PopoutZoneState | null =
-  storedString(LEGACY_ENABLED_KEY) === 'true' ? { poppedOut: true, position: legacyPosition() } : null
+  composerStorageEnabled && storedString(LEGACY_ENABLED_KEY) === 'true'
+    ? { poppedOut: true, position: legacyPosition() }
+    : null
 
 const zoneState = (zones: Record<string, PopoutZoneState>, groupId: string): PopoutZoneState =>
   zones[groupId] ?? legacySeed ?? DEFAULT_ZONE

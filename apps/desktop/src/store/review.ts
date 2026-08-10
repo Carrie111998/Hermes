@@ -9,6 +9,7 @@ import { desktopGit } from '@/lib/desktop-git'
 import { isExcludedPath } from '@/lib/excluded-paths'
 import { requestOneShot } from '@/lib/oneshot'
 import { Codecs, persistentAtom } from '@/lib/persisted'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import { refreshRepoStatus, repoStatusForCwd } from './coding-status'
 import { stampSessionPrBranch } from './pull-requests'
@@ -34,25 +35,30 @@ const TREE_MODE_KEY = 'hermes.desktop.reviewTreeMode'
 const SELECTED_KEY = 'hermes.desktop.reviewSelectedPath'
 const REVIEW_REFRESH_DEBOUNCE_MS = 100
 const SHIP_INFO_STALE_MS = 30_000
+const reviewStorageEnabled = !isAuxiliaryWindow()
 
 // Persisted so the pane stays open across reloads (like the other rail panes).
-export const $reviewOpen = persistentAtom(OPEN_KEY, false, Codecs.bool)
+export const $reviewOpen = reviewStorageEnabled ? persistentAtom(OPEN_KEY, false, Codecs.bool) : atom(false)
 
 // The split-button's remembered default action ('commit' | 'commitPush').
 export type CommitAction = 'commit' | 'commitPush'
 
-export const $reviewCommitDefault = persistentAtom<CommitAction>(COMMIT_DEFAULT_KEY, 'commit', {
-  decode: raw => (raw === 'commitPush' ? 'commitPush' : 'commit'),
-  encode: value => value
-})
+export const $reviewCommitDefault = reviewStorageEnabled
+  ? persistentAtom<CommitAction>(COMMIT_DEFAULT_KEY, 'commit', {
+      decode: raw => (raw === 'commitPush' ? 'commitPush' : 'commit'),
+      encode: value => value
+    })
+  : atom<CommitAction>('commit')
 
 // Changed-file layout: a flat path list (VS Code's default) or a folder tree.
 export type ReviewTreeMode = 'list' | 'tree'
 
-export const $reviewTreeMode = persistentAtom<ReviewTreeMode>(TREE_MODE_KEY, 'tree', {
-  decode: raw => (raw === 'list' ? 'list' : 'tree'),
-  encode: value => value
-})
+export const $reviewTreeMode = reviewStorageEnabled
+  ? persistentAtom<ReviewTreeMode>(TREE_MODE_KEY, 'tree', {
+      decode: raw => (raw === 'list' ? 'list' : 'tree'),
+      encode: value => value
+    })
+  : atom<ReviewTreeMode>('tree')
 
 export function toggleReviewTreeMode(): void {
   $reviewTreeMode.set($reviewTreeMode.get() === 'tree' ? 'list' : 'tree')
@@ -73,7 +79,9 @@ export const $reviewMaxChurn = computed($reviewFiles, files =>
 )
 // Persisted so a relaunch restores the file you were diffing (its diff is
 // re-fetched in refreshReview once the file is confirmed still changed).
-export const $reviewSelectedPath = persistentAtom<null | string>(SELECTED_KEY, null, Codecs.nullableText)
+export const $reviewSelectedPath = reviewStorageEnabled
+  ? persistentAtom<null | string>(SELECTED_KEY, null, Codecs.nullableText)
+  : atom<null | string>(null)
 export const $reviewDiff = atom<null | string>(null)
 export const $reviewDiffLoading = atom(false)
 

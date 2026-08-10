@@ -13,7 +13,7 @@ import { translateNow } from '@/i18n'
 import { readJson, readKey, writeJson, writeKey } from '@/lib/storage'
 import { notify } from '@/store/notifications'
 import { clearAllPaneSizeOverrides } from '@/store/panes'
-import { isSecondaryWindow } from '@/store/windows'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 import {
   allPaneIds,
@@ -45,8 +45,11 @@ import { rootChildSide } from './renderer/track-model'
 // v2: v1 trees were saved against placeholder panes with index-order zone
 // assignment (chat could land in a corner cell). Retire them wholesale.
 const STORAGE_KEY = 'hermes.desktop.layoutTree.v2'
+const layoutStorageEnabled = !isAuxiliaryWindow()
 
-writeKey('hermes.desktop.layoutTree.v1', null)
+if (layoutStorageEnabled) {
+  writeKey('hermes.desktop.layoutTree.v1', null)
+}
 
 let defaultTree: LayoutNode | null = null
 
@@ -59,29 +62,41 @@ function loadPersisted(): LayoutNode | null {
 }
 
 function persist(tree: LayoutNode | null) {
-  // A secondary window (single-chat pop-out) shares the origin's localStorage;
-  // writing its stripped-down DEFAULT tree back would wipe the primary's layout.
-  if (isSecondaryWindow()) {
+  // Auxiliary renderers share the primary origin but own only an ephemeral
+  // presentation tree. Their plugin/session adoption must never rewrite the
+  // primary window's durable layout.
+  if (!layoutStorageEnabled) {
     return
   }
 
   writeJson(STORAGE_KEY, tree)
 }
 
-/** The live tree (null until a default is declared). A secondary window ignores
- *  the persisted (primary) layout and boots to the default — nothing but its
- *  own routed session. */
-export const $layoutTree = atom<LayoutNode | null>(isSecondaryWindow() ? null : loadPersisted())
+/** The live tree (null until a default is declared). Auxiliary windows ignore
+ *  the persisted primary layout and boot to their own presentation default. */
+export const $layoutTree = atom<LayoutNode | null>(layoutStorageEnabled ? loadPersisted() : null)
 
 /**
  * Which layout preset the current tree came from; `'custom'` after the user
  * rearranges anything. Drives the picker's active highlight.
  */
-export const $activePresetId = atom<string>(readKey('hermes.desktop.layoutPreset.active') ?? 'default')
+export const $activePresetId = atom<string>(
+  layoutStorageEnabled ? (readKey('hermes.desktop.layoutPreset.active') ?? 'default') : 'default'
+)
+
+/** Exact layout-owned state captured by temporary workspace modes. */
+export interface LayoutStateSnapshot {
+  activePresetId: string
+  tree: LayoutNode
+  userPlacedPaneIds: string[]
+}
 
 export function markActivePreset(id: string) {
   $activePresetId.set(id)
-  writeKey('hermes.desktop.layoutPreset.active', id)
+
+  if (layoutStorageEnabled) {
+    writeKey('hermes.desktop.layoutPreset.active', id)
+  }
 }
 
 /** Pane id being dragged (tree drag session), null when idle. Also set to the
@@ -179,14 +194,17 @@ function frontPaneInGroup(paneId: string) {
 const DISMISSED_KEY = 'hermes.desktop.dismissedPanes.v1'
 
 function loadDismissed(): ReadonlySet<string> {
-  return new Set(readJson<string[]>(DISMISSED_KEY) ?? [])
+  return new Set(layoutStorageEnabled ? (readJson<string[]>(DISMISSED_KEY) ?? []) : [])
 }
 
 export const $dismissedPanes = atom<ReadonlySet<string>>(loadDismissed())
 
 function saveDismissed(next: ReadonlySet<string>) {
   $dismissedPanes.set(next)
-  writeJson(DISMISSED_KEY, next.size === 0 ? null : [...next])
+
+  if (layoutStorageEnabled) {
+    writeJson(DISMISSED_KEY, next.size === 0 ? null : [...next])
+  }
 }
 
 function setDismissed(paneId: string, dismissed: boolean) {
@@ -1095,7 +1113,7 @@ interface PaneDockHint {
   before?: null | string
 }
 
-function adoptContributedPanes(): void {
+export function adoptContributedPanes(): void {
   const tree = $layoutTree.get()
 
   if (!tree) {
@@ -1212,11 +1230,38 @@ function commit(next: LayoutNode | null) {
 
 const USER_PLACED_KEY = 'hermes.desktop.userPlacedPanes.v1'
 
-export const $userPlacedPanes = atom<ReadonlySet<string>>(new Set(readJson<string[]>(USER_PLACED_KEY) ?? []))
+export const $userPlacedPanes = atom<ReadonlySet<string>>(
+  new Set(layoutStorageEnabled ? (readJson<string[]>(USER_PLACED_KEY) ?? []) : [])
+)
 
 function saveUserPlaced(next: ReadonlySet<string>) {
   $userPlacedPanes.set(next)
-  writeJson(USER_PLACED_KEY, next.size === 0 ? null : [...next])
+
+  if (layoutStorageEnabled) {
+    writeJson(USER_PLACED_KEY, next.size === 0 ? null : [...next])
+  }
+}
+
+/** Capture every layout field that applying a preset can mutate. */
+export function captureLayoutStateSnapshot(): LayoutStateSnapshot {
+  const tree = $layoutTree.get()
+
+  if (!tree) {
+    throw new Error('Cannot capture layout state before the default tree is declared')
+  }
+
+  return {
+    activePresetId: $activePresetId.get(),
+    tree: structuredClone(tree),
+    userPlacedPaneIds: [...$userPlacedPanes.get()]
+  }
+}
+
+/** Restore exact pre-mode state; temporary modes must never fall back to defaults. */
+export function restoreLayoutStateSnapshot(snapshot: LayoutStateSnapshot): void {
+  commit(structuredClone(snapshot.tree))
+  saveUserPlaced(new Set(snapshot.userPlacedPaneIds))
+  markActivePreset(snapshot.activePresetId)
 }
 
 function markPaneUserPlaced(paneId: string) {
@@ -1704,7 +1749,7 @@ export function persistTree() {
   persist($layoutTree.get())
 }
 
-export function resetLayoutTree() {
+export function resetLayoutTree(): boolean {
   persist(null)
   clearAllPaneSizeOverrides()
   // Reset restores EVERYTHING — closed panes included — and hands pane
@@ -1720,6 +1765,13 @@ export function resetLayoutTree() {
   // Everything still missing (plugin panes) adopts by placement.
   adoptContributedPanes()
 
+  // Reset handlers may use the public move/apply operations to pre-place panes.
+  // Those operations correctly mark ordinary user moves as custom and pinned,
+  // but handler-driven placement is still part of the canonical default reset.
+  // Reassert the reset-owned metadata after every handler/adoption write.
+  saveUserPlaced(new Set())
+  markActivePreset('default')
+
   // "Restore everything" includes collapsed SIDES: reopen every bound side
   // (through its store, so $sidebarOpen / the toggles stay truthful). Without
   // this a sidebar hidden before the reset silently survives it, flipping the
@@ -1727,6 +1779,12 @@ export function resetLayoutTree() {
   for (const side of Object.keys(sideOpeners) as TreeSide[]) {
     sideOpeners[side]?.(true)
   }
+
+  // Object identity remains the declared default only when no reset handler or
+  // contributed-pane adoption committed a concrete replacement tree. Callers
+  // that verify durable reset completion use this to distinguish canonical
+  // `null` persistence from a required concrete final-tree write.
+  return $layoutTree.get() !== defaultTree
 }
 
 // Dev hook for automation.

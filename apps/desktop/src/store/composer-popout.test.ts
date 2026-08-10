@@ -2,11 +2,14 @@ import { beforeEach, describe, expect, it } from 'vitest'
 
 import {
   $composerPopoutZones,
+  captureComposerPopoutSnapshot,
   clampPopoutPosition,
   getComposerPopoutZone,
   POPOUT_WIDTH_REM,
   type PopoutBounds,
   pruneComposerPopoutZones,
+  reconcileComposerPopoutSnapshot,
+  restoreComposerPopoutSnapshot,
   setComposerPopoutPosition,
   setComposerPoppedOut
 } from './composer-popout'
@@ -80,6 +83,7 @@ describe('clampPopoutPosition', () => {
 
 describe('pop-out state is scoped to a layout zone', () => {
   beforeEach(() => {
+    window.localStorage.clear()
     $composerPopoutZones.set({})
   })
 
@@ -126,5 +130,58 @@ describe('pop-out state is scoped to a layout zone', () => {
     pruneComposerPopoutZones([LEFT_ZONE])
 
     expect(Object.keys($composerPopoutZones.get())).toEqual([LEFT_ZONE])
+  })
+})
+
+describe('transactional composer placement snapshots', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    $composerPopoutZones.set({})
+  })
+
+  it.each([
+    ['absent', null],
+    ['explicitly empty', '{}']
+  ])('distinguishes %s durable placement while restoring an empty map', (_label, durableValue) => {
+    if (durableValue !== null) {
+      window.localStorage.setItem('hermes.desktop.composerPopout.zones.v1', durableValue)
+    }
+
+    const snapshot = captureComposerPopoutSnapshot()
+
+    setComposerPoppedOut(LEFT_ZONE, true)
+    restoreComposerPopoutSnapshot(snapshot)
+
+    expect($composerPopoutZones.get()).toEqual({})
+    expect(window.localStorage.getItem('hermes.desktop.composerPopout.zones.v1')).toBe(durableValue)
+  })
+
+  it('captures and restores one concrete pop-out without sharing object identity', () => {
+    const zones = { [LEFT_ZONE]: { poppedOut: true, position: { bottom: 91, right: 113 } } }
+
+    window.localStorage.setItem('hermes.desktop.composerPopout.zones.v1', JSON.stringify(zones))
+    $composerPopoutZones.set(structuredClone(zones))
+    const snapshot = captureComposerPopoutSnapshot()
+
+    pruneComposerPopoutZones([])
+    restoreComposerPopoutSnapshot(snapshot)
+
+    expect($composerPopoutZones.get()).toEqual(zones)
+    expect($composerPopoutZones.get()).not.toBe(snapshot.zones)
+    expect(window.localStorage.getItem('hermes.desktop.composerPopout.zones.v1')).toBe(JSON.stringify(zones))
+  })
+
+  it('derives explicit-layout settlement state from the snapshot and surviving groups', () => {
+    const zones = {
+      [LEFT_ZONE]: { poppedOut: true, position: { bottom: 17, right: 19 } },
+      [RIGHT_ZONE]: { poppedOut: false, position: { bottom: 23, right: 29 } }
+    }
+
+    const snapshot = { storageValue: JSON.stringify(zones), zones }
+
+    expect(reconcileComposerPopoutSnapshot(snapshot, [RIGHT_ZONE])).toEqual({
+      storageValue: JSON.stringify({ [RIGHT_ZONE]: zones[RIGHT_ZONE] }),
+      zones: { [RIGHT_ZONE]: zones[RIGHT_ZONE] }
+    })
   })
 })

@@ -1,12 +1,16 @@
 import { atom } from 'nanostores'
 
 import { persistBoolean, storedBoolean } from '@/lib/storage'
+import { isAuxiliaryWindow } from '@/store/windows'
 
 const TAKEOVER_KEY = 'hermes.desktop.terminalTakeover'
+const terminalStorageEnabled = !isAuxiliaryWindow()
 
-export const $terminalTakeover = atom(storedBoolean(TAKEOVER_KEY, false))
+export const $terminalTakeover = atom(terminalStorageEnabled ? storedBoolean(TAKEOVER_KEY, false) : false)
 
-$terminalTakeover.subscribe(active => persistBoolean(TAKEOVER_KEY, active))
+if (terminalStorageEnabled) {
+  $terminalTakeover.subscribe(active => persistBoolean(TAKEOVER_KEY, active))
+}
 
 export const setTerminalTakeover = (active: boolean) => $terminalTakeover.set(active)
 

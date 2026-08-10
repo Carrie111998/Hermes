@@ -446,6 +446,10 @@ export const zh: Translations = {
       colorModeDesc: '选择固定模式，或让 Hermes 跟随系统设置。',
       toolViewTitle: '工具调用显示',
       toolViewDesc: '产品模式隐藏原始工具数据；技术模式显示完整输入/输出。',
+      ranModeTitle: 'Ran 模式',
+      ranModeDesc: '以对话为中心。临时最小化会话栏并隐藏次要面板和界面元素，退出时精确恢复之前的工作区。',
+      statusBarTitle: '状态栏',
+      statusBarDesc: '在底部显示后端、模型和项目状态。关闭可获得更安静的工作区。',
       uiScaleTitle: '界面缩放',
       uiScaleDesc: (percent: number) =>
         `缩放整个应用的文字和界面。也可使用 Cmd/Ctrl 加 +、- 或 0 调整。当前：${percent}%`,

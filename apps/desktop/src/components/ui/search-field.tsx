@@ -74,9 +74,10 @@ export function SearchField({
           // text; min-w-0 lets it shrink back below content size when the
           // context is narrower — long queries scroll inside the field.
           // text-xs matches the form controls (Input/Select via controlVariants).
-          'h-7 min-w-0 max-w-full bg-transparent text-xs text-foreground [field-sizing:content] placeholder:text-muted-foreground focus:outline-none',
+          'h-7 min-w-0 max-w-full bg-transparent text-start text-xs text-foreground [field-sizing:content] placeholder:text-muted-foreground focus:outline-none',
           inputClassName
         )}
+        dir="auto"
         onChange={event => onChange(event.target.value)}
         placeholder={effectivePlaceholder}
         ref={inputRef}
