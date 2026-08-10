@@ -988,7 +988,7 @@ def recover_with_credential_pool(
             except Exception:
                 _custom_match = False
         if not _custom_match:
-            _ra().logger.warning(
+            _ra().logger.debug(
                 "Credential pool provider mismatch: pool=%s, agent=%s — "
                 "skipping pool mutation to avoid cross-provider contamination",
                 pool_provider, current_provider,
