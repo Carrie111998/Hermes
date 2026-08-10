@@ -86,6 +86,25 @@ class TestBuildSessionContextPromptRedaction:
         prompt = build_session_context_prompt(ctx, redact_pii=False)
         assert "99999" in prompt
 
+    def test_home_channel_routing_ids_preserved_with_redaction(self):
+        hc = {
+            Platform.DISCORD: HomeChannel(
+                platform=Platform.DISCORD,
+                chat_id="1357255163595190292",
+                name="Discord Home",
+            ),
+            Platform.TELEGRAM: HomeChannel(
+                platform=Platform.TELEGRAM,
+                chat_id="-1003914667905",
+                name="Telegram Home",
+            ),
+        }
+        ctx = _make_context(home_channels=hc)
+        prompt = build_session_context_prompt(ctx, redact_pii=True)
+
+        assert 'discord: "Discord Home" (ID: "1357255163595190292")' in prompt
+        assert 'telegram: "Telegram Home" (ID: "-1003914667905")' in prompt
+
     def test_redaction_is_deterministic(self):
         ctx = _make_context(user_id="+15551234567")
         prompt1 = build_session_context_prompt(ctx, redact_pii=True)

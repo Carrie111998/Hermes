@@ -742,7 +742,13 @@ def build_session_context_prompt(
         lines.append("")
         lines.append("**Home Channels (default destinations):**")
         for platform, home in context.home_channels.items():
-            hc_id = _hash_chat_id(home.chat_id) if redact_pii else home.chat_id
+            # Home-channel IDs are explicit operator-configured routing
+            # destinations, not participant identifiers.  A deterministic
+            # hash is unusable with ``platform:chat_id`` targeting and is
+            # especially misleading for Discord, whose IDs are not redacted
+            # elsewhere.  Keep these destination identities literal while
+            # retaining PII redaction for source/user/DM identity fields.
+            hc_id = home.chat_id
             safe_name = _format_untrusted_prompt_value(home.name)
             safe_id = _format_untrusted_prompt_value(hc_id)
             lines.append(f"  - {platform.value}: {safe_name} (ID: {safe_id})")

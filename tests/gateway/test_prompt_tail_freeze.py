@@ -167,7 +167,13 @@ class TestEphemeralChangeKeyParity:
         # PII redaction only rewrites bytes on pii-safe platforms; the key
         # must react wherever the render does.
         runner = _make_runner()
-        ctx = _make_context(platform=Platform.TELEGRAM, thread_id=None, parent_chat_id=None)
+        ctx = _make_context(
+            platform=Platform.TELEGRAM,
+            thread_id=None,
+            parent_chat_id=None,
+            user_name=None,
+            user_id="9001",
+        )
         assert _render(ctx, False) != _render(ctx, True)
         assert _key(runner, ctx, False) != _key(runner, ctx, True)
 
