@@ -638,6 +638,87 @@ class TestMigrateHonchoProfileHostWrite:
         cfg = json.loads(real.read_text())
         assert cfg["hosts"]["hermes_newname"]["apiKey"] == "test-honcho-access-token"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+    def test_symlinked_config_on_another_filesystem_survives_a_failed_replace(
+        self, profile_env, monkeypatch
+    ):
+        """A cross-device rewrite must never truncate the real credential file.
+
+        ``~/.honcho/config.json`` is commonly a symlink into a dotfiles repo,
+        an encrypted volume or a mounted secrets share — i.e. a different
+        filesystem from ``~/.honcho`` itself.  Staging the temp beside the
+        *link* makes the rename cross-device, and the ``EXDEV`` fallback
+        copies onto the resolved target with the destination opened ``"wb"``,
+        emptying the file that holds the ``apiKey`` before a single
+        replacement byte exists.  A copy that then fails (ENOSPC, I/O error)
+        leaves it truncated, and this loop's ``except OSError: continue``
+        swallows the error, so the user is never told.
+        """
+        import errno
+
+        import utils
+
+        tmp_path = profile_env
+        other_fs = tmp_path / "other_fs"
+        other_fs.mkdir()
+        real = other_fs / "config.json"
+        original = json.dumps(self._host_block("oldname"))
+        real.write_text(original)
+        os.chmod(real, 0o600)
+        link_dir = tmp_path / ".honcho"
+        link_dir.mkdir()
+        link = link_dir / "config.json"
+        link.symlink_to(real)
+
+        genuine_replace = os.replace
+        replaces = []
+
+        def replace_across_filesystems(src, dst, *args, **kwargs):
+            src, dst = os.fspath(src), os.fspath(dst)
+            replaces.append((src, dst))
+            if os.path.dirname(src) != os.path.dirname(dst):
+                # Exactly what renaming between two filesystems returns; the
+                # staging directory is what decides whether it can happen.
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+            return genuine_replace(src, dst)
+
+        def copyfile_runs_out_of_space(src, dst, **kwargs):
+            # shutil.copyfile opens the destination "wb" first; land a few
+            # bytes, then fail the way a filling disk does.
+            with open(src, "rb") as source, open(dst, "wb") as destination:
+                destination.write(source.read(8))
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+        def copyfileobj_runs_out_of_space(src_handle, dst_handle, *args, **kwargs):
+            dst_handle.write(src_handle.read(8))
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+        monkeypatch.setattr("utils.os.replace", replace_across_filesystems)
+        monkeypatch.setattr("utils.shutil.copyfile", copyfile_runs_out_of_space)
+        monkeypatch.setattr("utils.shutil.copyfileobj", copyfileobj_runs_out_of_space)
+
+        profiles._migrate_honcho_profile_host("oldname", "newname", tmp_path / "absent")
+
+        surviving = real.read_text()
+        assert "test-honcho-access-token" in surviving, (
+            "a failed cross-device replace destroyed the Honcho credential file; "
+            f"it now holds {surviving!r}"
+        )
+        cfg = json.loads(surviving)
+        assert "hermes_oldname" not in cfg["hosts"]
+        assert cfg["hosts"]["hermes_newname"]["apiKey"] == "test-honcho-access-token"
+        assert real.stat().st_mode & 0o777 == 0o600
+        assert link.is_symlink()
+        assert link.resolve() == real.resolve()
+        assert not list(other_fs.glob(".*.tmp"))
+        assert not list(link_dir.glob(".*.tmp"))
+        # The staging directory is what makes EXDEV reachable at all, so pin
+        # it: every rename this rewrite issues stays inside one directory.
+        assert replaces, "the rewrite never reached os.replace"
+        assert all(
+            os.path.dirname(src) == os.path.dirname(dst) for src, dst in replaces
+        ), f"the rewrite staged its temp outside the resolved target's directory: {replaces}"
+
     def test_unwritable_candidate_still_advances_to_the_next(self, profile_env, monkeypatch):
         """The fail-soft ``continue`` must survive the switch to the helper."""
         import utils
