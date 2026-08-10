@@ -27,7 +27,7 @@ import sys
 import threading
 import uuid
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -4885,6 +4885,16 @@ class GatewaySlashCommandsMixin:
         key = "gateway.branch.branched_one" if msg_count == 1 else "gateway.branch.branched_many"
         return t(key, title=branch_title, count=msg_count, parent=parent_session_id, new=new_session_id)
 
+    @staticmethod
+    def _normalize_datetime_utc(value: object) -> datetime | None:
+        """Return an exact UTC datetime, rejecting malformed datetime subclasses."""
+        if type(value) is not datetime:
+            return None
+        try:
+            return value.astimezone(timezone.utc)
+        except Exception:
+            return None
+
     async def _handle_refresh_command(self, event: MessageEvent) -> str:
         """Handle cache-safe soft refresh or delegate authoritative branching."""
         args = event.get_command_args().strip()
@@ -4936,18 +4946,36 @@ class GatewaySlashCommandsMixin:
             if not isinstance(records, list):
                 return None
             event_time = getattr(event, "timestamp", None)
+            event_epoch = self._normalize_datetime_utc(event_time)
+            if event_epoch is None:
+                return None
             for pending in records:
-                after = pending.get("after")
+                if not isinstance(pending, dict):
+                    continue
+                token = pending.get("token")
+                pending_generation = pending.get("generation")
+                reserved_by = pending.get("reserved_by")
+                after_epoch = self._normalize_datetime_utc(pending.get("after"))
                 if (
-                    pending.get("reserved_by") is not None
-                    or generation < int(pending.get("generation", 0) or 0)
-                    or event_time is None
-                    or after is None
-                    or event_time <= after
+                    not isinstance(token, str)
+                    or not token
+                    or type(pending_generation) is not int
+                    or (
+                        reserved_by is not None
+                        and type(reserved_by) is not int
+                    )
+                ):
+                    continue
+                if after_epoch is None:
+                    continue
+                if (
+                    reserved_by is not None
+                    or generation < pending_generation
+                    or event_epoch <= after_epoch
                 ):
                     continue
                 pending["reserved_by"] = generation
-                return {"token": pending["token"], "note": str(pending.get("note") or "")}
+                return {"token": token, "note": str(pending.get("note") or "")}
             return None
 
     def _finish_refresh_context_note(
@@ -4963,7 +4991,20 @@ class GatewaySlashCommandsMixin:
             if not isinstance(records, list):
                 return
             for index, pending in enumerate(records):
-                if pending.get("token") != token or pending.get("reserved_by") != generation:
+                if not isinstance(pending, dict):
+                    continue
+                pending_token = pending.get("token")
+                pending_generation = pending.get("generation")
+                reserved_by = pending.get("reserved_by")
+                if (
+                    not isinstance(pending_token, str)
+                    or not pending_token
+                    or type(pending_generation) is not int
+                    or type(reserved_by) is not int
+                    or self._normalize_datetime_utc(pending.get("after")) is None
+                ):
+                    continue
+                if pending_token != token or reserved_by != generation:
                     continue
                 if attempted:
                     records.pop(index)

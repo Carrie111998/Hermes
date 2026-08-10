@@ -1,9 +1,11 @@
 """Gateway routing and invariants for ``/refresh``."""
 
+from datetime import datetime, timedelta, timezone
+from fractions import Fraction
+from pathlib import Path
+from threading import Barrier, Thread
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
-from datetime import timedelta
-from pathlib import Path
 
 import pytest
 
@@ -220,3 +222,301 @@ def test_gateway_second_refresh_survives_first_reservation_commit():
 
     second = runner._claim_refresh_context_note("session-a", event, 3)
     assert second == {"token": "two", "note": "NOTE-2"}
+
+
+@pytest.mark.parametrize(
+    ("after", "event_at"),
+    [
+        (
+            datetime.fromtimestamp(1_700_000_000),
+            lambda seconds: datetime.fromtimestamp(
+                1_700_000_000 + seconds, timezone(timedelta(hours=5, minutes=30))
+            ),
+        ),
+        (
+            datetime.fromtimestamp(1_700_000_000, timezone(timedelta(hours=-7))),
+            lambda seconds: datetime.fromtimestamp(1_700_000_000 + seconds),
+        ),
+    ],
+    ids=("refresh-naive-event-aware", "refresh-aware-event-naive"),
+)
+def test_gateway_refresh_note_claim_orders_mixed_datetime_awareness_exactly_once(
+    after, event_at
+):
+    runner, _adapter = _make_runner()
+    note = {
+        "token": "token-a",
+        "note": "[fresh context]",
+        "after": after,
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [note]}
+    event = _make_event("real next turn")
+    event.internal = False
+
+    event.timestamp = event_at(-1)
+    assert runner._claim_refresh_context_note("session-a", event, 7) is None
+    assert note["reserved_by"] is None
+
+    event.timestamp = event_at(0)
+    assert runner._claim_refresh_context_note("session-a", event, 7) is None
+    assert note["reserved_by"] is None
+
+    event.timestamp = event_at(1)
+    assert runner._claim_refresh_context_note("session-a", event, 7) == {
+        "token": "token-a",
+        "note": "[fresh context]",
+    }
+    assert note["reserved_by"] == 7
+    assert runner._claim_refresh_context_note("session-a", event, 8) is None
+
+
+@pytest.mark.parametrize(
+    ("event_timestamp", "after"),
+    [
+        ("not-a-datetime", datetime.now()),
+        (datetime.now(), "not-a-datetime"),
+        (None, datetime.now()),
+        (datetime.now(), None),
+    ],
+)
+def test_gateway_refresh_note_claim_rejects_malformed_timestamps_without_consuming(
+    event_timestamp, after
+):
+    runner, _adapter = _make_runner()
+    note = {
+        "token": "token-a",
+        "note": "[fresh context]",
+        "after": after,
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [note]}
+    event = _make_event("real next turn")
+    event.internal = False
+    event.timestamp = event_timestamp
+
+    assert runner._claim_refresh_context_note("session-a", event, 7) is None
+    assert note["reserved_by"] is None
+    assert runner._pending_refresh_notes == {"session-a": [note]}
+
+
+class _MalformedTimestamp(datetime):
+    timestamp_result = None
+    timestamp_error = None
+
+    def timestamp(self):
+        if self.timestamp_error is not None:
+            raise self.timestamp_error
+        return self.timestamp_result
+
+
+def _malformed_datetime(result=None, error=None):
+    value = _MalformedTimestamp(2026, 1, 1, tzinfo=timezone.utc)
+    value.timestamp_result = result
+    value.timestamp_error = error
+    return value
+
+
+class _HugeFractionTimestamp(datetime):
+    def timestamp(self):
+        return Fraction(10**1000, 1)
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        _malformed_datetime("1700000000"),
+        _malformed_datetime(float("nan")),
+        _malformed_datetime(float("inf")),
+        _malformed_datetime(float("-inf")),
+        _malformed_datetime(True),
+        _malformed_datetime(error=RuntimeError("broken timestamp")),
+        _HugeFractionTimestamp(2026, 1, 1, tzinfo=timezone.utc),
+    ],
+    ids=("string", "nan", "positive-infinity", "negative-infinity", "bool", "raises", "huge-fraction"),
+)
+def test_gateway_refresh_note_claim_skips_bad_datetime_subclass_and_claims_later_record(
+    malformed,
+):
+    runner, _adapter = _make_runner()
+    event = _make_event("real next turn")
+    event.internal = False
+    valid_after = event.timestamp - timedelta(seconds=1)
+    bad_note = {
+        "token": "bad",
+        "note": "BAD",
+        "after": malformed,
+        "generation": 7,
+        "reserved_by": None,
+    }
+    valid_note = {
+        "token": "valid",
+        "note": "VALID",
+        "after": valid_after,
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [bad_note, valid_note]}
+
+    assert runner._claim_refresh_context_note("session-a", event, 7) == {
+        "token": "valid",
+        "note": "VALID",
+    }
+    assert bad_note["reserved_by"] is None
+    assert valid_note["reserved_by"] == 7
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        _malformed_datetime("1700000000"),
+        _malformed_datetime(float("nan")),
+        _malformed_datetime(float("inf")),
+        _malformed_datetime(float("-inf")),
+        _malformed_datetime(True),
+        _malformed_datetime(error=RuntimeError("broken timestamp")),
+        _HugeFractionTimestamp(2026, 1, 1, tzinfo=timezone.utc),
+    ],
+    ids=("string", "nan", "positive-infinity", "negative-infinity", "bool", "raises", "huge-fraction"),
+)
+def test_gateway_refresh_note_claim_rejects_bad_event_datetime_without_consuming(malformed):
+    runner, _adapter = _make_runner()
+    note = {
+        "token": "valid",
+        "note": "VALID",
+        "after": datetime.now(),
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [note]}
+    event = _make_event("real next turn")
+    event.internal = False
+    event.timestamp = malformed
+
+    assert runner._claim_refresh_context_note("session-a", event, 7) is None
+    assert note["reserved_by"] is None
+    assert runner._pending_refresh_notes == {"session-a": [note]}
+
+
+def test_gateway_refresh_note_claim_handles_naive_datetime_min_without_crashing():
+    runner, _adapter = _make_runner()
+    note = {
+        "token": "minimum",
+        "note": "MINIMUM",
+        "after": datetime.min,
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [note]}
+    event = _make_event("real next turn")
+    event.internal = False
+
+    claim = runner._claim_refresh_context_note("session-a", event, 7)
+
+    assert claim in (None, {"token": "minimum", "note": "MINIMUM"})
+    assert note["reserved_by"] is (None if claim is None else 7)
+
+
+def test_gateway_refresh_note_claim_preserves_one_microsecond_near_datetime_max():
+    runner, _adapter = _make_runner()
+    after = datetime.max.replace(tzinfo=timezone.utc) - timedelta(microseconds=1)
+    note = {
+        "token": "boundary",
+        "note": "BOUNDARY",
+        "after": after,
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [note]}
+    event = _make_event("real next turn")
+    event.internal = False
+    event.timestamp = after + timedelta(microseconds=1)
+
+    assert runner._claim_refresh_context_note("session-a", event, 7) == {
+        "token": "boundary",
+        "note": "BOUNDARY",
+    }
+
+
+@pytest.mark.parametrize(
+    "bad_record",
+    [
+        None,
+        "not-a-record",
+        {},
+        {"token": "bad", "note": "BAD", "after": datetime.now(), "generation": "7", "reserved_by": None},
+        {"token": "", "note": "BAD", "after": datetime.now(), "generation": 7, "reserved_by": None},
+        {"token": "bad", "note": "BAD", "after": "yesterday", "generation": 7, "reserved_by": None},
+        {"token": "bad", "note": "BAD", "after": datetime.now(), "generation": 7, "reserved_by": {}},
+    ],
+    ids=("none", "non-dict", "missing-fields", "bad-generation", "empty-token", "bad-after", "bad-reservation"),
+)
+def test_gateway_refresh_note_claim_skips_structurally_bad_record_before_valid(bad_record):
+    runner, _adapter = _make_runner()
+    event = _make_event("real next turn")
+    event.internal = False
+    valid = {
+        "token": "valid",
+        "note": "VALID",
+        "after": event.timestamp - timedelta(seconds=1),
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [bad_record, valid]}
+
+    assert runner._claim_refresh_context_note("session-a", event, 7) == {
+        "token": "valid",
+        "note": "VALID",
+    }
+    assert valid["reserved_by"] == 7
+    if isinstance(bad_record, dict):
+        assert bad_record.get("reserved_by") != 7
+
+
+def test_gateway_refresh_note_claim_missing_token_never_reserves_record():
+    runner, _adapter = _make_runner()
+    event = _make_event("real next turn")
+    event.internal = False
+    missing_token = {
+        "note": "BAD",
+        "after": event.timestamp - timedelta(seconds=1),
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [missing_token]}
+
+    assert runner._claim_refresh_context_note("session-a", event, 7) is None
+    assert missing_token["reserved_by"] is None
+
+
+def test_gateway_refresh_note_claim_is_atomic_across_concurrent_claimants():
+    runner, _adapter = _make_runner()
+    event = _make_event("real next turn")
+    event.internal = False
+    note = {
+        "token": "only-token",
+        "note": "ONLY",
+        "after": event.timestamp - timedelta(seconds=1),
+        "generation": 7,
+        "reserved_by": None,
+    }
+    runner._pending_refresh_notes = {"session-a": [note]}
+    barrier = Barrier(3)
+    claims = []
+
+    def claim(generation):
+        barrier.wait()
+        claims.append(runner._claim_refresh_context_note("session-a", event, generation))
+
+    threads = [Thread(target=claim, args=(generation,)) for generation in (7, 8)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+
+    successful = [claim for claim in claims if claim is not None]
+    assert successful == [{"token": "only-token", "note": "ONLY"}]
+    assert note["reserved_by"] in (7, 8)
