@@ -6,7 +6,7 @@
   "suggested_session_title": "Usage Bar 内建化 M0 固化 + M1/M2 mockup",
   "writer": "20260810_115223_1ade7f",
   "parent_role": "read-only acceptance; 历史上曾有 two-writer interleave, 当前无活跃并行 writer",
-  "updated_at": "2026-08-10T05:36:56Z",
+  "updated_at": "2026-08-10T05:51:28Z",
   "git": {
     "branch": "codex/hermes-custom-migrate-v020",
     "head_at_start": "299d5d7d9",
@@ -23,7 +23,8 @@
       "3b184b12b docs: emit mockup HTML with LF line endings",
       "10d62c94e docs: refresh mockup DOM assertion evidence after LF regen",
       "535cdeddd feat(agent): add bounded usage singleflight and account metadata",
-      "484c008b7 fix(agent): preserve in-deadline usage results and admission safety"
+      "484c008b7 fix(agent): preserve in-deadline usage results and admission safety",
+      "574b84b31 fix(agent): count completed usage futures before callbacks (test-only; race absent at HEAD per Codex verify)"
     ],
     "uncommitted_not_mine_resolved": "两个写者会话交错提交已核实：历史线性、双方工作完整保留",
     "backup_branch": "backup/usage-bar-hardening-pre-m0-20260810",
@@ -37,9 +38,9 @@
     "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree exit 0 零冲突; live-checkout guard 禁止运行中 merge)"
   },
   "tests_final": {
-    "backend": "39 passed (usage_contract 31 + usage_accounts 1 + account_usage 7)",
+    "backend": "40 passed (usage_contract 32 + usage_accounts 1 + account_usage 7)",
     "desktop": "19 passed (context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
-    "total": "58 passed",
+    "total": "59 passed",
     "typecheck": "tsc x3 exit 0 (M0 轮; 本轮未动 production TS, types additive)",
     "git_diff_check": "git diff --check 299d5d7d9..HEAD -> clean (range)",
     "mockup_dom_assertions": "mockup/dom-assertions.json: 10/10 passed"
@@ -51,7 +52,7 @@
   },
   "milestones": {
     "M0": "DONE",
-    "M1_backend": "DONE (535cdeddd + 484c008b7 父评审 R2 修复: settle-timestamp 判定/negative TOCTOU/permit 泄漏; Codex APPROVE)",
+    "M1_backend": "DONE (535cdeddd + 484c008b7 父评审 R2 修复; 574b84b31 父评审 R3 竞态复核=无该竞态(test-only 锁定), Codex APPROVE)",
     "M1_deferred": "is_current 省略: gateway/session 无权威 active entry id 只读信号, load_pool 有副作用被拒——登记为 M2 integration blocker",
     "M2": "NOT_STARTED (下一短调用)",
     "M3": "NOT_STARTED"
