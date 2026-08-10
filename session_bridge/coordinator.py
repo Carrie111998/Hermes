@@ -5038,20 +5038,31 @@ class SessionBridgeCoordinator:
         exc: BaseException,
         adapter: object,
     ) -> None:
-        if stage not in _CODEX_SCAN_STAGES:
-            raise ValueError("invalid Codex scan diagnostic stage")
-        native_tag = redact_codex_thread_id(native_id) or "unknown"
-        exception_detail = _redacted_codex_diagnostic_text(str(exc))
-        stderr = _redacted_codex_stderr_tail(adapter)
-        _LOG.warning(
-            "codex_scan_diagnostic stage=%s code=%s native=%s detail=%r stderr=%r stderr_lines=%d",
-            stage,
-            _CODEX_SCAN_FAILURE_CODE,
-            native_tag,
-            exception_detail,
-            stderr,
-            len(stderr),
-        )
+        safe_stage = stage if stage in _CODEX_SCAN_STAGES else "diagnostic_unavailable"
+        try:
+            native_tag = redact_codex_thread_id(native_id) or "unknown"
+        except Exception:
+            native_tag = "unknown"
+        try:
+            exception_detail = _redacted_codex_diagnostic_text(str(exc))
+        except Exception:
+            exception_detail = "diagnostic_unavailable"
+        try:
+            stderr = _redacted_codex_stderr_tail(adapter)
+        except Exception:
+            stderr = ()
+        try:
+            _LOG.warning(
+                "codex_scan_diagnostic stage=%s code=%s native=%s detail=%r stderr=%r stderr_lines=%d",
+                safe_stage,
+                _CODEX_SCAN_FAILURE_CODE,
+                native_tag,
+                exception_detail,
+                stderr,
+                len(stderr),
+            )
+        except Exception:
+            pass
         self._record_error_code(_CODEX_SCAN_FAILURE_CODE)
 
     def _elapsed_ms(self, started: float) -> float:

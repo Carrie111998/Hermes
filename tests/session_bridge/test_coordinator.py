@@ -1642,6 +1642,62 @@ def test_codex_scan_stderr_diagnostics_are_bounded_and_redact_relative_paths() -
     assert all("[REDACTED_PATH]" in line for line in result)
 
 
+@pytest.mark.parametrize(
+    "native_path",
+    (
+        r"C:\\Users\\Private Owner\\Codex Logs\\thread.jsonl",
+        r"\\server\\private share\\Codex Logs\\thread.jsonl",
+        r"\\?\\C:\\Users\\Private Owner\\Codex Logs\\thread.jsonl",
+        r"\\?\\UNC\\server\\private share\\Codex Logs\\thread.jsonl",
+    ),
+)
+def test_codex_scan_diagnostic_redacts_windows_path_forms(native_path: str) -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    result = _redacted_codex_diagnostic_text(f"failed at {native_path}")
+
+    assert native_path not in result
+    assert "Private Owner" not in result
+    assert "private share" not in result
+    assert "[REDACTED_PATH]" in result
+
+
+@pytest.mark.asyncio
+async def test_codex_scan_diagnostic_failure_never_replaces_projection_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class UnprintableProjectionError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("synthetic str failure")
+
+    failing = _codex_summary("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 300.0)
+    healthy = _codex_summary("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 200.0)
+    adapter = _FullHistoryCodexAdapter(active=[failing, healthy], archived=[])
+    original_project = adapter.project_thread
+
+    def project_thread(summary: CodexThreadSummary) -> SessionProjection:
+        if summary.native_id == failing.native_id:
+            raise UnprintableProjectionError()
+        return original_project(summary)
+
+    adapter.project_thread = project_thread  # type: ignore[method-assign]
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=_StateStore([]),
+        adapters={Provider.CODEX: adapter},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+        summary = await coordinator.scan_all_history(Provider.CODEX)
+
+    assert summary.failed == 1
+    assert summary.indexed == 1
+    assert adapter.projected_native_ids == [healthy.native_id]
+    assert "codex_scan_diagnostic" in caplog.text
+    assert "diagnostic_unavailable" in caplog.text
+    assert "codex_scan_failed" in coordinator.health()["recent_error_codes"]
+
+
 @pytest.mark.asyncio
 async def test_scan_all_codex_history_includes_archived_when_steady_state_excludes_it() -> (
     None
