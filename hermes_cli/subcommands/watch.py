@@ -278,4 +278,4 @@ Examples:
         default=1.0,
         help="Polling interval in seconds (fallback mode, default: 1.0)",
     )
-    watch_parser.set_defaults(func=cmd_watch)
+    watch_parser.set_defaults(func=cmd_watch, command="watch")
