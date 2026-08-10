@@ -21,6 +21,7 @@ import os
 from typing import Optional
 
 from gateway.config import Platform
+from gateway.discord_scoped_auth import is_channel_scoped_user_allowed
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import (
     expand_whatsapp_aliases as _expand_whatsapp_auth_aliases,
@@ -503,6 +504,32 @@ class GatewayAuthorizationMixin:
 
         if not user_id:
             return False
+
+        # Discord channel-scoped users are admitted only in the configured
+        # channel or a thread whose trusted adapter metadata names that channel
+        # as its parent. DMs deliberately receive no channel candidates.
+        if source.platform == Platform.DISCORD and source.chat_type in {
+            "group", "forum", "channel", "thread"
+        }:
+            channel_ids = {
+                str(channel_id)
+                for channel_id in (source.chat_id, source.parent_chat_id)
+                if channel_id
+            }
+            try:
+                adapter = self._authorization_adapter(
+                    source.platform,
+                    profile=adapter_profile,
+                )
+                if adapter is not None:
+                    getter = getattr(adapter, "_get_channel_allowed_users_raw", None)
+                    raw = getter() if callable(getter) else None
+                    if raw and is_channel_scoped_user_allowed(
+                        user_id, channel_ids, raw
+                    ):
+                        return True
+            except Exception:
+                pass
 
         platform_env_map = {
             Platform.TELEGRAM: "TELEGRAM_ALLOWED_USERS",

@@ -632,6 +632,32 @@ gateway:
 
 Use `/whoami` to see the active scope, your tier (admin / user / unrestricted), and which slash commands you can run.
 
+## Per-Channel User Allowlists
+
+Grant specific users access to individual channels without adding them to the global `allow_from` list. Scoped grants are a **union** with global allowlists — a user in `allow_from` remains authorized everywhere, including DMs. Pairing, scoped entries, global allowlists, and allow-all flags are independent grants; any one is sufficient.
+
+```yaml
+discord:
+  channel_allowed_users:
+    "111111111111111111":   # channel ID
+      - "222222222222222222"  # user ID allowed only in this channel
+      - "333333333333333333"
+    "444444444444444444":
+      - "555555555555555555"
+```
+
+The same key under `gateway.platforms.discord.extra` works; the top-level `discord:` key wins when both are set.
+
+**Behavior:**
+
+- A listed user is authorized **only** in the configured channel, or in a thread whose parent channel ID matches an entry.
+- DMs never inherit a channel grant — scoped users cannot DM the bot unless they are also in `allow_from` or otherwise globally authorized.
+- Only numeric Discord **user IDs** and **channel IDs** (snowflakes) match. Channel names, ``#name`` forms, and display names (e.g. `Alice#1234`) are never accepted.
+- The literal string `"*"` in a scoped user list is treated as a user ID, **not** an allow-all wildcard (unlike global `allow_from`).
+- Scoped entries require bare numeric snowflakes — ``<@id>`` / ``user:`` prefixes are not normalized (unlike global `allow_from`).
+- Malformed config (invalid JSON, non-list values, empty user lists) is dropped fail-closed — it does not broaden access.
+- An empty user list for a channel denies everyone for that channel entry; it does not mean allow-all.
+
 ## Interactive Model Picker
 
 Send `/model` with no arguments in a Discord channel to open a dropdown-based model picker:

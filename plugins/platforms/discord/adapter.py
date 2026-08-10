@@ -29,6 +29,8 @@ from contextlib import suppress
 from typing import Callable, Dict, List, Optional, Any, Tuple
 from urllib.parse import quote, urljoin
 
+from gateway.discord_scoped_auth import is_channel_scoped_user_allowed
+
 from agent.async_utils import (
     consume_detached_task_result as _consume_background_task_result,
 )
@@ -4606,10 +4608,17 @@ class DiscordAdapter(BasePlatformAdapter):
         guild=None,
         is_dm: bool = False,
         channel_ids: Optional[set[str]] = None,
+        channel_keys: Optional[set[str]] = None,
     ) -> bool:
         """Check if user is allowed via DISCORD_ALLOWED_USERS or DISCORD_ALLOWED_ROLES.
 
-        Uses OR semantics: if the user matches EITHER allowlist, they're allowed.
+        Authorization is a union of grants: pairing, channel-scoped entries
+        (``channel_allowed_users``), allow-all flags (when no user/role
+        allowlists), ``DISCORD_ALLOWED_CHANNELS`` bypass (when no user/role
+        allowlists), user-ID allowlist, and role allowlist. Any one grant
+        suffices; scoped entries union with global lists.
+
+        Uses OR semantics for user/role allowlists: matching either allowlist allows.
         With no user/role allowlists configured, guild traffic may still pass when
         ``channel_ids`` matches ``DISCORD_ALLOWED_CHANNELS`` — but only when the
         caller supplies the validated channel context (on_message, slash). Calls
@@ -4628,8 +4637,10 @@ class DiscordAdapter(BasePlatformAdapter):
             author: Optional Member/User object for in-guild role lookup.
             guild: The guild the message arrived in (None for DMs).
             is_dm: True if the message came from a DM channel.
-            channel_ids: Resolved text-channel ids for guild traffic when an
-                upstream gate has already scoped the message to a channel.
+            channel_ids: Resolved channel snowflake IDs (current + thread parent).
+            channel_keys: Optional superset including bare names and ``#name``
+                forms for ``DISCORD_ALLOWED_CHANNELS`` matching. Slash callers
+                pass snowflakes in ``channel_ids`` and the full key set here.
         """
         # ``getattr`` fallbacks here guard against test fixtures that build
         # an adapter via ``object.__new__(DiscordAdapter)`` and skip __init__
@@ -4646,6 +4657,26 @@ class DiscordAdapter(BasePlatformAdapter):
         if self._is_pairing_approved_user(user_id):
             return True
 
+        # A scoped entry authorizes this user only in the configured channel or
+        # one of its threads. ``channel_ids`` must be immutable snowflakes only
+        # (on_message passes them directly; slash passes its snowflake set
+        # separately from ``channel_keys`` name forms).
+        scoped_channel_ids = (
+            {cid for cid in channel_ids if cid.isdigit()} if channel_ids else None
+        )
+        if (
+            not is_dm
+            and scoped_channel_ids
+            and is_channel_scoped_user_allowed(
+                user_id,
+                scoped_channel_ids,
+                self._get_channel_allowed_users_raw(),
+            )
+        ):
+            return True
+
+        channel_gate_keys = channel_keys if channel_keys is not None else channel_ids
+
         if not has_users and not has_roles:
             if self._discord_allow_all_users():
                 return True
@@ -4656,8 +4687,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # (voice loops and other guild-scoped callers may lack channel ids).
             if (
                 not is_dm
-                and channel_ids is not None
-                and self._discord_channel_ids_allowed(channel_ids)
+                and channel_gate_keys is not None
+                and self._discord_channel_ids_allowed(channel_gate_keys)
             ):
                 return True
             return False
@@ -4723,6 +4754,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if allowed_users or allowed_roles:
             return
         if self._get_allowed_channels():
+            return
+        if self._get_channel_allowed_users():
             return
         if self._discord_allow_all_users():
             return
@@ -4848,7 +4881,8 @@ class DiscordAdapter(BasePlatformAdapter):
             author=user,
             guild=interaction_guild,
             is_dm=in_dm,
-            channel_ids=channel_keys if not in_dm else None,
+            channel_ids=channel_ids if not in_dm else None,
+            channel_keys=channel_keys if not in_dm else None,
         ):
             return (
                 False,
@@ -6276,6 +6310,22 @@ class DiscordAdapter(BasePlatformAdapter):
             for entry in self._gate_csv_set(raw)
             if _clean_discord_id(str(entry))
         }
+
+    def _get_channel_allowed_users_raw(self) -> object:
+        """Raw ``channel_allowed_users`` mapping from this adapter's config extra."""
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        if isinstance(extra, dict):
+            return extra.get("channel_allowed_users")
+        return None
+
+    def _get_channel_allowed_users(self) -> dict[str, frozenset[str]]:
+        """Parse this adapter's per-channel user allowlists (per-profile)."""
+        from gateway.discord_scoped_auth import channel_user_allowlists
+
+        raw = self._get_channel_allowed_users_raw()
+        if raw is None:
+            return {}
+        return channel_user_allowlists(raw)
 
     def _get_allowed_roles(self) -> set:
         """This adapter's DISCORD_ALLOWED_ROLES role IDs (per-profile)."""
@@ -9962,6 +10012,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["allow_from"] = str(allowed_users_cfg)
         if not _skip_env_bridge and not os.getenv("DISCORD_ALLOWED_USERS"):
             os.environ["DISCORD_ALLOWED_USERS"] = str(allowed_users_cfg)
+    channel_allowed_users_cfg = (
+        discord_cfg["channel_allowed_users"]
+        if "channel_allowed_users" in discord_cfg
+        else platform_extra_cfg.get("channel_allowed_users")
+    )
+    if channel_allowed_users_cfg is not None:
+        seeded_extra["channel_allowed_users"] = channel_allowed_users_cfg
     allowed_roles_cfg = (
         discord_cfg["allowed_roles"] if "allowed_roles" in discord_cfg
         else platform_extra_cfg.get("allowed_roles")
