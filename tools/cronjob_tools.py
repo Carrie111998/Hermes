@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.jobs import (
     AmbiguousJobReference,
-    claim_job_for_fire,
+    claim_job_for_fire_attempt,
     effective_job_state,
     get_job,
     is_job_runnable,
@@ -48,6 +48,7 @@ from cron.jobs import (
     parse_schedule,
     pause_job,
     remove_job,
+    release_run_claim,
     resolve_job_ref,
     resume_job,
     update_job,
@@ -602,7 +603,7 @@ def _execute_job_now(
 ) -> Dict[str, Any]:
     """Execute a cron job immediately, outside the scheduler tick.
 
-    Atomically claims the job first via ``claim_job_for_fire`` — the same
+    Atomically claims the job first via ``claim_job_for_fire_attempt`` — the same
     at-most-once CAS the scheduler/external-provider fire path uses — so a
     concurrently-running gateway ticker cannot also fire it (the claim both
     blocks a duplicate fire and advances ``next_run_at`` for recurring jobs).
@@ -616,10 +617,12 @@ def _execute_job_now(
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    attempt_owner: Optional[str] = None
     try:
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
-            # claim_job_for_fire returns False for paused/disabled/missing
+        attempt_owner = claim_job_for_fire_attempt(job_id)
+        if attempt_owner is None:
+            # The claim CAS returns None for paused/disabled/missing
             # jobs too — don't mislabel those as "already being fired"
             # (#60703): that message sends the user chasing a phantom
             # in-flight run when the job simply isn't runnable.
@@ -633,17 +636,23 @@ def _execute_job_now(
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for immediate run: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        # A failed CAS grants no cleanup authority.  In particular, never use
+        # a caller-supplied snapshot to clear a live scheduler attempt.
+        return {"claimed": False, "success": False, "error": str(e)}
 
-    return _run_claimed_job(job, extra_prompt=extra_prompt)
+    return _run_claimed_job(
+        job,
+        attempt_owner=attempt_owner,
+        extra_prompt=extra_prompt,
+    )
 
 
 def _run_claimed_job(
-    job: Dict[str, Any], extra_prompt: Optional[str] = None
+    job: Dict[str, Any],
+    *,
+    attempt_owner: str,
+    extra_prompt: Optional[str] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> Dict[str, Any]:
     """Fire an already-claimed job through the shared ``run_one_job`` body.
 
@@ -663,6 +672,16 @@ def _run_claimed_job(
             try_register_running_job,
         )
 
+        if cancel_event is not None and cancel_event.is_set():
+            return {
+                "claimed": True,
+                "success": False,
+                "error": (
+                    "Manual cron run interrupted because its owning session "
+                    "ended."
+                ),
+            }
+
         # In-flight dedupe (idea from #53395 by @izumi0uu): the fire claim's
         # TTL (300s) is routinely outlived by real jobs, so it alone cannot
         # stop a manual run from double-firing a job the ticker (or another
@@ -670,7 +689,23 @@ def _run_claimed_job(
         # running set — the same guard _submit_with_guard uses — which also
         # makes this run visible to the gateway shutdown drain
         # (get_running_job_ids, #60432) and mark_running_jobs_interrupted.
-        if not try_register_running_job(job_id):
+        if not try_register_running_job(
+            job_id,
+            profile_scoped=True,
+            attempt_owner=attempt_owner,
+        ):
+            # We did win this concrete durable attempt, but an older in-process
+            # worker is still active.  Release only our exact token so the
+            # newly-created manual claim is not stranded and cannot erase a
+            # replacement owner.
+            try:
+                release_run_claim(job_id, expected_owner=attempt_owner)
+            except Exception:
+                logger.exception(
+                    "Failed to release rejected manual cron attempt %s for %s",
+                    attempt_owner,
+                    job_id,
+                )
             return {
                 "claimed": True,
                 "success": False,
@@ -681,6 +716,23 @@ def _run_claimed_job(
             }
         _registered = True
 
+        # Refetch after the CAS: claim_job_for_fire stamped this concrete
+        # attempt's immutable run token. Passing the caller's pre-claim snapshot
+        # could impersonate a scheduled owner or clear a newer claim.
+        refreshed_claimed_job = get_job(job_id)
+        if not isinstance(refreshed_claimed_job, dict):
+            raise RuntimeError(
+                "Job attempt disappeared after it was claimed; not executing"
+            )
+        claim = refreshed_claimed_job.get("run_claim")
+        if not isinstance(claim, dict) or claim.get("by") != attempt_owner:
+            raise RuntimeError(
+                "Job attempt claim could not be reloaded safely; not executing"
+            )
+        if cancel_event is not None and cancel_event.is_set():
+            raise RuntimeError(
+                "Manual cron run interrupted because its owning session ended."
+            )
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
         #
@@ -708,7 +760,7 @@ def _run_claimed_job(
         _heartbeat_thread = None
 
         if activity_cb is not None:
-            job_name = str(job.get("name") or job_id)
+            job_name = str(refreshed_claimed_job.get("name") or job_id)
 
             def _heartbeat_loop() -> None:
                 started = time.monotonic()
@@ -755,25 +807,42 @@ def _run_claimed_job(
         adapters = getattr(runner, "adapters", None) if runner is not None else None
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
 
+        attempt_outcome: Dict[str, Any] = {}
         try:
             try:
-                processed = run_one_job(
-                    job, adapters=adapters, loop=gateway_loop,
-                    extra_prompt=extra_prompt,
-                )
+                run_kwargs: Dict[str, Any] = {
+                    "adapters": adapters,
+                    "loop": gateway_loop,
+                    "extra_prompt": extra_prompt,
+                    "_attempt_outcome": attempt_outcome,
+                }
+                if cancel_event is not None:
+                    run_kwargs["cancel_event"] = cancel_event
+                processed = run_one_job(refreshed_claimed_job, **run_kwargs)
             finally:
                 _heartbeat_stop.set()
                 if _heartbeat_thread is not None:
                     _heartbeat_thread.join(timeout=_CRON_RUN_HEARTBEAT_INTERVAL + 1)
         finally:
             _registered = False
-            release_running_job(job_id)
-        refreshed = get_job(job_id) or {}
-        ok = refreshed.get("last_status") == "ok"
+            release_running_job(
+                job_id,
+                profile_scoped=True,
+                attempt_owner=attempt_owner,
+            )
+        # Never infer this attempt from shared job state: a successor can claim
+        # and update last_status immediately after our terminal CAS. Production
+        # run_one_job fills the exact-attempt sink; simple test doubles retain
+        # compatibility by falling back to their returned processed boolean.
+        ok = bool(attempt_outcome.get("success")) if attempt_outcome else bool(processed)
+        attempt_error = attempt_outcome.get("error") if attempt_outcome else None
+        if not processed and not attempt_error:
+            attempt_error = "Run claim ownership was lost before this manual attempt completed."
         return {
             "claimed": True,
             "success": bool(processed and ok),
-            "error": refreshed.get("last_error"),
+            "error": attempt_error,
+            "output_file": attempt_outcome.get("output_file"),
         }
 
     except Exception as e:
@@ -786,35 +855,46 @@ def _run_claimed_job(
             try:
                 from cron.scheduler import release_running_job as _release
 
-                _release(job_id)
+                _release(
+                    job_id,
+                    profile_scoped=True,
+                    attempt_owner=attempt_owner,
+                )
             except Exception:
                 pass
         try:
-            mark_job_run(job_id, False, str(e))
+            # Cleanup authority comes only from this call's successful CAS.
+            # Never trust a caller-supplied snapshot, which may contain a live
+            # scheduler attempt belonging to another process.
+            if attempt_owner:
+                mark_job_run(
+                    job_id,
+                    False,
+                    str(e),
+                    expected_run_claim_owner=attempt_owner,
+                )
         except Exception:
             pass
-        return {"claimed": True, "success": False, "error": str(e)}
+        return {
+            "claimed": attempt_owner is not None,
+            "success": False,
+            "error": str(e),
+        }
 
 
-def _latest_job_output_excerpt(job_id: str, max_chars: int = 2000) -> Optional[str]:
-    """Best-effort excerpt of the job's most recent saved output file.
-
-    Included in the background-run completion block so the parent agent sees
-    what the job actually produced without having to dig through
-    ``~/.hermes/cron/output/``. Never raises.
-    """
+def _attempt_output_excerpt(
+    output_file: Optional[str], max_chars: int = 2000
+) -> Optional[str]:
+    """Read only the output published by this exact attempt."""
+    if not output_file:
+        return None
     try:
-        from cron.jobs import get_cron_output_dir
-
-        out_dir = get_cron_output_dir() / job_id
-        files = sorted(out_dir.glob("*.md"))
-        if not files:
-            return None
-        text = files[-1].read_text(encoding="utf-8", errors="replace").strip()
+        path = Path(output_file)
+        text = path.read_text(encoding="utf-8", errors="replace").strip()
         if not text:
             return None
         if len(text) > max_chars:
-            text = text[:max_chars] + f"\n… (truncated; full output: {files[-1]})"
+            text = text[:max_chars] + f"\n… (truncated; full output: {path})"
         return text
     except Exception:
         return None
@@ -871,6 +951,7 @@ def _try_dispatch_background_run(
 
     job_id = job["id"]
     job_name = str(job.get("name") or job_id)
+    attempt_owner: Optional[str] = None
 
     # ---- routing capture (on THIS thread; contextvars don't cross the pool) ----
     # Resolved BEFORE the claim: with no routable session there is no durable
@@ -900,9 +981,9 @@ def _try_dispatch_background_run(
         # authoritative (atomic) check is try_register_running_job inside
         # _run_claimed_job on the worker.
         try:
-            from cron.scheduler import get_running_job_ids
+            from cron.scheduler import is_running_job
 
-            if job_id in get_running_job_ids():
+            if is_running_job(job_id, profile_scoped=True):
                 return {
                     "claimed": False,
                     "success": False,
@@ -914,7 +995,8 @@ def _try_dispatch_background_run(
         except Exception:
             pass
 
-        if not claim_job_for_fire(job_id):
+        attempt_owner = claim_job_for_fire_attempt(job_id)
+        if attempt_owner is None:
             refreshed = get_job(job_id)
             if refreshed is None:
                 reason = "Job no longer exists; nothing to run."
@@ -925,11 +1007,12 @@ def _try_dispatch_background_run(
             return {"claimed": False, "success": False, "error": reason}
     except Exception as e:
         logger.error("Failed to claim cron job %s for background run: %s", job_id, e)
-        try:
-            mark_job_run(job_id, False, str(e))
-        except Exception:
-            pass
-        return {"claimed": True, "dispatched": False, "success": False, "error": str(e)}
+        return {
+            "claimed": False,
+            "dispatched": False,
+            "success": False,
+            "error": str(e),
+        }
 
     origin_ui_session_id = ""
     try:
@@ -951,7 +1034,11 @@ def _try_dispatch_background_run(
             "cronjob run: async delegation registry unavailable (%s); "
             "running job '%s' inline.", e, job_name,
         )
-        result = _run_claimed_job(job, extra_prompt=extra_prompt)
+        result = _run_claimed_job(
+            job,
+            attempt_owner=attempt_owner,
+            extra_prompt=extra_prompt,
+        )
         result["dispatched"] = False
         return result
 
@@ -964,15 +1051,87 @@ def _try_dispatch_background_run(
 
     started_at = time.time()
     deliver = job.get("deliver", "local")
+    dispatch_profile_home = get_hermes_home().resolve()
+    cancel_event = threading.Event()
+    cancel_state_lock = threading.Lock()
+    cancel_requested = False
+    runner_finished = False
+    interrupt_error = (
+        "Manual cron run interrupted because its owning session ended."
+    )
+
+    def _interrupt_run() -> None:
+        """Cancel only this immutable manual attempt, from any caller thread."""
+        nonlocal cancel_requested
+        with cancel_state_lock:
+            if runner_finished or cancel_requested:
+                return
+            cancel_requested = True
+            cancel_event.set()
+
+        # interrupt_for_session()/interrupt_all() run outside the dispatching
+        # ContextVars. Pin the exact profile store captured before dispatch so
+        # a profile-B cancellation cannot mutate profile A/default jobs.json.
+        from cron.jobs import use_cron_store
+
+        try:
+            with use_cron_store(dispatch_profile_home):
+                marked = mark_job_run(
+                    job_id,
+                    False,
+                    interrupt_error,
+                    status="interrupted",
+                    expected_run_claim_owner=attempt_owner,
+                )
+                if marked is False:
+                    # The exact attempt already completed or was replaced.
+                    # Never clear the current successor's token.
+                    return
+        except Exception:
+            logger.exception(
+                "Failed to terminalize interrupted manual cron attempt %s "
+                "for %s; releasing its exact claim",
+                attempt_owner,
+                job_id,
+            )
+            try:
+                with use_cron_store(dispatch_profile_home):
+                    release_run_claim(job_id, expected_owner=attempt_owner)
+            except Exception:
+                logger.exception(
+                    "Failed to release interrupted manual cron attempt %s "
+                    "for %s",
+                    attempt_owner,
+                    job_id,
+                )
 
     def _runner() -> Dict[str, Any]:
-        res = _run_claimed_job(job, extra_prompt=extra_prompt)
+        nonlocal runner_finished
+        with cancel_state_lock:
+            cancelled_before_start = cancel_event.is_set()
+        if cancelled_before_start:
+            res = {
+                "claimed": True,
+                "success": False,
+                "error": interrupt_error,
+            }
+        else:
+            res = _run_claimed_job(
+                job,
+                attempt_owner=attempt_owner,
+                extra_prompt=extra_prompt,
+                cancel_event=cancel_event,
+            )
+        with cancel_state_lock:
+            runner_finished = True
         duration = round(time.time() - started_at, 2)
-        refreshed = get_job(job_id) or {}
+        interrupted = cancel_event.is_set() and not res.get("success")
+        refreshed = {} if interrupted else (get_job(job_id) or {})
+        result_error = interrupt_error if interrupted else res.get("error")
         lines = [
             f"Cron job '{job_name}' ({job_id}) finished its manual run.",
-            f"Result: {'ok' if res.get('success') else 'FAILED'}"
-            + (f" — {res.get('error')}" if res.get("error") else ""),
+            f"Result: {'INTERRUPTED' if interrupted else ('ok' if res.get('success') else 'FAILED')}"
+            + (f" — {result_error}" if result_error else ""),
             f"Delivery target: {deliver}"
             + (
                 " (output was delivered there by the job itself)"
@@ -982,34 +1141,61 @@ def _try_dispatch_background_run(
         ]
         if refreshed.get("next_run_at"):
             lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-        excerpt = _latest_job_output_excerpt(job_id)
+        excerpt = (
+            _attempt_output_excerpt(res.get("output_file"))
+            if res.get("success")
+            else None
+        )
         if excerpt:
             lines.append("--- JOB OUTPUT ---")
             lines.append(excerpt)
         return {
-            "status": "completed" if res.get("success") else "error",
+            "status": (
+                "interrupted"
+                if interrupted
+                else ("completed" if res.get("success") else "error")
+            ),
             "summary": "\n".join(lines),
-            "error": res.get("error"),
+            "error": result_error,
             "api_calls": 0,
             "duration_seconds": duration,
         }
 
-    dispatch = dispatch_async_delegation(
-        goal=f"Manual run of cron job '{job_name}' ({job_id})",
-        context=(
-            "Triggered via cronjob(action='run'). The job executed in its own "
-            "fresh cron session; this block reports its outcome."
-        ),
-        toolsets=None,
-        role="cron_run",
-        model=job.get("model"),
-        session_key=session_key,
-        parent_session_id=str(session_id) if session_id else None,
-        runner=_runner,
-        origin_ui_session_id=origin_ui_session_id,
-        origin_session_id=origin_session_id,
-        max_async_children=max_async,
-    )
+    try:
+        dispatch = dispatch_async_delegation(
+            goal=f"Manual run of cron job '{job_name}' ({job_id})",
+            context=(
+                "Triggered via cronjob(action='run'). The job executed in its own "
+                "fresh cron session; this block reports its outcome."
+            ),
+            toolsets=None,
+            role="cron_run",
+            model=job.get("model"),
+            session_key=session_key,
+            parent_session_id=str(session_id) if session_id else None,
+            runner=_runner,
+            origin_ui_session_id=origin_ui_session_id,
+            origin_session_id=origin_session_id,
+            interrupt_fn=_interrupt_run,
+            max_async_children=max_async,
+        )
+    except Exception as dispatch_error:
+        # The durable attempt was already claimed. Treat registry failures the
+        # same as an explicit rejection and execute inline; otherwise the exact
+        # run claim remains stranded until its TTL expires.
+        logger.warning(
+            "cronjob run: background dispatch failed (%s); running job '%s' "
+            "inline.",
+            dispatch_error,
+            job_name,
+        )
+        result = _run_claimed_job(
+            job,
+            attempt_owner=attempt_owner,
+            extra_prompt=extra_prompt,
+        )
+        result["dispatched"] = False
+        return result
 
     if dispatch.get("status") == "dispatched":
         return {
@@ -1024,7 +1210,11 @@ def _try_dispatch_background_run(
         "cronjob run: background pool unavailable (%s); running job '%s' inline.",
         dispatch.get("error", "rejected"), job_name,
     )
-    result = _run_claimed_job(job, extra_prompt=extra_prompt)
+    result = _run_claimed_job(
+        job,
+        attempt_owner=attempt_owner,
+        extra_prompt=extra_prompt,
+    )
     result["dispatched"] = False
     return result
 

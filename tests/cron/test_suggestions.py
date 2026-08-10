@@ -37,6 +37,72 @@ def _add(store, key="k1", title="Test", source="catalog", schedule="0 9 * * *"):
     )
 
 
+def test_suggestions_follow_active_cron_store_after_default_import(
+    monkeypatch, tmp_path
+):
+    """Secondary-profile decisions must not resolve default suggestions."""
+    default_home = tmp_path / "default"
+    ops_home = tmp_path / "home-ops"
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    import cron.suggestions as suggestions
+    from cron.jobs import use_cron_store
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    suggestions = importlib.reload(suggestions)
+    assert suggestions.SUGGESTIONS_FILE == (
+        default_home / "cron" / "suggestions.json"
+    )
+
+    default_accept = _add(
+        suggestions, key="shared-accept", title="Default accept"
+    )
+    default_dismiss = _add(
+        suggestions, key="shared-dismiss", title="Default dismiss"
+    )
+
+    token = set_hermes_home_override(ops_home)
+    try:
+        with use_cron_store(ops_home):
+            # Identical dedup keys are valid in a different profile.
+            ops_accept = _add(
+                suggestions, key="shared-accept", title="Ops accept"
+            )
+            ops_dismiss = _add(
+                suggestions, key="shared-dismiss", title="Ops dismiss"
+            )
+            assert ops_accept is not None
+            assert ops_dismiss is not None
+
+            with patch(
+                "cron.scheduler.create_job_with_scheduler_registration",
+                return_value={"id": "ops-job"},
+            ):
+                assert suggestions.accept_suggestion(ops_accept["id"]) == {
+                    "id": "ops-job"
+                }
+            assert suggestions.dismiss_suggestion(ops_dismiss["id"]) is True
+
+            ops_records = {
+                row["id"]: row for row in suggestions.load_suggestions()
+            }
+            assert ops_records[ops_accept["id"]]["status"] == "accepted"
+            assert ops_records[ops_dismiss["id"]]["status"] == "dismissed"
+    finally:
+        reset_hermes_home_override(token)
+
+    default_records = {
+        row["id"]: row for row in suggestions.load_suggestions()
+    }
+    assert default_records[default_accept["id"]]["status"] == "pending"
+    assert default_records[default_dismiss["id"]]["status"] == "pending"
+    assert (default_home / "cron" / "suggestions.json").is_file()
+    assert (ops_home / "cron" / "suggestions.json").is_file()
+
+
 class TestStore:
     def test_add_and_list_pending(self, store):
         rec = _add(store)

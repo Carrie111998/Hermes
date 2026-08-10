@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,10 +16,11 @@ import pytest
     ],
     ids=("script-only-job", "pre-agent-script"),
 )
+@pytest.mark.parametrize("schedule_kind", ["once", "interval"])
 def test_long_running_script_refreshes_owned_claim_in_profile_store(
-    tmp_path, monkeypatch, no_agent, script_output
+    tmp_path, monkeypatch, no_agent, script_output, schedule_kind
 ):
-    """Both blocking script paths keep their one-shot claim alive.
+    """Both blocking script paths keep one-shot and recurring claims alive.
 
     The real store update runs on the heartbeat thread.  A second store holds
     the same job ID, proving the thread inherited the active profile's
@@ -44,16 +46,18 @@ def test_long_running_script_refreshes_owned_claim_in_profile_store(
     monkeypatch.setattr(jobs, "_hermes_now", lambda: current_time[0])
 
     def _job() -> dict:
+        schedule = (
+            {"kind": "once", "run_at": original_timestamp}
+            if schedule_kind == "once"
+            else {"kind": "interval", "minutes": 1}
+        )
         return {
             "id": "long-script",
             "name": "long script",
             "prompt": "inspect the script output",
             "script": "watchdog.py",
             "no_agent": no_agent,
-            "schedule": {
-                "kind": "once",
-                "run_at": original_timestamp,
-            },
+            "schedule": schedule,
             "next_run_at": original_timestamp,
             "enabled": True,
             "run_claim": {
@@ -147,19 +151,110 @@ def test_script_heartbeat_uses_captured_claim_owner(tmp_path, monkeypatch):
         return updated
 
     def _blocking_script(_script_path: str, **kwargs) -> tuple[bool, str]:
-        assert heartbeat_seen.wait(timeout=2)
-        return True, "done"
+        pytest.fail("a stale script must be fenced before it starts")
 
     monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
     monkeypatch.setattr(scheduler, "heartbeat_run_claim", _observed_heartbeat)
     monkeypatch.setattr(scheduler, "_run_job_script", _blocking_script)
 
     with jobs.use_cron_store(profile_home):
-        assert scheduler._run_job_script_with_claim_heartbeat(job, "watchdog.py") == (
-            True,
-            "done",
+        ok, error = scheduler._run_job_script_with_claim_heartbeat(
+            job, "watchdog.py"
         )
+        assert ok is False
+        assert "ownership was lost" in error.lower()
+        assert heartbeat_seen.is_set()
         assert jobs.get_job("reclaimed-script")["run_claim"] == {
             "at": replacement_timestamp,
             "by": "replacement-owner",
         }
+
+
+def test_script_is_terminated_after_definite_claim_loss(tmp_path, monkeypatch):
+    """A stale script process cannot keep producing side effects after CAS loss."""
+    import cron.scheduler as scheduler
+
+    profile_home = tmp_path / "profile"
+    scripts_dir = profile_home / "scripts"
+    scripts_dir.mkdir(parents=True)
+    started = tmp_path / "started"
+    side_effect = tmp_path / "side-effect"
+    script = scripts_dir / "stale.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "import time\n"
+        f"Path({str(started)!r}).write_text('started')\n"
+        "time.sleep(1.0)\n"
+        f"Path({str(side_effect)!r}).write_text('should-not-exist')\n",
+        encoding="utf-8",
+    )
+    job = {
+        "id": "lost-script-claim",
+        "run_claim": {
+            "at": "2026-01-01T00:00:00+00:00",
+            "by": "original-attempt",
+        },
+    }
+
+    heartbeat_calls = 0
+
+    def lose_after_script_starts(*_args, **_kwargs):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls == 1:
+            return True
+        deadline = time.monotonic() + 2
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert started.exists(), "script never started"
+        return False
+
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: profile_home)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "heartbeat_run_claim", lose_after_script_starts)
+
+    ok, error = scheduler._run_job_script_with_claim_heartbeat(job, "stale.py")
+
+    assert ok is False
+    assert "ownership was lost" in error.lower()
+    time.sleep(1.1)
+    assert not side_effect.exists()
+
+
+def test_script_thread_start_failure_requires_outer_fence(monkeypatch):
+    """A claimed script never falls back to an uncancellable subprocess."""
+    import cron.scheduler as scheduler
+
+    job = {
+        "id": "thread-start-failure",
+        "run_claim": {
+            "at": "2026-01-01T00:00:00+00:00",
+            "by": "attempt",
+        },
+    }
+    calls = []
+    monkeypatch.setattr(scheduler, "heartbeat_run_claim", lambda *_a, **_kw: True)
+    monkeypatch.setattr(
+        scheduler.threading.Thread,
+        "start",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("thread unavailable")),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script",
+        lambda *_a, **kwargs: calls.append(kwargs.get("cancel_event"))
+        or (True, "done"),
+    )
+
+    ok, error = scheduler._run_job_script_with_claim_heartbeat(job, "script.py")
+    assert ok is False
+    assert "unfenced" in error
+    assert calls == []
+
+    outer_loss = threading.Event()
+    assert scheduler._run_job_script_with_claim_heartbeat(
+        job,
+        "script.py",
+        claim_ownership_lost=outer_loss,
+    ) == (True, "done")
+    assert calls == [outer_loss]

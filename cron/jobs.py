@@ -11,7 +11,9 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -20,9 +22,10 @@ import re
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
-# fcntl is Unix-only; on Windows fall back to msvcrt. Either may be absent,
-# in which case _jobs_lock() degrades to in-process locking only (the old
-# behaviour) rather than failing.
+# fcntl is Unix-only; on Windows fall back to msvcrt. If the platform provides
+# neither primitive, retain the historical in-process lock. When a primitive
+# exists, acquisition failures are fail-closed: durable attempt CAS operations
+# must never run in an unlocked "degraded" critical section.
 try:
     import fcntl
 except ImportError:  # pragma: no cover - non-Unix
@@ -97,6 +100,16 @@ TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
 # drift apart.
 TICKER_INTERVAL_SECONDS = 60
+# A gateway ticker refreshes its profile-local ownership lease once per loop.
+# Desktop waits through roughly three missed iterations before treating a
+# crashed/stalled gateway as gone, matching the existing ticker-health window.
+GATEWAY_TICKER_LEASE_STALE_SECONDS = TICKER_INTERVAL_SECONDS * 3 + 20
+_GATEWAY_TICKER_LEASE_FUTURE_SKEW_SECONDS = 5.0
+_GATEWAY_TICKER_LEASE_PREFIX = ".gateway_ticker_lease."
+_GATEWAY_TICKER_OWNER_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
+_GATEWAY_TICKER_PROCESS_OWNER_RE = re.compile(
+    r"p(?P<pid>[1-9][0-9]*)-s(?P<started>[0-9]+)-[a-f0-9]{32}\Z"
+)
 
 # In-process lock protecting load_jobs→modify→save_jobs cycles.
 # Required when tick() runs jobs in parallel threads — without this,
@@ -113,6 +126,7 @@ _jobs_lock_state = threading.local()
 # worst-case stall well under one status-alarm threshold.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 OUTPUT_DIR = CRON_DIR / "output"
+_MONITOR_SNAPSHOT_FILENAME = "monitor_last_output.txt"
 ONESHOT_GRACE_SECONDS = 120
 
 
@@ -195,6 +209,7 @@ def get_cron_output_dir() -> Path:
 # floor for the derived value so a very short configured timeout can't make the
 # claim expire mid-run.
 ONESHOT_RUN_CLAIM_TTL_SECONDS = 1800
+_RUN_CLAIM_FUTURE_SKEW_SECONDS = 5.0
 
 # The derived TTL is the cron inactivity timeout times this headroom multiplier.
 # A healthy run clears its claim via mark_job_run() long before the TTL; the
@@ -234,6 +249,18 @@ def _oneshot_run_claim_ttl_seconds() -> float:
         timeout * _ONESHOT_RUN_CLAIM_TTL_HEADROOM,
         float(ONESHOT_RUN_CLAIM_TTL_SECONDS),
     )
+
+
+def _claim_is_fresh(claim: Any, *, now: datetime, ttl_seconds: float) -> bool:
+    """Validate a persisted claim timestamp with tightly bounded clock skew."""
+    if not isinstance(claim, dict):
+        return False
+    try:
+        claimed_at = _ensure_aware(datetime.fromisoformat(claim["at"]))
+        age = (now - claimed_at).total_seconds()
+        return -_RUN_CLAIM_FUTURE_SKEW_SECONDS <= age < ttl_seconds
+    except (KeyError, ValueError, TypeError):
+        return False
 
 
 def _job_running_in_this_process(job_id: str) -> bool:
@@ -321,10 +348,10 @@ def _jobs_lock():
                     # get_due_jobs() — silently and forever: the heartbeat
                     # file stops updating and all jobs stop firing with no
                     # error logged.  Poll LOCK_NB against a deadline instead;
-                    # on timeout, log loudly and fall through to the same
-                    # in-process-only degraded mode used when locking is
-                    # unavailable.  A briefly-torn cross-process write is
-                    # strictly better than a permanently dead scheduler.
+                    # on timeout, log loudly and fail closed. The ticker catches
+                    # the bounded exception and retries; entering an unlocked
+                    # section would let two immutable attempt-token CAS writers
+                    # both win and execute duplicate external side effects.
                     _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
                     while True:
                         try:
@@ -335,8 +362,8 @@ def _jobs_lock():
                                 logger.error(
                                     "Timed out after %.0fs waiting for the cron "
                                     "jobs lock (%s) — another process is holding "
-                                    "it. Proceeding with in-process locking only "
-                                    "so the scheduler stays alive (#60703).",
+                                    "it. Refusing to enter an unlocked CAS "
+                                    "critical section (#60703).",
                                     _JOBS_LOCK_TIMEOUT_SECONDS,
                                     _jobs_lock_file(),
                                 )
@@ -345,15 +372,56 @@ def _jobs_lock():
                                 except OSError:
                                     pass
                                 lock_fd = None
-                                break
+                                raise RuntimeError(
+                                    "Timed out waiting for the cron jobs lock"
+                                )
                             time.sleep(0.1)
                 elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    _deadline = time.monotonic() + _JOBS_LOCK_TIMEOUT_SECONDS
+                    while True:
+                        try:
+                            getattr(msvcrt, "locking")(
+                                lock_fd.fileno(), getattr(msvcrt, "LK_NBLCK"), 1
+                            )
+                            break
+                        except (OSError, IOError):
+                            if time.monotonic() >= _deadline:
+                                logger.error(
+                                    "Timed out after %.0fs waiting for the cron "
+                                    "jobs lock (%s). Refusing to enter an "
+                                    "unlocked CAS critical section (#60703).",
+                                    _JOBS_LOCK_TIMEOUT_SECONDS,
+                                    _jobs_lock_file(),
+                                )
+                                try:
+                                    lock_fd.close()
+                                except OSError:
+                                    pass
+                                lock_fd = None
+                                raise RuntimeError(
+                                    "Timed out waiting for the cron jobs lock"
+                                )
+                            time.sleep(0.1)
             except (OSError, IOError) as e:
-                # Never let a locking failure take down cron writes — fall back to
-                # in-process-only protection (still held via _jobs_file_lock).
-                logger.warning("jobs.json cross-process lock unavailable (%s); "
-                               "proceeding with in-process lock only", e)
+                if lock_fd is not None:
+                    try:
+                        lock_fd.close()
+                    except OSError:
+                        pass
+                    lock_fd = None
+                if fcntl is not None or msvcrt is not None:
+                    logger.error(
+                        "jobs.json cross-process lock unavailable (%s); "
+                        "refusing unsafe unlocked mutation",
+                        e,
+                    )
+                    raise RuntimeError(
+                        "Cron jobs lock unavailable; mutation was not attempted"
+                    ) from e
+                logger.warning(
+                    "No cross-process lock primitive is available; using "
+                    "the in-process cron jobs lock only"
+                )
             try:
                 yield
             finally:
@@ -895,6 +963,117 @@ def _atomic_write_epoch(path: Path) -> None:
     atomic_write_text(path, str(time.time()), tmp_prefix=".hb_")
 
 
+def _gateway_ticker_lease_path(owner_id: str) -> Path:
+    """Return the profile-local lease path for one gateway instance.
+
+    Each gateway gets a unique file instead of sharing a single marker.  That
+    makes cleanup owner-local by construction: an exiting predecessor cannot
+    unlink a successor's lease between a compare and delete.
+    """
+    owner = str(owner_id or "")
+    if _GATEWAY_TICKER_OWNER_RE.fullmatch(owner) is None:
+        raise ValueError(f"Invalid gateway ticker owner id: {owner_id!r}")
+    return _current_cron_store().cron_dir / f"{_GATEWAY_TICKER_LEASE_PREFIX}{owner}"
+
+
+def record_gateway_ticker_lease(owner_id: str) -> None:
+    """Publish/refresh this gateway ticker's profile-local readiness lease.
+
+    Unlike the observability heartbeat below, this is a coordination signal:
+    callers intentionally see write failures so a gateway never dispatches
+    concurrently with Desktop merely because it could not advertise ownership.
+    """
+    # Reclaim crash remnants opportunistically even on headless installs where
+    # no Desktop process ever probes readiness. Cleanup is restricted to a
+    # structured owner whose exact PID/start fingerprint proves it is gone.
+    gateway_ticker_lease_is_fresh()
+    path = _gateway_ticker_lease_path(owner_id)
+    _atomic_write_epoch(path)
+    _secure_file(path)
+
+
+def clear_gateway_ticker_lease(owner_id: str) -> None:
+    """Remove only ``owner_id``'s lease after a clean gateway shutdown."""
+    path = _gateway_ticker_lease_path(owner_id)
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _gateway_ticker_owner_is_definitely_dead(owner_id: str) -> bool:
+    """Return True only when a structured lease owner's exact process is gone."""
+    match = _GATEWAY_TICKER_PROCESS_OWNER_RE.fullmatch(owner_id)
+    if match is None:
+        return False
+    pid = int(match.group("pid"))
+    started_text = match.group("started")
+    try:
+        from gateway.status import _pid_exists, get_stable_process_start_time
+
+        if not _pid_exists(pid):
+            return True
+        current_start = get_stable_process_start_time(pid)
+        if current_start is None:
+            return False
+        return current_start != int(started_text)
+    except Exception:
+        return False
+
+
+def gateway_ticker_lease_is_fresh(*, max_age_seconds: Optional[float] = None) -> bool:
+    """Whether a ready gateway ticker currently owns this profile's cron.
+
+    Gateway writes one unpredictable, owner-specific regular file only after
+    its cron provider thread starts, and refreshes it on every ticker cycle.
+    Multiplex gateways write the same owner ID into every served profile's
+    cron directory.  Stale crash remnants and malformed/non-regular files are
+    ignored, so they cannot permanently disable the Desktop fallback.
+    """
+    max_age = (
+        float(GATEWAY_TICKER_LEASE_STALE_SECONDS)
+        if max_age_seconds is None
+        else max(0.0, float(max_age_seconds))
+    )
+    now = time.time()
+    cron_dir = _current_cron_store().cron_dir
+    fresh = False
+    try:
+        candidates = cron_dir.glob(f"{_GATEWAY_TICKER_LEASE_PREFIX}*")
+        for path in candidates:
+            try:
+                # Do not follow a planted symlink while probing readiness.
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    continue
+                updated_at = float(path.read_text(encoding="utf-8").strip())
+                if not math.isfinite(updated_at):
+                    continue
+                # Bound backwards clock correction to a few seconds. Accepting
+                # one full TTL of future skew nearly doubles failover time;
+                # rejecting every sub-second correction can cause a false
+                # Desktop takeover while Gateway is still healthy.
+                age = now - updated_at
+                timestamp_is_fresh = (
+                    -_GATEWAY_TICKER_LEASE_FUTURE_SKEW_SECONDS
+                    <= age
+                    <= max_age
+                )
+                if timestamp_is_fresh:
+                    fresh = True
+                    continue
+                owner_id = path.name.removeprefix(_GATEWAY_TICKER_LEASE_PREFIX)
+                if _gateway_ticker_owner_is_definitely_dead(owner_id):
+                    # Owner paths contain a random per-process UUID, so no
+                    # successor can refresh this exact file. Conditional
+                    # process-identity proof makes this unlink race-safe.
+                    path.unlink()
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        return False
+    return fresh
+
+
 def _atomic_write_counter(path: Path, value: int) -> None:
     """Atomically persist a non-negative integer counter."""
     ensure_dirs()
@@ -929,16 +1108,13 @@ def record_ticker_heartbeat(success: bool = False) -> None:
 
     Best-effort: a write failure must never disrupt the tick loop.
     """
-    store = _current_cron_store()
     try:
+        store = _current_cron_store()
         _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
+        if success:
+            _atomic_write_epoch(store.cron_dir / "ticker_last_success")
     except Exception:
         pass
-    if success:
-        try:
-            _atomic_write_epoch(store.cron_dir / "ticker_last_success")
-        except Exception:
-            pass
 
 
 def _epoch_file_age(path: Path) -> Optional[float]:
@@ -999,9 +1175,9 @@ def record_ticker_error(message: str) -> None:
 
     Best-effort: a write failure must never disrupt the tick loop.
     """
-    store = _current_cron_store()
-    path = store.cron_dir / "ticker_last_error"
     try:
+        store = _current_cron_store()
+        path = store.cron_dir / "ticker_last_error"
         ensure_dirs()
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), suffix=".tmp", prefix=".terr_"
@@ -1033,10 +1209,10 @@ def get_catch_up_occurrence_count() -> int:
 
 def clear_ticker_error() -> None:
     """Remove the last-tick-error marker after a successful tick. Best-effort."""
-    store = _current_cron_store()
     try:
+        store = _current_cron_store()
         (store.cron_dir / "ticker_last_error").unlink()
-    except OSError:
+    except Exception:
         pass
 
 
@@ -1981,6 +2157,62 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
     return None
 
 
+def persist_monitor_state(
+    job_id: str,
+    new_hash: str,
+    output: str,
+    *,
+    expected_run_claim_owner: Optional[str] = None,
+) -> bool:
+    """Persist one monitor observation without crossing attempt ownership.
+
+    Claimed scheduler runs pass their immutable ``run_claim`` token.  The
+    snapshot and hash are then written while holding the same cross-process
+    lock used to replace that token, so a stale attempt can neither overwrite
+    a successor's snapshot nor publish state after ownership changes.
+
+    Unclaimed/manual monitor calls retain the historical unconditional update
+    behavior by leaving ``expected_run_claim_owner`` unset.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] != job_id:
+                continue
+            if expected_run_claim_owner is not None:
+                current_claim = job.get("run_claim")
+                current_owner = (
+                    str(current_claim.get("by") or "")
+                    if isinstance(current_claim, dict)
+                    else ""
+                )
+                if current_owner != expected_run_claim_owner:
+                    logger.warning(
+                        "Job '%s': ignoring monitor state from stale run-claim "
+                        "owner %r (current owner %r)",
+                        job_id,
+                        expected_run_claim_owner,
+                        current_owner or None,
+                    )
+                    return False
+
+            snapshot_path = _job_output_dir(job_id) / _MONITOR_SNAPSHOT_FILENAME
+            atomic_write_text(
+                snapshot_path,
+                output,
+                encoding="utf-8",
+                tmp_prefix=".monitor_",
+            )
+            job["monitor_state"] = {
+                "last_output_hash": new_hash,
+                "last_changed_at": _hermes_now().isoformat(),
+            }
+            jobs[i] = job
+            save_jobs(jobs)
+            return True
+    return False
+
+
 def pause_job(job_id: str, reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Pause a job without deleting it. Accepts a job ID or name."""
     job = resolve_job_ref(job_id)
@@ -2073,7 +2305,12 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def _set_preflight_alerted(job_id: str, value: bool) -> bool:
+def _set_preflight_alerted(
+    job_id: str,
+    value: bool,
+    *,
+    expected_run_claim_owner: Optional[str] = None,
+) -> Optional[bool]:
     """Set/clear the preflight alert-dedup marker; return the PRIOR value.
 
     The marker records that the operator was already alerted about this
@@ -2086,6 +2323,22 @@ def _set_preflight_alerted(job_id: str, value: bool) -> bool:
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                if expected_run_claim_owner is not None:
+                    current_claim = job.get("run_claim")
+                    current_owner = (
+                        str(current_claim.get("by") or "")
+                        if isinstance(current_claim, dict)
+                        else ""
+                    )
+                    if current_owner != expected_run_claim_owner:
+                        logger.warning(
+                            "Job '%s': ignoring preflight marker write from "
+                            "stale run-claim owner %r (current owner %r)",
+                            job_id,
+                            expected_run_claim_owner,
+                            current_owner or None,
+                        )
+                        return None
                 prior = bool(job.get("preflight_alerted"))
                 if value:
                     job["preflight_alerted"] = True
@@ -2095,22 +2348,40 @@ def _set_preflight_alerted(job_id: str, value: bool) -> bool:
                     jobs[i] = job
                     save_jobs(jobs)
                 return prior
-    return False
+    return None if expected_run_claim_owner is not None else False
 
 
-def mark_preflight_alerted(job_id: str) -> bool:
+def mark_preflight_alerted(
+    job_id: str, *, expected_run_claim_owner: Optional[str] = None
+) -> Optional[bool]:
     """Mark the job as preflight-alerted; return True if it already was."""
-    return _set_preflight_alerted(job_id, True)
+    return _set_preflight_alerted(
+        job_id,
+        True,
+        expected_run_claim_owner=expected_run_claim_owner,
+    )
 
 
-def clear_preflight_alerted(job_id: str) -> None:
+def clear_preflight_alerted(
+    job_id: str, *, expected_run_claim_owner: Optional[str] = None
+) -> Optional[bool]:
     """Clear the preflight alert-dedup marker (config validates again)."""
-    _set_preflight_alerted(job_id, False)
+    return _set_preflight_alerted(
+        job_id,
+        False,
+        expected_run_claim_owner=expected_run_claim_owner,
+    )
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None,
-                 status: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    status: Optional[str] = None,
+    *,
+    expected_run_claim_owner: Optional[str] = None,
+) -> bool:
     """
     Mark a job as having been run.
     
@@ -2125,11 +2396,32 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     the pre-dispatch configuration validation refused to run the agent
     (T1-26), so `cronjob list` distinguishes "your config is broken" from
     "the run itself failed".
+
+    When ``expected_run_claim_owner`` is supplied, the terminal write is a
+    compare-and-set against that immutable attempt token.  A stale runner that
+    resumes after another process reclaimed the job must not clear or overwrite
+    its successor's claim, status, repeat counter, or schedule.
     """
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
+                if expected_run_claim_owner is not None:
+                    current_claim = job.get("run_claim")
+                    current_owner = (
+                        str(current_claim.get("by") or "")
+                        if isinstance(current_claim, dict)
+                        else ""
+                    )
+                    if current_owner != expected_run_claim_owner:
+                        logger.warning(
+                            "Job '%s': ignoring terminal write from stale "
+                            "run-claim owner %r (current owner %r)",
+                            job_id,
+                            expected_run_claim_owner,
+                            current_owner or None,
+                        )
+                        return False
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = status or ("ok" if success else "error")
@@ -2186,7 +2478,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         job["state"] = "completed"
                         job["next_run_at"] = None
                         save_jobs(jobs)
-                        return
+                        return True
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
@@ -2221,9 +2513,10 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                     job["state"] = "scheduled"
 
                 save_jobs(jobs)
-                return
+                return True
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
@@ -2270,7 +2563,9 @@ def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
         )
 
 
-def claim_dispatch(job_id: str) -> bool:
+def claim_dispatch(
+    job_id: str, *, expected_run_claim_owner: Optional[str] = None
+) -> bool:
     """Atomically claim a finite one-shot job dispatch BEFORE execution.
 
     Increments ``repeat.completed`` under the cross-process jobs lock and
@@ -2292,6 +2587,22 @@ def claim_dispatch(job_id: str) -> bool:
         for i, job in enumerate(jobs):
             if job["id"] != job_id:
                 continue
+            if expected_run_claim_owner is not None:
+                current_claim = job.get("run_claim")
+                current_owner = (
+                    str(current_claim.get("by") or "")
+                    if isinstance(current_claim, dict)
+                    else ""
+                )
+                if current_owner != expected_run_claim_owner:
+                    logger.warning(
+                        "Job '%s': rejecting dispatch claim from stale "
+                        "run-claim owner %r (current owner %r)",
+                        job_id,
+                        expected_run_claim_owner,
+                        current_owner or None,
+                    )
+                    return False
             if job.get("schedule", {}).get("kind") != "once":
                 return True  # recurring jobs use advance_next_run(), not dispatch claims
             repeat = job.get("repeat")
@@ -2349,11 +2660,11 @@ def claim_dispatch(job_id: str) -> bool:
             "(handed-in job dict; nothing to persist a claim against)",
             job_id,
         )
-        return True
+        return expected_run_claim_owner is None
 
 
 def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
-    """Refresh a one-shot's ``run_claim`` timestamp while its run is alive.
+    """Refresh a job's ``run_claim`` timestamp while its run is alive.
 
     Called periodically from the scheduler's run monitor (#62002) so a
     legitimately long run keeps its claim fresh: an expired claim then really
@@ -2373,8 +2684,6 @@ def heartbeat_run_claim(job_id: str, *, expected_owner: str) -> bool:
         for job in jobs:
             if job.get("id") != job_id:
                 continue
-            if job.get("schedule", {}).get("kind") != "once":
-                return False
             claim = job.get("run_claim")
             if not isinstance(claim, dict) or claim.get("by") != expected_owner:
                 return False
@@ -2392,14 +2701,18 @@ def advance_next_runs(job_ids) -> int:
     O(N loads + N saves) for N due jobs (~110 ms at N=50, measured), the
     batch form O(1 + 1) (~2 ms). ``job_ids`` may contain ids of one-shot
     or unknown jobs; they are skipped exactly as the per-job form skips
-    them. Returns the number of jobs whose ``next_run_at`` was advanced.
+    them. A mapping of ``job_id -> expected run_claim owner`` enables the
+    scheduler's exact-attempt CAS; the legacy iterable-of-ids form remains
+    unconditional for existing callers. Returns the number of jobs whose
+    ``next_run_at`` was advanced.
 
     Crash semantics: the batch persists once at the end, so a crash
     mid-batch re-fires the whole set on restart (at-least-once burst)
     rather than advancing a prefix — acceptable given the sub-10ms window,
     and identical to the per-job form once the batch completes.
     """
-    ids = set(job_ids)
+    expected_owners = dict(job_ids) if isinstance(job_ids, dict) else {}
+    ids = set(expected_owners or job_ids)
     if not ids:
         return 0
     with _jobs_lock():
@@ -2409,6 +2722,23 @@ def advance_next_runs(job_ids) -> int:
         for job in jobs:
             if job["id"] not in ids:
                 continue
+            expected_owner = expected_owners.get(job["id"])
+            if expected_owner:
+                claim = job.get("run_claim")
+                current_owner = (
+                    str(claim.get("by") or "")
+                    if isinstance(claim, dict)
+                    else ""
+                )
+                if current_owner != expected_owner:
+                    logger.warning(
+                        "Job '%s': refusing next-run advance from stale "
+                        "run-claim owner %r (current owner %r)",
+                        job["id"],
+                        expected_owner,
+                        current_owner or None,
+                    )
+                    continue
             kind = job.get("schedule", {}).get("kind")
             if kind not in {"cron", "interval"}:
                 continue
@@ -2419,6 +2749,33 @@ def advance_next_runs(job_ids) -> int:
         if advanced:
             save_jobs(jobs)
         return advanced
+
+
+def release_run_claim(job_id: str, *, expected_owner: str) -> bool:
+    """Clear only this attempt's claim when dispatch never begins.
+
+    This is the rollback half of the due-scan CAS. It is intentionally owner
+    fenced so a failed/stopping scheduler cannot clear a successor's claim.
+    ``fire_claim`` is cleared only when it belongs to the same attempt token.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job.get("id") != job_id:
+                continue
+            claim = job.get("run_claim")
+            if not isinstance(claim, dict) or claim.get("by") != expected_owner:
+                return False
+            job["run_claim"] = None
+            fire_claim = job.get("fire_claim")
+            if (
+                isinstance(fire_claim, dict)
+                and fire_claim.get("by") == expected_owner
+            ):
+                job["fire_claim"] = None
+            save_jobs(jobs)
+            return True
+    return False
 
 
 def advance_next_run(job_id: str) -> bool:
@@ -2455,22 +2812,29 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
-    """Atomically claim a job for a single external 'fire' (multi-machine
-    at-most-once). Returns True iff THIS caller won the claim.
+def _new_run_claim_owner() -> str:
+    """Return an immutable, unique token for one concrete run attempt."""
+    return f"{_machine_id()}:{uuid.uuid4().hex}"
+
+
+def claim_job_for_fire_attempt(
+    job_id: str, *, claim_ttl_seconds: int = 300
+) -> Optional[str]:
+    """Atomically claim an external/manual fire and return its attempt token.
 
     Used by the external-provider fire path (``CronScheduler.fire_due``) when an
     external scheduler (Chronos) signals a job is due across N gateway replicas:
     exactly one wins. Single-machine deployments always win.
 
     Under the file lock: reject if the job is missing/disabled/paused. If a
-    fresh claim (younger than ``claim_ttl_seconds``) already exists, lose.
-    Otherwise stamp a ``fire_claim`` and, for recurring jobs, advance
+    fresh fire or run claim already exists, lose. Otherwise stamp both claims
+    with one immutable per-attempt token and, for recurring jobs, advance
     ``next_run_at`` (mirrors ``advance_next_run``'s at-most-once bump so a stale
     re-delivery for the old time can't re-fire). One-shots keep ``next_run_at``
     but the fresh ``fire_claim`` blocks a duplicate retry for the same fire.
-    ``mark_job_run`` clears the claim on completion so a re-armed recurring job
-    is claimable again next fire.
+    ``mark_job_run`` clears the claims only when that same attempt token
+    completes, so a manual/external fire can neither impersonate nor clear a
+    scheduled run owned by another process.
 
     The stale-claim TTL means a machine that crashed after claiming but before
     completing doesn't wedge the job forever — after the TTL another fire can
@@ -2484,32 +2848,44 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             # enabled + pause markers must both clear — a half-paused record
             # (enabled=true, state=paused/paused_at set) must not claim.
             if not is_job_runnable(job):
-                return False
+                return None
             now = _hermes_now()
             existing = job.get("fire_claim")
-            if existing:
-                try:
-                    claimed_at = _ensure_aware(datetime.fromisoformat(existing["at"]))
-                    # Bounded on BOTH sides (#60703): a claim stamped in the
-                    # future (clock/TZ skew across a restart, or a corrupted
-                    # timestamp) would otherwise have a negative age and stay
-                    # "fresh" forever — the job becomes permanently unfireable
-                    # and every manual `cron run` reports "already being
-                    # fired". Treat future-dated claims as stale/overwritable.
-                    _age = (now - claimed_at).total_seconds()
-                    if 0 <= _age < claim_ttl_seconds:
-                        return False  # someone holds a fresh claim
-                except Exception:
-                    pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            if _claim_is_fresh(
+                existing,
+                now=now,
+                ttl_seconds=float(claim_ttl_seconds),
+            ):
+                return None  # someone holds a fresh claim
+
+            existing_run = job.get("run_claim")
+            if existing_run:
+                # The explicit zero-TTL mode remains a recovery/testing escape
+                # hatch. Normal callers use at least the long-run TTL so a
+                # manual fire cannot overlap queued scheduler work.
+                run_ttl = (
+                    0.0
+                    if claim_ttl_seconds <= 0
+                    else max(
+                        float(claim_ttl_seconds),
+                        _oneshot_run_claim_ttl_seconds(),
+                    )
+                )
+                if _claim_is_fresh(existing_run, now=now, ttl_seconds=run_ttl):
+                    return None
+
+            attempt_owner = _new_run_claim_owner()
+            attempt_claim = {"at": now.isoformat(), "by": attempt_owner}
+            job["fire_claim"] = dict(attempt_claim)
+            job["run_claim"] = dict(attempt_claim)
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
                 nxt = compute_next_run(job["schedule"], now.isoformat())
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
-            return True
-        return False
+            return attempt_owner
+        return None
 
 
 # Completed one-shot job records are retained in jobs.json (final status +
@@ -2598,7 +2974,14 @@ def _sweep_completed_oneshots(
     return removed
 
 
-def get_due_jobs() -> List[Dict[str, Any]]:
+def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+    """Backward-compatible bool wrapper around the attempt-token CAS."""
+    return claim_job_for_fire_attempt(
+        job_id, claim_ttl_seconds=claim_ttl_seconds
+    ) is not None
+
+
+def get_due_jobs(*, claim_recurring: bool = False) -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
     For recurring jobs (cron/interval), if the scheduled time is stale (more
@@ -2611,12 +2994,18 @@ def get_due_jobs() -> List[Dict[str, Any]]:
 
     Note: firing once on catch-up flows through ``mark_job_run``, so a job with
     a ``repeat.times`` limit consumes one of its runs on that catch-up fire.
+
+    ``claim_recurring=True`` is used only by the builtin scheduler's dispatch
+    path. It atomically stamps recurring run claims under this same jobs lock;
+    read-only callers retain the historical behavior of merely listing due
+    recurring jobs. One-shot claims remain unconditional for their existing
+    at-most-once contract.
     """
     with _jobs_lock():
-        return _get_due_jobs_locked()
+        return _get_due_jobs_locked(claim_recurring=claim_recurring)
 
 
-def _get_due_jobs_locked() -> List[Dict[str, Any]]:
+def _get_due_jobs_locked(*, claim_recurring: bool = False) -> List[Dict[str, Any]]:
     """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
     now = _hermes_now()
     raw_jobs = load_jobs()
@@ -2767,26 +3156,19 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 continue
 
             # Cross-process running-claim guard (#59229): if another scheduler
-            # process already claimed this one-shot and its run is still in flight
+            # process already claimed this job and its run is still in flight
             # (claim younger than the TTL), skip it — do NOT re-dispatch. The
             # claim is stamped just before we return the job as due (below) and
             # cleared by mark_job_run() on completion. A claim older than the TTL
-            # is treated as stale (the claiming tick died mid-run) and allowed
-            # through so the job is recovered rather than wedged forever.
+            # is treated as stale (the worker died or its final write failed) and
+            # allowed through so recurring jobs cannot wedge forever.
             existing_claim = job.get("run_claim")
-            if existing_claim and job.get("schedule", {}).get("kind") == "once":
-                try:
-                    claimed_at = _ensure_aware(
-                        datetime.fromisoformat(existing_claim["at"])
-                    )
-                    # 0 <= age: a future-dated claim (clock/TZ skew across a
-                    # restart) must be treated as stale, not eternally fresh,
-                    # or the one-shot is skipped forever (#60703).
-                    _age = (now - claimed_at).total_seconds()
-                    if 0 <= _age < _run_claim_ttl:
-                        continue  # a fresh claim is held by an in-flight run
-                except (KeyError, ValueError, TypeError):
-                    pass  # malformed claim → fall through and (re)claim
+            if _claim_is_fresh(
+                existing_claim,
+                now=now,
+                ttl_seconds=_run_claim_ttl,
+            ):
+                continue  # a fresh claim is held by an in-flight run
 
             next_run = job.get("next_run_at")
             if not next_run:
@@ -2958,24 +3340,17 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                             _write_wedged_oneshot_diagnostic(job)
                             continue
 
-                # Durably claim a one-shot for the DURATION of its run before
-                # returning it as due, so a second scheduler process (gateway +
-                # desktop both run in-process 60s tickers on one HERMES_HOME)
-                # cannot re-dispatch it while the first run is still in flight
-                # (#59229). A plain one-shot's due-state is not resolved until
-                # mark_job_run() completes it minutes later, so advancing
-                # next_run_at by a fixed window is not enough — a job that outlives
-                # one tick (e.g. a 2.5-min research prompt) would simply re-fire on
-                # the next tick after the window. Instead we stamp a run_claim under
-                # the same lock get_due_jobs already holds; the other process reads
-                # a fresh claim on its next tick and skips (handled at the top of
-                # this loop). mark_job_run() clears the claim on completion. The TTL
-                # is only a safety valve: a claiming tick that DIES mid-run leaves a
-                # stale claim that expires after the resolved run-claim TTL
-                # (_oneshot_run_claim_ttl_seconds, derived from HERMES_CRON_TIMEOUT),
-                # so the job is re-dispatched rather than wedged forever.
-                if kind == "once":
-                    claim = {"at": now.isoformat(), "by": _machine_id()}
+                # Durably claim the job for the DURATION of its run before
+                # returning it as due, so Gateway and Desktop cannot dispatch
+                # the same long one-shot OR recurring job across a process
+                # handoff. The worker refreshes this claim and mark_job_run()
+                # clears it. If the worker dies or its final store write fails,
+                # the TTL eventually makes the claim reclaimable rather than
+                # wedging recurrence forever.
+                if kind == "once" or (
+                    claim_recurring and kind in {"cron", "interval"}
+                ):
+                    claim = {"at": now.isoformat(), "by": _new_run_claim_owner()}
                     job["run_claim"] = claim
                     for rj in raw_jobs:
                         if rj["id"] == job["id"]:
@@ -3045,15 +3420,56 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     return deleted
 
 
-def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+def save_job_output(
+    job_id: str,
+    output: str,
+    *,
+    expected_run_claim_owner: Optional[str] = None,
+) -> Optional[Path]:
+    """Save output, optionally as one exact-owner atomic publication.
+
+    For a claimed attempt, ownership validation and the filesystem replace run
+    under the same cross-process jobs lock.  A successor therefore cannot
+    replace the token between a check and publication.
+    """
+    if expected_run_claim_owner is not None:
+        with _jobs_lock():
+            jobs = load_jobs()
+            matched = next(
+                (job for job in jobs if job.get("id") == job_id),
+                None,
+            )
+            current_claim = matched.get("run_claim") if matched else None
+            current_owner = (
+                str(current_claim.get("by") or "")
+                if isinstance(current_claim, dict)
+                else ""
+            )
+            if current_owner != expected_run_claim_owner:
+                logger.warning(
+                    "Job '%s': suppressing output from stale run-claim owner "
+                    "%r (current owner %r)",
+                    job_id,
+                    expected_run_claim_owner,
+                    current_owner or None,
+                )
+                return None
+            return _save_job_output_unlocked(job_id, output)
+    return _save_job_output_unlocked(job_id, output)
+
+
+def _save_job_output_unlocked(job_id: str, output: str) -> Path:
+    """Filesystem half of :func:`save_job_output`; caller may hold jobs lock."""
     ensure_dirs()
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
 
-    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
-    output_file = job_output_dir / f"{timestamp}.md"
+    timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S-%f")
+    # A successor can publish in the same clock tick after this attempt drops
+    # the jobs lock. Keep the returned path attempt-unique so manual/background
+    # completion excerpts can never be overwritten by that successor.
+    output_file = job_output_dir / f"{timestamp}-{uuid.uuid4().hex[:8]}.md"
 
     fd, tmp_path = tempfile.mkstemp(dir=str(job_output_dir), suffix='.tmp', prefix='.output_')
     try:

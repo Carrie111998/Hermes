@@ -203,6 +203,50 @@ class TestWeixinSendMessageIntegration:
         assert _parse_target_ref("weixin", "filehelper") == ("filehelper", None, True)
         assert _parse_target_ref("weixin", "group@chatroom") == ("group@chatroom", None, True)
 
+    def test_direct_send_stops_media_after_text_loses_ownership(self, tmp_path):
+        owned = True
+
+        async def run():
+            nonlocal owned
+            adapter = Mock()
+            adapter._send_session = Mock(
+                closed=False,
+                _loop=asyncio.get_running_loop(),
+            )
+            adapter.format_message.return_value = "scheduled result"
+            adapter.send = AsyncMock()
+
+            async def send_text(*_args, **_kwargs):
+                nonlocal owned
+                owned = False
+                return Mock(success=True, message_id="text-1")
+
+            adapter.send.side_effect = send_text
+            adapter.send_image_file = AsyncMock(
+                return_value=Mock(success=True, message_id="image-1")
+            )
+            weixin._LIVE_ADAPTERS["test-token"] = adapter
+            try:
+                with patch.object(ContextTokenStore, "restore"), \
+                     patch.object(ContextTokenStore, "get", return_value="ctx"):
+                    result = await weixin.send_weixin_direct(
+                        extra={"account_id": "test-account"},
+                        token="test-token",
+                        chat_id="wxid_test123",
+                        message="scheduled result",
+                        media_files=[(str(tmp_path / "later.png"), False)],
+                        ownership_guard=lambda: owned,
+                    )
+            finally:
+                weixin._LIVE_ADAPTERS.pop("test-token", None)
+            return result, adapter
+
+        result, adapter = asyncio.run(run())
+
+        assert result["error"] == "Delivery ownership lost during standalone send"
+        adapter.send.assert_awaited_once()
+        adapter.send_image_file.assert_not_awaited()
+
 
 class TestWeixinChunkDelivery:
     def _connected_adapter(self) -> WeixinAdapter:

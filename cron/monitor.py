@@ -34,6 +34,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -99,15 +100,6 @@ def _read_last_output(job_id: str) -> str:
     return ""
 
 
-def _write_last_output(job_id: str, output: str) -> None:
-    try:
-        path = _snapshot_path(job_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(output, encoding="utf-8")
-    except Exception as exc:
-        logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
-
-
 def _fetch_monitor_url(url: str) -> tuple[bool, str]:
     """Bounded GET of a monitor URL. Returns (ok, body-or-error)."""
     import urllib.request
@@ -125,18 +117,32 @@ def _fetch_monitor_url(url: str) -> tuple[bool, str]:
         return False, f"monitor_url fetch failed: {exc}"
 
 
-def _run_monitor_source(job: dict) -> tuple[bool, str]:
+def _run_monitor_source(
+    job: dict,
+    *,
+    claim_ownership_lost: Optional[threading.Event] = None,
+) -> tuple[bool, str]:
     """Run the job's monitor source (script or URL). Returns (ok, output)."""
     monitor_script = (job.get("monitor_script") or "").strip()
     if monitor_script:
         # Same containment + interpreter rules as the existing `script` field.
-        from cron.scheduler import _run_job_script
+        from cron.scheduler import _run_job_script_with_claim_heartbeat
 
         workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(monitor_script, workdir=workdir)
+        return _run_job_script_with_claim_heartbeat(
+            job,
+            monitor_script,
+            workdir=workdir,
+            claim_ownership_lost=claim_ownership_lost,
+        )
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
-        return _fetch_monitor_url(monitor_url)
+        if claim_ownership_lost is not None and claim_ownership_lost.is_set():
+            return False, "Run claim ownership was lost before monitor fetch."
+        result = _fetch_monitor_url(monitor_url)
+        if claim_ownership_lost is not None and claim_ownership_lost.is_set():
+            return False, "Run claim ownership was lost during monitor fetch."
+        return result
     return False, "monitor job has neither monitor_script nor monitor_url"
 
 
@@ -144,7 +150,11 @@ def job_has_monitor(job: dict) -> bool:
     return bool((job.get("monitor_script") or "").strip() or (job.get("monitor_url") or "").strip())
 
 
-def check_monitor(job: dict) -> MonitorOutcome:
+def check_monitor(
+    job: dict,
+    *,
+    claim_ownership_lost: Optional[threading.Event] = None,
+) -> MonitorOutcome:
     """Run the monitor source and decide whether the agent should run.
 
     On change (or first run) the new hash + snapshot are persisted BEFORE
@@ -153,9 +163,21 @@ def check_monitor(job: dict) -> MonitorOutcome:
     On failure nothing is persisted.
     """
     job_id = str(job.get("id") or "")
-    ok, output = _run_monitor_source(job)
+    claim = job.get("run_claim")
+    expected_owner = (
+        str(claim.get("by") or "") if isinstance(claim, dict) else ""
+    ) or None
+    ok, output = _run_monitor_source(
+        job,
+        claim_ownership_lost=claim_ownership_lost,
+    )
     if not ok:
         return MonitorOutcome(ok=False, error=output)
+    if claim_ownership_lost is not None and claim_ownership_lost.is_set():
+        return MonitorOutcome(
+            ok=False,
+            error="Run claim ownership was lost after monitor source execution.",
+        )
 
     new_hash = hash_monitor_output(output)
     raw_state = job.get("monitor_state")
@@ -188,25 +210,40 @@ def check_monitor(job: dict) -> MonitorOutcome:
             f"### Current output\n\n```\n{shown_output}\n```"
         )
 
-    _persist_monitor_state(job_id, new_hash, output)
+    persisted = _persist_monitor_state(
+        job_id,
+        new_hash,
+        output,
+        expected_run_claim_owner=expected_owner,
+    )
+    if expected_owner is not None and not persisted:
+        if claim_ownership_lost is not None:
+            claim_ownership_lost.set()
+        return MonitorOutcome(
+            ok=False,
+            error="Run claim ownership was lost before monitor state persistence.",
+        )
     return MonitorOutcome(
         ok=True, changed=True, first_run=first_run, context_block=context_block
     )
 
 
-def _persist_monitor_state(job_id: str, new_hash: str, output: str) -> None:
-    from cron.jobs import _hermes_now, update_job
+def _persist_monitor_state(
+    job_id: str,
+    new_hash: str,
+    output: str,
+    *,
+    expected_run_claim_owner: Optional[str] = None,
+) -> bool:
+    from cron.jobs import persist_monitor_state
 
-    _write_last_output(job_id, output)
     try:
-        update_job(
+        return persist_monitor_state(
             job_id,
-            {
-                "monitor_state": {
-                    "last_output_hash": new_hash,
-                    "last_changed_at": _hermes_now().isoformat(),
-                }
-            },
+            new_hash,
+            output,
+            expected_run_claim_owner=expected_run_claim_owner,
         )
     except Exception as exc:
         logger.warning("Monitor: failed to persist state for %r: %s", job_id, exc)
+        return False

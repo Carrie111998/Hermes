@@ -58,3 +58,46 @@ def test_mark_job_run_clears_claim(temp_home):
     assert get_job(jid).get("fire_claim") is None
     # …and the re-armed recurring job is claimable again.
     assert claim_job_for_fire(jid) is True
+
+
+def test_manual_fire_cannot_impersonate_fresh_scheduled_run(temp_home):
+    """A run-now request loses while a scheduled attempt owns run_claim."""
+    from datetime import datetime, timezone
+    from cron.jobs import create_job, claim_job_for_fire, get_job, save_jobs
+
+    job = create_job(prompt="x", schedule="every 1h")
+    jobs = [get_job(job["id"])]
+    jobs[0]["run_claim"] = {
+        "at": datetime.now(timezone.utc).isoformat(),
+        "by": "scheduled-attempt",
+    }
+    save_jobs(jobs)
+
+    assert claim_job_for_fire(job["id"]) is False
+    assert get_job(job["id"])["run_claim"]["by"] == "scheduled-attempt"
+
+
+def test_attempt_claim_returns_exact_persisted_fence_token(temp_home):
+    from cron.jobs import claim_job_for_fire_attempt, create_job, get_job
+
+    job = create_job(prompt="x", schedule="every 1h")
+    token = claim_job_for_fire_attempt(job["id"])
+
+    assert token
+    assert get_job(job["id"])["run_claim"]["by"] == token
+
+
+def test_small_future_clock_skew_does_not_replace_live_claim(temp_home):
+    from datetime import datetime, timedelta, timezone
+    from cron.jobs import create_job, claim_job_for_fire, get_job, save_jobs
+
+    job = create_job(prompt="x", schedule="every 1h")
+    record = get_job(job["id"])
+    record["run_claim"] = {
+        "at": (datetime.now(timezone.utc) + timedelta(seconds=1)).isoformat(),
+        "by": "future-live-owner",
+    }
+    save_jobs([record])
+
+    assert claim_job_for_fire(job["id"]) is False
+    assert get_job(job["id"])["run_claim"]["by"] == "future-live-owner"

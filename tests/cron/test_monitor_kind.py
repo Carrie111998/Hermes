@@ -23,7 +23,10 @@ enabler: #80774.
 from __future__ import annotations
 
 import json
+import shlex
 import sys
+import threading
+import time
 
 import pytest
 
@@ -386,6 +389,123 @@ def test_monitor_script_failure_is_error_not_change(hermes_env, monkeypatch):
     assert observed["agent_runs"] == 1  # agent NOT invoked on source failure
     # Stored hash untouched — a later recovery to 'state A' still suppresses.
     assert get_job(job["id"])["monitor_state"]["last_output_hash"] == stored_hash
+
+
+def test_claim_loss_terminates_monitor_script_process_group(
+    hermes_env, monkeypatch
+):
+    """A replaced attempt cannot leave monitor-script children doing work."""
+    from cron.jobs import get_job, update_job
+    import cron.scheduler as scheduler
+
+    started = hermes_env / "monitor-started"
+    side_effect = hermes_env / "stale-side-effect"
+    job = _make_monitor_job(
+        hermes_env,
+        "printf started > " + shlex.quote(str(started)) + "\n"
+        "(\n"
+        "  sleep 0.5\n"
+        "  printf stale > " + shlex.quote(str(side_effect)) + "\n"
+        ") &\n"
+        "wait\n",
+    )
+    update_job(
+        job["id"],
+        {
+            "run_claim": {
+                "at": "2026-08-11T00:00:00+00:00",
+                "by": "original-attempt",
+            }
+        },
+    )
+    job = get_job(job["id"])
+    ownership_lost = threading.Event()
+    heartbeat_calls = 0
+
+    def lose_after_monitor_starts(*_args, **_kwargs):
+        nonlocal heartbeat_calls
+        heartbeat_calls += 1
+        if heartbeat_calls == 1:
+            return True
+        deadline = time.monotonic() + 2
+        while not started.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert started.exists(), "monitor script never started"
+        return False
+
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+    monkeypatch.setattr(scheduler, "_RUN_CLAIM_HEARTBEAT_SECONDS", 0.01)
+    monkeypatch.setattr(scheduler, "heartbeat_run_claim", lose_after_monitor_starts)
+
+    success, _doc, _final, error = scheduler.run_job(
+        job,
+        claim_ownership_lost=ownership_lost,
+    )
+
+    assert success is False
+    assert "ownership was lost" in str(error).lower()
+    assert ownership_lost.is_set()
+    time.sleep(0.7)
+    assert not side_effect.exists()
+    assert observed["agent_runs"] == 0
+
+
+def test_successor_monitor_state_survives_stale_attempt_persistence(
+    hermes_env, monkeypatch
+):
+    """A source that returns after claim replacement cannot overwrite state."""
+    from cron.jobs import get_job, update_job
+    import cron.monitor as monitor
+
+    job = _make_monitor_job(hermes_env, "echo stale\n")
+    update_job(
+        job["id"],
+        {
+            "run_claim": {
+                "at": "2026-08-11T00:00:00+00:00",
+                "by": "original-attempt",
+            },
+            "monitor_state": {
+                "last_output_hash": "original-hash",
+                "last_changed_at": "2026-08-11T00:00:00+00:00",
+            },
+        },
+    )
+    job = get_job(job["id"])
+    snapshot_path = monitor._snapshot_path(job["id"])
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_path.write_text("original snapshot", encoding="utf-8")
+    successor_state = {
+        "last_output_hash": "successor-hash",
+        "last_changed_at": "2026-08-11T00:01:00+00:00",
+    }
+    successor_claim = {
+        "at": "2026-08-11T00:01:00+00:00",
+        "by": "successor-attempt",
+    }
+
+    def fetch_after_successor_takes_over(_job, **_kwargs):
+        update_job(
+            job["id"],
+            {
+                "run_claim": successor_claim,
+                "monitor_state": successor_state,
+            },
+        )
+        snapshot_path.write_text("successor snapshot", encoding="utf-8")
+        return True, "stale output"
+
+    monkeypatch.setattr(monitor, "_run_monitor_source", fetch_after_successor_takes_over)
+
+    outcome = monitor.check_monitor(job)
+
+    persisted = get_job(job["id"])
+    assert outcome.ok is False
+    assert "ownership was lost" in str(outcome.error).lower()
+    assert persisted["run_claim"] == successor_claim
+    assert persisted["monitor_state"] == successor_state
+    assert snapshot_path.read_text(encoding="utf-8") == "successor snapshot"
 
 
 # ---------------------------------------------------------------------------

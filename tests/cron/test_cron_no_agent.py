@@ -135,6 +135,46 @@ def test_run_job_no_agent_reloads_dotenv_before_script(hermes_env, monkeypatch):
     assert str(loaded_homes[0]) == str(hermes_env)
 
 
+def test_secondary_no_agent_does_not_mutate_process_dotenv(
+    hermes_env, tmp_path, monkeypatch
+):
+    import cron.scheduler as scheduler
+    import hermes_cli.env_loader as env_loader
+
+    secondary = tmp_path / "secondary"
+    secondary.mkdir()
+    loaded = []
+    monkeypatch.setattr(scheduler, "_hermes_home", secondary)
+    monkeypatch.setattr(
+        scheduler, "get_process_hermes_home", lambda: hermes_env
+    )
+    monkeypatch.setattr(
+        env_loader,
+        "load_hermes_dotenv",
+        lambda **kwargs: loaded.append(kwargs),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_run_job_script_with_claim_heartbeat",
+        lambda *_a, **_kw: (True, "ok"),
+    )
+
+    success, _doc, response, error = scheduler.run_job(
+        {
+            "id": "secondary-no-agent",
+            "name": "secondary",
+            "no_agent": True,
+            "script": "probe.sh",
+            "deliver": "local",
+        }
+    )
+
+    assert success is True
+    assert response == "ok"
+    assert error is None
+    assert loaded == []
+
+
 # ---------------------------------------------------------------------------
 # _run_job_script: shell-script support
 # ---------------------------------------------------------------------------

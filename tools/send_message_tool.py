@@ -180,8 +180,58 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     return None
 
 
-async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs):
+def _ownership_guard_active(ownership_guard) -> bool:
+    """Fail closed when a cron attempt's ownership cannot be verified."""
+    if ownership_guard is None:
+        return True
+    try:
+        return bool(ownership_guard())
+    except Exception:
+        logger.exception("Standalone delivery ownership guard failed")
+        return False
+
+
+class _GuardedMediaSequence:
+    """List-like media view that stops iteration as soon as ownership is lost."""
+
+    def __init__(self, media_files, ownership_guard):
+        self._media_files = list(media_files)
+        self._ownership_guard = ownership_guard
+
+    def __bool__(self):
+        return bool(self._media_files) and _ownership_guard_active(
+            self._ownership_guard
+        )
+
+    def __len__(self):
+        if not _ownership_guard_active(self._ownership_guard):
+            return 0
+        return len(self._media_files)
+
+    def __iter__(self):
+        for item in self._media_files:
+            if not _ownership_guard_active(self._ownership_guard):
+                return
+            yield item
+
+    def __getitem__(self, index):
+        if not _ownership_guard_active(self._ownership_guard):
+            if isinstance(index, slice):
+                return []
+            raise IndexError(index)
+        return self._media_files[index]
+
+
+async def _send_telegram_message_with_retry(
+    bot,
+    *,
+    attempts: int = 3,
+    ownership_guard=None,
+    **kwargs,
+):
     for attempt in range(attempts):
+        if not _ownership_guard_active(ownership_guard):
+            raise RuntimeError("Delivery ownership lost during standalone send")
         try:
             return await bot.send_message(**kwargs)
         except Exception as exc:
@@ -694,6 +744,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    ownership_guard=None,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -707,6 +758,8 @@ async def _send_via_adapter(
       3. A descriptive error explaining both options.
     """
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
+    if not _ownership_guard_active(ownership_guard):
+        return {"error": "Delivery ownership lost during standalone send"}
     runner = None
     try:
         from gateway.run import _gateway_runner_ref
@@ -728,7 +781,11 @@ async def _send_via_adapter(
                     metadata["publish_topic"] = chat_id
                 if not metadata:
                     metadata = None
+                if not _ownership_guard_active(ownership_guard):
+                    return {"error": "Delivery ownership lost during standalone send"}
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
+                if not _ownership_guard_active(ownership_guard):
+                    return {"error": "Delivery ownership lost during standalone send"}
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -746,6 +803,8 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
@@ -754,6 +813,8 @@ async def _send_via_adapter(
                 media_files=media_files,
                 force_document=force_document,
             )
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -780,7 +841,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    ownership_guard=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -789,14 +859,42 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     """
     from gateway.config import Platform
 
+    def _owned():
+        if ownership_guard is None:
+            return True
+        try:
+            return bool(ownership_guard())
+        except Exception:
+            logger.exception("Standalone delivery ownership guard failed")
+            return False
+
+    ownership_error = {
+        "error": "Delivery ownership lost during standalone send"
+    }
+    if not _owned():
+        return ownership_error
+
     media_files = media_files or []
+    if ownership_guard is not None and media_files:
+        media_files = _GuardedMediaSequence(media_files, ownership_guard)
 
     # Weixin handles text/media delivery inside its native helper and does not
     # need the optional platform adapter imports below. Keep this branch early
     # so a Weixin send is not blocked by unrelated optional dependencies (for
     # example lark-oapi's heavy Feishu import path).
     if platform == Platform.WEIXIN:
-        return await _send_weixin(pconfig, chat_id, message, media_files=media_files)
+        if not _owned():
+            return ownership_error
+        result = await _send_weixin(
+            pconfig,
+            chat_id,
+            message,
+            media_files=media_files,
+            ownership_guard=ownership_guard,
+        )
+        if not _owned():
+            return ownership_error
+        return result
 
     from gateway.platforms.base import BasePlatformAdapter, utf16_len
 
@@ -852,7 +950,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # after all text chunks.
     if platform == Platform.TELEGRAM:
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
-        return await _send_telegram(
+        result = await _send_telegram(
             pconfig.token,
             chat_id,
             message,
@@ -860,7 +958,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            ownership_guard=ownership_guard,
         )
+        if not _owned():
+            return ownership_error
+        return result
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
     # The plugin's ``_standalone_send`` (registered in
@@ -883,6 +985,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _dc_caption is not None:
+            if not _owned():
+                return ownership_error
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
@@ -891,11 +995,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files,
                 caption=_dc_caption,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await entry.standalone_sender_fn(
                 pconfig,
@@ -904,6 +1012,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -917,6 +1027,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.MATRIX:
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await _send_matrix_via_adapter(
                 pconfig,
@@ -924,7 +1036,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 chunk,
                 media_files=media_files if is_last else [],
                 thread_id=thread_id,
+                ownership_guard=ownership_guard,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -934,13 +1049,18 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.SIGNAL and media_files:
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await _send_signal(
                 pconfig.extra,
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else [],
+                ownership_guard=ownership_guard,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -950,12 +1070,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.YUANBAO and media_files:
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await _send_yuanbao(
                 chat_id,
                 chunk,
                 media_files=media_files if is_last else None,
+                ownership_guard=ownership_guard,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -972,6 +1097,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             return {"error": "Feishu plugin not registered or missing standalone_sender_fn"}
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await _feishu_entry.standalone_sender_fn(
                 pconfig,
@@ -980,6 +1107,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files if is_last else None,
                 thread_id=thread_id,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -1001,6 +1130,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             max_caption_len=(max_len or _DEFAULT_CAPTION_LIMIT),
         )
         if _sl_caption is not None:
+            if not _owned():
+                return ownership_error
             result = await _slack_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
@@ -1009,11 +1140,15 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 media_files=media_files,
                 caption=_sl_caption,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await _slack_entry.standalone_sender_fn(
                 pconfig,
@@ -1022,6 +1157,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -1050,6 +1187,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         if _wa_caption is not None:
             # Single-file captioned send: no separate text chunk, caption on
             # the media itself.
+            if not _owned():
+                return ownership_error
             result = await _wa_entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
@@ -1059,10 +1198,14 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 force_document=force_document,
                 caption=_wa_caption,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             return result
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = (i == len(chunks) - 1)
             result = await _wa_entry.standalone_sender_fn(
                 pconfig,
@@ -1072,6 +1215,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 force_document=force_document,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -1088,6 +1233,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if platform == Platform.SLACK:
         last_result = None
         for i, chunk in enumerate(chunks):
+            if not _owned():
+                return ownership_error
             is_last = i == len(chunks) - 1
             result = await _send_via_adapter(
                 platform,
@@ -1097,7 +1244,10 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files if is_last else [],
                 force_document=force_document,
+                ownership_guard=ownership_guard,
             )
+            if not _owned():
+                return ownership_error
             if isinstance(result, dict) and result.get("error"):
                 return result
             last_result = result
@@ -1120,10 +1270,17 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     last_result = None
     for chunk in chunks:
+        if not _owned():
+            return ownership_error
         if platform == Platform.WHATSAPP:
             result = await _registry_standalone_send("whatsapp", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SIGNAL:
-            result = await _send_signal(pconfig.extra, chat_id, chunk)
+            result = await _send_signal(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                ownership_guard=ownership_guard,
+            )
         elif platform == Platform.EMAIL:
             result = await _registry_standalone_send("email", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.SMS:
@@ -1135,11 +1292,25 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         elif platform == Platform.WECOM:
             result = await _registry_standalone_send("wecom", pconfig, chat_id, chunk, thread_id)
         elif platform == Platform.BLUEBUBBLES:
-            result = await _send_bluebubbles(pconfig.extra, chat_id, chunk)
+            result = await _send_bluebubbles(
+                pconfig.extra,
+                chat_id,
+                chunk,
+                ownership_guard=ownership_guard,
+            )
         elif platform == Platform.QQBOT:
-            result = await _send_qqbot(pconfig, chat_id, chunk)
+            result = await _send_qqbot(
+                pconfig,
+                chat_id,
+                chunk,
+                ownership_guard=ownership_guard,
+            )
         elif platform == Platform.YUANBAO:
-            result = await _send_yuanbao(chat_id, chunk)
+            result = await _send_yuanbao(
+                chat_id,
+                chunk,
+                ownership_guard=ownership_guard,
+            )
         else:
             # Plugin platform: route through the gateway's live adapter if
             # available, otherwise the plugin's standalone_sender_fn.
@@ -1151,8 +1322,11 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                ownership_guard=ownership_guard,
             )
 
+        if not _owned():
+            return ownership_error
         if isinstance(result, dict) and result.get("error"):
             return result
         last_result = result
@@ -1173,7 +1347,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    ownership_guard=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1298,11 +1481,15 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 formatted, 4096, len_fn=utf16_len
             )
             for chunk in text_chunks:
+                if not _ownership_guard_active(ownership_guard):
+                    return {"error": "Delivery ownership lost during standalone send"}
                 try:
                     last_msg = await _send_telegram_message_with_retry(
                         bot,
                         chat_id=int_chat_id, text=chunk,
-                        parse_mode=send_parse_mode, **text_kwargs
+                        parse_mode=send_parse_mode,
+                        ownership_guard=ownership_guard,
+                        **text_kwargs,
                     )
                 except Exception as md_error:
                     # Thread not found — retry without message_thread_id so the
@@ -1317,7 +1504,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=chunk,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            ownership_guard=ownership_guard,
+                            **text_kwargs,
                         )
                     elif "parse" in str(md_error).lower() or "markdown" in str(md_error).lower() or "html" in str(md_error).lower():
                         logger.warning(
@@ -1336,12 +1525,16 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         last_msg = await _send_telegram_message_with_retry(
                             bot,
                             chat_id=int_chat_id, text=plain,
-                            parse_mode=None, **text_kwargs
+                            parse_mode=None,
+                            ownership_guard=ownership_guard,
+                            **text_kwargs,
                         )
                     else:
                         raise
 
         for media_path, is_voice in media_files:
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             if not os.path.exists(media_path):
                 warning = f"Media file not found, skipping: {media_path}"
                 logger.warning(warning)
@@ -1353,7 +1546,9 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     try:
                         last_msg = await _send_telegram_message_with_retry(
                             bot, chat_id=int_chat_id, text=_tg_caption,
-                            parse_mode=send_parse_mode, **text_kwargs
+                            parse_mode=send_parse_mode,
+                            ownership_guard=ownership_guard,
+                            **text_kwargs,
                         )
                         _tg_caption = None  # delivered — don't re-caption a later file
                     except Exception as _cap_err:
@@ -1383,6 +1578,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                         except Exception:
                             pass
                     try:
+                        if not _ownership_guard_active(ownership_guard):
+                            return {"error": "Delivery ownership lost during standalone send"}
                         if ext in _IMAGE_EXTS and not force_document:
                             last_msg = await bot.send_photo(
                                 chat_id=int_chat_id, photo=f, **media_kwargs
@@ -1414,6 +1611,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                             # Re-seek the file since the first attempt consumed it
                             f.seek(0)
                             media_kwargs.pop("message_thread_id", None)
+                            if not _ownership_guard_active(ownership_guard):
+                                return {"error": "Delivery ownership lost during standalone send"}
                             if ext in _IMAGE_EXTS and not force_document:
                                 last_msg = await bot.send_photo(
                                     chat_id=int_chat_id, photo=f, **media_kwargs
@@ -1453,6 +1652,8 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                                     media_kwargs["caption"] = _strip_mdv2(media_kwargs["caption"])
                                 except Exception:
                                     pass
+                            if not _ownership_guard_active(ownership_guard):
+                                return {"error": "Delivery ownership lost during standalone send"}
                             if ext in _IMAGE_EXTS and not force_document:
                                 last_msg = await bot.send_photo(
                                     chat_id=int_chat_id, photo=f, **media_kwargs
@@ -1595,7 +1796,13 @@ async def _resolve_slack_user_target(token, chat_id):
         return None, _error(f"Slack DM resolution failed: {e}")
 
 
-async def _send_signal(extra, chat_id, message, media_files=None):
+async def _send_signal(
+    extra,
+    chat_id,
+    message,
+    media_files=None,
+    ownership_guard=None,
+):
     """Send via signal-cli JSON-RPC API.
 
     Supports both text-only and text-with-attachments (images/audio/documents).
@@ -1649,6 +1856,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         plain_text, text_styles = markdown_to_signal(message)
 
         async def _post(batch_attachments, batch_message):
+            if not _ownership_guard_active(ownership_guard):
+                raise RuntimeError("Delivery ownership lost during standalone send")
             params = {"account": account, "message": batch_message}
             if batch_message and text_styles:
                 if len(text_styles) == 1:
@@ -1676,6 +1885,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 
         async def _send_inline_notice(text: str) -> None:
             """Best-effort one-shot RPC for a user-facing pacing notice."""
+            if not _ownership_guard_active(ownership_guard):
+                return
             notice_params = {"account": account, "message": text}
             if chat_id.startswith("group:"):
                 notice_params["groupId"] = chat_id[6:]
@@ -1702,6 +1913,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
         )
         failed_batches: list[int] = []
         for idx, att_batch in enumerate(att_batches):
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             n = len(att_batch)
             if n > 0:
                 estimated = scheduler.estimate_wait(n)
@@ -1714,6 +1927,8 @@ async def _send_signal(extra, chat_id, message, media_files=None):
             batch_message = plain_text if idx == 0 else ""
 
             for attempt in range(1, SIGNAL_RATE_LIMIT_MAX_ATTEMPTS + 1):
+                if not _ownership_guard_active(ownership_guard):
+                    return {"error": "Delivery ownership lost during standalone send"}
                 try:
                     await scheduler.acquire(n)
                     _rpc_t0 = time.monotonic()
@@ -1794,7 +2009,14 @@ async def _send_signal(extra, chat_id, message, media_files=None):
 # (_send_matrix_via_adapter below stays — it's the native-media upload path.)
 
 
-async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, thread_id=None):
+async def _send_matrix_via_adapter(
+    pconfig,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    ownership_guard=None,
+):
     """Send via the Matrix adapter so native Matrix media uploads are preserved.
 
     When a live gateway adapter is available (i.e. the tool runs inside a
@@ -1842,7 +2064,12 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
         # before the ephemeral ``adapter`` is constructed below, so the
         # ephemeral ``finally`` disconnect never touches the live session.
         return await _matrix_send_core(
-            live_adapter, chat_id, message, media_files, metadata
+            live_adapter,
+            chat_id,
+            message,
+            media_files,
+            metadata,
+            ownership_guard=ownership_guard,
         )
 
     # --- Fallback: ephemeral adapter (standalone / cron context) ---
@@ -1853,11 +2080,18 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
 
     adapter = MatrixAdapter(pconfig)
     try:
+        if not _ownership_guard_active(ownership_guard):
+            return {"error": "Delivery ownership lost during standalone send"}
         connected = await adapter.connect()
         if not connected:
             return _error("Matrix connect failed")
         return await _matrix_send_core(
-            adapter, chat_id, message, media_files, metadata
+            adapter,
+            chat_id,
+            message,
+            media_files,
+            metadata,
+            ownership_guard=ownership_guard,
         )
     except Exception as e:
         return _error(f"Matrix send failed: {e}")
@@ -1868,16 +2102,27 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
             pass
 
 
-async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
+async def _matrix_send_core(
+    adapter,
+    chat_id,
+    message,
+    media_files,
+    metadata,
+    ownership_guard=None,
+):
     """Core send logic shared by live and ephemeral Matrix adapters."""
     last_result = None
 
     if message.strip():
+        if not _ownership_guard_active(ownership_guard):
+            return {"error": "Delivery ownership lost during standalone send"}
         last_result = await adapter.send(chat_id, message, metadata=metadata)
         if not last_result.success:
             return _error(f"Matrix send failed: {last_result.error}")
 
     for media_path, is_voice in media_files:
+        if not _ownership_guard_active(ownership_guard):
+            return {"error": "Delivery ownership lost during standalone send"}
         if not os.path.exists(media_path):
             return _error(f"Media file not found: {media_path}")
 
@@ -1915,7 +2160,13 @@ async def _matrix_send_core(adapter, chat_id, message, media_files, metadata):
 # wired via standalone_sender_fn and reached through _registry_standalone_send. #41112.
 
 
-async def _send_weixin(pconfig, chat_id, message, media_files=None):
+async def _send_weixin(
+    pconfig,
+    chat_id,
+    message,
+    media_files=None,
+    ownership_guard=None,
+):
     """Send via Weixin iLink using the native adapter helper."""
     try:
         from gateway.platforms.weixin import check_weixin_requirements, send_weixin_direct
@@ -1931,12 +2182,18 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
             chat_id=chat_id,
             message=message,
             media_files=media_files,
+            ownership_guard=ownership_guard,
         )
     except Exception as e:
         return _error(f"Weixin send failed: {e}")
 
 
-async def _send_bluebubbles(extra, chat_id, message):
+async def _send_bluebubbles(
+    extra,
+    chat_id,
+    message,
+    ownership_guard=None,
+):
     """Send via BlueBubbles iMessage server using the adapter's REST API."""
     try:
         from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
@@ -1949,10 +2206,14 @@ async def _send_bluebubbles(extra, chat_id, message):
         from gateway.config import PlatformConfig
         pconfig = PlatformConfig(extra=extra)
         adapter = BlueBubblesAdapter(pconfig)
+        if not _ownership_guard_active(ownership_guard):
+            return {"error": "Delivery ownership lost during standalone send"}
         connected = await adapter.connect()
         if not connected:
             return _error("BlueBubbles: failed to connect to server")
         try:
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             result = await adapter.send(chat_id, message)
             if not result.success:
                 return _error(f"BlueBubbles send failed: {result.error}")
@@ -1994,7 +2255,7 @@ def _check_send_message():
         return False
 
 
-async def _send_qqbot(pconfig, chat_id, message):
+async def _send_qqbot(pconfig, chat_id, message, ownership_guard=None):
     """Send via QQBot using the REST API directly (no WebSocket needed).
 
     Uses the QQ Bot Open Platform REST endpoints to get an access token
@@ -2021,6 +2282,8 @@ async def _send_qqbot(pconfig, chat_id, message):
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             # Step 1: Get access token
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             token_resp = await client.post(
                 "https://bots.qq.com/app/getAppAccessToken",
                 json={"appId": str(appid), "clientSecret": str(secret)},
@@ -2042,6 +2305,8 @@ async def _send_qqbot(pconfig, chat_id, message):
             payload = {"content": message[:4000], "msg_type": 0}
 
             # Try channel endpoint first (works for guild channels)
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             url = f"https://api.sgroup.qq.com/channels/{chat_id}/messages"
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code in {200, 201}:
@@ -2050,6 +2315,8 @@ async def _send_qqbot(pconfig, chat_id, message):
                         "message_id": data.get("id")}
 
             # If channel endpoint failed (likely "频道不存在"), try C2C endpoint
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             url_c2c = f"https://api.sgroup.qq.com/v2/users/{chat_id}/messages"
             resp_c2c = await client.post(url_c2c, json=payload, headers=headers)
             if resp_c2c.status_code in {200, 201}:
@@ -2058,6 +2325,8 @@ async def _send_qqbot(pconfig, chat_id, message):
                         "message_id": data.get("id")}
 
             # If C2C also failed, try group endpoint
+            if not _ownership_guard_active(ownership_guard):
+                return {"error": "Delivery ownership lost during standalone send"}
             url_group = f"https://api.sgroup.qq.com/v2/groups/{chat_id}/messages"
             resp_group = await client.post(url_group, json=payload, headers=headers)
             if resp_group.status_code in {200, 201}:
@@ -2071,7 +2340,12 @@ async def _send_qqbot(pconfig, chat_id, message):
         return _error(f"QQBot send failed: {e}")
 
 
-async def _send_yuanbao(chat_id, message, media_files=None):
+async def _send_yuanbao(
+    chat_id,
+    message,
+    media_files=None,
+    ownership_guard=None,
+):
     """Send via Yuanbao using the running gateway adapter's WebSocket connection.
 
     Yuanbao uses a persistent WebSocket — unlike HTTP-based platforms, we
@@ -2095,7 +2369,13 @@ async def _send_yuanbao(chat_id, message, media_files=None):
         )
 
     try:
-        return await send_yuanbao_direct(adapter, chat_id, message, media_files=media_files)
+        return await send_yuanbao_direct(
+            adapter,
+            chat_id,
+            message,
+            media_files=media_files,
+            ownership_guard=ownership_guard,
+        )
     except Exception as e:
         return _error(f"Yuanbao send failed: {e}")
 

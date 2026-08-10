@@ -110,17 +110,45 @@ class CronScheduler(ABC):
         Returns True if THIS caller claimed and ran the job, False if the claim
         was lost (another machine/retry won it) or the job no longer exists.
         """
-        from cron.jobs import claim_job_for_fire, get_job
+        from cron.jobs import (
+            claim_job_for_fire_attempt,
+            get_job,
+            release_run_claim,
+        )
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        attempt_owner = claim_job_for_fire_attempt(job_id)
+        if attempt_owner is None:
             return False  # another machine already claimed this fire
-        job = get_job(job_id)
-        if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        handed_off = False
+        try:
+            job = get_job(job_id)
+            if job is None:
+                return False  # removed between atomic claim and refetch
+            run_claim = job.get("run_claim")
+            if (
+                not isinstance(run_claim, dict)
+                or run_claim.get("by") != attempt_owner
+            ):
+                return False  # a successor replaced this exact attempt
+            job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+            # From here run_one_job owns terminal bookkeeping/release. Set the
+            # flag before calling it so even BaseException cannot make this
+            # pre-handoff cleanup impersonate a completed worker.
+            handed_off = True
+            return run_one_job(job, adapters=adapters, loop=loop)
+        except Exception:
+            return False
+        finally:
+            if not handed_off:
+                try:
+                    release_run_claim(job_id, expected_owner=attempt_owner)
+                except Exception:
+                    # Exact-owner release is best effort. A later TTL retry is
+                    # safer than allowing cleanup failure to escape the fire
+                    # endpoint and trigger an unbounded upstream retry storm.
+                    pass
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):
@@ -192,11 +220,15 @@ class InProcessCronScheduler(CronScheduler):
         interval=60,
         can_dispatch=None,
         profile_homes=None,
+        gateway_owner_id=None,
+        recover_when_dispatchable=False,
     ):
         import logging
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
+            clear_gateway_ticker_lease,
             clear_ticker_error,
+            record_gateway_ticker_lease,
             record_ticker_error,
             record_ticker_heartbeat,
         )
@@ -219,56 +251,137 @@ class InProcessCronScheduler(CronScheduler):
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
+                gateway_owner_id=gateway_owner_id,
             )
             return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
-        if recovered:
-            logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
-                recovered,
-            )
-        # Heartbeat once before the first sleep so `hermes cron status` sees a
-        # live ticker immediately after startup, not only after the first tick.
-        record_ticker_heartbeat()
-        while not stop_event.is_set():
-            ok = False
+        recovery_pending = True
+
+        def _recover_once():
+            nonlocal recovery_pending
+            recovered = self.recover_interrupted()
+            recovery_pending = False
+            if recovered:
+                logger.warning(
+                    "Marked %d interrupted cron execution(s) unknown after restart",
+                    recovered,
+                )
+
+        def _publish_gateway_lease() -> bool:
+            if gateway_owner_id is None:
+                return True
             try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    cron_tick(
-                        verbose=False,
-                        adapters=adapters,
-                        loop=loop,
-                        sync=False,
-                        can_dispatch=can_dispatch,
+                record_gateway_ticker_lease(gateway_owner_id)
+                return True
+            except Exception as exc:
+                logger.error(
+                    "Could not publish gateway cron ownership lease: %s; "
+                    "skipping dispatch and retrying next cycle",
+                    exc,
+                    exc_info=True,
+                )
+                # An earlier successful refresh may still exist. Remove only
+                # this unique owner's path so Desktop can take over promptly.
+                try:
+                    clear_gateway_ticker_lease(gateway_owner_id)
+                except Exception:
+                    logger.warning(
+                        "Could not clear failed gateway cron ownership lease",
+                        exc_info=True,
                     )
-                ok = True
-            except BaseException as e:
-                # Catch BaseException (not just Exception) so a SystemExit from
-                # a misbehaving provider SDK / agent retry path does not kill
-                # the ticker thread silently (#32612). KeyboardInterrupt is
-                # intentionally caught here too — gateway shutdown is driven by
-                # stop_event (set by the main thread's signal handler), not by
-                # an exception in this daemon thread, so swallowing it and
-                # re-checking stop_event keeps shutdown clean.
-                logger.error("Cron tick error: %s", e, exc_info=True)
-                # Persist the failure reason next to the heartbeat markers so
-                # `hermes cron status`/`list` (separate processes) can show
-                # WHY ticks fail, not just that the success marker is stale —
-                # e.g. a root-rewritten jobs.json locking out the ticker's
-                # uid went unnoticed for ~14h with the reason buried in the
-                # gateway log (#68483).
-                record_ticker_error(f"{type(e).__name__}: {e}")
-            # Record liveness every iteration; bump the success marker only on a
-            # clean tick, so status can tell "alive but failing every tick" from
-            # "actually firing jobs" (#32612, #32895).
-            record_ticker_heartbeat(success=ok)
-            if ok:
-                clear_ticker_error()
-            stop_event.wait(interval)
+                try:
+                    record_ticker_error(f"GatewayTickerLeaseError: {exc}")
+                except Exception:
+                    logger.warning(
+                        "Could not record gateway cron ownership failure",
+                        exc_info=True,
+                    )
+                return False
+
+        try:
+            if not recover_when_dispatchable:
+                _recover_once()
+
+            # Heartbeat once before the first sleep so `hermes cron status`
+            # sees a live ticker immediately after startup, not only after the
+            # first tick.
+            record_ticker_heartbeat()
+            while not stop_event.is_set():
+                # This is the readiness boundary: publish only after provider
+                # initialization/recovery completed. A transient fsync/write
+                # failure skips this cycle and retries instead of killing the
+                # ticker thread or dispatching without an ownership signal.
+                if not _publish_gateway_lease():
+                    try:
+                        record_ticker_heartbeat(success=False)
+                    except Exception:
+                        logger.warning(
+                            "Could not record failed gateway cron heartbeat",
+                            exc_info=True,
+                        )
+                    stop_event.wait(interval)
+                    continue
+
+                ok = False
+                try:
+                    dispatch_allowed = can_dispatch is None or can_dispatch()
+                    # Desktop uses deferred recovery during a Gateway handoff.
+                    # Probe again immediately before reconciliation to close
+                    # the gap between its outer standby check and provider
+                    # startup as tightly as possible.
+                    if (
+                        dispatch_allowed
+                        and recovery_pending
+                        and recover_when_dispatchable
+                        and can_dispatch is not None
+                    ):
+                        dispatch_allowed = can_dispatch()
+
+                    if not dispatch_allowed:
+                        logger.debug(
+                            "Cron dispatch paused while another owner is active"
+                        )
+                    else:
+                        if recovery_pending:
+                            _recover_once()
+                        # Ownership can change while recovery runs. Recheck
+                        # before the due-job scan so the new owner wins without
+                        # waiting for another full interval.
+                        if can_dispatch is not None and not can_dispatch():
+                            logger.debug(
+                                "Cron dispatch paused after ownership changed"
+                            )
+                        else:
+                            cron_tick(
+                                verbose=False,
+                                adapters=adapters,
+                                loop=loop,
+                                sync=False,
+                                can_dispatch=can_dispatch,
+                            )
+                    ok = True
+                except BaseException as e:
+                    # Catch BaseException (not just Exception) so a SystemExit
+                    # from a misbehaving provider SDK / agent retry path does
+                    # not kill the ticker thread silently (#32612).
+                    logger.error("Cron tick error: %s", e, exc_info=True)
+                    record_ticker_error(f"{type(e).__name__}: {e}")
+                # Record liveness every iteration; bump success only on a clean
+                # tick so status distinguishes alive-but-failing from firing.
+                record_ticker_heartbeat(success=ok)
+                if ok:
+                    clear_ticker_error()
+                stop_event.wait(interval)
+        finally:
+            if gateway_owner_id is not None:
+                try:
+                    clear_gateway_ticker_lease(gateway_owner_id)
+                except Exception:
+                    logger.warning(
+                        "Could not clear gateway cron ownership lease",
+                        exc_info=True,
+                    )
 
     def _start_multiplex(
         self,
@@ -279,6 +392,7 @@ class InProcessCronScheduler(CronScheduler):
         loop=None,
         interval=60,
         can_dispatch=None,
+        gateway_owner_id=None,
     ):
         """Tick every served profile's cron store when multiplex_profiles is on.
 
@@ -291,7 +405,9 @@ class InProcessCronScheduler(CronScheduler):
         import logging
         from cron.scheduler import tick as cron_tick
         from cron.jobs import (
+            clear_gateway_ticker_lease,
             clear_ticker_error,
+            record_gateway_ticker_lease,
             record_ticker_error,
             record_ticker_heartbeat,
             use_cron_store,
@@ -305,63 +421,150 @@ class InProcessCronScheduler(CronScheduler):
             [p[0] if isinstance(p, tuple) else p for p in profile_homes],
         )
 
-        # Recovery + initial heartbeat for every profile.
-        for entry in profile_homes:
-            home = entry[1] if isinstance(entry, tuple) else entry
-            home_token = set_hermes_home_override(str(home))
-            try:
-                with use_cron_store(home):
-                    recovered = self.recover_interrupted()
-                    if recovered:
-                        logger.warning(
-                            "Marked %d interrupted cron execution(s) for profile at %s",
-                            recovered,
-                            home,
-                        )
-                    record_ticker_heartbeat()
-            finally:
-                reset_hermes_home_override(home_token)
+        homes = [entry[1] if isinstance(entry, tuple) else entry for entry in profile_homes]
 
-        while not stop_event.is_set():
-            ok = False
-            try:
-                if can_dispatch is not None and not can_dispatch():
-                    logger.debug("Cron dispatch paused while gateway drains existing work")
-                else:
-                    for entry in profile_homes:
-                        home = entry[1] if isinstance(entry, tuple) else entry
-                        home_token = set_hermes_home_override(str(home))
+        def _clear_profile_leases() -> None:
+            if gateway_owner_id is None:
+                return
+            for home in homes:
+                home_token = None
+                try:
+                    home_token = set_hermes_home_override(str(home))
+                    with use_cron_store(home):
+                        clear_gateway_ticker_lease(gateway_owner_id)
+                except Exception:
+                    logger.warning(
+                        "Could not clear gateway cron ownership lease for %s",
+                        home,
+                        exc_info=True,
+                    )
+                finally:
+                    if home_token is not None:
                         try:
-                            with use_cron_store(home):
-                                cron_tick(
-                                    verbose=False,
-                                    adapters=adapters,
-                                    loop=loop,
-                                    sync=False,
-                                    can_dispatch=can_dispatch,
-                                )
-                        finally:
                             reset_hermes_home_override(home_token)
-                ok = True
-            except BaseException as e:
-                logger.error("Cron tick error: %s", e, exc_info=True)
-                _tick_error = f"{type(e).__name__}: {e}"
-            else:
-                _tick_error = None
-            # Record per-profile heartbeat after each tick cycle.
-            for entry in profile_homes:
-                home = entry[1] if isinstance(entry, tuple) else entry
+                        except Exception:
+                            logger.warning(
+                                "Could not reset profile scope after lease cleanup for %s",
+                                home,
+                                exc_info=True,
+                            )
+
+        def _record_profile_lease_failure(home, lease_error: str | None) -> None:
+            """Best-effort diagnostics that can never terminate multiplex."""
+            home_token = None
+            try:
+                home_token = set_hermes_home_override(str(home))
+                with use_cron_store(home):
+                    record_ticker_heartbeat(success=False)
+                    if lease_error:
+                        record_ticker_error(lease_error)
+            except Exception:
+                logger.warning(
+                    "Could not record gateway lease failure for profile %s",
+                    home,
+                    exc_info=True,
+                )
+            finally:
+                if home_token is not None:
+                    try:
+                        reset_hermes_home_override(home_token)
+                    except Exception:
+                        logger.warning(
+                            "Could not reset profile scope after lease diagnostics for %s",
+                            home,
+                            exc_info=True,
+                        )
+
+        def _publish_profile_leases() -> tuple[bool, str | None]:
+            if gateway_owner_id is None:
+                return True, None
+            try:
+                for home in homes:
+                    home_token = set_hermes_home_override(str(home))
+                    try:
+                        with use_cron_store(home):
+                            record_gateway_ticker_lease(gateway_owner_id)
+                    finally:
+                        reset_hermes_home_override(home_token)
+                return True, None
+            except Exception as exc:
+                logger.error(
+                    "Could not publish multiplex gateway cron ownership leases: %s; "
+                    "skipping dispatch and retrying next cycle",
+                    exc,
+                    exc_info=True,
+                )
+                # Do not leave a partial profile set advertised as ready.
+                _clear_profile_leases()
+                return False, f"GatewayTickerLeaseError: {exc}"
+
+        try:
+            # Complete recovery/initialization for every served profile before
+            # advertising any of them as Gateway-owned. If a later profile's
+            # recovery stalls, already-initialized profiles keep their working
+            # Desktop fallback instead of observing a false ready signal.
+            for home in homes:
                 home_token = set_hermes_home_override(str(home))
                 try:
                     with use_cron_store(home):
-                        record_ticker_heartbeat(success=ok)
-                        # Surface the failure reason (or clear it) per profile
-                        # so `hermes cron status` can show WHY ticks fail
-                        # (#68483).
-                        if ok:
-                            clear_ticker_error()
-                        elif _tick_error:
-                            record_ticker_error(_tick_error)
+                        recovered = self.recover_interrupted()
+                        if recovered:
+                            logger.warning(
+                                "Marked %d interrupted cron execution(s) for profile at %s",
+                                recovered,
+                                home,
+                            )
+                        record_ticker_heartbeat()
                 finally:
                     reset_hermes_home_override(home_token)
-            stop_event.wait(interval)
+
+            while not stop_event.is_set():
+                leases_ready, lease_error = _publish_profile_leases()
+                if not leases_ready:
+                    for home in homes:
+                        _record_profile_lease_failure(home, lease_error)
+                    stop_event.wait(interval)
+                    continue
+
+                ok = False
+                try:
+                    if can_dispatch is not None and not can_dispatch():
+                        logger.debug(
+                            "Cron dispatch paused while gateway drains existing work"
+                        )
+                    else:
+                        for home in homes:
+                            home_token = set_hermes_home_override(str(home))
+                            try:
+                                with use_cron_store(home):
+                                    cron_tick(
+                                        verbose=False,
+                                        adapters=adapters,
+                                        loop=loop,
+                                        sync=False,
+                                        can_dispatch=can_dispatch,
+                                    )
+                            finally:
+                                reset_hermes_home_override(home_token)
+                    ok = True
+                except BaseException as e:
+                    logger.error("Cron tick error: %s", e, exc_info=True)
+                    _tick_error = f"{type(e).__name__}: {e}"
+                else:
+                    _tick_error = None
+                # Record per-profile heartbeat after each tick cycle. The next
+                # cycle refreshes all leases before any profile dispatches.
+                for home in homes:
+                    home_token = set_hermes_home_override(str(home))
+                    try:
+                        with use_cron_store(home):
+                            record_ticker_heartbeat(success=ok)
+                            if ok:
+                                clear_ticker_error()
+                            elif _tick_error:
+                                record_ticker_error(_tick_error)
+                    finally:
+                        reset_hermes_home_override(home_token)
+                stop_event.wait(interval)
+        finally:
+            _clear_profile_leases()

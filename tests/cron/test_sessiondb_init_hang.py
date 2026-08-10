@@ -83,7 +83,7 @@ class TestSessionDbInitTimeout:
              patch("cron.scheduler._resolve_origin", return_value=None), \
              patch("hermes_cli.env_loader.load_hermes_dotenv"), \
              patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-             patch("hermes_state.SessionDB"), \
+             patch("hermes_state.SessionDB") as mock_session_db, \
              patch(
                  "hermes_cli.runtime_provider.resolve_runtime_provider",
                  return_value=_RUNTIME,
@@ -105,6 +105,43 @@ class TestSessionDbInitTimeout:
         assert success is True
         assert final_response == "ok"
         assert mock_agent_cls.call_args.kwargs["session_db"] is None
+        mock_session_db.assert_called_once_with(db_path=tmp_path / "state.db")
+
+    def test_claim_loss_after_setup_prevents_agent_submit(
+        self, tmp_path, monkeypatch
+    ):
+        """A replaced token after agent construction must stop before API/tool work."""
+        job = {
+            "id": "lost-before-submit",
+            "name": "test",
+            "prompt": "hello",
+            "model": "test-model",
+            "run_claim": {
+                "at": "2026-01-01T00:00:00+00:00",
+                "by": "attempt-a",
+            },
+        }
+        fake_db = MagicMock()
+        agent = MagicMock()
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=fake_db), \
+             patch("tools.mcp_tool.discover_mcp_tools", return_value=[]), \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value=_RUNTIME,
+             ), \
+             patch("cron.scheduler.heartbeat_run_claim", return_value=False), \
+             patch("run_agent.AIAgent", return_value=agent):
+            success, _output, _response, error = run_job(job)
+
+        assert success is False
+        assert "ownership" in error.lower()
+        agent.run_conversation.assert_not_called()
+        agent.close.assert_called_once()
 
     def test_invalid_timeout_env_falls_back_to_default(self, tmp_path, monkeypatch, caplog):
         """A malformed HERMES_CRON_SESSION_DB_TIMEOUT logs a warning and still

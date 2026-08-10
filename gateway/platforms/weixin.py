@@ -2325,12 +2325,28 @@ async def send_weixin_direct(
     chat_id: str,
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
+    ownership_guard=None,
 ) -> Dict[str, Any]:
     """
     One-shot send helper for ``send_message`` and cron delivery.
 
     This bypasses the long-poll adapter lifecycle and uses the raw API directly.
     """
+    def _owned() -> bool:
+        if ownership_guard is None:
+            return True
+        try:
+            return bool(ownership_guard())
+        except Exception:
+            logger.exception("Weixin standalone delivery ownership guard failed")
+            return False
+
+    ownership_error = {
+        "error": "Delivery ownership lost during standalone send"
+    }
+    if not _owned():
+        return ownership_error
+
     account_id = str(extra.get("account_id") or _wx_secret("WEIXIN_ACCOUNT_ID", "")).strip()
     base_url = str(extra.get("base_url") or _wx_secret("WEIXIN_BASE_URL", ILINK_BASE_URL)).strip().rstrip("/")
     cdn_base_url = str(extra.get("cdn_base_url") or _wx_secret("WEIXIN_CDN_BASE_URL", WEIXIN_CDN_BASE_URL)).strip().rstrip("/")
@@ -2352,11 +2368,15 @@ async def send_weixin_direct(
         last_result: Optional[SendResult] = None
         cleaned = live_adapter.format_message(message)
         if cleaned:
+            if not _owned():
+                return ownership_error
             last_result = await live_adapter.send(chat_id, cleaned)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
+            if not _owned():
+                return ownership_error
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
                 last_result = await live_adapter.send_image_file(chat_id, media_path)
@@ -2397,11 +2417,15 @@ async def send_weixin_direct(
         last_result: Optional[SendResult] = None
         cleaned = adapter.format_message(message)
         if cleaned:
+            if not _owned():
+                return ownership_error
             last_result = await adapter.send(chat_id, cleaned)
             if not last_result.success:
                 return {"error": f"Weixin send failed: {last_result.error}"}
 
         for media_path, _is_voice in media_files or []:
+            if not _owned():
+                return ownership_error
             ext = Path(media_path).suffix.lower()
             if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
                 last_result = await adapter.send_image_file(chat_id, media_path)

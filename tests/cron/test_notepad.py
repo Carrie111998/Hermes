@@ -8,6 +8,7 @@ use the notepad, and the `hermes cron notepad` CLI handler.
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from pathlib import Path
 
@@ -42,6 +43,52 @@ def cron_env(tmp_path, monkeypatch, notepad):
     monkeypatch.setattr(jobs_mod, "JOBS_FILE", hermes_home / "cron" / "jobs.json")
     monkeypatch.setattr(jobs_mod, "OUTPUT_DIR", hermes_home / "cron" / "output")
     return hermes_home
+
+
+def test_notepad_follows_active_cron_store_after_default_import(monkeypatch, tmp_path):
+    """A multiplex profile must not read or mutate the default notepad."""
+    default_home = tmp_path / "default"
+    ops_home = tmp_path / "home-ops"
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    import cron.notepad as notepad_mod
+    from cron.jobs import use_cron_store
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    # Reproduce a multiplex gateway: imports happen under the default profile,
+    # while later scheduler iterations run under a secondary profile context.
+    notepad_mod = importlib.reload(notepad_mod)
+    assert notepad_mod.NOTEPAD_FILE == default_home / "cron" / "notepad.db"
+
+    job_id = "same-job-id"
+    notepad_mod.set_note(job_id, "sentinel", "default-profile")
+
+    token = set_hermes_home_override(ops_home)
+    try:
+        with use_cron_store(ops_home):
+            notepad_mod.set_note(job_id, "sentinel", "ops-profile")
+            notepad_mod.set_note(job_id, "remove-me", "delete this")
+            notepad_mod.set_note(job_id, "clear-me", "clear this")
+
+            rendered = notepad_mod.render_notepad_section(job_id)
+            assert "ops-profile" in rendered
+            assert "default-profile" not in rendered
+
+            assert notepad_mod.delete_note(job_id, "remove-me") is True
+            assert notepad_mod.get_note(job_id, "remove-me") is None
+            assert notepad_mod.clear_notepad(job_id) == 2
+            assert notepad_mod.render_notepad_section(job_id) == ""
+    finally:
+        reset_hermes_home_override(token)
+
+    # The same job ID has an independent row in the default profile, and no
+    # secondary-profile operation above was allowed to mutate it.
+    assert notepad_mod.get_note(job_id, "sentinel") == "default-profile"
+    assert (default_home / "cron" / "notepad.db").is_file()
+    assert (ops_home / "cron" / "notepad.db").is_file()
 
 
 class TestNotepadCrud:

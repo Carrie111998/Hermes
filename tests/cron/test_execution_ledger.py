@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import sqlite3
@@ -15,6 +16,50 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def test_ledger_follows_active_cron_store_after_default_import(monkeypatch, tmp_path):
+    """A multiplex secondary profile must not write the default ledger."""
+    default_home = tmp_path / "default"
+    ops_home = tmp_path / "home-ops"
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+    import cron.executions as executions
+    from cron.jobs import use_cron_store
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    # Reproduce the gateway lifetime: the module is first imported for the
+    # default profile, then a multiplex iteration switches to a secondary
+    # profile without re-importing it.
+    executions = importlib.reload(executions)
+    assert executions.EXECUTIONS_FILE == default_home / "cron" / "executions.db"
+
+    token = set_hermes_home_override(ops_home)
+    try:
+        with use_cron_store(ops_home):
+            claimed = executions.create_execution("ops-job", source="builtin")
+            assert executions.list_executions(job_id="ops-job") == [claimed]
+
+            # Recovery has an orthogonal process-liveness dependency. Turn
+            # this row into a foreign abandoned attempt so the test exercises
+            # the real recovery transaction against the selected profile DB.
+            with sqlite3.connect(ops_home / "cron" / "executions.db") as conn:
+                conn.execute(
+                    "UPDATE executions SET process_id='foreign-owner' WHERE id=?",
+                    (claimed["id"],),
+                )
+            monkeypatch.setattr(executions, "_owner_is_live", lambda *_a, **_kw: False)
+
+            assert executions.recover_interrupted_executions() == 1
+            assert executions.latest_execution("ops-job")["status"] == "unknown"
+    finally:
+        reset_hermes_home_override(token)
+
+    assert (ops_home / "cron" / "executions.db").is_file()
+    assert not (default_home / "cron" / "executions.db").exists()
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):
@@ -114,6 +159,48 @@ def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_
     assert executions.latest_execution("still-live")["status"] == "running"
 
 
+def test_owner_liveness_fails_safe_when_start_time_is_unavailable(monkeypatch):
+    """An existing PID is not declared dead merely because identity is unknown."""
+    import cron.executions as executions
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_legacy_process_start_time", lambda _pid: None)
+
+    assert executions._owner_is_live(12345, 67890) is True
+
+
+def test_foreign_live_legacy_owner_tolerates_macos_psutil_drift(monkeypatch):
+    """Rolling readers do not mark a live pre-stable-fingerprint row unknown."""
+    import cron.executions as executions
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        executions, "_legacy_process_start_time", lambda _pid: 178624314936
+    )
+
+    assert executions._owner_is_live(777, 178624315136) is True
+    assert executions._owner_is_live(777, 178624315437) is False
+
+
+def test_stable_owner_fingerprint_remains_exact(monkeypatch):
+    """New versioned rows keep strict PID-reuse protection."""
+    import cron.executions as executions
+    import gateway.status as gateway_status
+
+    monkeypatch.setattr(gateway_status, "_pid_exists", lambda _pid: True)
+    monkeypatch.setattr(executions, "_process_start_time", lambda _pid: 12345)
+
+    assert executions._owner_is_live(
+        777, 99999, stable_started_at=12345
+    ) is True
+    assert executions._owner_is_live(
+        777, 99999, stable_started_at=12346
+    ) is False
+
+
 def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     """Real temp-HERMES_HOME subprocess restart: in-flight is audit-only unknown."""
     home = tmp_path / "home"
@@ -181,7 +268,11 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         scheduler, "finish_execution",
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
-    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
+    monkeypatch.setattr(
+        scheduler,
+        "get_due_jobs",
+        lambda **_kwargs: [{"id": "submit-fail"}],
+    )
     monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
@@ -215,7 +306,12 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(
         scheduler,
         "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
+        lambda job, *, defer_agent_teardown=None, **_kwargs: (
+            True,
+            "output",
+            "response",
+            None,
+        ),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)

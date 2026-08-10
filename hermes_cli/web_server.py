@@ -156,16 +156,44 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
     scheduler provider here (no live adapters; delivery falls back to the
     per-platform send path).
 
-    Cross-process safe: the built-in provider's ``cron.scheduler.tick`` takes
-    the ``cron/.tick.lock`` file lock, so this never double-fires alongside a
-    real gateway on the same HERMES_HOME — whichever process grabs the lock
-    first wins the tick.
+    When a real gateway owns the same HERMES_HOME, the desktop fallback yields
+    dispatch to it. The built-in provider's ``cron/.tick.lock`` only protects
+    the short due-job scan; agent jobs continue asynchronously after that lock
+    is released, so the lock alone cannot prevent cross-process overlap.
     """
-    from cron.scheduler_provider import resolve_cron_scheduler
+    from cron.scheduler_provider import (
+        InProcessCronScheduler,
+        resolve_cron_scheduler,
+    )
 
     provider = resolve_cron_scheduler()
+    start_kwargs: Dict[str, Any] = {"interval": interval}
+    if isinstance(provider, InProcessCronScheduler):
+
+        def _gateway_is_absent() -> bool:
+            try:
+                from cron.jobs import gateway_ticker_lease_is_fresh
+
+                return not gateway_ticker_lease_is_fresh()
+            except Exception:
+                # Fail open during partial upgrades: without the new lease API,
+                # Desktop remains a working fallback instead of silently
+                # dropping every local schedule.
+                return True
+
+        if not _gateway_is_absent():
+            _log.info("Desktop cron scheduler standing by while gateway owns dispatch")
+        while not _gateway_is_absent():
+            if stop_event.wait(max(float(interval), 0.01)):
+                return
+        start_kwargs["can_dispatch"] = _gateway_is_absent
+        # A Gateway may publish its lease between the standby probe above and
+        # provider startup. Defer execution-ledger recovery until the same gate
+        # authorizes dispatch, so Desktop cannot mark that Gateway's live work
+        # interrupted during the handoff.
+        start_kwargs["recover_when_dispatchable"] = True
     _log.info("Desktop cron scheduler started (provider=%s, interval=%ds)", provider.name, interval)
-    provider.start(stop_event, interval=interval)
+    provider.start(stop_event, **start_kwargs)
 
 
 def _warm_gateway_module() -> None:

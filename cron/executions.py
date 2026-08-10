@@ -9,24 +9,49 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import sys
 import threading
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
+_IMPORT_EXECUTIONS_FILE = EXECUTIONS_FILE
 MAX_TERMINAL_EXECUTIONS = 1000
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
 
+def _current_executions_file() -> Path:
+    """Resolve the ledger for the active cron profile context.
+
+    ``EXECUTIONS_FILE`` remains a compatibility surface for tests and
+    embedders that deliberately re-point it. Otherwise resolve lazily through
+    the same ContextVar-backed store as jobs.json so a multiplex gateway does
+    not keep writing the profile that happened to import this module first.
+
+    The import is intentionally local. ``cron.jobs`` only imports this module
+    from inside listing functions, so runtime resolution avoids an import-time
+    cycle while keeping both stores on one profile-selection source of truth.
+    """
+    configured = Path(EXECUTIONS_FILE)
+    if configured != _IMPORT_EXECUTIONS_FILE:
+        return configured
+
+    from cron.jobs import _current_cron_store
+
+    return _current_cron_store().cron_dir / "executions.db"
+
+
 def _connect() -> sqlite3.Connection:
-    EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+    executions_file = _current_executions_file()
+    executions_file.parent.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(executions_file, timeout=5)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -44,6 +69,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              process_id TEXT NOT NULL,
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
+             process_started_at_stable INTEGER,
              status TEXT NOT NULL CHECK(status IN
                ('claimed','running','completed','failed','unknown')),
              claimed_at TEXT NOT NULL,
@@ -60,6 +86,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_status_claimed "
         "ON executions(status, claimed_at DESC, id DESC)"
     )
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(executions)")
+    }
+    if "process_started_at_stable" not in columns:
+        conn.execute(
+            "ALTER TABLE executions ADD COLUMN process_started_at_stable INTEGER"
+        )
 
 
 @contextmanager
@@ -101,23 +134,56 @@ def _emit_execution_state(
 
 def _process_start_time(pid: int) -> Optional[int]:
     try:
+        from gateway.status import get_stable_process_start_time
+        return get_stable_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _legacy_process_start_time(pid: int) -> Optional[int]:
+    """Read the legacy persisted gateway/ledger fingerprint format."""
+    try:
         from gateway.status import get_process_start_time
         return get_process_start_time(pid)
     except Exception:
         return None
 
 
-def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
+def _owner_is_live(
+    pid: int,
+    started_at: Optional[int],
+    *,
+    stable_started_at: Optional[int] = None,
+) -> bool:
     try:
         from gateway.status import _pid_exists
         if not _pid_exists(pid):
             return False
     except Exception:
         return True  # fail safe: inability to prove death must not rewrite state
+    if stable_started_at is not None:
+        current_stable = _process_start_time(pid)
+        if current_stable is None:
+            return True  # inability to prove identity mismatch is not death
+        return current_stable == stable_started_at
+
     if started_at is None:
-        return pid == os.getpid()
-    current = _process_start_time(pid)
-    return current is not None and current == started_at
+        # PID existence is all we can prove. Treat the owner as live rather
+        # than rewriting/redispatching work whose exact identity is unknown.
+        return True
+    current = _legacy_process_start_time(pid)
+    if current is None:
+        return True  # fail safe: unavailable identity is not proof of death
+    if current == started_at:
+        return True
+    # Transitional macOS compatibility: psutil 7.2's legacy public timestamp
+    # can differ between interpreters after a wall-clock correction. Existing
+    # rows have no source/version field, so a small bounded difference is
+    # ambiguous rather than proof that the PID was reused. New rows carry the
+    # stable raw fingerprint above and retain exact reuse protection.
+    if sys.platform == "darwin" and abs(current - started_at) <= 500:
+        return True
+    return False
 
 
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
@@ -141,10 +207,10 @@ def create_execution(job_id: str, *, source: str) -> Dict[str, Any]:
         conn.execute(
             """INSERT INTO executions
                (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?)""",
+                process_started_at_stable, status, claimed_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'claimed', ?)""",
             (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now),
+             _legacy_process_start_time(pid), _process_start_time(pid), now),
         )
         row = conn.execute(
             "SELECT * FROM executions WHERE id=?", (execution_id,)
@@ -203,13 +269,18 @@ def recover_interrupted_executions() -> int:
     recovered: List[Dict[str, Any]] = []
     with _transaction() as conn:
         rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
+            """SELECT id, process_id, pid, process_started_at,
+                      process_started_at_stable FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
         for row in rows:
             if row["process_id"] == _PROCESS_ID:
                 continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            if _owner_is_live(
+                int(row["pid"]),
+                row["process_started_at"],
+                stable_started_at=row["process_started_at_stable"],
+            ):
                 continue
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
