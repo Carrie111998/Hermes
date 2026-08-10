@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { canOpenNewWindow, canOpenSessionWindow, openNewWindow, openSessionInNewWindow } from './windows'
+import {
+  canOpenNewWindow,
+  canOpenSessionWindow,
+  openNewWindow,
+  openSessionInNewWindow,
+  windowProfileOverride
+} from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const initialHermesDesktop = desktopWindow.hermesDesktop
@@ -26,11 +32,27 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  window.history.replaceState({}, '', '/')
+
   if (initialHermesDesktop) {
     desktopWindow.hermesDesktop = initialHermesDesktop
   } else {
     delete desktopWindow.hermesDesktop
   }
+})
+
+describe('windowProfileOverride', () => {
+  it('returns a valid decoded profile hint', () => {
+    window.history.replaceState({}, '', '/?profile=life_2')
+
+    expect(windowProfileOverride()).toBe('life_2')
+  })
+
+  it('treats malformed profile hints as absent', () => {
+    window.history.replaceState({}, '', '/?profile=..%2Flife')
+
+    expect(windowProfileOverride()).toBeNull()
+  })
 })
 
 describe('canOpenSessionWindow', () => {

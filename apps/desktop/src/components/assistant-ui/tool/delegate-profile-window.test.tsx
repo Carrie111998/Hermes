@@ -3,10 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { I18nProvider } from '@/i18n'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $activeSessionId, $selectedStoredSessionId, $sessions } from '@/store/session'
+import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 import { $subagentsBySession, type SubagentProgress } from '@/store/subagents'
 import type * as WindowsStore from '@/store/windows'
-import type { SessionInfo } from '@/types/hermes'
 
 import { DelegateTool } from './delegate'
 
@@ -38,10 +37,9 @@ const subagent = (): SubagentProgress => ({
 describe('DelegateTool subagent windows', () => {
   beforeEach(() => {
     openSessionInNewWindow.mockReset()
-    $activeGatewayProfile.set('default')
+    $activeGatewayProfile.set('life')
     $activeSessionId.set(RUNTIME)
     $selectedStoredSessionId.set(STORED)
-    $sessions.set([{ id: STORED, profile: 'life' } as SessionInfo])
     $subagentsBySession.set({ [RUNTIME]: [subagent()] })
   })
 
@@ -50,7 +48,6 @@ describe('DelegateTool subagent windows', () => {
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     $selectedStoredSessionId.set(null)
-    $sessions.set([])
     $subagentsBySession.set({})
   })
 

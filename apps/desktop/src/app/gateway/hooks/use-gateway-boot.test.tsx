@@ -70,6 +70,12 @@ class FakeWebSocket {
     this.emit('close', {})
   }
 
+  sendEvent(params: Record<string, unknown>) {
+    this.emit('message', {
+      data: JSON.stringify({ jsonrpc: '2.0', method: 'event', params })
+    })
+  }
+
   private emit(type: string, ev: unknown) {
     for (const fn of this.listeners[type] ?? []) {
       fn(ev)
@@ -77,11 +83,11 @@ class FakeWebSocket {
   }
 }
 
-function fakeDesktop() {
+function fakeDesktop(profile = 'default') {
   const conn = {
     authMode: 'token' as const,
     baseUrl: 'https://vps.example.com',
-    profile: 'default',
+    profile,
     token: 't',
     wsUrl: 'wss://vps.example.com/api/ws?token=t'
   }
@@ -116,11 +122,16 @@ function fakeDesktop() {
 
 function Harness({
   beforeConnectionSwitch = () => undefined,
+  handleGatewayEvent = () => undefined,
   refreshSessions
-}: { beforeConnectionSwitch?: () => void; refreshSessions?: () => Promise<void> } = {}) {
+}: {
+  beforeConnectionSwitch?: () => void
+  handleGatewayEvent?: Parameters<typeof useGatewayBoot>[0]['handleGatewayEvent']
+  refreshSessions?: () => Promise<void>
+} = {}) {
   useGatewayBoot({
     beforeConnectionSwitch,
-    handleGatewayEvent: () => undefined,
+    handleGatewayEvent,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
     refreshHermesConfig: async () => undefined,
@@ -225,6 +236,47 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     } finally {
       stop()
       window.history.replaceState({}, '', '/')
+      $activeGatewayProfile.set('default')
+    }
+  })
+
+  it('publishes the named primary connection profile before open when the URL has no hint', async () => {
+    window.history.replaceState({}, '', '/')
+    $activeGatewayProfile.set('default')
+    const desktop = fakeDesktop('life')
+    let profileAtFirstOpen: string | null = null
+    const eventProfiles: string[] = []
+
+    const stop = $gatewayState.listen(state => {
+      if (state === 'open' && profileAtFirstOpen === null) {
+        profileAtFirstOpen = $activeGatewayProfile.get()
+      }
+    })
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+
+    try {
+      render(<Harness handleGatewayEvent={event => eventProfiles.push(event.profile ?? '')} />)
+      await flushAsync()
+
+      act(() => {
+        FakeWebSocket.instances[0]?.sendEvent({ type: 'session.updated' })
+        $activeGatewayProfile.set('other')
+        FakeWebSocket.instances[0]?.sendEvent({ type: 'session.updated' })
+        $activeGatewayProfile.set('life')
+      })
+
+      expect(desktop.getConnection).toHaveBeenCalledWith(undefined)
+      const connection = await desktop.getConnection.mock.results[0]?.value
+
+      expect({
+        connectionProfile: connection?.profile,
+        current: $activeGatewayProfile.get(),
+        profileAtFirstOpen
+      }).toEqual({ connectionProfile: 'life', current: 'life', profileAtFirstOpen: 'life' })
+      expect(eventProfiles).toEqual(['life', 'life'])
+    } finally {
+      stop()
       $activeGatewayProfile.set('default')
     }
   })

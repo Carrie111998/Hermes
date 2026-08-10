@@ -94,6 +94,7 @@ export function useGatewayBoot({
 
   useEffect(() => {
     let cancelled = false
+    let connectionProfile: null | string = null
     const desktop = window.hermesDesktop
     const profileOverride = windowProfileOverride()
 
@@ -270,17 +271,29 @@ export function useGatewayBoot({
     // non-primary profile, adopting the primary here resolves its session id
     // against the wrong backend. The override wins over the stored preference;
     // absent, behavior is unchanged (#82285).
+    function adoptConnectionProfile(connection: HermesConnection) {
+      const key = normalizeProfileKey(profileOverride ?? connection.profile ?? $activeGatewayProfile.get())
+
+      connectionProfile = key
+      $activeGatewayProfile.set(key)
+      setPrimaryGateway(gateway, key)
+    }
+
     async function adoptPrimaryProfile() {
       const override = profileOverride
 
       try {
-        const profileKey = override ?? (await desktop.profile?.get?.())?.profile ?? ''
+        const profileKey =
+          override ?? connectionProfile ?? (await desktop.profile?.get?.())?.profile ?? $activeGatewayProfile.get()
+
         const key = normalizeProfileKey(profileKey)
         $activeGatewayProfile.set(key)
         setPrimaryGateway(gateway, key)
         void ensureGatewayForProfile(key)
       } catch {
-        $activeGatewayProfile.set(normalizeProfileKey(override))
+        if (override) {
+          $activeGatewayProfile.set(normalizeProfileKey(override))
+        }
       }
     }
 
@@ -324,6 +337,7 @@ export function useGatewayBoot({
           return
         }
 
+        adoptConnectionProfile(conn)
         publish(conn)
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await gateway.connect(wsUrl)
@@ -431,10 +445,11 @@ export function useGatewayBoot({
       }
     })
 
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
-
     const offEvent = gateway.onEvent(event =>
-      callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })
+      callbacksRef.current.handleGatewayEvent({
+        ...event,
+        profile: connectionProfile ?? normalizeProfileKey($activeGatewayProfile.get())
+      })
     )
 
     // Wake signals: power resume (macOS/Windows), network coming back, and the
@@ -517,6 +532,7 @@ export function useGatewayBoot({
           return
         }
 
+        adoptConnectionProfile(conn)
         setDesktopBootStep({
           phase: 'renderer.gateway.connect',
           message: translateNow('boot.steps.connectingGateway'),

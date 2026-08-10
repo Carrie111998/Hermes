@@ -108,17 +108,31 @@ function instanceWindowBounds(base: { x: number; y: number; width: number; heigh
 function createSessionWindowRegistry() {
   const windows = new Map()
 
-  function openOrFocus(sessionId, factory, profile = null) {
+  const registryKey = (sessionId, profile = null) => {
     const id = typeof sessionId === 'string' ? sessionId.trim() : ''
 
     if (!id) {
       return null
     }
 
-    const profileKey = typeof profile === 'string' ? profile.trim() : ''
-    // Session ids are profile-scoped. Keep the legacy key for unhinted windows,
-    // but do not let equal ids in two profiles focus the wrong renderer.
-    const key = profileKey ? `${profileKey}\u0000${id}` : id
+    // Main resolves an omitted hint to the effective primary profile before it
+    // reaches the registry. Keep `default` as the pure-helper fallback so
+    // legacy/test callers share identity with an explicit default window.
+    const profileKey = (typeof profile === 'string' ? profile.trim() : '') || 'default'
+
+    // JSON encodes the tuple unambiguously even if a session id contains the
+    // delimiter text an ad-hoc concatenation would confuse.
+    return JSON.stringify([profileKey, id])
+  }
+
+  function openOrFocus(sessionId, factory, profile = null) {
+    const key = registryKey(sessionId, profile)
+
+    if (!key) {
+      return null
+    }
+
+    const id = sessionId.trim()
 
     const existing = windows.get(key)
 
@@ -157,8 +171,8 @@ function createSessionWindowRegistry() {
 
   return {
     openOrFocus,
-    get: key => windows.get(key),
-    has: key => windows.has(key),
+    get: (sessionId, profile = null) => windows.get(registryKey(sessionId, profile)),
+    has: (sessionId, profile = null) => windows.has(registryKey(sessionId, profile)),
     get size() {
       return windows.size
     }

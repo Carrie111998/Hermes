@@ -163,6 +163,7 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import { normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
@@ -628,9 +629,6 @@ const DESKTOP_WINDOW_STATE_PATH = path.join(app.getPath('userData'), 'window-sta
 // ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
 // no --profile flag, so the backend honors active_profile / default.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
-// Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
-// value its profile resolver would reject and exit on.
-const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 // Branch we track for self-update. The GUI work has merged to main, so this
 // tracks main. User can also override at runtime via
 // hermesDesktop.updates.setBranch().
@@ -8129,7 +8127,10 @@ function profileRouteOptions(profile) {
 // resolveProfileBackendRoute(). An empty / unknown profile resolves to the
 // primary, so legacy callers are unchanged.
 async function ensureBackend(profile) {
-  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+  // All renderer-provided profile values converge here (`hermes:connection`,
+  // REST, and fresh WS tickets). Malformed URL/query input is treated as an
+  // absent hint and cannot become a pool key or `--profile` child argument.
+  const key = normalizeDesktopProfile(profile) ?? primaryProfileKey()
   const route = resolveProfileBackendRoute(key, profileRouteOptions(key))
 
   if (route.backend === 'primary') {
@@ -10128,13 +10129,17 @@ ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
     return { ok: false, error: 'invalid-session-id' }
   }
 
-  const profile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+  const requestedProfile = typeof opts?.profile === 'string' ? opts.profile.trim() : ''
+  const profile = normalizeDesktopProfile(requestedProfile)
 
-  if (profile && profile !== 'default' && !PROFILE_NAME_RE.test(profile)) {
+  if (requestedProfile && !profile) {
     return { ok: false, error: 'invalid-profile' }
   }
 
-  createSessionWindow(sessionId.trim(), { profile: profile || null, watch: opts?.watch === true })
+  createSessionWindow(sessionId.trim(), {
+    profile: profile ?? primaryProfileKey(),
+    watch: opts?.watch === true
+  })
 
   return { ok: true }
 })

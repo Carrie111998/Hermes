@@ -154,6 +154,40 @@ test('registry treats the same session id in different profiles as different win
   assert.equal(registry.size, 2)
 })
 
+test('registry treats an omitted profile as default ownership', () => {
+  const registry = createSessionWindowRegistry()
+  let built = 0
+
+  const factory = () => {
+    built += 1
+
+    return makeFakeWindow()
+  }
+
+  registry.openOrFocus('s1', factory)
+  registry.openOrFocus('s1', factory, 'default')
+
+  assert.equal(built, 1)
+  assert.equal(registry.size, 1)
+})
+
+test('registry tuple keys do not collide with delimiter text in session ids', () => {
+  const registry = createSessionWindowRegistry()
+  let built = 0
+
+  const factory = () => {
+    built += 1
+
+    return makeFakeWindow()
+  }
+
+  registry.openOrFocus('b\u0000c', factory, 'a')
+  registry.openOrFocus('c', factory, 'a\u0000b')
+
+  assert.equal(built, 2)
+  assert.equal(registry.size, 2)
+})
+
 test('registry restores + shows a minimized/hidden window on re-open', () => {
   const registry = createSessionWindowRegistry()
   const win = makeFakeWindow()
