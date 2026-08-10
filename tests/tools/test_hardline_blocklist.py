@@ -670,3 +670,120 @@ def test_sudo_stdin_guard_container_bypass(clean_session):
         for cmd in _SUDO_STDIN_BLOCK:
             result = check_all_command_guards(cmd, env)
             assert result["approved"] is True, f"container {env} should bypass sudo guard on {cmd!r}"
+
+
+# -------------------------------------------------------------------------
+# Filesystem-root guard (issue #82842)
+# -------------------------------------------------------------------------
+#
+# Issue #82842 (Hermes Agent) executed ``rd /s /q`` against the ``C:\\``
+# drive root after a user-approved scoped folder deletion. The
+# destructive command's target resolved to ``C:\\`` after a
+# multi-layer quote-escape collapse. The hardline floor must reject
+# any destructive command whose target is a filesystem root, regardless
+# of approval state — yolo, mode=off, smart-approval, and the permanent
+# allowlist cannot bypass it.
+#
+# Previous regression coverage only included POSIX root (``rm -rf /``)
+# via HARDLINE_PATTERNS; the Windows drive-root case was zero-covered.
+# This block adds the missing tests so the bug cannot return under any
+# of the bypasses.
+
+_WINDOWS_DESTRUCTIVE_ROOT_BLOCK = [
+    # Direct Windows cmd-destructive shapes targeting a drive root.
+    "rd /s /q C:\\",
+    'rd /s /q "C:\\"',
+    "rd /s /q C:\\.",
+    "rd /s /q C:\\..",
+    "rd /s /q C:\\/",
+    "rd /s /q c:\\",
+    # Bare-backslash root — collapses to current-drive root in cmd.exe.
+    "rd /s /q \\",
+    "rd /s /q \\\\",
+    # Cross-drive spelling — every drive-letter root is unsafe.
+    "rd /s /q D:\\",
+    "rd /s /q H:\\",
+    "rd /s /q Z:\\",
+    # PowerShell Remove-Item / Set-Volume / Format-Volume spelling.
+    "powershell Remove-Item -Recurse -Force C:\\",
+    "Remove-Item -Recurse -Force H:\\",
+    # Format-volume is destructive of the drive itself — the root-target
+    # guard fires because the PowerShell ``-DriveLetter H:`` argument
+    # identifies the drive-letter root as the implicit target.
+    "format-volume D:",
+    "Format-Volume -DriveLetter H:",
+]
+# Note: ``Initialize-Disk`` and ``Clear-Disk`` wipe numbered *disks*
+# (not filesystem roots); they fall under the disk-wipe floor and are
+# out of scope for the filesystem-root guard.
+
+
+_WINDOWS_DESTRUCTIVE_USER_FOLDER_ALLOW = [
+    # The original shell-wrapper form from issue #82842 with a real
+    # (non-root) target. These reach the softer ``DANGEROUS_PATTERNS``
+    # layer (which prompts the user) but must NOT be hardline-blocked.
+    'cmd /c "rd /s /q C:\\Users\\tester"',
+]
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
+def test_filesystem_root_guard_blocks_windows_destructive(command):
+    """Any Windows destructive command resolving to a drive root is
+    hardline-blocked even with a normal non-root target alongside it."""
+    is_hl, desc = detect_hardline_command(command)
+    assert is_hl, f"root-target command slipped past the floor: {command!r}"
+    assert desc, "expected a non-empty hardline description"
+    # Either the new root-target guard or an existing recursive-delete
+    # pattern should fire — but the new guard is the one that catches
+    # ``rd /s /q C:\\`` on its own and is the regression target for #82842.
+    assert "filesystem root" in desc.lower() or "recursive delete" in desc.lower(), (
+        f"unexpected description {desc!r} for {command!r}"
+    )
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
+def test_root_target_guard_unaffected_by_yolo(command, clean_session, monkeypatch):
+    """yolo mode is *not* allowed to bypass the root-target guard.
+
+    Regression for issue #82842: the destructive command had been
+    auto-approved by smart approval earlier in the session and would
+    have run unchallenged if yolo had been active. Both states must keep
+    the hardline floor intact.
+    """
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    enable_session_yolo("hardline_test")
+    try:
+        is_hl, desc = detect_hardline_command(command)
+        assert is_hl, f"yolo bypassed the root-target guard: {command!r}"
+        assert desc
+    finally:
+        disable_session_yolo("hardline_test")
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_USER_FOLDER_ALLOW)
+def test_root_target_guard_does_not_block_user_folder_target(command):
+    """A destructive command targeting a real user folder must reach the
+    softer ``DANGEROUS_PATTERNS`` layer (which prompts the user), NOT
+    the hardline floor. This is the regression target for the original
+    #82842 shell-wrapper form whose *correct* target was user-controlled.
+    """
+    is_hl, _ = detect_hardline_command(command)
+    assert not is_hl, f"user-folder target wrongly hardline-blocked: {command!r}"
+
+
+def test_root_target_guard_does_not_block_benign_root_tokens():
+    """Defensive: an echo / cat with a literal ``/`` or ``C:\\`` token
+    must NOT be hardline-blocked. The guard fires only on destructive
+    verbs (rm, rd, Remove-Item, etc.), not on every command whose
+    argument string happens to mention a root.
+    """
+    benign = [
+        "echo /",
+        "echo C:\\Users",
+        "ls /home",
+        "cat /etc/passwd",
+        "grep -r C:\\Users\\tester .",
+    ]
+    for cmd in benign:
+        is_hl, _ = detect_hardline_command(cmd)
+        assert not is_hl, f"benign command wrongly blocked: {cmd!r}"

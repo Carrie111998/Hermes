@@ -531,12 +531,86 @@ def detect_hardline_command(command: str) -> tuple:
     _, malformed_grep = _grep_safe_detection_variant(normalized)
     if malformed_grep:
         return (True, _MALFORMED_EXEC_DESCRIPTION)
+    # Filesystem-root guard (issue #82842): any token that resolves to a
+    # filesystem root (POSIX ``/``, Windows ``C:\\`` / ``\\``, UNC root)
+    # is rejected unconditionally here. The hardline patterns cover
+    # ``rm -rf /`` for POSIX; this guard catches the equivalent
+    # Windows-native spellings (``rd /s /q C:\\``, ``Remove-Item
+    # -Recurse -Force H:\\``, ``del /s /q \\``, ``format-volume D:``)
+    # plus any future shell variant that already-resolved targets a
+    # root. Run BEFORE the pattern loop so a quote-collapse that
+    # surfaces a stray bare ``\\`` (the exact issue #82842 failure
+    # mode) cannot fall through to the softer DANGEROUS_PATTERNS layer.
+    root_desc = _filesystem_root_guard(command)
+    if root_desc is not None:
+        return (True, root_desc)
     for command_variant in _command_detection_variants(command):
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
             if pattern_re.search(variant_lower):
                 return (True, description)
     return (False, None)
+
+
+# Description emitted when the root-target guard rejects a command. Kept
+# consistent with the surrounding ``hardline_delete_...`` phrasing so the
+# approval-rendering layer does not need to special-case it.
+_ROOT_TARGET_DESCRIPTION = "destructive command targets a filesystem root"
+
+
+def _filesystem_root_guard(command: str) -> Optional[str]:
+    """Return ``"destructive command targets a filesystem root"`` when any
+    path-like token extracted from *command* resolves to a filesystem
+    root, otherwise ``None``.
+
+    Defence-in-depth helper for :func:`detect_hardline_command`. The
+    classifier is conservative: tokens that cannot be classified as
+    paths (e.g. ``/s`` and ``/q`` cmd flags) are not considered. The
+    helper only fires on the destructive-command shells
+    (``rm``, ``rmdir``, ``rd``, ``del``, ``erase``, ``Remove-Item``,
+    ``Remove-Item`` aliases) so a soft command with a literal ``/``
+    argument (e.g. ``echo /``) is not wrongly blocked; see
+    ``_DESTRUCTIVE_VERB_RE`` below for the trigger set.
+    """
+    if not command:
+        return None
+    # Only fire on commands whose first token (modulo wrappers) looks
+    # like a known destructive verb. This keeps ``echo /`` and similar
+    # benign commands flowing through to the normal approval pipeline.
+    destructive_match = _DESTRUCTIVE_VERB_RE.search(command)
+    if not destructive_match:
+        return None
+    from tools.path_security import (
+        extract_filesystem_targets,
+        is_filesystem_root,
+    )
+    for token in extract_filesystem_targets(command):
+        if is_filesystem_root(token):
+            return _ROOT_TARGET_DESCRIPTION
+    return None
+
+
+# Recognised destructive-verb triggers, matched as a word boundary
+# against the leading verb of the destructive command. Keeping the set
+# small and explicit prevents false positives on commands that simply
+# quote a literal ``/`` (e.g. ``echo /foo``).
+_DESTRUCTIVE_VERB_RE = re.compile(
+    r"(?<![A-Za-z0-9_/])"                                    # word-break before the verb
+    r"(?:"
+    r"rm\b"
+    r"|rmdir\b"
+    r"|rd\b"
+    r"|del\b"
+    r"|erase\b"
+    r"|(?:remove-item|ri|rm|rmdir|erase|del|rd)\b"          # PowerShell aliases
+    r"|format-volume\b"
+    r"|set-volume\b"
+    r"|initialize-disk\b"
+    r"|clear-disk\b"
+    r"|format\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _match_user_deny_rule(command: str) -> str | None:
