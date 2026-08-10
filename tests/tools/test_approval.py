@@ -440,22 +440,28 @@ class TestApprovalConfigHelpers:
             "_get_approval_config",
             return_value={"timeout": "not-an-int"},
         ):
-            assert _get_approval_timeout() == 60
+            assert _get_approval_timeout() == 300
 
     def test_cron_approval_mode_aliases(self):
-        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"cron_mode": "allow"}}):
+        with mock_patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"approvals": {"cron_mode": "allow"}},
+        ):
             assert _get_cron_approval_mode() == "approve"
-        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"cron_mode": "deny"}}):
+        with mock_patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value={"approvals": {"cron_mode": "deny"}},
+        ):
             assert _get_cron_approval_mode() == "deny"
 
     def test_load_permanent_allowlist_syncs_config_patterns(self):
         with mock_patch.object(approval_module, "_permanent_approved", set()), \
-             mock_patch("hermes_cli.config.load_config", return_value={"command_allowlist": ["recursive delete"]}):
+             mock_patch("hermes_cli.config.load_config_readonly", return_value={"command_allowlist": ["recursive delete"]}):
             assert load_permanent_allowlist() == {"recursive delete"}
             assert is_approved("any-session", "recursive delete") is True
 
     def test_load_permanent_allowlist_fails_closed_on_config_error(self):
-        with mock_patch("hermes_cli.config.load_config", side_effect=RuntimeError("boom")):
+        with mock_patch("hermes_cli.config.load_config_readonly", side_effect=RuntimeError("boom")):
             assert load_permanent_allowlist() == set()
 
     def test_save_permanent_allowlist_writes_config(self):
