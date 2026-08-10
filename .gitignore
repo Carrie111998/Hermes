@@ -10,6 +10,7 @@ act/
 .act-sandbox-agent.*
 .venv/
 .venv
+venv/
 .vscode/
 .env
 .op.env
