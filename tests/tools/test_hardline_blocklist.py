@@ -245,6 +245,24 @@ _WINDOWS_ROOT_DELETE_ALLOW = [
 ]
 
 
+_WINDOWS_DYNAMIC_ROOT_DELETE_BLOCK = [
+    "cmd /c rd /s /q %SYSTEMDRIVE%\\",
+    "cmd /c rd /s /q %HOMEDRIVE%/",
+    "cmd /v:on /c rd /s /q !SYSTEMDRIVE!\\",
+    "cmd /c rd /s /q %SystemRoot%\\..",
+    "cmd /c rd /s /q %TARGET%",
+    "cmd /c rd /s /q %TARGET%\\folder\\..",
+]
+
+
+_WINDOWS_DYNAMIC_ROOT_DELETE_ALLOW = [
+    "cmd /c rd /s /q %SYSTEMDRIVE%\\scoped",
+    "cmd /v:on /c rd /s /q !SYSTEMDRIVE!\\scoped",
+    "cmd /c rd /s /q %SystemRoot%\\Temp",
+    "cmd /c rd /s /q %TARGET%\\scoped",
+]
+
+
 @pytest.mark.parametrize("command", _HARDLINE_BLOCK)
 def test_hardline_detection_blocks(command):
     is_hl, desc = detect_hardline_command(command)
@@ -271,6 +289,32 @@ def test_windows_scoped_or_non_recursive_delete_is_not_hardline(command):
     is_hl, desc = detect_hardline_command(command)
     assert not is_hl, f"scoped Windows delete was hardline-blocked: {command!r}"
     assert desc is None
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DYNAMIC_ROOT_DELETE_BLOCK)
+def test_windows_dynamic_recursive_root_delete_is_hardline(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert is_hl, f"dynamic Windows root delete bypassed hardline detection: {command!r}"
+    assert desc == "recursive delete of Windows filesystem root"
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DYNAMIC_ROOT_DELETE_ALLOW)
+def test_windows_scoped_dynamic_delete_is_not_hardline(command):
+    is_hl, desc = detect_hardline_command(command)
+    assert not is_hl, f"scoped dynamic Windows delete was hardline-blocked: {command!r}"
+    assert desc is None
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DYNAMIC_ROOT_DELETE_BLOCK)
+def test_windows_dynamic_root_delete_cannot_bypass_public_guards(
+    command, clean_session, monkeypatch
+):
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+
+    for guard in (check_dangerous_command, check_all_command_guards):
+        result = guard(command, "local")
+        assert result["approved"] is False
+        assert result.get("hardline") is True
 
 
 @pytest.mark.parametrize(

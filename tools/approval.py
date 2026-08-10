@@ -564,6 +564,20 @@ HARDLINE_PATTERNS_COMPILED = [
 _WINDOWS_ROOT_DELETE_RE = re.compile(_WINDOWS_ROOT_DELETE_PATTERN, _RE_FLAGS)
 _WINDOWS_RD_INVOCATION_RE = re.compile(_WINDOWS_RD_INVOCATION_PATTERN, _RE_FLAGS)
 _WINDOWS_ARGUMENT_TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+_WINDOWS_DRIVE_VARIABLE_RE = re.compile(
+    r'%(?:systemdrive|homedrive)%|!(?:systemdrive|homedrive)!|'
+    r'\$env:(?:systemdrive|homedrive)\b',
+    re.IGNORECASE,
+)
+_WINDOWS_SYSTEM_DIR_VARIABLE_RE = re.compile(
+    r'%(?:systemroot|windir)%|!(?:systemroot|windir)!|'
+    r'\$env:(?:systemroot|windir)\b',
+    re.IGNORECASE,
+)
+_WINDOWS_DYNAMIC_PATH_RE = re.compile(
+    r'%[^%]+%|![^!]+!|\$(?:env:)?[a-z_][a-z0-9_]*|`',
+    re.IGNORECASE,
+)
 
 
 def _windows_literal_path_is_root(token: str) -> bool:
@@ -576,8 +590,30 @@ def _windows_literal_path_is_root(token: str) -> bool:
     return tail == "\\" and (bool(drive) or normalized == "\\")
 
 
+def _windows_path_is_root_or_unscoped_dynamic(token: str) -> bool:
+    """Classify roots and dynamic paths that cannot be proven scoped."""
+    token = token.strip().strip("\"'")
+    resolved = _WINDOWS_DRIVE_VARIABLE_RE.sub(lambda _: "C:", token)
+    resolved = _WINDOWS_SYSTEM_DIR_VARIABLE_RE.sub(lambda _: r"C:\Windows", resolved)
+    dynamic_matches = list(_WINDOWS_DYNAMIC_PATH_RE.finditer(resolved))
+    if not dynamic_matches:
+        return _windows_literal_path_is_root(resolved)
+
+    suffix = resolved[dynamic_matches[-1].end():].replace("/", "\\")
+    scoped_components = []
+    for component in suffix.split("\\"):
+        if component in {"", "."}:
+            continue
+        if component == "..":
+            if scoped_components:
+                scoped_components.pop()
+            continue
+        scoped_components.append(component)
+    return not scoped_components
+
+
 def _windows_recursive_delete_targets_root(command: str) -> bool:
-    """Parse cmd-owned rd arguments and classify literal normalized roots."""
+    """Parse cmd-owned rd arguments and classify root-equivalent targets."""
     for match in _WINDOWS_RD_INVOCATION_RE.finditer(command):
         tokens = _WINDOWS_ARGUMENT_TOKEN_RE.findall(match.group("arguments"))
         normalized_tokens = [token.strip("\"'").lower() for token in tokens]
@@ -586,7 +622,7 @@ def _windows_recursive_delete_targets_root(command: str) -> bool:
         for token, normalized_token in zip(tokens, normalized_tokens):
             if normalized_token in {"/s", "/q"}:
                 continue
-            if _windows_literal_path_is_root(token):
+            if _windows_path_is_root_or_unscoped_dynamic(token):
                 return True
     return False
 
