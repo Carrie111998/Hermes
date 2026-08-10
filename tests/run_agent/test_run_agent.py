@@ -2711,6 +2711,37 @@ class TestHandleMaxIterations:
         assert tool_ids == ["call_good", "call_bad"]
 
 
+class TestStructuredAssistantContent:
+    """Assistant content blocks must be flattened before regex scrubbing."""
+
+    def test_interim_visible_text_accepts_codex_content_blocks(self, agent):
+        visible = agent._interim_assistant_visible_text(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "output_text", "text": "Phase complete."},
+                    {"type": "text", "text": "Starting verification."},
+                ],
+            }
+        )
+
+        # flatten_message_text joins parts with \n (v0.20.0+); .strip() removes trailing whitespace
+        assert visible == "Phase complete.\nStarting verification."
+
+    def test_interim_visible_text_ignores_non_text_blocks(self, agent):
+        visible = agent._interim_assistant_visible_text(
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+                    {"type": "output_text", "text": "Visible status."},
+                ],
+            }
+        )
+
+        assert visible == "Visible status."
+
+
 class TestRunConversation:
     """Tests for the main run_conversation method.
 
