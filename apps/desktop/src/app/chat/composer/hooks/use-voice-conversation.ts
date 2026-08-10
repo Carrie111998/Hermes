@@ -354,14 +354,17 @@ export function useVoiceConversation({
           return
         }
 
+        // No early return after arming pendingStartRef: in the common path the
+        // status is ALREADY 'idle' — speak()'s finally set it, which is what
+        // triggered this very run — so setStatus bails without a re-render and
+        // no later run would ever reach the startListening() gate below. Fall
+        // through and consume the armed flag in THIS run.
         if (!response.pending && !busy) {
           awaitingSpokenResponseRef.current = false
           consumePendingResponse()
           resetSpeechBuffer()
           pendingStartRef.current = true
           setStatus('idle')
-
-          return
         }
       }
 
@@ -370,8 +373,6 @@ export function useVoiceConversation({
         resetSpeechBuffer()
         pendingStartRef.current = true
         setStatus('idle')
-
-        return
       }
     }
 
