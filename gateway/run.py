@@ -9761,12 +9761,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return
 
+        if self._enqueue_user_event_before_goal_continuations(
+            session_key,
+            event,
+            adapter,
+            adapter_session_key=slot_key,
+        ):
+            return
+
         self._enqueue_fifo(
             session_key,
             event,
             adapter,
             adapter_session_key=slot_key,
         )
+
+    def _enqueue_user_event_before_goal_continuations(
+        self,
+        session_key: str,
+        event: MessageEvent,
+        adapter: Any,
+        *,
+        adapter_session_key: Optional[str] = None,
+    ) -> bool:
+        """Put real user work ahead of queued synthetic /goal continuations.
+
+        A continuation can occupy the adapter's next-up slot just as a new
+        inbound user message arrives.  Treating that slot as an ordinary FIFO
+        head would run the synthetic turn first.  Preserve FIFO among real
+        events, but demote every synthetic continuation behind them.
+        """
+        if self._is_goal_continuation_event(event):
+            return False
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        if not isinstance(pending_slot, dict):
+            return False
+        slot_key = adapter_session_key or session_key
+        pending_event = pending_slot.get(slot_key)
+        q_state = self._session_state(session_key)
+        queued_events = q_state.conversation.queued_events
+        current_events = ([pending_event] if pending_event is not None else []) + list(queued_events)
+        if not any(self._is_goal_continuation_event(item) for item in current_events):
+            return False
+
+        real_events = [item for item in current_events if not self._is_goal_continuation_event(item)]
+        continuations = [item for item in current_events if self._is_goal_continuation_event(item)]
+        real_events.append(event)
+        pending_slot[slot_key] = real_events[0]
+        queued_events[:] = real_events[1:] + continuations
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.

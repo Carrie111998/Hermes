@@ -32,6 +32,13 @@ class _FakeSessionStore:
 class _PendingAdapter:
     def __init__(self):
         self._pending_messages = {}
+        self.adapter_session_key: str | None = None
+
+    def get_pending_message(self, session_key):
+        return self._pending_messages.pop(session_key, None)
+
+    def session_key_for_source(self, source):
+        return self.adapter_session_key
 
 
 class _DrainAdapter(BasePlatformAdapter):
@@ -383,6 +390,48 @@ def test_gateway_goal_resume_fifo_separates_multiplexed_slot_and_state_keys():
     assert removed == 2
     assert adapter._pending_messages == {}
     assert runner._session_state(state_key).conversation.queued_events == [user_event]
+
+
+def test_gateway_real_user_preempts_queued_goal_continuation():
+    """A newly arriving user event outranks an already-staged synthetic turn."""
+    adapter = _PendingAdapter()
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="token")}
+    )
+    runner.__dict__["session_store"] = _MultiplexSessionStore()
+    runner._queued_events = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chat-goal-priority",
+        chat_type="channel",
+        user_id="user-goal-priority",
+        profile="coder",
+    )
+    state_key = runner._session_key_for_source(source)
+    adapter_key = "adapter:goal-priority"
+    adapter.adapter_session_key = adapter_key
+    continuation = MessageEvent(
+        text="[Continuing toward your standing goal]\nGoal: ship safely",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    real_user = MessageEvent(
+        text="pause and change direction",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    adapter._pending_messages[adapter_key] = continuation
+    runner._adapter_for_source = lambda source: adapter
+
+    runner._queue_or_replace_pending_event(
+        state_key,
+        real_user,
+        adapter_session_key=adapter_key,
+    )
+
+    assert runner._dequeue_and_promote_queued_event(state_key, adapter, source) is real_user
+    assert runner._dequeue_and_promote_queued_event(state_key, adapter, source) is continuation
 
 
 @pytest.mark.asyncio
