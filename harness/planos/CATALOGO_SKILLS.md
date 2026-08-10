@@ -7,6 +7,7 @@ Contratos resumidos. Implementação em `~/.cursor/skills/hermes-*/SKILL.md` + s
 | `hermes-patch-guard` | `harness/scripts/hermes_patch_guard.py` + `~/.cursor/skills/hermes-patch-guard/` | ✅ v0.1.0 |
 | `hermes-test-slice` | `harness/scripts/hermes_test_slice.py` + skill | ✅ v0.1.0 (`.venv` + `--extra dev`) |
 | `hermes-gateway-ops` | `harness/scripts/hermes_gateway_ops.py` + skill | ✅ v0.1.0 |
+| `hermes-credential-audit` | `harness/scripts/hermes_credential_audit.py` + skill | ✅ v0.1.0 |
 
 ---
 
@@ -182,5 +183,5 @@ Contratos resumidos. Implementação em `~/.cursor/skills/hermes-*/SKILL.md` + s
 2. `hermes-test-slice`
 3. `hermes-sync-upstream` (depende 1+2)
 4. ~~`hermes-gateway-ops`~~ ✅
-5. `hermes-credential-audit`
+5. ~~`hermes-credential-audit`~~ ✅
 6. Demais conforme confirmação D-003..D-006

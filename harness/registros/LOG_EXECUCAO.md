@@ -62,6 +62,18 @@
 | Fix UTF-8 stdout Windows | OK |
 | Fix venv resolution | OK — prefere `.venv` sobre PATH |
 
+### 2026-08-10 — Skill hermes-credential-audit
+
+| Passo | Resultado |
+|---|---|
+| Script `hermes_credential_audit.py` | OK — pool + oauth + env keys |
+| Skill Cursor | OK — `~/.cursor/skills/hermes-credential-audit/` |
+| Teste default scope | OK — sem vazamento de tokens |
+| Teste `--all-profiles` | OK — 4 scopes (default + 3 profiles) |
+| Teste `--provider openrouter` | OK — entry zumbi detectada (`has_token: false`) |
+
+**Próximo passo:** `hermes doctor --fix` ou skill `hermes-cron-audit`
+
 ### 2026-08-10 — Fim de sessão
 
 Handoff: `registros/RETOMADA_SESSAO.md`. Usuário reiniciará sessão Cursor.
