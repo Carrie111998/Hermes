@@ -365,7 +365,8 @@ def render_sources(
             lines.append(f"[^{s['id']}]: {s['url']}{suffix}")
         return "\n".join(lines)
     if style == "chat":
-        lines.append(f"## {heading} <!-- hermes-sources -->")
+        normalized_heading = " ".join(heading.split()) or "Sources"
+        lines.append(f"## {normalized_heading} <!-- hermes-sources -->")
         lines.append("")
         for s in picked:
             label = _markdown_label(s.get("label") or _fallback_label(s["url"]))
@@ -393,6 +394,19 @@ def render_sources(
 # ---------------------------------------------------------------------------
 
 
+def _sources_header_index(lines: list[str]) -> int:
+    """Return the last Sources header outside fenced code, or -1."""
+    header_idx = -1
+    in_fence = False
+    for i, line in enumerate(lines):
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence and _SOURCES_HEADER_RE.match(line):
+            header_idx = i
+    return header_idx
+
+
 def _split_draft(text: str) -> tuple[str, dict[int, str]]:
     """Split a draft into (prose, sources_block_map).
 
@@ -401,10 +415,7 @@ def _split_draft(text: str) -> tuple[str, dict[int, str]]:
     Fenced code blocks are dropped from prose.
     """
     lines = text.splitlines()
-    header_idx = -1
-    for i, line in enumerate(lines):
-        if _SOURCES_HEADER_RE.match(line):
-            header_idx = i
+    header_idx = _sources_header_index(lines)
     listed: dict[int, str] = {}
     if header_idx >= 0:
         for line in lines[header_idx + 1:]:
@@ -433,10 +444,7 @@ def _strip_sources_block(text: str) -> str:
     idempotent instead of stacking duplicate blocks.
     """
     lines = text.splitlines()
-    header_idx = -1
-    for i, line in enumerate(lines):
-        if _SOURCES_HEADER_RE.match(line):
-            header_idx = i
+    header_idx = _sources_header_index(lines)
     if header_idx < 0:
         return text
     return "\n".join(lines[:header_idx])

@@ -696,6 +696,56 @@ def test_render_replace_in_appends_when_no_block_exists(sources_mod, tmp_path: P
     capsys.readouterr()
 
 
+def test_render_replace_in_ignores_localized_marker_inside_fence(
+    sources_mod, tmp_path: Path, capsys
+) -> None:
+    ledger = tmp_path / "fenced.json"
+    args = ["--ledger", str(ledger)]
+    sources_mod.main(args + ["add", "https://a.example"])
+    capsys.readouterr()
+    draft = tmp_path / "d.md"
+    draft.write_text(
+        "Example output:\n\n"
+        "```md\n## Fuentes <!-- hermes-sources -->\n"
+        "[1] [example](https://example.invalid)\n```\n\n"
+        "A real claim after the example cites the ledger.[1]\n",
+        encoding="utf-8",
+    )
+
+    assert sources_mod.main(args + ["render", "--replace-in", str(draft)]) == 0
+    rendered = draft.read_text(encoding="utf-8")
+
+    assert "example.invalid" in rendered
+    assert "A real claim after the example cites the ledger.[1]" in rendered
+    assert rendered.endswith(
+        "## Sources <!-- hermes-sources -->\n\n[1] [a.example](https://a.example)\n"
+    )
+
+
+def test_render_replace_in_normalizes_multiline_heading_idempotently(
+    sources_mod, tmp_path: Path, capsys
+) -> None:
+    ledger = tmp_path / "heading.json"
+    args = ["--ledger", str(ledger)]
+    sources_mod.main(args + ["add", "https://a.example"])
+    capsys.readouterr()
+    draft = tmp_path / "d.md"
+    draft.write_text("A claim resting on the first source.[1]\n", encoding="utf-8")
+    command = args + [
+        "render",
+        "--heading",
+        "Fuentes\nconsultadas",
+        "--replace-in",
+        str(draft),
+    ]
+
+    assert sources_mod.main(command) == 0
+    first = draft.read_text(encoding="utf-8")
+    assert "## Fuentes consultadas <!-- hermes-sources -->" in first
+    assert sources_mod.main(command) == 0
+    assert draft.read_text(encoding="utf-8") == first
+
+
 # ---------------------------------------------------------------------------
 # Output legibility
 # ---------------------------------------------------------------------------
