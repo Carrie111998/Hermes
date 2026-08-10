@@ -37,6 +37,13 @@ except ImportError:
 import struct
 
 
+# ``struct timeval`` — ``tv_sec``, ``tv_usec`` — the payload of ``SO_RCVTIMEO``
+# on the platforms this POSIX-only module runs on.  Named once so the probe and
+# the recovery below cannot drift apart.
+_TIMEVAL_FORMAT = "ll"
+_TIMEVAL_SIZE = struct.calcsize(_TIMEVAL_FORMAT)
+
+
 # Rate-limit: at most this many spurious-EOF recoveries per 60-second window.
 # A child aggressively flipping ``O_NONBLOCK`` on the shared fd would otherwise
 # create a tight busy-loop burning CPU.  Exceeding the cap exits the process —
@@ -69,7 +76,13 @@ def diagnose_stdin_state() -> str:
         try:
             s = _socket.fromfd(0, _socket.AF_UNIX, _socket.SOCK_STREAM)
             try:
-                tv = s.getsockopt(_socket.SOL_SOCKET, _socket.SO_RCVTIMEO)
+                # ``getsockopt`` without an explicit buffer length assumes an
+                # *int* option and reads only ``sizeof(int)`` bytes, truncating
+                # ``struct timeval`` to the low half of ``tv_sec`` — a 500 ms
+                # timeout is then reported as ``0``.  Read the whole struct.
+                tv = s.getsockopt(
+                    _socket.SOL_SOCKET, _socket.SO_RCVTIMEO, _TIMEVAL_SIZE
+                )
                 parts.append(f"SO_RCVTIMEO={tv!r}")
             finally:
                 # ``fromfd`` duped the fd; ``close`` releases the dup without
@@ -139,7 +152,11 @@ def handle_spurious_eof(
             s = _socket.fromfd(0, _socket.AF_UNIX, _socket.SOCK_STREAM)
             try:
                 # Zero timeval: tv_sec=0, tv_usec=0 (struct timeval on most platforms)
-                s.setsockopt(_socket.SOL_SOCKET, _socket.SO_RCVTIMEO, struct.pack("ll", 0, 0))
+                s.setsockopt(
+                    _socket.SOL_SOCKET,
+                    _socket.SO_RCVTIMEO,
+                    struct.pack(_TIMEVAL_FORMAT, 0, 0),
+                )
             finally:
                 s.close()
         except Exception:
