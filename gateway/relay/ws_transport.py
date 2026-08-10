@@ -854,7 +854,25 @@ class WebSocketRelayTransport:
                 *lines, buf = buf.split("\n")
                 for line in lines:
                     if line.strip():
-                        await self._handle_frame(line)
+                        try:
+                            await self._handle_frame(line)
+                        except Exception:  # noqa: BLE001 - one frame must not end the read loop
+                            # Unguarded, the FIRST raising frame ended the
+                            # `async for` outright — taking with it every frame
+                            # already parsed behind it in `lines` AND the
+                            # trailing partial in `buf`, which is reassigned
+                            # above before any of them dispatch. An
+                            # `outbound_result` batched behind a bad `inbound`
+                            # then never reached `_pending`, so an unrelated
+                            # send was answered by the connection-lost path
+                            # instead of by its own result. Skip the frame and
+                            # keep the rest of the chunk — the same disposition
+                            # `_handle_frame`'s own decode guard already takes.
+                            # `CancelledError` is a `BaseException`, so a
+                            # cancelled reader still unwinds.
+                            logger.warning(
+                                "relay: frame handler failed; skipping frame", exc_info=True
+                            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - log + let the task end; reconnection handled below
