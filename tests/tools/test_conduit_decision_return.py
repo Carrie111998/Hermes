@@ -13,6 +13,7 @@ from tools.conduit_decision_return import (
     ConduitClientSession,
     ConduitDecisionReturnBridge,
     ConduitDecisionReturnNotification,
+    ConduitServerNotification,
     compatible_server_capability,
 )
 
@@ -57,6 +58,24 @@ def test_capability_and_notification_contract_are_exact() -> None:
                 "stream_seq": 3,
                 "title": "must not travel unsolicited",
             },
+        })
+
+
+def test_extended_notification_union_accepts_exact_jsonrpc_envelope() -> None:
+    wrapped = ConduitServerNotification.model_validate({
+        "jsonrpc": "2.0",
+        "method": "notifications/conduit/decision-return",
+        "params": {"version": 1, "decision_id": "dec_wire", "stream_seq": 3},
+    })
+
+    assert isinstance(wrapped.root, ConduitDecisionReturnNotification)
+    assert wrapped.root.jsonrpc == "2.0"
+
+    with pytest.raises(Exception):
+        ConduitServerNotification.model_validate({
+            "jsonrpc": "1.0",
+            "method": "notifications/conduit/decision-return",
+            "params": {"version": 1, "decision_id": "dec_wire", "stream_seq": 3},
         })
 
 

@@ -16,7 +16,7 @@ import json
 import logging
 import threading
 import time
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, RootModel
 
@@ -41,6 +41,7 @@ class _DecisionReturnParams(BaseModel):
 class ConduitDecisionReturnNotification(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    jsonrpc: Literal["2.0"] = "2.0"
     method: str = Field(pattern=r"^notifications/conduit/decision-return$")
     params: _DecisionReturnParams
 
