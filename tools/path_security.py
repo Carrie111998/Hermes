@@ -250,6 +250,42 @@ def extract_filesystem_targets(command: Optional[str]) -> list[str]:
     for fb in _fallback_extract_windows_paths(command):
         if fb not in targets:
             targets.append(fb)
+    # Outer-quote wrap-around: when ``cmd /c "..."`` or
+    # ``powershell -Command '...'`` collapses to a single outer
+    # token, the inner structure of the wrapped command can still
+    # contain a root-target destructive verb on a root path
+    # containing backslashes (Windows UNC roots, device-namespace
+    # roots). Round-8 MoA review flagged that these slipped through
+    # the primary pass.
+    #
+    # Restricting the re-tokenize trigger to tokens that contain a
+    # backslash (``\\``) — and not just any path separator — avoids
+    # false positives such as ``git commit -m "rm -rf /"`` where the
+    # quoted segment is *string data* (a commit message) but the
+    # forward slash inside would otherwise be re-tokenized into a
+    # root-target. Pure POSIX forward-slash paths are already
+    # handled by the primary tokenizer + the drive-root fallback.
+    for token in tokens:
+        if not token:
+            continue
+        t = token.strip().strip('"').strip("'")
+        if not t or "\\" not in t:
+            continue
+        for inner in _command_tokenize(t):
+            inner = inner.strip().strip('"').strip("'")
+            if not inner:
+                continue
+            if not _looks_like_filesystem_target(inner):
+                continue
+            if inner in targets:
+                continue
+            added_any = False
+            for inner_fb in _fallback_extract_windows_paths(inner):
+                if inner_fb not in targets:
+                    targets.append(inner_fb)
+                added_any = True
+            if not added_any:
+                targets.append(inner)
     # Deduplicate while preserving order.
     seen = set()
     out = []
@@ -351,12 +387,14 @@ def _fallback_extract_windows_paths(s: str) -> list[str]:
             out.append(m)
     drive_joined = " ".join(drive_matches)
     # Build the set of source-string spans covered by path-like
-    # candidates the primary tokenizer already emitted, so the
-    # bare-backslash filter only emits a backslash that is NOT inside
-    # any path-already-shadowed region.  This handles both:
-    #   - drive matches from _DRIVE_ROOT_RE (above), and
-    #   - UNC / drive-root tokens from _command_tokenize that did not
-    #     match the _DRIVE_ROOT_RE regex (e.g. ``\\server\share\folder``).
+    # candidates. Drives come from _DRIVE_ROOT_RE; UNC and other
+    # backslash-bearing tokens come from the primary tokenizer
+    # stage. The tokenizer sometimes returns a token that wraps an
+    # entire quoted body (when outer ``cmd /c "..."`` or
+    # ``powershell -Command '...'`` collapse ate the inner structure)
+    # — when such a token contains a backslash we still treat it as
+    # a path-bearing span so the bare backslash inside it is NOT
+    # re-emitted as a fresh root residue.
     spans: list[tuple[int, int]] = []
     cursor = 0
     for m in drive_matches:
@@ -364,18 +402,18 @@ def _fallback_extract_windows_paths(s: str) -> list[str]:
         if idx != -1:
             spans.append((idx, idx + len(m)))
             cursor = idx + len(m)
-    # Tokenize-and-locate path spans in the source string.
-    # _BACKSLASH_RE-isolated matches inside any of those spans are
-    # inside a path-already-classified region, so they are NOT bare
-    # root residue.
     cursor2 = 0
     for tok in _command_tokenize(s):
-        if not _looks_like_filesystem_target(tok):
-            continue
         idx = s.find(tok, cursor2)
         if idx == -1:
             continue
-        spans.append((idx, idx + len(tok)))
+        # Register a span for a tokenizer-emitted token when either:
+        # (a) the token is itself path-like (``_looks_like_filesystem_target``),
+        # OR (b) the token contains a backslash — implying it wraps
+        #     a quoted path-segment and its bare separators are NOT
+        #     new bare-root residue from outer-quote collapse.
+        if _looks_like_filesystem_target(tok) or ("\\" in tok or "/" in tok):
+            spans.append((idx, idx + len(tok)))
         cursor2 = idx + len(tok)
     for bmatch in _BACKSLASH_RE.finditer(s):
         m = bmatch.group(0)
@@ -394,7 +432,7 @@ def _fallback_extract_windows_paths(s: str) -> list[str]:
             if stripped.startswith("\n"):
                 continue
             head = s[:pos].rstrip(" \t")
-            if head.endswith((";", "&", "|")) and stripped and (stripped[0].isalpha() or stripped[0] == "_"):
+            if head.endswith((";", "&", "|")) and stripped and (stripped[0].isalnum() or stripped[0] == "_"):
                 continue
         out.append(m)
     return out
