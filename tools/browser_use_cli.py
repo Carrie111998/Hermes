@@ -52,7 +52,16 @@ def _blocked_url_in_code(code: str) -> Optional[str]:
 def _base_subprocess_env() -> dict:
     from tools.browser_tool import _build_browser_env
 
-    return _build_browser_env()
+    env = _build_browser_env()
+    # The browser-use CLI runs under its own Python (via uvx or a standalone
+    # binary), which may differ from Hermes's venv Python.  PYTHONPATH inherited
+    # from the agent process points at Hermes's venv site-packages, so the CLI
+    # would import packages (e.g. pydantic) from the wrong interpreter and crash
+    # on compiled C-extension ABI mismatches.  Strip it — the CLI manages its
+    # own environment and never needs Hermes's import path.
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    return env
 
 
 def _read_browser_cfg() -> dict:
