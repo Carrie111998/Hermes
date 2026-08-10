@@ -136,6 +136,11 @@ class SubdirectoryHintTracker:
         a different path (a symlink farm, a shared workspace) is recognised as a
         duplicate instead of being sent a second time.
         """
+        if self._has_denied_lexical_ancestor(
+            self.working_dir,
+            include_working_dir_parents=True,
+        ):
+            return
         for filename in _HINT_FILENAMES:
             candidate = self.working_dir / filename
             if _is_denied_context_path(candidate, base_path=self.working_dir):
@@ -238,22 +243,23 @@ class SubdirectoryHintTracker:
         except (OSError, ValueError, RuntimeError):
             pass
 
-    def _has_denied_lexical_ancestor(self, path: Path) -> bool:
-        """Check the progressive walk chain without filesystem canonicalization."""
+    def _has_denied_lexical_ancestor(
+        self,
+        path: Path,
+        *,
+        include_working_dir_parents: bool = False,
+    ) -> bool:
+        """Check ancestors lexically before any filesystem canonicalization."""
         current = path
-        for _ in range(_MAX_ANCESTOR_WALK + 1):
+        for current in [current, *current.parents]:
             if _is_denied_context_path(
                 current,
                 base_path=self.working_dir,
                 canonicalize=False,
             ):
                 return True
-            if current == self.working_dir:
+            if current == self.working_dir and not include_working_dir_parents:
                 break
-            parent = current.parent
-            if parent == current:
-                break
-            current = parent
         return False
 
     def _extract_paths_from_command(self, cmd: str, candidates: Set[Path]):

@@ -490,6 +490,38 @@ class TestDetection:
         ):
             assert cc._marker_root(nested, policy_base_path=nested) is None
 
+    @pytest.mark.parametrize("resolver", [cc._git_root, cc._marker_root])
+    def test_workspace_discovery_preflights_fixed_width_denied_ancestor(
+        self,
+        tmp_path,
+        resolver,
+    ):
+        denied_ancestor = tmp_path / "private1"
+        cwd = denied_ancestor / "src"
+        cwd.mkdir(parents=True)
+        from agent import deny_policy
+
+        def in_denied_subtree(raw_path):
+            path = Path(raw_path)
+            return path == denied_ancestor or denied_ancestor in path.parents
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "private?")],
+            ),
+            patch(
+                "agent.deny_policy.os.path.realpath",
+                wraps=deny_policy.os.path.realpath,
+            ) as mock_realpath,
+        ):
+            assert resolver(cwd, policy_base_path=cwd) is None
+
+        assert not any(
+            in_denied_subtree(call.args[0])
+            for call in mock_realpath.call_args_list
+        )
+
     @pytest.mark.parametrize("marker", ["pyproject.toml", "package.json", "go.mod", "AGENTS.md"])
     def test_project_manifest_triggers_without_git(self, tmp_path, marker):
         (tmp_path / marker).write_text("x")

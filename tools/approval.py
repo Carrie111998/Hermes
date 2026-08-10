@@ -552,14 +552,9 @@ def _match_user_deny_rule(command: str) -> str | None:
     quoting tricks (``r\\m``, ``git st""atus``) can't sidestep a rule any
     more easily than they sidestep detection. Empty/absent lists = no-op.
     """
-    from agent.deny_policy import parse_deny_patterns, permissions_deny_commands
+    from agent.deny_policy import command_deny_patterns
 
-    deny_patterns = parse_deny_patterns(
-        _get_approval_config().get("deny"),
-        field="approvals.deny",
-        require_list=True,
-    )
-    deny_patterns.extend(permissions_deny_commands())
+    deny_patterns = command_deny_patterns()
     if not deny_patterns:
         return None
     for command_variant in _command_detection_variants(command):

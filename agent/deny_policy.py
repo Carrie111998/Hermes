@@ -105,6 +105,28 @@ def permissions_deny_commands(config: dict[str, Any] | None = None) -> list[str]
     )
 
 
+def command_deny_patterns(config: dict[str, Any] | None = None) -> list[str]:
+    """Return both command-deny aliases from one strict policy snapshot."""
+    if config is None:
+        config = load_user_config()
+    if not isinstance(config, dict):
+        raise DenyPolicyError("Hermes config must be a mapping")
+
+    approvals = config.get("approvals")
+    if approvals is None:
+        approvals = {}
+    if not isinstance(approvals, dict):
+        raise DenyPolicyError("approvals must be a mapping")
+
+    patterns = parse_deny_patterns(
+        approvals.get("deny"),
+        field="approvals.deny",
+        require_list=True,
+    )
+    patterns.extend(permissions_deny_commands(config))
+    return patterns
+
+
 def permissions_deny_paths(config: dict[str, Any] | None = None) -> list[str]:
     """Return path deny globs from ``permissions.deny.paths``."""
     deny = _permissions_deny_config(config)

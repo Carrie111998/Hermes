@@ -961,7 +961,16 @@ class TestPermissionsDenyCommandsAlias:
             "mode": "manual",
             "deny": ["git push --force*"],
         })
-        monkeypatch.setattr(deny_policy, "load_user_config", lambda: {})
+        monkeypatch.setattr(
+            deny_policy,
+            "load_user_config",
+            lambda: {
+                "approvals": {
+                    "mode": "manual",
+                    "deny": ["git push --force*"],
+                }
+            },
+        )
 
         result = approval_mod.check_all_command_guards("git push --force origin main", "local")
 

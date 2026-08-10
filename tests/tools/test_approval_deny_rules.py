@@ -22,6 +22,10 @@ def deny_config(monkeypatch):
         state["config"] = {"mode": "manual", "deny": list(patterns), **extra}
 
     monkeypatch.setattr(mod, "_get_approval_config", lambda: state["config"])
+    monkeypatch.setattr(
+        "agent.deny_policy.load_user_config",
+        lambda: {"approvals": state["config"]},
+    )
     return set_deny
 
 
@@ -41,16 +45,57 @@ class TestMatchUserDenyRule:
         assert mod._match_user_deny_rule("git push --force origin main") is None
 
     def test_missing_key_is_noop(self, monkeypatch):
-        monkeypatch.setattr(mod, "_get_approval_config", lambda: {"mode": "manual"})
+        monkeypatch.setattr(
+            "agent.deny_policy.load_user_config",
+            lambda: {"approvals": {"mode": "manual"}},
+        )
         assert mod._match_user_deny_rule("rm -rf build/") is None
 
     def test_config_load_failure_propagates_to_fail_closed_guard(self, monkeypatch):
         def boom():
             raise RuntimeError("config unavailable")
 
-        monkeypatch.setattr(mod, "_get_approval_config", boom)
+        monkeypatch.setattr("agent.deny_policy.load_user_config", boom)
         with pytest.raises(RuntimeError, match="config unavailable"):
             mod._match_user_deny_rule("git push --force")
+
+    @pytest.mark.parametrize(
+        ("command", "expected"),
+        [
+            ("legacy operation", "legacy*"),
+            ("alias operation", "alias*"),
+        ],
+    )
+    def test_command_aliases_share_one_strict_policy_snapshot(
+        self,
+        monkeypatch,
+        command,
+        expected,
+    ):
+        calls = 0
+
+        def strict_load():
+            nonlocal calls
+            calls += 1
+            return {
+                "approvals": {"deny": ["legacy*"]},
+                "permissions": {"deny": {"commands": ["alias*"]}},
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_security_policy_config_readonly",
+            strict_load,
+        )
+        monkeypatch.setattr(
+            mod,
+            "_get_approval_config",
+            lambda: (_ for _ in ()).throw(
+                AssertionError("general config loader used for command deny policy")
+            ),
+        )
+
+        assert mod._match_user_deny_rule(command) == expected
+        assert calls == 1
 
     def test_quote_obfuscation_still_matches(self, deny_config):
         """Deobfuscation variants from the detector also feed deny matching."""
@@ -78,9 +123,8 @@ class TestDenyBeatsYolo:
     def test_malformed_legacy_deny_fails_closed_in_all_guards(
             self, monkeypatch, clean_env, deny_value, guard, env_type):
         monkeypatch.setattr(
-            mod,
-            "_get_approval_config",
-            lambda: {"mode": "off", "deny": deny_value},
+            "agent.deny_policy.load_user_config",
+            lambda: {"approvals": {"mode": "off", "deny": deny_value}},
         )
 
         result = guard("ls -la", env_type)

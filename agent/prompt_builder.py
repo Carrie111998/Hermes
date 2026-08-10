@@ -84,15 +84,25 @@ def _find_git_root(
     *,
     is_denied: Optional[Callable[[Path], bool]] = None,
     is_root_denied: Optional[Callable[[Path], bool]] = None,
+    is_lexically_root_denied: Optional[Callable[[Path], bool]] = None,
 ) -> Optional[Path]:
     """Walk *start* and its parents looking for a ``.git`` directory.
 
     Returns the directory containing ``.git``, or ``None`` if we hit the
     filesystem root without finding one.
     """
-    policy_aware = is_denied is not None or is_root_denied is not None
+    policy_aware = (
+        is_denied is not None
+        or is_root_denied is not None
+        or is_lexically_root_denied is not None
+    )
     current = start.absolute() if policy_aware else start.resolve()
-    for parent in [current, *current.parents]:
+    parents = [current, *current.parents]
+    if is_lexically_root_denied is not None and any(
+        is_lexically_root_denied(parent) for parent in parents
+    ):
+        return None
+    for parent in parents:
         if is_root_denied is not None and is_root_denied(parent):
             return None
         git_marker = parent / ".git"
@@ -111,6 +121,7 @@ def _find_hermes_md(
     *,
     is_denied: Optional[Callable[[Path], bool]] = None,
     is_root_denied: Optional[Callable[[Path], bool]] = None,
+    is_lexically_root_denied: Optional[Callable[[Path], bool]] = None,
 ) -> Optional[Path]:
     """Discover the nearest ``.hermes.md`` or ``HERMES.md``.
 
@@ -118,13 +129,24 @@ def _find_hermes_md(
     including) the git repository root.  Returns the first match, or
     ``None`` if nothing is found.
     """
+    policy_aware = (
+        is_denied is not None
+        or is_root_denied is not None
+        or is_lexically_root_denied is not None
+    )
+    current = cwd.absolute() if policy_aware else cwd.resolve()
+    if is_lexically_root_denied is not None and any(
+        is_lexically_root_denied(parent)
+        for parent in [current, *current.parents]
+    ):
+        return None
+
     stop_at = _find_git_root(
         cwd,
         is_denied=is_denied,
         is_root_denied=is_root_denied,
+        is_lexically_root_denied=is_lexically_root_denied,
     )
-    policy_aware = is_denied is not None or is_root_denied is not None
-    current = cwd.absolute() if policy_aware else cwd.resolve()
 
     # When there is no git root, only check cwd itself – walking parents
     # could pick up a .hermes.md planted in /tmp, /home, etc.
@@ -2046,7 +2068,12 @@ def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -
 # Context files (SOUL.md, AGENTS.md, .cursorrules)
 # =========================================================================
 
-def _is_denied_project_context_path(path: Path, *, base_path: Path) -> bool:
+def _is_denied_project_context_path(
+    path: Path,
+    *,
+    base_path: Path,
+    canonicalize: bool = True,
+) -> bool:
     """Apply permissions.deny.paths to an implicit project-context file."""
     try:
         from agent.deny_policy import (
@@ -2058,7 +2085,7 @@ def _is_denied_project_context_path(path: Path, *, base_path: Path) -> bool:
             str(path),
             patterns=permissions_deny_paths(),
             base_path=base_path,
-            canonicalize=True,
+            canonicalize=canonicalize,
         ) is not None
     except Exception:
         logger.warning(
@@ -2069,7 +2096,12 @@ def _is_denied_project_context_path(path: Path, *, base_path: Path) -> bool:
         return True
 
 
-def _is_denied_project_context_root(path: Path, *, base_path: Path) -> bool:
+def _is_denied_project_context_root(
+    path: Path,
+    *,
+    base_path: Path,
+    canonicalize: bool = True,
+) -> bool:
     """Fail closed before project-context discovery enumerates *path*."""
     try:
         from agent.deny_policy import (
@@ -2082,7 +2114,7 @@ def _is_denied_project_context_root(path: Path, *, base_path: Path) -> bool:
             patterns=permissions_deny_paths(),
             base_path=base_path,
             root_is_file=False,
-            canonicalize=True,
+            canonicalize=canonicalize,
         ) is not None
     except Exception:
         logger.warning(
@@ -2091,6 +2123,19 @@ def _is_denied_project_context_root(path: Path, *, base_path: Path) -> bool:
             exc_info=True,
         )
         return True
+
+
+def _has_denied_project_context_ancestor(path: Path, *, base_path: Path) -> bool:
+    """Lexically preflight the full discovery chain before filesystem probes."""
+    current = path.absolute()
+    return any(
+        _is_denied_project_context_path(
+            ancestor,
+            base_path=base_path,
+            canonicalize=False,
+        )
+        for ancestor in [current, *current.parents]
+    )
 
 
 def _truncate_content(
@@ -2182,6 +2227,9 @@ def _load_hermes_md(cwd_path: Path, context_length: Optional[int] = None) -> str
         is_root_denied=lambda path: _is_denied_project_context_root(
             path, base_path=cwd_path
         ),
+        is_lexically_root_denied=lambda path: _is_denied_project_context_root(
+            path, base_path=cwd_path, canonicalize=False
+        ),
     )
     if not hermes_md_path:
         return ""
@@ -2227,6 +2275,9 @@ def _agents_md_directory_chain(cwd_path: Path) -> List[Path]:
         ),
         is_root_denied=lambda path: _is_denied_project_context_root(
             path, base_path=current
+        ),
+        is_lexically_root_denied=lambda path: _is_denied_project_context_root(
+            path, base_path=current, canonicalize=False
         ),
     )
     if root is None or root == current:
@@ -2409,7 +2460,10 @@ def build_context_files_prompt(
     # their launch dir IS the user's shell cwd (developing Hermes in-tree).
     from agent.runtime_cwd import _is_install_tree
 
-    if _is_denied_project_context_path(cwd_path, base_path=cwd_path):
+    if (
+        _has_denied_project_context_ancestor(cwd_path, base_path=cwd_path)
+        or _is_denied_project_context_path(cwd_path, base_path=cwd_path)
+    ):
         logger.warning(
             "skipping project-context discovery: working directory is denied "
             "by permissions.deny.paths (%s)",

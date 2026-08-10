@@ -212,6 +212,71 @@ async def test_permissions_deny_blocks_reference_before_path_resolution(
 
 
 @pytest.mark.asyncio
+async def test_file_reference_rechecks_resolved_sensitive_home_alias(tmp_path: Path):
+    import os
+
+    from agent.context_references import preprocess_context_references_async
+
+    home = tmp_path / "home"
+    protected = home / ".aws"
+    protected.mkdir(parents=True)
+    secret = protected / "credentials"
+    secret.write_text("AWS ALIAS CREDENTIAL SECRET", encoding="utf-8")
+    alias = tmp_path / "notes.txt"
+    alias.symlink_to(secret)
+    original_expanduser = os.path.expanduser
+
+    def fake_expanduser(value):
+        return str(home) if value == "~" else original_expanduser(value)
+
+    with (
+        patch("agent.context_references.os.path.expanduser", fake_expanduser),
+        patch("agent.deny_policy.permissions_deny_paths", return_value=[]),
+    ):
+        result = await preprocess_context_references_async(
+            "inspect @file:notes.txt",
+            cwd=tmp_path,
+            allowed_root=tmp_path,
+            context_length=100_000,
+        )
+
+    assert "AWS ALIAS CREDENTIAL SECRET" not in result.message
+    assert any("sensitive" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
+async def test_folder_reference_rechecks_resolved_sensitive_home_alias(tmp_path: Path):
+    import os
+
+    from agent.context_references import preprocess_context_references_async
+
+    home = tmp_path / "home"
+    protected = home / ".aws"
+    protected.mkdir(parents=True)
+    (protected / "credentials").write_text("FOLDER ALIAS SECRET")
+    alias = tmp_path / "docs"
+    alias.symlink_to(protected, target_is_directory=True)
+    original_expanduser = os.path.expanduser
+
+    def fake_expanduser(value):
+        return str(home) if value == "~" else original_expanduser(value)
+
+    with (
+        patch("agent.context_references.os.path.expanduser", fake_expanduser),
+        patch("agent.deny_policy.permissions_deny_paths", return_value=[]),
+    ):
+        result = await preprocess_context_references_async(
+            "inspect @folder:docs",
+            cwd=tmp_path,
+            allowed_root=tmp_path,
+            context_length=100_000,
+        )
+
+    assert "credentials" not in result.message
+    assert any("sensitive" in warning for warning in result.warnings)
+
+
+@pytest.mark.asyncio
 async def test_permissions_deny_blocks_git_reference_before_subprocess(tmp_path: Path):
     from agent.context_references import preprocess_context_references_async
 

@@ -391,6 +391,7 @@ def _is_denied_workspace_root(
     path: Path,
     *,
     base_path: Path | None = None,
+    canonicalize: bool = True,
 ) -> bool:
     """Fail closed before coding-context discovery can enumerate *path*."""
     try:
@@ -404,7 +405,7 @@ def _is_denied_workspace_root(
             patterns=permissions_deny_paths(),
             base_path=base_path or path,
             root_is_file=False,
-            canonicalize=True,
+            canonicalize=canonicalize,
         ) is not None
     except Exception:
         logger.warning(
@@ -421,7 +422,17 @@ def _git_root(
     policy_base_path: Path | None = None,
 ) -> Optional[Path]:
     current = cwd.absolute() if policy_base_path is not None else cwd.resolve()
-    for parent in [current, *current.parents]:
+    parents = [current, *current.parents]
+    if policy_base_path is not None and any(
+        _is_denied_workspace_root(
+            parent,
+            base_path=policy_base_path,
+            canonicalize=False,
+        )
+        for parent in parents
+    ):
+        return None
+    for parent in parents:
         if policy_base_path is not None and _is_denied_workspace_root(
             parent, base_path=policy_base_path
         ):
@@ -456,6 +467,17 @@ def _marker_root(
     not a project-root signal.
     """
     current = cwd.absolute() if policy_base_path is not None else cwd.resolve()
+    all_parents = [current, *current.parents]
+    if policy_base_path is not None and any(
+        _is_denied_workspace_root(
+            parent,
+            base_path=policy_base_path,
+            canonicalize=False,
+        )
+        for parent in all_parents
+    ):
+        return None
+    parents = all_parents[:7]
     home = _home()
     # Shared world-writable temp roots are never project roots: a stray
     # manifest in /tmp (left by any process) must not flip every session
@@ -465,9 +487,7 @@ def _marker_root(
         temp_root = Path(tempfile.gettempdir()).resolve()
     except Exception:
         temp_root = None
-    for depth, parent in enumerate([current, *current.parents]):
-        if depth > 6:
-            break
+    for parent in parents:
         if parent == home or (temp_root is not None and parent == temp_root):
             continue
         if policy_base_path is not None and _is_denied_workspace_root(

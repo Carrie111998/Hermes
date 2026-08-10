@@ -573,6 +573,84 @@ class TestBuildContextFilesPrompt:
         assert result == ""
         assert "DENIED LEXICAL STARTUP" not in result
 
+    def test_startup_preflights_fixed_width_denied_ancestor_before_metadata(
+        self,
+        tmp_path,
+    ):
+        from pathlib import Path
+        from unittest.mock import patch
+
+        denied_ancestor = tmp_path / "private1"
+        cwd = denied_ancestor / "src"
+        cwd.mkdir(parents=True)
+        (cwd / "AGENTS.md").write_text("DENIED ANCESTOR STARTUP")
+        original_exists = Path.exists
+        original_is_file = Path.is_file
+        from agent import deny_policy
+        from agent.prompt_builder import _is_denied_project_context_root
+
+        def in_denied_subtree(path_obj):
+            return path_obj == denied_ancestor or denied_ancestor in path_obj.parents
+
+        def guarded_exists(path_obj):
+            if in_denied_subtree(path_obj):
+                raise AssertionError("startup probed inside denied ancestor")
+            return original_exists(path_obj)
+
+        def guarded_is_file(path_obj):
+            if in_denied_subtree(path_obj):
+                raise AssertionError("startup inspected file inside denied ancestor")
+            return original_is_file(path_obj)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "private?")],
+            ),
+            patch(
+                "agent.deny_policy.os.path.realpath",
+                wraps=deny_policy.os.path.realpath,
+            ) as mock_realpath,
+            patch.object(Path, "exists", guarded_exists),
+            patch.object(Path, "is_file", guarded_is_file),
+        ):
+            lexical_root_denied = lambda path: _is_denied_project_context_root(
+                path,
+                base_path=cwd,
+                canonicalize=False,
+            )
+            assert _find_git_root(
+                cwd,
+                is_lexically_root_denied=lexical_root_denied,
+            ) is None
+            git_realpath_calls = [
+                str(call.args[0])
+                for call in mock_realpath.call_args_list
+                if in_denied_subtree(Path(call.args[0]))
+            ]
+            assert git_realpath_calls == []
+            mock_realpath.reset_mock()
+            assert _find_hermes_md(
+                cwd,
+                is_lexically_root_denied=lexical_root_denied,
+            ) is None
+            hermes_realpath_calls = [
+                str(call.args[0])
+                for call in mock_realpath.call_args_list
+                if in_denied_subtree(Path(call.args[0]))
+            ]
+            assert hermes_realpath_calls == []
+            mock_realpath.reset_mock()
+            result = build_context_files_prompt(cwd=str(cwd), skip_soul=True)
+
+        assert result == ""
+        denied_realpath_calls = [
+            str(call.args[0])
+            for call in mock_realpath.call_args_list
+            if in_denied_subtree(Path(call.args[0]))
+        ]
+        assert denied_realpath_calls == []
+
     def test_denied_hermes_md_is_not_probed_before_allowed_agents_md(self, tmp_path):
         """Exact deny checks precede implicit .hermes.md file metadata access."""
         from pathlib import Path

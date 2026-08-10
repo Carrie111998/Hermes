@@ -181,6 +181,40 @@ class TestSubdirectoryHintTracker:
         ):
             SubdirectoryHintTracker(working_dir=str(lexical_workdir))
 
+    def test_digest_seed_preflights_fixed_width_denied_ancestor(self, tmp_path):
+        denied_ancestor = tmp_path / "private1"
+        working_dir = denied_ancestor / "src"
+        working_dir.mkdir(parents=True)
+        (working_dir / "AGENTS.md").write_text("DENIED DIGEST ANCESTOR")
+        original_is_file = Path.is_file
+        from agent import deny_policy
+
+        def in_denied_subtree(path_obj):
+            return path_obj == denied_ancestor or denied_ancestor in path_obj.parents
+
+        def guarded_is_file(path_obj):
+            if in_denied_subtree(path_obj):
+                raise AssertionError("digest seed probed inside denied ancestor")
+            return original_is_file(path_obj)
+
+        with (
+            patch(
+                "agent.deny_policy.permissions_deny_paths",
+                return_value=[str(tmp_path / "private?")],
+            ),
+            patch(
+                "agent.deny_policy.os.path.realpath",
+                wraps=deny_policy.os.path.realpath,
+            ) as mock_realpath,
+            patch.object(Path, "is_file", guarded_is_file),
+        ):
+            SubdirectoryHintTracker(working_dir=str(working_dir))
+
+        assert not any(
+            in_denied_subtree(Path(call.args[0]))
+            for call in mock_realpath.call_args_list
+        )
+
     def test_progressive_discovery_preflights_denied_ancestor_before_metadata(
         self,
         tmp_path,
