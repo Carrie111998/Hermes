@@ -1076,7 +1076,10 @@ def mcp_command(args):
 
     if action == "serve":
         from mcp_serve import run_mcp_server
-        run_mcp_server(verbose=getattr(args, "verbose", False))
+        run_mcp_server(
+            verbose=getattr(args, "verbose", False),
+            read_only=getattr(args, "read_only", False),
+        )
         return
 
     # Catalog subcommands live in mcp_picker / mcp_catalog. Import lazily so
