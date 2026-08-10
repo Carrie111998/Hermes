@@ -3641,7 +3641,14 @@ class ConnectionManager:
     def schedule_reconnect(self) -> None:
         """Schedule a reconnect only if running and not already reconnecting."""
         if self._adapter._running and not self._reconnecting:
-            asyncio.create_task(self._reconnect_with_backoff())
+            # Anchor the task in the adapter's background set: a bare
+            # asyncio.create_task() keeps only a weak reference, so the loop may
+            # GC the still-pending reconnect mid-flight and the adapter would
+            # then stay offline until the gateway is restarted.
+            self._adapter._track_task(asyncio.create_task(
+                self._reconnect_with_backoff(),
+                name="yuanbao-reconnect",
+            ))
 
     async def _reconnect_with_backoff(self) -> bool:
         """Reconnect with exponential backoff (1s, 2s, 4s, … up to 60s)."""
