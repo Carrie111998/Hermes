@@ -5952,10 +5952,12 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
+        _sk_store = getattr(self, "_session_store", None)
         session_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=_sk_store._resolve_profile_for_key(event.source) if _sk_store else None,
         )
 
         # On-entry self-heal: if the adapter still has an _active_sessions
