@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "compose" ]]; then
+  arguments=()
+  for argument in "$@"; do
+    if [[ "$argument" != "--build" ]]; then
+      arguments+=("$argument")
+    fi
+  done
+  exec /usr/bin/docker "${arguments[@]}"
+fi
+
+exec /usr/bin/docker "$@"

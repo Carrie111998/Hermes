@@ -176,13 +176,14 @@ def _signed_execution_attestation(
                         "host_mounts_absent": True,
                         "host_docker_socket_absent": True,
                         "resources_bounded": True,
-                        "egress_default_deny": True,
+                        "egress_isolated_before_browser_verification": True,
                     },
                 }
                 if worker_required
                 else {"required": False}
             ),
-            "gates": gates or [_gate_record(scope, gate) for gate in scope.required_execution_gates],
+            "gates": gates
+            or [_gate_record(scope, gate) for gate in scope.required_execution_gates],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -261,7 +262,9 @@ def test_manifest_exposes_only_opaque_cursors_bound_to_fixed_endpoints():
         "statuses",
         "workflow_runs",
     }
-    assert all("/" not in token and len(token) >= 20 for token in result["cursors"].values())
+    assert all(
+        "/" not in token and len(token) >= 20 for token in result["cursors"].values()
+    )
     assert "repository" not in result["next_parameters"]
     assert "ref" not in result["next_parameters"]
     assert "path" not in result["next_parameters"]
@@ -299,8 +302,9 @@ def test_recalled_manifest_recovers_only_current_required_cursors():
 
 def test_manifest_recovery_inventory_is_bounded_and_reports_truncation():
     scope = _scope()
-    with evidence_scope(scope), patch(
-        "tools.github_pr_evidence._MAX_RECOVERY_CURSOR_INVENTORY", 2
+    with (
+        evidence_scope(scope),
+        patch("tools.github_pr_evidence._MAX_RECOVERY_CURSOR_INVENTORY", 2),
     ):
         manifest = json.loads(github_pr_evidence_tool("manifest"))
 
@@ -440,9 +444,12 @@ def test_gate_resolution_makes_execution_attestation_mandatory():
         assert resolution_result["success"] is True
         attestation_token = manifest["cursors"]["execution_attestation"]
         assert scope.cursors[attestation_token].required is True
-        assert json.loads(github_pr_evidence_tool("manifest"))["coverage"][
-            "execution_attestation"
-        ]["gate_resolution_complete"] is True
+        assert (
+            json.loads(github_pr_evidence_tool("manifest"))["coverage"][
+                "execution_attestation"
+            ]["gate_resolution_complete"]
+            is True
+        )
         recovery = json.loads(github_pr_evidence_tool("manifest"))[
             "current_required_cursors"
         ]
@@ -460,10 +467,25 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
         "tree": [
             {"path": "AGENTS.md", "mode": "100644", "type": "blob", "sha": "1" * 40},
             {"path": "docs/DEV.md", "mode": "100644", "type": "blob", "sha": "8" * 40},
-            {"path": "docs/TESTING.md", "mode": "100644", "type": "blob", "sha": "9" * 40},
+            {
+                "path": "docs/TESTING.md",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "9" * 40,
+            },
             {"path": "package.json", "mode": "100644", "type": "blob", "sha": "2" * 40},
-            {"path": "playwright.config.ts", "mode": "100644", "type": "blob", "sha": "a" * 40},
-            {"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob", "sha": "3" * 40},
+            {
+                "path": "playwright.config.ts",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "a" * 40,
+            },
+            {
+                "path": ".github/workflows/ci.yml",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "3" * 40,
+            },
             {"path": "src/app.py", "mode": "100644", "type": "blob", "sha": "4" * 40},
         ],
     }
@@ -473,12 +495,32 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
         "tree": [
             {"path": "AGENTS.md", "mode": "100644", "type": "blob", "sha": "1" * 40},
             {"path": "docs/DEV.md", "mode": "100644", "type": "blob", "sha": "8" * 40},
-            {"path": "docs/TESTING.md", "mode": "100644", "type": "blob", "sha": "9" * 40},
+            {
+                "path": "docs/TESTING.md",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "9" * 40,
+            },
             {"path": "package.json", "mode": "100644", "type": "blob", "sha": "2" * 40},
-            {"path": "playwright.config.ts", "mode": "100644", "type": "blob", "sha": "a" * 40},
-            {"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob", "sha": "3" * 40},
+            {
+                "path": "playwright.config.ts",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "a" * 40,
+            },
+            {
+                "path": ".github/workflows/ci.yml",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "3" * 40,
+            },
             {"path": "src/app.py", "mode": "100644", "type": "blob", "sha": "5" * 40},
-            {"path": "tests/test_app.py", "mode": "100644", "type": "blob", "sha": "6" * 40},
+            {
+                "path": "tests/test_app.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "6" * 40,
+            },
         ],
     }
     api_files = [
@@ -513,7 +555,9 @@ def test_tree_diff_reconciles_github_inventory_and_requires_changed_and_canonica
         [f"repos/org/repo/git/trees/{BASE_SHA}?recursive=1"],
         [f"repos/org/repo/git/trees/{HEAD_SHA}?recursive=1"],
     ]
-    required_blobs = [cursor for cursor in scope.cursors.values() if cursor.kind == "blob"]
+    required_blobs = [
+        cursor for cursor in scope.cursors.values() if cursor.kind == "blob"
+    ]
     assert {cursor.data["sha"] for cursor in required_blobs} == {
         "1" * 40,
         "2" * 40,
@@ -650,15 +694,16 @@ def test_tree_diff_normalizes_rename_with_changed_content_from_github_inventory(
     head_tree = {
         **base_tree,
         "sha": "d" * 40,
-        "tree": [
-            entry for entry in base_tree["tree"] if entry["path"] != "src/old.py"
-        ]
+        "tree": [entry for entry in base_tree["tree"] if entry["path"] != "src/old.py"]
         + [{"path": "src/new.py", "mode": "100644", "type": "blob", "sha": "9" * 40}],
     }
 
-    with evidence_scope(scope), patch(
-        "tools.github_pr_evidence._run_gh_json",
-        side_effect=[_comparison(), base_tree, head_tree],
+    with (
+        evidence_scope(scope),
+        patch(
+            "tools.github_pr_evidence._run_gh_json",
+            side_effect=[_comparison(), base_tree, head_tree],
+        ),
     ):
         token = _new_cursor(scope, _Cursor("tree_diff"))
         result = json.loads(github_pr_evidence_tool("read", token))
@@ -719,14 +764,17 @@ def test_tree_diff_uses_merge_base_when_the_base_branch_advanced():
         ],
     }
 
-    with evidence_scope(scope), patch(
-        "tools.github_pr_evidence._run_gh_json",
-        side_effect=[
-            _comparison(merge_base_sha),
-            base_tip_tree,
-            merge_base_tree,
-            head_tree,
-        ],
+    with (
+        evidence_scope(scope),
+        patch(
+            "tools.github_pr_evidence._run_gh_json",
+            side_effect=[
+                _comparison(merge_base_sha),
+                base_tip_tree,
+                merge_base_tree,
+                head_tree,
+            ],
+        ),
     ):
         token = _new_cursor(scope, _Cursor("tree_diff"))
         result = json.loads(github_pr_evidence_tool("read", token))
@@ -925,7 +973,12 @@ def test_concise_changed_files_bounds_large_patches_without_cursor_fanout():
 
 def test_reading_gate_definitions_discovers_referenced_setup_scripts_as_required():
     scope = _scope()
-    package = {"path": "package.json", "mode": "100644", "type": "blob", "sha": "2" * 40}
+    package = {
+        "path": "package.json",
+        "mode": "100644",
+        "type": "blob",
+        "sha": "2" * 40,
+    }
     setup = {
         "path": "scripts/setup-db.sh",
         "mode": "100755",
@@ -956,7 +1009,9 @@ def test_reading_gate_definitions_discovers_referenced_setup_scripts_as_required
 
 def test_cursor_from_another_scope_is_rejected_without_github_access():
     with evidence_scope(_scope(41)):
-        cursor = json.loads(github_pr_evidence_tool("manifest"))["cursors"]["pull_request"]
+        cursor = json.loads(github_pr_evidence_tool("manifest"))["cursors"][
+            "pull_request"
+        ]
 
     with evidence_scope(_scope(42)):
         with patch("tools.github_pr_evidence.subprocess.run") as run:
@@ -1010,16 +1065,14 @@ def test_changed_file_count_mismatch_is_fatal():
         manifest = json.loads(github_pr_evidence_tool("manifest"))
         with patch(
             "tools.github_pr_evidence.subprocess.run",
-            return_value=_result(
-                {
-                    "state": "open",
-                    "draft": False,
-                    "number": 42,
-                    "base": {"sha": BASE_SHA},
-                    "head": {"sha": HEAD_SHA},
-                    "changed_files": 2,
-                }
-            ),
+            return_value=_result({
+                "state": "open",
+                "draft": False,
+                "number": 42,
+                "base": {"sha": BASE_SHA},
+                "head": {"sha": HEAD_SHA},
+                "changed_files": 2,
+            }),
         ):
             json.loads(
                 github_pr_evidence_tool("read", manifest["cursors"]["pull_request"])
@@ -1078,12 +1131,32 @@ def test_pr_184_shape_completes_without_reading_157_artifact_entries():
         "tree": [
             {"path": "AGENTS.md", "mode": "100644", "type": "blob", "sha": "1" * 40},
             {"path": "docs/DEV.md", "mode": "100644", "type": "blob", "sha": "8" * 40},
-            {"path": "docs/TESTING.md", "mode": "100644", "type": "blob", "sha": "9" * 40},
+            {
+                "path": "docs/TESTING.md",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "9" * 40,
+            },
             {"path": "package.json", "mode": "100644", "type": "blob", "sha": "2" * 40},
-            {"path": "playwright.config.ts", "mode": "100644", "type": "blob", "sha": "a" * 40},
-            {"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob", "sha": "3" * 40},
+            {
+                "path": "playwright.config.ts",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "a" * 40,
+            },
+            {
+                "path": ".github/workflows/ci.yml",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "3" * 40,
+            },
             {"path": "src/app.py", "mode": "100644", "type": "blob", "sha": "4" * 40},
-            {"path": "tests/test_app.py", "mode": "100644", "type": "blob", "sha": "5" * 40},
+            {
+                "path": "tests/test_app.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "5" * 40,
+            },
         ],
     }
     head_tree = {
@@ -1092,12 +1165,32 @@ def test_pr_184_shape_completes_without_reading_157_artifact_entries():
         "tree": [
             {"path": "AGENTS.md", "mode": "100644", "type": "blob", "sha": "1" * 40},
             {"path": "docs/DEV.md", "mode": "100644", "type": "blob", "sha": "8" * 40},
-            {"path": "docs/TESTING.md", "mode": "100644", "type": "blob", "sha": "9" * 40},
+            {
+                "path": "docs/TESTING.md",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "9" * 40,
+            },
             {"path": "package.json", "mode": "100644", "type": "blob", "sha": "2" * 40},
-            {"path": "playwright.config.ts", "mode": "100644", "type": "blob", "sha": "a" * 40},
-            {"path": ".github/workflows/ci.yml", "mode": "100644", "type": "blob", "sha": "3" * 40},
+            {
+                "path": "playwright.config.ts",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "a" * 40,
+            },
+            {
+                "path": ".github/workflows/ci.yml",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "3" * 40,
+            },
             {"path": "src/app.py", "mode": "100644", "type": "blob", "sha": "6" * 40},
-            {"path": "tests/test_app.py", "mode": "100644", "type": "blob", "sha": "7" * 40},
+            {
+                "path": "tests/test_app.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": "7" * 40,
+            },
         ],
     }
     coverage_bytes = io.BytesIO()
@@ -1120,11 +1213,23 @@ def test_pr_184_shape_completes_without_reading_157_artifact_entries():
         if endpoint.endswith("actions/runs?head_sha=" + HEAD_SHA + "&per_page=100"):
             return [{"workflow_runs": [workflow_run]}]
         if endpoint.endswith("/jobs?per_page=100"):
-            return [{"jobs": [{"id": 77, "status": "completed", "conclusion": "success"}]}]
+            return [
+                {"jobs": [{"id": 77, "status": "completed", "conclusion": "success"}]}
+            ]
         if endpoint.endswith("/artifacts?per_page=100"):
-            return [{"artifacts": [{"id": 184, "name": "coverage", "size_in_bytes": 739076}]}]
+            return [
+                {
+                    "artifacts": [
+                        {"id": 184, "name": "coverage", "size_in_bytes": 739076}
+                    ]
+                }
+            ]
         if endpoint == "repos/org/repo/issues/183":
-            return {"number": 183, "title": "Requirement", "body": "Acceptance criteria"}
+            return {
+                "number": 183,
+                "title": "Requirement",
+                "body": "Acceptance criteria",
+            }
         if args and args[0] == "graphql":
             return closing_issues
         return [[]]
@@ -1150,9 +1255,10 @@ def test_pr_184_shape_completes_without_reading_157_artifact_entries():
                 calls += 1
                 assert calls <= 60
 
-        assert review_evidence_complete_for(
-            "v2", "org/repo", 42, BASE_SHA, HEAD_SHA
-        ) is True
+        assert (
+            review_evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA)
+            is True
+        )
         assert evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA) is False
         payload, signature = _signed_execution_attestation(scope)
         assert record_execution_attestation(payload, signature) is True
@@ -1172,8 +1278,14 @@ def test_closing_issue_relationship_is_tuple_bound_and_not_parsed_from_body_text
                     "pullRequest": {
                         "closingIssuesReferences": {
                             "nodes": [
-                                {"number": 183, "repository": {"nameWithOwner": "org/repo"}},
-                                {"number": 9, "repository": {"nameWithOwner": "other/repo"}},
+                                {
+                                    "number": 183,
+                                    "repository": {"nameWithOwner": "org/repo"},
+                                },
+                                {
+                                    "number": 9,
+                                    "repository": {"nameWithOwner": "other/repo"},
+                                },
                             ],
                             "pageInfo": {"hasNextPage": False, "endCursor": None},
                         }
@@ -1181,7 +1293,9 @@ def test_closing_issue_relationship_is_tuple_bound_and_not_parsed_from_body_text
                 }
             }
         }
-        with patch("tools.github_pr_evidence._run_gh_json", return_value=graphql) as run:
+        with patch(
+            "tools.github_pr_evidence._run_gh_json", return_value=graphql
+        ) as run:
             result = json.loads(
                 github_pr_evidence_tool("read", manifest["cursors"]["closing_issues"])
             )
@@ -1212,7 +1326,8 @@ def test_large_coverage_archive_inventory_is_optional_and_bounded():
             ),
         )
         with patch(
-            "tools.github_pr_evidence._run_gh_bytes", return_value=archive_bytes.getvalue()
+            "tools.github_pr_evidence._run_gh_bytes",
+            return_value=archive_bytes.getvalue(),
         ):
             result = json.loads(github_pr_evidence_tool("read", token))
 
@@ -1245,8 +1360,9 @@ def test_required_evidence_can_expand_past_bounded_optional_archive_inventory():
 
 def test_cursor_registry_still_fails_closed_at_configured_scope_limit():
     scope = _scope()
-    with evidence_scope(scope), patch(
-        "tools.github_pr_evidence._MAX_ACTIVE_CURSORS", 2
+    with (
+        evidence_scope(scope),
+        patch("tools.github_pr_evidence._MAX_ACTIVE_CURSORS", 2),
     ):
         _new_cursor(scope, _Cursor(kind="data"))
         _new_cursor(scope, _Cursor(kind="data"))
@@ -1271,7 +1387,8 @@ def test_large_archive_entry_creates_only_one_lazy_continuation_cursor():
             ),
         )
         with patch(
-            "tools.github_pr_evidence._run_gh_bytes", return_value=archive_bytes.getvalue()
+            "tools.github_pr_evidence._run_gh_bytes",
+            return_value=archive_bytes.getvalue(),
         ):
             inventory = json.loads(github_pr_evidence_tool("read", token))
         entry_cursors = inventory["items"]["entries"][0]["cursors"]
@@ -1292,7 +1409,12 @@ def test_binary_optional_entry_is_reported_as_base64_without_blocking_completion
             scope,
             _Cursor(
                 kind="archive_entry",
-                data={"path": "coverage/data.bin", "content": b"\xff\x00", "part": 1, "parts": 1},
+                data={
+                    "path": "coverage/data.bin",
+                    "content": b"\xff\x00",
+                    "part": 1,
+                    "parts": 1,
+                },
                 required=False,
             ),
         )
@@ -1332,7 +1454,11 @@ def test_concurrent_same_tuple_scopes_keep_required_and_optional_cursors_isolate
         with evidence_scope(scope):
             manifest = json.loads(github_pr_evidence_tool("manifest"))
             barrier.wait()
-            return set(scope.required_cursors), set(scope.cursors), set(manifest["cursors"].values())
+            return (
+                set(scope.required_cursors),
+                set(scope.cursors),
+                set(manifest["cursors"].values()),
+            )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         first, second = list(pool.map(inspect, (1, 2)))
@@ -1407,9 +1533,7 @@ def test_execution_control_plane_cursors_enforce_resolution_before_attestation()
         assert gate_cursor in scope.required_cursors
         assert attestation_cursor not in scope.required_cursors
 
-        premature = json.loads(
-            github_pr_evidence_tool("read", attestation_cursor)
-        )
+        premature = json.loads(github_pr_evidence_tool("read", attestation_cursor))
         assert premature == {
             "success": False,
             "error": "Execution attestation prerequisites are incomplete",
@@ -1439,33 +1563,90 @@ def test_signed_execution_attestation_requires_worker_identity_preflight_and_all
         payload, signature = _signed_execution_attestation(scope)
 
         assert record_execution_attestation(payload, signature) is True
-        assert execution_evidence_complete_for(
-            "v2", "org/repo", 42, BASE_SHA, HEAD_SHA
-        ) is True
+        assert (
+            execution_evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA)
+            is True
+        )
 
         missing_gate = json.loads(payload)
         missing_gate["gates"] = missing_gate["gates"][:-1]
         rejected_payload, rejected_signature = _signed_execution_attestation(
             scope, gates=missing_gate["gates"]
         )
-        assert record_execution_attestation(rejected_payload, rejected_signature) is False
+        assert (
+            record_execution_attestation(rejected_payload, rejected_signature) is False
+        )
 
         unsafe_preflight = dict(missing_gate["worker"]["preflight"])
         unsafe_preflight["credentials_absent"] = False
         rejected_payload, rejected_signature = _signed_execution_attestation(
             scope, preflight=unsafe_preflight
         )
-        assert record_execution_attestation(rejected_payload, rejected_signature) is False
+        assert (
+            record_execution_attestation(rejected_payload, rejected_signature) is False
+        )
 
 
 def test_github_actions_only_attestation_does_not_claim_a_disposable_worker():
     scope = _scope()
     with evidence_scope(scope):
-        payload, signature = _signed_execution_attestation(
-            scope, worker_required=False
-        )
+        payload, signature = _signed_execution_attestation(scope, worker_required=False)
 
         assert record_execution_attestation(payload, signature) is True
+
+
+def test_feature_command_requires_attestation_and_verifies_signed_exact_head_result():
+    scope = _scope()
+    command = ["npm", "run", "test:voice"]
+    private_key = Ed25519PrivateKey.generate()
+    scope.execution_attestation_public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    scope.head_tree_sha = "d" * 40
+
+    result_payload = json.dumps(
+        {
+            **scope.tuple_dict,
+            "command": command,
+            "status": "pass",
+            "attempted": True,
+            "exit_code": 0,
+            "started_at": "2026-08-10T18:00:00Z",
+            "completed_at": "2026-08-10T18:00:01Z",
+            "duration_ms": 1000,
+            "tree_before": scope.head_tree_sha,
+            "tree_after": scope.head_tree_sha,
+            "log_sha256": "e" * 64,
+            "output_excerpt": "feature passed",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    result_signature = base64.b64encode(private_key.sign(result_payload)).decode(
+        "ascii"
+    )
+    scope.feature_command_loader = lambda selected, timeout: (
+        result_payload,
+        result_signature,
+    )
+
+    with evidence_scope(scope):
+        premature = json.loads(
+            github_pr_evidence_tool("execute", command=command, timeout_seconds=300)
+        )
+        assert premature["success"] is False
+        assert "execution attestation" in premature["error"].lower()
+
+        scope.execution_attestation_valid = True
+        completed = json.loads(
+            github_pr_evidence_tool("execute", command=command, timeout_seconds=300)
+        )
+
+    assert completed["success"] is True
+    assert completed["kind"] == "feature_command"
+    assert completed["items"]["status"] == "pass"
+    assert completed["items"]["output_excerpt"] == "feature passed"
 
 
 def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
@@ -1484,9 +1665,7 @@ def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
         }
         for gate in ("quality", "integration", "e2e")
     }
-    manifest_sha256 = _install_gate_resolution(
-        scope, private_key, contracts=contracts
-    )
+    manifest_sha256 = _install_gate_resolution(scope, private_key, contracts=contracts)
     report = {
         **scope.tuple_dict,
         "base_tree_sha": scope.base_tree_sha,
@@ -1510,7 +1689,7 @@ def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
                 "host_mounts_absent": True,
                 "host_docker_socket_absent": True,
                 "resources_bounded": True,
-                "egress_default_deny": True,
+                "egress_isolated_before_browser_verification": True,
             },
         },
         "gates": [
@@ -1535,13 +1714,16 @@ def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
 
     with evidence_scope(scope):
         assert record_execution_attestation(payload, signature) is True
-        assert execution_evidence_complete_for(
-            scope.contract_version,
-            scope.repository,
-            scope.pr_number,
-            scope.base_sha,
-            scope.head_sha,
-        ) is True
+        assert (
+            execution_evidence_complete_for(
+                scope.contract_version,
+                scope.repository,
+                scope.pr_number,
+                scope.base_sha,
+                scope.head_sha,
+            )
+            is True
+        )
 
 
 def test_review_worker_gate_cannot_omit_disposable_worker_preflight():
@@ -1702,7 +1884,7 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
                 "host_mounts_absent": True,
                 "host_docker_socket_absent": True,
                 "resources_bounded": True,
-                "egress_default_deny": True,
+                "egress_isolated_before_browser_verification": True,
             },
         },
         "gates": [
@@ -1716,7 +1898,6 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
                 "status": "pass",
                 "head_sha": scope.head_sha,
                 "attempted": True,
-
                 "command": ["npm", "run", "ai:eval:voice", "--", "--dry-run"],
                 "exit_code": 0,
                 "plan": {
@@ -1734,9 +1915,13 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
                 "status": "pr-fail",
                 "head_sha": scope.head_sha,
                 "attempted": True,
-
                 "command": [
-                    "npm", "run", "ai:eval:voice", "--", "--output", artifact,
+                    "npm",
+                    "run",
+                    "ai:eval:voice",
+                    "--",
+                    "--output",
+                    artifact,
                     "--confirm-cost",
                 ],
                 "exit_code": 0,
@@ -1777,7 +1962,6 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
                 "status": "pass",
                 "head_sha": scope.head_sha,
                 "attempted": True,
-
                 "exit_code": 0,
                 "scenarios": scope.execution_gate_contracts["voice-browser"][
                     "required_scenarios"
@@ -1785,14 +1969,16 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
             },
             {
                 **_gate_record(
-                    scope, "issue-183-requirements", status="pr-fail", executor="review_worker"
+                    scope,
+                    "issue-183-requirements",
+                    status="pr-fail",
+                    executor="review_worker",
                 ),
                 "id": "issue-183-requirements",
                 "executor": "review_worker",
                 "status": "pr-fail",
                 "head_sha": scope.head_sha,
                 "attempted": True,
-
                 "issue_number": 183,
                 "criterion": "mathematical-notation",
                 "checked": True,
@@ -1805,9 +1991,7 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
     }
 
     def sign(candidate):
-        payload = json.dumps(
-            candidate, sort_keys=True, separators=(",", ":")
-        ).encode()
+        payload = json.dumps(candidate, sort_keys=True, separators=(",", ":")).encode()
         return payload, base64.b64encode(private_key.sign(payload)).decode("ascii")
 
     with evidence_scope(scope):
@@ -1828,7 +2012,10 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
             invalid_report = copy.deepcopy(report)
             invalid_report["gates"][0].pop(field)
             invalid_payload, invalid_signature = sign(invalid_report)
-            assert record_execution_attestation(invalid_payload, invalid_signature) is False
+            assert (
+                record_execution_attestation(invalid_payload, invalid_signature)
+                is False
+            )
 
         missing_provider = copy.deepcopy(report)
         missing_provider["gates"][4]["result"].pop("provider")
@@ -1869,7 +2056,9 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
         lambda gate: gate["evidence"].update(log_sha256="d" * 64),
     ],
 )
-def test_command_gate_rejects_contract_time_and_exact_head_actions_substitutions(mutation):
+def test_command_gate_rejects_contract_time_and_exact_head_actions_substitutions(
+    mutation,
+):
     scope = _scope()
     with evidence_scope(scope):
         payload, _ = _signed_execution_attestation(scope)
@@ -1906,12 +2095,14 @@ def test_review_and_execution_attestations_are_independent_publication_gates():
     scope.required_artifact_inventories_materialized = True
 
     with evidence_scope(scope):
-        assert review_evidence_complete_for(
-            "v2", "org/repo", 42, BASE_SHA, HEAD_SHA
-        ) is True
-        assert execution_evidence_complete_for(
-            "v2", "org/repo", 42, BASE_SHA, HEAD_SHA
-        ) is False
+        assert (
+            review_evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA)
+            is True
+        )
+        assert (
+            execution_evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA)
+            is False
+        )
         assert evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA) is False
 
         payload, signature = _signed_execution_attestation(scope)
@@ -1919,10 +2110,12 @@ def test_review_and_execution_attestations_are_independent_publication_gates():
         assert evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA) is True
 
         scope.tree_diff_reconciled = False
-        assert execution_evidence_complete_for(
-            "v2", "org/repo", 42, BASE_SHA, HEAD_SHA
-        ) is True
-        assert review_evidence_complete_for(
-            "v2", "org/repo", 42, BASE_SHA, HEAD_SHA
-        ) is False
+        assert (
+            execution_evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA)
+            is True
+        )
+        assert (
+            review_evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA)
+            is False
+        )
         assert evidence_complete_for("v2", "org/repo", 42, BASE_SHA, HEAD_SHA) is False

@@ -77,22 +77,29 @@ def _install_attestation_key(monkeypatch):
 def test_gate_resolution_is_signed_and_local_only(monkeypatch):
     private_key = _install_attestation_key(monkeypatch)
 
-    result = gate.resolve_execution_gates(
-        _execution_request("resolve_execution_gates")
-    )
+    result = gate.resolve_execution_gates(_execution_request("resolve_execution_gates"))
 
     payload = base64.b64decode(result["gate_resolution_payload"])
     private_key.public_key().verify(
         base64.b64decode(result["gate_resolution_signature"]), payload
     )
     manifest = json.loads(payload)
-    assert manifest["resolved_gates"] == ["quality", "integration", "e2e"]
+    assert manifest["resolved_gates"] == [
+        "install",
+        "security",
+        "quality",
+        "integration",
+        "e2e",
+    ]
     assert manifest["policy_sha256"] == gate.EXECUTION_GATE_POLICY_SHA256
     assert manifest["gate_contracts"]["quality"] == {
         "kind": "command",
         "command": ["npm", "run", "check"],
         "executor": "review_worker",
-        "runner": {"kind": "review_worker", "name": "docker-node22"},
+        "runner": {
+            "kind": "review_worker",
+            "name": "docker-playwright-dind",
+        },
         "statuses": ["pass", "pr-fail", "unavailable"],
         "exit_codes": list(range(0, 256)),
     }
@@ -123,11 +130,100 @@ def test_execution_evidence_is_signed_from_the_local_worker(monkeypatch):
     report = json.loads(payload)
     assert report["worker"] == {"required": True, "isolation": "docker"}
     assert [item["id"] for item in report["gates"]] == [
+        "install",
+        "security",
         "quality",
         "integration",
         "e2e",
     ]
     assert {item["status"] for item in report["gates"]} == {"unavailable"}
+
+
+@pytest.mark.parametrize(
+    ("returncode", "log", "expected"),
+    [
+        (0, "all good", "pass"),
+        (1, "AssertionError: expected true", "pr-fail"),
+        (1, "spawnSync docker ENOENT", "unavailable"),
+        (1, "browserType.launch: Executable doesn't exist", "unavailable"),
+        (124, "timed out", "unavailable"),
+    ],
+)
+def test_gate_status_separates_product_failures_from_worker_failures(
+    returncode, log, expected
+):
+    status, _ = gate._gate_status(returncode, log)
+    assert status == expected
+
+
+def test_linux_arm_platform_packages_repairs_missing_lock_entries(tmp_path):
+    lockfile = tmp_path / "package-lock.json"
+    lockfile.write_text(
+        json.dumps({
+            "packages": {
+                "": {},
+                "node_modules/esbuild": {
+                    "optionalDependencies": {
+                        "@esbuild/linux-arm64": "0.27.2",
+                        "@esbuild/linux-x64": "0.27.2",
+                    }
+                },
+                "node_modules/rolldown": {
+                    "optionalDependencies": {
+                        "@rolldown/binding-linux-arm64-gnu": "1.1.5",
+                        "@rolldown/binding-linux-arm64-musl": "1.1.5",
+                    }
+                },
+                "node_modules/@next/swc-linux-arm64-gnu": {"version": "16.2.11"},
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    assert gate._linux_arm64_glibc_packages(lockfile) == (
+        "@esbuild/linux-arm64@0.27.2",
+        "@rolldown/binding-linux-arm64-gnu@1.1.5",
+    )
+
+
+def test_feature_command_result_is_signed_and_exact_head(monkeypatch, tmp_path):
+    private_key = _install_attestation_key(monkeypatch)
+    monkeypatch.setattr(gate, "_docker_environment", lambda home: {"PATH": "/bin"})
+    monkeypatch.setattr(gate, "_commit_tree_sha", lambda sha: "d" * 40)
+    monkeypatch.setattr(
+        gate,
+        "_worker_git_output",
+        lambda worker_name, *args, **kwargs: (
+            HEAD_SHA
+            if args == ("rev-parse", "HEAD")
+            else "d" * 40
+            if args == ("rev-parse", "HEAD^{tree}")
+            else ""
+        ),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_run_command",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="feature passed\n", stderr=""
+        ),
+    )
+
+    result = gate.execute_feature_command({
+        **_execution_request("execute_feature_command"),
+        "command": ["npm", "run", "test:voice"],
+        "timeout_seconds": 300,
+    })
+
+    payload = base64.b64decode(result["command_result_payload"])
+    private_key.public_key().verify(
+        base64.b64decode(result["command_result_signature"]), payload
+    )
+    command_result = json.loads(payload)
+    assert command_result["command"] == ["npm", "run", "test:voice"]
+    assert command_result["status"] == "pass"
+    assert command_result["tree_before"] == "d" * 40
+    assert command_result["tree_after"] == "d" * 40
 
 
 def test_review_state_store_uses_wal_and_reclaims_only_expired_leases(tmp_path):
@@ -233,7 +329,9 @@ def test_publication_claim_is_single_use_token_fenced_and_extends_lease(tmp_path
     assert isinstance(replacement, str)
 
 
-def test_settlement_control_plane_claims_publication_before_side_effect(monkeypatch, tmp_path):
+def test_settlement_control_plane_claims_publication_before_side_effect(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     review_tuple = ReviewTuple(
         repository="NewtonsAppleAI/newtonsapple-web",
@@ -267,7 +365,9 @@ def test_settlement_control_plane_claims_publication_before_side_effect(monkeypa
         gate._settle(payload, "newtonsapple-bot", store)
 
 
-def test_publication_claim_rejects_a_superseded_request_generation(monkeypatch, tmp_path):
+def test_publication_claim_rejects_a_superseded_request_generation(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     stale = ReviewTuple(
         repository="NewtonsAppleAI/newtonsapple-web",
@@ -311,7 +411,9 @@ def test_publication_claim_rejects_a_superseded_request_generation(monkeypatch, 
     assert store.active_lease(stale, lease_token=lease_token, now=120) is True
 
 
-def test_complete_settlement_records_review_without_commit_status(monkeypatch, tmp_path):
+def test_complete_settlement_records_review_without_commit_status(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     review_tuple = ReviewTuple(
         repository="NewtonsAppleAI/newtonsapple-web",
@@ -352,9 +454,7 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
         delivered.append((content, reply_to))
         return f"buzz-{len(delivered)}"
 
-    monkeypatch.setattr(
-        gate, "_buzz_send", buzz_send
-    )
+    monkeypatch.setattr(gate, "_buzz_send", buzz_send)
     monkeypatch.setattr(gate.time, "time", lambda: 120)
 
     result = gate._settle(
@@ -464,8 +564,9 @@ def test_release_settlement_never_publishes_a_github_status(monkeypatch, tmp_pat
     monkeypatch.setattr(
         gate,
         "_buzz_send",
-        lambda content, reply_to=None: delivered.append((content, reply_to))
-        or "buzz-blocker",
+        lambda content, reply_to=None: (
+            delivered.append((content, reply_to)) or "buzz-blocker"
+        ),
     )
 
     result = None
@@ -542,18 +643,23 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
     assert result["review_request_id"] == REVIEW_REQUEST_ID
     assert isinstance(result["lease_token"], str)
     assert len(result["lease_token"]) >= 32
-    assert store.requested_event_id(
-        ReviewTuple(
-            repository=gate.REPOSITORY,
-            pr_number=185,
-            base_sha=BASE_SHA,
-            head_sha=HEAD_SHA,
-            request_id=REVIEW_REQUEST_ID,
+    assert (
+        store.requested_event_id(
+            ReviewTuple(
+                repository=gate.REPOSITORY,
+                pr_number=185,
+                base_sha=BASE_SHA,
+                head_sha=HEAD_SHA,
+                request_id=REVIEW_REQUEST_ID,
+            )
         )
-    ) == "buzz-request"
+        == "buzz-request"
+    )
 
 
-def test_started_control_plane_replies_once_under_requested_thread(monkeypatch, tmp_path):
+def test_started_control_plane_replies_once_under_requested_thread(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     review_tuple = ReviewTuple(
         repository=gate.REPOSITORY,
@@ -570,8 +676,9 @@ def test_started_control_plane_replies_once_under_requested_thread(monkeypatch, 
     monkeypatch.setattr(
         gate,
         "_buzz_send",
-        lambda content, reply_to=None: delivered.append((content, reply_to))
-        or "buzz-started",
+        lambda content, reply_to=None: (
+            delivered.append((content, reply_to)) or "buzz-started"
+        ),
     )
     payload = {
         "operation": "started",
@@ -585,12 +692,8 @@ def test_started_control_plane_replies_once_under_requested_thread(monkeypatch, 
         "pr_url": "https://github.com/NewtonsAppleAI/newtonsapple-web/pull/185",
     }
 
-    assert gate._settle(payload, "newtonsapple-bot", store) == {
-        "settled": "started"
-    }
-    assert gate._settle(payload, "newtonsapple-bot", store) == {
-        "settled": "started"
-    }
+    assert gate._settle(payload, "newtonsapple-bot", store) == {"settled": "started"}
+    assert gate._settle(payload, "newtonsapple-bot", store) == {"settled": "started"}
     assert delivered == [
         (
             gate._started_content(
@@ -618,8 +721,12 @@ def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tm
         f"head={HEAD_SHA} request={review_tuple.request_id} -->"
     )
 
-    first_id = store.enqueue_summary(review_tuple, marker=marker, content="review summary")
-    second_id = store.enqueue_summary(review_tuple, marker=marker, content="replacement ignored")
+    first_id = store.enqueue_summary(
+        review_tuple, marker=marker, content="review summary"
+    )
+    second_id = store.enqueue_summary(
+        review_tuple, marker=marker, content="replacement ignored"
+    )
 
     assert first_id == second_id
     assert store.pending_summaries() == [
@@ -637,11 +744,12 @@ def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tm
     sent = []
     processed = drain_summary_outbox(
         store,
-        find_existing=lambda candidate, reply_to: "buzz-event-existing"
-        if candidate == marker
-        else None,
-        send=lambda content, reply_to: sent.append((content, reply_to))
-        or "buzz-event-new",
+        find_existing=lambda candidate, reply_to: (
+            "buzz-event-existing" if candidate == marker else None
+        ),
+        send=lambda content, reply_to: (
+            sent.append((content, reply_to)) or "buzz-event-new"
+        ),
     )
 
     assert processed == 1
@@ -669,50 +777,49 @@ def test_summary_outbox_replies_to_the_persisted_request_root(tmp_path):
     processed = drain_summary_outbox(
         store,
         find_existing=lambda marker, reply_to: None,
-        send=lambda content, reply_to: delivered.append((content, reply_to))
-        or "summary-event",
+        send=lambda content, reply_to: (
+            delivered.append((content, reply_to)) or "summary-event"
+        ),
     )
 
     assert processed == 1
-    assert delivered == [
-        ("one paragraph\n\nsummary-marker", "request-root")
-    ]
+    assert delivered == [("one paragraph\n\nsummary-marker", "request-root")]
 
 
-def test_buzz_marker_reconciliation_requires_configured_channel_and_own_author(monkeypatch):
+def test_buzz_marker_reconciliation_requires_configured_channel_and_own_author(
+    monkeypatch,
+):
     marker = "<!-- tuple-marker -->"
     own_pubkey = "b" * 64
-    responses = iter(
+    responses = iter([
+        [{"display_name": "Hermany", "pubkey": own_pubkey}],
         [
-            [{"display_name": "Hermany", "pubkey": own_pubkey}],
-            [
-                {
-                    "id": "wrong-channel",
-                    "pubkey": own_pubkey,
-                    "content": marker,
-                    "tags": [["h", "different-channel"]],
-                },
-                {
-                    "id": "forged-same-channel",
-                    "pubkey": "a" * 64,
-                    "content": marker,
-                    "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
-                },
-                {
-                    "id": "quoted-by-own-author",
-                    "pubkey": own_pubkey,
-                    "content": f"quoted {marker} but not a settled outbox message",
-                    "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
-                },
-                {
-                    "id": "expected-channel-and-author",
-                    "pubkey": own_pubkey,
-                    "content": marker,
-                    "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
-                },
-            ],
-        ]
-    )
+            {
+                "id": "wrong-channel",
+                "pubkey": own_pubkey,
+                "content": marker,
+                "tags": [["h", "different-channel"]],
+            },
+            {
+                "id": "forged-same-channel",
+                "pubkey": "a" * 64,
+                "content": marker,
+                "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
+            },
+            {
+                "id": "quoted-by-own-author",
+                "pubkey": own_pubkey,
+                "content": f"quoted {marker} but not a settled outbox message",
+                "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
+            },
+            {
+                "id": "expected-channel-and-author",
+                "pubkey": own_pubkey,
+                "content": marker,
+                "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
+            },
+        ],
+    ])
     monkeypatch.setattr(
         "scripts.newtonsapple_pr_review_gate.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
@@ -727,31 +834,29 @@ def test_buzz_marker_reconciliation_requires_configured_channel_and_own_author(m
 def test_buzz_marker_reconciliation_requires_the_expected_thread_parent(monkeypatch):
     marker = "<!-- tuple-marker -->"
     own_pubkey = "b" * 64
-    responses = iter(
+    responses = iter([
+        [{"display_name": "Hermany", "pubkey": own_pubkey}],
         [
-            [{"display_name": "Hermany", "pubkey": own_pubkey}],
-            [
-                {
-                    "id": "wrong-parent",
-                    "pubkey": own_pubkey,
-                    "content": marker,
-                    "tags": [
-                        ["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"],
-                        ["e", "other-root", "", "reply"],
-                    ],
-                },
-                {
-                    "id": "expected-parent",
-                    "pubkey": own_pubkey,
-                    "content": marker,
-                    "tags": [
-                        ["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"],
-                        ["e", "request-root", "", "reply"],
-                    ],
-                },
-            ],
-        ]
-    )
+            {
+                "id": "wrong-parent",
+                "pubkey": own_pubkey,
+                "content": marker,
+                "tags": [
+                    ["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"],
+                    ["e", "other-root", "", "reply"],
+                ],
+            },
+            {
+                "id": "expected-parent",
+                "pubkey": own_pubkey,
+                "content": marker,
+                "tags": [
+                    ["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"],
+                    ["e", "request-root", "", "reply"],
+                ],
+            },
+        ],
+    ])
     monkeypatch.setattr(
         "scripts.newtonsapple_pr_review_gate.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
@@ -907,7 +1012,9 @@ def test_reconciliation_selects_only_live_exact_tuple_with_no_bot_marker():
     )
 
 
-def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, tmp_path):
+def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     live_pr = _live_pr()
     review_tuple = ReviewTuple(
@@ -919,9 +1026,7 @@ def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, t
     marker_body = f"legacy review\n\n{gate.review_marker(review_tuple)}"
     state = (live_pr, None, [marker_body])
     monkeypatch.setattr(gate, "_collection", lambda endpoint: [live_pr])
-    monkeypatch.setattr(
-        gate, "_recoverable_live_tuple", lambda *args: state
-    )
+    monkeypatch.setattr(gate, "_recoverable_live_tuple", lambda *args: state)
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
         gate, "_buzz_send", lambda content, reply_to=None: "buzz-blocker"
@@ -932,7 +1037,9 @@ def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, t
     assert result["events"] == []
 
 
-def test_reconcile_settles_existing_marker_for_verified_timeline_request(monkeypatch, tmp_path):
+def test_reconcile_settles_existing_marker_for_verified_timeline_request(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     live_pr = _live_pr()
     review_tuple = ReviewTuple(
@@ -1196,7 +1303,9 @@ def test_webhook_accepts_verified_payload_tuple(monkeypatch, tmp_path):
     assert result["review_request_id"] == REVIEW_REQUEST_ID
 
 
-def test_webhook_rejects_head_mutation_between_payload_and_live_state(monkeypatch, tmp_path):
+def test_webhook_rejects_head_mutation_between_payload_and_live_state(
+    monkeypatch, tmp_path
+):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     payload_pr = _live_pr()
     live_pr = _live_pr(head={"ref": "chore--review", "sha": "c" * 40})
@@ -1228,12 +1337,21 @@ def test_local_execution_worker_attempts_every_gate_without_credentials(monkeypa
     )
     monkeypatch.setenv("GITHUB_TOKEN", "must-not-propagate")
     monkeypatch.setenv("GH_TOKEN", "must-not-propagate")
-    monkeypatch.setattr(gate, "_local_docker_host", lambda: "unix:///tmp/docker.sock")
+    monkeypatch.setattr(
+        gate,
+        "_docker_environment",
+        lambda home: {"PATH": "/bin", "DOCKER_HOST": "unix:///tmp/docker.sock"},
+    )
     fetched = []
     monkeypatch.setattr(
         gate,
         "_fetch_exact_commit",
         lambda workspace, sha, *, home: fetched.append((sha, home)),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_linux_arm64_glibc_packages",
+        lambda lockfile: ("@turbo/linux-arm64@2.10.5",),
     )
     monkeypatch.setattr(
         gate,
@@ -1249,12 +1367,54 @@ def test_local_execution_worker_attempts_every_gate_without_credentials(monkeypa
         ),
     )
     calls = []
+    gate_calls = []
 
     def fake_run(command, *, cwd, env, timeout):
         calls.append((command, env))
         return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
     monkeypatch.setattr(gate, "_run_command", fake_run)
+    monkeypatch.setattr(gate, "_assert_worker_image", lambda env: None)
+    monkeypatch.setattr(
+        gate, "_start_review_worker", lambda *args, **kwargs: "review-worker"
+    )
+    monkeypatch.setattr(
+        gate,
+        "_worker_git_output",
+        lambda worker_name, *args, **kwargs: (
+            HEAD_SHA
+            if args == ("rev-parse", "HEAD")
+            else "d" * 40
+            if args == ("rev-parse", "HEAD^{tree}")
+            else "commit"
+            if args == ("cat-file", "-t", BASE_SHA)
+            else ""
+        ),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_load_nested_images",
+        lambda worker_name, *, env: calls.append(("load", env)),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_build_isolated_service_image",
+        lambda worker_name, *, env: calls.append(("service-image", env)),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_disconnect_worker_network",
+        lambda worker_name, *, env: calls.append(("disconnect", env)),
+    )
+
+    def fake_gate(review_tuple, worker_name, name, **kwargs):
+        gate_calls.append((name, kwargs["env"], kwargs.get("setup_command")))
+        item = gate._unavailable_local_gate(name, "unused")
+        item.update(status="pass", attempted=True, exit_code=0)
+        item["evidence"]["reason"] = ""
+        return item
+
+    monkeypatch.setattr(gate, "_run_worker_gate", fake_gate)
 
     result = gate._run_local_execution_worker(
         ReviewTuple(
@@ -1267,30 +1427,45 @@ def test_local_execution_worker_attempts_every_gate_without_credentials(monkeypa
 
     assert result["worker"]["required"] is True
     assert result["worker"]["preflight"]["host_mounts_absent"] is True
-    assert [item["status"] for item in result["gates"]] == ["pass", "pass", "pass"]
+    assert [item["id"] for item in result["gates"]] == [
+        "install",
+        "security",
+        "quality",
+        "integration",
+        "e2e",
+    ]
+    assert [item["status"] for item in result["gates"]] == ["pass"] * 5
     assert all(item["attempted"] is True for item in result["gates"])
     assert [sha for sha, _ in fetched] == [HEAD_SHA, BASE_SHA]
-    docker_calls = [(command, env) for command, env in calls if command[0] == "docker"]
-    assert len(docker_calls) == 6
-    assert [command[command.index("--network") + 1] for command, _ in docker_calls] == [
-        "bridge",
-        "none",
-        "bridge",
-        "none",
-        "bridge",
-        "none",
+    assert [name for name, _, _ in gate_calls] == [
+        "install",
+        "security",
+        "integration",
+        "quality",
+        "e2e",
     ]
-    assert all(env["DOCKER_HOST"] == "unix:///tmp/docker.sock" for _, env in docker_calls)
-    assert all("GITHUB_TOKEN" not in env and "GH_TOKEN" not in env for _, env in docker_calls)
+    assert gate_calls[-1][2] == ["npm", "run", "db:start"]
+    assert all(
+        env["DOCKER_HOST"] == "unix:///tmp/docker.sock"
+        and "GITHUB_TOKEN" not in env
+        and "GH_TOKEN" not in env
+        for _, env, _ in gate_calls
+    )
 
 
-def test_local_execution_worker_reports_each_gate_when_docker_is_unavailable(monkeypatch):
+def test_local_execution_worker_reports_each_gate_when_docker_is_unavailable(
+    monkeypatch,
+):
     monkeypatch.setattr(
         gate,
         "_commit_tree_sha",
         lambda sha: "c" * 40 if sha == BASE_SHA else "d" * 40,
     )
-    monkeypatch.setattr(gate, "_local_docker_host", lambda: "unix:///tmp/docker.sock")
+    monkeypatch.setattr(
+        gate,
+        "_docker_environment",
+        lambda home: {"PATH": "/bin", "DOCKER_HOST": "unix:///tmp/docker.sock"},
+    )
     monkeypatch.setattr(gate, "_fetch_exact_commit", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         gate,
@@ -1305,19 +1480,18 @@ def test_local_execution_worker_reports_each_gate_when_docker_is_unavailable(mon
             else ""
         ),
     )
-    docker_calls = []
-
-    def fake_run(command, *, cwd, env, timeout):
-        if command[0] == "docker":
-            docker_calls.append(command)
-            return SimpleNamespace(
-                returncode=1,
-                stdout="",
-                stderr="failed to connect to the docker API",
-            )
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(gate, "_run_command", fake_run)
+    monkeypatch.setattr(
+        gate,
+        "_run_command",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_assert_worker_image",
+        lambda env: (_ for _ in ()).throw(
+            RuntimeError("failed to connect to the docker API")
+        ),
+    )
 
     result = gate._run_local_execution_worker(
         ReviewTuple(
@@ -1328,12 +1502,7 @@ def test_local_execution_worker_reports_each_gate_when_docker_is_unavailable(mon
         )
     )
 
-    assert len(docker_calls) == 6
-    assert [item["status"] for item in result["gates"]] == [
-        "unavailable",
-        "unavailable",
-        "unavailable",
-    ]
+    assert [item["status"] for item in result["gates"]] == ["unavailable"] * 5
     assert all(item["attempted"] is False for item in result["gates"])
 
 
@@ -1359,11 +1528,7 @@ def test_local_execution_reports_unavailable_gates_in_signed_evidence(monkeypatc
         base64.b64decode(result["attestation_signature"]), payload
     )
     report = json.loads(payload)
-    assert [item["status"] for item in report["gates"]] == [
-        "unavailable",
-        "unavailable",
-        "unavailable",
-    ]
+    assert [item["status"] for item in report["gates"]] == ["unavailable"] * 5
 
 
 def test_exact_commit_fetch_uses_only_the_pinned_gh_credential_helper(
@@ -1401,9 +1566,7 @@ def test_exact_commit_fetch_uses_only_the_pinned_gh_credential_helper(
             ],
             workspace,
             {
-                "PATH": gate.os.environ.get(
-                    "PATH", "/usr/bin:/bin:/usr/sbin:/sbin"
-                ),
+                "PATH": gate.os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
                 "LANG": "C.UTF-8",
                 "LC_ALL": "C.UTF-8",
                 "HOME": str(home),
@@ -1458,6 +1621,8 @@ def test_gate_resolution_exposes_all_local_gate_outcomes(monkeypatch):
         name: contract["statuses"]
         for name, contract in signed["gate_contracts"].items()
     } == {
+        "install": ["pass", "pr-fail", "unavailable"],
+        "security": ["pass", "pr-fail", "unavailable"],
         "quality": ["pass", "pr-fail", "unavailable"],
         "integration": ["pass", "pr-fail", "unavailable"],
         "e2e": ["pass", "pr-fail", "unavailable"],
@@ -1498,8 +1663,13 @@ def test_reconciliation_rechecks_request_event_and_later_invalidation():
         ({"draft": True}, []),
         ({"base": {"ref": "feature", "sha": BASE_SHA}}, []),
         ({"requested_reviewers": []}, []),
-        ({}, ["prefix <!-- newtonsapple-pr-review:v2 repo=NewtonsAppleAI/newtonsapple-web "
-              f"pr=185 base={BASE_SHA} head={HEAD_SHA} request=1 --> suffix"]),
+        (
+            {},
+            [
+                "prefix <!-- newtonsapple-pr-review:v2 repo=NewtonsAppleAI/newtonsapple-web "
+                f"pr=185 base={BASE_SHA} head={HEAD_SHA} request=1 --> suffix"
+            ],
+        ),
     ],
 )
 def test_reconciliation_rejects_stale_ineligible_or_completed_tuple(

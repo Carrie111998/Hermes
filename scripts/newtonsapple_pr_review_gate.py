@@ -1,7 +1,8 @@
 """Trusted control-plane gate for NewtonsApple pull-request reviews.
 
 This module is executable as a webhook route script and importable for contract
-and recovery tests. It never executes pull-request code.
+and recovery tests. It runs pull-request code only inside the credential-free,
+offline review worker described by the signed execution policy.
 """
 
 from __future__ import annotations
@@ -42,16 +43,37 @@ FAILURE_REASONS = {
     "publication_failed": "GitHub did not accept or confirm the formal review",
     "processing_failed": "the review run ended before formal publication",
 }
-BASELINE_EXECUTION_GATES = ("quality", "integration", "e2e")
+BASELINE_EXECUTION_GATES = ("install", "security", "quality", "integration", "e2e")
 EXECUTION_GATE_COMMANDS = {
+    "install": [
+        "npm",
+        "ci",
+        "--ignore-scripts",
+        "--no-audit",
+        "--no-fund",
+    ],
+    "security": ["npm", "audit", "--omit=dev", "--audit-level=high"],
     "quality": ["npm", "run", "check"],
     "integration": ["npm", "run", "db:verify"],
-    "e2e": ["npm", "run", "test:e2e:all:ci"],
+    "e2e": ["npm", "run", "test:e2e:all"],
 }
-LOCAL_REVIEW_WORKER_IMAGE = (
-    "node@sha256:0557ac14e0d45d02ed563067b82856ca5e7aa3437fa28d98d4350ea9c3d9494a"
+LOCAL_REVIEW_WORKER_IMAGE = "newtonsapple-pr-review-worker:2"
+LOCAL_REVIEW_WORKER_IMAGE_ID = (
+    "sha256:ab1387a851aa3c357c04b3010de263020642ea87b0c5b0744a9e02ded33b96dc"
 )
-EXECUTION_GATE_POLICY_VERSION = "newtonsapple-v1"
+LOCAL_REVIEW_NESTED_IMAGES = (
+    "postgres:17.10-alpine",
+    "edoburu/pgbouncer:v1.25.2-p0",
+    "axllent/mailpit:v1.27.8",
+    "node:22.14-alpine",
+)
+LOCAL_REVIEW_RUNNER = "docker-playwright-dind"
+MIGRATOR_DOCKERFILE_SHA256 = (
+    "12c1d924c048464d3618af443f4e44d9107f614c7948d12cadbf3b9b5ae9c6ed"
+)
+LOCAL_REVIEW_LOG_LIMIT = 1_000_000
+LOCAL_REVIEW_EXCERPT_LIMIT = 12_000
+EXECUTION_GATE_POLICY_VERSION = "newtonsapple-v2"
 _EXECUTION_GATE_POLICY = {
     "version": EXECUTION_GATE_POLICY_VERSION,
     "repository": REPOSITORY,
@@ -59,10 +81,30 @@ _EXECUTION_GATE_POLICY = {
     "commands": EXECUTION_GATE_COMMANDS,
     "local_worker": {
         "image": LOCAL_REVIEW_WORKER_IMAGE,
-        "runner": "docker-node22",
-        "install": ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"],
+        "image_id": LOCAL_REVIEW_WORKER_IMAGE_ID,
+        "runner": LOCAL_REVIEW_RUNNER,
+        "nested_images": list(LOCAL_REVIEW_NESTED_IMAGES),
+        "platform_dependencies": "package-lock-linux-arm64-glibc",
+        "own_docker_daemon": True,
+        "storage_driver": "vfs",
+        "install": EXECUTION_GATE_COMMANDS["install"],
+        "dependency_rebuild": ["npm", "rebuild"],
         "statuses": ["pass", "pr-fail", "unavailable"],
-        "gate_network": "none",
+        "gate_network": {
+            "online_without_pr_scripts": [
+                "install",
+                "security",
+                "service_image_dependency_layers",
+            ],
+            "isolated": [
+                "service_image_source_build",
+                "dependency_rebuild",
+                "integration",
+                "quality",
+                "e2e",
+                "feature_commands",
+            ],
+        },
     },
 }
 EXECUTION_GATE_POLICY_SHA256 = hashlib.sha256(
@@ -161,9 +203,7 @@ class ReviewStateStore:
             row = connection.execute("PRAGMA journal_mode").fetchone()
         return str(row[0]).lower()
 
-    def record_requested_event(
-        self, review_tuple: ReviewTuple, event_id: str
-    ) -> str:
+    def record_requested_event(self, review_tuple: ReviewTuple, event_id: str) -> str:
         if not event_id:
             raise ValueError("missing requested event id")
         key = tuple_key(review_tuple)
@@ -189,9 +229,7 @@ class ReviewStateStore:
             ).fetchone()
         return None if row is None else str(row[0])
 
-    def record_started_event(
-        self, review_tuple: ReviewTuple, event_id: str
-    ) -> str:
+    def record_started_event(self, review_tuple: ReviewTuple, event_id: str) -> str:
         if not event_id:
             raise ValueError("missing started event id")
         key = tuple_key(review_tuple)
@@ -632,7 +670,7 @@ def drain_summary_outbox(
                     lease_seconds=5 * 60,
                 )
                 event_id = send(
-                    f'{item["content"]}\n\n{item["marker"]}',
+                    f"{item['content']}\n\n{item['marker']}",
                     item["reply_to"],
                 )
             store.mark_summary_sent(
@@ -729,11 +767,7 @@ def select_authorized_tuple(
             or SHA_PATTERN.fullmatch(str(head.get("sha", ""))) is None
             or not isinstance(requested, list)
             or reviewer_login
-            not in {
-                item.get("login")
-                for item in requested
-                if isinstance(item, dict)
-            }
+            not in {item.get("login") for item in requested if isinstance(item, dict)}
         ):
             return None
         pr_number = int(live_pr["number"])
@@ -748,9 +782,7 @@ def select_authorized_tuple(
         return None
     if not isinstance(timeline, list):
         return None
-    request_id = _latest_current_request_id(
-        timeline, reviewer_login=reviewer_login
-    )
+    request_id = _latest_current_request_id(timeline, reviewer_login=reviewer_login)
     if request_id is None:
         return None
     candidate = ReviewTuple(
@@ -856,7 +888,7 @@ def _local_gate_contract(name: str) -> dict:
         "kind": "command",
         "command": EXECUTION_GATE_COMMANDS[name],
         "executor": "review_worker",
-        "runner": {"kind": "review_worker", "name": "docker-node22"},
+        "runner": {"kind": "review_worker", "name": LOCAL_REVIEW_RUNNER},
         "statuses": ["pass", "pr-fail", "unavailable"],
         "exit_codes": list(range(0, 256)),
     }
@@ -909,17 +941,21 @@ def _duration_ms(started_at: object, completed_at: object) -> int:
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
+    return (
+        datetime
+        .now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
     )
 
 
 def _unavailable_local_gate(name: str, reason: str) -> dict:
     now = _utc_now()
+    excerpt = reason[-LOCAL_REVIEW_EXCERPT_LIMIT:]
     return {
         "id": name,
         "executor": "review_worker",
-        "runner": {"kind": "review_worker", "name": "docker-node22"},
+        "runner": {"kind": "review_worker", "name": LOCAL_REVIEW_RUNNER},
         "status": "unavailable",
         "head_sha": "",
         "attempted": False,
@@ -933,7 +969,8 @@ def _unavailable_local_gate(name: str, reason: str) -> dict:
         "evidence": {
             "kind": "local_worker",
             "log_sha256": hashlib.sha256(reason.encode()).hexdigest(),
-            "reason": reason[:500],
+            "reason": excerpt,
+            "excerpt": excerpt,
         },
     }
 
@@ -1036,46 +1073,476 @@ def _git_output(workspace: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _docker_gate_command(workspace: Path, command: list[str], *, network: str) -> list[str]:
-    return [
-        "docker",
-        "run",
-        "--rm",
-        "--network",
-        network,
-        "--cpus",
-        "2",
-        "--memory",
-        "4g",
-        "--pids-limit",
-        "512",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--read-only",
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=512m",
-        "--mount",
-        f"type=bind,src={workspace},dst=/workspace",
+def _review_worker_name(review_tuple: ReviewTuple) -> str:
+    digest = hashlib.sha256(tuple_key(review_tuple).encode()).hexdigest()[:20]
+    return f"newtonsapple-review-{digest}"
+
+
+def _docker_environment(home: Path) -> dict[str, str]:
+    return {**_credential_free_environment(home), "DOCKER_HOST": _local_docker_host()}
+
+
+def _worker_command(
+    worker_name: str, command: list[str], *, detach: bool = False
+) -> list[str]:
+    invocation = ["docker", "exec"]
+    if detach:
+        invocation.append("--detach")
+    invocation.extend([
         "--workdir",
         "/workspace",
         "--env",
-        "HOME=/tmp/home",
+        "HOME=/tmp/review-home",
         "--env",
         "CI=true",
-        LOCAL_REVIEW_WORKER_IMAGE,
+        worker_name,
         *command,
+    ])
+    return invocation
+
+
+def _clean_log(value: str, *, limit: int = LOCAL_REVIEW_LOG_LIMIT) -> str:
+    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value)
+    value = "".join(
+        character
+        for character in value
+        if character in "\n\r\t" or ord(character) >= 32
+    )
+    return value[-limit:]
+
+
+def _gate_status(returncode: int, log: str) -> tuple[str, bool]:
+    unavailable_pattern = re.compile(
+        r"(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|Service Unavailable|"
+        r"Cannot connect to the Docker daemon|failed to connect to the docker API|"
+        r"docker daemon is not running|no such host|network is unreachable|"
+        r"temporary failure in name resolution|connection timed out|"
+        r"browserType\.launch:.*executable doesn.t exist|"
+        r"failed to launch browser|missing delivery authority|\bENOENT\b)",
+        re.IGNORECASE | re.DOTALL,
+    )
+    not_started_pattern = re.compile(
+        r"(Cannot connect to the Docker daemon|failed to connect to the docker API|"
+        r"docker daemon is not running|executable file not found|command not found|"
+        r"\bENOENT\b)",
+        re.IGNORECASE,
+    )
+    attempted = returncode not in {125, 126, 127} and not not_started_pattern.search(
+        log
+    )
+    if returncode == 0:
+        return "pass", attempted
+    if returncode in {124, 125, 126, 127} or unavailable_pattern.search(log):
+        return "unavailable", attempted
+    return "pr-fail", attempted
+
+
+def _worker_git_output(
+    worker_name: str, *args: str, env: dict[str, str], timeout: int = 60
+) -> str:
+    result = _run_command(
+        _worker_command(worker_name, ["git", *args]),
+        cwd=Path("/"),
+        env=env,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("local worker could not verify immutable source")
+    return result.stdout.strip()
+
+
+def _remove_review_worker(review_tuple: ReviewTuple) -> None:
+    home = Path(tempfile.gettempdir()) / "newtonsapple-review-control-home"
+    home.mkdir(mode=0o700, exist_ok=True)
+    try:
+        env = _docker_environment(home)
+    except RuntimeError:
+        return
+    _run_command(
+        ["docker", "rm", "--force", _review_worker_name(review_tuple)],
+        cwd=Path("/"),
+        env=env,
+        timeout=120,
+    )
+
+
+def _assert_worker_image(env: dict[str, str]) -> None:
+    result = _run_command(
+        [
+            "docker",
+            "image",
+            "inspect",
+            LOCAL_REVIEW_WORKER_IMAGE,
+            "--format",
+            "{{.Id}}",
+        ],
+        cwd=Path("/"),
+        env=env,
+        timeout=30,
+    )
+    if result.returncode != 0 or result.stdout.strip() != LOCAL_REVIEW_WORKER_IMAGE_ID:
+        raise RuntimeError("pinned local review worker image is unavailable")
+
+
+def _linux_arm64_glibc_packages(lockfile: Path) -> tuple[str, ...]:
+    try:
+        packages = json.loads(lockfile.read_text(encoding="utf-8"))["packages"]
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise RuntimeError("package-lock platform metadata is unavailable") from exc
+    installed_names = {
+        path.rsplit("node_modules/", 1)[-1]
+        for path in packages
+        if "node_modules/" in path
+    }
+    required: dict[str, set[str]] = {}
+    for metadata in packages.values():
+        if not isinstance(metadata, dict):
+            continue
+        for name, version in metadata.get("optionalDependencies", {}).items():
+            if "linux-arm64" not in name or "musl" in name or name in installed_names:
+                continue
+            required.setdefault(name, set()).add(version)
+    conflicts = [name for name, versions in required.items() if len(versions) != 1]
+    if conflicts:
+        raise RuntimeError("package-lock has conflicting Linux ARM dependencies")
+    return tuple(
+        f"{name}@{next(iter(versions))}" for name, versions in sorted(required.items())
+    )
+
+
+def _install_platform_dependencies(
+    worker_name: str, packages: tuple[str, ...], *, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    if not packages:
+        return subprocess.CompletedProcess([], 0, "", "")
+    installed = _run_command(
+        _worker_command(
+            worker_name,
+            [
+                "npm",
+                "install",
+                "--prefix",
+                "/tmp/review-platform-packages",
+                "--ignore-scripts",
+                "--no-audit",
+                "--no-fund",
+                *packages,
+            ],
+        ),
+        cwd=Path("/"),
+        env=env,
+        timeout=600,
+    )
+    if installed.returncode != 0:
+        return installed
+    return _run_command(
+        _worker_command(
+            worker_name,
+            [
+                "cp",
+                "-R",
+                "/tmp/review-platform-packages/node_modules/.",
+                "/workspace/node_modules/",
+            ],
+        ),
+        cwd=Path("/"),
+        env=env,
+        timeout=60,
+    )
+
+
+def _prepare_local_environment(
+    worker_name: str, *, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    for source, target in (
+        ("/workspace/apps/api/.env.example", "/workspace/apps/api/.env"),
+        ("/workspace/apps/web/.env.example", "/workspace/apps/web/.env.local"),
+    ):
+        copied = _run_command(
+            _worker_command(worker_name, ["cp", source, target]),
+            cwd=Path("/"),
+            env=env,
+            timeout=30,
+        )
+        if copied.returncode != 0:
+            return copied
+    return subprocess.CompletedProcess([], 0, "", "")
+
+
+def _start_review_worker(
+    review_tuple: ReviewTuple, workspace: Path, *, env: dict[str, str]
+) -> str:
+    worker_name = _review_worker_name(review_tuple)
+    _run_command(
+        ["docker", "rm", "--force", worker_name],
+        cwd=Path("/"),
+        env=env,
+        timeout=120,
+    )
+    command = [
+        "docker",
+        "run",
+        "--detach",
+        "--init",
+        "--privileged",
+        "--name",
+        worker_name,
+        "--label",
+        "newtonsapple.review-worker=1",
+        "--label",
+        f"newtonsapple.review-tuple={hashlib.sha256(tuple_key(review_tuple).encode()).hexdigest()}",
+        "--cpus",
+        "8",
+        "--memory",
+        "7g",
+        "--pids-limit",
+        "4096",
+        "--shm-size",
+        "2g",
+        "--tmpfs",
+        "/tmp:rw,exec,nosuid,size=1g",
+        "--workdir",
+        "/workspace",
+        "--env",
+        "HOME=/tmp/review-home",
+        "--env",
+        "CI=true",
+        "--env",
+        "NEXT_TELEMETRY_DISABLED=1",
+        "--env",
+        "TURBO_TELEMETRY_DISABLED=1",
+        "--env",
+        "NEXT_FONT_GOOGLE_MOCKED_RESPONSES=/usr/local/share/review-font-mocks.cjs",
+        LOCAL_REVIEW_WORKER_IMAGE,
+        "bash",
+        "-lc",
+        (
+            "mkdir -p /tmp/review-home /workspace; "
+            "dockerd --host=unix:///var/run/docker.sock "
+            "--storage-driver=vfs >/tmp/dockerd.log 2>&1 & "
+            "exec sleep infinity"
+        ),
     ]
+    started = _run_command(command, cwd=Path("/"), env=env, timeout=120)
+    if started.returncode != 0:
+        raise RuntimeError("local review worker could not start")
+    copied = _run_command(
+        ["docker", "cp", f"{workspace}/.", f"{worker_name}:/workspace"],
+        cwd=Path("/"),
+        env=env,
+        timeout=300,
+    )
+    if copied.returncode != 0:
+        _remove_review_worker(review_tuple)
+        raise RuntimeError("local review worker could not receive exact-head source")
+    trusted_workspace = _run_command(
+        _worker_command(
+            worker_name,
+            ["git", "config", "--global", "--add", "safe.directory", "/workspace"],
+        ),
+        cwd=Path("/"),
+        env=env,
+        timeout=30,
+    )
+    if trusted_workspace.returncode != 0:
+        _remove_review_worker(review_tuple)
+        raise RuntimeError("local review worker could not trust exact-head source")
+    for _ in range(60):
+        ready = _run_command(
+            _worker_command(worker_name, ["docker", "info", "--format", "{{.Driver}}"]),
+            cwd=Path("/"),
+            env=env,
+            timeout=15,
+        )
+        if ready.returncode == 0 and ready.stdout.strip() == "vfs":
+            return worker_name
+        time.sleep(1)
+    _remove_review_worker(review_tuple)
+    raise RuntimeError("isolated Docker daemon did not become ready")
+
+
+def _load_nested_images(worker_name: str, *, env: dict[str, str]) -> None:
+    for image in LOCAL_REVIEW_NESTED_IMAGES:
+        present = _run_command(
+            ["docker", "image", "inspect", image],
+            cwd=Path("/"),
+            env=env,
+            timeout=30,
+        )
+        if present.returncode != 0:
+            pulled = _run_command(
+                ["docker", "pull", image],
+                cwd=Path("/"),
+                env=env,
+                timeout=1200,
+            )
+            if pulled.returncode != 0:
+                raise RuntimeError(f"required nested image unavailable: {image}")
+
+    producer = subprocess.Popen(
+        ["docker", "image", "save", *LOCAL_REVIEW_NESTED_IMAGES],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    assert producer.stdout is not None
+    consumer = subprocess.Popen(
+        ["docker", "exec", "--interactive", worker_name, "docker", "image", "load"],
+        env=env,
+        stdin=producer.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+    )
+    producer.stdout.close()
+    _, consumer_error = consumer.communicate(timeout=1200)
+    producer_error = producer.stderr.read() if producer.stderr is not None else b""
+    producer_status = producer.wait(timeout=60)
+    if producer_status != 0 or consumer.returncode != 0:
+        reason = (producer_error + consumer_error).decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"nested image cache unavailable: {_clean_log(reason, limit=500)}"
+        )
+
+
+def _build_isolated_service_image(worker_name: str, *, env: dict[str, str]) -> None:
+    dockerfile = _run_command(
+        _worker_command(
+            worker_name,
+            ["sha256sum", "/workspace/infra/migrator/Dockerfile"],
+        ),
+        cwd=Path("/"),
+        env=env,
+        timeout=30,
+    )
+    if (
+        dockerfile.returncode != 0
+        or dockerfile.stdout.split(maxsplit=1)[0] != MIGRATOR_DOCKERFILE_SHA256
+    ):
+        raise RuntimeError("migrator Dockerfile changed outside the review policy")
+    result = _run_command(
+        _worker_command(
+            worker_name,
+            [
+                "docker",
+                "build",
+                "--file",
+                "/usr/local/share/review-migrator.Dockerfile",
+                "--tag",
+                "newtonsapple-portable-migrate",
+                "/workspace",
+            ],
+        ),
+        cwd=Path("/"),
+        env=env,
+        timeout=1200,
+    )
+    if result.returncode != 0:
+        log = _clean_log(
+            result.stdout + result.stderr, limit=LOCAL_REVIEW_EXCERPT_LIMIT
+        )
+        raise RuntimeError(f"isolated service image unavailable: {log}")
+
+
+def _disconnect_worker_network(worker_name: str, *, env: dict[str, str]) -> None:
+    disconnected = _run_command(
+        ["docker", "network", "disconnect", "bridge", worker_name],
+        cwd=Path("/"),
+        env=env,
+        timeout=60,
+    )
+    if disconnected.returncode != 0:
+        raise RuntimeError("local review worker could not enter offline mode")
+
+
+def _run_worker_gate(
+    review_tuple: ReviewTuple,
+    worker_name: str,
+    name: str,
+    *,
+    env: dict[str, str],
+    head_tree_sha: str,
+    timeout: int,
+    setup_command: Optional[list[str]] = None,
+) -> dict:
+    started = _utc_now()
+    log = ""
+    returncode = 0
+    attempted = True
+    try:
+        if setup_command is not None:
+            setup = _run_command(
+                _worker_command(worker_name, setup_command),
+                cwd=Path("/"),
+                env=env,
+                timeout=timeout,
+            )
+            log += setup.stdout + setup.stderr
+            returncode = setup.returncode
+        if returncode == 0:
+            result = _run_command(
+                _worker_command(worker_name, EXECUTION_GATE_COMMANDS[name]),
+                cwd=Path("/"),
+                env=env,
+                timeout=timeout,
+            )
+            returncode = result.returncode
+            log += result.stdout + result.stderr
+        log = _clean_log(log)
+        status, attempted = _gate_status(returncode, log)
+    except subprocess.TimeoutExpired as exc:
+        log = _clean_log(f"local gate timeout: {exc}")
+        returncode = 124
+        status = "unavailable"
+        attempted = True
+    completed = _utc_now()
+    try:
+        head = _worker_git_output(worker_name, "rev-parse", "HEAD", env=env)
+        tree = _worker_git_output(worker_name, "rev-parse", "HEAD^{tree}", env=env)
+        dirty = _worker_git_output(
+            worker_name,
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            env=env,
+        )
+        if head != review_tuple.head_sha or tree != head_tree_sha or dirty:
+            status = "unavailable"
+            log = _clean_log(log + "\ntracked source mutated during local gate")
+    except RuntimeError as exc:
+        status = "unavailable"
+        log = _clean_log(log + f"\n{exc}")
+    excerpt = log[-LOCAL_REVIEW_EXCERPT_LIMIT:] if status != "pass" else ""
+    return {
+        "id": name,
+        "executor": "review_worker",
+        "runner": {"kind": "review_worker", "name": LOCAL_REVIEW_RUNNER},
+        "status": status,
+        "head_sha": review_tuple.head_sha,
+        "attempted": attempted,
+        "command": EXECUTION_GATE_COMMANDS[name],
+        "exit_code": max(0, min(returncode, 255)),
+        "started_at": started,
+        "completed_at": completed,
+        "duration_ms": _duration_ms(started, completed),
+        "tree_before": head_tree_sha,
+        "tree_after": head_tree_sha,
+        "evidence": {
+            "kind": "local_worker",
+            "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
+            "reason": excerpt,
+            "excerpt": excerpt,
+        },
+    }
 
 
 def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
-    """Run exact-head gates in a bounded Docker worker with no credentials."""
+    """Run exact-head gates once in a disposable full-stack review worker."""
     base_tree_sha = _commit_tree_sha(review_tuple.base_sha)
     head_tree_sha = _commit_tree_sha(review_tuple.head_sha)
     worker = {
         "required": True,
-        "isolation": "docker",
+        "isolation": "docker-in-docker",
         "head_sha": review_tuple.head_sha,
         "base_present": True,
         "tree_before": head_tree_sha,
@@ -1086,11 +1553,20 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
             "host_mounts_absent": True,
             "host_docker_socket_absent": True,
             "resources_bounded": True,
-            "egress_default_deny": True,
+            "direct_egress_absent": True,
+            "egress_isolated_before_browser_verification": True,
+        },
+        "capabilities": {
+            "commands": True,
+            "services": True,
+            "docker_compose": True,
+            "playwright_chromium": True,
+            "feature_commands": True,
         },
         "mutations": [],
     }
     gates: list[dict] = []
+    worker_name = ""
     with tempfile.TemporaryDirectory(prefix="newtonsapple-review-") as temp:
         root = Path(temp)
         workspace = root / "workspace"
@@ -1131,126 +1607,141 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
             ):
                 raise RuntimeError("local worker exact-head preflight failed")
 
-            docker_env = {**env, "DOCKER_HOST": _local_docker_host()}
-            unavailable_pattern = re.compile(
-                r"(ECONNREFUSED|ENOTFOUND|Service Unavailable|docker: not found|"
-                r"Cannot connect to the Docker daemon|no such host|"
-                r"executable doesn't exist|browserType\.launch)",
-                re.IGNORECASE,
-            )
-            not_started_pattern = re.compile(
-                r"(docker: not found|Cannot connect to the Docker daemon|"
-                r"failed to connect to the docker API|no such host)",
-                re.IGNORECASE,
-            )
-            for name in BASELINE_EXECUTION_GATES:
-                for command in (
-                    ["git", "reset", "--hard", review_tuple.head_sha],
-                    ["git", "clean", "-fdx"],
-                ):
-                    cleaned = _run_command(
-                        command, cwd=workspace, env=env, timeout=120
-                    )
-                    if cleaned.returncode != 0:
-                        raise RuntimeError("local worker could not reset exact-head source")
-
-                install_log = ""
-                install_returncode = 0
-                try:
-                    install = _run_command(
-                        _docker_gate_command(
-                            workspace,
-                            [
-                                "npm",
-                                "ci",
-                                "--ignore-scripts",
-                                "--no-audit",
-                                "--no-fund",
-                            ],
-                            network="bridge",
-                        ),
-                        cwd=workspace,
-                        env=docker_env,
-                        timeout=1200,
-                    )
-                    install_returncode = install.returncode
-                    install_log = (install.stdout + install.stderr)[-200_000:]
-                except subprocess.TimeoutExpired as exc:
-                    install_returncode = 124
-                    install_log = f"dependency installation timeout: {exc}"
-
-                started = _utc_now()
-                try:
-                    result = _run_command(
-                        _docker_gate_command(
-                            workspace,
-                            EXECUTION_GATE_COMMANDS[name],
-                            network="none",
-                        ),
-                        cwd=workspace,
-                        env=docker_env,
-                        timeout=3600,
-                    )
-                    log = (result.stdout + result.stderr)[-1_000_000:]
-                    attempted = (
-                        result.returncode not in {125, 126, 127}
-                        and not not_started_pattern.search(log)
-                    )
-                    if result.returncode == 0:
-                        status = "pass"
-                    elif (
-                        install_returncode != 0
-                        or result.returncode in {125, 126, 127}
-                        or unavailable_pattern.search(log)
-                    ):
-                        status = "unavailable"
-                    else:
-                        status = "pr-fail"
-                    exit_code = max(0, min(result.returncode, 255))
-                except subprocess.TimeoutExpired as exc:
-                    log = f"local gate timeout: {exc}"
-                    status = "unavailable"
-                    exit_code = 124
-                    attempted = True
-                completed = _utc_now()
-
-                dirty = _git_output(workspace, "status", "--porcelain")
-                if dirty:
-                    status = "unavailable"
-                    log += "\nsource tree mutated during local gate"
-                if install_returncode != 0:
-                    log += "\ndependency installation unavailable: " + install_log[-500:]
-                gates.append(
-                    {
-                        "id": name,
-                        "executor": "review_worker",
-                        "runner": {
-                            "kind": "review_worker",
-                            "name": "docker-node22",
-                        },
-                        "status": status,
-                        "head_sha": review_tuple.head_sha,
-                        "attempted": attempted,
-                        "command": EXECUTION_GATE_COMMANDS[name],
-                        "exit_code": exit_code,
-                        "started_at": started,
-                        "completed_at": completed,
-                        "duration_ms": _duration_ms(started, completed),
-                        "tree_before": head_tree_sha,
-                        "tree_after": head_tree_sha,
-                        "evidence": {
-                            "kind": "local_worker",
-                            "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
-                            "reason": log[-500:] if status == "unavailable" else "",
-                        },
-                    }
+            docker_env = _docker_environment(home)
+            _assert_worker_image(docker_env)
+            worker_name = _start_review_worker(review_tuple, workspace, env=docker_env)
+            if (
+                _worker_git_output(worker_name, "rev-parse", "HEAD", env=docker_env)
+                != review_tuple.head_sha
+                or _worker_git_output(
+                    worker_name, "rev-parse", "HEAD^{tree}", env=docker_env
                 )
+                != head_tree_sha
+                or _worker_git_output(
+                    worker_name,
+                    "cat-file",
+                    "-t",
+                    review_tuple.base_sha,
+                    env=docker_env,
+                )
+                != "commit"
+            ):
+                raise RuntimeError("local worker exact-head container preflight failed")
+
+            gates.append(
+                _run_worker_gate(
+                    review_tuple,
+                    worker_name,
+                    "install",
+                    env=docker_env,
+                    head_tree_sha=head_tree_sha,
+                    timeout=1200,
+                )
+            )
+            platform_packages = _install_platform_dependencies(
+                worker_name,
+                _linux_arm64_glibc_packages(workspace / "package-lock.json"),
+                env=docker_env,
+            )
+            if platform_packages.returncode == 0:
+                platform_packages = _prepare_local_environment(
+                    worker_name, env=docker_env
+                )
+            if platform_packages.returncode != 0:
+                platform_log = _clean_log(
+                    platform_packages.stdout + platform_packages.stderr
+                )
+                install_gate = gates[0]
+                status, attempted = _gate_status(
+                    platform_packages.returncode, platform_log
+                )
+                install_gate["status"] = status
+                install_gate["attempted"] = attempted
+                install_gate["exit_code"] = max(
+                    0, min(platform_packages.returncode, 255)
+                )
+                install_gate["evidence"] = {
+                    "kind": "local_worker",
+                    "log_sha256": hashlib.sha256(platform_log.encode()).hexdigest(),
+                    "reason": platform_log[-LOCAL_REVIEW_EXCERPT_LIMIT:],
+                    "excerpt": platform_log[-LOCAL_REVIEW_EXCERPT_LIMIT:],
+                }
+            gates.append(
+                _run_worker_gate(
+                    review_tuple,
+                    worker_name,
+                    "security",
+                    env=docker_env,
+                    head_tree_sha=head_tree_sha,
+                    timeout=600,
+                )
+            )
+            _load_nested_images(worker_name, env=docker_env)
+            _build_isolated_service_image(worker_name, env=docker_env)
+            _disconnect_worker_network(worker_name, env=docker_env)
+
+            rebuild = _run_command(
+                _worker_command(worker_name, ["npm", "rebuild", "--offline"]),
+                cwd=Path("/"),
+                env=docker_env,
+                timeout=1200,
+            )
+            install_gate = gates[0]
+            install_gate["completed_at"] = _utc_now()
+            install_gate["duration_ms"] = _duration_ms(
+                install_gate["started_at"], install_gate["completed_at"]
+            )
+            if rebuild.returncode != 0:
+                rebuild_log = _clean_log(rebuild.stdout + rebuild.stderr)
+                status, attempted = _gate_status(rebuild.returncode, rebuild_log)
+                install_gate["status"] = status
+                install_gate["attempted"] = attempted
+                install_gate["exit_code"] = max(0, min(rebuild.returncode, 255))
+                install_gate["evidence"] = {
+                    "kind": "local_worker",
+                    "log_sha256": hashlib.sha256(rebuild_log.encode()).hexdigest(),
+                    "reason": rebuild_log[-LOCAL_REVIEW_EXCERPT_LIMIT:],
+                    "excerpt": rebuild_log[-LOCAL_REVIEW_EXCERPT_LIMIT:],
+                }
+
+            integration_gate = _run_worker_gate(
+                review_tuple,
+                worker_name,
+                "integration",
+                env=docker_env,
+                head_tree_sha=head_tree_sha,
+                timeout=3600,
+            )
+            quality_gate = _run_worker_gate(
+                review_tuple,
+                worker_name,
+                "quality",
+                env=docker_env,
+                head_tree_sha=head_tree_sha,
+                timeout=3600,
+            )
+
+            gates.append(quality_gate)
+            gates.append(integration_gate)
+            gates.append(
+                _run_worker_gate(
+                    review_tuple,
+                    worker_name,
+                    "e2e",
+                    env=docker_env,
+                    head_tree_sha=head_tree_sha,
+                    timeout=3600,
+                    setup_command=["npm", "run", "db:start"],
+                )
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             reason = str(exc)
             gates.extend(
                 _unavailable_local_gate(name, reason)
                 for name in BASELINE_EXECUTION_GATES[len(gates) :]
             )
+            if worker_name:
+                _remove_review_worker(review_tuple)
     for gate in gates:
         gate["head_sha"] = review_tuple.head_sha
         gate["tree_before"] = head_tree_sha
@@ -1287,6 +1778,97 @@ def execution_evidence(payload: dict) -> dict:
         report,
         payload_key="attestation_payload",
         signature_key="attestation_signature",
+    )
+
+
+def execute_feature_command(payload: dict) -> dict:
+    """Run one agent-selected exact-head command in the retained offline worker."""
+    review_tuple = _execution_tuple(payload)
+    command = payload.get("command")
+    timeout = payload.get("timeout_seconds", 1800)
+    if (
+        not isinstance(command, list)
+        or not command
+        or len(command) > 64
+        or any(
+            not isinstance(part, str) or not part or len(part) > 4096
+            for part in command
+        )
+        or isinstance(timeout, bool)
+        or not isinstance(timeout, int)
+        or timeout < 1
+        or timeout > 3600
+    ):
+        raise RuntimeError("invalid feature command")
+    home = Path(tempfile.gettempdir()) / "newtonsapple-review-control-home"
+    home.mkdir(mode=0o700, exist_ok=True)
+    env = _docker_environment(home)
+    worker_name = _review_worker_name(review_tuple)
+    expected_tree = _commit_tree_sha(review_tuple.head_sha)
+    if (
+        _worker_git_output(worker_name, "rev-parse", "HEAD", env=env)
+        != review_tuple.head_sha
+        or _worker_git_output(worker_name, "rev-parse", "HEAD^{tree}", env=env)
+        != expected_tree
+    ):
+        raise RuntimeError("exact-head feature worker is unavailable")
+
+    started = _utc_now()
+    try:
+        result = _run_command(
+            _worker_command(worker_name, command),
+            cwd=Path("/"),
+            env=env,
+            timeout=timeout,
+        )
+        returncode = result.returncode
+        log = _clean_log(result.stdout + result.stderr)
+        status, attempted = _gate_status(returncode, log)
+    except subprocess.TimeoutExpired as exc:
+        returncode = 124
+        log = _clean_log(f"feature command timeout: {exc}")
+        status = "unavailable"
+        attempted = True
+    completed = _utc_now()
+    dirty = _worker_git_output(
+        worker_name,
+        "status",
+        "--porcelain",
+        "--untracked-files=no",
+        env=env,
+    )
+    tree_after = _worker_git_output(worker_name, "rev-parse", "HEAD^{tree}", env=env)
+    if dirty or tree_after != expected_tree:
+        status = "unavailable"
+        log = _clean_log(log + "\ntracked source mutated during feature command")
+        _run_command(
+            _worker_command(
+                worker_name, ["git", "reset", "--hard", review_tuple.head_sha]
+            ),
+            cwd=Path("/"),
+            env=env,
+            timeout=120,
+        )
+    result_payload = {
+        **review_tuple.__dict__,
+        "command": command,
+        "status": status,
+        "attempted": attempted,
+        "exit_code": max(0, min(returncode, 255)),
+        "started_at": started,
+        "completed_at": completed,
+        "duration_ms": _duration_ms(started, completed),
+        "tree_before": expected_tree,
+        "tree_after": expected_tree,
+        "runner": {"kind": "review_worker", "name": LOCAL_REVIEW_RUNNER},
+        "network": "isolated",
+        "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
+        "output_excerpt": log[-LOCAL_REVIEW_EXCERPT_LIMIT:],
+    }
+    return _signed_result(
+        result_payload,
+        payload_key="command_result_payload",
+        signature_key="command_result_signature",
     )
 
 
@@ -1397,9 +1979,7 @@ def _retry_content(
 
 
 def _summary_content(review_tuple: ReviewTuple, pr_url: str, review_body: str) -> str:
-    findings = re.findall(
-        r"(?m)^###\s+(P[0-3])\s+[—-]\s+(.+?)\s*$", review_body
-    )
+    findings = re.findall(r"(?m)^###\s+(P[0-3])\s+[—-]\s+(.+?)\s*$", review_body)
     if findings:
         first_severity, first_title = findings[0]
         finding_summary = (
@@ -1590,17 +2170,20 @@ def _live_review_state(pr_number: int, expected_login: str) -> tuple[dict, list[
         raise RuntimeError("GitHub returned malformed pull request")
     live_pr = cast(dict[str, Any], live_pr_result)
     head = live_pr.get("head")
-    if not isinstance(head, dict) or SHA_PATTERN.fullmatch(str(head.get("sha", ""))) is None:
+    if (
+        not isinstance(head, dict)
+        or SHA_PATTERN.fullmatch(str(head.get("sha", ""))) is None
+    ):
         raise RuntimeError("GitHub returned malformed pull request head")
-    comments = _collection(f"repos/{REPOSITORY}/issues/{pr_number}/comments?per_page=100")
+    comments = _collection(
+        f"repos/{REPOSITORY}/issues/{pr_number}/comments?per_page=100"
+    )
     reviews = _collection(f"repos/{REPOSITORY}/pulls/{pr_number}/reviews?per_page=100")
     return live_pr, _bot_bodies(comments + reviews, expected_login)
 
 
 def _load_timeline(pr_number: int) -> list[dict]:
-    return _collection(
-        f"repos/{REPOSITORY}/issues/{pr_number}/timeline?per_page=100"
-    )
+    return _collection(f"repos/{REPOSITORY}/issues/{pr_number}/timeline?per_page=100")
 
 
 def _recoverable_live_tuple(
@@ -1629,18 +2212,14 @@ def _authorized_live_tuple(
 
 
 def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
-    pulls = _collection(
-        f"repos/{REPOSITORY}/pulls?state=open&base=dev&per_page=100"
-    )
+    pulls = _collection(f"repos/{REPOSITORY}/pulls?state=open&base=dev&per_page=100")
     events: list[dict] = []
     for listed in pulls:
         number = listed.get("number")
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             continue
         try:
-            live_pr, selected, bodies = _recoverable_live_tuple(
-                number, expected_login
-            )
+            live_pr, selected, bodies = _recoverable_live_tuple(number, expected_login)
         except (RuntimeError, TypeError, ValueError, sqlite3.Error):
             base = listed.get("base")
             head = listed.get("head")
@@ -1655,11 +2234,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                 and SHA_PATTERN.fullmatch(head["sha"]) is not None
                 and isinstance(requested, list)
                 and expected_login
-                in {
-                    item.get("login")
-                    for item in requested
-                    if isinstance(item, dict)
-                }
+                in {item.get("login") for item in requested if isinstance(item, dict)}
             ):
                 blocked_tuple = ReviewTuple(
                     repository=REPOSITORY,
@@ -1683,11 +2258,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
             continue
         if selected is not None:
             matching_body = next(
-                (
-                    body
-                    for body in bodies
-                    if review_marker(selected) in body
-                ),
+                (body for body in bodies if review_marker(selected) in body),
                 None,
             )
             if matching_body is not None:
@@ -1702,23 +2273,21 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                     reply_to=thread_root,
                 )
                 continue
-            events.append(
-                {
-                    "delivery_id": (
-                        f"recovery-v2-pr{number}-"
-                        f"{selected.base_sha[:12]}-{selected.head_sha[:12]}-"
-                        f"req{selected.request_id}"
-                    ),
-                    "event_type": "pull_request",
-                    "payload": {
-                        "action": "review_requested",
-                        "number": number,
-                        "repository": {"full_name": REPOSITORY},
-                        "requested_reviewer": {"login": expected_login},
-                        "pull_request": live_pr,
-                    },
-                }
-            )
+            events.append({
+                "delivery_id": (
+                    f"recovery-v2-pr{number}-"
+                    f"{selected.base_sha[:12]}-{selected.head_sha[:12]}-"
+                    f"req{selected.request_id}"
+                ),
+                "event_type": "pull_request",
+                "payload": {
+                    "action": "review_requested",
+                    "number": number,
+                    "repository": {"full_name": REPOSITORY},
+                    "requested_reviewer": {"login": expected_login},
+                    "pull_request": live_pr,
+                },
+            })
             continue
 
         base = live_pr.get("base")
@@ -1741,11 +2310,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
             and SHA_PATTERN.fullmatch(review_tuple.head_sha) is not None
             and isinstance(requested, list)
             and expected_login
-            in {
-                item.get("login")
-                for item in requested
-                if isinstance(item, dict)
-            }
+            in {item.get("login") for item in requested if isinstance(item, dict)}
         ):
             _ensure_requested_message(
                 store, review_tuple, str(live_pr.get("html_url", ""))
@@ -1760,9 +2325,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                     "the timeline. The review was not started."
                 ),
             )
-    delivered = drain_summary_outbox(
-        store, find_existing=_buzz_find, send=_buzz_send
-    )
+    delivered = drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
     return {"events": events, "outbox_delivered": delivered}
 
 
@@ -1807,9 +2370,7 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         _ensure_started_message(store, review_tuple, pr_url)
         return {"settled": "started"}
     if operation == "claim_publish":
-        _, selected, _ = _recoverable_live_tuple(
-            review_tuple.pr_number, expected_login
-        )
+        _, selected, _ = _recoverable_live_tuple(review_tuple.pr_number, expected_login)
         if selected != review_tuple:
             raise RuntimeError("review request generation changed before publication")
         store.claim_publication(
@@ -1842,6 +2403,7 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
             failure_reason=failure_reason,
         )
         drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
+        _remove_review_worker(review_tuple)
         return {"settled": "release", **failure}
     if operation != "complete":
         raise RuntimeError("invalid settlement operation")
@@ -1876,9 +2438,8 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         content=_summary_content(review_tuple, pr_url, matching_body),
         reply_to=thread_root,
     )
-    delivered = drain_summary_outbox(
-        store, find_existing=_buzz_find, send=_buzz_send
-    )
+    delivered = drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
+    _remove_review_worker(review_tuple)
     return {"settled": "complete", "outbox_delivered": delivered}
 
 
@@ -1945,9 +2506,7 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
     if lease_token is None:
         raise RuntimeError("review tuple is already leased or completed")
     try:
-        _ensure_requested_message(
-            store, review_tuple, str(live_pr.get("html_url", ""))
-        )
+        _ensure_requested_message(store, review_tuple, str(live_pr.get("html_url", "")))
     except Exception:
         store.release(review_tuple, lease_token=lease_token)
         raise
@@ -1982,6 +2541,8 @@ def main() -> None:
             output = resolve_execution_gates(payload)
         elif operation == "execution_evidence":
             output = execution_evidence(payload)
+        elif operation == "execute_feature_command":
+            output = execute_feature_command(payload)
         elif operation in {"claim_publish", "complete", "release", "started"}:
             output = _settle(payload, expected_login, store)
         elif operation is not None:

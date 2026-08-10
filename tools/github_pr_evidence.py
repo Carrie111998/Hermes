@@ -126,6 +126,9 @@ class EvidenceScope:
     execution_attestation_loader: Optional[Callable[[], tuple[bytes, str]]] = field(
         default=None, repr=False
     )
+    feature_command_loader: Optional[Callable[[list[str], int], tuple[bytes, str]]] = (
+        field(default=None, repr=False)
+    )
     gate_resolution_loader: Optional[Callable[[], tuple[bytes, str]]] = field(
         default=None, repr=False
     )
@@ -171,15 +174,13 @@ class EvidenceScope:
 
     @property
     def cache_key(self) -> str:
-        return ":".join(
-            (
-                self.contract_version,
-                self.repository,
-                str(self.pr_number),
-                self.base_sha,
-                self.head_sha,
-            )
-        )
+        return ":".join((
+            self.contract_version,
+            self.repository,
+            str(self.pr_number),
+            self.base_sha,
+            self.head_sha,
+        ))
 
     @property
     def required_cursors(self) -> set[str]:
@@ -337,20 +338,18 @@ def _closing_issues(scope: EvidenceScope, value: Any) -> dict[str, Any]:
         repo = repository.get("nameWithOwner")
         if repo != scope.repository:
             continue
-        issues.append(
-            {
-                "repository": repo,
-                "number": number,
-                "cursor": _new_cursor(
-                    scope,
-                    _Cursor(
-                        "linked_issue",
-                        f"repos/{repo}/issues/{number}",
-                        data=(repo, number),
-                    ),
+        issues.append({
+            "repository": repo,
+            "number": number,
+            "cursor": _new_cursor(
+                scope,
+                _Cursor(
+                    "linked_issue",
+                    f"repos/{repo}/issues/{number}",
+                    data=(repo, number),
                 ),
-            }
-        )
+            ),
+        })
 
     has_next = page_info.get("hasNextPage")
     end_cursor = page_info.get("endCursor")
@@ -455,35 +454,33 @@ def _manifest(scope: EvidenceScope) -> str:
             ),
         }
         if not scope.concise_review:
-            endpoints.update(
-                {
-                    "closing_issues": _Cursor("closing_issues"),
-                    "issue_comments": _Cursor(
-                        "issue_comments",
-                        f"repos/{repo}/issues/{pr}/comments?per_page=100",
-                    ),
-                    "reviews": _Cursor(
-                        "reviews", f"repos/{repo}/pulls/{pr}/reviews?per_page=100"
-                    ),
-                    "review_comments": _Cursor(
-                        "review_comments",
-                        f"repos/{repo}/pulls/{pr}/comments?per_page=100",
-                    ),
-                    "commits": _Cursor(
-                        "commits", f"repos/{repo}/pulls/{pr}/commits?per_page=100"
-                    ),
-                    "checks": _Cursor(
-                        "checks", f"repos/{repo}/commits/{head}/check-runs?per_page=100"
-                    ),
-                    "statuses": _Cursor(
-                        "statuses", f"repos/{repo}/commits/{head}/statuses?per_page=100"
-                    ),
-                    "workflow_runs": _Cursor(
-                        "workflow_runs",
-                        f"repos/{repo}/actions/runs?head_sha={head}&per_page=100",
-                    ),
-                }
-            )
+            endpoints.update({
+                "closing_issues": _Cursor("closing_issues"),
+                "issue_comments": _Cursor(
+                    "issue_comments",
+                    f"repos/{repo}/issues/{pr}/comments?per_page=100",
+                ),
+                "reviews": _Cursor(
+                    "reviews", f"repos/{repo}/pulls/{pr}/reviews?per_page=100"
+                ),
+                "review_comments": _Cursor(
+                    "review_comments",
+                    f"repos/{repo}/pulls/{pr}/comments?per_page=100",
+                ),
+                "commits": _Cursor(
+                    "commits", f"repos/{repo}/pulls/{pr}/commits?per_page=100"
+                ),
+                "checks": _Cursor(
+                    "checks", f"repos/{repo}/commits/{head}/check-runs?per_page=100"
+                ),
+                "statuses": _Cursor(
+                    "statuses", f"repos/{repo}/commits/{head}/statuses?per_page=100"
+                ),
+                "workflow_runs": _Cursor(
+                    "workflow_runs",
+                    f"repos/{repo}/actions/runs?head_sha={head}&per_page=100",
+                ),
+            })
         scope.manifest_cursors = {
             name: _new_cursor(scope, cursor) for name, cursor in endpoints.items()
         }
@@ -509,9 +506,7 @@ def _manifest(scope: EvidenceScope) -> str:
             for token, cursor in scope.cursors.items()
             if cursor.required and token in scope.exposed_cursors
         ]
-        total_required = sum(
-            1 for cursor in scope.cursors.values() if cursor.required
-        )
+        total_required = sum(1 for cursor in scope.cursors.values() if cursor.required)
     current_required.sort(
         key=lambda item: (
             item["kind"] == "execution_attestation",
@@ -710,7 +705,9 @@ def _maybe_reconcile_changed_inventories(scope: EvidenceScope) -> None:
             normalized.add(("renamed", old_path, new_path))
     scope.tree_changed_inventory = normalized
     if scope.api_changed_inventory != scope.tree_changed_inventory:
-        raise RuntimeError("GitHub and immutable tree changed-file inventories disagree")
+        raise RuntimeError(
+            "GitHub and immutable tree changed-file inventories disagree"
+        )
     scope.tree_diff_reconciled = True
 
 
@@ -733,7 +730,9 @@ def _changed_files(scope: EvidenceScope, items: list[Any]) -> list[Any]:
         previous = item.get("previous_filename")
         if status == "renamed":
             if not isinstance(previous, str) or not previous:
-                raise RuntimeError("Renamed file evidence omitted its previous filename")
+                raise RuntimeError(
+                    "Renamed file evidence omitted its previous filename"
+                )
             inventory.add(("renamed", previous, filename))
         elif status == "modified":
             inventory.add(("modified", filename, filename))
@@ -786,7 +785,9 @@ def _tree_map(value: Any) -> tuple[str, dict[str, dict[str, Any]]]:
         ):
             raise RuntimeError("Immutable Git tree entry was malformed")
         if kind == "commit" or mode == "160000":
-            raise RuntimeError("Immutable Git tree contains unsupported submodule gitlink")
+            raise RuntimeError(
+                "Immutable Git tree contains unsupported submodule gitlink"
+            )
         if kind != "tree":
             result[path] = {"path": path, "mode": mode, "type": kind, "sha": sha}
     return str(tree_sha), result
@@ -794,14 +795,14 @@ def _tree_map(value: Any) -> tuple[str, dict[str, dict[str, Any]]]:
 
 def _comparison_merge_base(scope: EvidenceScope) -> str:
     """Resolve the immutable merge base used by GitHub's pull-request diff."""
-    comparison = _run_gh_json(
-        [
-            f"repos/{scope.repository}/compare/{scope.base_sha}...{scope.head_sha}",
-            "--jq",
-            "{base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}",
-        ]
+    comparison = _run_gh_json([
+        f"repos/{scope.repository}/compare/{scope.base_sha}...{scope.head_sha}",
+        "--jq",
+        "{base_commit:{sha:.base_commit.sha},merge_base_commit:{sha:.merge_base_commit.sha}}",
+    ])
+    base_commit = (
+        comparison.get("base_commit") if isinstance(comparison, dict) else None
     )
-    base_commit = comparison.get("base_commit") if isinstance(comparison, dict) else None
     merge_base = (
         comparison.get("merge_base_commit") if isinstance(comparison, dict) else None
     )
@@ -889,21 +890,19 @@ def _is_canonical_gate_path(path: str) -> bool:
         or lower.startswith("docker-compose.")
         or name == "Dockerfile"
         or name.endswith(".Dockerfile")
-        or lower.startswith(
-            (
-                "playwright.",
-                "vitest.",
-                "vite.",
-                "jest.",
-                "webpack.",
-                "eslint.",
-                "prettier.",
-                "tsconfig.",
-                "next.",
-                "postcss.",
-                "tailwind.",
-            )
-        )
+        or lower.startswith((
+            "playwright.",
+            "vitest.",
+            "vite.",
+            "jest.",
+            "webpack.",
+            "eslint.",
+            "prettier.",
+            "tsconfig.",
+            "next.",
+            "postcss.",
+            "tailwind.",
+        ))
     )
 
 
@@ -930,23 +929,23 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
         merge_base_tree_ref = expected_merge_base_tree
         head_tree_ref = expected_head_tree
     base_tree_sha, base = _tree_map(
-        _run_gh_json(
-            [f"repos/{scope.repository}/git/trees/{base_tree_ref}?recursive=1"]
-        )
+        _run_gh_json([
+            f"repos/{scope.repository}/git/trees/{base_tree_ref}?recursive=1"
+        ])
     )
     if merge_base_sha == scope.base_sha:
         merge_base_tree_sha = base_tree_sha
         merge_base = base
     else:
         merge_base_tree_sha, merge_base = _tree_map(
-            _run_gh_json(
-                [f"repos/{scope.repository}/git/trees/{merge_base_tree_ref}?recursive=1"]
-            )
+            _run_gh_json([
+                f"repos/{scope.repository}/git/trees/{merge_base_tree_ref}?recursive=1"
+            ])
         )
     head_tree_sha, head = _tree_map(
-        _run_gh_json(
-            [f"repos/{scope.repository}/git/trees/{head_tree_ref}?recursive=1"]
-        )
+        _run_gh_json([
+            f"repos/{scope.repository}/git/trees/{head_tree_ref}?recursive=1"
+        ])
     )
     if scope.concise_review:
         if (
@@ -969,10 +968,14 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
     rename_targets: dict[tuple[str, str, str], list[str]] = {}
     for path in added:
         entry = head[path]
-        rename_targets.setdefault((entry["sha"], entry["mode"], entry["type"]), []).append(path)
+        rename_targets.setdefault(
+            (entry["sha"], entry["mode"], entry["type"]), []
+        ).append(path)
     for old_path in sorted(tuple(removed)):
         entry = merge_base[old_path]
-        candidates = rename_targets.get((entry["sha"], entry["mode"], entry["type"]), [])
+        candidates = rename_targets.get(
+            (entry["sha"], entry["mode"], entry["type"]), []
+        )
         if candidates:
             new_path = sorted(candidates)[0]
             candidates.remove(new_path)
@@ -993,9 +996,7 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
 
     changed_paths = {path for _, old, new in inventory for path in (old, new) if path}
     canonical_paths = {
-        path
-        for path in set(base) | set(head)
-        if _is_canonical_gate_path(path)
+        path for path in set(base) | set(head) if _is_canonical_gate_path(path)
     }
     essential = {"AGENTS.md", "docs/DEV.md", "docs/TESTING.md", "package.json"}
     if (
@@ -1003,7 +1004,9 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
         or not any(path.startswith("playwright.config.") for path in head)
         or not any(path.startswith(".github/workflows/") for path in head)
     ):
-        raise RuntimeError("Canonical review/gate files were absent from the immutable trees")
+        raise RuntimeError(
+            "Canonical review/gate files were absent from the immutable trees"
+        )
     blob_cursors: dict[str, list[str]] = {"changed": [], "canonical": []}
     if scope.concise_review:
         scope.canonical_files_materialized = True
@@ -1073,20 +1076,18 @@ def _workflow_runs(scope: EvidenceScope, items: list[Any]) -> list[Any]:
                 ),
             )
             scope.required_log_tokens.add(log_cursor)
-            attempts.append(
-                {
-                    "attempt": attempt,
-                    "jobs": _new_cursor(
-                        scope,
-                        _Cursor(
-                            "jobs",
-                            f"repos/{scope.repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
-                            {"run_id": run_id, "attempt": attempt},
-                        ),
+            attempts.append({
+                "attempt": attempt,
+                "jobs": _new_cursor(
+                    scope,
+                    _Cursor(
+                        "jobs",
+                        f"repos/{scope.repository}/actions/runs/{run_id}/attempts/{attempt}/jobs?per_page=100",
+                        {"run_id": run_id, "attempt": attempt},
                     ),
-                    "logs": log_cursor,
-                }
-            )
+                ),
+                "logs": log_cursor,
+            })
         child = {
             "attempts": attempts,
             "artifacts": _new_cursor(
@@ -1101,9 +1102,7 @@ def _workflow_runs(scope: EvidenceScope, items: list[Any]) -> list[Any]:
     return result
 
 
-def _jobs(
-    scope: EvidenceScope, items: list[Any], context: dict[str, Any]
-) -> list[Any]:
+def _jobs(scope: EvidenceScope, items: list[Any], context: dict[str, Any]) -> list[Any]:
     if not items:
         raise RuntimeError("Workflow-job evidence was empty")
     result = []
@@ -1122,7 +1121,9 @@ def _jobs(
             f"https://github.com/{scope.repository}/actions/runs/{run_id}/job/{job_id}"
         )
         if item.get("html_url") not in (None, expected_url):
-            raise RuntimeError("Workflow-job evidence URL did not match its trusted run")
+            raise RuntimeError(
+                "Workflow-job evidence URL did not match its trusted run"
+            )
         scope.observed_action_jobs[job_id] = {
             "run_id": run_id,
             "url": expected_url,
@@ -1153,7 +1154,11 @@ def _artifacts(scope: EvidenceScope, items: list[Any]) -> list[Any]:
         if not isinstance(item, dict):
             raise RuntimeError("Workflow-artifact evidence was malformed")
         artifact_id = item.get("id")
-        if isinstance(artifact_id, bool) or not isinstance(artifact_id, int) or artifact_id <= 0:
+        if (
+            isinstance(artifact_id, bool)
+            or not isinstance(artifact_id, int)
+            or artifact_id <= 0
+        ):
             raise RuntimeError("Workflow artifact omitted a valid ID")
         archive_cursor = _new_cursor(
             scope,
@@ -1202,9 +1207,16 @@ def _safe_archive(
         if total > _MAX_TOTAL_UNCOMPRESSED or info.file_size > _MAX_ENTRY_BYTES:
             raise RuntimeError("GitHub evidence archive exceeded extraction limits")
         if info.compress_size == 0 and info.file_size > 0:
-            raise RuntimeError("GitHub evidence archive had an invalid compression ratio")
-        if info.compress_size and info.file_size / info.compress_size > _MAX_COMPRESSION_RATIO:
-            raise RuntimeError("GitHub evidence archive exceeded the compression-ratio limit")
+            raise RuntimeError(
+                "GitHub evidence archive had an invalid compression ratio"
+            )
+        if (
+            info.compress_size
+            and info.file_size / info.compress_size > _MAX_COMPRESSION_RATIO
+        ):
+            raise RuntimeError(
+                "GitHub evidence archive exceeded the compression-ratio limit"
+            )
         content = archive.read(info)
         entry_cursors = [
             _new_cursor(
@@ -1223,13 +1235,11 @@ def _safe_archive(
         ]
         if log_evidence:
             scope.required_log_tokens.update(entry_cursors)
-        entries.append(
-            {
-                "path": info.filename,
-                "size": info.file_size,
-                "cursors": entry_cursors,
-            }
-        )
+        entries.append({
+            "path": info.filename,
+            "size": info.file_size,
+            "cursors": entry_cursors,
+        })
     return {"archive_kind": archive_kind, "entries": entries}
 
 
@@ -1242,7 +1252,9 @@ def _job_log(
     if job_id is not None:
         observed = scope.observed_action_jobs.get(job_id)
         if observed is None or observed.get("run_id") != metadata.get("run_id"):
-            raise RuntimeError("Workflow-job log was not bound to an observed exact-head job")
+            raise RuntimeError(
+                "Workflow-job log was not bound to an observed exact-head job"
+            )
         observed["log_sha256"] = hashlib.sha256(payload).hexdigest()
     if payload.startswith(b"PK\x03\x04"):
         return _safe_archive(
@@ -1291,16 +1303,21 @@ def _raw_file(
         except UnicodeDecodeError:
             text = ""
         raw_references = {
-            match.group(1).rstrip(".,;:)]}") for match in _REFERENCED_PATH_RE.finditer(text)
+            match.group(1).rstrip(".,;:)]}")
+            for match in _REFERENCED_PATH_RE.finditer(text)
         }
         for path_info in metadata["paths"]:
             tree = scope.base_tree if path_info["source"] == "base" else scope.head_tree
             source_path = PurePosixPath(path_info["path"])
             for reference in sorted(raw_references):
                 direct = reference.removeprefix("./")
-                relative = posixpath.normpath(str(source_path.parent.joinpath(reference)))
+                relative = posixpath.normpath(
+                    str(source_path.parent.joinpath(reference))
+                )
                 candidates = (direct, relative)
-                entry = next((tree.get(path) for path in candidates if tree.get(path)), None)
+                entry = next(
+                    (tree.get(path) for path in candidates if tree.get(path)), None
+                )
                 if entry is not None and entry.get("type") == "blob":
                     _new_blob_cursor(
                         scope,
@@ -1474,7 +1491,9 @@ def _read(scope: EvidenceScope, token: str) -> str:
                 raise RuntimeError("Execution gate resolver is unavailable")
             payload, signature = loader()
             if not record_gate_resolution(payload, signature):
-                raise RuntimeError("Execution gate resolution was invalid or incomplete")
+                raise RuntimeError(
+                    "Execution gate resolution was invalid or incomplete"
+                )
             _require_execution_attestation(scope)
             value = {
                 "resolved": True,
@@ -1503,9 +1522,7 @@ def _read(scope: EvidenceScope, token: str) -> str:
             if not scope.required_log_tokens:
                 scope.required_logs_materialized = True
         elif cursor.kind == "archive_entry":
-            value = _archive_entry(
-                scope, cursor.data, token, required=cursor.required
-            )
+            value = _archive_entry(scope, cursor.data, token, required=cursor.required)
         elif cursor.kind == "data":
             value = cursor.data
         else:
@@ -1522,7 +1539,9 @@ def _read(scope: EvidenceScope, token: str) -> str:
                     "-F",
                     f"number={scope.pr_number}",
                 ]
-                after = cursor.data.get("after") if isinstance(cursor.data, dict) else None
+                after = (
+                    cursor.data.get("after") if isinstance(cursor.data, dict) else None
+                )
                 if after:
                     args.extend(["-f", f"after={after}"])
             elif cursor.kind in {"pull_request", "blob", "linked_issue"}:
@@ -1547,9 +1566,7 @@ def _read(scope: EvidenceScope, token: str) -> str:
             elif cursor.kind == "changed_files":
                 value = _changed_files(scope, _flatten_pages(value))
             elif cursor.kind == "workflow_runs":
-                value = _workflow_runs(
-                    scope, _paginated_items(value, "workflow_runs")
-                )
+                value = _workflow_runs(scope, _paginated_items(value, "workflow_runs"))
             elif cursor.kind == "jobs":
                 value = _jobs(scope, _paginated_items(value, "jobs"), cursor.data)
             elif cursor.kind == "artifacts":
@@ -1591,7 +1608,77 @@ def _read(scope: EvidenceScope, token: str) -> str:
         return _error(scope, str(exc), fatal=True)
 
 
-def github_pr_evidence_tool(operation: str, cursor: Optional[str] = None) -> str:
+def _execute_feature_command(
+    scope: EvidenceScope, command: Any, timeout_seconds: Any
+) -> str:
+    if not scope.execution_attestation_valid:
+        return _error(
+            scope, "Read the execution attestation before running feature commands"
+        )
+    if (
+        not isinstance(command, list)
+        or not command
+        or len(command) > 64
+        or any(
+            not isinstance(part, str) or not part or len(part) > 4096
+            for part in command
+        )
+        or isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, int)
+        or timeout_seconds < 1
+        or timeout_seconds > 3600
+    ):
+        return _error(scope, "Invalid feature command")
+    loader = scope.feature_command_loader
+    if loader is None:
+        return _error(scope, "Feature command worker is unavailable")
+    try:
+        payload, signature = loader(command, timeout_seconds)
+        decoded_signature = base64.b64decode(signature, validate=True)
+        Ed25519PublicKey.from_public_bytes(
+            scope.execution_attestation_public_key
+        ).verify(decoded_signature, payload)
+        result = json.loads(payload)
+    except (InvalidSignature, ValueError, TypeError, json.JSONDecodeError) as exc:
+        return _error(scope, f"Feature command attestation was invalid: {exc}")
+    expected = {
+        **scope.tuple_dict,
+        "command": command,
+        "tree_before": scope.head_tree_sha,
+        "tree_after": scope.head_tree_sha,
+    }
+    if (
+        not isinstance(result, dict)
+        or any(result.get(key) != value for key, value in expected.items())
+        or result.get("status") not in {"pass", "pr-fail", "unavailable"}
+        or not isinstance(result.get("attempted"), bool)
+        or isinstance(result.get("exit_code"), bool)
+        or not isinstance(result.get("exit_code"), int)
+        or not _valid_gate_timing(result)
+        or not isinstance(result.get("log_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", result["log_sha256"]) is None
+        or not isinstance(result.get("output_excerpt"), str)
+        or len(result["output_excerpt"]) > 12_000
+    ):
+        return _error(scope, "Feature command attestation was invalid")
+    response = {
+        "success": True,
+        "kind": "feature_command",
+        "items": result,
+        "coverage": _coverage(scope),
+    }
+    encoded = json.dumps(response, ensure_ascii=False)
+    if len(encoded) > _MAX_RESULT_CHARS:
+        return _error(scope, "Feature command result exceeded the tool limit")
+    return encoded
+
+
+def github_pr_evidence_tool(
+    operation: str,
+    cursor: Optional[str] = None,
+    command: Any = None,
+    timeout_seconds: Any = 1800,
+) -> str:
     """Return manifest metadata or consume one opaque evidence cursor."""
     scope = current_evidence_scope()
     if scope is None:
@@ -1602,6 +1689,8 @@ def github_pr_evidence_tool(operation: str, cursor: Optional[str] = None) -> str
         if not isinstance(cursor, str) or not cursor:
             return _error(scope, "An opaque evidence cursor is required")
         return _read(scope, cursor)
+    if operation == "execute":
+        return _execute_feature_command(scope, command, timeout_seconds)
     return _error(scope, "Unsupported evidence operation")
 
 
@@ -1632,7 +1721,9 @@ def review_evidence_complete_for(
 ) -> bool:
     scope = current_evidence_scope()
     return bool(
-        _scope_matches(scope, contract_version, repository, pr_number, base_sha, head_sha)
+        _scope_matches(
+            scope, contract_version, repository, pr_number, base_sha, head_sha
+        )
         and scope is not None
         and _coverage(scope)["complete"]
     )
@@ -1647,7 +1738,9 @@ def execution_evidence_complete_for(
 ) -> bool:
     scope = current_evidence_scope()
     return bool(
-        _scope_matches(scope, contract_version, repository, pr_number, base_sha, head_sha)
+        _scope_matches(
+            scope, contract_version, repository, pr_number, base_sha, head_sha
+        )
         and scope is not None
         and scope.execution_attestation_valid
     )
@@ -1755,13 +1848,13 @@ def _valid_gate_contract(contract: Any) -> bool:
         and valid_status_contract
         and isinstance(exit_codes, list)
         and exit_codes
-        and all(isinstance(code, int) and not isinstance(code, bool) for code in exit_codes)
+        and all(
+            isinstance(code, int) and not isinstance(code, bool) for code in exit_codes
+        )
     )
 
 
-def _valid_gate_evidence(
-    scope: EvidenceScope, evidence: Any, status: Any
-) -> bool:
+def _valid_gate_evidence(scope: EvidenceScope, evidence: Any, status: Any) -> bool:
     if not isinstance(evidence, dict):
         return False
     digest = evidence.get("log_sha256") or evidence.get("artifact_sha256")
@@ -1955,8 +2048,7 @@ def record_execution_attestation(payload: bytes, signature: str) -> bool:
     if not isinstance(worker, dict) or not isinstance(worker.get("required"), bool):
         return False
     worker_required = any(
-        contract.get("executor") == "review_worker"
-        or contract.get("kind") != "command"
+        contract.get("executor") == "review_worker" or contract.get("kind") != "command"
         for contract in scope.execution_gate_contracts.values()
     )
     if worker_required and worker.get("required") is not True:
@@ -1971,7 +2063,7 @@ def record_execution_attestation(payload: bytes, signature: str) -> bool:
         "host_mounts_absent",
         "host_docker_socket_absent",
         "resources_bounded",
-        "egress_default_deny",
+        "egress_isolated_before_browser_verification",
     }
     if worker.get("required") is True:
         if (
@@ -2059,19 +2151,36 @@ registry.register(
             "github_pr_evidence calls in one assistant turn. Continue with cursors "
             "from next_required_cursors; if context loss removes continuation "
             "tokens, call manifest again and resume only from its bounded "
-            "current_required_cursors inventory. A recalled manifest omits consumed "
-            "control-plane cursors."
+            "current_required_cursors inventory. After reading the signed execution "
+            "attestation, use operation=execute for relevant feature-specific commands "
+            "in the retained exact-head full-stack worker. A recalled manifest omits "
+            "consumed control-plane cursors."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["manifest", "read"],
+                    "enum": ["manifest", "read", "execute"],
                 },
                 "cursor": {
                     "type": "string",
                     "description": "Opaque cursor returned by this tool.",
+                },
+                "command": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Exact command argv to run in the retained, credential-free, "
+                        "offline exact-head review worker. Available only after the "
+                        "execution attestation is read."
+                    ),
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 3600,
+                    "default": 1800,
                 },
             },
             "required": ["operation"],
@@ -2079,7 +2188,10 @@ registry.register(
         },
     },
     handler=lambda args, **kwargs: github_pr_evidence_tool(
-        operation=args.get("operation", ""), cursor=args.get("cursor")
+        operation=args.get("operation", ""),
+        cursor=args.get("cursor"),
+        command=args.get("command"),
+        timeout_seconds=args.get("timeout_seconds", 1800),
     ),
     check_fn=check_github_pr_evidence_requirements,
     description="Tuple-bound read-only GitHub PR evidence",
