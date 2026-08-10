@@ -1,0 +1,110 @@
+[
+  {
+    "id": "a5b11e18f15f",
+    "name": "JobFlow LinkedIn liveness recheck (deterministic, cap 25)"
+  },
+  {
+    "id": "792038de2a38",
+    "name": "audit-rotate"
+  },
+  {
+    "id": "1aad5cc3fa04",
+    "name": "canvas-artifact-retention"
+  },
+  {
+    "id": "36100ecbb4f5",
+    "name": "cron-profile-catalog-guard"
+  },
+  {
+    "id": "61a89811ca4e",
+    "name": "desktop-asar-guard-watch"
+  },
+  {
+    "id": "d2ff1d82fcfe",
+    "name": "devflow-observability-refresh"
+  },
+  {
+    "id": "9ef25685b0c5",
+    "name": "devflow-triage-tick"
+  },
+  {
+    "id": "493f54949016",
+    "name": "event-bus-retention"
+  },
+  {
+    "id": "d4ab3c23e760",
+    "name": "financier-canvas-am"
+  },
+  {
+    "id": "f22662ce48aa",
+    "name": "financier-canvas-pm"
+  },
+  {
+    "id": "fa9ac8c2e719",
+    "name": "financier-snapshot-am"
+  },
+  {
+    "id": "3c1164b5318e",
+    "name": "financier-snapshot-pm"
+  },
+  {
+    "id": "2c17900e005e",
+    "name": "gbrain-backup-weekly"
+  },
+  {
+    "id": "9afc54db179f",
+    "name": "hermes-upstream-019-watch"
+  },
+  {
+    "id": "0e078cb4fd33",
+    "name": "honcho-memory-bridge"
+  },
+  {
+    "id": "e6a45c1add4f",
+    "name": "langfuse-retention-sweep"
+  },
+  {
+    "id": "99c3c66c2d86",
+    "name": "mempalace-export-weekly"
+  },
+  {
+    "id": "05be0de0f332",
+    "name": "mempalace-retention-report"
+  },
+  {
+    "id": "8b89df094583",
+    "name": "nightly-test-gate"
+  },
+  {
+    "id": "b45f50d66d6b",
+    "name": "repo-mirror-weekly"
+  },
+  {
+    "id": "13156926050d",
+    "name": "roadmap-devflow-intake"
+  },
+  {
+    "id": "9225c1940fdd",
+    "name": "security-audit-weekly"
+  },
+  {
+    "id": "fc6ad6a820ed",
+    "name": "sentinel-vip-evening"
+  },
+  {
+    "id": "01ef8acaf9dd",
+    "name": "sentinel-vip-midday"
+  },
+  {
+    "id": "092f4ed7657c",
+    "name": "sentinel-vip-morning"
+  },
+  {
+    "id": "2eef3807aa71",
+    "name": "tracker-operator-drain"
+  },
+  {
+    "id": "1c943ace710e",
+    "name": "whatsapp-session-backup-weekly"
+  }
+]

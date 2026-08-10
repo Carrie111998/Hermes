@@ -1,22 +1,138 @@
 enforcement: observe
 activities:
-  cron.postgres.sync:
-    policy_version: 1
-    owner: postgres
+  cron.audit.rotate:
+    policy_version: 2
+    owner: audit
     aliases:
-    - postgres-sync
+    - audit-rotate
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.canvas.artifact.retention:
+    policy_version: 2
+    owner: canvas
+    aliases:
+    - canvas-artifact-retention
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.critic.proposal.emit:
+    policy_version: 2
+    owner: critic
+    aliases:
+    - critic-proposal-emit
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.critic.reasoning.effort.tune:
+    policy_version: 2
+    owner: critic
+    aliases:
+    - critic-reasoning-effort-tune
     execution_class: S2
     quality_floor: standard
-    preferred_models: &id001
+    preferred_models:
     - deepseek/deepseek-v4-pro
-    allowed_fallbacks: &id002
+    allowed_fallbacks:
     - openai-codex/gpt-5.6-sol
-    reasoning: &id003
+    reasoning:
       mode: adaptive
       effort: medium
-    budgets: &id004
+    budgets:
       max_turns: 30
-      max_model_calls: 8
+      max_model_calls: 12
       max_uncached_input_tokens: 180000
       max_cache_read_tokens: 900000
       max_cache_write_tokens: 90000
@@ -29,546 +145,2585 @@ activities:
       max_child_depth: 1
       max_recorded_provider_cost_usd: '5.00'
       max_api_equivalent_cost_usd: '25.00'
-    tools: &id005
+    tools:
       allow:
       - read_file
+      - write_file
+      - terminal
       deny:
       - merge
       - deploy
-    outcome_contract: &id006
+    outcome_contract:
       required_artifacts: []
       required_validations:
       - factuality
-    escalation: &id007
+    escalation:
       'on':
       - quality_gate_failed
       - provider_unavailable
-  cron.learning.loop:
-    policy_version: 1
-    owner: learning
-    aliases:
-    - learning-loop
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.scout:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-scout
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.matcher:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-matcher
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.researcher:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-researcher
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  jobflow.tailor.generate:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-tailor
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.applier:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-applier
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.tracker.cycle:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-tracker-cycle
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.tracker.followup:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-tracker-followup
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.tracker.weekly:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-tracker-weekly
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.notifier:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-notifier
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.devflow:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-devflow
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jaum.inbox.sweeper:
-    policy_version: 1
-    owner: jaum
-    aliases:
-    - jaum-inbox-sweeper
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jaum.daytime.relay:
-    policy_version: 1
-    owner: jaum
-    aliases:
-    - jaum-daytime-relay
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.archiver:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-archiver
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
   cron.critic.skill.review:
-    policy_version: 1
+    policy_version: 2
     owner: critic
     aliases:
     - critic-skill-review
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.pipeline.drift.audit:
-    policy_version: 1
-    owner: operations
-    aliases:
-    - Pipeline Drift Audit
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.matcher.shadow:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-matcher-shadow
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.matcher.shadow.diff:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-matcher-shadow-diff
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.curator.nightly:
-    policy_version: 1
-    owner: curator
-    aliases:
-    - curator-nightly
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.scribe.am:
-    policy_version: 1
-    owner: scribe
-    aliases:
-    - scribe-am
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.scribe.pm:
-    policy_version: 1
-    owner: scribe
-    aliases:
-    - scribe-pm
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.scribe.weekly:
-    policy_version: 1
-    owner: scribe
-    aliases:
-    - scribe-weekly
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence
   cron.critic.weekly.retro:
-    policy_version: 1
+    policy_version: 2
     owner: critic
     aliases:
     - critic-weekly-retro
     execution_class: S2
     quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.critic.proposal.emit:
-    policy_version: 1
-    owner: critic
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.cron.jobs.snapshot:
+    policy_version: 2
+    owner: orchestrator
     aliases:
-    - critic-proposal-emit
+    - cron-jobs-snapshot
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.cron.profile.catalog.guard:
+    policy_version: 2
+    owner: cron
+    aliases:
+    - cron-profile-catalog-guard
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.cron.stall.detector:
+    policy_version: 2
+    owner: orchestrator
+    aliases:
+    - cron-stall-detector
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.curator.nightly:
+    policy_version: 2
+    owner: curator
+    aliases:
+    - curator-nightly
     execution_class: S2
     quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.critic.reasoning.effort.tune:
-    policy_version: 1
-    owner: critic
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.desktop.asar.guard.watch:
+    policy_version: 2
+    owner: desktop
     aliases:
-    - critic-reasoning-effort-tune
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
+    - desktop-asar-guard-watch
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.devflow.observability.refresh:
+    policy_version: 2
+    owner: devflow
+    aliases:
+    - devflow-observability-refresh
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
   cron.devflow.pr.build.poll:
-    policy_version: 1
+    policy_version: 2
     owner: devflow
     aliases:
     - devflow-pr-build-poll
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.cron.stall.detector:
-    policy_version: 1
-    owner: cron
-    aliases:
-    - cron-stall-detector
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.financier.digest.am:
-    policy_version: 1
-    owner: financier
-    aliases:
-    - financier-digest-am
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.financier.digest.pm:
-    policy_version: 1
-    owner: financier
-    aliases:
-    - financier-digest-pm
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.memory.consolidation.nightly:
-    policy_version: 1
-    owner: memory
-    aliases:
-    - memory-consolidation-nightly
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.cron.jobs.snapshot:
-    policy_version: 1
-    owner: cron
-    aliases:
-    - cron-jobs-snapshot
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.approved.release:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-approved-release
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  cron.jobflow.pipeline.worker.soak.recheck:
-    policy_version: 1
-    owner: jobflow
-    aliases:
-    - jobflow-pipeline-worker-soak-recheck
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
   cron.devflow.process.inbox:
-    policy_version: 1
+    policy_version: 2
     owner: devflow
     aliases:
     - devflow-process-inbox
     execution_class: S2
     quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.devflow.triage.tick:
+    policy_version: 2
+    owner: devflow
+    aliases:
+    - devflow-triage-tick
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.event.bus.retention:
+    policy_version: 2
+    owner: event
+    aliases:
+    - event-bus-retention
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.financier.canvas.am:
+    policy_version: 2
+    owner: financier
+    aliases:
+    - financier-canvas-am
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.financier.canvas.pm:
+    policy_version: 2
+    owner: financier
+    aliases:
+    - financier-canvas-pm
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.financier.digest.am:
+    policy_version: 2
+    owner: financier
+    aliases:
+    - financier-digest-am
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.financier.digest.pm:
+    policy_version: 2
+    owner: financier
+    aliases:
+    - financier-digest-pm
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.financier.snapshot.am:
+    policy_version: 2
+    owner: financier
+    aliases:
+    - financier-snapshot-am
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.financier.snapshot.pm:
+    policy_version: 2
+    owner: financier
+    aliases:
+    - financier-snapshot-pm
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.gbrain.backup.weekly:
+    policy_version: 2
+    owner: gbrain
+    aliases:
+    - gbrain-backup-weekly
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.hermes.upstream.019.watch:
+    policy_version: 2
+    owner: hermes
+    aliases:
+    - hermes-upstream-019-watch
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.honcho.memory.bridge:
+    policy_version: 2
+    owner: honcho
+    aliases:
+    - honcho-memory-bridge
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.jaum.daytime.relay:
+    policy_version: 2
+    owner: orchestrator
+    aliases:
+    - jaum-daytime-relay
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jaum.inbox.sweeper:
+    policy_version: 2
+    owner: orchestrator
+    aliases:
+    - jaum-inbox-sweeper
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jobflow.applier:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-applier
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence
+  cron.jobflow.approved.release:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-approved-release
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jobflow.archiver:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-archiver
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
   cron.jobflow.ats.url.resolve:
-    policy_version: 1
+    policy_version: 2
     owner: jobflow
     aliases:
     - jobflow-ats-url-resolve
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  jobflow.job.extract:
-    policy_version: 1
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jobflow.devflow:
+    policy_version: 2
     owner: jobflow
-    aliases: []
+    aliases:
+    - jobflow-devflow
     execution_class: S2
     quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
-  jobflow.resume.score:
-    policy_version: 1
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.jobflow.linkedin.liveness.recheck:
+    policy_version: 2
     owner: jobflow
-    aliases: []
+    aliases:
+    - JobFlow LinkedIn liveness recheck (deterministic, cap 25)
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.jobflow.matcher:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-matcher
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence
+  cron.jobflow.matcher.shadow:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-matcher-shadow
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence
+  cron.jobflow.matcher.shadow.diff:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-matcher-shadow-diff
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jobflow.notifier:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-notifier
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jobflow.pipeline.worker.soak.recheck:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-pipeline-worker-soak-recheck
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.jobflow.researcher:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-researcher
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence
+  cron.jobflow.scout:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-scout
     execution_class: S2
     quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.jobflow.tracker.cycle:
+    policy_version: 2
+    owner: tracker
+    aliases:
+    - jobflow-tracker-cycle
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.jobflow.tracker.followup:
+    policy_version: 2
+    owner: tracker
+    aliases:
+    - jobflow-tracker-followup
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.jobflow.tracker.weekly:
+    policy_version: 2
+    owner: tracker
+    aliases:
+    - jobflow-tracker-weekly
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.langfuse.retention.sweep:
+    policy_version: 2
+    owner: langfuse
+    aliases:
+    - langfuse-retention-sweep
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.learning.loop:
+    policy_version: 2
+    owner: orchestrator
+    aliases:
+    - learning-loop
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.memory.consolidation.nightly:
+    policy_version: 2
+    owner: orchestrator
+    aliases:
+    - memory-consolidation-nightly
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.mempalace.export.weekly:
+    policy_version: 2
+    owner: mempalace
+    aliases:
+    - mempalace-export-weekly
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.mempalace.retention.report:
+    policy_version: 2
+    owner: mempalace
+    aliases:
+    - mempalace-retention-report
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.nightly.test.gate:
+    policy_version: 2
+    owner: nightly
+    aliases:
+    - nightly-test-gate
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.pipeline.drift.audit:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - Pipeline Drift Audit
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.postgres.sync:
+    policy_version: 2
+    owner: postgres
+    aliases:
+    - postgres-sync
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  cron.repo.mirror.weekly:
+    policy_version: 2
+    owner: repo
+    aliases:
+    - repo-mirror-weekly
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.roadmap.devflow.intake:
+    policy_version: 2
+    owner: roadmap
+    aliases:
+    - roadmap-devflow-intake
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.scribe.am:
+    policy_version: 2
+    owner: scribe
+    aliases:
+    - scribe-am
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.scribe.pm:
+    policy_version: 2
+    owner: scribe
+    aliases:
+    - scribe-pm
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.scribe.weekly:
+    policy_version: 2
+    owner: scribe
+    aliases:
+    - scribe-weekly
+    execution_class: S2
+    quality_floor: standard
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: medium
+    budgets:
+      max_turns: 30
+      max_model_calls: 12
+      max_uncached_input_tokens: 180000
+      max_cache_read_tokens: 900000
+      max_cache_write_tokens: 90000
+      max_output_tokens: 30000
+      max_reasoning_tokens: 60000
+      max_tool_calls: 40
+      wall_clock_seconds: 2400
+      retries: 1
+      max_children: 2
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '5.00'
+      max_api_equivalent_cost_usd: '25.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+  cron.security.audit.weekly:
+    policy_version: 2
+    owner: security
+    aliases:
+    - security-audit-weekly
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.sentinel.vip.evening:
+    policy_version: 2
+    owner: sentinel
+    aliases:
+    - sentinel-vip-evening
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.sentinel.vip.midday:
+    policy_version: 2
+    owner: sentinel
+    aliases:
+    - sentinel-vip-midday
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.sentinel.vip.morning:
+    policy_version: 2
+    owner: sentinel
+    aliases:
+    - sentinel-vip-morning
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.tracker.operator.drain:
+    policy_version: 2
+    owner: tracker
+    aliases:
+    - tracker-operator-drain
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
+  cron.whatsapp.session.backup.weekly:
+    policy_version: 2
+    owner: whatsapp
+    aliases:
+    - whatsapp-session-backup-weekly
+    execution_class: D0
+    quality_floor: deterministic
+    preferred_models: []
+    allowed_fallbacks: []
+    reasoning:
+      mode: disabled
+      effort: none
+    budgets:
+      max_turns: 1
+      max_model_calls: 0
+      max_uncached_input_tokens: 0
+      max_cache_read_tokens: 0
+      max_cache_write_tokens: 0
+      max_output_tokens: 0
+      max_reasoning_tokens: 0
+      max_tool_calls: 20
+      wall_clock_seconds: 900
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.00'
+      max_api_equivalent_cost_usd: '0.00'
+    tools:
+      allow: []
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations: []
+    escalation:
+      'on': []
   jobflow.application.validate:
-    policy_version: 1
+    policy_version: 2
     owner: jobflow
     aliases: []
-    execution_class: S2
-    quality_floor: standard
-    preferred_models: *id001
-    allowed_fallbacks: *id002
-    reasoning: *id003
-    budgets: *id004
-    tools: *id005
-    outcome_contract: *id006
-    escalation: *id007
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  jobflow.job.extract:
+    policy_version: 2
+    owner: jobflow
+    aliases: []
+    execution_class: S1
+    quality_floor: bounded
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: low
+    budgets:
+      max_turns: 6
+      max_model_calls: 4
+      max_uncached_input_tokens: 40000
+      max_cache_read_tokens: 200000
+      max_cache_write_tokens: 20000
+      max_output_tokens: 6000
+      max_reasoning_tokens: 4000
+      max_tool_calls: 15
+      wall_clock_seconds: 600
+      retries: 1
+      max_children: 0
+      max_child_depth: 0
+      max_recorded_provider_cost_usd: '0.50'
+      max_api_equivalent_cost_usd: '3.00'
+    tools:
+      allow:
+      - read_file
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - schema
+    escalation:
+      'on':
+      - provider_unavailable
+  jobflow.resume.score:
+    policy_version: 2
+    owner: jobflow
+    aliases: []
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence
+  jobflow.tailor.generate:
+    policy_version: 2
+    owner: jobflow
+    aliases:
+    - jobflow-tailor
+    execution_class: P3
+    quality_floor: premium
+    preferred_models:
+    - deepseek/deepseek-v4-pro
+    allowed_fallbacks:
+    - openai-codex/gpt-5.6-sol
+    reasoning:
+      mode: adaptive
+      effort: high
+    budgets:
+      max_turns: 60
+      max_model_calls: 40
+      max_uncached_input_tokens: 400000
+      max_cache_read_tokens: 2000000
+      max_cache_write_tokens: 200000
+      max_output_tokens: 60000
+      max_reasoning_tokens: 150000
+      max_tool_calls: 90
+      wall_clock_seconds: 5400
+      retries: 2
+      max_children: 3
+      max_child_depth: 1
+      max_recorded_provider_cost_usd: '15.00'
+      max_api_equivalent_cost_usd: '75.00'
+    tools:
+      allow:
+      - read_file
+      - write_file
+      - terminal
+      - web_search
+      deny:
+      - merge
+      - deploy
+    outcome_contract:
+      required_artifacts: []
+      required_validations:
+      - factuality
+      - schema
+    escalation:
+      'on':
+      - quality_gate_failed
+      - provider_unavailable
+      - low_source_confidence

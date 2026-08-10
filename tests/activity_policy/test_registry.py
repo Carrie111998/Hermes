@@ -200,3 +200,82 @@ def test_load_normalizes_unhashable_mapping_key_to_policy_error(tmp_path):
 
     assert isinstance(raised.value.__cause__, TypeError)
     assert "unhashable type" in str(raised.value.__cause__)
+
+
+# ---------------------------------------------------------------------------
+# Classification quality
+# ---------------------------------------------------------------------------
+#
+# A registry where every activity carries the same class is a labelling
+# exercise, not a policy. These tests assert the packaged file actually
+# expresses the D0..P4 differentiation the design is built on, and that it
+# covers the whole enabled fleet rather than only the model-capable half.
+
+
+def _fixture(name):
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).parent / "fixtures" / name
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_every_enabled_deterministic_job_has_a_d0_policy():
+    registry = ActivityRegistry.load_default()
+    missing = []
+    wrong_class = []
+    for row in _fixture("enabled_deterministic_jobs.json"):
+        policy = registry.resolve(alias=row["name"])
+        if policy is None:
+            missing.append(row["name"])
+        elif policy.execution_class != "D0":
+            wrong_class.append((row["name"], policy.execution_class))
+    assert missing == [], f"deterministic jobs with no policy: {missing}"
+    assert wrong_class == [], f"deterministic jobs not classified D0: {wrong_class}"
+
+
+def test_every_enabled_model_capable_job_is_not_d0():
+    registry = ActivityRegistry.load_default()
+    wrong = []
+    for row in _fixture("enabled_model_capable_jobs.json"):
+        policy = registry.resolve(alias=row["name"])
+        assert policy is not None, f"model-capable job unmapped: {row['name']}"
+        if policy.execution_class == "D0":
+            wrong.append(row["name"])
+    assert wrong == [], f"model-capable jobs classified D0: {wrong}"
+
+
+def test_classification_is_not_degenerate():
+    """Guards the exact defect this file shipped with: everything one class."""
+    registry = ActivityRegistry.load_default()
+    classes = {p.execution_class for p in registry.policies.values()}
+    assert "D0" in classes, "no deterministic activities declared"
+    assert len(classes) >= 3, f"classification collapsed into {sorted(classes)}"
+
+
+def test_reasoning_effort_rises_with_class():
+    """Effort is the differentiator we can justify without evaluation evidence."""
+    order = {"none": 0, "low": 1, "medium": 2, "high": 3}
+    ceiling = {"D0": 0, "S1": 1, "S2": 2, "P3": 3, "P4": 3}
+    registry = ActivityRegistry.load_default()
+    for policy in registry.policies.values():
+        effort = order.get(policy.reasoning_effort)
+        assert effort is not None, f"{policy.activity_id}: odd effort {policy.reasoning_effort!r}"
+        assert effort <= ceiling[policy.execution_class], (
+            f"{policy.activity_id} ({policy.execution_class}) has effort "
+            f"{policy.reasoning_effort}"
+        )
+
+
+def test_budgets_scale_with_class():
+    registry = ActivityRegistry.load_default()
+    by_class = {}
+    for policy in registry.policies.values():
+        by_class.setdefault(policy.execution_class, []).append(policy.budgets.max_model_calls)
+    for cls, calls in by_class.items():
+        if cls == "D0":
+            assert set(calls) == {0}, "D0 must never budget a model call"
+    if "S1" in by_class and "P3" in by_class:
+        assert max(by_class["S1"]) < max(by_class["P3"]), (
+            "bounded work must not be budgeted like critical generation"
+        )
