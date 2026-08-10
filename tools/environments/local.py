@@ -1419,6 +1419,7 @@ class LocalEnvironment(BaseEnvironment):
     CWD persists via file-based read after each command.
     """
 
+    _sudo_nopasswd_probe_supported = True
     _profile_scoped_passthrough = True
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict = None):

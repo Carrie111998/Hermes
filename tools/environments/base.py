@@ -592,6 +592,10 @@ class BaseEnvironment(ABC):
     # Snapshot creation timeout (override for slow cold-starts).
     _snapshot_timeout: int = 30
 
+    # Opt in only when a timed-out probe can kill its command without tearing
+    # down the whole backend. SDK adapters cancel by stopping the sandbox.
+    _sudo_nopasswd_probe_supported: bool = False
+
     # Local and Docker override this because they resolve allowlisted values
     # through the active profile scope. Other backends keep their existing
     # snapshot semantics until they implement the same resolver contract.
@@ -1443,6 +1447,8 @@ class BaseEnvironment(ABC):
 
     def _sudo_nopasswd_works(self) -> bool:
         """Probe passwordless sudo inside this execution environment."""
+        if not self._sudo_nopasswd_probe_supported:
+            return False
         try:
             proc = self._run_bash(
                 "sudo -n true",
@@ -1450,15 +1456,7 @@ class BaseEnvironment(ABC):
                 timeout=3,
                 stdin_data=None,
             )
-            # SDK process handles cancel by stopping/terminating the entire
-            # sandbox.  Do not let this best-effort probe tear down a healthy
-            # backend after three seconds; their own exec call still receives
-            # the short timeout above and the outer wait retains the normal
-            # environment deadline as a safety net.
-            wait_timeout = (
-                self.timeout if isinstance(proc, _ThreadedProcessHandle) else 3
-            )
-            result = self._wait_for_process(proc, timeout=wait_timeout)
+            result = self._wait_for_process(proc, timeout=3)
             return result.get("returncode") == 0
         except Exception:
             return False
