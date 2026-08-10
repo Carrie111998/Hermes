@@ -8993,14 +8993,12 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
     legacy ``slack_cfg`` block that used to live in
     ``gateway/config.py::load_gateway_config()`` before this migration.
 
-    The SlackAdapter reads its runtime configuration via ``os.getenv()``
-    throughout the connect / handle code paths, so rather than rewrite those
-    call sites to read from ``PlatformConfig.extra``, this hook keeps the
-    existing env-driven model and owns the YAML→env translation here, next to
-    the adapter that consumes it. Env vars take precedence over YAML — every
-    assignment is guarded by ``not os.getenv(...)`` so explicit env vars
-    survive a config.yaml update. Returns ``None`` because no extras are
-    seeded into ``PlatformConfig.extra`` directly (everything flows through env).
+    Most SlackAdapter runtime settings remain env-driven, so this hook owns
+    their YAML→env translation next to the adapter that consumes them. Env vars
+    take precedence over YAML — every env assignment is guarded by
+    ``not os.getenv(...)`` so explicit env vars survive a config.yaml update.
+    Security policy that must stay adapter/profile scoped is returned for
+    seeding into ``PlatformConfig.extra`` instead of process-global env.
     """
     if "require_mention" in slack_cfg and not os.getenv("SLACK_REQUIRE_MENTION"):
         os.environ["SLACK_REQUIRE_MENTION"] = str(slack_cfg["require_mention"]).lower()
@@ -9101,8 +9099,8 @@ def register(ctx) -> None:
         # keys (require_mention, strict_mention, ignore_other_user_mentions,
         # thread_require_mention, allow_bots, free_response_channels,
         # reactions, disable_dms, allowed_channels, ignored_channels) into
-        # SLACK_* env vars that
-        # the adapter reads via os.getenv(). Replaces the
+        # SLACK_* env vars that the adapter reads via os.getenv(), while
+        # open_user_channels is returned as adapter-scoped extra config. Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.
         apply_yaml_config_fn=_apply_yaml_config,
         # Auth env vars for _is_user_authorized() integration
