@@ -4498,6 +4498,9 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
+            _usage_summary = agent._usage_summary_for_api_request_hook(response)
+            agent._record_activity_response(response, _usage_summary)
+
             try:
                 from hermes_cli.plugins import (
                     has_hook,
@@ -4532,7 +4535,7 @@ def run_conversation(
                             assistant_message,
                             finish_reason=finish_reason,
                         ),
-                        usage=agent._usage_summary_for_api_request_hook(response),
+                        usage=_usage_summary,
                         assistant_message=assistant_message,
                         assistant_content_chars=len(_assistant_text),
                         assistant_tool_call_count=len(_assistant_tool_calls),

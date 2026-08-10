@@ -1,0 +1,146 @@
+[
+  {
+    "id": "9823bee8f270",
+    "name": "postgres-sync"
+  },
+  {
+    "id": "f27e831ee4ab",
+    "name": "learning-loop"
+  },
+  {
+    "id": "1c34e737bb39",
+    "name": "jobflow-scout"
+  },
+  {
+    "id": "b74186b2eaa5",
+    "name": "jobflow-matcher"
+  },
+  {
+    "id": "785bd746431b",
+    "name": "jobflow-researcher"
+  },
+  {
+    "id": "b95c7eba034a",
+    "name": "jobflow-tailor"
+  },
+  {
+    "id": "4a7755a04909",
+    "name": "jobflow-applier"
+  },
+  {
+    "id": "1f8c450136b5",
+    "name": "jobflow-tracker-cycle"
+  },
+  {
+    "id": "708527597900",
+    "name": "jobflow-tracker-followup"
+  },
+  {
+    "id": "9a68c6219ff3",
+    "name": "jobflow-tracker-weekly"
+  },
+  {
+    "id": "81026d784430",
+    "name": "jobflow-notifier"
+  },
+  {
+    "id": "28ccac7971c5",
+    "name": "jobflow-devflow"
+  },
+  {
+    "id": "2ed00a922aa2",
+    "name": "jaum-inbox-sweeper"
+  },
+  {
+    "id": "e4bfb4b2d024",
+    "name": "jaum-daytime-relay"
+  },
+  {
+    "id": "c6599a8983a5",
+    "name": "jobflow-archiver"
+  },
+  {
+    "id": "6aeaa6a838f9",
+    "name": "critic-skill-review"
+  },
+  {
+    "id": "d0eb71a5ea3d",
+    "name": "Pipeline Drift Audit"
+  },
+  {
+    "id": "449bc1b6665c",
+    "name": "jobflow-matcher-shadow"
+  },
+  {
+    "id": "dae5ee06cf9b",
+    "name": "jobflow-matcher-shadow-diff"
+  },
+  {
+    "id": "e2201c0a2ba0",
+    "name": "curator-nightly"
+  },
+  {
+    "id": "ffe04963bd94",
+    "name": "scribe-am"
+  },
+  {
+    "id": "41727a09d186",
+    "name": "scribe-pm"
+  },
+  {
+    "id": "e6562cb05eca",
+    "name": "scribe-weekly"
+  },
+  {
+    "id": "7c3ca3fb5fe8",
+    "name": "critic-weekly-retro"
+  },
+  {
+    "id": "f57cd269a9d7",
+    "name": "critic-proposal-emit"
+  },
+  {
+    "id": "7dff9dd23c7c",
+    "name": "critic-reasoning-effort-tune"
+  },
+  {
+    "id": "9dba3f4e405d",
+    "name": "devflow-pr-build-poll"
+  },
+  {
+    "id": "65ff25ea9c12",
+    "name": "cron-stall-detector"
+  },
+  {
+    "id": "e69eef67abd7",
+    "name": "financier-digest-am"
+  },
+  {
+    "id": "fff8a15ea495",
+    "name": "financier-digest-pm"
+  },
+  {
+    "id": "4c13bc541572",
+    "name": "memory-consolidation-nightly"
+  },
+  {
+    "id": "ba2e83f015c5",
+    "name": "cron-jobs-snapshot"
+  },
+  {
+    "id": "fdd51d8652b7",
+    "name": "jobflow-approved-release"
+  },
+  {
+    "id": "f97db77db716",
+    "name": "jobflow-pipeline-worker-soak-recheck"
+  },
+  {
+    "id": "87d20a1c63f8",
+    "name": "devflow-process-inbox"
+  },
+  {
+    "id": "425e2e16d790",
+    "name": "jobflow-ats-url-resolve"
+  }
+]
