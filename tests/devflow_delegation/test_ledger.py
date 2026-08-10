@@ -299,3 +299,33 @@ def test_stage2_schema_migrates_existing_ledger(tmp_path):
     assert {"worktree_path", "branch", "attempt_count"} <= lease_columns
     assert "artifacts" in tables
     migrated.close()
+
+
+def test_count_prs_for_target_since_counts_only_pr_artifacts_in_window(tmp_path):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+
+    def _seed(idem, repo):
+        req = parse_request({
+            "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+            "idempotency_key": idem,
+            "source": {"agent": "operator", "kind": "explicit", "finding_id": "f"},
+            "kind": "task", "title": "t", "problem_statement": "p",
+            "evidence": [{"kind": "test", "summary": "s"}],
+            "target": {"repo": repo, "subsystem": "src"},
+            "severity": "low", "priority": "P3", "confidence": 1.0,
+            "acceptance_criteria": ["a"], "safety_notes": [],
+        })
+        ledger.insert_request(req)
+        return req.request_id
+
+    a = _seed("k-a", "sandbox")
+    b = _seed("k-b", "sandbox")
+    c = _seed("k-c", "other")
+    ledger.add_artifact(a, "pr", "https://example.test/pr/1")
+    ledger.add_artifact(b, "branch", "ddp-b-a1")          # not a pr -> not counted
+    ledger.add_artifact(c, "pr", "https://example.test/pr/2")  # other target -> not counted
+
+    assert ledger.count_prs_for_target_since("sandbox", "1970-01-01T00:00:00+00:00") == 1
+    assert ledger.count_prs_for_target_since("other", "1970-01-01T00:00:00+00:00") == 1
+    # A window that starts in the far future excludes everything.
+    assert ledger.count_prs_for_target_since("sandbox", "2999-01-01T00:00:00+00:00") == 0

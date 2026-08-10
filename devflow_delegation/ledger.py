@@ -580,3 +580,18 @@ class DelegationLedger:
             "SELECT * FROM artifacts WHERE request_id=? ORDER BY id", (request_id,)
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def count_prs_for_target_since(self, target_repo: str, since_iso: str) -> int:
+        """Count PR artifacts opened for a target within a durable window.
+
+        Joins pr-kind artifacts to their request by ``requests.target_repo`` and
+        filters on ``artifacts.created_at``. Backs the executor's per-window PR
+        budget; independent of the gate.py merge/deploy window budget.
+        """
+        row = self._conn().execute(
+            "SELECT COUNT(*) AS n FROM artifacts a "
+            "JOIN requests r ON a.request_id = r.request_id "
+            "WHERE a.kind = 'pr' AND r.target_repo = ? AND a.created_at >= ?",
+            (target_repo, since_iso),
+        ).fetchone()
+        return int(row["n"])
