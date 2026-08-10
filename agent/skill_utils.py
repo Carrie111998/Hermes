@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -171,6 +172,26 @@ def yaml_load(content: str):
 # ── Frontmatter parsing ──────────────────────────────────────────────────
 
 
+def _normalize_yaml_scalars(obj: Any) -> Any:
+    """Recursively convert YAML-native date/datetime to ISO-8601 strings.
+
+    PyYAML's SafeLoader / CSafeLoader resolve ``2026-03-05`` to a
+    ``datetime.date`` and ``2026-03-05T12:00:00`` to a ``datetime.datetime``.
+    These types are not JSON-serializable, so downstream ``json.dumps``
+    calls (e.g. ``skill_view``) fail with ``Object of type date is not JSON
+    serializable``.  Walk the parsed frontmatter dict/list tree and
+    normalise those scalars to ISO-8601 strings before they escape the
+    YAML layer.
+    """
+    if isinstance(obj, (date, datetime)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: _normalize_yaml_scalars(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_yaml_scalars(v) for v in obj]
+    return obj
+
+
 def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     """Parse YAML frontmatter from a markdown string.
 
@@ -208,7 +229,7 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
     try:
         parsed = yaml_load(yaml_content)
         if isinstance(parsed, dict):
-            frontmatter = parsed
+            frontmatter = _normalize_yaml_scalars(parsed)
     except Exception:
         # Fallback: simple key:value parsing for malformed YAML
         for line in yaml_content.strip().split("\n"):
