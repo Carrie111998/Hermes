@@ -6,7 +6,7 @@ from pathlib import Path
 from scripts.measure_abstention_gates import measure_payload
 
 
-RAW = Path(r"C:/Users/downl/AppData/Local/Temp/nsfw-bge-m3-v5-quantisation-query-results.json")
+RAW = Path(__file__).parents[1] / "fixtures" / "nsfw-bge-m3-v5-quantisation-query-results.json"
 
 
 def test_measurement_reports_missing_scores_without_inventing_gate_metrics() -> None:
