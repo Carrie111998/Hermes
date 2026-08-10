@@ -3705,7 +3705,7 @@ def _preserve_queued_followup_history_offset(
 
 
 async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None:
-    """Best-effort dispose for an adapter that never made it onto ``self.adapters``.
+    """Best-effort dispose for an adapter that never made it onto ``self._ctx.adapters``.
 
     The reconnect watcher in ``GatewayRunner._platform_reconnect_watcher``
     constructs a fresh adapter on every retry attempt. When the connect
@@ -5885,6 +5885,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
+    # DEV-0159: no class-level _ctx default.  Tests that build GatewayRunner
+    # via object.__new__ (without __init__) hit __getattr__ below which
+    # lazily creates a GatewayContext from self.config.
+
+    def __getattr__(self, name):
+        if name == "_ctx":
+            from gateway.context import GatewayContext
+            cfg = object.__getattribute__(self, "config")
+            return GatewayContext(config=cfg) if cfg is not None else None
+        raise AttributeError(name)
 
     # ------------------------------------------------------------------
     # Legacy per-session dict adapters.  All per-session state lives in
@@ -5978,19 +5988,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # DEV-0159: create the state-spine context immediately so
+        # self._ctx.config is available for all subsequent __init__
+        # code. Remaining fields (session_store, etc.) are patched
+        # inline as they become available.
+        from gateway.context import GatewayContext
+        self._ctx = GatewayContext(config=self.config)
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
         # leaking a cross-profile value (Workstream A). Inert when off.
         try:
             from agent.secret_scope import set_multiplex_active
-            set_multiplex_active(bool(getattr(self.config, "multiplex_profiles", False)))
+            set_multiplex_active(bool(getattr(self._ctx.config, "multiplex_profiles", False)))
         except Exception:
             logger.debug("could not set multiplex-active flag", exc_info=True)
-        self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        self._ctx.adapters: Dict[Platform, BasePlatformAdapter] = {}
         # Multi-profile multiplexing: adapters for NON-default profiles live
-        # here, keyed by profile name then Platform. self.adapters stays the
-        # default/active profile's map so the ~93 existing self.adapters[...]
+        # here, keyed by profile name then Platform. self._ctx.adapters stays the
+        # default/active profile's map so the ~93 existing self._ctx.adapters[...]
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
@@ -6018,13 +6034,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # NOT killed, only ignored by the reset guard.
         from tools.process_registry import process_registry
         _bg_max_age_hours = getattr(
-            self.config.default_reset_policy, "bg_process_max_age_hours", 24
+            self._ctx.config.default_reset_policy, "bg_process_max_age_hours", 24
         )
         _bg_max_age_seconds = (
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
         self.session_store = SessionStore(
-            self.config.sessions_dir, self.config,
+            self._ctx.config.sessions_dir, self._ctx.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
             ),
@@ -6032,10 +6048,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # One enforced loop-side boundary for the synchronous SessionStore.
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
-        self._async_session_store = AsyncSessionStore(self.session_store)
-        self.delivery_router = DeliveryRouter(self.config)
+        self._async_session_store = AsyncSessionStore(self._ctx.session_store)
+        self.delivery_router = DeliveryRouter(self._ctx.config)
         self._running = False
-        self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ctx._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
@@ -6083,7 +6099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._stop_task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
         self._executor_lock = threading.Lock()
-        self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._ctx._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
@@ -6284,7 +6300,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _sess_cfg.get("min_vacuum_interval_days", 30)
                         ),
                         vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
-                        sessions_dir=self.config.sessions_dir,
+                        sessions_dir=self._ctx.config.sessions_dir,
                     )
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
@@ -6355,6 +6371,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
 
+        # DEV-0159: state-spine context object.  Created alongside the
+        # existing self.X attributes as a parallel view.  No consumer
+        # uses self._ctx yet — this is infrastructure for the state-first
+        # refactoring sequence.
+        from gateway.context import GatewayContext
+        self._ctx = GatewayContext(
+            config=self._ctx.config,
+            adapters=self._ctx.adapters,
+            session_store=self._ctx.session_store,
+            async_session_store=self._ctx._async_session_store,
+            delivery_router=self._ctx.delivery_router,
+            _running=self._ctx._running,
+        )
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -6363,7 +6392,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         teams_pipeline plugin isn't enabled — lets the gateway start cleanly
         whether or not the user has opted into the pipeline.
         """
-        if Platform.MSGRAPH_WEBHOOK not in self.adapters:
+        if Platform.MSGRAPH_WEBHOOK not in self._ctx.adapters:
             return
         if not _teams_pipeline_plugin_enabled():
             logger.debug("Teams pipeline plugin is disabled; skipping runtime wiring")
@@ -6399,7 +6428,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if os.getenv("TERMINAL_ENV", "").strip().lower() != "docker":
             return
 
-        connected = self.config.get_connected_platforms()
+        connected = self._ctx.config.get_connected_platforms()
         messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
@@ -6779,9 +6808,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
-        if hasattr(self, "session_store") and self.session_store is not None:
+        if hasattr(self, "session_store") and self._ctx.session_store is not None:
             try:
-                session_key = self.session_store._generate_session_key(source)
+                session_key = self._ctx.session_store._generate_session_key(source)
                 if isinstance(session_key, str) and session_key:
                     return session_key
             except Exception:
@@ -7347,7 +7376,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if not adapter.fatal_error_retryable:
             return False
-        platform_config = self.config.platforms.get(adapter.platform)
+        platform_config = self._ctx.config.platforms.get(adapter.platform)
         if not platform_config or adapter.platform in self._failed_platforms:
             return False
         self._failed_platforms[adapter.platform] = {
@@ -7435,7 +7464,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             shutdown_event = getattr(self, "_shutdown_event", None)
             stranded = (
                 adapter.fatal_error_retryable
-                and platform not in self.adapters
+                and platform not in self._ctx.adapters
                 and platform not in getattr(self, "_failed_platforms", {})
                 and not (shutdown_event is not None and shutdown_event.is_set())
             )
@@ -7460,7 +7489,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # would overwrite an already-healthy platform's runtime status and
         # incorrectly re-queue it for reconnection, so bail out before any of
         # that happens.
-        existing = self.adapters.get(adapter.platform)
+        existing = self._ctx.adapters.get(adapter.platform)
         if existing is not None and existing is not adapter:
             logger.debug(
                 "Ignoring stale fatal error from a superseded %s adapter instance: %s",
@@ -7498,8 +7527,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # from a concurrent recovery path) would otherwise still see
             # itself as "existing" during the await below and disconnect()
             # the same object twice.
-            self.adapters.pop(adapter.platform, None)
-            self.delivery_router.adapters = self.adapters
+            self._ctx.adapters.pop(adapter.platform, None)
+            self._ctx.delivery_router.adapters = self._ctx.adapters
 
         # Queue retryable failures BEFORE any disconnect await (#80598).
         # A half-dead transport can wedge native close() (or swallow
@@ -7515,7 +7544,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # fatal handler always returns to the stay-alive / stranded path.
             await self._safe_adapter_disconnect(adapter, adapter.platform)
 
-        if not self.adapters and not self._failed_platforms:
+        if not self._ctx.adapters and not self._failed_platforms:
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
             if adapter.fatal_error_retryable:
                 self._exit_with_failure = True
@@ -7523,7 +7552,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 logger.error("No connected messaging platforms remain. Shutting down gateway cleanly.")
             await self.stop()
-        elif not self.adapters and self._failed_platforms:
+        elif not self._ctx.adapters and self._failed_platforms:
             # All platforms are down and queued for background reconnection.
             # Keep the gateway alive so:
             #   • cron jobs still run
@@ -7544,7 +7573,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _request_clean_exit(self, reason: str) -> None:
         self._exit_cleanly = True
         self._exit_reason = reason
-        self._shutdown_event.set()
+        self._ctx._shutdown_event.set()
 
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
@@ -7709,8 +7738,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # `platform_config.enabled` (see the `if not platform_config.enabled: continue`
             # in the adapter-connect loop) — arm off the same notion of "active platform."
             platforms = (
-                [p for p, pc in self.config.platforms.items() if getattr(pc, "enabled", False)]
-                if self.config
+                [p for p, pc in self._ctx.config.platforms.items() if getattr(pc, "enabled", False)]
+                if self._ctx.config
                 else []
             )
         except Exception:  # noqa: BLE001
@@ -7747,10 +7776,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 active = (
                     [
                         getattr(p, "value", p)
-                        for p, pc in self.config.platforms.items()
+                        for p, pc in self._ctx.config.platforms.items()
                         if getattr(pc, "enabled", False)
                     ]
-                    if self.config
+                    if self._ctx.config
                     else []
                 )
             except Exception:  # noqa: BLE001
@@ -7804,7 +7833,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from gateway.platforms.base import Platform
         except Exception:  # noqa: BLE001
             return None
-        return self.adapters.get(Platform.RELAY)
+        return self._ctx.adapters.get(Platform.RELAY)
 
     async def _scale_to_zero_watcher(self, interval: float = 30.0) -> None:
         """Watch for idle and drive the relay dormant so the platform can suspend.
@@ -7824,10 +7853,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         re-arm cooldown so a wake's drained backlog isn't immediately re-quiesced.
         """
         await asyncio.sleep(min(interval, 30.0))  # let startup settle
-        while self._running:
+        while self._ctx._running:
             try:
                 await asyncio.sleep(interval)
-                if not self._running:
+                if not self._ctx._running:
                     return
                 if time.time() < self._scale_to_zero_cooldown_until:
                     continue
@@ -8062,7 +8091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._external_drain_active:
             return
         self._external_drain_active = False
-        if self._draining or not self._running:
+        if self._ctx._draining or not self._ctx._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
             logger.info(
@@ -8092,7 +8121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from gateway.drain_control import drain_requested
 
-        while self._running:
+        while self._ctx._running:
             try:
                 if drain_requested():
                     self._enter_external_drain()
@@ -8957,7 +8986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return True  # handled (silently dropped); do not fall through
 
         # --- Draining case (gateway restarting/stopping) ---
-        if self._draining:
+        if self._ctx._draining:
             adapter = self._adapter_for_source(event.source)
             if not adapter:
                 return True
@@ -9481,7 +9510,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if getattr(self, "session_store", None) is not None:
                     await self.async_session_store._ensure_loaded()
-                    entry = self.session_store._entries.get(session_key)
+                    entry = self._ctx.session_store._entries.get(session_key)
                     source = getattr(entry, "origin", None) if entry else None
             except Exception as e:
                 logger.debug(
@@ -9516,11 +9545,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             try:
                 platform = Platform(platform_str)
-                adapter = self.adapters.get(platform)
+                adapter = self._ctx.adapters.get(platform)
                 if not adapter:
                     continue
 
-                platform_cfg = self.config.platforms.get(platform)
+                platform_cfg = self._ctx.config.platforms.get(platform)
                 if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                     logger.info(
                         "Shutdown notification suppressed for active session: %s has gateway_restart_notification=false",
@@ -9600,16 +9629,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("drain_notification_suppressed check failed: %s", e)
 
         # Snapshot adapters up front: adapter.send() can hit a fatal error
-        # path that pops the adapter from self.adapters (see _handle_fatal
+        # path that pops the adapter from self._ctx.adapters (see _handle_fatal
         # elsewhere), which would otherwise trigger
         # ``RuntimeError: dictionary changed size during iteration`` —
         # observed in a user report during gateway shutdown.
-        for platform, adapter in list(self.adapters.items()):
-            home = self.config.get_home_channel(platform)
+        for platform, adapter in list(self._ctx.adapters.items()):
+            home = self._ctx.config.get_home_channel(platform)
             if not home or not home.chat_id:
                 continue
 
-            platform_cfg = self.config.platforms.get(platform)
+            platform_cfg = self._ctx.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Shutdown notification suppressed for home channel: %s has gateway_restart_notification=false",
@@ -9951,7 +9980,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         for session_key in stuck_keys:
             try:
-                entry = self.session_store._entries.get(session_key)
+                entry = self._ctx.session_store._entries.get(session_key)
                 if entry and not entry.suspended:
                     entry.suspended = True
                     suspended += 1
@@ -9965,7 +9994,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if suspended:
             try:
-                self.session_store._save()
+                self._ctx.session_store._save()
             except Exception:
                 pass
 
@@ -10574,11 +10603,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if not await asyncio.to_thread(ledger_enabled):
                 return 0
-            # Only claim rows we can actually send this boot: self.adapters
+            # Only claim rows we can actually send this boot: self._ctx.adapters
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
             _deliverable = {
-                getattr(p, "value", str(p)) for p in self.adapters
+                getattr(p, "value", str(p)) for p in self._ctx.adapters
             }
             claimed = await asyncio.to_thread(
                 sweep_recoverable, None, deliverable_platforms=_deliverable
@@ -10599,7 +10628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     row["obligation_id"], row.get("platform"),
                 )
                 continue
-            adapter = self.adapters.get(platform)
+            adapter = self._ctx.adapters.get(platform)
             if adapter is None:
                 # Platform not connected this boot — leave the row claimed;
                 # attempts cap + stale cutoff bound the retries on later boots.
@@ -10665,7 +10694,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         injection path owns the wording and we never double up.
 
         Adapters that are not yet ready (adapter missing from
-        ``self.adapters``) are skipped silently; their sessions stay
+        ``self._ctx.adapters``) are skipped silently; their sessions stay
         ``resume_pending`` and will auto-resume on the next real user
         message, or when the platform reconnects — the reconnect watcher
         calls this again scoped to that ``platform``.
@@ -10679,10 +10708,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         window = _auto_continue_freshness_window()
         try:
-            with self.session_store._lock:  # noqa: SLF001 — snapshot under lock
-                self.session_store._ensure_loaded_locked()  # noqa: SLF001
+            with self._ctx.session_store._lock:  # noqa: SLF001 — snapshot under lock
+                self._ctx.session_store._ensure_loaded_locked()  # noqa: SLF001
                 candidates = [
-                    entry for entry in self.session_store._entries.values()  # noqa: SLF001
+                    entry for entry in self._ctx.session_store._entries.values()  # noqa: SLF001
                     if entry.resume_pending
                     and not entry.suspended
                     and entry.origin is not None
@@ -10799,8 +10828,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _startup_should_abort(self) -> bool:
         return (
             self._restart_requested
-            or self._draining
-            or self._shutdown_event.is_set()
+            or self._ctx._draining
+            or self._ctx._shutdown_event.is_set()
         )
 
     async def _abort_startup_if_shutdown_requested(
@@ -10821,7 +10850,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         current_task = asyncio.current_task()
         if stop_task is not None and stop_task is not current_task:
             await stop_task
-        elif not self._shutdown_event.is_set():
+        elif not self._ctx._shutdown_event.is_set():
             await self.stop(
                 restart=self._restart_requested,
                 detached_restart=self._restart_detached,
@@ -10915,7 +10944,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             faulthandler.enable()
         except (RuntimeError, ValueError, OSError):
             try:
-                _fh_log_dir = getattr(self.config, "log_dir", None) or os.path.join(
+                _fh_log_dir = getattr(self._ctx.config, "log_dir", None) or os.path.join(
                     str(get_hermes_home()),
                     "logs",
                 )
@@ -10934,7 +10963,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _sigusr2 = getattr(signal, "SIGUSR2", None)
         if _sigusr2 is not None and hasattr(faulthandler, "register"):
             try:
-                _log_dir = getattr(self.config, "log_dir", None) or os.path.join(
+                _log_dir = getattr(self._ctx.config, "log_dir", None) or os.path.join(
                     str(get_hermes_home()),
                     "logs",
                 )
@@ -10954,9 +10983,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
             self._gateway_loop = None
-        if self._gateway_loop is not None:
-            self._start_loop_liveness_guards(self._gateway_loop)
-        logger.info("Session storage: %s", self.config.sessions_dir)
+        if self._ctx._gateway_loop is not None:
+            self._start_loop_liveness_guards(self._ctx._gateway_loop)
+        logger.info("Session storage: %s", self._ctx.config.sessions_dir)
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
@@ -11129,7 +11158,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "dm_policy/group_policy: open on the platform."
             )
 
-        reason = _own_policy_open_startup_violation(self.config)
+        reason = _own_policy_open_startup_violation(self._ctx.config)
         if reason:
             platform_value = reason.split(":", 1)[0]
             allow_all_env = None
@@ -11299,9 +11328,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         startup_retryable_errors: list[str] = []
         
         # Initialize and connect each configured platform
-        _multiplex_on = bool(getattr(self.config, "multiplex_profiles", False))
+        _multiplex_on = bool(getattr(self._ctx.config, "multiplex_profiles", False))
         _multiplex_skipped_platforms: list[Platform] = []
-        for platform, platform_config in self.config.platforms.items():
+        for platform, platform_config in self._ctx.config.platforms.items():
             if await self._abort_startup_if_shutdown_requested():
                 return True
             if not platform_config.enabled:
@@ -11345,7 +11374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # before the narrower agent-turn scope is installed.
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-            adapter.set_session_store(self.session_store)
+            adapter.set_session_store(self._ctx.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
@@ -11369,7 +11398,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if await self._abort_startup_if_shutdown_requested(adapter, platform):
                     return True
                 if success:
-                    self.adapters[platform] = adapter
+                    self._ctx.adapters[platform] = adapter
                     self._sync_voice_mode_state_to_adapter(adapter)
                     # Wire voice input callback at connect time so voice
                     # transcription is forwarded without requiring /voice join.
@@ -11598,7 +11627,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Update delivery router with adapters
         if await self._abort_startup_if_shutdown_requested():
             return True
-        self.delivery_router.adapters = self.adapters
+        self._ctx.delivery_router.adapters = self._ctx.adapters
         self._wire_teams_pipeline_runtime()
 
         self._running = True
@@ -11629,7 +11658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hook_count:
             logger.info("%s hook(s) loaded", hook_count)
         await self.hooks.emit("gateway:startup", {
-            "platforms": [p.value for p in self.adapters.keys()],
+            "platforms": [p.value for p in self._ctx.adapters.keys()],
         })
         
         if connected_count > 0:
@@ -11638,7 +11667,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build initial channel directory for send_message name resolution
         try:
             from gateway.channel_directory import build_channel_directory
-            directory = await build_channel_directory(self.adapters)
+            directory = await build_channel_directory(self._ctx.adapters)
             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
             logger.info("Channel directory built: %d target(s)", ch_count)
         except Exception as e:
@@ -11832,7 +11861,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Complements upstream's per-iteration inner-loop try/except (which only
         guards a single loop-body) by covering what that CANNOT: an exception
-        raised in the watcher's OUTER ``while self._running:`` loop or its
+        raised in the watcher's OUTER ``while self._ctx._running:`` loop or its
         pre-try setup region, plus task-level death generally. A bare
         ``asyncio.create_task`` drops such an exception on the floor — no log,
         no restart, the watcher silently gone. This retains the handle in
@@ -11882,7 +11911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # would busy-spin such a watcher — so NEVER restart on clean exit.
                 return
             logger.error("Supervised task %s died: %r", name, exc, exc_info=exc)
-            if restart and self._running:
+            if restart and self._ctx._running:
                 ran_for = time.monotonic() - _started
                 if ran_for >= self._SUPERVISED_HEALTHY_SECS:
                     # Ran healthily for a while before crashing — this is a
@@ -11905,7 +11934,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 async def _respawn():
                     await asyncio.sleep(backoff)
-                    if self._running:
+                    if self._ctx._running:
                         self._spawn_supervised(
                             coro_factory,
                             name,
@@ -11943,7 +11972,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Initial delay so the gateway is fully connected to its platforms
         # before we try to dispatch handoffs through them.
         await asyncio.sleep(5)
-        while self._running:
+        while self._ctx._running:
             try:
                 if self._session_db is None:
                     await asyncio.sleep(interval)
@@ -11994,7 +12023,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # resolve_delivery_transport is the shared alias-aware resolver (native
         # adapter wins; relay eligible only when its authenticated transport
         # advertises it fronts the logical platform).
-        transport = resolve_delivery_transport(platform, self.config, self.adapters)
+        transport = resolve_delivery_transport(platform, self._ctx.config, self._ctx.adapters)
         if not transport:
             raise RuntimeError(
                 f"platform '{platform_name}' is not active in this gateway"
@@ -12002,7 +12031,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = transport.adapter
 
         # Home channel must be configured
-        home = self.config.get_home_channel(platform)
+        home = self._ctx.config.get_home_channel(platform)
         if not home or not home.chat_id:
             raise RuntimeError(
                 f"no home channel configured for {platform_name}; "
@@ -12093,7 +12122,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # entry. For thread destinations build_session_key keys without
         # user_id (thread_sessions_per_user defaults to False) — so the
         # next real user message in the thread shares this same session.
-        platform_cfg = self.config.platforms.get(platform)
+        platform_cfg = self._ctx.config.platforms.get(platform)
         extra = platform_cfg.extra if platform_cfg else {}
         session_key = build_session_key(
             dest_source,
@@ -12188,12 +12217,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await asyncio.sleep(60)  # initial delay — let the gateway fully start
         _finalize_failures: dict[str, int] = {}  # session_id -> consecutive failure count
         _MAX_FINALIZE_RETRIES = 3
-        while self._running:
+        while self._ctx._running:
             try:
                 await self.async_session_store._ensure_loaded()
                 # Collect expired sessions first, then log a single summary.
                 _expired_entries = []
-                for key, entry in list(self.session_store._entries.items()):
+                for key, entry in list(self._ctx.session_store._entries.items()):
                     if entry.expiry_finalized:
                         continue
                     if not await self.async_session_store._is_session_expired(entry):
@@ -12345,7 +12374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if time.time() - _last_prune_ts > _prune_interval:
                     try:
                         _max_age = int(
-                            getattr(self.config, "session_store_max_age_days", 0) or 0
+                            getattr(self._ctx.config, "session_store_max_age_days", 0) or 0
                         )
                         if _max_age > 0:
                             _pruned = await self.async_session_store.prune_old_entries(_max_age)
@@ -12361,7 +12390,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("Session expiry watcher error: %s", e)
             # Sleep in small increments so we can stop quickly
             for _ in range(interval):
-                if not self._running:
+                if not self._ctx._running:
                     break
                 await asyncio.sleep(1)
 
@@ -12601,7 +12630,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         # Short initial delay so startup reconnect noise does not false-fire.
         await asyncio.sleep(min(30.0, max(1.0, float(interval))))
-        while self._running:
+        while self._ctx._running:
             try:
                 timeout = self._session_stall_timeout_seconds()
                 if timeout > 0:
@@ -12611,7 +12640,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Interruptible sleep
             steps = max(1, int(float(interval)))
             for _ in range(steps):
-                if not self._running:
+                if not self._ctx._running:
                     break
                 await asyncio.sleep(1)
 
@@ -12668,11 +12697,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         bots silently staying dead after a transient DNS failure.
         """
         await asyncio.sleep(10)  # initial delay — let startup finish
-        while self._running:
+        while self._ctx._running:
             if not self._failed_platforms:
                 # Nothing to reconnect — sleep and check again
                 for _ in range(30):
-                    if not self._running:
+                    if not self._ctx._running:
                         return
                     if self._failed_platforms:
                         break
@@ -12681,7 +12710,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             now = time.monotonic()
             for platform in list(self._failed_platforms.keys()):
-                if not self._running:
+                if not self._ctx._running:
                     return
                 info = self._failed_platforms.get(platform)
                 if info is None:
@@ -12728,7 +12757,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
-                    adapter.set_session_store(self.session_store)
+                    adapter.set_session_store(self._ctx.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
@@ -12744,12 +12773,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter, platform, is_reconnect=True
                     )
                     if success:
-                        self.adapters[platform] = adapter
+                        self._ctx.adapters[platform] = adapter
                         self._sync_voice_mode_state_to_adapter(adapter)
                         # Wire voice input callback on reconnect as well (#60623).
                         if hasattr(adapter, "_voice_input_callback"):
                             adapter._voice_input_callback = self._handle_voice_channel_input
-                        self.delivery_router.adapters = self.adapters
+                        self._ctx.delivery_router.adapters = self._ctx.adapters
                         del self._failed_platforms[platform]
                         self._update_platform_runtime_status(
                             platform.value,
@@ -12762,7 +12791,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # Rebuild channel directory with the new adapter
                         try:
                             from gateway.channel_directory import build_channel_directory
-                            await build_channel_directory(self.adapters)
+                            await build_channel_directory(self._ctx.adapters)
                         except Exception:
                             pass
 
@@ -12793,7 +12822,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             platform.value, adapter.fatal_error_message,
                         )
                         # The adapter is about to be dropped from the queue
-                        # without ever being installed on self.adapters, so
+                        # without ever being installed on self._ctx.adapters, so
                         # nothing else will call disconnect() on it. We must
                         # dispose it here, otherwise the resource owners it
                         # constructed in __init__ (ResponseStore for
@@ -12860,7 +12889,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Check every 10 seconds for platforms that need reconnection
             for _ in range(10):
-                if not self._running:
+                if not self._ctx._running:
                     return
                 await asyncio.sleep(1)
 
@@ -12898,7 +12927,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _start_systemd_watchdog(self) -> bool:
         """Start sd_notify only after a configured gateway is truly running."""
-        if not self._running or self.config.systemd_watchdog_seconds <= 0:
+        if not self._ctx._running or self._ctx.config.systemd_watchdog_seconds <= 0:
             return False
         if self._systemd_watchdog is not None:
             return True
@@ -13021,8 +13050,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 started = _stop_started_at_box.get("t")
                 return {
                     "restart_requested": bool(self._restart_requested),
-                    "draining": bool(self._draining),
-                    "running": bool(self._running),
+                    "draining": bool(self._ctx._draining),
+                    "running": bool(self._ctx._running),
                     "active_agents": self._running_agent_count(),
                     "active_cron_jobs": self._active_cron_job_count(),
                     "active_api_runs": self._active_api_run_count(),
@@ -13255,7 +13284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _agent, context="shutdown idle-cache"
                     )
 
-            for platform, adapter in list(self.adapters.items()):
+            for platform, adapter in list(self._ctx.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
 
             # Disconnect secondary-profile adapters (multiplex mode).
@@ -13284,7 +13313,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _task.cancel()
             self._background_tasks.clear()
 
-            self.adapters.clear()
+            self._ctx.adapters.clear()
             for _session_key in list(self._running_agents):
                 self._release_running_agent_state(_session_key)
             # Flush pending messages to disk before clearing (#72680).
@@ -13308,7 +13337,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._pending_approvals.clear()
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
-            self._shutdown_event.set()
+            self._ctx._shutdown_event.set()
 
             # Global cleanup: kill any remaining tool subprocesses not tied
             # to a specific agent (catch-all for zombie prevention). On the
@@ -13466,7 +13495,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""
-        await self._shutdown_event.wait()
+        await self._ctx._shutdown_event.wait()
 
     async def _start_secondary_profile_adapters(self) -> int:
         """Bring up adapters for every non-active profile this gateway serves.
@@ -13483,7 +13512,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles polling the same bot token) are detected and refused here, the
         only point that sees every profile's resolved credentials together.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
+        if not getattr(self._ctx.config, "multiplex_profiles", False):
             return 0
 
         try:
@@ -13497,7 +13526,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # profiles polling the same account; listener claims prevent sidecars
         # with distinct credentials from binding the same endpoint.
         claimed: Dict[tuple, str] = {}
-        for _plat, _ad in self.adapters.items():
+        for _plat, _ad in self._ctx.adapters.items():
             fp = self._adapter_credential_fingerprint(_ad)
             if fp is not None:
                 claimed[(_plat, fp)] = active
@@ -13599,7 +13628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # active profile owns the one connection; connector-stamped
             # source.profile routes inbound turns to secondary profiles.
             if (
-                getattr(self.config, "multiplex_profiles", False)
+                getattr(self._ctx.config, "multiplex_profiles", False)
                 and platform is Platform.RELAY
             ):
                 continue
@@ -13697,7 +13726,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
-        adapter.set_session_store(self.session_store)
+        adapter.set_session_store(self._ctx.session_store)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
@@ -13715,7 +13744,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         attempts = 0
         current_task = asyncio.current_task()
         try:
-            while self._running:
+            while self._ctx._running:
                 adapter = None
                 try:
                     from hermes_cli.profiles import get_profile_dir
@@ -13741,7 +13770,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter, platform, is_reconnect=True
                         )
 
-                    if success and self._running:
+                    if success and self._ctx._running:
                         profile_map = self._profile_adapters.setdefault(profile_name, {})
                         if platform not in profile_map:
                             profile_map[platform] = adapter
@@ -13784,7 +13813,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
 
-                if not self._running:
+                if not self._ctx._running:
                     return
                 attempts += 1
                 backoff = _reconnect_backoff(attempts)
@@ -13810,7 +13839,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self, profile_name: str, platform: Platform, adapter: BasePlatformAdapter
     ) -> None:
         """Schedule one runner-owned reconnect without sharing primary secrets."""
-        if not self._running or not adapter.fatal_error_retryable:
+        if not self._ctx._running or not adapter.fatal_error_retryable:
             return
         pending = self._profile_failed_platforms
         if not isinstance(pending, dict):
@@ -13849,7 +13878,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Remove a failed multiplexed adapter without touching the primary slot.
 
         Secondary adapters are owned by ``_profile_adapters`` rather than
-        ``self.adapters``. The primary-only fatal handler intentionally ignores
+        ``self._ctx.adapters``. The primary-only fatal handler intentionally ignores
         them; without this route, a fatal secondary Discord client stayed live
         forever after its liveness sampler stopped.
         """
@@ -13863,7 +13892,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         profile_map.pop(platform, None)
         await self._safe_adapter_disconnect(adapter, platform)
-        if not self._running:
+        if not self._ctx._running:
             return
         self._schedule_secondary_profile_reconnect(profile_name, platform, adapter)
         logger.error(
@@ -13915,7 +13944,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _primary_message_handler(self):
         """Return the correctly scoped handler for a primary adapter."""
-        if getattr(self.config, "multiplex_profiles", False):
+        if getattr(self._ctx.config, "multiplex_profiles", False):
             return self._make_default_profile_message_handler()
         return self._handle_message
 
@@ -14013,11 +14042,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(config, "extra") and isinstance(config.extra, dict):
             config.extra.setdefault(
                 "group_sessions_per_user",
-                self.config.group_sessions_per_user,
+                self._ctx.config.group_sessions_per_user,
             )
             config.extra.setdefault(
                 "thread_sessions_per_user",
-                getattr(self.config, "thread_sessions_per_user", False),
+                getattr(self._ctx.config, "thread_sessions_per_user", False),
             )
 
         # ── Plugin-registered platforms (checked first) ───────────────────
@@ -14728,18 +14757,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not is_internal:
             try:
                 from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+                # DEV-0119: pass a minimal read-only view instead of the full
+                # gateway (adapters hold platform tokens) + session store.
+                # This hook runs BEFORE user authorization.
+                from types import SimpleNamespace as _SimpleNamespace
+                _gw_view = _SimpleNamespace(
+                    platform_names=tuple(
+                        (p.value if hasattr(p, "value") else str(p))
+                        for p in self._ctx.adapters
+                    ),
+                )
                 _hook_results = _invoke_hook(
                     "pre_gateway_dispatch",
                     event=event,
-                    gateway=self,
-                    # getattr: bare-runner tests build GatewayRunner via
-                    # object.__new__ without __init__ (pitfall #17), and the
-                    # hook must not fail dispatch over a missing attribute.
-                    session_store=getattr(self, "session_store", None),
+                    gateway=_gw_view,
                 )
             except Exception as _hook_exc:
+                # DEV-0141: fail-closed — if the hook invocation itself
+                # raises, treat the message as denied.  The hook runs
+                # BEFORE user authorization; a broken hook should not
+                # silently pass every message through.
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
-                _hook_results = []
+                return None
 
             for _result in _hook_results:
                 if not isinstance(_result, dict):
@@ -15241,7 +15280,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         merge_text=True,
                     )
                 return None
-            if self._draining:
+            if self._ctx._draining:
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
                 return (
@@ -15368,10 +15407,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Preserve built-in precedence; aliases only need early handling when
         # the typed command is not already known.
         if command and _cmd_def is None:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
+            if isinstance(self._ctx.config, dict):
+                quick_commands = self._ctx.config.get("quick_commands", {}) or {}
             else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
+                quick_commands = getattr(self._ctx.config, "quick_commands", {}) or {}
             if isinstance(quick_commands, dict) and command in quick_commands:
                 qcmd = quick_commands[command]
                 if qcmd.get("type") == "alias":
@@ -15795,15 +15834,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
-        if self._draining:
+        if self._ctx._draining:
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
-            if isinstance(self.config, dict):
-                quick_commands = self.config.get("quick_commands", {}) or {}
+            if isinstance(self._ctx.config, dict):
+                quick_commands = self._ctx.config.get("quick_commands", {}) or {}
             else:
-                quick_commands = getattr(self.config, "quick_commands", {}) or {}
+                quick_commands = getattr(self._ctx.config, "quick_commands", {}) or {}
             if not isinstance(quick_commands, dict):
                 quick_commands = {}
             if command in quick_commands:
@@ -16222,8 +16261,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _pending_stt_prepared
             else event.text
         ) or ""
-        _group_sessions_per_user = getattr(self.config, "group_sessions_per_user", True)
-        _thread_sessions_per_user = getattr(self.config, "thread_sessions_per_user", False)
+        _group_sessions_per_user = getattr(self._ctx.config, "group_sessions_per_user", True)
+        _thread_sessions_per_user = getattr(self._ctx.config, "thread_sessions_per_user", False)
         # Prefer the already resolved session key from the caller so this write
         # key matches the consume key at the run_conversation site. Fall back
         # to deriving it here for tests and legacy standalone callers.
@@ -16673,8 +16712,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def async_session_store(self) -> AsyncSessionStore:
         """Return the single async facade for this runner's SessionStore."""
         facade = getattr(self, "_async_session_store", None)
-        if facade is None or facade._store is not self.session_store:
-            facade = AsyncSessionStore(self.session_store)
+        if facade is None or facade._store is not self._ctx.session_store:
+            facade = AsyncSessionStore(self._ctx.session_store)
             self._async_session_store = facade
         return facade
 
@@ -16898,7 +16937,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             })
         
         # Build session context
-        context = build_session_context(source, self.config, session_entry)
+        context = build_session_context(source, self._ctx.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -16960,7 +16999,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # - the platform is excluded (e.g. api_server, webhook)
             # - the expired session had no activity (nothing was cleared)
             try:
-                policy = self.session_store.config.get_reset_policy(
+                policy = self._ctx.session_store.config.get_reset_policy(
                     platform=source.platform,
                     session_type=getattr(source, 'chat_type', 'dm'),
                 )
@@ -17904,7 +17943,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 home_env = (os.getenv(env_key) or "").strip() if env_key else ""
             # Also honor in-memory / yaml home_channel on this platform.
             try:
-                if not home_env and self.config.get_home_channel(source.platform):
+                if not home_env and self._ctx.config.get_home_channel(source.platform):
                     home_env = "set"
             except Exception:
                 pass
@@ -18955,7 +18994,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if not canonical_cmd:
             return None
-        policy = _policy_for_source(self.config, source)
+        policy = _policy_for_source(self._ctx.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
         logger.info(
@@ -19194,9 +19233,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         try:
             goals_cfg = (
-                (self.config or {}).get("goals", {})
-                if isinstance(self.config, dict)
-                else getattr(self.config, "goals", {}) or {}
+                (self._ctx.config or {}).get("goals", {})
+                if isinstance(self._ctx.config, dict)
+                else getattr(self._ctx.config, "goals", {}) or {}
             )
             if not goals_cfg:
                 from hermes_cli.config import load_config
@@ -19568,7 +19607,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
         self._save_voice_modes()
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._ctx.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
 
     def _is_duplicate_voice_transcript(self, guild_id: int, user_id: int, transcript: str) -> bool:
@@ -19620,7 +19659,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
         """
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._ctx.adapters.get(Platform.DISCORD)
         if not adapter:
             return
 
@@ -19717,7 +19756,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         voice_mode = self._voice_mode.get(voice_key)
         is_voice_input = (event.message_type == MessageType.VOICE)
 
-        adapter = self.adapters.get(event.source.platform)
+        adapter = self._ctx.adapters.get(event.source.platform)
         adapter_auto_tts = False
         if adapter and hasattr(adapter, "_should_auto_tts_for_chat"):
             try:
@@ -19769,7 +19808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _should_echo_stt_transcripts(self) -> bool:
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
-        return bool(getattr(self.config, "stt_echo_transcripts", True))
+        return bool(getattr(self._ctx.config, "stt_echo_transcripts", True))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
         """Generate TTS audio and send as a voice message before the text reply."""
@@ -20699,8 +20738,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Default is False (auto-rename enabled, preserves prior behaviour).
         """
         platform_cfg = (
-            self.config.platforms.get(source.platform)
-            if getattr(self, "config", None) and getattr(self.config, "platforms", None)
+            self._ctx.config.platforms.get(source.platform)
+            if getattr(self, "config", None) and getattr(self._ctx.config, "platforms", None)
             else None
         )
         if platform_cfg is None:
@@ -21426,7 +21465,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message_id = pending.get("message_id")
                     if platform_str and chat_id:
                         platform = Platform(platform_str)
-                        adapter = self.adapters.get(platform)
+                        adapter = self._ctx.adapters.get(platform)
                         metadata = self._thread_metadata_for_target(
                             platform,
                             chat_id,
@@ -21694,7 +21733,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Resolve adapter
             platform = Platform(platform_str)
-            adapter = self.adapters.get(platform)
+            adapter = self._ctx.adapters.get(platform)
 
             if not adapter and chat_id:
                 # The update finished, but the target platform has not
@@ -21777,7 +21816,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             platform = Platform(platform_str)
-            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            transport = resolve_delivery_transport(platform, self._ctx.config, self._ctx.adapters)
             if transport is None:
                 logger.debug(
                     "Restart notification skipped: no live transport for %s",
@@ -21785,7 +21824,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return None
 
-            platform_cfg = self.config.platforms.get(platform)
+            platform_cfg = self._ctx.config.platforms.get(platform)
             if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
                 logger.info(
                     "Restart notification suppressed: %s has gateway_restart_notification=false",
@@ -21853,12 +21892,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         skipped = skip_targets or set()
         message = "♻️ Gateway online — Hermes is back and ready."
 
-        for platform, platform_cfg in self.config.platforms.items():
+        for platform, platform_cfg in self._ctx.config.platforms.items():
             home = platform_cfg.home_channel
             if not home or not home.chat_id:
                 continue
 
-            transport = resolve_delivery_transport(platform, self.config, self.adapters)
+            transport = resolve_delivery_transport(platform, self._ctx.config, self._ctx.adapters)
             if transport is None:
                 continue
 
@@ -21936,7 +21975,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # background=True) know whether this channel can wake a later turn.
         # Default True keeps CLI / unknown paths working; stateless adapters
         # (api_server) declare supports_async_delivery=False. Use getattr so
-        # bare runners built via object.__new__ (tests) without self.adapters
+        # bare runners built via object.__new__ (tests) without self._ctx.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
@@ -22180,7 +22219,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
-        if not getattr(self.config, "stt_enabled", True):
+        if not getattr(self._ctx.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
@@ -22437,8 +22476,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if session_key:
             try:
-                self.session_store._ensure_loaded()
-                entry = self.session_store._entries.get(session_key)
+                self._ctx.session_store._ensure_loaded()
+                entry = self._ctx.session_store._entries.get(session_key)
                 if entry and getattr(entry, "origin", None):
                     return entry.origin
             except Exception as exc:
@@ -22526,7 +22565,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _sk and _parse_session_key(_sk) is None:
                     raw_sid = _sk
             if raw_sid:
-                adapter = self.adapters.get(Platform.API_SERVER)
+                adapter = self._ctx.adapters.get(Platform.API_SERVER)
                 from gateway.wake import adapter_supports_push, deliver_wake
                 if adapter is not None and not adapter_supports_push(adapter):
                     try:
@@ -22557,7 +22596,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         adapter = None
-        for p, a in self.adapters.items():
+        for p, a in self._ctx.adapters.items():
             if p.value == platform_name:
                 adapter = a
                 break
@@ -22853,7 +22892,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
-        while self._running:
+        while self._ctx._running:
             try:
                 # Peek the queue for async-delegation events. We must NOT
                 # consume watch/completion events here (other drains own them),
@@ -23030,7 +23069,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"Here's the final output:\n{new_output}]"
                     )
                     adapter = None
-                    for p, a in self.adapters.items():
+                    for p, a in self._ctx.adapters.items():
                         if p.value == platform_name:
                             adapter = a
                             break
@@ -23060,7 +23099,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"New output:\n{new_output}]"
                 )
                 adapter = None
-                for p, a in self.adapters.items():
+                for p, a in self._ctx.adapters.items():
                     if p.value == platform_name:
                         adapter = a
                         break
@@ -23840,7 +23879,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if source.platform != Platform.DISCORD:
             return None
-        adapter = self.adapters.get(Platform.DISCORD)
+        adapter = self._ctx.adapters.get(Platform.DISCORD)
         guild_id = self._get_guild_id(event)
         if not (guild_id and adapter and hasattr(adapter, "get_voice_channel_context")):
             return None
@@ -25261,7 +25300,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _voice_ack_fired = [False]
         _voice_ack_guild: List[Optional[int]] = [None]
         if source.platform == Platform.DISCORD:
-            _va = self.adapters.get(Platform.DISCORD)
+            _va = self._ctx.adapters.get(Platform.DISCORD)
             # source.chat_id is the linked text channel; resolve the guild whose
             # voice connection is bound to it (mirrors DiscordAdapter.play_tts).
             _vtc = getattr(_va, "_voice_text_channels", None)
@@ -25593,7 +25632,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer
                 from tools.tts_tool import _load_tts_config
                 _tts_cfg = _load_tts_config()
-                _gateway_loop = self._gateway_loop or asyncio.get_event_loop()
+                _gateway_loop = self._ctx._gateway_loop or asyncio.get_event_loop()
                 _stts_consumer = StreamingTTSConsumer(
                     adapter=_stts_adapter,
                     chat_id=source.chat_id,
@@ -25665,7 +25704,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 return
             self._session_state(session_key).turn.agent = agent_holder[0]
-            if self._draining:
+            if self._ctx._draining:
                 self._update_runtime_status("draining")
         
         tracking_task = asyncio.create_task(track_agent())
@@ -26334,7 +26373,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         pass
 
-            if self._draining and (pending_event or pending):
+            if self._ctx._draining and (pending_event or pending):
                 logger.info(
                     "Discarding pending follow-up for session %s during gateway %s",
                     session_key or "?",
@@ -26622,7 +26661,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_running_agent_state(
                     session_key, run_generation=run_generation
                 )
-            if self._draining:
+            if self._ctx._draining:
                 self._update_runtime_status("draining")
             
             # Wait for cancelled tasks

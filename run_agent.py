@@ -7650,10 +7650,10 @@ class AIAgent:
                 telemetry_agent=self,
             )
             # compress_context ran on a daemon pool worker thread; the session
-            # id rotation updated hermes_logging._session_context (a
-            # threading.local) on the WORKER thread, not this one. Propagate
-            # the current session_id back so subsequent log lines on this
-            # thread carry the rotated id (#34089).
+            # id rotation updated hermes_logging._session_context on the WORKER
+            # thread (ContextVar propagates across thread boundaries via
+            # copy_context). Propagate the current session_id back so
+            # subsequent log lines carry the rotated id (#34089).
             try:
                 from hermes_logging import set_session_context
                 set_session_context(self.session_id)

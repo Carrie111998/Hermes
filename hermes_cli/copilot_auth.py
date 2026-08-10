@@ -22,14 +22,49 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: Path, data: object) -> None:
+    """Write JSON to *path* atomically with hard permissions (DEV-0146).
+
+    Uses ``O_WRONLY | O_CREAT | O_EXCL`` on a random-suffixed tempfile
+    (preventing symlink races and concurrent-write collisions), writes
+    the payload, ``fsync``'s the file and its parent directory, then
+    ``os.replace`` into place.  The target file receives ``0o600``.
+
+    This matches the pattern used by ``auth.py`` for credential stores
+    (``O_EXCL`` + 0600-at-create + ``fsync``).
+    """
+    parent = path.parent
+    tmp_path = parent / f".{path.name}.{uuid.uuid4().hex[:12]}.tmp"
+    fd = os.open(
+        tmp_path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        os.write(fd, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, path)
+    # fsync parent so the directory entry rename survives a power cycle
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY)
+        os.fsync(dir_fd)
+        os.close(dir_fd)
+    except OSError:
+        pass
 
 # OAuth device code flow constants — VS Code's GitHub App client ID.
 # The previous opencode OAuth App ID (Ov23li8tweQw6odWQebz) produces gho_*
@@ -397,13 +432,7 @@ def evict_cached_exchanged_token(raw_token: str) -> None:
         store = _read_jwt_store(path)
         if store is not None and fp in store:
             del store[fp]
-            tmp = path.with_suffix(path.suffix + ".tmp")
-            tmp.write_text(json.dumps(store), encoding="utf-8")
-            try:
-                os.chmod(tmp, 0o600)
-            except Exception:
-                pass
-            os.replace(tmp, path)
+            _atomic_write_json(path, store)
     except Exception as exc:
         logger.debug("Failed to evict cached Copilot JWT: %s", exc)
 
@@ -462,17 +491,7 @@ def _save_jwt_to_disk(
             "expires_at": expires_at,
             "base_url": base_url,
         }
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(store), encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except Exception:
-            pass
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except Exception:
-            pass
+        _atomic_write_json(path, store)
     except Exception as exc:
         logger.debug("Failed to persist Copilot JWT: %s", exc)
 
