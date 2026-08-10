@@ -2559,6 +2559,9 @@ export const ar = defineLocale({
       'يلخّص Hermes السياق السابق. تم تعطيل إرسال الرسائل وتغيير هذه الجلسة مؤقتًا.',
     compactionGuardStatus:
       'ستُفتح هذه النافذة تلقائيًا بعد تحميل الجلسة المضغوطة. ستبقى مسودتك محفوظة.',
+    compactionCompleteTitle: 'تم ضغط السياق',
+    compactionCompleteMessage: 'تم تلخيص السجل السابق بنجاح. هذه الجلسة جاهزة للمتابعة.',
+    compactionFailedTitle: 'فشل ضغط السياق',
     nothingToBranch: 'لا يوجد ما يمكن تفريعه',
     branchNeedsChat: 'يحتاج التفريع إلى محادثة',
     sessionBusy: 'الجلسة مشغولة',

@@ -2770,6 +2770,9 @@ export const ja = defineLocale({
       'Hermes が以前のコンテキストを要約しています。メッセージの送信とこのセッションの変更は一時的に無効です。',
     compactionGuardStatus:
       '圧縮されたセッションが読み込まれると、この画面は自動的に解除されます。下書きは保持されます。',
+    compactionCompleteTitle: 'コンテキストを圧縮しました',
+    compactionCompleteMessage: '過去の履歴が正常に要約されました。このセッションを続けられます。',
+    compactionFailedTitle: 'コンテキストの圧縮に失敗しました',
     nothingToBranch: 'ブランチするものがありません',
     branchNeedsChat: 'ブランチする前にチャットを開始または再開してください。',
     sessionBusy: 'セッションが使用中',

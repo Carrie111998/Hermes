@@ -2947,6 +2947,9 @@ export const en: Translations = {
       'Hermes is summarizing earlier context. Sending messages and changing this session are temporarily disabled.',
     compactionGuardStatus:
       'This window will unlock automatically after the compressed session is loaded. Your draft is preserved.',
+    compactionCompleteTitle: 'Context compressed',
+    compactionCompleteMessage: 'Earlier history was summarized successfully. This session is ready to continue.',
+    compactionFailedTitle: 'Context compression failed',
     nothingToBranch: 'Nothing to branch',
     branchNeedsChat: 'Start or resume a chat before branching.',
     sessionBusy: 'Session busy',

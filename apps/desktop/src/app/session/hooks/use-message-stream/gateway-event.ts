@@ -21,7 +21,7 @@ import { type AgentNoticePayload, clearAgentNotice, nativeNoticeInput, showAgent
 import { reconcileApprovalModeForProfile } from '@/store/approval-mode'
 import { billingCtaLabel, clearBillingBlock, runBillingRecovery, setBillingBlock } from '@/store/billing-block'
 import { clearClarifyRequest, normalizeChoices, setClarifyRequest, warnDroppedChoices } from '@/store/clarify'
-import { setSessionCompacting } from '@/store/compaction'
+import { isSessionCompacting, setSessionCompacting } from '@/store/compaction'
 import { refreshBackgroundProcesses } from '@/store/composer-status'
 import { $gateway } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
@@ -199,6 +199,24 @@ const COMPACTION_RESUME_EVENT_TYPES = new Set([
   'tool.complete'
 ])
 
+function completeSessionCompaction(sessionId: string): void {
+  const wasCompacting = isSessionCompacting(sessionId)
+
+  setSessionCompacting(sessionId, false)
+
+  if (!wasCompacting) {
+    return
+  }
+
+  notify({
+    durationMs: 4_000,
+    id: `compaction-complete:${sessionId}`,
+    kind: 'success',
+    message: translateNow('desktop.compactionCompleteMessage'),
+    title: translateNow('desktop.compactionCompleteTitle')
+  })
+}
+
 interface GatewayEventDeps {
   activeGatewayProfile: string
   activeSessionIdRef: MutableRefObject<string | null>
@@ -318,7 +336,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       // turn has resumed, so retire the phase label without waiting for the
       // whole turn to complete.
       if (sessionId && COMPACTION_RESUME_EVENT_TYPES.has(event.type) && compactedTurnRef.current.has(sessionId)) {
-        setSessionCompacting(sessionId, false)
+        completeSessionCompaction(sessionId)
       }
 
       if (sessionId && DRAFT_SUPERSEDING_EVENT_TYPES.has(event.type)) {
@@ -1166,7 +1184,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)
         } else if (sessionId && payload?.kind === 'compacted') {
-          setSessionCompacting(sessionId, false)
+          completeSessionCompaction(sessionId)
           compactedTurnRef.current.delete(sessionId)
         } else if (sessionId && payload?.kind === 'process') {
           // The gateway's notification poller announces background process
@@ -1235,6 +1253,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
       } else if (event.type === 'error') {
         const errorMessage = payload?.message || 'Hermes reported an error'
         const looksLikeProviderSetup = isProviderSetupErrorMessage(errorMessage)
+        const compactionFailed = isSessionCompacting(sessionId)
 
         // A turn that errors out has also ended — drop any open blocking prompt
         // for this session so an approval/sudo/secret overlay can't linger past
@@ -1261,6 +1280,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
 
         if (looksLikeProviderSetup) {
           requestDesktopOnboarding(errorMessage)
+        }
+
+        if (compactionFailed) {
+          notify({
+            id: `compaction-failed:${sessionId}`,
+            kind: 'error',
+            message: errorMessage,
+            title: translateNow('desktop.compactionFailedTitle')
+          })
+        } else if (looksLikeProviderSetup) {
+          // Onboarding above is the actionable surface for setup failures.
         } else if (isDiskFullErrorMessage(errorMessage)) {
           notifyError(new Error(errorMessage), translateNow('notifications.errors.diskFull'))
         } else {

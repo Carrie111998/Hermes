@@ -1,5 +1,5 @@
 import { useStore } from '@nanostores/react'
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 
 import {
   Dialog,
@@ -22,8 +22,23 @@ interface CompactionGuardProps {
  * UI unlocks only after the backend clears the session's compacting state.
  */
 export function CompactionGuard({ sessionId }: CompactionGuardProps) {
-  const compactingStore = useMemo(() => sessionCompacting(sessionId ?? '__no-session__'), [sessionId])
+  const compactingStore = useMemo(() => sessionCompacting(sessionId), [sessionId])
   const compacting = useStore(compactingStore)
+
+  useEffect(() => {
+    if (!compacting) {
+      return
+    }
+
+    const blockKeyboardShortcuts = (event: KeyboardEvent) => {
+      event.preventDefault()
+      event.stopImmediatePropagation()
+    }
+
+    window.addEventListener('keydown', blockKeyboardShortcuts, { capture: true })
+
+    return () => window.removeEventListener('keydown', blockKeyboardShortcuts, { capture: true })
+  }, [compacting])
   const { t } = useI18n()
 
   return (

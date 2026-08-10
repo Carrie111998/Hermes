@@ -1,5 +1,5 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $compactingSessions, setSessionCompacting } from '@/store/compaction'
 
@@ -30,10 +30,17 @@ describe('CompactionGuard', () => {
   it('cannot be dismissed while compaction remains active', () => {
     setSessionCompacting(SID, true)
     render(<CompactionGuard sessionId={SID} />)
+    const downstreamShortcut = vi.fn()
+
+    window.addEventListener('keydown', downstreamShortcut)
 
     expect(screen.queryByRole('button', { name: /close/i })).toBeNull()
     fireEvent.keyDown(window.document, { key: 'Escape' })
+    fireEvent.keyDown(window, { ctrlKey: true, key: 'n' })
     expect(screen.getByRole('dialog')).not.toBeNull()
+    expect(downstreamShortcut).not.toHaveBeenCalled()
+
+    window.removeEventListener('keydown', downstreamShortcut)
   })
 
   it('unlocks only when the structured compaction state clears', () => {

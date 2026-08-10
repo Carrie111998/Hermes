@@ -2495,6 +2495,9 @@ export interface Translations {
     compactionGuardTitle: string
     compactionGuardDescription: string
     compactionGuardStatus: string
+    compactionCompleteTitle: string
+    compactionCompleteMessage: string
+    compactionFailedTitle: string
     nothingToBranch: string
     branchNeedsChat: string
     sessionBusy: string

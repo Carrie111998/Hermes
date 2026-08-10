@@ -13,6 +13,10 @@ export function sessionCompacting(sessionId: null | string) {
   return computed($compactingSessions, sessions => keyFor(sessionId) in sessions)
 }
 
+export function isSessionCompacting(sessionId: null | string | undefined): boolean {
+  return keyFor(sessionId) in $compactingSessions.get()
+}
+
 export function setSessionCompacting(sessionId: string | null | undefined, active: boolean): void {
   const key = keyFor(sessionId)
   const sessions = $compactingSessions.get()
