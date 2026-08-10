@@ -13,11 +13,12 @@ trusts the payload.
 from __future__ import annotations
 
 import asyncio
+import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform, PlatformConfig
+from gateway.config import Platform, PlatformConfig, load_gateway_config
 from plugins.platforms.whatsapp.adapter import WhatsAppAdapter, _apply_yaml_config
 
 
@@ -162,5 +163,32 @@ def test_oversight_yaml_options_seed_adapter_extra(monkeypatch):
         "respond_as_owner": False,
         "forward_owner_messages": True,
     }
+
+
+def test_documented_oversight_yaml_shape_loads_home_and_policy(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in tuple(os.environ):
+        if name.startswith("WHATSAPP_"):
+            monkeypatch.delenv(name, raising=False)
+    (tmp_path / "config.yaml").write_text(
+        """whatsapp:
+  enabled: true
+  oversight_mode: true
+  respond_as_owner: false
+  forward_owner_messages: true
+  home_channel:
+    chat_id: "15550001111@s.whatsapp.net"
+    name: "Owner"
+""",
+        encoding="utf-8",
+    )
+
+    config = load_gateway_config().platforms[Platform.WHATSAPP]
+
+    assert config.home_channel is not None
+    assert config.home_channel.chat_id == "15550001111@s.whatsapp.net"
+    assert config.extra["oversight_mode"] is True
+    assert config.extra["respond_as_owner"] is False
+    assert config.extra["forward_owner_messages"] is True
 
 
