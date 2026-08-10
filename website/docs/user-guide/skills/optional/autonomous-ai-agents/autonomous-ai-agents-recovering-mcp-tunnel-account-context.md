@@ -76,6 +76,23 @@ A Platform usage balance and a ChatGPT subscription are separate. A new
 account matters because it can split the identity chain, not because debt
 travels through the tunnel.
 
+## Deployment Ownership
+
+Account-context recovery and same-alias maintenance are different operations.
+During account-context recovery, keep the old runtime running and create a
+distinct replacement. Do not unload the healthy rollback runtime before the
+replacement has passed connector, discovery, harmless-read, and post-cutover
+gates.
+
+For same-alias maintenance, first identify the mechanism that owns that exact
+alias. If a service manager owns it, stop or unload only that exact service
+immediately before a verified manual launcher is used, never run both owners
+concurrently, and restore normal supervision immediately afterward.
+
+Process/state metadata is authoritative only for the mechanism that created
+it. A service-owned process plus its live health probe may disagree with stale
+manual-launcher metadata. Local runtime health is not end-to-end proof.
+
 ## Procedure
 
 ### 1. Freeze rollback
@@ -121,9 +138,11 @@ the old runtime stays live.
 
 ### 5. Start restricted Hermes
 
-Run the verified managed-runtime flow with `hermes mcp serve --read-only`.
-Require process running, healthy, ready, managed-runtime state ready, and no
-current error.
+Run the verified replacement flow with `hermes mcp serve --read-only`. If the
+managed-runtime command owns the process, require its process and state fields,
+live health/readiness, and no current error. If a service manager owns it,
+require the service-owned process plus its live health probe; do not substitute
+stale metadata from a different launcher.
 
 **Done when:** the replacement runtime is ready before connector creation.
 
@@ -158,7 +177,8 @@ invoke a mutating tool merely to test that it is absent.
 
 Stop only the precisely identified old runtime. Preserve its tunnel,
 connector, profile, alias, and key reference for rollback. Recheck the new
-runtime and repeat one harmless read after the old runtime stops.
+runtime and repeat one harmless read after the old runtime stops. This is the
+first point at which recovery may stop or unload the healthy rollback service.
 
 **Done when:** the replacement remains ready and independent after cutover.
 

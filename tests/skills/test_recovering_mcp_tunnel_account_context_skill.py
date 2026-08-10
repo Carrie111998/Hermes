@@ -97,3 +97,15 @@ def test_recovery_and_read_only_invariants_are_explicit():
     }
     for tool in expected_tools | {"messages_send", "permissions_respond"}:
         assert f"`{tool}`" in body
+
+
+def test_recovery_keeps_rollback_live_and_separates_maintenance():
+    _, body = _frontmatter_and_body()
+    assert "Account-context recovery" in body
+    assert "same-alias maintenance" in body
+    assert "Do not unload the healthy rollback runtime" in body
+    assert "distinct replacement" in body
+    assert "Local runtime health is not end-to-end proof" in body
+    assert body.index("Keep the old runtime running") < body.index(
+        "Stop only the precisely identified old runtime"
+    )
