@@ -12333,7 +12333,26 @@ function registerDeepLinkProtocol() {
     if (process.defaultApp && process.argv.length >= 2) {
       // Dev: register with the electron exec path + entry script so the OS can
       // relaunch us with the URL.
-      app.setAsDefaultProtocolClient(HERMES_PROTOCOL, process.execPath, [path.resolve(process.argv[1])])
+      // On Windows the Electron registry command validation rejects exec
+      // paths that contain characters it deems "restricted" (e.g. spaces in
+      // AppData-rooted installs). The custom binary here is the electron
+      // runtime itself plus our entry script, so opt into the unsafe-but-fine
+      // path. Mirrors the git-bin handling in electron/git-review-ops.ts.
+      // The `options` 4th arg is supported at runtime (Electron >= 30) but is
+      // not yet reflected in the published type definitions, hence the cast.
+      ;(
+        app.setAsDefaultProtocolClient as unknown as (
+          protocol: string,
+          path?: string,
+          args?: string[],
+          options?: { unsafe?: { allowUnsafeCustomBinary?: boolean } }
+        ) => boolean
+      )(
+        HERMES_PROTOCOL,
+        process.execPath,
+        [path.resolve(process.argv[1])],
+        process.platform === 'win32' ? { unsafe: { allowUnsafeCustomBinary: true } } : undefined
+      )
     } else {
       app.setAsDefaultProtocolClient(HERMES_PROTOCOL)
     }
