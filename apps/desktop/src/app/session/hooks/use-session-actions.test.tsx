@@ -1646,6 +1646,10 @@ describe('branchStoredSession desktop source tagging', () => {
       />
     )
     await waitFor(() => expect(branchStoredSession).not.toBeNull())
+    // Both capture and completion normalize the absent tree anchor to undefined.
+    // A stable no-anchor branch must still reveal its child pane.
+    vi.mocked(focusedSessionTabAnchor).mockReturnValue(null)
+    vi.mocked(revealTreePane).mockClear()
 
     await expect(branchStoredSession!('stored-parent')).resolves.toBe(true)
 
@@ -1703,7 +1707,8 @@ describe('branchStoredSession desktop source tagging', () => {
     // Branching a session that is not the one currently open must not steal
     // the user's active view — "stored-other" stays selected.
     expect($selectedStoredSessionId.get()).toBe('stored-other')
-    // The branch instead opens as its own tile.
+    // A stable no-anchor branch still reveals the child opened as its own tile.
+    expect(revealTreePane).toHaveBeenCalledWith('session-tile:branch-stored')
     expect($sessionTiles.get().some(tile => tile.storedSessionId === 'branch-stored')).toBe(true)
   })
 
