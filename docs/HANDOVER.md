@@ -28,7 +28,8 @@
 ## 2. Goal and roadmap
 
 - **Current goal:** Advance Hermes mainline through ARCH-002 while maintaining a
-  separate, reviewed skills ecosystem lane.
+  separate, reviewed skills ecosystem lane. Product priority and remote-coding
+  engineering order remain recorded separately from ticket order.
 - **Completed and verified:**
   - ARCH-001 mainline reconciliation merged as
     ec50a154eeb44e7206f24b7703f9032b8f97069c.
