@@ -188,6 +188,52 @@ def test_never_started_recovery_preserves_direct_manual_claim(conn):
     assert task.consecutive_failures == 0
 
 
+def test_never_started_recovery_requeues_review_claim_to_review(conn):
+    task_id = kb.create_task(conn, title="review ghost", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status = 'review' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    claimed = kb.claim_review_task(
+        conn, task_id, claimer=kb._dispatcher_claimer_id()
+    )
+    assert claimed is not None
+    assert claimed.status == "running"
+
+    old_started = int(time.time()) - 120
+    conn.execute(
+        "UPDATE task_runs SET started_at = ? WHERE id = ?",
+        (old_started, claimed.current_run_id),
+    )
+    conn.commit()
+
+    recovered = kb.detect_never_started(
+        conn,
+        grace_seconds=60,
+        failure_limit=2,
+        board="default",
+    )
+
+    assert recovered == [task_id]
+    task = kb.get_task(conn, task_id)
+    assert task.status == "review"
+    assert task.claim_lock is None
+    assert task.worker_pid is None
+    assert task.consecutive_failures == 1
+
+    run = kb.latest_run(conn, task_id)
+    assert run.status == "spawn_failed"
+    assert run.outcome == "spawn_failed"
+
+    events = kb.list_events(conn, task_id)
+    failure = next(event for event in events if event.kind == "spawn_failed")
+    assert failure.payload["reason"] == "worker_never_started"
+    assert failure.payload["source_status"] == "review"
+    assert failure.payload["requeue_status"] == "review"
+
+
 def test_never_started_recovery_trips_existing_failure_limit(conn):
     task_id = kb.create_task(conn, title="repeated spawn failure", assignee="worker")
     claimed = kb.claim_task(conn, task_id, claimer=kb._dispatcher_claimer_id())
@@ -197,6 +243,38 @@ def test_never_started_recovery_trips_existing_failure_limit(conn):
         "UPDATE tasks SET consecutive_failures = 1 WHERE id = ?",
         (task_id,),
     )
+    conn.execute(
+        "UPDATE task_runs SET started_at = ? WHERE id = ?",
+        (old_started, claimed.current_run_id),
+    )
+    conn.commit()
+
+    assert kb.detect_never_started(
+        conn,
+        grace_seconds=60,
+        failure_limit=2,
+        board="default",
+    ) == [task_id]
+
+    task = kb.get_task(conn, task_id)
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 2
+    assert getattr(kb.detect_never_started, "_last_auto_blocked") == [task_id]
+
+
+def test_never_started_review_recovery_trips_failure_limit_to_blocked(conn):
+    task_id = kb.create_task(conn, title="review spawn breaker", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status = 'review', consecutive_failures = 1 WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    claimed = kb.claim_review_task(
+        conn, task_id, claimer=kb._dispatcher_claimer_id()
+    )
+    assert claimed is not None
+    old_started = int(time.time()) - 120
     conn.execute(
         "UPDATE task_runs SET started_at = ? WHERE id = ?",
         (old_started, claimed.current_run_id),

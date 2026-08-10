@@ -2880,6 +2880,40 @@ def _is_host_local_dispatch_claim(claim_lock: Optional[str]) -> bool:
     return lock.startswith(host_prefix) and lock.endswith(_DISPATCH_CLAIM_SUFFIX)
 
 
+def _claim_source_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> str:
+    """Return the lane a claim left (``ready`` or ``review``).
+
+    ``claim_review_task`` records ``source_status: review`` on its claimed
+    event; ordinary ``claim_task`` records ``ready`` (or omits it on older
+    rows). Failed launches must restore that lane so a dead review spawn
+    does not fall back into the implementation queue.
+    """
+    if run_id is None:
+        return "ready"
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return "ready"
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return "ready"
+    if not isinstance(payload, dict):
+        return "ready"
+    source = payload.get("source_status")
+    if source == "review":
+        return "review"
+    return "ready"
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -4346,7 +4380,12 @@ def claim_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "ready",
+            },
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -7644,6 +7683,9 @@ def detect_never_started(
     worker log from the active attempt is therefore treated as a spawn failure.
     Automatic dispatch marks its claim lock explicitly; direct/manual claims
     intentionally lack that marker and are never interpreted as failed spawns.
+    Review-agent launches are restored to ``review`` (not ``ready``) using the
+    ``source_status`` recorded on the claim event, so a dead reviewer does not
+    re-enter the ordinary worker queue.
 
     The log check protects the narrow ``Popen`` -> PID-persistence crash window:
     ``_default_spawn`` opens the task log before starting the child, so a log
@@ -7695,21 +7737,31 @@ def detect_never_started(
             "worker did not record a PID or heartbeat within "
             f"{grace}s of claim"
         )
+        requeue_status = _claim_source_status(
+            conn, row["id"], row["current_run_id"]
+        )
         payload = {
             "reason": "worker_never_started",
             "claim_lock": row["claim_lock"],
             "elapsed_seconds": elapsed,
             "grace_seconds": grace,
+            "source_status": requeue_status,
+            "requeue_status": requeue_status,
         }
         with write_txn(conn):
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND current_run_id IS ? "
                 "  AND worker_pid IS NULL AND last_heartbeat_at IS NULL",
-                (row["id"], row["claim_lock"], row["current_run_id"]),
+                (
+                    requeue_status,
+                    row["id"],
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -8047,10 +8099,11 @@ def _record_task_failure(
       releases the claim, and closes the run with ``outcome=<outcome>``.
 
     * ``release_claim=False, end_run=False`` — timeout/crash path.
-      Caller has ALREADY flipped the task to ``ready`` and closed the
-      run with the appropriate outcome. This just increments the
-      counter; if the breaker trips, the task is re-transitioned
-      ``ready → blocked`` and a ``gave_up`` event is emitted.
+      Caller has ALREADY flipped the task to its requeue lane
+      (``ready`` or ``review``) and closed the run with the appropriate
+      outcome. This just increments the counter; if the breaker trips,
+      the task is re-transitioned ``ready|review → blocked`` and a
+      ``gave_up`` event is emitted.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -8107,13 +8160,14 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
+                # Timeout/crash/never-started path: claim is already
+                # cleared and the task sits in its requeue lane
+                # (ready or review); just flip to blocked + update
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -8155,8 +8209,9 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready`` via
-                # its own UPDATE. Just bookkeep the counter + last error.
+                # Timeout/crash/never-started path: task is already at its
+                # requeue lane via its own UPDATE. Just bookkeep the
+                # counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
                     "last_failure_error = ? WHERE id = ?",
