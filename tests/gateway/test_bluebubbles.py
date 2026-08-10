@@ -308,6 +308,51 @@ class TestBlueBubblesWebhookParsing:
         assert response.status == 200
         assert handled == []
 
+    @pytest.mark.asyncio
+    async def test_group_privacy_prompt_is_attached_only_to_group_turns(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            send_read_receipts=False,
+            group_prompt="Protect information learned outside this group.",
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        for payload in (
+            {
+                "type": "new-message",
+                "data": {
+                    "guid": "group-prompt-message",
+                    "text": "Rico, help us plan",
+                    "handle": {"address": "+15550000001"},
+                    "isFromMe": False,
+                    "isGroup": True,
+                    "chats": [{"guid": "any;+;group-chat"}],
+                },
+            },
+            {
+                "type": "new-message",
+                "data": {
+                    "guid": "dm-no-prompt-message",
+                    "text": "Help me privately",
+                    "handle": {"address": "+15550000001"},
+                    "isFromMe": False,
+                    "isGroup": False,
+                    "chats": [{"guid": "any;-;+15550000001"}],
+                },
+            },
+        ):
+            response = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+            assert response.status == 200
+        await asyncio.sleep(0)
+
+        assert len(handled) == 2
+        assert handled[0].channel_prompt == "Protect information learned outside this group."
+        assert handled[1].channel_prompt is None
+
     def test_webhook_can_fall_back_to_sender_when_chat_fields_missing(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         payload = {

@@ -196,6 +196,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if _working_ack is None:
             _working_ack = os.getenv("BLUEBUBBLES_WORKING_ACK_EMOJI", "")
         self.working_ack_emoji = str(_working_ack or "").strip()
+        _group_prompt = extra.get("group_prompt")
+        if _group_prompt is None:
+            _group_prompt = os.getenv("BLUEBUBBLES_GROUP_PROMPT", "")
+        self.group_prompt = str(_group_prompt or "").strip() or None
         _allowed_chat_guids = extra.get("allowed_chat_guids")
         if _allowed_chat_guids is None:
             _allowed_chat_guids = os.getenv("BLUEBUBBLES_ALLOWED_CHAT_GUIDS", "")
@@ -1208,6 +1212,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             ),
             media_urls=media_urls,
             media_types=media_types,
+            channel_prompt=self.group_prompt if is_group else None,
         )
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
