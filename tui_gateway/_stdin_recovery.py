@@ -52,6 +52,43 @@ _TIMEVAL_SIZE = struct.calcsize(_TIMEVAL_FORMAT)
 MAX_RECOVERIES_PER_MINUTE = 10
 
 
+def _read_stdin_rcvtimeo() -> bytes | None:
+    """Return stdin's raw ``SO_RCVTIMEO`` timeval, or ``None`` if unreadable.
+
+    ``SO_RCVTIMEO`` is a socket option (not a file-status flag), equally shared
+    on the open file description.  A child setting it via ``setsockopt``
+    launders into the same spurious-EOF path as ``O_NONBLOCK`` — but with
+    ``O_NONBLOCK`` clear.
+
+    ``None`` means **"cannot tell"**, not "no timeout": either the ``socket``
+    module is unavailable, or fd 0 is not a socket at all (a tty, or an
+    anonymous pipe), in which case ``fromfd``/``getsockopt`` raises
+    ``ENOTSOCK``.  Callers must treat ``None`` as "nothing detected" so that
+    non-socket stdin keeps its existing behaviour.
+    """
+    if not (_HAS_SOCKET and _socket is not None):
+        return None
+    try:
+        s = _socket.fromfd(0, _socket.AF_UNIX, _socket.SOCK_STREAM)
+    except Exception:
+        # ``ENOTSOCK`` surfaces here on platforms whose socket constructor
+        # validates the descriptor (macOS).
+        return None
+    try:
+        # ``getsockopt`` without an explicit buffer length assumes an *int*
+        # option and reads only ``sizeof(int)`` bytes, truncating
+        # ``struct timeval`` to the low half of ``tv_sec`` — a 500 ms timeout
+        # would then be reported as ``0``.  Read the whole struct.
+        return s.getsockopt(_socket.SOL_SOCKET, _socket.SO_RCVTIMEO, _TIMEVAL_SIZE)
+    except Exception:
+        # ...and here on platforms that defer validation to the option call.
+        return None
+    finally:
+        # ``fromfd`` duped the fd; ``close`` releases the dup without touching
+        # the original fd 0.
+        s.close()
+
+
 def diagnose_stdin_state() -> str:
     """Return a diagnostic string about stdin's current state.
 
@@ -68,28 +105,10 @@ def diagnose_stdin_state() -> str:
             parts.append(f"F_GETFL error: {e}")
     else:
         parts.append("O_NONBLOCK=n/a (no fcntl)")
-    # ``SO_RCVTIMEO`` is a socket option (not a file-status flag), equally
-    # shared on the open file description.  A child setting it via
-    # ``setsockopt`` launders into the same spurious-EOF path with
-    # ``O_NONBLOCK`` clear, so we report it alongside the flag.
-    if _HAS_SOCKET and _socket is not None:
-        try:
-            s = _socket.fromfd(0, _socket.AF_UNIX, _socket.SOCK_STREAM)
-            try:
-                # ``getsockopt`` without an explicit buffer length assumes an
-                # *int* option and reads only ``sizeof(int)`` bytes, truncating
-                # ``struct timeval`` to the low half of ``tv_sec`` — a 500 ms
-                # timeout is then reported as ``0``.  Read the whole struct.
-                tv = s.getsockopt(
-                    _socket.SOL_SOCKET, _socket.SO_RCVTIMEO, _TIMEVAL_SIZE
-                )
-                parts.append(f"SO_RCVTIMEO={tv!r}")
-            finally:
-                # ``fromfd`` duped the fd; ``close`` releases the dup without
-                # touching the original fd 0.
-                s.close()
-        except Exception:
-            pass
+    # Report the shared-description socket timeout alongside the flag.
+    tv = _read_stdin_rcvtimeo()
+    if tv is not None:
+        parts.append(f"SO_RCVTIMEO={tv!r}")
     return ", ".join(parts) if parts else "unknown"
 
 
