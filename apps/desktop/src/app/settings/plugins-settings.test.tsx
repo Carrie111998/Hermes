@@ -1,4 +1,5 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { requestGateway } = vi.hoisted(() => ({ requestGateway: vi.fn() }))
@@ -18,6 +19,14 @@ import {
 import { $connection, $gatewayState } from '@/store/session'
 
 import { PluginsSettings } from './plugins-settings'
+
+function renderPluginsSettings() {
+  return render(
+    <MemoryRouter>
+      <PluginsSettings />
+    </MemoryRouter>
+  )
+}
 
 const legacyRow = {
   name: 'Legacy plugin',
@@ -45,7 +54,7 @@ afterEach(() => {
 
 describe('PluginsSettings', () => {
   it('renders and searches plugin rows returned without a canonical key', () => {
-    render(<PluginsSettings />)
+    renderPluginsSettings()
 
     expect(screen.getByText('Legacy plugin')).toBeTruthy()
 
@@ -58,7 +67,7 @@ describe('PluginsSettings', () => {
     // Name-addressed toggles flip every same-named plugin across category
     // dirs (image_gen/fal vs video_gen/fal) — the reason toggles moved to
     // canonical keys. A pre-contract-v6 row must never reach the RPC.
-    render(<PluginsSettings />)
+    renderPluginsSettings()
 
     const toggle = screen.getByRole('switch', { name: 'Enable Legacy plugin' })
 
@@ -79,7 +88,7 @@ describe('PluginsSettings', () => {
 
     $agentPlugins.set([legacyRow, sibling])
 
-    render(<PluginsSettings />)
+    renderPluginsSettings()
 
     expect(screen.getAllByRole('switch', { name: 'Enable Legacy plugin' })).toHaveLength(2)
     expect(screen.getByText(sibling.description)).toBeTruthy()
@@ -92,7 +101,7 @@ describe('PluginsSettings', () => {
     $agentPlugins.set([keyedRow])
     requestGateway.mockResolvedValue({ ok: true, plugin: { ...keyedRow, status: 'enabled' } })
 
-    render(<PluginsSettings />)
+    renderPluginsSettings()
     fireEvent.click(screen.getByRole('switch', { name: 'Enable Legacy plugin' }))
 
     await waitFor(() =>
