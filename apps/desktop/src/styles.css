@@ -2900,11 +2900,6 @@ button[data-slot='aui_msg-reactions'] svg {
   touch-action: none;
 }
 
-/* While resizing, keep the window solid and the cursor honest. */
-[data-hud-shell] [data-hud-resize][data-hud-resizing] {
-  cursor: nwse-resize;
-}
-
 /* The composer's drop target is a full-window dashed sheet sized for the app's
    chat column. In the HUD it is a white slab hanging under the bar on a fresh
    thread, and there is nowhere to drop anything into a bar anyway. */

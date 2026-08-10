@@ -341,7 +341,7 @@ export function HudShell() {
   // never be misread as a resize gesture (the Windows transparent-frameless
   // growth bug); the handle is the one sanctioned way to change size, driving
   // the same flip-resizable-for-the-call pattern the pet overlay uses.
-  const { resizing: hudResizing, onPointerDown: onHudResizePointerDown } = useHudResizeHandle(true)
+  const { resizing: hudResizing, onPointerDown: onHudResizePointerDown } = useHudResizeHandle()
 
   // Force the HOST layers transparent. index.html's pre-paint script writes an
   // opaque themed background onto <html> as an INLINE style (the anti-white-
@@ -403,14 +403,16 @@ export function HudShell() {
 
       {/* The resize handle: bottom-right corner, the one sanctioned way to
           change the HUD's size. Invisible chrome — a hot corner, not a
-          button — so it never reads as part of the surface. */}
+          button — so it never reads as part of the surface. `data-hud-grabbing`
+          is the same flag the composer drag raises: a gesture in progress owns
+          the window, so click-through can't hand the mouse away mid-resize
+          when the growing edge outruns the cursor. */}
       <div
-        aria-hidden={!hudResizing}
+        aria-hidden
         className="absolute bottom-0 right-0 z-20"
+        data-hud-grabbing={hudResizing ? '' : undefined}
         data-hud-resize=""
-        data-hud-resizing={hudResizing ? '' : undefined}
         onPointerDown={onHudResizePointerDown}
-        role="presentation"
       />
     </div>
   )

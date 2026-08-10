@@ -28,41 +28,39 @@ interface ResizeState {
  * coordinates are relative to a window that is changing size, so they cannot
  * be trusted mid-resize.
  */
-export function useHudResizeHandle(enabled: boolean): {
+export function useHudResizeHandle(): {
   resizing: boolean
   onPointerDown: (event: ReactPointerEvent<HTMLElement>) => void
 } {
   const [resizing, setResizing] = useState(false)
   const stateRef = useRef<ResizeState | null>(null)
 
-  const onPointerDown = useCallback(
-    (event: ReactPointerEvent<HTMLElement>) => {
-      if (!enabled || event.button !== 0) {
-        return
-      }
+  const reset = useCallback(() => {
+    stateRef.current = null
+    setResizing(false)
+  }, [])
 
-      stateRef.current = {
-        startX: event.screenX,
-        startY: event.screenY,
-        originX: window.screenX,
-        originY: window.screenY,
-        originW: window.outerWidth,
-        originH: window.outerHeight,
-        pointerId: event.pointerId
-      }
-
-      setResizing(true)
-      event.currentTarget.setPointerCapture(event.pointerId)
-      event.preventDefault()
-    },
-    [enabled]
-  )
-
-  useEffect(() => {
-    if (!enabled) {
+  const onPointerDown = useCallback((event: ReactPointerEvent<HTMLElement>) => {
+    if (event.button !== 0) {
       return
     }
 
+    stateRef.current = {
+      startX: event.screenX,
+      startY: event.screenY,
+      originX: window.screenX,
+      originY: window.screenY,
+      originW: window.outerWidth,
+      originH: window.outerHeight,
+      pointerId: event.pointerId
+    }
+
+    setResizing(true)
+    event.currentTarget.setPointerCapture(event.pointerId)
+    event.preventDefault()
+  }, [])
+
+  useEffect(() => {
     const onMove = (event: PointerEvent) => {
       const state = stateRef.current
 
@@ -90,8 +88,7 @@ export function useHudResizeHandle(enabled: boolean): {
         return
       }
 
-      stateRef.current = null
-      setResizing(false)
+      reset()
     }
 
     window.addEventListener('pointermove', onMove)
@@ -103,15 +100,10 @@ export function useHudResizeHandle(enabled: boolean): {
       window.removeEventListener('pointerup', onUp)
       window.removeEventListener('pointercancel', onUp)
     }
-  }, [enabled])
+  }, [reset])
 
   // A resize interrupted by an unmount must not leave the state dangling.
-  useEffect(() => {
-    if (!enabled) {
-      stateRef.current = null
-      setResizing(false)
-    }
-  }, [enabled])
+  useEffect(() => reset, [reset])
 
   return { resizing, onPointerDown }
 }
