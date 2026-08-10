@@ -170,3 +170,14 @@ Commits syncados: `#83143` fmt, `#83138` titlebar tahoe, `#83139` fmt, fullscree
 ### 2026-08-10 — Fim de sessão / handoff
 
 Handoff em `registros/RETOMADA_SESSAO.md`.
+
+### 2026-08-10 — Remoção Gemini (title_generation)
+
+| Passo | Resultado |
+|---|---|
+| Remover `GEMINI_API_KEY` / `GOOGLE_API_KEY` (User env) | OK — variáveis apagadas |
+| `auxiliary.title_generation` → MiniMax-M3 | OK — `config.yaml` |
+| `hermes doctor` | OK — Gemini fora dos connectivity checks |
+| Aviso title gen | OK — não deve mais aparecer após restart do CLI |
+
+**Nota:** `config.yaml` vive em `%LOCALAPPDATA%\hermes\`; espelho em `Denispds/hermes-local`.

@@ -63,10 +63,13 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 | 2 | (Opcional) hook `register_api_mount` p/ plugin puro | Baixa |
 | 3 | ~~Fix avaliacao-agente-dande~~ ✅ | — |
 | 4 | ~~D-004 extração modular~~ ✅ | — |
+| 5 | ~~Remover Gemini (title_generation)~~ ✅ | — |
 
 ---
 
-## Modelos Codex (ChatGPT)
+## Gemini
+
+Removido em 2026-08-10: chaves `GEMINI_API_KEY`/`GOOGLE_API_KEY` do User env; `auxiliary.title_generation` usa MiniMax-M3.
 
 **Usar:** `gpt-5.5`, `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.4-mini`  
 **Não usar:** `gpt-5.2-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`
