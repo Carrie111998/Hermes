@@ -6,6 +6,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 from hermes_cli import active_sessions
 
 
@@ -167,3 +169,43 @@ def test_release_orphaned_leases_reclaims_only_unowned_own_pid_entries(tmp_path,
         for entry in active_sessions.active_session_registry_snapshot()
     ) == ["kept", "other"]
     assert orphan is not None
+
+
+def test_release_retries_after_registry_write_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="retry-me",
+        surface="gateway:test",
+        config={"max_concurrent_sessions": 1},
+    )
+    assert message is None
+    assert lease is not None
+
+    real_write_entries = active_sessions._write_entries
+    writes = 0
+
+    def fail_first_write(state_path, entries):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError("transient registry write failure")
+        return real_write_entries(state_path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_first_write)
+
+    with pytest.raises(OSError, match="transient registry write failure"):
+        lease.release()
+
+    assert lease.released is False
+    assert [
+        entry["lease_id"]
+        for entry in active_sessions.active_session_registry_snapshot()
+    ] == [lease.lease_id]
+
+    lease.release()
+    assert lease.released is True
+    assert active_sessions.active_session_registry_snapshot() == []
+
+    writes_before_third_release = writes
+    lease.release()
+    assert writes == writes_before_third_release

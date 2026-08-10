@@ -16112,26 +16112,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _quick_key,
             )
             return _limit_message
-        _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.started_ts = time.time()
-        self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
-
-        # Claim refresh context only for a genuine inbound user event accepted
-        # after the command. Event timestamps keep an older FIFO entry from
-        # stealing the note; generation keeps an already-running turn out.
-        if not is_internal:
-            refresh_reservation = self._claim_refresh_context_note(
-                _quick_key, event, _run_generation
-            )
-            if refresh_reservation:
-                event.metadata["refresh_context_note"] = refresh_reservation["note"]
-                event.metadata["refresh_context_token"] = refresh_reservation["token"]
-
+        _run_generation = 0
+        refresh_reservation = None
         try:
+            _claim_state = self._session_state(_quick_key)
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.started_ts = time.time()
+            self._persist_active_agents()
+            _run_generation = self._begin_session_run_generation(_quick_key)
+
+            # Claim refresh context only for a genuine inbound user event accepted
+            # after the command. Event timestamps keep an older FIFO entry from
+            # stealing the note; generation keeps an already-running turn out.
+            if not is_internal:
+                refresh_reservation = self._claim_refresh_context_note(
+                    _quick_key, event, _run_generation
+                )
+                if refresh_reservation:
+                    event.metadata["refresh_context_note"] = refresh_reservation["note"]
+                    event.metadata["refresh_context_token"] = refresh_reservation["token"]
+
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -16182,14 +16184,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
-            if not (getattr(event, "metadata", None) or {}).get(
-                "refresh_context_note_committed"
-            ):
-                self._finish_refresh_context_note(
-                    _quick_key,
-                    str((getattr(event, "metadata", None) or {}).get("refresh_context_token") or ""),
-                    _run_generation,
-                    attempted=False,
+            try:
+                if not (getattr(event, "metadata", None) or {}).get(
+                    "refresh_context_note_committed"
+                ):
+                    _refresh_token = str(
+                        (getattr(event, "metadata", None) or {}).get(
+                            "refresh_context_token"
+                        )
+                        or (refresh_reservation or {}).get("token")
+                        or ""
+                    )
+                    self._finish_refresh_context_note(
+                        _quick_key,
+                        _refresh_token,
+                        _run_generation,
+                        attempted=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to roll back refresh context during turn cleanup",
+                    exc_info=True,
                 )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -16199,12 +16214,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # permanently (every later message silently fans out through MoA).
             # Putting it in finally guarantees the revert on success, exception,
             # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
+            try:
+                self._restore_moa_one_shot(event, _quick_key)
+            except Exception:
+                logger.warning(
+                    "Failed to restore MoA one-shot override during turn cleanup",
+                    exc_info=True,
+                )
+            try:
+                self._restore_pending_one_turn_model_override(_quick_key)
+            except Exception:
+                logger.warning(
+                    "Failed to restore one-turn model override during turn cleanup",
+                    exc_info=True,
+                )
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
             # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
+            try:
+                await self._clear_durable_active_turn(event)
+            except Exception:
+                logger.warning(
+                    "Failed to clear durable active turn during turn cleanup",
+                    exc_info=True,
+                )
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -16212,11 +16245,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            try:
+                self._release_running_agent_state(_quick_key)
+            except Exception:
+                logger.warning(
+                    "Failed to release running agent state during turn cleanup",
+                    exc_info=True,
+                )
+            # If setup failed before the lease was attached to SessionState,
+            # the normal state release above cannot see it. ActiveSessionLease
+            # release is idempotent, so this also safely covers attached leases.
+            if _active_session_lease is not None:
+                try:
+                    _active_session_lease.release()
+                except Exception:
+                    logger.warning(
+                        "Failed to release active session lease during turn cleanup",
+                        exc_info=True,
+                    )
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                self._release_turn_lease(_quick_key, _run_generation)
+            except Exception:
+                logger.warning(
+                    "Failed to release turn lease during turn cleanup",
+                    exc_info=True,
+                )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.

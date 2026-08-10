@@ -336,18 +336,16 @@ def try_acquire_active_session(
 
 def release_active_session(lease: ActiveSessionLease) -> None:
     state_path = _state_path()
-    try:
-        with _FileLock(_lock_path()):
-            entries = _prune_dead(_read_entries(state_path))
-            kept = [
-                entry
-                for entry in entries
-                if str(entry.get("lease_id") or "") != lease.lease_id
-            ]
-            if len(kept) != len(entries):
-                _write_entries(state_path, kept)
-    finally:
-        lease.released = True
+    with _FileLock(_lock_path()):
+        entries = _prune_dead(_read_entries(state_path))
+        kept = [
+            entry
+            for entry in entries
+            if str(entry.get("lease_id") or "") != lease.lease_id
+        ]
+        if len(kept) != len(entries):
+            _write_entries(state_path, kept)
+    lease.released = True
 
 
 def transfer_active_session(
