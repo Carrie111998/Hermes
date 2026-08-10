@@ -100,12 +100,44 @@ class TestCleanupStaleAsyncClients:
 
         try:
             cleanup_stale_async_clients()
+            mock_client.close.assert_called_once()
             with _client_cache_lock:
                 assert key not in _client_cache, "Stale entry should be removed"
         finally:
             # Clean up in case test fails
             with _client_cache_lock:
                 _client_cache.pop(key, None)
+
+    def test_awaits_async_close_for_closed_loop(self):
+        from agent.auxiliary_client import (
+            _client_cache,
+            _client_cache_lock,
+            cleanup_stale_async_clients,
+        )
+
+        class AsyncClient:
+            def __init__(self):
+                self._client = MagicMock()
+                self._client.is_closed = False
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        loop = asyncio.new_event_loop()
+        loop.close()
+        client = AsyncClient()
+        key = ("test_async_close", True, "", "", "", (), False)
+        with _client_cache_lock:
+            _client_cache[key] = (client, "test-model", loop)
+
+        try:
+            cleanup_stale_async_clients()
+            assert client.closed
+        finally:
+            with _client_cache_lock:
+                _client_cache.pop(key, None)
+
 
     def test_keeps_live_entries(self):
         """Entries with an open loop should be preserved."""
