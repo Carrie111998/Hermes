@@ -248,14 +248,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
   const { connectionRef, gateway, gatewayRef, requestGateway } = useGatewayRequest()
 
-  const {
-    loadMoreMessagingForPlatform,
-    loadMoreSessions,
-    loadMoreSessionsForProfile,
-    refreshCronJobs,
-    refreshMessagingSessions,
-    refreshSessions
-  } = useSessionListActions({ profileScope })
+  const { loadMoreMessagingForPlatform, loadMoreSessions, refreshCronJobs, refreshMessagingSessions, refreshSessions } =
+    useSessionListActions({ profileScope })
 
   const updateActiveSessionRuntimeInfo = useCallback(
     (info: { branch?: string; cwd?: string }) => {
@@ -879,7 +873,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     onDismissError: dismissError,
     onEdit: editMessage,
     onLoadMoreMessaging: loadMoreMessagingForPlatform,
-    onLoadMoreProfileSessions: loadMoreSessionsForProfile,
     onLoadMoreSessions: loadMoreSessions,
     onManageCronJob: jobId => {
       setCronFocusJobId(jobId)
