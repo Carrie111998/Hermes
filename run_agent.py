@@ -3168,6 +3168,20 @@ class AIAgent:
                         exc_info=True,
                     )
 
+        # Stage 0 has no claimed native cancellation frame. Retire the child
+        # process so a stop cannot leak late deltas into a later turn.
+        if getattr(self, "api_mode", None) == "claude_cli":
+            _claude_session = getattr(self, "_claude_cli_session", None)
+            _request_interrupt = getattr(_claude_session, "request_interrupt", None)
+            if callable(_request_interrupt):
+                try:
+                    _request_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to retire Claude CLI subprocess during interrupt",
+                        exc_info=True,
+                    )
+
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
@@ -4384,6 +4398,17 @@ class AIAgent:
             if codex_session is not None:
                 self._codex_session = None
                 codex_session.close()
+        except Exception:
+            pass
+
+        # 6d. Close the persistent official Claude CLI subprocess. As above,
+        # clear the attribute before close so repeated/concurrent teardown is
+        # idempotent and cannot reuse a half-closed session.
+        try:
+            claude_cli_session = getattr(self, "_claude_cli_session", None)
+            if claude_cli_session is not None:
+                self._claude_cli_session = None
+                claude_cli_session.close()
         except Exception:
             pass
 
@@ -8082,6 +8107,26 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+    def _run_claude_cli_turn(
+        self,
+        user_message,
+        original_user_message,
+        messages,
+        effective_task_id,
+        should_review_memory=False,
+    ):
+        """Forwarder for the official Claude CLI special runtime."""
+        from agent.transports.claude_cli import run_claude_cli_turn
+
+        return run_claude_cli_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
 
 def main(
     query: str = None,

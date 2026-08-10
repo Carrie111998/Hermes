@@ -393,6 +393,7 @@ _VALID_API_MODES = {
     # `model.openai_runtime == "codex_app_server"` AND provider in
     # {"openai", "openai-codex"}. Default is unchanged.
     "codex_app_server",
+    "claude_cli",
 }
 
 
@@ -1701,6 +1702,36 @@ def resolve_runtime_provider(
                 f"provider {requested_provider!r} is disabled in config "
                 f"(providers.{requested_provider}.enabled: false)"
             )
+
+    _claude_model_cfg = _get_model_config()
+    _configured_provider = str(
+        _claude_model_cfg.get("provider") or ""
+    ).strip().lower()
+    _claude_cli_explicit = requested_provider in {"claude-cli", "claude_cli"} or (
+        requested_provider == "auto"
+        and _configured_provider in {"claude-cli", "claude_cli"}
+    )
+    if _claude_cli_explicit:
+        if explicit_api_key or _claude_model_cfg.get("api_key"):
+            raise ValueError("claude-cli does not accept api_key")
+        if explicit_base_url or _claude_model_cfg.get("base_url"):
+            raise ValueError("claude-cli does not accept base_url")
+        _claude_target_model = target_model or str(
+            _claude_model_cfg.get("default") or ""
+        ).strip()
+        if _claude_target_model != "claude-opus-5":
+            raise ValueError(
+                "claude-cli Stage 0 requires the exact provider/model pair "
+                "provider=claude-cli, model=claude-opus-5"
+            )
+        return {
+            "provider": "claude-cli",
+            "api_mode": "claude_cli",
+            "base_url": "",
+            "api_key": "",
+            "source": "external-process",
+            "requested_provider": "claude-cli",
+        }
 
     if requested_provider == "moa":
         return {

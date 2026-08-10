@@ -1617,6 +1617,17 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # Optional opt-in text-only runtime backed by one persistent official
+    # Claude CLI subprocess. Authentication/session/policy stay inside the CLI.
+    if agent.api_mode == "claude_cli":
+        return agent._run_claude_cli_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+        )
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
