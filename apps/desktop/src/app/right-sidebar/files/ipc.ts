@@ -1,6 +1,9 @@
 import ignore from 'ignore'
 
 import type { HermesReadDirEntry, HermesReadDirResult } from '@/global'
+import { desktopFsCacheKey, desktopGitRoot, readDesktopDir, readDesktopFileDataUrl } from '@/lib/desktop-fs'
+import { ALWAYS_EXCLUDED } from '@/lib/excluded-paths'
+import { cleanPath, comparisonPath } from '@/lib/path-compare'
 
 export type ProjectTreeEntry = HermesReadDirEntry
 
@@ -26,21 +29,10 @@ function decodeDataUrl(dataUrl: string) {
   return new TextDecoder().decode(bytes)
 }
 
-function clean(path: string) {
-  return path.replace(/\/+$/, '') || '/'
-}
-
-// Windows path identity is case-insensitive. Fold only comparison keys so the
-// relative path returned below keeps the filesystem's original spelling;
-// POSIX paths remain case-sensitive.
-function comparisonPath(path: string) {
-  return /^[A-Za-z]:(?:\/|$)/.test(path) || path.startsWith('//') ? path.toLowerCase() : path
-}
-
 /** Strict POSIX-style relative path; null if `child` is not inside `root`. */
 function relativeTo(root: string, child: string) {
-  const r = clean(root)
-  const c = clean(child)
+  const r = cleanPath(root)
+  const c = cleanPath(child)
   const rKey = comparisonPath(r)
   const cKey = comparisonPath(c)
 
@@ -53,7 +45,7 @@ function relativeTo(root: string, child: string) {
 
 /** Repo-root → repo-root/a → repo-root/a/b → … for every dir between root and `dir`. */
 function ancestorDirs(root: string, dir: string) {
-  const r = clean(root)
+  const r = cleanPath(root)
   const rel = relativeTo(r, dir)
 
   if (rel === null || rel === '') {
@@ -72,15 +64,11 @@ function ancestorDirs(root: string, dir: string) {
 }
 
 async function gitRootFor(start: string) {
-  if (!window.hermesDesktop?.gitRoot) {
-    return null
-  }
-
-  const key = clean(start)
+  const key = `${desktopFsCacheKey()}:${cleanPath(start)}`
   let cached = gitRootCache.get(key)
 
   if (!cached) {
-    cached = window.hermesDesktop.gitRoot(key)
+    cached = desktopGitRoot(cleanPath(start))
     gitRootCache.set(key, cached)
   }
 
@@ -89,18 +77,14 @@ async function gitRootFor(start: string) {
 
 /** Read .gitignore at `dir` if it actually exists — never probe missing files. */
 async function readGitignore(dir: string): Promise<GitignoreRule | null> {
-  if (!window.hermesDesktop?.readDir || !window.hermesDesktop.readFileDataUrl) {
-    return null
-  }
-
   try {
-    const listing = await window.hermesDesktop.readDir(dir)
+    const listing = await readDesktopDir(dir)
 
     if (!listing.entries.some(e => e.name === '.gitignore' && !e.isDirectory)) {
       return null
     }
 
-    const text = decodeDataUrl(await window.hermesDesktop.readFileDataUrl(`${dir}/.gitignore`))
+    const text = decodeDataUrl(await readDesktopFileDataUrl(`${dir}/.gitignore`))
 
     return { base: dir, ig: ignore().add(text) }
   } catch {
@@ -109,11 +93,11 @@ async function readGitignore(dir: string): Promise<GitignoreRule | null> {
 }
 
 async function gitignoreFor(dir: string) {
-  const key = clean(dir)
+  const key = `${desktopFsCacheKey()}:${cleanPath(dir)}`
   let cached = gitignoreCache.get(key)
 
   if (!cached) {
-    cached = readGitignore(key)
+    cached = readGitignore(cleanPath(dir))
     gitignoreCache.set(key, cached)
   }
 
@@ -151,9 +135,10 @@ export async function readProjectDir(dirPath: string, rootPath = dirPath): Promi
     return { entries: [], error: 'no-bridge' }
   }
 
-  const result = await window.hermesDesktop.readDir(dirPath)
+  const result = await readDesktopDir(dirPath)
+  const entries = (result?.entries ?? []).filter(entry => !ALWAYS_EXCLUDED.has(entry.name))
 
-  return { ...result, entries: await filterIgnored(result.entries, rootPath, dirPath) }
+  return { ...result, entries: await filterIgnored(entries, rootPath, dirPath) }
 }
 
 export function clearProjectDirCache(rootPath?: string) {
@@ -164,7 +149,7 @@ export function clearProjectDirCache(rootPath?: string) {
     return
   }
 
-  const key = clean(rootPath)
+  const key = `${desktopFsCacheKey()}:${cleanPath(rootPath)}`
   gitRootCache.delete(key)
   gitignoreCache.delete(key)
 }

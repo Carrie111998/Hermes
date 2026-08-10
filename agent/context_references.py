@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from agent.model_metadata import estimate_tokens_rough
+from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from hermes_cli.sizefmt import format_bytes
 
 _QUOTED_REFERENCE_VALUE = r'(?:`[^`\n]+`|"[^"\n]+"|\'[^\'\n]+\')'
 REFERENCE_PATTERN = re.compile(
@@ -167,13 +169,24 @@ async def preprocess_context_references_async(
     blocks: list[str] = []
     injected_tokens = 0
 
-    for ref in refs:
-        warning, block = await _expand_reference(
-            ref,
-            cwd_path,
-            url_fetcher=url_fetcher,
-            allowed_root=allowed_root_path,
+    # Expand all references concurrently. Each _expand_reference is independent
+    # (no shared state during expansion) — a message with several @url: refs
+    # would otherwise pay one full web_extract round-trip per ref in series.
+    # gather preserves positional order, so we reassemble warnings/blocks in the
+    # original ref order exactly as the prior serial loop did; the token-budget
+    # check below is unchanged (it runs once, after all refs are expanded).
+    expanded = await asyncio.gather(
+        *(
+            _expand_reference(
+                ref,
+                cwd_path,
+                url_fetcher=url_fetcher,
+                allowed_root=allowed_root_path,
+            )
+            for ref in refs
         )
+    )
+    for warning, block in expanded:
         if warning:
             warnings.append(warning)
         if block:
@@ -310,6 +323,7 @@ def _expand_git_reference(
     args: list[str],
     label: str,
 ) -> tuple[str | None, str | None]:
+    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         result = subprocess.run(
             ["git", *args],
@@ -318,6 +332,7 @@ def _expand_git_reference(
             text=True, encoding='utf-8', errors='replace',
             timeout=30,
             stdin=subprocess.DEVNULL,
+            **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:
         return f"{ref.raw}: git command timed out (30s)", None
@@ -345,9 +360,9 @@ async def _fetch_url_content(
 async def _default_url_fetcher(url: str) -> str:
     from tools.web_tools import web_extract_tool
 
-    raw = await web_extract_tool([url], format="markdown", use_llm_processing=True)
+    raw = await web_extract_tool([url], format="markdown")
     payload = json.loads(raw)
-    docs = payload.get("data", {}).get("documents", [])
+    docs = payload.get("results", [])
     if not docs:
         return ""
     doc = docs[0]
@@ -386,6 +401,37 @@ def _ensure_reference_path_allowed(path: Path) -> None:
         except ValueError:
             continue
         raise ValueError("path is a sensitive credential or internal Hermes path and cannot be attached")
+
+    # Anchor to the canonical read deny-list (agent/file_safety.get_read_block_error),
+    # the single source of truth used by the file/terminal read path. The narrow
+    # list above predates that guard and never caught the real credential stores:
+    # provider keys (auth.json), Anthropic OAuth tokens (.anthropic_oauth.json),
+    # MCP OAuth material (mcp-tokens/), webhook HMAC secrets, and project-local
+    # .env files. That gap matters because the gateway feeds UNTRUSTED remote
+    # message text into reference expansion, so `@file:~/.hermes/auth.json` from a
+    # chat peer would otherwise read the operator's keys straight into context.
+    # Routing through the canonical guard closes the gap today and keeps this path
+    # protected automatically whenever that deny-list grows.
+    try:
+        from agent.file_safety import get_read_block_error
+
+        if get_read_block_error(str(path)) is not None:
+            raise ValueError(
+                "path is a sensitive credential or internal Hermes path and cannot be attached"
+            )
+    except ValueError:
+        raise
+    except Exception:
+        # Fail CLOSED on the security path. This guard exists specifically to
+        # cover credential stores the narrow list above misses (auth.json,
+        # .anthropic_oauth.json, mcp-tokens/, ...). If the canonical lookup
+        # ever fails, silently falling through would re-open that exact hole —
+        # the gateway feeds untrusted remote text here, so a probe could then
+        # attach the operator's keys. Refuse instead: a spurious block on a
+        # legitimate file is a recoverable annoyance; a leaked credential is not.
+        raise ValueError(
+            "path could not be verified against the credential deny-list and cannot be attached"
+        )
 
 
 def _strip_trailing_punctuation(value: str) -> str:
@@ -490,6 +536,7 @@ def _iter_visible_entries(path: Path, cwd: Path, limit: int) -> list[Path]:
 
 
 def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
+    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
     try:
         result = subprocess.run(
             ["rg", "--files", str(path.relative_to(cwd))],
@@ -498,6 +545,7 @@ def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
             text=True, encoding='utf-8', errors='replace',
             timeout=10,
             stdin=subprocess.DEVNULL,
+            **_popen_kwargs,
         )
     except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
         return None
@@ -507,25 +555,40 @@ def _rg_files(path: Path, cwd: Path, limit: int) -> list[Path] | None:
     return files[:limit]
 
 
-def _human_bytes(n: int) -> str:
-    size = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GB"
+def _agent_visible_path(path: Path) -> str:
+    """Map a host path to the path the agent's tools can read in the active backend.
+
+    Under a container backend (docker) the gateway host path dangles inside the
+    sandbox — the container has its own filesystem and the host path is not
+    mounted. Files staged into an auto-mounted cache dir (``images/``,
+    ``attachments/``, ...) are translated to their in-container path via the
+    existing ``tools.credential_files`` machinery (#76577). Falls back to the
+    host path when the backend is local or translation is unavailable.
+    """
+    try:
+        # Desktop/in-process gateways may not have bridged ``terminal.*``
+        # config into ``TERMINAL_ENV`` at startup; run the idempotent bridge so
+        # the credential_files translation gate sees the active backend.
+        from tools.terminal_tool import _ensure_terminal_env_bridged
+
+        _ensure_terminal_env_bridged()
+        from tools.credential_files import to_agent_visible_cache_path
+
+        return to_agent_visible_cache_path(str(path))
+    except Exception:
+        return str(path)
 
 
 def _binary_reference_block(ref: ContextReference, path: Path) -> str:
     mime, _ = mimetypes.guess_type(path.name)
     mime = mime or "application/octet-stream"
     try:
-        size = _human_bytes(path.stat().st_size)
+        size = format_bytes(path.stat().st_size)
     except OSError:
         size = "unknown size"
     return (
         f"📎 {ref.raw} ({mime}, {size}) — binary file, not inlined as text. "
-        f"It is available on disk at `{path}`. Use your tools to work with it "
+        f"It is available on disk at `{_agent_visible_path(path)}`. Use your tools to work with it "
         f"(read or convert it, extract its text, or view/render it as needed); "
         f"do not tell the user the file type is unsupported."
     )

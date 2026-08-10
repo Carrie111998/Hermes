@@ -1048,6 +1048,42 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
         f"{_ALLOW_MACOS_KEYCHAIN_MARK}: allow a test to exercise the macOS "
         "Keychain credential reader with its own subprocess/platform mocks.",
     )
+    config.addinivalue_line(
+        "markers",
+        "require_symlinks: skip the test if symbolic links cannot be "
+        "created in the current environment (needs admin/developer mode "
+        "on Windows).",
+    )
+
+
+_symlink_supported_cache = None
+
+
+def _check_symlink_support() -> bool:
+    global _symlink_supported_cache
+    if _symlink_supported_cache is not None:
+        return _symlink_supported_cache
+
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "src"
+            src.touch()
+            lnk = Path(d) / "lnk"
+            lnk.symlink_to(src)
+            _symlink_supported_cache = True
+            return True
+    except OSError:
+        _symlink_supported_cache = False
+        return False
+
+
+def pytest_runtest_setup(item):
+    if item.get_closest_marker("require_symlinks"):
+        if not _check_symlink_support():
+            pytest.skip(
+                "Environment does not support symbolic links "
+                "(requires admin/developer mode on Windows)"
+            )
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
