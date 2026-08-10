@@ -25,6 +25,7 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
+    _is_recall_restatement,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -195,6 +196,7 @@ def provider_with_config(tmp_path, monkeypatch):
             "bank_id": "test-bank",
             "budget": "mid",
             "memory_mode": "hybrid",
+            "recall_source_tag_patterns": [r"^[A-Z]+-\d+$"],
         }
         config.update(overrides)
         config_path = tmp_path / "hindsight" / "config.json"
@@ -217,6 +219,22 @@ def test_normalize_retain_tags_accepts_csv_and_dedupes():
         "agent:fakeassistantname",
         "source_system:hermes-agent",
     ]
+
+
+@pytest.mark.parametrize("left,right", [
+    ("Project Nimbus launch date is April 1", "Project Nimbus launch date is April 15"),
+    ("The production deployment region is us-east-1.", "The production deployment region is us-east-2."),
+    ("Project Nimbus launch color is purple.", "Project Nimbus launch color is orange."),
+])
+def test_recall_restatement_never_collapses_conflicting_values(left, right):
+    assert _is_recall_restatement(left, right) is False
+
+
+def test_recall_restatement_collapses_known_next_check_suffix():
+    assert _is_recall_restatement(
+        "Robert prefers Decision, Evidence, and Next",
+        "Robert prefers Decision, Evidence, and Next check",
+    ) is True
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +335,19 @@ class TestConfig:
         assert p._recall_max_input_chars == 500
         assert p._bank_mission == "Test agent mission"
 
+    def test_recall_tags_accept_csv_and_normalize_to_list(self, provider_with_config):
+        p = provider_with_config(recall_tags="pilot, robert, pilot")
+        assert p._recall_tags == ["pilot", "robert"]
+
+    @pytest.mark.parametrize("configured,expected", [
+        ("false", False), ("0", False), ("true", True), ("1", True),
+    ])
+    def test_recall_expand_conflicts_parses_string_booleans(
+        self, provider_with_config, configured, expected
+    ):
+        p = provider_with_config(recall_result_expand_conflicts=configured)
+        assert p._recall_result_expand_conflicts is expected
+
 
     def test_embedded_profile_env_includes_idle_timeout_from_config(self):
         env = _build_embedded_profile_env({
@@ -337,6 +368,7 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *args, **kwargs: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -446,6 +478,374 @@ class TestToolHandlers:
         ))
         assert "Memory 1" in result["result"]
         assert "Memory 2" in result["result"]
+
+    def test_recall_source_group_limit_collapses_typed_restatements(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_items=8,
+            recall_result_max_chars=600,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Cedar depends on service Finch for schema validation.",
+                type="observation", document_id=None,
+                tags=["pilot", "robert", "relationship", "REL-01"],
+            ),
+            SimpleNamespace(
+                text="Project Cedar depends on service Finch for schema validation. | Involving: Project Cedar, service Finch",
+                type="world", document_id="stage1-v1-REL-01",
+                tags=["pilot", "robert", "relationship", "REL-01"],
+            ),
+            SimpleNamespace(
+                text="Service Finch is maintained by Team Amber.",
+                type="observation", document_id=None,
+                tags=["pilot", "robert", "relationship", "REL-01"],
+            ),
+            SimpleNamespace(
+                text="Robert prefers teal charts and no pie charts.",
+                type="observation", document_id=None,
+                tags=["pilot", "robert", "stable_preference", "PREF-03"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "Who maintains the service Cedar depends on?"}
+        ))
+
+        assert "Project Cedar depends on service Finch" in payload["result"]
+        assert "Involving: Project Cedar, service Finch" in payload["result"]
+        assert "Service Finch is maintained by Team Amber" in payload["result"]
+        assert payload["result"].count("Project Cedar depends") == 1
+        assert "teal charts" not in payload["result"]
+        assert len(payload["result"]) <= 500
+
+    def test_recall_item_limit_applies_after_richer_world_restatement_wins(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_items=1,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Robert prefers a three-row table with Decision, Evidence, and Next.",
+                type="observation", document_id=None,
+                tags=["pilot", "preference", "PREF-01"],
+            ),
+            SimpleNamespace(
+                text="Robert prefers a three-row table with Decision, Evidence, and Next check. | Involving: Robert",
+                type="world", document_id="preference-source",
+                tags=["pilot", "preference", "PREF-01"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What table does Robert prefer?"}
+        ))
+
+        assert "Next check" in payload["result"]
+        assert "Involving: Robert" in payload["result"]
+
+    def test_recall_source_group_limit_preserves_ranked_conflict_groups(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_items=8,
+            recall_result_max_chars=600,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple.", type="world",
+                document_id="stage1-v1-CON-02",
+                tags=["pilot", "robert", "conflict", "CON-02"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange.", type="world",
+                document_id="stage1-v1-CON-01",
+                tags=["pilot", "robert", "conflict", "CON-01"],
+            ),
+            SimpleNamespace(
+                text="The cafeteria served violet macarons.", type="world",
+                document_id="stage1-v1-IRR-01",
+                tags=["pilot", "robert", "irrelevant", "IRR-01"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the unresolved Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "macarons" not in payload["result"]
+
+    def test_recall_deduplication_does_not_collapse_claims_across_sources(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple. | Source: Alpha",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple. | Source: Beta",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "Source: Alpha" in payload["result"]
+        assert "Source: Beta" in payload["result"]
+
+    @pytest.mark.parametrize("limit_name,limit_value", [
+        ("recall_result_max_items", 1),
+        ("recall_result_max_chars", 80),
+    ])
+    def test_recall_abstains_when_cap_cannot_preserve_complete_conflict_set(
+        self, provider_with_config, limit_name, limit_value
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_expand_conflicts=True,
+            **{limit_name: limit_value},
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source Beta.",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Source Alpha also recorded a secondary rationale.",
+                type="world", document_id="source-alpha",
+                tags=["pilot"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert payload["result"] == "No relevant memories found."
+
+    def test_recall_character_cap_drops_only_optional_conflict_secondary_facts(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_chars=150,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Source Alpha also recorded a secondary rationale.",
+                type="world", document_id="source-alpha",
+                tags=["pilot"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source Beta.",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "secondary rationale" not in payload["result"]
+
+    def test_recall_query_gate_does_not_remove_consecutive_conflict_source(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_min_query_terms=2,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Source Beta disagrees and says orange.",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Robert likes macarons.",
+                type="world", document_id="unrelated",
+                tags=["pilot", "irrelevant"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "macarons" not in payload["result"]
+
+    def test_recall_conflict_detection_checks_every_fact_in_source_group(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color rationale from Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source Beta.",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Robert likes macarons.",
+                type="world", document_id="unrelated",
+                tags=["pilot", "irrelevant"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "macarons" not in payload["result"]
+
+    def test_recall_item_cap_prioritizes_conflict_claim_over_source_rationale(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_max_items=2,
+            recall_result_expand_conflicts=True,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Source Alpha rationale: the launch memo was revised after review.",
+                type="world", document_id="source-alpha",
+                tags=["pilot"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source Beta.",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "rationale" not in payload["result"]
+
+    @pytest.mark.parametrize("limit_name,limit_value", [
+        ("recall_result_max_items", 2),
+        ("recall_result_max_chars", 140),
+    ])
+    def test_recall_conflict_subset_survives_caps_with_ordinary_selected_group(
+        self, provider_with_config, limit_name, limit_value
+    ):
+        p = provider_with_config(
+            recall_result_max_source_groups=3,
+            recall_result_expand_conflicts=True,
+            **{limit_name: limit_value},
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Nimbus launch color is purple according to Source Alpha.",
+                type="world", document_id="source-alpha",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Source Alpha rationale explaining evidence.",
+                type="world", document_id="source-alpha",
+                tags=["pilot"],
+            ),
+            SimpleNamespace(
+                text="Project Nimbus launch color is orange according to Source Beta.",
+                type="world", document_id="source-beta",
+                tags=["pilot", "conflict"],
+            ),
+            SimpleNamespace(
+                text="Robert likes macarons.",
+                type="world", document_id="ordinary-source",
+                tags=["pilot", "irrelevant"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Nimbus launch color?"}
+        ))
+
+        assert "purple" in payload["result"]
+        assert "orange" in payload["result"]
+        assert "rationale" not in payload["result"]
+        assert "macarons" not in payload["result"]
+
+    def test_recall_query_term_gate_abstains_when_ranked_results_are_unrelated(self, provider_with_config):
+        p = provider_with_config(
+            recall_result_max_source_groups=1,
+            recall_result_min_query_terms=1,
+        )
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="Project Cedar chose SQLite for its prototype.", type="world",
+                document_id="cedar-decision", tags=["pilot", "robert", "decision"],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "What is the Lighthouse catering budget?"}
+        ))
+
+        assert payload["result"] == "No relevant memories found."
+
+    def test_recall_character_cap_omits_oversized_memory_instead_of_truncating_it(self, provider_with_config):
+        p = provider_with_config(recall_result_max_chars=24)
+        p._client.arecall.return_value = SimpleNamespace(results=[
+            SimpleNamespace(
+                text="A long memory whose partial text could change its meaning.",
+                type="world", document_id="long-source", tags=[],
+            ),
+        ])
+
+        payload = json.loads(p.handle_tool_call(
+            "hindsight_recall", {"query": "long memory meaning"}
+        ))
+
+        assert payload["result"] == "No relevant memories found."
 
 
     def test_reflect_success(self, provider):

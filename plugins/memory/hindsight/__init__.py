@@ -37,6 +37,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 
@@ -85,6 +86,70 @@ def _parse_int_setting(value: Any, default: int) -> int:
     except (TypeError, ValueError):
         logger.warning("Invalid integer Hindsight setting %r; using default %s", value, default)
         return default
+
+
+def _parse_bool_setting(value: Any, default: bool = False) -> bool:
+    """Parse JSON/native booleans and common string/env representations."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    return default
+
+
+def _normalize_recall_text(text: str) -> str:
+    """Normalize a recalled fact for conservative typed-restatement collapse."""
+    # Hindsight world facts commonly append provenance after ``|`` while an
+    # observation repeats the same leading claim. Keep the claim for matching.
+    claim = str(text or "").split("|", 1)[0].strip().lower()
+    return " ".join("".join(ch if ch.isalnum() else " " for ch in claim).split())
+
+
+def _is_recall_restatement(left: str, right: str) -> bool:
+    """Collapse only exact claims plus one known benign typed-restatement suffix."""
+    a = _normalize_recall_text(left)
+    b = _normalize_recall_text(right)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = sorted((a, b), key=len)
+    suffix = longer[len(shorter):].strip() if longer.startswith(shorter + " ") else ""
+    return len(shorter) >= 32 and suffix == "check"
+
+
+_RECALL_QUERY_STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does",
+    "for", "from", "how", "i", "in", "is", "it", "me", "of", "on", "or",
+    "our", "please", "project", "tell", "that", "the", "this", "to",
+    "user", "was", "were", "what", "when", "where", "which", "who", "why",
+    "with", "you",
+}
+
+
+def _recall_query_terms(text: str) -> set[str]:
+    """Extract lightweight stemmed content terms for deterministic abstention."""
+    raw = _normalize_recall_text(text).split()
+    terms: set[str] = set()
+    for token in raw:
+        if token in _RECALL_QUERY_STOPWORDS or len(token) < 3:
+            continue
+        if token.endswith("ies") and len(token) > 4:
+            token = token[:-3] + "y"
+        else:
+            for suffix in ("ing", "ed", "es", "s"):
+                if token.endswith(suffix) and len(token) > len(suffix) + 3:
+                    token = token[:-len(suffix)]
+                    break
+        if token not in _RECALL_QUERY_STOPWORDS:
+            terms.add(token)
+    return terms
 
 
 # Env var the embedded daemon manager reads (at import time, as a module-level
@@ -718,6 +783,14 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+        # Opt-in post-retrieval bounds. Zero preserves Hindsight's native
+        # response unchanged for existing installations.
+        self._recall_result_max_source_groups = 0
+        self._recall_result_max_items = 0
+        self._recall_result_max_chars = 0
+        self._recall_result_min_query_terms = 0
+        self._recall_source_tag_patterns: list[str] = []
+        self._recall_result_expand_conflicts = False
 
         # Bank
         self._bank_mission = ""
@@ -1014,6 +1087,12 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_async","description": "Process retain asynchronously on the Hindsight server", "default": True},
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
+            {"key": "recall_result_max_source_groups", "description": "Opt-in maximum ranked source groups returned after recall (0 keeps all)", "default": 0},
+            {"key": "recall_result_max_items", "description": "Opt-in maximum canonical recall items after typed-restatement collapse (0 keeps all)", "default": 0},
+            {"key": "recall_result_max_chars", "description": "Opt-in hard character cap applied after recall serialization (0 disables)", "default": 0},
+            {"key": "recall_result_min_query_terms", "description": "Minimum shared stemmed content terms required between query and a returned source group (0 disables)", "default": 0},
+            {"key": "recall_source_tag_patterns", "description": "Regex list identifying source-specific tags used to join typed restatements", "default": []},
+            {"key": "recall_result_expand_conflicts", "description": "Preserve consecutive ranked conflict-tagged source groups beyond the source-group limit", "default": False},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
@@ -1324,7 +1403,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("observation_scopes")
             or os.environ.get("HINDSIGHT_RETAIN_OBSERVATION_SCOPES", "")
         )
-        self._recall_tags = self._config.get("recall_tags") or None
+        self._recall_tags = _normalize_retain_tags(self._config.get("recall_tags")) or None
         self._recall_tags_match = self._config.get("recall_tags_match", "any")
         self._retain_source = str(
             self._config.get("retain_source") or os.environ.get("HINDSIGHT_RETAIN_SOURCE", "")
@@ -1357,6 +1436,29 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        self._recall_result_max_source_groups = max(
+            0, _parse_int_setting(self._config.get("recall_result_max_source_groups"), 0)
+        )
+        self._recall_result_max_items = max(
+            0, _parse_int_setting(self._config.get("recall_result_max_items"), 0)
+        )
+        self._recall_result_max_chars = max(
+            0, _parse_int_setting(self._config.get("recall_result_max_chars"), 0)
+        )
+        self._recall_result_min_query_terms = max(
+            0, _parse_int_setting(self._config.get("recall_result_min_query_terms"), 0)
+        )
+        self._recall_source_tag_patterns = _normalize_retain_tags(
+            self._config.get("recall_source_tag_patterns")
+        )
+        for pattern in self._recall_source_tag_patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"Invalid recall_source_tag_patterns regex {pattern!r}: {exc}") from exc
+        self._recall_result_expand_conflicts = _parse_bool_setting(
+            self._config.get("recall_result_expand_conflicts"), False
+        )
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1469,6 +1571,161 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
+    def _recall_source_key(self, result: Any) -> tuple[str, ...]:
+        """Return a stable source grouping key for one ranked recall result."""
+        tags = {str(tag).strip().lower() for tag in (getattr(result, "tags", None) or []) if str(tag).strip()}
+        source_tags = tuple(sorted(
+            tag for tag in tags
+            if any(re.search(pattern, tag, flags=re.IGNORECASE) for pattern in self._recall_source_tag_patterns)
+        ))
+        if source_tags:
+            return ("source-tags", *source_tags)
+        document_id = str(getattr(result, "document_id", "") or "").strip()
+        if document_id:
+            return ("document", document_id)
+        result_id = str(getattr(result, "id", "") or "").strip()
+        return ("result", result_id or str(id(result)))
+
+    @staticmethod
+    def _recall_result_is_conflict(result: Any) -> bool:
+        return any(
+            str(tag).strip().lower() == "conflict"
+            for tag in (getattr(result, "tags", None) or [])
+        )
+
+    @classmethod
+    def _recall_group_is_conflict(cls, results: Any) -> bool:
+        return any(cls._recall_result_is_conflict(result) for result in results)
+
+    def _select_recall_results(self, results: Any, *, query: str = "") -> list[Any]:
+        """Bound ranked recall while preserving source-coherent and conflict facts."""
+        ranked = [r for r in (results or []) if str(getattr(r, "text", "") or "").strip()]
+        if not any((
+            self._recall_result_max_source_groups,
+            self._recall_result_max_items,
+            self._recall_result_max_chars,
+            self._recall_result_min_query_terms,
+        )):
+            return ranked
+
+        groups: dict[tuple[str, ...], list[Any]] = {}
+        order: list[tuple[str, ...]] = []
+        for result in ranked:
+            key = self._recall_source_key(result)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(result)
+
+        ranked_order = list(order)
+        if self._recall_result_min_query_terms and query:
+            query_terms = _recall_query_terms(query)
+            order = [
+                key for key in order
+                if len(
+                    query_terms
+                    & _recall_query_terms(" ".join(str(item.text) for item in groups[key]))
+                ) >= self._recall_result_min_query_terms
+            ]
+
+        selected_keys = order
+        group_limit = self._recall_result_max_source_groups
+        if group_limit and order:
+            selected_keys = order[:group_limit]
+            # Conflicts are evidence sets: if the highest-ranked source is
+            # explicitly tagged conflict, retain the consecutive competing
+            # conflict sources rather than presenting one side as authoritative.
+            if self._recall_result_expand_conflicts and self._recall_group_is_conflict(groups[order[0]]):
+                first_rank = ranked_order.index(order[0])
+                for key in ranked_order[first_rank + 1:]:
+                    if not self._recall_group_is_conflict(groups[key]):
+                        break
+                    if key not in selected_keys:
+                        selected_keys.append(key)
+
+        group_canonicals: list[list[Any]] = []
+        for key in selected_keys:
+            group_canonical: list[Any] = []
+            for result in groups[key]:
+                text = str(result.text).strip()
+                duplicate_index = next(
+                    (
+                        index for index, existing in enumerate(group_canonical)
+                        if _is_recall_restatement(text, str(existing.text))
+                    ),
+                    None,
+                )
+                if duplicate_index is not None:
+                    existing = group_canonical[duplicate_index]
+                    if (
+                        str(getattr(result, "type", "") or "").lower() == "world"
+                        and str(getattr(existing, "type", "") or "").lower() != "world"
+                    ):
+                        group_canonical[duplicate_index] = result
+                    continue
+                group_canonical.append(result)
+            if self._recall_group_is_conflict(group_canonical):
+                group_canonical.sort(key=lambda item: not self._recall_result_is_conflict(item))
+            group_canonicals.append(group_canonical)
+
+        conflict_group_indexes = [
+            index for index, group in enumerate(group_canonicals)
+            if self._recall_group_is_conflict(group)
+        ]
+        conflict_set = len(conflict_group_indexes) > 1
+        if (
+            conflict_set
+            and self._recall_result_max_items
+            and self._recall_result_max_items < len(conflict_group_indexes)
+        ):
+            return []
+
+        canonical: list[Any] = []
+        if conflict_set:
+            # Reserve one claim from every conflicting source before ordinary
+            # groups or secondary facts, so global caps cannot present one side.
+            canonical.extend(group_canonicals[index][0] for index in conflict_group_indexes)
+            conflict_indexes = set(conflict_group_indexes)
+            for index, group in enumerate(group_canonicals):
+                canonical.extend(group[1:] if index in conflict_indexes else group)
+        else:
+            for group in group_canonicals:
+                canonical.extend(group)
+        if self._recall_result_max_items:
+            return canonical[: self._recall_result_max_items]
+        return canonical
+
+    def _format_recall_results(self, results: Any, *, numbered: bool, query: str = "") -> str:
+        selected = self._select_recall_results(results, query=query)
+        selected_groups: dict[tuple[str, ...], list[Any]] = {}
+        for result in selected:
+            selected_groups.setdefault(self._recall_source_key(result), []).append(result)
+        conflict_source_keys = {
+            key for key, group in selected_groups.items()
+            if any(self._recall_result_is_conflict(result) for result in group)
+        }
+        complete_conflict_required = len(conflict_source_keys) > 1
+        lines: list[str] = []
+        serialized_source_keys: set[tuple[str, ...]] = set()
+        cap = self._recall_result_max_chars
+        for result in selected:
+            prefix = f"{len(lines) + 1}. " if numbered else "- "
+            line = prefix + str(result.text).strip()
+            candidate = "\n".join([*lines, line])
+            if cap and len(candidate) > cap:
+                # Never inject a partial memory: truncation can drop negation,
+                # provenance, or safety context and change the claim's meaning.
+                # A partial multi-source conflict is equally unsafe because it
+                # can present one side as authoritative.
+                if complete_conflict_required and not conflict_source_keys.issubset(serialized_source_keys):
+                    return ""
+                break
+            lines.append(line)
+            serialized_source_keys.add(self._recall_source_key(result))
+        if complete_conflict_required and not conflict_source_keys.issubset(serialized_source_keys):
+            return ""
+        return "\n".join(lines)
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
@@ -1522,7 +1779,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
                     num_results = len(resp.results) if resp.results else 0
                     logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                    text = self._format_recall_results(resp.results, numbered=False, query=query)
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text
@@ -1753,8 +2010,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 logger.debug("Tool hindsight_recall: %d results", num_results)
                 if not resp.results:
                     return json.dumps({"result": "No relevant memories found."})
-                lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
-                return json.dumps({"result": "\n".join(lines)})
+                text = self._format_recall_results(resp.results, numbered=True, query=query)
+                return json.dumps({"result": text or "No relevant memories found."})
             except Exception as e:
                 logger.warning("hindsight_recall failed: %s", e, exc_info=True)
                 return tool_error(f"Failed to search memory: {e}")
