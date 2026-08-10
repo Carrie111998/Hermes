@@ -97,10 +97,17 @@ def _snapshot_path(job_id: str):
 
 
 def _read_last_output(job_id: str) -> str:
+    """Load the previous snapshot for diffs, redacting legacy unredacted files.
+
+    Snapshots written before forced URL-credential redaction may still contain
+    userinfo or credential-named query values. Diff construction feeds the
+    agent prompt, so every loaded baseline must pass through the same forced
+    redaction as new source output.
+    """
     try:
         path = _snapshot_path(job_id)
         if path.exists():
-            return path.read_text(encoding="utf-8")
+            return _redact_monitor_text(path.read_text(encoding="utf-8"))
     except Exception as exc:
         logger.warning("Monitor: failed to read last output for %r: %s", job_id, exc)
     return ""

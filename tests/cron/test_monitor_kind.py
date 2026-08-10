@@ -153,30 +153,88 @@ def test_create_job_monitor_rejected_with_no_agent(hermes_env):
         )
 
 
-@pytest.mark.parametrize(
-    ("initial_monitor", "updates"),
-    [
-        (True, {"no_agent": True, "script": "worker.sh"}),
-        (False, {"monitor_script": "monitor.sh"}),
-    ],
-)
-def test_update_job_rejects_monitor_with_no_agent(
-    hermes_env, initial_monitor, updates
-):
+def test_update_job_rejects_no_agent_on_monitor_job(hermes_env):
+    """The create-time monitor×no_agent invariant must hold through the
+    update door too — the scheduler's no_agent short-circuit runs before
+    the monitor gate, so flipping no_agent=True on a monitor job would
+    silently disable the monitor (post-merge audit of #81138)."""
     from cron.jobs import create_job, update_job
 
-    _write_script(hermes_env, "monitor.sh", "echo state\n")
-    _write_script(hermes_env, "worker.sh", "echo alert\n")
+    _write_script(hermes_env, "mon.sh", "echo stable\n")
+    _write_script(hermes_env, "w.sh", "echo hi\n")
     job = create_job(
-        prompt="React" if initial_monitor else None,
+        prompt="React to the change",
         schedule="every 5m",
-        monitor_script="monitor.sh" if initial_monitor else None,
-        script=None if initial_monitor else "worker.sh",
-        no_agent=not initial_monitor,
+        monitor_script="mon.sh",
+        deliver="local",
     )
-
     with pytest.raises(ValueError, match="no_agent"):
-        update_job(job["id"], updates)
+        update_job(job["id"], {"no_agent": True, "script": "w.sh"})
+
+
+def test_update_job_rejects_adding_monitor_to_no_agent_job(hermes_env):
+    from cron.jobs import create_job, update_job
+
+    _write_script(hermes_env, "w.sh", "echo hi\n")
+    _write_script(hermes_env, "mon.sh", "echo stable\n")
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="w.sh",
+        no_agent=True,
+        deliver="local",
+    )
+    with pytest.raises(ValueError, match="no_agent"):
+        update_job(job["id"], {"monitor_script": "mon.sh"})
+
+
+def test_update_job_rejects_second_monitor_source(hermes_env):
+    from cron.jobs import create_job, update_job
+
+    _write_script(hermes_env, "mon.sh", "echo stable\n")
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="mon.sh",
+        deliver="local",
+    )
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        update_job(job["id"], {"monitor_url": "https://example.com/status"})
+
+
+def test_update_job_allows_clearing_monitor_then_no_agent(hermes_env):
+    """Clearing the monitor and flipping no_agent in ONE update is valid —
+    the invariant is checked on the merged record, not per-field."""
+    from cron.jobs import create_job, get_job, update_job
+
+    _write_script(hermes_env, "mon.sh", "echo stable\n")
+    _write_script(hermes_env, "w.sh", "echo hi\n")
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="mon.sh",
+        deliver="local",
+    )
+    update_job(job["id"], {"monitor_script": "", "no_agent": True, "script": "w.sh"})
+    reloaded = get_job(job["id"])
+    assert reloaded.get("monitor_script") is None
+    assert reloaded["no_agent"] is True
+
+
+def test_update_job_unrelated_fields_skip_mode_validation(hermes_env):
+    """A legacy/odd record must keep accepting updates that don't touch the
+    mode fields — the invariant re-check is scoped to changed fields."""
+    from cron.jobs import create_job, update_job
+
+    _write_script(hermes_env, "mon.sh", "echo stable\n")
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="mon.sh",
+        deliver="local",
+    )
+    updated = update_job(job["id"], {"name": "renamed"})
+    assert updated["name"] == "renamed"
 
 
 def test_update_job_resets_baseline_when_monitor_source_changes(hermes_env):
@@ -374,6 +432,63 @@ def test_monitor_failure_forces_strict_url_credential_redaction(
     assert "opaque" not in error
     assert "alice:***@example.com" in error
     assert "token=***" in error
+
+
+def test_legacy_monitor_snapshot_is_redacted_before_diff(hermes_env, monkeypatch):
+    """Pre-upgrade snapshots may still hold URL credentials verbatim.
+
+    On the next changed tick those bytes flow into build_monitor_diff and
+    context_block; force the same redaction used for new output.
+    """
+    import agent.redact as redact
+    import cron.monitor as monitor
+    from cron.jobs import create_job, get_job, update_job
+
+    monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    legacy = "https://alice:secret@example.com/path?token=opaque&public=visible"
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_url="https://example.com/status",
+    )
+    update_job(
+        job["id"],
+        {
+            "monitor_state": {
+                "last_output_hash": monitor._hash_monitor_bytes(b"legacy-baseline"),
+                "last_changed_at": "now",
+            }
+        },
+    )
+    # Bypass _write_last_output so the on-disk file mimics a pre-upgrade
+    # snapshot that was never redacted at write time.
+    path = monitor._snapshot_path(job["id"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(legacy, encoding="utf-8")
+    # Direct read path must redact before any caller builds a diff.
+    loaded = monitor._read_last_output(job["id"])
+    assert "secret" not in loaded
+    assert "opaque" not in loaded
+    assert "alice:***@example.com" in loaded
+    assert "token=***" in loaded
+    assert "public=visible" in loaded
+    monkeypatch.setattr(
+        monitor,
+        "_run_monitor_source",
+        lambda _job: (True, "safe-current-output", b"safe-current-output"),
+    )
+
+    outcome = monitor.check_monitor(get_job(job["id"]))
+
+    assert outcome.ok is True
+    assert outcome.changed is True
+    context = outcome.context_block or ""
+    assert "secret" not in context
+    assert "opaque" not in context
+    assert "alice:***@example.com" in context
+    assert "token=***" in context
+    assert "public=visible" in context
+    assert "safe-current-output" in context
 
 
 def test_monitor_url_rejects_ssrf_blocked_target(hermes_env, monkeypatch):
