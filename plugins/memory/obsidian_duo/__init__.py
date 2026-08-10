@@ -21,6 +21,7 @@ from .inference import MemoryInference
 from .policy import MemoryPolicy
 from .retrieval import MemoryRetriever
 from .store import SqliteMemoryStore
+from .sync import CommandSyncAdapter, NoopSyncAdapter
 from .vault import ObsidianVault
 
 
@@ -65,6 +66,11 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
         store = SqliteMemoryStore(self._hermes_home / "obsidian_duo" / "memory.db")
         vault = ObsidianVault(Path(config.vault_path), config.managed_folder)
         retriever = MemoryRetriever(store)
+        sync_adapter = (
+            CommandSyncAdapter(config.sync_command, config.sync_debounce_seconds)
+            if config.sync_mode == "command" and config.sync_command
+            else NoopSyncAdapter()
+        )
         broker = EmbeddedMemoryBroker(
             config=config,
             store=store,
@@ -72,6 +78,7 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
             policy=MemoryPolicy(),
             retriever=retriever,
             inference=MemoryInference(self._llm) if self._llm else None,
+            sync_adapter=sync_adapter,
         )
         broker.start()
         self._broker = EmbeddedMemoryBrokerClient(broker)

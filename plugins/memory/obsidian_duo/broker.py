@@ -29,13 +29,14 @@ class RecoveryResult:
 
 
 class EmbeddedMemoryBroker:
-    def __init__(self, *, config: ObsidianDuoConfig, store: SqliteMemoryStore, vault: ObsidianVault, policy: MemoryPolicy, retriever: MemoryRetriever, inference=None):
+    def __init__(self, *, config: ObsidianDuoConfig, store: SqliteMemoryStore, vault: ObsidianVault, policy: MemoryPolicy, retriever: MemoryRetriever, inference=None, sync_adapter=None):
         self.config = config
         self.store = store
         self.vault = vault
         self.policy = policy
         self.retriever = retriever
         self.inference = inference
+        self.sync_adapter = sync_adapter
         self._events: queue.Queue = queue.Queue(maxsize=config.queue_maxsize)
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
@@ -69,6 +70,8 @@ class EmbeddedMemoryBroker:
 
     def observe(self, event: MemoryEvent) -> None:
         self.store.initialize()
+        if self.sync_adapter is not None and hasattr(self.sync_adapter, "mark_dirty"):
+            self.sync_adapter.mark_dirty(event.event_type)
         self._ensure_worker()
         try:
             self._events.put_nowait(event)
@@ -113,6 +116,11 @@ class EmbeddedMemoryBroker:
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.01)
+        if self.sync_adapter is not None:
+            result = self.sync_adapter.flush()
+            if not result.success:
+                self._state = "DEGRADED"
+                return False
         return True
 
     def recover(self) -> RecoveryResult:
