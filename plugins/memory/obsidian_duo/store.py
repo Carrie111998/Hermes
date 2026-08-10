@@ -1,0 +1,306 @@
+"""SQLite persistence for Memory Duo's durable and derived state."""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import threading
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+from .contracts import (
+    Authority,
+    EvidenceRecord,
+    MemoryCandidate,
+    MemoryRecord,
+    MemoryStatus,
+    Verification,
+)
+
+
+def new_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    memory_id: str
+    title: str
+    body: str
+    rank: float
+
+
+class SqliteMemoryStore:
+    SCHEMA_VERSION = 1
+
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self._local = threading.local()
+        self._init_lock = threading.Lock()
+        self._initialized = False
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=5, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            conn = self._connect()
+            self._local.connection = conn
+            if not self._initialized:
+                self.initialize()
+        return conn
+
+    def initialize(self) -> None:
+        with self._init_lock:
+            conn = getattr(self._local, "connection", None)
+            if conn is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                conn = self._connect()
+                self._local.connection = conn
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS schema_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS memories (
+                    memory_id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    authority TEXT NOT NULL,
+                    verification TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    importance REAL NOT NULL,
+                    evidence_ids TEXT NOT NULL,
+                    relationships TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS memory_versions (
+                    version_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    version_reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(memory_id) REFERENCES memories(memory_id)
+                );
+                CREATE TABLE IF NOT EXISTS evidence (
+                    evidence_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    session_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS memory_evidence (
+                    memory_id TEXT NOT NULL,
+                    evidence_id TEXT NOT NULL,
+                    PRIMARY KEY(memory_id, evidence_id),
+                    FOREIGN KEY(memory_id) REFERENCES memories(memory_id),
+                    FOREIGN KEY(evidence_id) REFERENCES evidence(evidence_id)
+                );
+                CREATE TABLE IF NOT EXISTS relationships (
+                    relationship_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relationship TEXT NOT NULL,
+                    metadata TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS conflicts (
+                    conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id TEXT NOT NULL,
+                    conflicting_memory_id TEXT,
+                    reason TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'disputed',
+                    FOREIGN KEY(memory_id) REFERENCES memories(memory_id)
+                );
+                CREATE TABLE IF NOT EXISTS candidates (
+                    candidate_id TEXT PRIMARY KEY,
+                    payload TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'staged',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS note_index (
+                    path TEXT PRIMARY KEY,
+                    memory_id TEXT,
+                    mtime_ns INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    parse_status TEXT NOT NULL DEFAULT 'indexed',
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS journal (
+                    txn_id TEXT PRIMARY KEY,
+                    operation TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE IF NOT EXISTS metrics (
+                    name TEXT PRIMARY KEY,
+                    value INTEGER NOT NULL DEFAULT 0
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+                    memory_id UNINDEXED, title, body, tags, entities
+                );
+                """
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
+                (str(self.SCHEMA_VERSION),),
+            )
+            conn.commit()
+            self._initialized = True
+
+    def _serialize_memory(self, record: MemoryRecord) -> tuple:
+        return (
+            record.memory_id,
+            record.content,
+            record.memory_type,
+            record.scope,
+            record.status.value,
+            record.authority.value,
+            record.verification.value,
+            record.confidence,
+            record.importance,
+            json.dumps(record.evidence_ids),
+            json.dumps(record.relationships),
+        )
+
+    def upsert_memory(self, record: MemoryRecord, version_reason: str) -> None:
+        conn = self.connection()
+        with conn:
+            old = conn.execute("SELECT * FROM memories WHERE memory_id=?", (record.memory_id,)).fetchone()
+            if old is not None:
+                conn.execute(
+                    "INSERT INTO memory_versions(memory_id, content, payload, version_reason) VALUES(?,?,?,?)",
+                    (record.memory_id, old["content"], json.dumps(dict(old)), version_reason),
+                )
+            conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (record.memory_id,))
+            conn.execute(
+                """INSERT INTO memories(
+                    memory_id, content, memory_type, scope, status, authority,
+                    verification, confidence, importance, evidence_ids, relationships
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    content=excluded.content, memory_type=excluded.memory_type,
+                    scope=excluded.scope, status=excluded.status,
+                    authority=excluded.authority, verification=excluded.verification,
+                    confidence=excluded.confidence, importance=excluded.importance,
+                    evidence_ids=excluded.evidence_ids, relationships=excluded.relationships,
+                    updated_at=CURRENT_TIMESTAMP""",
+                self._serialize_memory(record),
+            )
+            conn.execute(
+                "INSERT INTO memory_fts(memory_id,title,body,tags,entities) VALUES(?,?,?,?,?)",
+                (record.memory_id, record.memory_type, record.content, record.scope, ""),
+            )
+
+    def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
+        row = self.connection().execute(
+            "SELECT * FROM memories WHERE memory_id=?", (memory_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return MemoryRecord(
+            memory_id=row["memory_id"], content=row["content"],
+            memory_type=row["memory_type"], scope=row["scope"],
+            status=MemoryStatus(row["status"]), authority=Authority(row["authority"]),
+            verification=Verification(row["verification"]), confidence=row["confidence"],
+            importance=row["importance"], evidence_ids=tuple(json.loads(row["evidence_ids"])),
+            relationships=tuple(json.loads(row["relationships"])),
+        )
+
+    def insert_evidence(self, record: EvidenceRecord) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT OR REPLACE INTO evidence(evidence_id,kind,content,source,session_id) VALUES(?,?,?,?,?)",
+                (record.evidence_id, record.kind, record.content, record.source, record.session_id),
+            )
+
+    def link_evidence(self, memory_id: str, evidence_id: str) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT OR IGNORE INTO memory_evidence(memory_id,evidence_id) VALUES(?,?)",
+                (memory_id, evidence_id),
+            )
+
+    def search_fts(self, query: str, limit: int = 12) -> list[SearchHit]:
+        rows = self.connection().execute(
+            "SELECT memory_id,title,body,bm25(memory_fts) AS rank FROM memory_fts WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
+            (query, limit),
+        ).fetchall()
+        return [SearchHit(row["memory_id"], row["title"], row["body"], row["rank"]) for row in rows]
+
+    def record_relationship(self, source_id: str, target_id: str, relationship: str, metadata: Optional[dict] = None) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT INTO relationships(source_id,target_id,relationship,metadata) VALUES(?,?,?,?)",
+                (source_id, target_id, relationship, json.dumps(metadata or {})),
+            )
+
+    def record_conflict(self, memory_id: str, conflicting_memory_id: Optional[str], reason: str) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT INTO conflicts(memory_id,conflicting_memory_id,reason) VALUES(?,?,?)",
+                (memory_id, conflicting_memory_id, reason),
+            )
+
+    def stage_candidate(self, candidate: MemoryCandidate) -> str:
+        candidate_id = new_id("candidate")
+        payload = {"content": candidate.content, "memory_type": candidate.memory_type, "scope": candidate.scope}
+        with self.connection():
+            self.connection().execute(
+                "INSERT INTO candidates(candidate_id,payload) VALUES(?,?)",
+                (candidate_id, json.dumps(payload)),
+            )
+        return candidate_id
+
+    def record_journal(self, txn_id: str, operation: str, state: str, payload: dict) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT OR REPLACE INTO journal(txn_id,operation,state,payload,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",
+                (txn_id, operation, state, json.dumps(payload)),
+            )
+
+    def set_note_index(self, path: str, memory_id: Optional[str], mtime_ns: int, size: int, content_hash: str, parse_status: str = "indexed") -> None:
+        with self.connection():
+            self.connection().execute(
+                """INSERT INTO note_index(path,memory_id,mtime_ns,size,content_hash,parse_status)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET memory_id=excluded.memory_id,
+                mtime_ns=excluded.mtime_ns,size=excluded.size,content_hash=excluded.content_hash,
+                parse_status=excluded.parse_status,updated_at=CURRENT_TIMESTAMP""",
+                (path, memory_id, mtime_ns, size, content_hash, parse_status),
+            )
+
+    def metrics_increment(self, name: str, value: int = 1) -> None:
+        with self.connection():
+            self.connection().execute(
+                "INSERT INTO metrics(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=value+excluded.value",
+                (name, value),
+            )
+
+    def rebuild_fts(self) -> None:
+        conn = self.connection()
+        with conn:
+            conn.execute("DELETE FROM memory_fts")
+            conn.execute(
+                "INSERT INTO memory_fts(memory_id,title,body,tags,entities) SELECT memory_id,memory_type,content,scope,'' FROM memories"
+            )
+
+    def close(self) -> None:
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            conn.close()
+            self._local.connection = None
