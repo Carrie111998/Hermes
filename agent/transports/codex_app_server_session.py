@@ -24,6 +24,7 @@ call is synchronous and behaves like AIAgent's existing chat_completions loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -395,6 +396,20 @@ class CodexAppServerSession:
                 ),
             )
         self._thread_id = thread_id
+        scope_receipt = {
+            "thread_id": thread_id,
+            "developer_instructions_present": bool(self._developer_instructions),
+            "dynamic_tools_explicit": self._dynamic_tools is not None,
+            "dynamic_tool_names": [
+                tool["name"]
+                for tool in self._dynamic_tools or ()
+                if isinstance(tool, dict) and isinstance(tool.get("name"), str)
+            ],
+        }
+        logger.info(
+            "codex app-server thread/start scope receipt=%s",
+            json.dumps(scope_receipt, sort_keys=True),
+        )
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
             self._thread_id[:8],

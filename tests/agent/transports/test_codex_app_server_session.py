@@ -7,6 +7,8 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 from pathlib import Path
 import time
@@ -169,45 +171,81 @@ class TestLifecycle:
         method_calls = [m for (m, _) in client.requests if m == "thread/start"]
         assert len(method_calls) == 1
 
-    def test_thread_start_passes_cwd_only(self):
+    def test_thread_start_passes_cwd_only(self, caplog):
         """thread/start carries cwd. We intentionally do NOT pass `permissions`
         on this codex version (experimentalApi-gated + requires matching
         config.toml [permissions] table). Letting codex use its default
         (read-only unless user configures otherwise) is the documented path."""
         client = FakeClient()
         s = make_session(client, permission_profile="workspace-write")
+        caplog.set_level(logging.INFO, logger=session_mod.__name__)
         s.ensure_started()
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+        receipt = next(
+            json.loads(record.message.partition("=")[2])
+            for record in caplog.records
+            if "thread/start scope receipt=" in record.message
+        )
+        assert receipt == {
+            "thread_id": "thread-fake-001",
+            "developer_instructions_present": False,
+            "dynamic_tools_explicit": False,
+            "dynamic_tool_names": [],
+        }
 
-    def test_thread_start_forwards_profile_and_exact_dynamic_tools(self):
+    def test_thread_start_forwards_profile_and_exact_dynamic_tools(self, caplog):
         client = FakeClient()
         dynamic_tools = [
             {
                 "type": "function",
                 "name": "mcp__law_firm_ops__list_email_obligations",
-                "description": "List obligations.",
-                "inputSchema": {"type": "object", "properties": {}},
+                "description": "SENSITIVE DESCRIPTION",
+                "inputSchema": {"secret_schema_field": "SENSITIVE SCHEMA"},
             }
         ]
         s = make_session(
             client,
-            developer_instructions="Use the Legal Assistant profile.",
+            developer_instructions="SENSITIVE INSTRUCTIONS",
             dynamic_tools=dynamic_tools,
         )
+        caplog.set_level(logging.INFO, logger=session_mod.__name__)
+        assert not caplog.records
         s.ensure_started()
         _, params = next(r for r in client.requests if r[0] == "thread/start")
-        assert params["developerInstructions"] == "Use the Legal Assistant profile."
+        assert params["developerInstructions"] == "SENSITIVE INSTRUCTIONS"
         assert params["dynamicTools"] == dynamic_tools
         assert "outlook" not in str(params["dynamicTools"]).lower()
+        receipt_records = [
+            record.message
+            for record in caplog.records
+            if "thread/start scope receipt=" in record.message
+        ]
+        assert len(receipt_records) == 1
+        assert json.loads(receipt_records[0].partition("=")[2]) == {
+            "thread_id": "thread-fake-001",
+            "developer_instructions_present": True,
+            "dynamic_tools_explicit": True,
+            "dynamic_tool_names": ["mcp__law_firm_ops__list_email_obligations"],
+        }
+        assert "SENSITIVE" not in receipt_records[0]
+        assert "inputSchema" not in receipt_records[0]
 
-    def test_thread_start_keeps_explicit_empty_dynamic_tools(self):
+    def test_thread_start_keeps_explicit_empty_dynamic_tools(self, caplog):
         client = FakeClient()
         s = make_session(client, dynamic_tools=[])
+        caplog.set_level(logging.INFO, logger=session_mod.__name__)
         s.ensure_started()
         _, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["dynamicTools"] == []
+        receipt = next(
+            json.loads(record.message.partition("=")[2])
+            for record in caplog.records
+            if "thread/start scope receipt=" in record.message
+        )
+        assert receipt["dynamic_tools_explicit"] is True
+        assert receipt["dynamic_tool_names"] == []
 
     def test_session_uses_private_codex_home(self):
         client = FakeClient()
@@ -1023,7 +1061,7 @@ class TestThreadStartCrossFill:
 
 
 
-    def test_missing_thread_id_raises(self):
+    def test_missing_thread_id_raises(self, caplog):
         from agent.transports.codex_app_server import CodexAppServerError
 
         client = FakeClient()
@@ -1033,8 +1071,13 @@ class TestThreadStartCrossFill:
             {"turn": {"id": "tu1"}}
         )
         s = make_session(client)
+        caplog.set_level(logging.INFO, logger=session_mod.__name__)
         with pytest.raises(CodexAppServerError, match="no thread id"):
             s.ensure_started()
+        assert not any(
+            "thread/start scope receipt=" in record.message
+            for record in caplog.records
+        )
 
 
 class TestHasTurnAbortedMarker:
