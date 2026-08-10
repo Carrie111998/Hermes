@@ -15870,9 +15870,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 plugin_handler = get_plugin_command_handler(command.replace("_", "-"))
                 if plugin_handler:
                     user_args = event.get_command_args().strip()
-                    result = plugin_handler(user_args)
-                    if asyncio.iscoroutine(result):
-                        result = await result
+                    # Bind THIS turn's session identity for the duration of the
+                    # handler. reset_session_vars() ran at handler entry and
+                    # _set_session_env() doesn't run until the agent path, so
+                    # without this every HERMES_SESSION_* var stays unset for
+                    # the whole handler: get_session_env() finds no ContextVar,
+                    # and nothing in the product mirrors these vars into
+                    # os.environ any more (see the deliberate non-mirroring of
+                    # HERMES_SESSION_KEY above), so the handler — and every
+                    # Hermes internal it calls, e.g. send_message_tool,
+                    # cronjob_tools, kanban_tools, approval — reads an empty
+                    # origin and stamps an empty platform/chat/user on whatever
+                    # it does. The handler gets no event/source argument, so
+                    # the bound context is its only view of the origin.
+                    # HERMES_SESSION_ID is the one var still mirrored process-
+                    # globally (agent_init), so resolve this key's real id
+                    # instead of binding "" over a possibly-foreign value.
+                    _plugin_session_id = await self._peek_bound_session_id(_quick_key)
+                    _plugin_env_tokens = self._set_session_env_from_source(
+                        source, _quick_key, session_id=_plugin_session_id
+                    )
+                    try:
+                        result = plugin_handler(user_args)
+                        if asyncio.iscoroutine(result):
+                            result = await result
+                    finally:
+                        # Clears to "" rather than restoring (these helpers are
+                        # not nestable). Only observable when the handler
+                        # raises and dispatch falls through to skill/agent
+                        # handling, which sees "" instead of the os.environ
+                        # fallback until _set_session_env binds properly —
+                        # stricter than before, not looser.
+                        self._clear_session_env(_plugin_env_tokens)
                     return str(result) if result else None
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
@@ -21930,6 +21959,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
+        return self._set_session_env_from_source(context.source, context.session_key)
+
+    async def _peek_bound_session_id(self, session_key: str) -> str:
+        """Best-effort persisted ``session_id`` for *session_key* (``""`` if none).
+
+        Dispatch paths that bind session context before the agent path runs
+        must carry the existing session id, or they replace it with ``""`` for
+        the duration of the handler — ``agent_init`` is what repopulates it on
+        the agent path, and it never runs for those paths.
+
+        Mirrors the store access in ``gateway/platforms/webhook.py``: the
+        public lock-held accessor, tolerant of stores and test doubles that
+        don't provide it. Never raises — an unresolvable id must not fail a
+        command.
+        """
+        peek = getattr(getattr(self, "session_store", None), "peek_session_id", None)
+        if not callable(peek):
+            return ""
+        try:
+            session_id = await asyncio.to_thread(peek, session_key)
+        except Exception:
+            return ""
+        # Only a real id counts: an unknown key yields None, and bare runners
+        # built via object.__new__ in tests carry a mock store whose call
+        # returns a mock object rather than a string.
+        return session_id if isinstance(session_id, str) else ""
+
+    def _set_session_env_from_source(
+        self, source: SessionSource, session_key: str, session_id: str = ""
+    ) -> list:
+        """Bind session context variables from a raw source + session key.
+
+        Same contract as :meth:`_set_session_env`, but usable from dispatch
+        paths that have the real ``SessionSource`` in hand before a
+        ``SessionContext`` is built (plugin slash commands). ``session_id``
+        defaults to ``""`` so :meth:`_set_session_env` keeps binding exactly
+        what it bound before this seam existed (the agent path gets its id
+        from ``agent_init`` a moment later); callers that bind outside the
+        agent path pass the session's real id.
+        """
         from gateway.session_context import set_session_vars
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
@@ -21939,27 +22008,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # bare runners built via object.__new__ (tests) without self.adapters
         # don't blow up — they simply default to supported.
         _adapters = getattr(self, "adapters", None) or {}
-        _adapter = _adapters.get(context.source.platform)
+        _adapter = _adapters.get(source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
         return set_session_vars(
-            platform=context.source.platform.value,
-            chat_id=context.source.chat_id,
-            chat_type=(
-                str(context.source.chat_type) if context.source.chat_type else ""
-            ),
-            chat_name=context.source.chat_name or "",
-            thread_id=str(context.source.thread_id) if context.source.thread_id else "",
-            user_id=str(context.source.user_id) if context.source.user_id else "",
-            user_name=str(context.source.user_name) if context.source.user_name else "",
-            session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            platform=source.platform.value,
+            chat_id=source.chat_id,
+            chat_type=str(source.chat_type) if source.chat_type else "",
+            chat_name=source.chat_name or "",
+            thread_id=str(source.thread_id) if source.thread_id else "",
+            user_id=str(source.user_id) if source.user_id else "",
+            user_name=str(source.user_name) if source.user_name else "",
+            session_key=session_key,
+            session_id=session_id,
+            message_id=str(source.message_id) if source.message_id else "",
+            profile=getattr(source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
         )
 
     def _clear_session_env(self, tokens: list) -> None:
-        """Restore session context variables to their pre-handler values."""
+        """Mark session context variables as explicitly cleared.
+
+        ``clear_session_vars`` sets every var to ``""`` rather than restoring
+        the pre-handler values — the helpers are not nestable and the tokens
+        are accepted for API compatibility only. That distinction matters at
+        mid-turn call sites (plugin dispatch): after this, reads return ``""``
+        instead of falling back to ``os.environ``.
+        """
         from gateway.session_context import clear_session_vars
         clear_session_vars(tokens)
 
