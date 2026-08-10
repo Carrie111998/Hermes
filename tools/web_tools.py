@@ -156,6 +156,32 @@ def _load_web_config() -> dict:
         return {}
 
 
+def _config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _rss_specialization_enabled() -> bool:
+    """Return True when ``web.extract_specializations.rss`` is explicitly enabled."""
+    web = _load_web_config()
+    specializations = web.get("extract_specializations")
+    if not isinstance(specializations, dict):
+        return False
+    configured = specializations.get("rss")
+    if configured is None:
+        return False
+    return _config_bool(configured)
+
+
 # The built-in web backends whose availability is driven by hardcoded
 # env-var / package / OAuth probes below. Any name NOT in this set is a
 # candidate plugin-registered provider and must be resolved through the
@@ -963,7 +989,15 @@ async def web_extract_tool(
             results = [by_index[index] for index in range(len(urls))]
 
         response = {"results": results}
-        
+
+        if _rss_specialization_enabled():
+            from tools.web_specializations.rss import apply_rss_specialization
+
+            for result in response.get("results", []):
+                if result.get("error"):
+                    continue
+                apply_rss_specialization(result)
+
         pages_extracted = len(response.get('results', []))
         logger.info("Extracted content from %d pages", pages_extracted)
         
