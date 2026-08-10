@@ -42,7 +42,7 @@ description: "将编码任务委托给 OpenCode CLI（功能开发、PR 审查�
 
 ## 前置条件
 
-- 已安装 OpenCode：`npm i -g opencode-ai@latest` 或 `brew install anomalyco/tap/opencode`
+- 已安装 OpenCode：`curl -fsSL https://opencode.ai/install | bash`
 - 已配置认证：`opencode auth login` 或设置 provider 环境变量（OPENROUTER_API_KEY 等）
 - 验证：`opencode auth list` 应显示至少一个 provider
 - 代码任务推荐使用 Git 仓库
