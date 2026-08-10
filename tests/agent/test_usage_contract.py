@@ -1019,3 +1019,135 @@ def test_orphan_generation_cannot_remove_replacement(tmp_path, monkeypatch):
     assert outcome_b["status"] == "available"
     with usage_contract._CACHE_LOCK:
         assert flight not in usage_contract._INFLIGHT
+
+
+def test_in_deadline_completion_survives_late_consumption(tmp_path, monkeypatch):
+    """Job A consumes the whole deadline; job B settled before it. B must
+    render its real result (and cache it) even though the request thread
+    consumes B after the deadline has passed."""
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entries = [
+        {"id": "slow-a", "priority": 0, "source": "manual", "access_token": "tok-a"},
+        {"id": "fast-b", "priority": 1, "source": "manual", "access_token": "tok-b"},
+    ]
+    _write_fixture(hermes_home, {"openrouter": entries})
+    usage_contract._clear_usage_cache_for_tests()
+    monkeypatch.setattr(usage_contract, "_FETCH_DEADLINE_SECONDS", 0.3)
+
+    a_may_finish = threading.Event()
+    calls = []
+
+    def fetch(provider, *, api_key, base_url=None):
+        calls.append(api_key)
+        if api_key == "tok-a":
+            a_may_finish.wait(timeout=5)
+        return _available_snapshot(provider)
+
+    payload = build_usage_contract(fetcher=fetch)
+    # A blocks past the 0.3s deadline inside the build (its finish waits the
+    # full remaining budget); B settles almost immediately, in-deadline, but
+    # is consumed after A — the settle timestamp, not consumption, decides.
+    a_may_finish.set()
+    quotas = {a["display_name"]: a["quota"] for a in payload["providers"][0]["accounts"]}
+    # Entries iterate in fixture order: slow-a first.
+    first_quota = payload["providers"][0]["accounts"][0]["quota"]
+    second_quota = payload["providers"][0]["accounts"][1]["quota"]
+    assert first_quota["status"] == "error" and "timed out" in first_quota["reason"]
+    assert second_quota["status"] == "available"
+
+    # B was cached by its owner; a second build serves it fresh, no refetch.
+    second = build_usage_contract(fetcher=fetch)
+    second_b = second["providers"][0]["accounts"][1]["quota"]
+    assert second_b["status"] == "available"
+    assert calls.count("tok-b") == 1
+
+
+def test_begin_fetch_rechecks_negative_inside_critical_section(tmp_path, monkeypatch):
+    """First (unlocked) negative read misses; by the time the thread holds the
+    registration lock, a negative exists — it must serve it, never submit."""
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+
+    entry = {"id": "a", "source": "manual", "access_token": "tok"}
+    key = usage_contract._cache_identity("openrouter", entry, "tok")
+    job = {
+        "account": {"account_id": "acct_a"},
+        "provider": "openrouter",
+        "api_key": "tok",
+        "base_url": None,
+        "cache_key": key,
+        "stale": None,
+    }
+
+    real_read = usage_contract._negative_read
+    reads = []
+    negative_payload = {"status": "unavailable", "reason": "Credential authentication failed (HTTP 401)", "windows": []}
+
+    def staged(read_key):
+        reads.append(read_key)
+        if len(reads) == 1:
+            return None  # unlocked pre-check misses
+        return negative_payload  # in-lock re-check hits
+
+    monkeypatch.setattr(usage_contract, "_negative_read", staged)
+    calls = []
+
+    def fetch(provider, **kw):
+        calls.append(provider)
+        return _available_snapshot(provider)
+
+    handle = usage_contract._begin_fetch(job, fetch, usage_contract._monotonic() + 1.0)
+    assert handle["mode"] == "done"
+    assert handle["outcome"] == negative_payload
+    assert calls == []
+    assert len(reads) >= 2
+    monkeypatch.setattr(usage_contract, "_negative_read", real_read)
+
+
+def test_submit_failure_releases_admission_and_recovers(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+
+    entry = {"id": "a", "source": "manual", "access_token": "tok"}
+    key = usage_contract._cache_identity("openrouter", entry, "tok")
+    job = {
+        "account": {"account_id": "acct_a"},
+        "provider": "openrouter",
+        "api_key": "tok",
+        "base_url": None,
+        "cache_key": key,
+        "stale": None,
+    }
+
+    class BrokenExecutor:
+        def submit(self, *args, **kwargs):
+            raise RuntimeError("executor exploded")
+
+    # A capacity-1 semaphore makes a leaked permit immediately observable:
+    # any leak means the next acquire fails outright.
+    import threading
+
+    monkeypatch.setattr(usage_contract, "_ADMISSION", threading.Semaphore(1))
+    monkeypatch.setattr(usage_contract, "_EXECUTOR", BrokenExecutor())
+    handle = usage_contract._begin_fetch(job, lambda p, **kw: _available_snapshot(p), usage_contract._monotonic() + 1.0)
+    # Safe error surface, no crash; permit released; nothing registered/counted.
+    outcome = usage_contract._finish_fetch(job, handle)
+    assert outcome["status"] == "error"
+    stats = usage_contract._usage_fetch_stats_for_tests()
+    assert stats["in_flight_submitted"] == 0
+    assert stats["registered_flights"] == 0
+
+    # Full capacity provably restored: with capacity 1, a second begin must
+    # still acquire and complete as owner — impossible if the permit leaked.
+    monkeypatch.setattr(usage_contract, "_EXECUTOR", None)
+    handle2 = usage_contract._begin_fetch(job, lambda p, **kw: _available_snapshot(p), usage_contract._monotonic() + 1.0)
+    assert handle2["mode"] == "owner"
+    outcome2 = usage_contract._finish_fetch(job, handle2)
+    assert outcome2["status"] == "available"

@@ -492,6 +492,25 @@ def _usage_fetch_stats_for_tests() -> dict[str, int]:
         }
 
 
+def _run_fetch(
+    fetcher: UsageFetcher,
+    provider: str,
+    api_key: Optional[str],
+    base_url: Optional[str],
+) -> tuple[float, bool, Any]:
+    """Worker wrapper: record the real settle time with the outcome.
+
+    The request thread may consume the result long after the deadline; what
+    decides timeout-vs-render is when the fetch ACTUALLY settled, not when the
+    consumer looked. Workers stay pure — this only stamps time.
+    """
+    try:
+        value = fetcher(provider, api_key=api_key, base_url=base_url)
+        return (_monotonic(), True, value)
+    except Exception as exc:
+        return (_monotonic(), False, exc)
+
+
 def _begin_fetch(job: dict[str, Any], fetcher: UsageFetcher, deadline: float) -> dict[str, Any]:
     """Start or join the account's flight. Never blocks on the future.
 
@@ -507,23 +526,36 @@ def _begin_fetch(job: dict[str, Any], fetcher: UsageFetcher, deadline: float) ->
     if negative is not None:
         return {"mode": "done", "outcome": negative}
     with _CACHE_LOCK:
-        # Re-check the positive cache inside the critical section: a concurrent
-        # build may have completed this flight between our cache read at job
-        # creation and now. RLock makes the nested read safe.
+        # Re-check both caches inside the critical section: a concurrent build
+        # may have completed this flight (positive) or classified its failure
+        # (negative) between our unlocked reads at job creation and now.
+        # RLock makes the nested reads safe.
         fresh, _stale_again = _cache_read(key)
         if fresh is not None:
             return {"mode": "done", "outcome": _quota_payload(fresh)}
+        negative = _negative_read(key)
+        if negative is not None:
+            return {"mode": "done", "outcome": negative}
         entry = _INFLIGHT.get(flight)
         if entry is not None and _monotonic() < entry["deadline"]:
             return {"mode": "join", "future": entry["future"], "deadline": entry["deadline"]}
         if not _ADMISSION.acquire(blocking=False):
             return {"mode": "busy"}
-        future = _shared_executor().submit(
-            fetcher,
-            job["provider"],
-            api_key=job["api_key"],
-            base_url=job["base_url"],
-        )
+        try:
+            future = _shared_executor().submit(
+                _run_fetch,
+                fetcher,
+                job["provider"],
+                job["api_key"],
+                job["base_url"],
+            )
+        except Exception:
+            # Never leak the permit on a broken executor; surface a safe error.
+            _ADMISSION.release()
+            return {
+                "mode": "done",
+                "outcome": {"status": "error", "reason": "Provider usage request failed", "windows": []},
+            }
         _SUBMITTED += 1
         future.add_done_callback(_release_admission)
         _GENERATION += 1
@@ -567,6 +599,16 @@ def _finish_fetch(job: dict[str, Any], handle: dict[str, Any], deadline: Optiona
     remaining = deadline - _monotonic()
     outcome: dict[str, Any]
     if remaining <= 0:
+        # Consumer is past the deadline without a settle record: check whether
+        # the future already completed in time before declaring a timeout.
+        if future.done():
+            settled_at, ok, value = future.result()
+            if settled_at <= deadline:
+                outcome = _settled_outcome(job, owner, ok, value, settled_at, deadline)
+                self_outcome = outcome
+                if owner:
+                    _finish_owner_cleanup(handle)
+                return self_outcome
         outcome = (
             _quota_payload(stale, stale=True)
             if stale is not None
@@ -574,7 +616,7 @@ def _finish_fetch(job: dict[str, Any], handle: dict[str, Any], deadline: Optiona
         )
     else:
         try:
-            snapshot = future.result(timeout=remaining)
+            settled_at, ok, value = future.result(timeout=remaining)
         except FuturesTimeoutError:
             # No negative write here: the flight is still running and the next
             # build past the deadline must be free to register a replacement.
@@ -583,29 +625,56 @@ def _finish_fetch(job: dict[str, Any], handle: dict[str, Any], deadline: Optiona
                 if stale is not None
                 else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
             )
-        except Exception as exc:
-            outcome, negative_ttl = _failure_outcome(exc, stale)
-            # Owner writes only while inside its deadline window.
-            if owner and negative_ttl is not None and _monotonic() <= deadline:
-                _negative_write(key, outcome, negative_ttl)
         else:
-            if snapshot is None:
-                outcome = {
-                    "status": "unavailable",
-                    "reason": "No provider usage data was returned",
-                    "windows": [],
-                }
-            else:
-                outcome = _quota_payload(snapshot)
-                if owner and _monotonic() <= deadline:
-                    _cache_write(key, snapshot)
+            outcome = _settled_outcome(job, owner, ok, value, settled_at, deadline)
 
     if owner:
-        with _CACHE_LOCK:
-            current = _INFLIGHT.get(handle["flight"])
-            if current is not None and current["generation"] == handle["generation"]:
-                _INFLIGHT.pop(handle["flight"], None)
+        _finish_owner_cleanup(handle)
     return outcome
+
+
+def _settled_outcome(
+    job: dict[str, Any],
+    owner: bool,
+    ok: bool,
+    value: Any,
+    settled_at: float,
+    deadline: float,
+) -> dict[str, Any]:
+    """Render a settled fetch. The settle timestamp — not the consumption
+    time — decides validity: a result that settled at/before the flight
+    deadline is real and cacheable by its owner; one that settled after is a
+    timeout/orphan and writes nothing."""
+    key = job["cache_key"]
+    stale = job["stale"]
+    if settled_at > deadline:
+        return (
+            _quota_payload(stale, stale=True)
+            if stale is not None
+            else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
+        )
+    if not ok:
+        outcome, negative_ttl = _failure_outcome(value, stale)
+        if owner and negative_ttl is not None:
+            _negative_write(key, outcome, negative_ttl)
+        return outcome
+    if value is None:
+        return {
+            "status": "unavailable",
+            "reason": "No provider usage data was returned",
+            "windows": [],
+        }
+    if owner:
+        _cache_write(key, value)
+    return _quota_payload(value)
+
+
+def _finish_owner_cleanup(handle: dict[str, Any]) -> None:
+    """Compare-and-remove the owner's registry entry by generation."""
+    with _CACHE_LOCK:
+        current = _INFLIGHT.get(handle["flight"])
+        if current is not None and current["generation"] == handle["generation"]:
+            _INFLIGHT.pop(handle["flight"], None)
 
 
 def _routing_summary(accounts: list[dict[str, Any]]) -> dict[str, int]:
