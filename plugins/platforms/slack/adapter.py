@@ -9052,7 +9052,17 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ic, list):
             ic = ",".join(str(v) for v in ic)
         os.environ["SLACK_IGNORED_CHANNELS"] = str(ic)
-    return None  # all settings flow through env; nothing to merge into extras
+
+    # Keep channel-scoped user authorization in PlatformConfig.extra. Unlike
+    # legacy presentation/routing toggles above, this security boundary must
+    # never flow through process-global env in a multiplex gateway.
+    open_user_channels = slack_cfg.get("open_user_channels")
+    nested_extra = slack_cfg.get("extra")
+    if open_user_channels is None and isinstance(nested_extra, dict):
+        open_user_channels = nested_extra.get("open_user_channels")
+    if open_user_channels is not None:
+        return {"open_user_channels": open_user_channels}
+    return None
 
 
 def _is_connected(config) -> bool:
