@@ -216,8 +216,8 @@ import { formatBlockerMessage, formatProbeFailedMessage, scanVenvBlockers } from
 import { fetchMarketplaceThemes, searchMarketplaceThemes } from './vscode-marketplace'
 import { createWakeIndicatorWindowController } from './wake-indicator-window'
 import { readWindowBelow } from './window-below'
-import { createWindowRevealController } from './window-reveal'
 import { installWindowRendererLifecycle } from './window-renderer-lifecycle'
+import { createWindowRevealController } from './window-reveal'
 import {
   bindGeometryPersistence,
   computeWindowOptions,
