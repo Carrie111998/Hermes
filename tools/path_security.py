@@ -241,12 +241,15 @@ def extract_filesystem_targets(command: Optional[str]) -> list[str]:
             continue
         if _looks_like_filesystem_target(stripped):
             targets.append(stripped)
-    # Defence in depth: if shell quoting collapsed the parsed tokens
-    # into a single opaque blob (issue #82842 echo reproduction), fall
-    # back to a regex sweep that surfaces any drive-root or bare-slash
-    # substrings so :func:`is_filesystem_root` can classify them.
-    if not targets:
-        targets = _fallback_extract_windows_paths(command)
+    # Defence in depth: shell quoting can collapse bare backslashes
+    # into adjacent non-root tokens (issue #82842 echo reproduction),
+    # so we *always* merge the fallback regex sweep regardless of
+    # whether the token-stream path yielded targets. A drive-rooted
+    # string that surfaces only in the fallback and is missed by
+    # tokenize must still reach :func:`is_filesystem_root`.
+    for fb in _fallback_extract_windows_paths(command):
+        if fb not in targets:
+            targets.append(fb)
     # Deduplicate while preserving order.
     seen = set()
     out = []
@@ -317,32 +320,59 @@ def _looks_like_filesystem_target(token: str) -> bool:
 
 # Windows path extractors — used when shell quoting collapses bare
 # backslashes into adjacent characters and a ``"\\""`` artifact surfaces.
-_DRIVE_ROOT_RE = __import__("re").compile(r"[A-Za-z]:\\[A-Za-z0-9_. -\\]*")
+_DRIVE_ROOT_RE = __import__("re").compile(r"[A-Za-z]:\\[A-Za-z0-9_. \\-]*")
 _BACKSLASH_RE = __import__("re").compile(r"\\+")
 
 
 def _fallback_extract_windows_paths(s: str) -> list[str]:
-    """Best-effort extraction of Windows-looking paths from *s*.
+    """Best-effort extraction of Windows-looking paths and bare
+    separators from *s*.
 
-    Used when :func:`_command_tokenize` cannot yield a clean list
-    because shell quoting collapsed bare backslashes and ``"`` chars
-    (the exact failure mode in issue #82842).
+    Always merged into the regular token-stream output (not only on
+    empty targets), because the failure mode from issue #82842 can
+    surface bare-backslash roots embedded between regular tokens after
+    bash → PowerShell → cmd quote-escape collapse. The function
+    surfaces:
+
+    * Drive-rooted substrings (``C:\\Users\\tester``) via
+      ``_DRIVE_ROOT_RE``.
+    * Bare backslash sequences that are NOT inside an already-matched
+      drive path (``\\server\\share`` after collapse, ``\\`` alone).
+
+    The returned list is deduplicated while preserving order so the
+    downstream :func:`is_filesystem_root` classifier sees each
+    candidate at most once.
     """
-    out = []
+    out: list[str] = []
     # Drive-rooted absolute paths: ``C:\\Users\\tester`` etc.
-    for m in _DRIVE_ROOT_RE.findall(s):
-        # Trim any trailing backslash + adjacent artifacts left by
-        # collapsed quoting — but keep a single trailing backslash
-        # because that *is* the drive root.
-        cleaned = m
-        # If the match ends with multiple backslashes or with the
-        # collapse artifacts of PowerShell nested-quoting (``\"``
-        # surfaces as ``"`` adjacent to a backslash), we still keep
-        # the entire drive-rooted string because the approval layer
-        # will downclassify the bare-root suffix via
-        # :func:`is_filesystem_root`.
-        if cleaned not in out:
-            out.append(cleaned)
+    drive_matches = list(_DRIVE_ROOT_RE.findall(s))
+    for m in drive_matches:
+        if m not in out:
+            out.append(m)
+    drive_joined = " ".join(drive_matches)
+    for m_match in _BACKSLASH_RE.finditer(s):
+        m = m_match.group(0)
+        if m in drive_joined or m in out:
+            continue
+        # Skip the single-backslash continuation artefact
+        # ``\\<whitespace>*<newline>`` — that is a shell line-continuation
+        # token, not a filesystem-root target. The shell will silently
+        # strip it before argument parsing. Issue #82842's collapse
+        # always surfaces `\` adjacent to a `\\<drive>` substring,
+        # not `\` before a newline, so this skip is safe.
+        if len(m) == 1:
+            pos = m_match.start()
+            tail = s[pos + len(m):]
+            stripped = tail.lstrip(" \t")
+            if stripped.startswith("\n"):
+                continue
+            # Also skip if the bare backslash is between command
+            # separator characters (`;` or `&`) and an alphanumeric
+            # argument — same shell-line-continuation pattern.
+            head = s[:pos].rstrip(" \t")
+            if head.endswith((";", "&", "|")) and stripped and (stripped[0].isalpha() or stripped[0] == "_"):
+                continue
+        out.append(m)
     return out
 
 

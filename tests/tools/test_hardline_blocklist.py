@@ -751,11 +751,13 @@ def test_filesystem_root_guard_endtoend_blocks_windows_destructive(command, monk
     command must come back ``approved=False`` regardless of the
     yolo / session-allowlist / smart-approval path that follows.
 
-    MoA (independent full-diff review) flagged that the yolo test in
-    the previous version only invoked ``detect_hardline_command`` and
-    bypassed the surrounding approval chain — leaving the question
-    open whether the floor actually fires before the user-facing
-    pipeline can run. This test pins the end-to-end contract.
+    MoA (independent full-diff review round 6, 2026-08-10) flagged
+    that the previous yolo test only invoked
+    ``detect_hardline_command`` and bypassed the surrounding approval
+    chain — leaving the question open whether the floor actually
+    fires before the user-facing pipeline can run. This test pins
+    the end-to-end contract for every env-type so a future pattern-
+    layer edit cannot mask the fix.
     """
     monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -781,7 +783,9 @@ def test_filesystem_root_guard_endtoend_blocks_windows_destructive(command, monk
 @pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
 def test_filesystem_root_guard_unaltered_by_yolo_in_full_pipeline(command, clean_session, monkeypatch):
     """With yolo=1 in the full approval pipeline, root-target destructive
-    commands still come back rejected."""
+    commands still come back rejected *via the hardline floor*, not via
+    a softer 'requires_user_consent=False' short-circuit.
+    """
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
     enable_session_yolo("hardline_test")
     try:
@@ -790,8 +794,63 @@ def test_filesystem_root_guard_unaltered_by_yolo_in_full_pipeline(command, clean
             assert result["approved"] is False, (
                 f"yolo bypassed the root-target guard in full pipeline on {env_type!r}: {command!r}: {result!r}"
             )
+            assert result.get("hardline") is True, (
+                f"yolo path must still surface hardline=True on {env_type!r}: {result!r}"
+            )
+            assert "filesystem root" in (result.get("message") or "").lower(), (
+                f"yolo path must still name 'filesystem root' on {env_type!r}: {result!r}"
+            )
     finally:
         disable_session_yolo("hardline_test")
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
+def test_filesystem_root_guard_unaffected_by_mode_off(command, monkeypatch):
+    """``approvals.mode=off`` must NOT bypass the root-target floor.
+    Round-6 MoA review flagged that the test matrix would only cover
+    yolo + the default path; mode=off is the same effective disable
+    surface and must be pinned explicitly.
+    """
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.setenv("HERMES_APPROVALS_MODE", "off")
+    try:
+        for env_type in ("posix", "windows", "wsl", "cmd"):
+            result = check_all_command_guards(command, env_type=env_type, approval_callback=None)
+            assert result["approved"] is False, (
+                f"mode=off bypassed the root-target guard on {env_type!r}: {command!r}: {result!r}"
+            )
+            assert result.get("hardline") is True, (
+                f"mode=off must still surface hardline=True on {env_type!r}: {result!r}"
+            )
+    finally:
+        monkeypatch.delenv("HERMES_APPROVALS_MODE", raising=False)
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
+def test_filesystem_root_guard_unaffected_by_smart_approval_callback(command, monkeypatch):
+    """Even when smart-approval returns ``approved=True`` from its
+    callback, the floor must still refuse root-target destructive
+    commands. The hardline layer is run *before* the smart-approval
+    callback ever sees the command.
+    """
+
+    def _pretend_smart_callback(command_to_approve: str) -> bool:
+        # Smart approval says YES to anything. This MUST NOT bypass
+        # the hardline floor.
+        return True
+
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    for env_type in ("posix", "windows", "wsl", "cmd"):
+        result = check_all_command_guards(
+            command, env_type=env_type, approval_callback=_pretend_smart_callback,
+        )
+        assert result["approved"] is False, (
+            f"smart-approval callback YES bypassed the root-target guard on {env_type!r}: "
+            f"{command!r}: {result!r}"
+        )
+        assert result.get("hardline") is True, (
+            f"smart-approval callback YES must still surface hardline=True on {env_type!r}: {result!r}"
+        )
 
 
 @pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)

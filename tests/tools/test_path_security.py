@@ -165,17 +165,29 @@ class TestExtractFilesystemTargets:
 
     def test_drive_root_token_is_returned(self):
         # The exact shell-construction from issue #82842: PowerShell
-        # receives ``cmd /c "rd /s /q \\""C:\\Users\\tester\\""\"""`` and
+        # receives ``cmd /c "rd /s /q \""C:\Users\tester\""\""""`` and
         # the PowerShell/cmd layer collapses the escape into two
-        # arguments — ``\\`` and ``C:\\Users\\tester``.  The agent-side
+        # arguments — ``\`` and ``C:\Users\tester``.  The agent-side
         # approval layer sees the inner part (after PowerShell strips the
         # outer single quotes), so we feed the helper just that fragment
-        # to assert it surfaces the real Windows target.
+        # to assert it surfaces the real Windows target AND the
+        # bare-root residue (so the root-target guard catches it).
         ps_inner = 'cmd /c "rd /s /q \\\\\\"C:\\\\Users\\\\tester\\\\\""'
         tokens = extract_filesystem_targets(ps_inner)
-        # At minimum the real Windows path target must be present.
+        # The real Windows path target must be present (defence-in-depth
+        # for the user folder part).
         assert any("tester" in t for t in tokens), (
             f"expected the human-readable target to surface from the collapsed command, got {tokens!r}"
+        )
+        # Round-6 MoA review (2026-08-10) demanded explicit token-level
+        # assertion: at least ONE returned token must classify as a
+        # filesystem root, so that :func:`is_filesystem_root` cannot
+        # silently fail to extract the dangerous bare ``\`` residue.
+        from tools.path_security import is_filesystem_root
+
+        root_tokens = [t for t in tokens if is_filesystem_root(t)]
+        assert root_tokens, (
+            f"expected at least one token classifying as a filesystem root, got {tokens!r}"
         )
 
     def test_posix_root_command(self):
