@@ -402,3 +402,21 @@ def test_executor_metadata_file_is_not_committed(tmp_path):
     assert payload["request"]["title"] == "Update synthetic fixture"
     refs = [item["ref"] for item in ledger.artifacts_for(request.request_id)]
     assert all(".ddp_request.json" not in ref for ref in refs)
+
+
+def test_canary_pr_body_and_label_carry_do_not_merge_marker(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    client = FakePrClient()
+
+    run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=client, mode="canary",
+    )
+
+    call = client.calls[0]
+    assert call["label"] == "devflow-canary"
+    assert f"request-id: {request.request_id}" in call["body"]
+    assert "Do not auto-merge" in call["body"]
+    # No leakage: the body must not contain absolute paths or the worktree base.
+    assert str(tmp_path) not in call["body"]

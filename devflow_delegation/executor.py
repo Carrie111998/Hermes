@@ -49,6 +49,7 @@ class PrClient(Protocol):
         title: str,
         body: str,
         repo: str,
+        label: str = "",
     ) -> Dict[str, Any]:
         ...
 
@@ -65,12 +66,16 @@ class GhPrClient:
         title: str,
         body: str,
         repo: str,
+        label: str = "",
     ) -> Dict[str, Any]:
+        argv = [
+            "gh", "pr", "create", "--repo", repo, "--base", base_branch,
+            "--head", branch, "--title", title, "--body", body,
+        ]
+        if label:
+            argv += ["--label", label]
         created = _run_checked(
-            [
-                "gh", "pr", "create", "--repo", repo, "--base", base_branch,
-                "--head", branch, "--title", title, "--body", body,
-            ],
+            argv,
             cwd=worktree_path,
             timeout_seconds=60,
             label="gh pr create",
@@ -405,6 +410,18 @@ def _shadow_ref(paths_count: int, lines: int, branch: str, title: str) -> str:
     return f"paths={paths_count} lines={lines} branch={branch} title={safe_title}"
 
 
+def _pr_body(request_id: str) -> str:
+    """Human-review PR body. Carries only the request id + do-not-merge marker.
+
+    Deliberately excludes secrets, paths, prompts, and provider/model details.
+    """
+    return (
+        "Automated DevFlow canary PR.\n\n"
+        f"request-id: {request_id}\n\n"
+        "Do not auto-merge — human review required."
+    )
+
+
 def run_executor_tick(
     ledger: DelegationLedger,
     allowlist: Allowlist,
@@ -513,8 +530,9 @@ def run_executor_tick(
             branch=branch,
             base_branch=target.default_branch,
             title=title[:160],
-            body=f"Automated DDP Stage 2 PR.\n\nrequest-id: {request_id}",
+            body=_pr_body(request_id),
             repo=target.github_repo,
+            label="devflow-canary",
         )
         if not isinstance(pr, dict) or not str(pr.get("url") or "").strip() or not pr.get("number"):
             raise ExecutorError("PR client did not return a PR number and URL")
