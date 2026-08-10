@@ -2860,9 +2860,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
-    def __init__(self, config: Optional[GatewayConfig] = None):
+    def __init__(self, config: Optional[GatewayConfig] = None, runtime_state=None):
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
+        # ARCH-001 is injected by start_gateway after profile-scoped preflight.
+        # Keep it optional for direct construction in tests and embedders.
+        self._runtime_state = runtime_state
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of
@@ -7964,6 +7967,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _runtime_state_profile_for_source(self, source):
+        """Resolve the profile-scoped ARCH-001 repository for one turn."""
+        manager = getattr(self, "_runtime_state", None)
+        if manager is None:
+            return None
+        profile_name = getattr(source, "profile", None) or self._active_profile_name()
+        return manager.profile(profile_name)
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -11120,6 +11131,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry)
                 except Exception:
                     logger.debug("Failed to record Telegram topic binding", exc_info=True)
+        # Mirror the durable ARCH-001 session/task boundary only after routing
+        # and compression-tip resolution have settled.
+        runtime_profile = self._runtime_state_profile_for_source(source)
+        if runtime_profile is not None:
+            runtime_profile.ensure_session(session_entry.session_id, source.user_id)
+            runtime_profile.ensure_compression(session_entry.session_id)
+            event._runtime_state_profile = runtime_profile
+            event._runtime_task_lease = runtime_profile.begin_task(
+                session_entry.session_id
+            )
+            from gateway.runtime_state import bind_runtime_state_context
+
+            event._runtime_state_context_token = bind_runtime_state_context(
+                runtime_profile,
+                session_entry.session_id,
+                event._runtime_task_lease.task_id,
+            )
         # Capture and immediately consume was_auto_reset so it does not
         # re-fire on subsequent messages — preventing the cleanup from
         # wiping model/reasoning overrides set between turns (Closes #48031).
@@ -11837,6 +11865,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             run_generation,
         )
 
+        _runtime_task_status = "failed"
         try:
             # Emit agent:start hook
             hook_ctx = {
@@ -11869,6 +11898,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
             )
+            if isinstance(agent_result, dict):
+                if agent_result.get("partial"):
+                    _runtime_task_status = "degraded"
+                elif not any(
+                    agent_result.get(key)
+                    for key in ("failed", "error", "interrupted")
+                ):
+                    _runtime_task_status = "succeeded"
+            elif agent_result is not None:
+                _runtime_task_status = "succeeded"
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -12545,6 +12584,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            _runtime_profile = getattr(event, "_runtime_state_profile", None)
+            _runtime_lease = getattr(event, "_runtime_task_lease", None)
+            if _runtime_profile is not None and _runtime_lease is not None:
+                try:
+                    _runtime_profile.finish_task(_runtime_lease, _runtime_task_status)
+                except Exception:
+                    logger.error(
+                        "ARCH-001 runtime task completion failed; "
+                        "leaving the gateway turn fail-closed",
+                        exc_info=True,
+                    )
+            _runtime_context_token = getattr(
+                event, "_runtime_state_context_token", None
+            )
+            if _runtime_context_token is not None:
+                try:
+                    from gateway.runtime_state import reset_runtime_state_context
+
+                    reset_runtime_state_context(_runtime_context_token)
+                except Exception:
+                    logger.debug(
+                        "ARCH-001 runtime context cleanup failed",
+                        exc_info=True,
+                    )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -19169,6 +19232,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (e.g. session:compress fires after context compression splits a session)
         def _event_callback_sync(event_type: str, context: dict) -> None:
             try:
+                if event_type == "session:compress":
+                    from gateway.runtime_state import get_runtime_state_context
+
+                    runtime_context = get_runtime_state_context()
+                    if runtime_context is not None:
+                        runtime_context.profile.record_compression(
+                            runtime_context.session_id,
+                            "succeeded",
+                        )
                 asyncio.run_coroutine_threadsafe(
                     _hooks_ref.emit(event_type, context),
                     _loop_for_step,
@@ -21846,7 +21918,31 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if _stderr_level < logging.getLogger().level:
             logging.getLogger().setLevel(_stderr_level)
 
-    runner = GatewayRunner(config)
+    # ARCH-001 startup preflight must complete before GatewayRunner constructs
+    # adapters or opens any external connector. It uses a separate,
+    # profile-scoped runtime_state.db and never replaces legacy state.db.
+    from gateway.runtime_state import RuntimeStateManager
+
+    effective_config = config or load_gateway_config()
+    runtime_state = RuntimeStateManager(effective_config)
+    try:
+        runtime_state.preflight()
+    except Exception:
+        runtime_state.close()
+        logger.error(
+            "ARCH-001 runtime-state preflight failed; refusing to start gateway",
+            exc_info=True,
+        )
+        return False
+
+    # Attach after construction so existing embedders and test shims that
+    # provide GatewayRunner(config) remain compatible.
+    try:
+        runner = GatewayRunner(effective_config)
+    except Exception:
+        runtime_state.close()
+        raise
+    runner._runtime_state = runtime_state
     
     # Track whether an unexpected signal initiated the shutdown. When an
     # unexpected SIGTERM kills the gateway, we exit non-zero so service
@@ -22018,22 +22114,26 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             "Another gateway instance (PID %d) started during our startup. "
             "Exiting to avoid double-running.", _current_pid
         )
+        runtime_state.close()
         return False
     if not acquire_gateway_runtime_lock():
         logger.error(
             "Gateway runtime lock is already held by another instance. Exiting."
         )
+        runtime_state.close()
         return False
     try:
         write_pid_file()
     except FileExistsError:
         release_gateway_runtime_lock()
+        runtime_state.close()
         logger.error(
             "PID file race lost to another gateway instance. Exiting."
         )
         return False
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
+    atexit.register(runtime_state.close)
 
     try:
         from hermes_cli.nous_auth_keepalive import start_nous_auth_keepalive
