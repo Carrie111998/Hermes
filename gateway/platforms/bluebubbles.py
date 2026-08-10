@@ -114,14 +114,18 @@ _TAPBACK_REMOVED = {
     3003: "laugh", 3004: "emphasize", 3005: "question",
 }
 
-# Webhook event types that carry user messages
-_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+# Webhook event types that represent a new user prompt. ``updated-message``
+# repeats the same physical iMessage with a reduced payload on some
+# BlueBubbles builds; treating it as new can both duplicate the turn and fall
+# back from the group GUID to the sender's 1:1 address.
+_MESSAGE_EVENTS = {"new-message", "message"}
 
 # Log redaction patterns
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_SEEN_MESSAGE_GUIDS_SIZE = 2000  # Bounded idempotency window for webhook retries
 
 
 def _redact(text: str) -> str:
@@ -202,6 +206,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._seen_message_guids: OrderedDict[str, None] = OrderedDict()
 
     # ------------------------------------------------------------------
     # API helpers
@@ -386,19 +391,29 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return False
 
         webhook_url = self._webhook_register_url
+        desired_events = ["new-message"]
 
         # Crash resilience — reuse an existing registration if present
         existing = await self._find_registered_webhooks(webhook_url)
-        if existing:
+        matching = [
+            wh for wh in existing
+            if sorted(wh.get("events") or []) == desired_events
+        ]
+        if matching and len(existing) == 1:
             logger.info(
                 "[bluebubbles] webhook already registered: %s",
                 self._webhook_register_url_for_log,
             )
             return True
+        if existing:
+            # Reconcile registrations created by older Hermes builds that also
+            # subscribed to ``updated-message``. Those events replayed one
+            # physical iMessage and could lose its group chat GUID.
+            await self._unregister_webhook()
 
         payload = {
             "url": webhook_url,
-            "events": ["new-message", "updated-message"],
+            "events": desired_events,
         }
 
         try:
@@ -1026,6 +1041,27 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
 
+        # BlueBubbles can retry a webhook delivery. Keep one bounded in-memory
+        # idempotency window so one physical iMessage GUID starts at most one
+        # Hermes turn. Do this only after the payload is validated so a malformed
+        # event cannot poison a later valid delivery for the same GUID.
+        message_guid = self._value(
+            record.get("guid"),
+            record.get("messageGuid"),
+            record.get("id"),
+        )
+        if message_guid:
+            if message_guid in self._seen_message_guids:
+                self._seen_message_guids.move_to_end(message_guid)
+                logger.debug(
+                    "[bluebubbles] ignoring duplicate message webhook guid=%s",
+                    _redact(message_guid),
+                )
+                return web.Response(text="ok")
+            self._seen_message_guids[message_guid] = None
+            while len(self._seen_message_guids) > _SEEN_MESSAGE_GUIDS_SIZE:
+                self._seen_message_guids.popitem(last=False)
+
         session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
         if is_group and self.require_mention:
@@ -1048,11 +1084,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             raw_message=payload,
-            message_id=self._value(
-                record.get("guid"),
-                record.get("messageGuid"),
-                record.get("id"),
-            ),
+            message_id=message_guid,
             reply_to_message_id=self._value(
                 record.get("threadOriginatorGuid"),
                 record.get("associatedMessageGuid"),

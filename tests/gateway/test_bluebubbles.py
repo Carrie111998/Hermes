@@ -116,6 +116,60 @@ class TestBlueBubblesMentionGating:
 
 class TestBlueBubblesWebhookParsing:
 
+    @pytest.mark.asyncio
+    async def test_updated_message_is_acknowledged_without_starting_a_turn(self, monkeypatch):
+        """An iMessage update must not replay the original message as a new prompt."""
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {
+                "guid": "msg-update-1",
+                "text": "same physical iMessage",
+                "handle": {"address": "+155****0100"},
+                "isFromMe": False,
+            },
+        }))
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_duplicate_new_message_guid_is_processed_once(self, monkeypatch):
+        """Webhook retries for one physical iMessage must be idempotent."""
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        payload = {
+            "type": "new-message",
+            "data": {
+                "guid": "msg-dedup-1",
+                "text": "one physical iMessage",
+                "handle": {"address": "+155****0100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "iMessage;+;family-group"}],
+            },
+        }
+
+        first = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        second = await adapter._handle_webhook(_FakeBlueBubblesRequest(payload))
+        await asyncio.sleep(0)
+
+        assert first.status == 200
+        assert second.status == 200
+        assert len(handled) == 1
+
     def test_webhook_can_fall_back_to_sender_when_chat_fields_missing(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         payload = {
@@ -374,6 +428,29 @@ class TestBlueBubblesWebhookRegistration:
         )
         assert ok is True
 
+    def test_register_subscribes_only_to_new_messages(self, monkeypatch):
+        """Message updates are metadata changes, not new user prompts."""
+        import asyncio
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = self._mock_client(
+            get_response={"status": 200, "data": []},
+            post_response={"status": 200, "data": {"id": 42}},
+        )
+        posted = []
+
+        async def tracking_post(path, payload):
+            posted.append((path, payload))
+            return {"status": 200, "data": {"id": 42}}
+
+        adapter._api_post = tracking_post
+        ok = asyncio.get_event_loop().run_until_complete(adapter._register_webhook())
+
+        assert ok is True
+        assert posted == [("/api/v1/webhook", {
+            "url": adapter._webhook_register_url,
+            "events": ["new-message"],
+        })]
+
 
     def test_register_reuses_existing(self, monkeypatch):
         """Crash resilience — existing registration is reused, no POST needed."""
@@ -400,6 +477,41 @@ class TestBlueBubblesWebhookRegistration:
         )
         assert ok is True
         assert not post_called, "Should reuse existing, not POST again"
+
+    def test_register_replaces_legacy_updated_message_subscription(self, monkeypatch):
+        """Old new+updated registrations are removed before creating the quiet one."""
+        import asyncio
+        adapter = _make_adapter(monkeypatch)
+        url = adapter._webhook_register_url
+        deleted = []
+        posted = []
+        adapter.client = self._mock_client(
+            get_response={"status": 200, "data": [
+                {"id": 7, "url": url, "events": ["new-message", "updated-message"]},
+            ]},
+        )
+
+        async def mock_delete(*args, **kwargs):
+            deleted.append(args[0])
+            class R:
+                def raise_for_status(self):
+                    pass
+            return R()
+
+        async def tracking_post(path, payload):
+            posted.append((path, payload))
+            return {"status": 200, "data": {"id": 8}}
+
+        adapter.client.delete = mock_delete
+        adapter._api_post = tracking_post
+        ok = asyncio.get_event_loop().run_until_complete(adapter._register_webhook())
+
+        assert ok is True
+        assert len(deleted) == 1
+        assert posted == [("/api/v1/webhook", {
+            "url": url,
+            "events": ["new-message"],
+        })]
 
 
     # -- _unregister_webhook --
