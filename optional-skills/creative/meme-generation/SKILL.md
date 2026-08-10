@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [creative, memes, humor, images]
-    related_skills: [ascii-art]
+    related_skills: []
     category: creative
 ---
 

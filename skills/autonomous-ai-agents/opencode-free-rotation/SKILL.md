@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [OpenCode, Free-Models, Failover, Catalog, Zen]
     category: autonomous-ai-agents
-    related_skills: [opencode]
+    related_skills: []
 ---
 
 # OpenCode Free Rotation

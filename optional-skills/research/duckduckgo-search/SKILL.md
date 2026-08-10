@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [search, duckduckgo, web-search, free, fallback]
-    related_skills: [arxiv]
+    related_skills: []
     fallback_for_toolsets: [web]
 ---
 

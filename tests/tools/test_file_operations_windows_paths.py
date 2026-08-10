@@ -18,7 +18,7 @@ class _FakeGitBashEnv:
             return {"output": "", "returncode": 1}
         if "/c/Users/alice/project/notes.txt" not in command:
             return {"output": "", "returncode": 1}
-        if command.startswith("wc -c"):
+        if "wc -c" in command:
             return {"output": "12\n", "returncode": 0}
         if command.startswith("head -c"):
             return {"output": "hello\nworld\n", "returncode": 0}
@@ -59,7 +59,7 @@ class _FakeGitBashEnvWithLegacyStyle:
             return {"output": "", "returncode": 1}
         if "/c/Users/alice/project/notes.txt" not in command:
             return {"output": "", "returncode": 1}
-        if command.startswith("wc -c"):
+        if "wc -c" in command:
             return {"output": "12\n", "returncode": 0}
         if command.startswith("head -c"):
             return {"output": "hello\nworld\n", "returncode": 0}

@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [vrchat, neuro-api, osc, voicevox, autonomy, gaming]
     category: gaming
-    related_skills: [vrchat-osc]
+    related_skills: []
 ---
 
 # Neuro VRChat Bridge

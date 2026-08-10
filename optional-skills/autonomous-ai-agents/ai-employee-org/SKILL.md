@@ -192,7 +192,7 @@ skill; login sites via `browser_navigate`. Full queries:
 
 ```powershell
 # Persistent ops dir (not scratch)
-New-Item -ItemType Directory -Force -Path C:\Users\downl\Documents\ops\job-seeker
+New-Item -ItemType Directory -Force -Path $env:USERPROFILE\Documents\ops\job-seeker
 
 # Register per-role crons (default profile ~/.hermes/cron/jobs.json)
 py -3 optional-skills\autonomous-ai-agents\ai-employee-org\scripts\install-job-seeker-cron.py

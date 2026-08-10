@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [wiki, knowledge-base, research, notes, markdown, rag-alternative]
     category: research
-    related_skills: [obsidian, arxiv]
+    related_skills: [obsidian]
 ---
 
 # Karpathy's LLM Wiki

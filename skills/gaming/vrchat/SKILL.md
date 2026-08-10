@@ -1,6 +1,10 @@
 ---
-name: vrchat-osc
-description: VRChat OSC integration — chatbox messaging, avatar parameter control, and raw OSC via python-osc. Requires VOICEVOX and VRChat running with OSC enabled.
+name: vrchat
+description: Control VRChat through OSC chatbox and avatar commands.
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
 tags: [vrchat, osc, vr, metaverse, chatbox, avatar, voicevox, japanese]
 ---
 
