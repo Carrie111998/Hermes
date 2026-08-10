@@ -2072,6 +2072,19 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # Strip image parts for non-vision models (no-op when vision-capable).
     _msgs_for_chat = agent._prepare_messages_for_non_vision_model(api_messages)
 
+    try:
+        from hermes_cli.route_identity import normalize_route_base_url
+
+        _route = normalize_route_base_url(agent.base_url)
+        _supports_prompt_cache_key = any(
+            isinstance(entry, dict)
+            and normalize_route_base_url(entry.get("base_url")) == _route
+            and entry.get("supports_prompt_cache_key") is True
+            for entry in getattr(agent, "_custom_providers", [])
+        )
+    except Exception:
+        _supports_prompt_cache_key = False
+
     return _ct.build_kwargs(
         model=agent.model,
         messages=_msgs_for_chat,
@@ -2108,6 +2121,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         lmstudio_reasoning_options=agent._lmstudio_reasoning_options_cached() if _is_lmstudio else None,
         anthropic_max_output=_ant_max,
         provider_name=agent.provider,
+        supports_prompt_cache_key=_supports_prompt_cache_key,
     )
 
 
