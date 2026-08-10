@@ -122,6 +122,89 @@ def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypa
     assert result["final_response"] == "verified summary."
     assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
     agent._handle_max_iterations.assert_called_once()
+    assert not any(
+        isinstance(message, dict)
+        and message.get("_terminal_continuation_scaffold")
+        for message in result["messages"]
+    )
+    transcript_text = "\n".join(
+        str(message.get("content") or "") for message in result["messages"]
+    )
+    assert "I'll inspect the files now" not in transcript_text
+    assert "still incomplete" not in transcript_text
+
+
+def test_terminal_continuation_budget_exhaustion_is_visible(agent, monkeypatch):
+    agent.max_iterations = 3
+    agent.iteration_budget.max_total = 3
+    agent.valid_tool_names = ["web_search"]
+    agent._intent_ack_continuation = True
+    answers = iter([_response("I'll inspect the files now") for _ in range(3)])
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    delivered = []
+    agent.interim_assistant_callback = lambda text, **_kw: delivered.append(text)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("inspect /tmp/project")
+
+    assert result["api_calls"] == 3
+    assert result["response_previewed"] is False
+    assert delivered == ["I'll inspect the files now"]
+    assert all("PAUSED" not in text for text in delivered)
+    assert "PAUSED" in result["final_response"]
+    assert "budget exhausted" in result["final_response"]
+    assert not any(
+        isinstance(message, dict)
+        and message.get("_terminal_continuation_scaffold")
+        for message in result["messages"]
+    )
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert "PAUSED" in result["messages"][-1]["content"]
+    assert "budget exhausted" in result["messages"][-1]["content"]
+
+
+def test_verification_rounds_share_original_turn_continuation_budget(
+    agent, monkeypatch
+):
+    """Synthetic verification rounds must not reset the human-turn cap."""
+    agent.max_iterations = 6
+    agent.iteration_budget.max_total = 6
+    agent.valid_tool_names = ["web_search"]
+    agent._intent_ack_continuation = True
+    agent._looks_like_codex_intermediate_ack = MagicMock(return_value=True)
+    answers = iter(
+        [
+            _response("I'll inspect the files now"),
+            _response("candidate one"),
+            _response("I'll inspect the files now"),
+            _response("candidate two"),
+            _response("I'll inspect the files now"),
+            _response("candidate three"),
+        ]
+    )
+    agent._interruptible_api_call = lambda _kwargs: next(answers)
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", "verify it", None],
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("inspect /tmp/project")
+
+    assert result["api_calls"] == 5
+    assert "PAUSED" in result["final_response"]
+    assert "budget exhausted" in result["final_response"]
+    assert "candidate three" not in result["final_response"]
 
 
 def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):

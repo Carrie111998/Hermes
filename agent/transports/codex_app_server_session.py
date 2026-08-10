@@ -68,6 +68,10 @@ class TurnResult:
     final_text: str = ""
     projected_messages: list[dict] = field(default_factory=list)
     tool_iterations: int = 0
+    # True only after a matching native ``turn/completed`` notification with a
+    # completed (or omitted) status. Deadline-accepted assistant text is usable
+    # as a response but must never authorize an automatic continuation.
+    native_completed: bool = False
     interrupted: bool = False
     error: Optional[str] = None  # Set if turn ended in a non-recoverable error
     turn_id: Optional[str] = None
@@ -736,6 +740,7 @@ class CodexAppServerSession:
                 turn_status = (
                     (note.get("params") or {}).get("turn") or {}
                 ).get("status")
+                result.native_completed = turn_status in {None, "completed"}
                 if turn_status and turn_status not in {"completed", "interrupted"}:
                     err_obj = (
                         (note.get("params") or {}).get("turn") or {}

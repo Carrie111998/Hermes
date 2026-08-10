@@ -67,6 +67,18 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _drop_terminal_continuation_scaffolding(messages) -> None:
+    """Drop both halves of false-stop recovery pairs on every exit path."""
+    messages[:] = [
+        message
+        for message in messages
+        if not (
+            isinstance(message, dict)
+            and message.get("_terminal_continuation_scaffold")
+        )
+    ]
+
+
 def finalize_turn(
     agent,
     *,
@@ -92,9 +104,44 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    # False-stop retries use a paired assistant-candidate/user-nudge scaffold.
+    # Capture the latest real checkpoint before removing the retry context so a
+    # non-terminal recovery exit can restore it durably.
+    terminal_continuation_fallback_message = next(
+        (
+            message
+            for message in reversed(messages)
+            if isinstance(message, dict)
+            and message.get("role") == "assistant"
+            and message.get("_terminal_continuation_scaffold")
+            and str(message.get("content") or "").strip()
+        ),
+        None,
+    )
+    terminal_continuation_fallback = (
+        str(terminal_continuation_fallback_message.get("content") or "").strip()
+        if terminal_continuation_fallback_message
+        else None
+    )
+    terminal_continuation_previewed = bool(
+        terminal_continuation_fallback_message
+        and terminal_continuation_fallback_message.get(
+            "_terminal_continuation_previewed"
+        )
+    )
+    _drop_terminal_continuation_scaffolding(messages)
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
+    )
+    final_response_text = str(final_response or "").strip()
+    terminal_continuation_has_no_answer = (
+        not final_response_text
+        or final_response_text == "(empty)"
+        or final_response_text.startswith(
+            "⚠️ The model produced only internal reasoning and no final answer"
+        )
     )
     budget_fallback_eligible = (
         budget_exhausted
@@ -102,11 +149,23 @@ def finalize_turn(
         and not failed
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
-    continuation_budget_exhausted = (
+    pending_verification_fallback = (
         final_response is None
         and bool(_pending_verification_response)
         and budget_fallback_eligible
     )
+    if (
+        terminal_continuation_fallback
+        and terminal_continuation_has_no_answer
+        and not (final_response is None and budget_fallback_eligible)
+    ):
+        final_response = terminal_continuation_fallback
+        messages.append(
+            {"role": "assistant", "content": terminal_continuation_fallback}
+        )
+        if terminal_continuation_previewed:
+            agent._response_was_previewed = True
+    continuation_budget_exhausted = pending_verification_fallback
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False

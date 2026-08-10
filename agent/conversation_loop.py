@@ -826,13 +826,13 @@ _CODEX_INCOMPLETE_NUDGE = (
 )
 
 
-# Re-prompt sent after a Codex/Responses turn ends with an acknowledgment-only
-# reply (no tool calls, no final answer) — named so
-# agent.context_compressor's _is_synthetic_compression_user_turn can
-# recognize it by content the same way it recognizes _CODEX_INCOMPLETE_NUDGE.
-_CODEX_ACK_CONTINUATION_NUDGE = (
-    "[System: Continue now. Execute the required tool calls and only "
-    "send your final answer after completing the task.]"
+# Re-prompt sent after a Codex turn ends with a false-stop response. Imported
+# from the shared policy module so the normal and app-server runtimes cannot
+# drift. The private alias preserves context-compressor content matching.
+from agent.terminal_continuation import (
+    BUDGET_EXHAUSTED_NOTICE as _TERMINAL_CONTINUATION_EXHAUSTED_NOTICE,
+    CONTINUATION_NUDGE as _CODEX_ACK_CONTINUATION_NUDGE,
+    ContinuationReason as _ContinuationReason,
 )
 
 # Re-prompt sent when a provider returns finish_reason="tool_calls" with an
@@ -7322,39 +7322,68 @@ def run_conversation(
                 agent._clear_status_buffer()
 
                 from agent.agent_runtime_helpers import (
+                    classify_codex_terminal,
                     intent_ack_continuation_mode,
                 )
 
                 _ack_mode = intent_ack_continuation_mode(agent)
-                if (
-                    _ack_mode != "off"
-                    and agent.valid_tool_names
-                    and codex_ack_continuations < 2
-                    and agent._looks_like_codex_intermediate_ack(
-                        user_message=user_message,
-                        assistant_content=final_response,
-                        messages=messages,
+                if _ack_mode != "off" and agent.valid_tool_names:
+                    _continuation_reason = classify_codex_terminal(
+                        agent,
+                        user_message,
+                        final_response,
+                        messages,
                         require_workspace=(_ack_mode == "codex_only"),
+                        terminal_completed=True,
+                        finish_reason=finish_reason,
+                        continuation_attempts=codex_ack_continuations,
                     )
-                ):
+                else:
+                    _continuation_reason = _ContinuationReason.NONE
+
+                if _continuation_reason is _ContinuationReason.BUDGET_EXHAUSTED:
+                    final_response = (
+                        f"{final_response.rstrip()}\n\n"
+                        f"{_TERMINAL_CONTINUATION_EXHAUSTED_NOTICE}"
+                    )
+                elif _continuation_reason is not _ContinuationReason.NONE:
                     codex_ack_continuations += 1
-                    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+                    interim_msg = agent._build_assistant_message(
+                        assistant_message, "incomplete"
+                    )
+                    interim_msg["_terminal_continuation_scaffold"] = True
                     messages.append(interim_msg)
-                    agent._emit_interim_assistant_message(interim_msg)
+                    interim_msg["_terminal_continuation_previewed"] = bool(
+                        agent._emit_interim_assistant_message(interim_msg)
+                    )
 
                     continue_msg = {
                         "role": "user",
                         "content": _CODEX_ACK_CONTINUATION_NUDGE,
+                        "_terminal_continuation_scaffold": True,
                     }
                     messages.append(continue_msg)
                     agent._session_messages = messages
-                    # An acknowledgment is explicitly non-final. Do not let its
-                    # text suppress iteration-limit summarization if this
-                    # continuation consumes the remaining budget.
+                    # This candidate+nudge pair is recovery scaffolding. It is
+                    # stripped from every durable/exported transcript once the
+                    # retry reaches a true terminal.
                     final_response = None
                     continue
 
-                codex_ack_continuations = 0
+                if any(
+                    isinstance(msg, dict)
+                    and msg.get("_terminal_continuation_scaffold")
+                    for msg in messages
+                ):
+                    messages[:] = [
+                        msg
+                        for msg in messages
+                        if not (
+                            isinstance(msg, dict)
+                            and msg.get("_terminal_continuation_scaffold")
+                        )
+                    ]
+                    agent._session_messages = messages
 
                 if truncated_response_parts:
                     final_response = _join_truncated_parts([*truncated_response_parts, final_response])
@@ -7369,6 +7398,13 @@ def run_conversation(
                 final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                if (
+                    _continuation_reason
+                    is _ContinuationReason.BUDGET_EXHAUSTED
+                ):
+                    # Keep exhaustion truthful across resume/replay, not only
+                    # in the immediate delivery payload.
+                    final_msg["content"] = final_response
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5

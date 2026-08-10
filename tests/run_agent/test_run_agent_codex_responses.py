@@ -1574,8 +1574,11 @@ def test_interim_commentary_is_not_marked_already_streamed_without_callbacks(mon
         {"text": text, "already_streamed": already_streamed}
     )
 
-    agent._emit_interim_assistant_message({"role": "assistant", "content": "short version: yes"})
+    delivered = agent._emit_interim_assistant_message(
+        {"role": "assistant", "content": "short version: yes"}
+    )
 
+    assert delivered is True
     assert observed == {
         "text": "short version: yes",
         "already_streamed": False,
