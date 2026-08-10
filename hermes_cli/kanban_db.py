@@ -5261,17 +5261,25 @@ def _cleanup_workspace(
                     # Primary: query spawn events (immutable, survives
                     # complete_task's UPDATE that clears worker_pid).
                     spawn_row = conn.execute(
-                        "SELECT json_extract(payload, '$.pid') as pid"
+                        "SELECT json_extract(payload, '$.pid') as pid,"
+                        " json_extract(payload, '$.starttime') as starttime"
                         " FROM task_events"
                         " WHERE task_id = ? AND kind = 'spawned'"
                         " ORDER BY id DESC LIMIT 1",
                         (task_id,),
                     ).fetchone()
                     spawn_pid: int | None = None
+                    spawn_starttime: int | None = None
                     if spawn_row and spawn_row["pid"] is not None:
                         spawn_pid = int(spawn_row["pid"])
+                        # starttime may be None for spawn events recorded
+                        # before this fix was deployed.
+                        if spawn_row["starttime"] is not None:
+                            spawn_starttime = int(spawn_row["starttime"])
                     elif captured_worker_pid is not None:
                         spawn_pid = captured_worker_pid
+                        # captured_worker_pid is a live capture — it cannot
+                        # be stale, so no starttime check needed.
                     elif captured_worker_pid is None:
                         # Fall back to tasks.worker_pid (for callers that
                         # bypass complete_task and don't pass capture).
@@ -5282,7 +5290,10 @@ def _cleanup_workspace(
                         if worker_row and worker_row["worker_pid"]:
                             spawn_pid = int(worker_row["worker_pid"])
                     if spawn_pid is not None:
-                        owned = _discover_descendant_pids(spawn_pid)
+                        owned = _discover_descendant_pids(
+                            spawn_pid,
+                            expected_starttime=spawn_starttime,
+                        )
                         if not owned:
                             owned = set()
                     else:
@@ -7932,7 +7943,18 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     The event's payload carries the pid so a human reading ``hermes kanban
     tail`` can correlate log lines with OS-level traces without opening
     the drawer.
+
+    Also captures the process's starttime from ``/proc/<pid>/stat`` so
+    downstream ownership checks can distinguish a recycled PID from the
+    original spawned process (#AION-RL2-CORE-04, bafuxunan audit
+    t_86c15b21).
     """
+    # Capture process identity for PID reuse detection.
+    identity = _read_process_identity(int(pid))
+    spawn_payload: dict = {"pid": int(pid)}
+    if identity is not None:
+        spawn_payload["starttime"] = identity["starttime"]
+
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET worker_pid = ? WHERE id = ?",
@@ -7944,7 +7966,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
                 (int(pid), run_id),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        _append_event(conn, task_id, "spawned", spawn_payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -10243,7 +10265,9 @@ def _revalidate_identity(pid: int, captured: dict) -> bool:
     )
 
 
-def _discover_descendant_pids(root_pid: int) -> set[int]:
+def _discover_descendant_pids(
+    root_pid: int, *, expected_starttime: int | None = None,
+) -> set[int]:
     """Return the set of PIDs that are descendants of *root_pid*.
 
     Walks ``/proc`` once and traces the ppid chain of every PID back to
@@ -10251,6 +10275,13 @@ def _discover_descendant_pids(root_pid: int) -> set[int]:
     no descendants.
 
     ``root_pid`` itself is always included when it is alive.
+
+    When *expected_starttime* is provided, the root PID's current starttime
+    (from ``/proc/<pid>/stat`` field 22) must match *expected_starttime* or
+    the PID is treated as recycled — an unrelated process that happened to
+    reuse the same PID after the original exited. In that case, an empty set
+    is returned as if the root were dead (#AION-RL2-CORE-04, bafuxunan audit
+    t_86c15b21).
     """
     import os as _os
 
@@ -10261,6 +10292,27 @@ def _discover_descendant_pids(root_pid: int) -> set[int]:
         _os.kill(root_pid, 0)
     except OSError:
         return owned
+
+    # When expected_starttime is provided, verify the PID hasn't been
+    # recycled — the current process's starttime must match.
+    if expected_starttime is not None:
+        try:
+            stat_data = Path(f"/proc/{root_pid}/stat").read_text(encoding="utf-8")
+        except (OSError, FileNotFoundError):
+            return owned
+        close_paren = stat_data.rfind(")")
+        if close_paren == -1:
+            return owned
+        fields = stat_data[close_paren + 2:].split()
+        if len(fields) < 20:
+            return owned
+        try:
+            current_starttime = int(fields[19])
+        except (ValueError, IndexError):
+            return owned
+        if current_starttime != expected_starttime:
+            return owned  # PID recycled — unrelated process
+
     owned.add(root_pid)
 
     # Build a PID → ppid map from /proc in one pass.
