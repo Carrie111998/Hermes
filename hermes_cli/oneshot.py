@@ -31,6 +31,11 @@ from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.oneshot_policy import (
+    configure_oneshot_approval_policy,
+    current_oneshot_yolo_policy,
+    reset_oneshot_approval_policy,
+)
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -168,32 +173,31 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
-def _configure_oneshot_yolo() -> bool:
-    """Apply the explicit one-shot YOLO policy and return whether it is enabled.
-
-    A one-shot run has no interactive approval surface. The safe default is
-    therefore to leave dangerous-command and plugin approval gates active so
-    approval-required actions fail closed. Trusted automation can explicitly
-    opt into the historical auto-bypass with ``approvals.oneshot_yolo: true``.
-    """
-    enabled = False
-    try:
-        from hermes_cli.config import load_config
-
-        approvals = (load_config() or {}).get("approvals")
-        if isinstance(approvals, dict):
-            enabled = approvals.get("oneshot_yolo") is True
-    except Exception:
-        enabled = False
-    if enabled:
-        os.environ["HERMES_YOLO_MODE"] = "1"
-    else:
-        # Clear inherited YOLO as well: approval state may be frozen at import.
-        os.environ.pop("HERMES_YOLO_MODE", None)
-    return enabled
-
-
 def run_oneshot(
+    prompt: str,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    toolsets: object = None,
+    usage_file: Optional[str] = None,
+) -> int:
+    """Run one invocation under its explicit approval-policy context."""
+    policy_token = None
+    if current_oneshot_yolo_policy() is None:
+        policy_token = configure_oneshot_approval_policy()
+    try:
+        return _run_oneshot(
+            prompt,
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            usage_file=usage_file,
+        )
+    finally:
+        if policy_token is not None:
+            reset_oneshot_approval_policy(policy_token)
+
+
+def _run_oneshot(
     prompt: str,
     model: Optional[str] = None,
     provider: Optional[str] = None,
@@ -242,9 +246,6 @@ def run_oneshot(
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-    # One-shot is non-interactive, so approval-required actions must either be
-    # explicitly auto-approved or fail closed rather than waiting for input.
-    _configure_oneshot_yolo()
     os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
     # One-shot prints a single final response and exits: there is no later turn
@@ -478,7 +479,8 @@ def _run_agent(
             #                HERMES_INTERACTIVE which we never set
             #   - shell-hook approval → auto-approved via HERMES_ACCEPT_HOOKS=1
             #                (set above); also falls back to deny on non-tty
-            #   - dangerous-command approval → bypassed via HERMES_YOLO_MODE=1
+            #   - dangerous-command approval → fail-closed unless the invocation
+            #                policy explicitly enables approvals.oneshot_yolo
             #   - skill secret capture → returns gracefully when no callback set
             clarify_callback=_oneshot_clarify_callback,
         )

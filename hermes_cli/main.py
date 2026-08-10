@@ -10813,8 +10813,18 @@ def _should_background_mcp_startup(args) -> bool:
     return args.command in {None, "chat", "rl"}
 
 
+def _configure_oneshot_policy_if_needed(args) -> None:
+    """Resolve one-shot approval policy before any plugin/tool imports."""
+    if not getattr(args, "oneshot", None):
+        return
+    from hermes_cli.oneshot_policy import configure_oneshot_approval_policy
+
+    configure_oneshot_approval_policy()
+
+
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    _configure_oneshot_policy_if_needed(args)
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -10822,7 +10832,7 @@ def _prepare_agent_startup(args) -> None:
     # reachable from other launchers too (e.g. the Termux fast-CLI path),
     # so the guarantee lives here where the import is actually triggered
     # (#60328).
-    if getattr(args, "yolo", False):
+    if getattr(args, "yolo", False) and not getattr(args, "oneshot", None):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
 
@@ -10960,6 +10970,7 @@ def _try_termux_fast_cli_launch() -> bool:
         return True
 
     if getattr(args, "oneshot", None):
+        _configure_oneshot_policy_if_needed(args)
         _prepare_agent_startup(args)
         _run_and_exit_oneshot(
             args.oneshot,
@@ -12613,13 +12624,15 @@ def main():
         cmd_version(args)
         return
 
+    _configure_oneshot_policy_if_needed(args)
+
     # --yolo: set HERMES_YOLO_MODE *before* plugin discovery.  The call to
     # _prepare_agent_startup() below triggers discover_plugins() → tool
     # imports, and tools.approval freezes _YOLO_MODE_FROZEN at module
     # import time (PR #7994, security hardening against prompt-injection).
     # If the env var is set only later (e.g. inside cmd_chat), the frozen
     # value is already False and --yolo silently does nothing.
-    if getattr(args, "yolo", False):
+    if getattr(args, "yolo", False) and not getattr(args, "oneshot", None):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
     # Discover Python plugins and register shell hooks once, before any

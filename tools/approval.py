@@ -24,6 +24,7 @@ import time
 import unicodedata
 from typing import Optional
 from hermes_cli.config import cfg_get
+from hermes_cli.oneshot_policy import current_oneshot_yolo_policy
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -2938,8 +2939,9 @@ def _get_approval_mode() -> str:
 def is_approval_bypass_active_for_session(session_key: str) -> bool:
     """Return whether one exact session bypasses Hermes approval prompts.
 
-    Collapses the canonical three-source bypass check used across the codebase
-    into one place:
+    Collapses the canonical bypass check used across the codebase into one
+    place. An active one-shot invocation policy is authoritative; otherwise
+    the normal three sources apply:
       - process-scoped ``--yolo`` / ``HERMES_YOLO_MODE`` (frozen at import time
         so a mid-process skill can't flip it — a prompt-injection escalation
         path; see ``_YOLO_MODE_FROZEN`` above),
@@ -2949,6 +2951,9 @@ def is_approval_bypass_active_for_session(session_key: str) -> bool:
     This is the pure-bypass sub-expression only. Callers that also honor a
     hardline blocklist / permanent allowlist must check those separately.
     """
+    oneshot_yolo = current_oneshot_yolo_policy()
+    if oneshot_yolo is not None:
+        return oneshot_yolo
     return (
         _YOLO_MODE_FROZEN
         or is_session_yolo_enabled(session_key)
@@ -3198,6 +3203,21 @@ def _run_approval_gate(
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
+    oneshot_yolo = current_oneshot_yolo_policy()
+    if oneshot_yolo is True:
+        return {"approved": True, "message": None}
+    if oneshot_yolo is False:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: one-shot mode has no approval surface. Set "
+                "approvals.oneshot_yolo: true only for a trusted invocation."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "blocked",
+            "user_consent": False,
+        }
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
         return {"approved": True, "message": None}
 
@@ -3455,7 +3475,11 @@ def check_dangerous_command(command: str, env_type: str,
 
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    oneshot_yolo = current_oneshot_yolo_policy()
+    if oneshot_yolo is True or (
+        oneshot_yolo is None
+        and (_YOLO_MODE_FROZEN or is_current_session_yolo_enabled())
+    ):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -3779,10 +3803,21 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    oneshot_yolo = current_oneshot_yolo_policy()
+
+    # An active one-shot policy overrides inherited/process/session YOLO and
+    # approvals.mode=off. Only its exact trusted opt-in may bypass this sink.
+    if oneshot_yolo is True:
+        return {"approved": True, "message": None}
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if oneshot_yolo is None and (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
     if _command_matches_permanent_allowlist(command):
@@ -3794,7 +3829,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if oneshot_yolo is None and not is_cli and not is_gateway and not is_ask:
         # Cron sessions: respect cron_mode config
         if _is_cron_approval_context():
             if _get_cron_approval_mode() == "deny":
@@ -3933,6 +3968,19 @@ def check_all_command_guards(command: str, env_type: str,
     # Nothing to warn about
     if not warnings:
         return {"approved": True, "message": None}
+
+    if oneshot_yolo is False:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: one-shot mode has no approval surface. Set "
+                "approvals.oneshot_yolo: true only for a trusted invocation."
+            ),
+            "pattern_key": warnings[0][0],
+            "description": "; ".join(desc for _, desc, _ in warnings),
+            "outcome": "blocked",
+            "user_consent": False,
+        }
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
@@ -4256,6 +4304,23 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    oneshot_yolo = current_oneshot_yolo_policy()
+    if oneshot_yolo is True:
+        return {"approved": True, "message": None}
+    if oneshot_yolo is False:
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code requires approval, but one-shot mode "
+                "has no approval surface. Set approvals.oneshot_yolo: true "
+                "only for a trusted invocation."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "blocked",
+            "user_consent": False,
+        }
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()
