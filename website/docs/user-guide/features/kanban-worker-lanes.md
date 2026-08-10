@@ -20,6 +20,92 @@ GitHub PR      =  upstreamable artifact (optional, for code lanes)
 
 Hermes Kanban owns lifecycle truth — `ready` → `running` → `review` / `blocked` / `done` / `archived`. Worker lanes execute work but never own that truth; everything they do flows back through the kanban kernel via the `kanban_*` tools (or, for non-Hermes external workers, via the API). Reviewers gate the transition from "code change written" to "task done."
 
+## Workflow-configuration preflight
+
+Tasks that change durable workflow configuration use the `workflow_configuration`
+intake contract. Preflight is a read-only validation and normalization step that
+runs before the task is written; it is not a second dispatcher and it does not
+force a coding CLI.
+
+The specialist resolution order is **Forge, then DEV, then Chip, then Quill**.
+An explicit implementation assignee is honored only when that profile exists and
+is one of those validated implementation profiles. `default` and `halo` are
+control profiles, not owners of mutable workflow configuration. If no valid
+implementation profile is available, preflight rejects the request before any
+task or dependency row is written.
+
+Accepted requests receive canonical metadata. A normal routed task has the
+following shape (an explicitly requested `cursor` replaces the default agent):
+
+```json
+{
+  "canonical": true,
+  "task_type": "workflow_configuration",
+  "lane": "FORGE",
+  "implementation_lane": true,
+  "route": "coding_cli_router",
+  "use_coding_router": true,
+  "coding_agent": "codex",
+  "coding_agent_resolution": "default"
+}
+```
+
+Direct DEV execution is represented explicitly rather than by inventing a
+coding-agent name:
+
+```json
+{
+  "canonical": true,
+  "task_type": "workflow_configuration",
+  "lane": "DEV",
+  "implementation_lane": true,
+  "route": "dev_direct",
+  "use_coding_router": false,
+  "coding_agent": null,
+  "coding_agent_resolution": "dev_direct",
+  "execution_fallback": "dev_direct"
+}
+```
+
+`coding_agent=codex` is the default; `coding_agent=cursor` is valid only when
+explicitly requested. No coding CLI is forced by this contract: the route and
+the normalized metadata describe what the owning lane may use. Human approval,
+review, deployment, and other gates remain in force.
+
+Use the dry-run command to inspect the decision without touching the board:
+
+```bash
+hermes kanban preflight --task-type workflow_configuration \
+  --assignee forge --json
+hermes kanban preflight --task-type workflow_configuration \
+  --metadata '{"route":"dev_direct","use_coding_router":false}' --json
+```
+
+Both successful responses report `writes: 0` and `duplicates_created: 0`.
+Representative rejections include:
+
+```text
+--metadata '{"route":"dev_direct","use_coding_router":true}'
+# rejected: dev_direct requires use_coding_router=false
+
+--metadata '{"use_coding_router":false,"coding_agent":"codex"}'
+# rejected: direct execution must omit coding_agent
+
+--coding-agent claude
+# rejected: choose codex or cursor
+```
+
+Rejected input is fail-closed: it returns an actionable error and performs no
+task, parent-link, or duplicate write. Preflight does not replace create-time
+idempotency; automation should still provide an idempotency key when creating a
+task.
+
+When a workflow-configuration task depends on another task, pass real parent
+IDs through `parents=[...]` (or the CLI's repeated `--parent` option) when
+creating it. A child remains dependency-gated in `todo` until every parent is
+`done`; prose such as “depends on X” is not a dependency edge. The normal
+worker/reviewer lifecycle still applies after promotion.
+
 ## What a lane provides
 
 To be a kanban worker lane, an integration must provide three things:

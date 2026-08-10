@@ -69,6 +69,67 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
+### Workflow-configuration intake contract
+
+Use `task_type: "workflow_configuration"` for durable workflow/configuration
+changes. The create path performs a **read-only preflight before the first
+database write**. It resolves implementation ownership in this order:
+**Forge → DEV → Chip → Quill**. An explicit `--assignee` is accepted only if
+it names an installed profile in that implementation set; `default` and `halo`
+cannot own mutable configuration. If no implementation profile resolves, the
+request is rejected before creating a task, parent link, or duplicate.
+
+The same decision can be inspected without writing anything:
+
+```bash
+hermes kanban preflight --task-type workflow_configuration \
+  --assignee forge --json
+```
+
+The JSON result includes `accepted`, `resolved_assignee`, normalized `metadata`,
+`writes: 0`, and `duplicates_created: 0`. A normal result contains canonical
+routing metadata like this:
+
+```json
+{
+  "canonical": true,
+  "task_type": "workflow_configuration",
+  "lane": "FORGE",
+  "implementation_lane": true,
+  "route": "coding_cli_router",
+  "use_coding_router": true,
+  "coding_agent": "codex",
+  "coding_agent_resolution": "default"
+}
+```
+
+The default coding agent is `codex`; `cursor` is recorded only when explicitly
+requested. Direct implementation is represented without a fake agent:
+
+```json
+{
+  "route": "dev_direct",
+  "use_coding_router": false,
+  "coding_agent": null,
+  "coding_agent_resolution": "dev_direct",
+  "execution_fallback": "dev_direct"
+}
+```
+
+`dev_direct` requires `use_coding_router: false` and omission of
+`coding_agent`. For example, `coding_agent: "claude"`,
+`{"route":"dev_direct","use_coding_router":true}`, and
+`{"use_coding_router":false,"coding_agent":"codex"}` are invalid and fail
+closed. These are routing descriptions, not mandates to launch a CLI; human
+approval, review, deployment, and other gates remain in effect.
+
+For parent-child work, create the dependency edge with `--parent <task-id>`
+(repeat it for multiple parents) or `parents=[...]` in `kanban_create`. The
+child stays in `todo` until all parents are `done`, then is promoted to `ready`.
+Putting a dependency only in the title/body does not gate dispatch. Preflight is
+read-only and never creates duplicates; actual automation should additionally
+use `--idempotency-key` so a retried create returns the existing task.
+
 ## Boards (multi-project)
 
 Boards let you separate unrelated streams of work — one per project, repo,
