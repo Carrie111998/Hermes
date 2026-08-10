@@ -2865,6 +2865,55 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+_DISPATCH_CLAIM_SUFFIX = ":dispatch"
+
+
+def _dispatcher_claimer_id() -> str:
+    """Return a durable marker for claims owned by automatic dispatch."""
+    return f"{_claimer_id()}{_DISPATCH_CLAIM_SUFFIX}"
+
+
+def _is_host_local_dispatch_claim(claim_lock: Optional[str]) -> bool:
+    """Distinguish automatic launches from direct/manual task claims."""
+    lock = claim_lock or ""
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    return lock.startswith(host_prefix) and lock.endswith(_DISPATCH_CLAIM_SUFFIX)
+
+
+def _claim_source_status(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+) -> str:
+    """Return the lane a claim left (``ready`` or ``review``).
+
+    ``claim_review_task`` records ``source_status: review`` on its claimed
+    event; ordinary ``claim_task`` records ``ready`` (or omits it on older
+    rows). Failed launches must restore that lane so a dead review spawn
+    does not fall back into the implementation queue.
+    """
+    if run_id is None:
+        return "ready"
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND run_id = ? AND kind = 'claimed' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id, int(run_id)),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return "ready"
+    try:
+        payload = json.loads(row["payload"])
+    except Exception:
+        return "ready"
+    if not isinstance(payload, dict):
+        return "ready"
+    source = payload.get("source_status")
+    if source == "review":
+        return "review"
+    return "ready"
+
+
 # ---------------------------------------------------------------------------
 # Task creation / mutation
 # ---------------------------------------------------------------------------
@@ -4331,7 +4380,12 @@ def claim_task(
         )
         _append_event(
             conn, task_id, "claimed",
-            {"lock": lock, "expires": expires, "run_id": run_id},
+            {
+                "lock": lock,
+                "expires": expires,
+                "run_id": run_id,
+                "source_status": "ready",
+            },
             run_id=run_id,
         )
         claimed = get_task(conn, task_id)
@@ -6798,6 +6852,9 @@ class DispatchResult:
     """Task ids requeued by :func:`reconcile_orphaned_running` this tick —
     ``running`` cards whose claim bookkeeping was broken (no valid claim,
     dead/gone worker). See the reconciliation pass for details."""
+    never_started: list[str] = field(default_factory=list)
+    """Task ids requeued because a claimed worker produced no PID, heartbeat,
+    or log before the launch grace elapsed."""
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
     skipped_unassigned: list[str] = field(default_factory=list)
@@ -7609,6 +7666,138 @@ def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     return streak
 
 
+def detect_never_started(
+    conn: sqlite3.Connection,
+    *,
+    grace_seconds: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    board: Optional[str] = None,
+) -> list[str]:
+    """Reclaim claimed tasks whose worker never became observable.
+
+    A dispatcher can die after ``claim_task`` but before persisting the child
+    PID, and legacy/custom spawn callbacks may return no PID at all.  Those
+    tasks have valid claim bookkeeping, so orphan reconciliation ignores them;
+    crash detection also ignores them because it requires a PID.  After twice
+    the normal launch grace, a host-local claim with no PID, heartbeat, or
+    worker log from the active attempt is therefore treated as a spawn failure.
+    Automatic dispatch marks its claim lock explicitly; direct/manual claims
+    intentionally lack that marker and are never interpreted as failed spawns.
+    Review-agent launches are restored to ``review`` (not ``ready``) using the
+    ``source_status`` recorded on the claim event, so a dead reviewer does not
+    re-enter the ordinary worker queue.
+
+    The log check protects the narrow ``Popen`` -> PID-persistence crash window:
+    ``_default_spawn`` opens the task log before starting the child, so a log
+    created or written during the active run means a worker may really be
+    running even though its PID was lost. Logs are reused across retries, so an
+    older attempt's file is not evidence for the current one. The compare-and-
+    swap update rechecks the PID and heartbeat under the write lock before
+    releasing the claim.
+    """
+    grace = (
+        2 * _resolve_crash_grace_seconds()
+        if grace_seconds is None
+        else max(0, int(grace_seconds))
+    )
+    now = int(time.time())
+    rows = conn.execute(
+        "SELECT t.id, t.claim_lock, t.current_run_id, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running' "
+        "  AND t.claim_lock IS NOT NULL "
+        "  AND t.claim_expires IS NOT NULL "
+        "  AND t.worker_pid IS NULL "
+        "  AND t.last_heartbeat_at IS NULL "
+        "  AND COALESCE(r.started_at, t.started_at) IS NOT NULL "
+        "  AND COALESCE(r.started_at, t.started_at) <= ?",
+        (now - grace,),
+    ).fetchall()
+
+    recovered: list[str] = []
+    auto_blocked: list[str] = []
+    log_dir = worker_logs_dir(board=board)
+    for row in rows:
+        claim_lock = row["claim_lock"] or ""
+        if not _is_host_local_dispatch_claim(claim_lock):
+            continue
+        log_path = log_dir / f"{row['id']}.log"
+        if log_path.exists():
+            try:
+                if log_path.stat().st_mtime >= int(row["active_started_at"]):
+                    continue
+            except OSError:
+                # An unreadable log cannot safely prove the worker absent.
+                continue
+
+        elapsed = now - int(row["active_started_at"])
+        error = (
+            "worker did not record a PID or heartbeat within "
+            f"{grace}s of claim"
+        )
+        requeue_status = _claim_source_status(
+            conn, row["id"], row["current_run_id"]
+        )
+        payload = {
+            "reason": "worker_never_started",
+            "claim_lock": row["claim_lock"],
+            "elapsed_seconds": elapsed,
+            "grace_seconds": grace,
+            "source_status": requeue_status,
+            "requeue_status": requeue_status,
+        }
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, "
+                "last_heartbeat_at = NULL "
+                "WHERE id = ? AND status = 'running' "
+                "  AND claim_lock IS ? AND current_run_id IS ? "
+                "  AND worker_pid IS NULL AND last_heartbeat_at IS NULL",
+                (
+                    requeue_status,
+                    row["id"],
+                    row["claim_lock"],
+                    row["current_run_id"],
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            run_id = _end_run(
+                conn,
+                row["id"],
+                outcome="spawn_failed",
+                status="spawn_failed",
+                error=error,
+                metadata=payload,
+            )
+            _append_event(
+                conn,
+                row["id"],
+                "spawn_failed",
+                payload,
+                run_id=run_id,
+            )
+            recovered.append(row["id"])
+
+        if _record_task_failure(
+            conn,
+            row["id"],
+            error,
+            outcome="spawn_failed",
+            failure_limit=failure_limit,
+            release_claim=False,
+            end_run=False,
+            event_payload_extra=payload,
+        ):
+            auto_blocked.append(row["id"])
+
+    detect_never_started._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    return recovered
+
+
 def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
@@ -7906,14 +8095,17 @@ def _record_task_failure(
 
     * ``release_claim=True, end_run=True`` — spawn-failure path.
       Caller has a running task with an open run; this transitions
-      it back to ``ready`` (or ``blocked`` when the breaker trips),
-      releases the claim, and closes the run with ``outcome=<outcome>``.
+      it back to the claim's source lane (``ready`` or ``review``, via
+      :func:`_claim_source_status`) or ``blocked`` when the breaker
+      trips, releases the claim, and closes the run with
+      ``outcome=<outcome>``.
 
     * ``release_claim=False, end_run=False`` — timeout/crash path.
-      Caller has ALREADY flipped the task to ``ready`` and closed the
-      run with the appropriate outcome. This just increments the
-      counter; if the breaker trips, the task is re-transitioned
-      ``ready → blocked`` and a ``gave_up`` event is emitted.
+      Caller has ALREADY flipped the task to its requeue lane
+      (``ready`` or ``review``) and closed the run with the appropriate
+      outcome. This just increments the counter; if the breaker trips,
+      the task is re-transitioned ``ready|review → blocked`` and a
+      ``gave_up`` event is emitted.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -7939,12 +8131,23 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
+        current_run_id = (
+            row["current_run_id"] if "current_run_id" in row.keys() else None
+        )
+        # Spawn-failure reclaim must restore the claim's source lane
+        # (ready vs review). Reading before mutations keeps the claimed
+        # event for the open run visible to _claim_source_status.
+        requeue_status = (
+            _claim_source_status(conn, task_id, current_run_id)
+            if release_claim
+            else "ready"
+        )
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -7970,13 +8173,14 @@ def _record_task_failure(
                     (failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready``
-                # with claim cleared; just flip to blocked + update
+                # Timeout/crash/never-started path: claim is already
+                # cleared and the task sits in its requeue lane
+                # (ready or review); just flip to blocked + update
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
                     "consecutive_failures = ?, last_failure_error = ? "
-                    "WHERE id = ? AND status IN ('ready', 'running')",
+                    "WHERE id = ? AND status IN ('ready', 'running', 'review')",
                     (failures, error[:500], task_id),
                 )
             run_id = None
@@ -7991,6 +8195,8 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        "source_status": requeue_status,
+                        "requeue_status": requeue_status,
                     },
                 )
             payload = {
@@ -8000,6 +8206,9 @@ def _record_task_failure(
                 "error": error[:500],
                 "trigger_outcome": outcome,
             }
+            if release_claim:
+                payload["source_status"] = requeue_status
+                payload["requeue_status"] = requeue_status
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -8009,17 +8218,20 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: restore the claim's source lane and clear
+                # claim bookkeeping. Review launches must not fall into
+                # the ready/implementation queue.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (requeue_status, failures, error[:500], task_id),
                 )
             else:
-                # Timeout/crash path: task is already at ``ready`` via
-                # its own UPDATE. Just bookkeep the counter + last error.
+                # Timeout/crash/never-started path: task is already at its
+                # requeue lane via its own UPDATE. Just bookkeep the
+                # counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
                     "last_failure_error = ? WHERE id = ?",
@@ -8031,11 +8243,22 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata={
+                        "failures": failures,
+                        "source_status": requeue_status,
+                        "requeue_status": requeue_status,
+                    },
                 )
+                event_payload = {
+                    "error": error[:500],
+                    "failures": failures,
+                }
+                if release_claim:
+                    event_payload["source_status"] = requeue_status
+                    event_payload["requeue_status"] = requeue_status
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    event_payload,
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
@@ -8387,10 +8610,11 @@ def _dispatch_once_locked(
 
     Steps:
       1. Reclaim stale running tasks (TTL expired).
-      2. Reclaim stale running tasks (no recent heartbeat).
-      3. Reclaim crashed running tasks (host-local PID no longer alive).
-      3. Promote todo -> ready where all parents are done.
-      4. For each ready task with an assignee, atomically claim and call
+      2. Reclaim claimed tasks whose worker never started.
+      3. Reclaim stale running tasks (no recent heartbeat).
+      4. Reclaim crashed running tasks (host-local PID no longer alive).
+      5. Promote todo -> ready where all parents are done.
+      6. For each ready task with an assignee, atomically claim and call
          ``spawn_fn(task, workspace_path, board) -> Optional[int]``. The
          return value (if any) is recorded as ``worker_pid`` so subsequent
          ticks can detect crashes before the TTL expires.
@@ -8422,6 +8646,16 @@ def _dispatch_once_locked(
         # bookkeeping is broken (no valid claim, dead/gone worker) that the
         # TTL/crash/stale paths can never see. See reconcile_orphaned_running.
         result.reconciled_orphans = reconcile_orphaned_running(conn)
+    result.never_started = detect_never_started(
+        conn,
+        failure_limit=failure_limit,
+        board=board,
+    )
+    _never_started_auto_blocked = getattr(
+        detect_never_started, "_last_auto_blocked", []
+    )
+    if _never_started_auto_blocked:
+        result.auto_blocked.extend(_never_started_auto_blocked)
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
@@ -8631,7 +8865,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            claimer=_dispatcher_claimer_id(),
+        )
         if claimed is None:
             continue
         try:
@@ -8723,7 +8962,12 @@ def _dispatch_once_locked(
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            claimer=_dispatcher_claimer_id(),
+        )
         if claimed is None:
             continue
         try:
