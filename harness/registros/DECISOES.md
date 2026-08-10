@@ -38,8 +38,7 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 
 ## Próximo passo
 
-1. Sync 5 commits de `origin/main` (patch-guard antes/depois)
-2. Revalidar job `avaliacao-agente-dande` (erro stale `tool_delay`)
-3. Pluginizar patches Hermes One (D-004 follow-up)
+1. Revalidar job `avaliacao-agente-dande` (erro stale `tool_delay`)
+2. Pluginizar patches Hermes One (D-004 follow-up)
 
-~~Commit harness cron-audit~~ ✅ · ~~`model.default`~~ ✅ · ~~SQLite prod 3.53.1~~ ✅ · ~~shim `hermes.cmd`~~ ✅ · provider ativo **minimax-oauth / MiniMax-M3**
+~~Sync origin/main~~ ✅ `667c85c773` · ~~SQLite 3.53.1~~ ✅ · ~~shim hermes.cmd~~ ✅ · provider **minimax-oauth / MiniMax-M3** · config **v34**

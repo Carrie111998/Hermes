@@ -1,6 +1,6 @@
 # Retomada de Sessão — Harness Hermes Agent
 
-**Salvo em:** 2026-08-10 11:15 (pós `hermes update` + gateways no SQLite 3.53.1)  
+**Salvo em:** 2026-08-10 11:50 (sync origin/main + MiniMax + SQLite 3.53.1)  
 **Objetivo:** reiniciar Cursor sem perder contexto.
 
 ---

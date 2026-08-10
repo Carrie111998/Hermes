@@ -141,6 +141,21 @@
 
 **Próximo passo:** commit docs harness (opcional) ou alinhar `.venv` / evitar PATH `hermes.cmd`
 
+### 2026-08-10 — Sync origin/main → local/harness
+
+| Passo | Resultado |
+|---|---|
+| patch-guard baseline | OK |
+| `git fetch origin main` | OK — 5 commits |
+| `git merge origin/main` | OK — ort, sem conflito (só apps/desktop) |
+| patch-guard pós-merge | OK — Hermes One + OpenRouter prune |
+| `hermes doctor --fix` | OK — config v33→**v34** (regrediu após troca MiniMax; remigrado) |
+| Merge commit | `667c85c773` |
+
+Commits syncados: `#83143` fmt, `#83138` titlebar tahoe, `#83139` fmt, fullscreen guard, titlebar Y nudge.
+
+**Próximo passo:** revalidar cron `avaliacao-agente-dande` ou D-004 pluginizar patches
+
 ### 2026-08-10 — Fim de sessão / handoff
 
 Handoff em `registros/RETOMADA_SESSAO.md`.
