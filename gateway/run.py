@@ -6039,7 +6039,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _bg_max_age_seconds = (
             _bg_max_age_hours * 3600 if _bg_max_age_hours and _bg_max_age_hours > 0 else None
         )
-        self.session_store = SessionStore(
+        self._ctx.session_store = SessionStore(
             self._ctx.config.sessions_dir, self._ctx.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(
                 key, max_active_age=_bg_max_age_seconds,
@@ -6049,15 +6049,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Sync helpers keep using ``session_store`` directly; async gateway
         # handlers call this facade and await every operation.
         self._async_session_store = AsyncSessionStore(self._ctx.session_store)
-        self.delivery_router = DeliveryRouter(self._ctx.config)
-        self._running = False
+        self._ctx.delivery_router = DeliveryRouter(self._ctx.config)
+        self._ctx._running = False
         self._ctx._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
         self._shutdown_event = asyncio.Event()
         self._exit_cleanly = False
         self._exit_with_failure = False
         self._exit_reason: Optional[str] = None
         self._exit_code: Optional[int] = None
-        self._draining = False
+        self._ctx._draining = False
         self._profile_failed_platforms: Dict[str, Dict[Platform, asyncio.Task]] = {}
         self._systemd_watchdog = None
         # External (NAS-driven) drain state — distinct from the shutdown
@@ -6371,19 +6371,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
 
-        # DEV-0159: state-spine context object.  Created alongside the
-        # existing self.X attributes as a parallel view.  No consumer
-        # uses self._ctx yet — this is infrastructure for the state-first
-        # refactoring sequence.
-        from gateway.context import GatewayContext
-        self._ctx = GatewayContext(
-            config=self._ctx.config,
-            adapters=self._ctx.adapters,
-            session_store=self._ctx.session_store,
-            async_session_store=self._ctx._async_session_store,
-            delivery_router=self._ctx.delivery_router,
-            _running=self._ctx._running,
-        )
+        # DEV-0159: state-spine context object — patch remaining fields
+        # onto the already-created self._ctx from __init__ start (line 5986).
+        # No re-creation needed; the initial GatewayContext already owns
+        # config and the adapters dict.  The remaining fields are set
+        # on self directly during __init__ and mirrored here so _ctx stays
+        # a faithful shadow.
+        self._ctx.adapters = self.adapters
+        self._ctx.session_store = self.session_store
+        self._ctx.async_session_store = self._async_session_store
+        self._ctx.delivery_router = self.delivery_router
+        self._ctx._running = self._running
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -10391,7 +10389,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Refuse new turns immediately while in-flight work finishes.
         # Keep ``_running`` True so adapters stay connected and the active
         # turn can still deliver its final response (#77184).
-        self._draining = True
+        self._ctx._draining = True
 
         async def _run_restart() -> None:
             await self._await_active_work_before_restart()
@@ -11630,7 +11628,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._ctx.delivery_router.adapters = self._ctx.adapters
         self._wire_teams_pipeline_runtime()
 
-        self._running = True
+        self._ctx._running = True
         self._update_runtime_status("running")
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
@@ -13091,8 +13089,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             def _phase_elapsed() -> float:
                 return time.monotonic() - _stop_started_at
 
-            self._running = False
-            self._draining = True
+            self._ctx._running = False
+            self._ctx._draining = True
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -13456,7 +13454,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
                 self._exit_reason = self._exit_reason or "Gateway restart requested"
 
-            self._draining = False
+            self._ctx._draining = False
             # Persist the terminal gateway_state. The default is "stopped",
             # but when this teardown was triggered by an UNEXPECTED external
             # signal (container/s6 SIGTERM on `docker restart` or image
