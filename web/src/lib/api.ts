@@ -164,10 +164,17 @@ export async function fetchJSON<T>(
     // handled above, so reaching here in gated mode means a real
     // middleware failure that should not reload-loop.
     if (!window.__HERMES_AUTH_REQUIRED__ && !options?.allowUnauthorized) {
-      showSessionExpiredBanner();
       if (attemptDashboardTokenReloadOnce()) {
+        // Reload fires synchronously through window.location.reload(); the page
+        // is about to unload, so any banner appended here would never get a
+        // rendering opportunity. Nothing to show on this path.
         return new Promise<T>(() => {});
       }
+      // The one-shot reload already happened (or was skipped because the guard
+      // is set) and the token is STILL stale, so a second reload cannot fix it.
+      // This is the only state the user can actually observe — surface it here,
+      // where paint is guaranteed because no navigation follows.
+      showSessionExpiredBanner();
     }
   }
   if (res.ok) {
@@ -175,6 +182,8 @@ export async function fetchJSON<T>(
     // current ``window.__HERMES_SESSION_TOKEN__`` is valid, so the next
     // 401 — if any — should be allowed to trigger its own reload cycle.
     clearDashboardTokenReloadAttempt();
+    // A recovered session should also tear down any visible banner.
+    dismissSessionExpiredBanner();
   }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
@@ -184,23 +193,35 @@ export async function fetchJSON<T>(
 }
 
 /**
- * Show a fixed, dismissible banner when a stale session token forces a reload.
+ * Show a fixed, dismissible banner when a stale session token can no longer be
+ * recovered by a reload.
  *
  * A dashboard tab left open across a `hermes gateway restart` / `hermes update`
  * keeps the previous `window.__HERMES_SESSION_TOKEN__`, so every `fetchJSON`
- * 401s. The loopback 401 handler below triggers a silent `window.location.reload()`
- * (or, if the reload guard is already set, falls through and throws) — making a
- * button click look like a dead no-op. This banner explains the cause. It is
- * rendered directly into `document.body` because `fetchJSON` is a plain-TS module
- * with no access to the React toast store. SSR-safe; no-op when `document` is
- * unavailable. See hermes-agent#73599.
+ * 401s. The loopback 401 handler triggers a one-shot `window.location.reload()`
+ * (handled elsewhere in this module) which picks up the freshly-injected token.
+ *
+ * This banner is shown ONLY on the path where that reload has already been
+ * attempted and the token is STILL stale, i.e. a second reload cannot help.
+ * It is therefore safe to render here — no navigation follows — and it explains
+ * to the user that they must reload manually. It is rendered directly into
+ * `document.body` because `fetchJSON` is a plain-TS module with no access to the
+ * React toast store. SSR-safe; no-op when `document` is unavailable.
+ * See hermes-agent#73599.
  */
+const SESSION_EXPIRED_BANNER_ID = "hermes-session-expired-banner";
+
+export function dismissSessionExpiredBanner(): void {
+  if (typeof document === "undefined") return;
+  document.getElementById(SESSION_EXPIRED_BANNER_ID)?.remove();
+}
+
 function showSessionExpiredBanner(): void {
   if (typeof document === "undefined" || !document.body) return;
-  const id = "hermes-session-expired-banner";
-  if (document.getElementById(id)) return;
+  if (document.getElementById(SESSION_EXPIRED_BANNER_ID)) return;
   const el = document.createElement("div");
-  el.id = id;
+  el.id = SESSION_EXPIRED_BANNER_ID;
+  el.setAttribute("role", "status");
   el.setAttribute(
     "style",
     [
@@ -209,6 +230,9 @@ function showSessionExpiredBanner(): void {
       "bottom:24px",
       "transform:translateX(-50%)",
       "z-index:2147483647",
+      "display:flex",
+      "gap:12px",
+      "align-items:center",
       "padding:12px 18px",
       "border-radius:8px",
       "background:#7f1d1d",
@@ -219,7 +243,18 @@ function showSessionExpiredBanner(): void {
       "text-align:center",
     ].join("; "),
   );
-  el.textContent = "Session expired — reloading dashboard…";
+  el.textContent = "Session expired — reload the page to reconnect.";
+
+  const close = document.createElement("button");
+  close.setAttribute(
+    "style",
+    "background:transparent;border:none;color:#fff;font:inherit;cursor:pointer;padding:0 4px;",
+  );
+  close.textContent = "✕";
+  close.setAttribute("aria-label", "Dismiss");
+  close.addEventListener("click", () => el.remove());
+  el.appendChild(close);
+
   document.body.appendChild(el);
 }
 
