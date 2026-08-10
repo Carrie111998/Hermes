@@ -69,6 +69,7 @@ import {
   pathWithGlobalRemoteProfile,
   profileHasRemoteConnection,
   profileRemoteOverride,
+  profileScopedConnection,
   profileSshOverride,
   resolveAuthMode,
   resolveProfileBackendRoute,
@@ -8136,9 +8137,10 @@ async function ensureBackend(profile) {
   if (route.backend === 'primary') {
     const connection = await startHermes()
 
-    // A shared backend still owes the caller its profile scope, so renderer-side
-    // WebSocket, filesystem, and cache routing target the selected profile.
-    return route.descriptorProfile ? { ...connection, profile: route.descriptorProfile } : connection
+    // Every connection owes the renderer its effective desktop profile. The raw
+    // primary descriptor predates profiles and omits it, while a shared remote
+    // route can override it with the selected alias.
+    return profileScopedConnection(connection, key, route)
   }
 
   const existing = backendPool.get(key)

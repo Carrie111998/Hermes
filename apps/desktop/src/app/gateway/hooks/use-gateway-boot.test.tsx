@@ -83,11 +83,11 @@ class FakeWebSocket {
   }
 }
 
-function fakeDesktop(profile = 'default') {
+function fakeDesktop(profile: null | string = 'default', storedProfile = profile ?? 'default') {
   const conn = {
     authMode: 'token' as const,
     baseUrl: 'https://vps.example.com',
-    profile,
+    ...(profile === null ? {} : { profile }),
     token: 't',
     wsUrl: 'wss://vps.example.com/api/ws?token=t'
   }
@@ -116,7 +116,7 @@ function fakeDesktop(profile = 'default') {
     onPowerResume: vi.fn(() => () => undefined),
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
-    profile: { get: vi.fn(async () => ({ profile: 'default' })) }
+    profile: { get: vi.fn(async () => ({ profile: storedProfile })) }
   }
 }
 
@@ -243,7 +243,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
   it('publishes the named primary connection profile before open when the URL has no hint', async () => {
     window.history.replaceState({}, '', '/')
     $activeGatewayProfile.set('default')
-    const desktop = fakeDesktop('life')
+    const desktop = fakeDesktop(null, 'life')
     let profileAtFirstOpen: string | null = null
     const eventProfiles: string[] = []
 
@@ -273,7 +273,7 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
         connectionProfile: connection?.profile,
         current: $activeGatewayProfile.get(),
         profileAtFirstOpen
-      }).toEqual({ connectionProfile: 'life', current: 'life', profileAtFirstOpen: 'life' })
+      }).toEqual({ connectionProfile: undefined, current: 'life', profileAtFirstOpen: 'life' })
       expect(eventProfiles).toEqual(['life', 'life'])
     } finally {
       stop()

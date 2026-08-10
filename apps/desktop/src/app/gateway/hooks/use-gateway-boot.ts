@@ -271,8 +271,23 @@ export function useGatewayBoot({
     // non-primary profile, adopting the primary here resolves its session id
     // against the wrong backend. The override wins over the stored preference;
     // absent, behavior is unchanged (#82285).
-    function adoptConnectionProfile(connection: HermesConnection) {
-      const key = normalizeProfileKey(profileOverride ?? connection.profile ?? $activeGatewayProfile.get())
+    async function adoptConnectionProfile(connection: HermesConnection) {
+      let storedProfile: null | string = null
+
+      // Older primary descriptors omit `profile`. Resolve the stored desktop
+      // preference before opening the socket so the first event and REST route
+      // still inherit the backend's actual scope.
+      if (!profileOverride && !connection.profile) {
+        try {
+          storedProfile = (await desktop.profile?.get?.())?.profile ?? null
+        } catch {
+          // Fall through to the live atom for legacy/single-profile installs.
+        }
+      }
+
+      const key = normalizeProfileKey(
+        profileOverride ?? connection.profile ?? storedProfile ?? $activeGatewayProfile.get()
+      )
 
       connectionProfile = key
       $activeGatewayProfile.set(key)
@@ -337,7 +352,7 @@ export function useGatewayBoot({
           return
         }
 
-        adoptConnectionProfile(conn)
+        await adoptConnectionProfile(conn)
         publish(conn)
         const wsUrl = await resolveGatewayWsUrl(desktop, conn)
         await gateway.connect(wsUrl)
@@ -532,7 +547,7 @@ export function useGatewayBoot({
           return
         }
 
-        adoptConnectionProfile(conn)
+        await adoptConnectionProfile(conn)
         setDesktopBootStep({
           phase: 'renderer.gateway.connect',
           message: translateNow('boot.steps.connectingGateway'),
