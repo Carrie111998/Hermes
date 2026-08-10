@@ -151,6 +151,36 @@ def test_notify_sub_crud(kanban_home):
         conn.close()
 
 
+def test_child_inherits_notification_transport_provenance(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="parent")
+        kb.add_notify_sub(
+            conn,
+            task_id=parent,
+            platform="telegram",
+            chat_id="123",
+            chat_type="dm",
+            notifier_profile="worker",
+            delivery_metadata={
+                "transport_profile": "default",
+                "allow_default_adapter_fallback": True,
+            },
+        )
+        child = kb.create_task(conn, title="child", parents=[parent])
+
+        inherited = kb.list_notify_subs(conn, child)
+        assert len(inherited) == 1
+        assert inherited[0]["chat_type"] == "dm"
+        assert inherited[0]["notifier_profile"] == "worker"
+        assert inherited[0]["delivery_metadata"] == {
+            "transport_profile": "default",
+            "allow_default_adapter_fallback": True,
+        }
+    finally:
+        conn.close()
+
+
 def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     conn1 = kb.connect()
     conn2 = kb.connect()
@@ -1406,5 +1436,4 @@ def test_notify_sub_starts_caught_up_on_active_task(kanban_home):
         assert events == [], "historical events must not replay to a new sub"
     finally:
         conn.close()
-
 

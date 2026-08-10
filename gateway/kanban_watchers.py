@@ -219,12 +219,20 @@ class GatewayKanbanWatchersMixin:
                 def _collect():
                     deliveries: list[dict] = []
                     include_unowned = self._owns_kanban_dispatcher_lock()
-                    notifier_profiles = {notifier_profile}
-                    notifier_profiles.update(
-                        str(profile).strip()
-                        for profile in getattr(self, "_profile_adapters", {})
-                        if str(profile).strip()
-                    )
+                    if include_unowned:
+                        # The singleton dispatcher must also inspect stamped
+                        # subscriptions whose runtime profile intentionally
+                        # used the default transport.  The provenance marker
+                        # below is what authorizes that narrow fallback;
+                        # unmarked foreign rows are still skipped before claim.
+                        notifier_profiles = None
+                    else:
+                        notifier_profiles = {notifier_profile}
+                        notifier_profiles.update(
+                            str(profile).strip()
+                            for profile in getattr(self, "_profile_adapters", {})
+                            if str(profile).strip()
+                        )
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
@@ -290,7 +298,8 @@ class GatewayKanbanWatchersMixin:
                             ) == 0:
                                 logger.debug(
                                     "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
-                                    slug, sorted(notifier_profiles),
+                                    slug,
+                                    "dispatcher" if notifier_profiles is None else sorted(notifier_profiles),
                                 )
                                 continue
                         except Exception as exc:
@@ -329,7 +338,16 @@ class GatewayKanbanWatchersMixin:
                                     owner_profile = sub.get("notifier_profile") or None
                                     if owner_profile and owner_profile != notifier_profile:
                                         _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                        if not _owner_adapters:
+                                        _delivery_meta = sub.get("delivery_metadata")
+                                        _allow_default = bool(
+                                            isinstance(_delivery_meta, dict)
+                                            and _delivery_meta.get(
+                                                "allow_default_adapter_fallback"
+                                            ) is True
+                                            and _delivery_meta.get("transport_profile")
+                                            == "default"
+                                        )
+                                        if not _owner_adapters and not _allow_default:
                                             logger.debug(
                                                 "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
                                                 sub.get("task_id"), owner_profile, notifier_profile,
@@ -402,7 +420,24 @@ class GatewayKanbanWatchersMixin:
                     # wrong bot (the cross-profile mis-delivery this whole change
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
-                    adapter = self._authorization_adapter(plat, sub_profile or None)
+                    delivery_meta = sub.get("delivery_metadata")
+                    allow_default_fallback = bool(
+                        sub_profile
+                        and isinstance(delivery_meta, dict)
+                        and delivery_meta.get("allow_default_adapter_fallback") is True
+                        and delivery_meta.get("transport_profile") == "default"
+                    )
+                    if allow_default_fallback:
+                        # Provenance says the originating turn entered through
+                        # the default adapter even though its runtime/session
+                        # profile was secondary.  Always use that transport;
+                        # do not prefer a same-platform secondary adapter that
+                        # happens to be connected now.
+                        adapter = self._authorization_adapter(plat, None)
+                    else:
+                        adapter = self._authorization_adapter(
+                            plat, sub_profile or None
+                        )
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",

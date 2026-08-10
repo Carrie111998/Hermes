@@ -2774,6 +2774,66 @@ _RETRYABLE_ERROR_PATTERNS = (
 MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
 
 
+def _iter_group_topics(config_extra: dict) -> list[dict]:
+    """Normalize Telegram ``group_topics`` into chat/topic entries."""
+    raw = config_extra.get("group_topics", []) if isinstance(config_extra, dict) else []
+    if isinstance(raw, dict):
+        return [
+            {"chat_id": chat_id, "topics": topics}
+            for chat_id, topics in raw.items()
+        ]
+    if isinstance(raw, list):
+        return [entry for entry in raw if isinstance(entry, dict)]
+    return []
+
+
+def resolve_group_topic(
+    config_extra: dict,
+    chat_id: str | None,
+    thread_id: str | None,
+) -> dict | None:
+    """Resolve an exact Telegram topic or its canonical cross-thread owner.
+
+    ``cross_thread`` shares configuration only.  The physical thread id remains
+    the routing/session identity, and an explicit child entry always wins.
+    """
+    if not chat_id or not thread_id:
+        return None
+    topics: list[dict] = []
+    for chat_entry in _iter_group_topics(config_extra):
+        if str(chat_entry.get("chat_id", "")) != str(chat_id):
+            continue
+        raw_topics = chat_entry.get("topics", [])
+        if isinstance(raw_topics, list):
+            topics = [topic for topic in raw_topics if isinstance(topic, dict)]
+        break
+    for topic in topics:
+        if str(topic.get("thread_id", "")) == str(thread_id):
+            return topic
+    for topic in topics:
+        children = topic.get("cross_thread", [])
+        if isinstance(children, (list, tuple, set)) and any(
+            str(child) == str(thread_id) for child in children
+        ):
+            return topic
+    return None
+
+
+def resolve_cross_thread_canonical_id(
+    config_extra: dict,
+    thread_id: str | None,
+    parent_id: str | None = None,
+) -> str | None:
+    """Return the canonical topic id inherited by a physical child thread."""
+    topic = resolve_group_topic(config_extra, parent_id, thread_id)
+    if topic is None:
+        return None
+    canonical = topic.get("thread_id")
+    if canonical is None or str(canonical) == str(thread_id):
+        return None
+    return str(canonical)
+
+
 def resolve_channel_prompt(
     config_extra: dict,
     channel_id: str,
@@ -2792,7 +2852,10 @@ def resolve_channel_prompt(
     if not isinstance(prompts, dict):
         return None
 
-    for key in (channel_id, parent_id):
+    canonical_id = resolve_cross_thread_canonical_id(
+        config_extra, channel_id, parent_id
+    )
+    for key in (channel_id, parent_id, canonical_id):
         if not key:
             continue
         prompt = prompts.get(key)

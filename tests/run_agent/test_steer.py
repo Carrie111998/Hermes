@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_window_open = True
     agent._pending_redirect = None
     agent._pending_redirect_lock = threading.Lock()
     agent._model_request_active = threading.Event()
@@ -31,6 +32,7 @@ def _bare_agent() -> AIAgent:
     agent._interrupt_thread_signal_pending = False
     agent._interrupt_requested = False
     agent._interrupt_message = None
+    agent._hard_interrupt_requested = threading.Event()
     agent._active_children = []
     agent._active_children_lock = threading.Lock()
     agent._tool_worker_threads = None
@@ -48,6 +50,47 @@ class TestSteerAcceptance:
         agent = _bare_agent()
         assert agent.steer("go ahead and check the logs") is True
         assert agent._pending_steer == "go ahead and check the logs"
+
+    def test_rejects_when_turn_window_is_closed(self):
+        agent = _bare_agent()
+        agent._close_steer_window()
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
+
+
+class TestSteerTurnWindow:
+    def test_accepted_before_close_is_drained(self):
+        agent = _bare_agent()
+        assert agent.steer("late correction") is True
+        assert agent._close_steer_window() == "late correction"
+        assert agent.steer("after close") is False
+
+    def test_close_race_has_no_false_success_loss(self):
+        for _ in range(100):
+            agent = _bare_agent()
+            barrier = threading.Barrier(3)
+            outcome = {}
+
+            def steer():
+                barrier.wait()
+                outcome["accepted"] = agent.steer("correction")
+
+            def close():
+                barrier.wait()
+                outcome["drained"] = agent._close_steer_window()
+
+            t1 = threading.Thread(target=steer)
+            t2 = threading.Thread(target=close)
+            t1.start()
+            t2.start()
+            barrier.wait()
+            t1.join(timeout=1)
+            t2.join(timeout=1)
+            assert outcome in (
+                {"accepted": True, "drained": "correction"},
+                {"accepted": False, "drained": None},
+            )
+            assert agent._pending_steer is None
 
 
 
@@ -465,6 +508,7 @@ class TestSteerClearedOnInterrupt:
         agent._pending_redirect = "also drop this"
         assert agent._pending_steer == "will be dropped"
 
+        agent._hard_interrupt_requested.set()
         agent.clear_interrupt()
         assert agent._pending_steer is None
         assert agent._pending_redirect is None

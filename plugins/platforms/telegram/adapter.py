@@ -9810,32 +9810,14 @@ class TelegramAdapter(BasePlatformAdapter):
             #   [{"chat_id": "-100...", "topics": [...]}]
             # and legacy/operator-edited mapping shape:
             #   {"-100...": [{"thread_id": 12, ...}]}
-            group_topics_config = self.config.extra.get("group_topics", [])
-            if isinstance(group_topics_config, dict):
-                group_topics_iter = [
-                    {"chat_id": cfg_chat_id, "topics": topics}
-                    for cfg_chat_id, topics in group_topics_config.items()
-                ]
-            elif isinstance(group_topics_config, list):
-                group_topics_iter = [
-                    entry for entry in group_topics_config if isinstance(entry, dict)
-                ]
-            else:
-                group_topics_iter = []
-            for chat_entry in group_topics_iter:
-                if str(chat_entry.get("chat_id", "")) == str(chat.id):
-                    topics = chat_entry.get("topics", [])
-                    if not isinstance(topics, list):
-                        topics = []
-                    for topic in topics:
-                        if not isinstance(topic, dict):
-                            continue
-                        tid = topic.get("thread_id")
-                        if tid is not None and str(tid) == thread_id_str:
-                            chat_topic = topic.get("name")
-                            topic_skill = topic.get("skill")
-                            break
-                    break
+            from gateway.platforms.base import resolve_group_topic
+
+            topic = resolve_group_topic(
+                self.config.extra, str(chat.id), thread_id_str
+            )
+            if topic is not None:
+                chat_topic = topic.get("name")
+                topic_skill = topic.get("skills", topic.get("skill"))
 
         # Build source
         source = self.build_source(

@@ -532,6 +532,8 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    auto_loaded_skill_prompt: str = "",
+    enabled_skills: List[str] = None,
 ):
     """
     Initialize the AI Agent.
@@ -594,6 +596,10 @@ def init_agent(
     agent.quiet_mode = quiet_mode
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
+    agent._auto_loaded_skill_prompt = auto_loaded_skill_prompt or ""
+    agent.enabled_skills = (
+        tuple(enabled_skills) if enabled_skills is not None else None
+    )
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
@@ -807,6 +813,7 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_window_open = False
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model
     # is generating is different from a hard /stop: preserve the valid turn

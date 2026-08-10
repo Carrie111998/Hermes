@@ -330,6 +330,8 @@ class SessionContext:
     session_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    model: str = ""
+    provider: str = ""
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -343,6 +345,8 @@ class SessionContext:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "model": self.model,
+            "provider": self.provider,
         }
 
 
@@ -589,6 +593,26 @@ def build_session_context_prompt(
         if redact_pii:
             uid = _hash_sender_id(uid)
         lines.append(f"**User ID:** {_format_untrusted_prompt_value(uid)}")
+
+    # Durable/runtime identity belongs only in this session-scoped block. Keep
+    # it out of the generic timestamp tail so it is neither duplicated nor
+    # confused with provider-authored content.
+    chat_id = (
+        _hash_chat_id(context.source.chat_id)
+        if redact_pii
+        else context.source.chat_id
+    )
+    if context.session_id:
+        lines.append(f"**Session_ID:** `{context.session_id}`")
+    lines.append(f"**Thread_ID:** `{context.source.thread_id or ''}`")
+    lines.append(
+        f"**Chat_ID:** `{_format_untrusted_prompt_value(chat_id)}`"
+    )
+    lines.append(f"**Platform:** `{context.source.platform.value}`")
+    if context.model:
+        lines.append(f"**Model:** `{context.model}`")
+    if context.provider:
+        lines.append(f"**Provider:** `{context.provider}`")
 
     # Platform-specific behavioral notes
     if context.source.platform == Platform.SLACK:

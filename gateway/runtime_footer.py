@@ -14,6 +14,7 @@ Config (``~/.hermes/config.yaml``)::
 Available fields:
     model        — bare model id, vendor prefix dropped (``gpt-5.4``)
     context_pct  — last-call context occupancy as a percent (``5%``)
+    tokens       — prompt tokens / context length (``63.04K / 1M``)
     latency      — wall-clock duration of the turn (``22s``, ``1m05s``)
     cwd          — home-relative working dir (``~``)
 
@@ -108,6 +109,16 @@ def _format_latency(seconds: float) -> str:
     return f"{m}m{sec:02d}s"
 
 
+def _format_token_count(value: int) -> str:
+    if value >= 1_000_000:
+        rendered = f"{value / 1_000_000:.2f}".rstrip("0").rstrip(".")
+        return rendered + "M"
+    if value >= 1_000:
+        rendered = f"{value / 1_000:.2f}".rstrip("0").rstrip(".")
+        return rendered + "K"
+    return str(value)
+
+
 def format_runtime_footer(
     *,
     model: Optional[str],
@@ -132,6 +143,12 @@ def format_runtime_footer(
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
                 parts.append(f"{pct}%")
+        elif field == "tokens":
+            if context_length and context_length > 0 and context_tokens >= 0:
+                parts.append(
+                    f"{_format_token_count(context_tokens)} / "
+                    f"{_format_token_count(context_length)}"
+                )
         elif field == "latency":
             # Wall-clock turn duration. Skipped when the caller supplied no
             # timing (call sites that don't measure) or the value is negative.
@@ -146,6 +163,25 @@ def format_runtime_footer(
     if not parts:
         return ""
     return _SEP.join(parts)
+
+
+def append_runtime_footer(
+    response: str,
+    footer_line: str,
+    platform_key: str | None,
+    *,
+    trailing: bool = False,
+) -> str:
+    """Apply the platform-specific visual boundary around a final footer."""
+    if not footer_line:
+        return response
+    if (platform_key or "").lower() == "telegram":
+        if trailing or not response:
+            return f"---\n\n{footer_line}"
+        return f"{response}\n\n---\n\n{footer_line}"
+    if trailing or not response:
+        return footer_line
+    return f"{response}\n\n{footer_line}"
 
 
 def build_footer_line(

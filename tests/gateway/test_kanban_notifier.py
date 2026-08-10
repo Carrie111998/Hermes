@@ -167,6 +167,49 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
+def test_default_transport_fallback_requires_provenance_marker(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "default-transport-fallback.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        marked = kb.create_task(conn, title="marked", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=marked,
+            platform="telegram",
+            chat_id="marked-chat",
+            notifier_profile="worker",
+            delivery_metadata={
+                "transport_profile": "default",
+                "allow_default_adapter_fallback": True,
+            },
+        )
+        kb.complete_task(conn, marked, summary="marked done")
+
+        strict = kb.create_task(conn, title="strict", assignee="worker")
+        kb.add_notify_sub(
+            conn,
+            task_id=strict,
+            platform="telegram",
+            chat_id="strict-chat",
+            notifier_profile="worker",
+        )
+        kb.complete_task(conn, strict, summary="strict done")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner._active_profile_name = lambda: "default"
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [item["chat_id"] for item in adapter.sent] == ["marked-chat"]
+    assert len(_unseen_terminal_events_for(strict, "strict-chat")) == 1
+
+
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):

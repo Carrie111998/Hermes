@@ -317,3 +317,25 @@ def test_default_build_footer_line_ignores_turn_seconds(monkeypatch):
     with_timing = build_footer_line(**common, turn_seconds=125.0)
     assert baseline == "gpt-5.4 · 5% · /var/data"
     assert with_timing == baseline
+
+
+def test_tokens_field_uses_compact_counts():
+    out = format_runtime_footer(
+        model=None,
+        context_tokens=63_040,
+        context_length=1_000_000,
+        cwd="",
+        fields=("tokens",),
+    )
+    assert out == "63.04K / 1M"
+
+
+def test_telegram_footer_divider_for_joined_and_trailing_paths():
+    from gateway.runtime_footer import append_runtime_footer
+
+    assert append_runtime_footer("body", "meta", "telegram") == (
+        "body\n\n---\n\nmeta"
+    )
+    assert append_runtime_footer("", "meta", "telegram", trailing=True) == (
+        "---\n\nmeta"
+    )

@@ -1570,7 +1570,16 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 notifier_profile = get_active_profile_name() or "default"
             except Exception:
                 notifier_profile = "default"
+        transport_profile = get_session_env(
+            "HERMES_SESSION_TRANSPORT_PROFILE", ""
+        ) or notifier_profile
         delivery_metadata: dict[str, Any] = {}
+        if (
+            notifier_profile not in {"", "default"}
+            and transport_profile == "default"
+        ):
+            delivery_metadata["transport_profile"] = "default"
+            delivery_metadata["allow_default_adapter_fallback"] = True
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:

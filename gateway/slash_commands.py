@@ -248,22 +248,23 @@ class GatewaySlashCommandsMixin:
             "session_key": session_key,
         })
 
-        # Resolve session config info to surface to the user, scoped to the
-        # profile serving this source so a multiplexed /reset //new banner
-        # reports the profile's model, not the base config's (#59003).
-        try:
-            session_info = await asyncio.to_thread(
-                self._reset_notice_session_info, source
-            )
-        except Exception:
-            session_info = ""
-
         if new_entry:
             header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_default")
         else:
             # No existing session, just create one
             new_entry = await self.async_session_store.get_or_create_session(source, force_new=True)
             header = await asyncio.to_thread(self._telegram_topic_new_header, source) or t("gateway.reset.header_new")
+
+        # Resolve only after the replacement entry exists so the notice names
+        # the newly-created durable conversation, never the expired one.
+        try:
+            session_info = await asyncio.to_thread(
+                self._reset_notice_session_info,
+                source,
+                new_entry.session_id if new_entry else None,
+            )
+        except Exception:
+            session_info = ""
 
         # Set session title if provided with /new <title>
         _title_arg = event.get_command_args().strip()

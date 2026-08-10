@@ -26,6 +26,17 @@ def _patch_info(tmp_path, config_yaml, model, runtime):
 
 class TestFormatSessionInfo:
 
+    def test_optional_new_session_id_is_first_line(self, runner, tmp_path):
+        p1, p2, p3 = _patch_info(
+            tmp_path,
+            "model:\n  default: test-model\n  context_length: 32768\n",
+            "test-model",
+            {"provider": "custom", "base_url": "", "api_key": ""},
+        )
+        with p1, p2, p3:
+            info = runner._format_session_info(session_id="new-session-id")
+        assert info.splitlines()[0] == "◆ Session ID: `new-session-id`"
+
     def test_includes_model_name(self, runner, tmp_path):
         p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: anthropic/claude-opus-4.6\n  provider: openrouter\n",
                                   "anthropic/claude-opus-4.6",
@@ -153,4 +164,3 @@ class TestResetNoticeSessionInfo:
         assert "profile-model" in info
         assert "anthropic" in info
         assert "base-model" not in info
-

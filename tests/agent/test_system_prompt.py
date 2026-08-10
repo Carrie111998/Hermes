@@ -130,6 +130,20 @@ def test_build_system_prompt_records_stable_prefix():
     assert prompt[len(agent._cached_system_prompt_static):].startswith("\n\ncontext")
 
 
+def test_auto_loaded_skill_is_in_stable_system_prefix_once():
+    marker = "# Auto-Loaded Authoritative Skills\n\nAUDIT PROCEDURE"
+    agent = _make_agent(_auto_loaded_skill_prompt=marker)
+    with (
+        patch("run_agent.load_soul_md", return_value="IDENTITY"),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        prompt = build_system_prompt(agent)
+    assert prompt.count(marker) == 1
+    assert marker in agent._cached_system_prompt_static
+
+
 def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
     """The cache split must not reorder the stored coding prompt."""
     import agent.system_prompt as system_prompt
@@ -160,7 +174,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         expected_profile,
         "SYSTEM_MESSAGE",
         "CONTEXT_FILES",
-        "Conversation started: Friday, January 02, 2026",
+            "Current date: Friday, January 02, 2026",
     ))
 
     with (
@@ -338,4 +352,4 @@ class TestSkillsInVolatileBand:
         # memory/timestamp tail.
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
-        assert full.index(_SKILLS) < full.index("Conversation started:")
+        assert full.index(_SKILLS) < full.index("Current date:")

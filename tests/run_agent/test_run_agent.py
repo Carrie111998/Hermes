@@ -147,6 +147,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
 
+        def flush_token_counts(self):
+            return None
+
     db = _BarrierDB()
     agent._session_db = db
     agent._session_db_created = True
@@ -923,7 +926,7 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         # Find the line and strip it for inspection
         for line in prompt.splitlines():
-            if line.startswith("Conversation started:"):
+            if line.startswith("Current date:"):
                 # Must NOT contain AM/PM indicator (minute precision had %I:%M %p)
                 assert " AM" not in line and " PM" not in line, (
                     f"Timestamp line has time-of-day, breaks daily cache stability: {line!r}"
@@ -935,7 +938,7 @@ class TestBuildSystemPrompt:
                 )
                 break
         else:
-            assert False, "Expected a 'Conversation started:' line in the system prompt"
+            assert False, "Expected a 'Current date:' line in the system prompt"
 
     def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")

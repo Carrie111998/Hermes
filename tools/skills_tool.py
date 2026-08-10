@@ -832,6 +832,13 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
+        from agent.skill_policy_context import current_enabled_skills
+
+        enabled_policy = current_enabled_skills()
+        if enabled_policy is not None:
+            allowed = set(enabled_policy)
+            all_skills = [s for s in all_skills if s.get("name") in allowed]
+
         # Filter by category if specified
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
@@ -1076,6 +1083,20 @@ def skill_view(
         JSON string with skill content or error message
     """
     try:
+        from agent.skill_policy_context import current_enabled_skills
+
+        enabled_policy = current_enabled_skills()
+        if enabled_policy is not None:
+            requested = str(name or "").strip()
+            allowed = set(enabled_policy)
+            if requested not in allowed and requested.rsplit("/", 1)[-1] not in allowed:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Skill policy denied: '{requested}' is not enabled for this topic.",
+                    },
+                    ensure_ascii=False,
+                )
         # Validate before the ':' qualified-name dispatch so a Windows drive
         # path (e.g. C:\skills\foo) can't be reinterpreted as a plugin
         # namespace, and so a traversal/absolute name never reaches the

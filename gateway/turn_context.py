@@ -94,6 +94,9 @@ class TurnContext:
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None
+    enabled_skills: Any = None
+    enabled_toolsets_policy_fingerprint: str = "legacy"
+    auto_loaded_skill_prompt: str = ""
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
     needs_progress_queue: bool = False

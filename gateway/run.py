@@ -44,7 +44,7 @@ from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
+from typing import Awaitable, Callable, Dict, Iterable, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
 from agent.conversation_compression import (
@@ -4761,6 +4761,9 @@ class TurnRunner:
             user_id=getattr(ctx.source, "user_id", None),
             user_id_alt=getattr(ctx.source, "user_id_alt", None),
             skip_context_files=skip_context_files,
+            enabled_skills=ctx.enabled_skills,
+            topic_policy_fingerprint=ctx.enabled_toolsets_policy_fingerprint,
+            auto_loaded_skill_prompt=ctx.auto_loaded_skill_prompt,
         )
         agent = None
         reused_cached_agent = False
@@ -5000,6 +5003,8 @@ class TurnRunner:
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
                 load_soul_identity=True,
+                auto_loaded_skill_prompt=ctx.auto_loaded_skill_prompt,
+                enabled_skills=ctx.enabled_skills,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:
@@ -5608,7 +5613,12 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            from agent.skill_policy_context import bind_enabled_skills
+
+            with bind_enabled_skills(ctx.enabled_skills):
+                result = agent.run_conversation(
+                    _api_run_message, **_conversation_kwargs
+                )
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -14645,7 +14655,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if accepted:
                 preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                 return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-            return "Steer rejected (empty payload)."
+            adapter = self._adapter_for_source(source)
+            if adapter:
+                self._enqueue_fifo(
+                    quick_key,
+                    MessageEvent(
+                        text=steer_text,
+                        message_type=MessageType.TEXT,
+                        source=event.source,
+                        message_id=event.message_id,
+                        channel_prompt=event.channel_prompt,
+                        channel_context=event.channel_context,
+                    ),
+                    adapter,
+                )
+            return "Turn already closing — /steer queued for the next turn."
         # Running agent is missing or lacks steer() — fall back to queue.
         adapter = self._adapter_for_source(source)
         if adapter:
@@ -15915,6 +15939,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # resolve_skill_command_key() handles the Telegram underscore/hyphen
         # round-trip so /claude_code from Telegram autocomplete still resolves
         # to the claude-code skill.
+        _topic_enabled_skills = None
+        if command:
+            try:
+                _slash_policy = self._frozen_topic_policy(
+                    source, _quick_key, _load_gateway_config()
+                )
+                _topic_enabled_skills = _slash_policy.get("enabled_skills")
+            except ValueError as exc:
+                return f"Skill policy denied: {exc}"
         if command:
             # Skill bundles take precedence over individual skill commands —
             # /<bundle> loads multiple skills at once. Mirrors CLI dispatch.
@@ -15939,6 +15972,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     if bundle_result:
                         msg, _loaded, missing = bundle_result
+                        if _topic_enabled_skills is not None:
+                            blocked = sorted(
+                                set(_loaded) - set(_topic_enabled_skills)
+                            )
+                            if blocked:
+                                return (
+                                    "Skill policy denied bundle member(s): "
+                                    + ", ".join(blocked)
+                                )
                         event.text = msg
                         _bundle_handled = True
                         if missing:
@@ -15965,6 +16007,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # list at scan time; per-platform overrides need checking
                     # here because the cache is process-global across platforms.
                     _skill_name = skill_cmds[cmd_key].get("name", "")
+                    if (
+                        _topic_enabled_skills is not None
+                        and _skill_name not in _topic_enabled_skills
+                    ):
+                        return (
+                            f"Skill policy denied: **{_skill_name}** is not "
+                            "enabled for this topic."
+                        )
                     _plat = source.platform.value if source.platform else None
                     if _plat and _skill_name:
                         from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
@@ -16008,6 +16058,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 f"The **{', '.join(_disabled_extra)}** skill(s) in this "
                                 f"stacked invocation are disabled for {_plat}.\n"
                                 f"Enable them with: `hermes skills config`"
+                            )
+                    if extra_keys and _topic_enabled_skills is not None:
+                        _blocked_extra = [
+                            skill_cmds.get(key, {}).get("name", key)
+                            for key in extra_keys
+                            if skill_cmds.get(key, {}).get("name", "")
+                            not in _topic_enabled_skills
+                        ]
+                        if _blocked_extra:
+                            return (
+                                "Skill policy denied stacked skill(s): "
+                                + ", ".join(_blocked_extra)
                             )
                     if extra_keys and _build_stacked is not None:
                         stacked_result = _build_stacked(
@@ -16933,6 +16995,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+        try:
+            _identity_cfg = _load_gateway_config()
+            _identity_model, _identity_runtime = self._resolve_session_agent_runtime(
+                source=source, user_config=_identity_cfg
+            )
+            context.model = str(_identity_model or "")
+            context.provider = str(_identity_runtime.get("provider") or "")
+        except Exception:
+            logger.debug("Failed to resolve session prompt identity", exc_info=True)
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(context)
@@ -17052,6 +17123,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Discord channel_skill_bindings).  Supports a single name or ordered list.
         # Only inject on NEW sessions — ongoing conversations already have the
         # skill content in their conversation history from the first message.
+        _auto_loaded_skill_prompt = ""
         _auto = getattr(event, "auto_skill", None)
         if _is_new_session and _auto:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
@@ -17074,9 +17146,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         logger.warning("[Gateway] Auto-skill '%s' not found", _sname)
                 if _combined_parts:
-                    # Append the user's original text after all skill payloads
-                    _combined_parts.append(event.text)
-                    event.text = "\n\n".join(_combined_parts)
+                    _auto_loaded_skill_prompt = (
+                        "# Auto-Loaded Authoritative Skills\n\n"
+                        "The following channel/topic-bound skills are authoritative "
+                        "procedures for this session. Follow them within the active "
+                        "SOUL and session constraints.\n\n"
+                        + "\n\n".join(_combined_parts)
+                    )
                     logger.info(
                         "[Gateway] Auto-loaded skill(s) %s for session %s",
                         _loaded_names, session_key,
@@ -18094,6 +18170,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                auto_loaded_skill_prompt=_auto_loaded_skill_prompt,
+                auto_skill_names=(
+                    [_auto] if isinstance(_auto, str) else list(_auto or [])
+                ),
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -18317,7 +18397,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
-                response = f"{response}\n\n{_footer_line}"
+                from gateway.runtime_footer import append_runtime_footer
+
+                response = append_runtime_footer(
+                    response,
+                    _footer_line,
+                    _platform_config_key(source.platform),
+                )
 
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
@@ -18701,9 +18787,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         _foot_adapter = self._adapter_for_source(source)
                         if _foot_adapter:
+                            from gateway.runtime_footer import append_runtime_footer
+
                             await _foot_adapter.send(
                                 source.chat_id,
-                                _footer_line,
+                                append_runtime_footer(
+                                    "",
+                                    _footer_line,
+                                    _platform_config_key(source.platform),
+                                    trailing=True,
+                                ),
                                 metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
                             )
                     except Exception as _e:
@@ -18829,7 +18922,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _reset_notice_session_info(self, source: SessionSource) -> str:
+    def _reset_notice_session_info(
+        self, source: SessionSource, session_id: Optional[str] = None
+    ) -> str:
         """Session-info block for the auto-reset notice, profile-scoped.
 
         When multiplexing, resolve model/provider/context inside the profile
@@ -18844,12 +18939,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         inside this method, so contextvars behave correctly in the worker
         thread.
         """
+        def _format() -> str:
+            if session_id is None:
+                return self._format_session_info()
+            return self._format_session_info(session_id=session_id)
+
         if getattr(getattr(self, "config", None), "multiplex_profiles", False):
             with _profile_runtime_scope(self._resolve_profile_home_for_source(source)):
-                return self._format_session_info()
-        return self._format_session_info()
+                return _format()
+        return _format()
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, session_id: Optional[str] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -18957,11 +19057,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             ctx_display = str(context_length)
 
-        lines = [
+        lines = []
+        if session_id:
+            lines.append(f"◆ Session ID: `{session_id}`")
+        lines.extend([
             f"◆ Model: `{model}`",
             f"◆ Provider: {provider or 'openrouter'}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
-        ]
+        ])
 
         # Show endpoint for local/custom setups
         if base_url and ("localhost" in base_url or "127.0.0.1" in base_url or "0.0.0.0" in base_url):
@@ -22000,6 +22103,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            transport_profile=(
+                self._adapter_profile_for_source(context.source)
+                or self._active_profile_name()
+                or "default"
+            ),
             async_delivery=_async_delivery,
             cron_session="",
         )
@@ -23316,6 +23424,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         user_id: str | None = None,
         user_id_alt: str | None = None,
         skip_context_files: bool = False,
+        enabled_skills: Optional[Iterable[str]] = None,
+        topic_policy_fingerprint: str = "",
+        auto_loaded_skill_prompt: str = "",
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -23374,6 +23485,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # (context files in vs out) — a toggled config edit must
                 # rebuild the cached agent, not silently reuse it.
                 bool(skip_context_files),
+                # Topic policy and auto-loaded skill text are frozen inputs to
+                # the cached system prompt.  Include them explicitly so a
+                # session switch can never reuse an agent built for a
+                # different allowlist or authoritative skill payload.
+                sorted(str(name) for name in (enabled_skills or ())),
+                str(topic_policy_fingerprint or ""),
+                str(auto_loaded_skill_prompt or ""),
             ],
             sort_keys=True,
             default=str,
@@ -24047,6 +24165,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         key_tuple = (
             platform,
+            str(context.session_id or ""),
+            str(getattr(context, "model", "") or ""),
+            str(getattr(context, "provider", "") or ""),
             str(src.chat_id or ""),
             str(src.thread_id or ""),
             str(src.chat_type or ""),
@@ -25016,6 +25137,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        auto_loaded_skill_prompt: str = "",
+        auto_skill_names: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25035,6 +25158,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                auto_loaded_skill_prompt=auto_loaded_skill_prompt,
+                auto_skill_names=auto_skill_names,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25047,7 +25172,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                auto_loaded_skill_prompt=auto_loaded_skill_prompt,
+                auto_skill_names=auto_skill_names,
             )
+
+    def _frozen_topic_policy(
+        self,
+        source: SessionSource,
+        session_key: Optional[str],
+        config: dict,
+    ) -> dict:
+        """Resolve topic policy once and persist its small session snapshot."""
+        metadata_key = "topic_policy_v1"
+        if session_key:
+            snapshot = self.session_store.get_session_metadata(
+                session_key, metadata_key, None
+            )
+            if isinstance(snapshot, dict) and snapshot.get("version") == 1:
+                return snapshot
+
+        from agent.skill_commands import get_skill_commands
+        from gateway.skill_policy import (
+            SkillPolicyStatus,
+            resolve_enabled_skills_policy,
+        )
+        from gateway.toolset_policy import (
+            ToolsetPolicyStatus,
+            resolve_enabled_toolsets_policy,
+        )
+
+        known_skills = {
+            str(info.get("name"))
+            for info in get_skill_commands().values()
+            if isinstance(info, dict) and info.get("name")
+        }
+        skill_policy = resolve_enabled_skills_policy(
+            source, config, skill_names=known_skills
+        )
+        if skill_policy.status not in {
+            SkillPolicyStatus.UNCONFIGURED,
+            SkillPolicyStatus.CONFIGURED_VALID,
+        }:
+            raise ValueError(skill_policy.error or "invalid enabled_skills")
+        toolset_policy = resolve_enabled_toolsets_policy(source, config)
+        if toolset_policy.status not in {
+            ToolsetPolicyStatus.UNCONFIGURED,
+            ToolsetPolicyStatus.CONFIGURED_VALID,
+        }:
+            raise ValueError(toolset_policy.error or "invalid enabled_toolsets")
+
+        snapshot = {
+            "version": 1,
+            "enabled_skills": (
+                list(skill_policy.identities)
+                if skill_policy.status is SkillPolicyStatus.CONFIGURED_VALID
+                else None
+            ),
+            "skills_fingerprint": skill_policy.fingerprint,
+            "enabled_toolsets": (
+                list(toolset_policy.toolsets)
+                if toolset_policy.status is ToolsetPolicyStatus.CONFIGURED_VALID
+                else None
+            ),
+            "toolsets_fingerprint": toolset_policy.fingerprint,
+        }
+        if session_key:
+            self.session_store.set_session_metadata(
+                session_key, metadata_key, snapshot
+            )
+        return snapshot
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -25169,6 +25362,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        auto_loaded_skill_prompt: str = "",
+        auto_skill_names: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25207,7 +25402,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        try:
+            _topic_policy = self._frozen_topic_policy(
+                source, session_key, user_config
+            )
+        except ValueError as exc:
+            return {
+                "final_response": f"⚠️ Topic policy denied: {exc}",
+                "messages": list(history),
+                "api_calls": 0,
+                "completed": False,
+                "history_offset": len(history),
+                "session_id": session_id,
+            }
+        _topic_toolsets = _topic_policy.get("enabled_toolsets")
+        enabled_toolsets = (
+            list(_topic_toolsets)
+            if _topic_toolsets is not None
+            else sorted(_get_platform_tools(user_config, platform_key))
+        )
+        enabled_skills = _topic_policy.get("enabled_skills")
+        denied_auto = sorted(
+            set(auto_skill_names or []) - set(enabled_skills or [])
+        ) if enabled_skills is not None else []
+        if denied_auto:
+            return {
+                "final_response": (
+                    "⚠️ Topic skill policy denied auto-loaded skill(s): "
+                    + ", ".join(denied_auto)
+                ),
+                "messages": list(history),
+                "api_calls": 0,
+                "completed": False,
+                "history_offset": len(history),
+                "session_id": session_id,
+            }
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
@@ -25436,6 +25665,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_config=user_config,
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
+            enabled_skills=enabled_skills,
+            enabled_toolsets_policy_fingerprint=str(
+                _topic_policy.get("toolsets_fingerprint") or "legacy"
+            ),
+            auto_loaded_skill_prompt=auto_loaded_skill_prompt,
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             needs_progress_queue=needs_progress_queue,

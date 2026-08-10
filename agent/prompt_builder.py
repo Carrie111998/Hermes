@@ -1681,6 +1681,7 @@ def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
     compact_categories: "frozenset[str] | None" = None,
+    enabled_skills: "tuple[str, ...] | list[str] | None" = None,
 ) -> str:
     """Build a compact skill index for the system prompt.
 
@@ -1713,6 +1714,7 @@ def build_skills_system_prompt(
     # produce distinct cache entries (gateway serves multiple platforms).
     _platform_hint = _current_session_platform_hint()
     disabled = get_disabled_skill_names(_platform_hint or None)
+    enabled = set(enabled_skills) if enabled_skills is not None else None
     cache_key = (
         str(skills_dir),
         tuple(str(d) for d in external_dirs),
@@ -1721,6 +1723,7 @@ def build_skills_system_prompt(
         _platform_hint,
         tuple(sorted(disabled)),
         tuple(sorted(compact_categories or ())),
+        tuple(sorted(enabled)) if enabled is not None else None,
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -1745,6 +1748,8 @@ def build_skills_system_prompt(
                 continue
             skill_name = entry.get("skill_name") or ""
             frontmatter_name = entry.get("frontmatter_name") or skill_name
+            if enabled is not None and frontmatter_name not in enabled:
+                continue
             platforms = entry.get("platforms") or []
             if not skill_matches_platform_list(platforms):
                 continue
@@ -1770,6 +1775,8 @@ def build_skills_system_prompt(
             if not is_compatible:
                 continue
             skill_name = entry["skill_name"]
+            if enabled is not None and entry["frontmatter_name"] not in enabled:
+                continue
             if entry["frontmatter_name"] in disabled or skill_name in disabled:
                 continue
             if not _skill_should_show(
@@ -1851,6 +1858,8 @@ def build_skills_system_prompt(
                 entry = _build_snapshot_entry(skill_file, ext_dir, frontmatter, desc)
                 skill_name = entry["skill_name"]
                 frontmatter_name = entry["frontmatter_name"]
+                if enabled is not None and frontmatter_name not in enabled:
+                    continue
                 if frontmatter_name in seen_skill_names:
                     continue
                 if frontmatter_name in disabled or skill_name in disabled:
@@ -2100,10 +2109,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
-        content = _truncate_content(
-            content, "SOUL.md", context_length=context_length,
-            read_path=str(soul_path),
-        )
+        logger.debug("SOUL.md loaded in full (no truncation): %d chars", len(content))
         return content
     except Exception as e:
         logger.debug("Could not read SOUL.md from %s: %s", soul_path, e)

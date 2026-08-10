@@ -200,6 +200,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # Topic/channel-bound skills are authoritative session instructions. They
+    # are captured once when the agent is built and therefore remain in the
+    # cache-stable prefix rather than being persisted as a synthetic user turn.
+    _auto_skill_prompt = getattr(agent, "_auto_loaded_skill_prompt", "") or ""
+    if _auto_skill_prompt:
+        stable_parts.append(_auto_skill_prompt)
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
@@ -322,6 +329,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+            enabled_skills=getattr(agent, "enabled_skills", None),
         )
     else:
         skills_prompt = ""
@@ -548,15 +556,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
-    if agent.pass_session_id and agent.session_id:
-        timestamp_line += f"\nSession ID: {agent.session_id}"
-    if agent.model:
-        timestamp_line += f"\nModel: {agent.model}"
-    if agent.provider:
-        timestamp_line += f"\nProvider: {agent.provider}"
-    if agent.platform:
-        timestamp_line += f"\nPlatform: {agent.platform}"
+    timestamp_line = f"Current date: {now.strftime('%A, %B %d, %Y')}"
     volatile_parts.append(timestamp_line)
 
     return {

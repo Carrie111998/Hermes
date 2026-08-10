@@ -509,6 +509,8 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        auto_loaded_skill_prompt: str = "",
+        enabled_skills: List[str] = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -595,6 +597,8 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            auto_loaded_skill_prompt=auto_loaded_skill_prompt,
+            enabled_skills=enabled_skills,
         )
 
     def _get_session_db_for_recall(self):
@@ -3154,6 +3158,13 @@ class AIAgent:
                 _admit_hard_cancel()
             self._pending_redirect = None
 
+        if hard_cancel:
+            _steer_lock = getattr(self, "_pending_steer_lock", None)
+            if _steer_lock is not None:
+                with _steer_lock:
+                    self._steer_window_open = False
+                    self._pending_steer = None
+
         # Codex app-server owns its model/tool loop and watches a private
         # interrupt event rather than Hermes' per-thread flag.
         if getattr(self, "api_mode", None) == "codex_app_server":
@@ -3241,6 +3252,9 @@ class AIAgent:
         intentionally cancels a model request to rebuild that same logical
         turn. Public hard-stop paths keep the default and clear everything.
         """
+        _clearing_hard_interrupt = getattr(
+            self, "_hard_interrupt_requested", threading.Event()
+        ).is_set()
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
@@ -3283,10 +3297,11 @@ class AIAgent:
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a
         # late injection on the post-interrupt turn.
-        _steer_lock = getattr(self, "_pending_steer_lock", None)
-        if _steer_lock is not None:
-            with _steer_lock:
-                self._pending_steer = None
+        if _clearing_hard_interrupt:
+            _steer_lock = getattr(self, "_pending_steer_lock", None)
+            if _steer_lock is not None:
+                with _steer_lock:
+                    self._pending_steer = None
         return True
 
     def steer(self, text: str) -> bool:
@@ -3315,15 +3330,46 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if not getattr(self, "_steer_window_open", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if not getattr(self, "_steer_window_open", False):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
+
+    def _open_steer_window(self) -> None:
+        """Open the current turn's linearizable steer admission window."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            self._steer_window_open = True
+            return
+        with lock:
+            self._steer_window_open = True
+
+    def _close_steer_window(self, *, drain: bool = True) -> Optional[str]:
+        """Atomically close steer admission and optionally drain accepted text."""
+        lock = getattr(self, "_pending_steer_lock", None)
+        if lock is None:
+            self._steer_window_open = False
+            if not drain:
+                return None
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            return text
+        with lock:
+            self._steer_window_open = False
+            if not drain:
+                return None
+            text = self._pending_steer
+            self._pending_steer = None
+            return text
 
     def redirect(self, text: str) -> bool:
         """Redirect the active turn without converting it into a new task.
@@ -7943,6 +7989,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        self._open_steer_window()
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -8012,6 +8059,12 @@ class AIAgent:
             if task_started:
                 task_finished = True
                 finish_task_run(**task_context, result=result)
+            late_steer = self._close_steer_window()
+            if late_steer and isinstance(result, dict):
+                existing = result.get("pending_steer")
+                result["pending_steer"] = (
+                    f"{existing}\n{late_steer}" if existing else late_steer
+                )
             return result
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
@@ -8028,8 +8081,12 @@ class AIAgent:
             if task_started and not task_finished:
                 task_finished = True
                 finish_task_run(**task_context, error=exc)
+            self._close_steer_window(drain=False)
             raise
         finally:
+            # Idempotent fallback for early-return runtimes that bypass the
+            # ordinary turn finalizer.
+            self._close_steer_window(drain=False)
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

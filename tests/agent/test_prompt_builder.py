@@ -433,6 +433,23 @@ class TestBuildNousSubscriptionPrompt:
 # =========================================================================
 
 
+def test_soul_is_scanned_but_never_truncated(monkeypatch, tmp_path):
+    import agent.prompt_builder as prompt_builder
+
+    content = "SOUL-BEGIN\n" + ("x" * 600_000) + "\nSOUL-END"
+    (tmp_path / "SOUL.md").write_text(content)
+    monkeypatch.setattr(prompt_builder, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        "hermes_cli.config.ensure_hermes_home", lambda: None
+    )
+
+    loaded = prompt_builder.load_soul_md(context_length=8_000)
+    assert loaded is not None
+    assert loaded.startswith("SOUL-BEGIN")
+    assert loaded.endswith("SOUL-END")
+    assert "truncated SOUL.md" not in loaded
+
+
 class TestBuildContextFilesPrompt:
     def test_empty_dir_loads_seeded_global_soul(self, tmp_path):
         from unittest.mock import patch
@@ -988,5 +1005,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-
