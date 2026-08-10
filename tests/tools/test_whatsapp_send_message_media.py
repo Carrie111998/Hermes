@@ -89,7 +89,7 @@ def _session_with(responses):
 
 
 def _pconfig():
-    return SimpleNamespace(token="", extra={"bridge_port": 3000})
+    return SimpleNamespace(token="", extra={"bridge_port": 3000}, home_channel=None)
 
 
 def _tmpfile(suffix):
@@ -155,3 +155,51 @@ def test_missing_captioned_file_falls_back_to_text():
     assert len(calls) == 1
     assert calls[0][0].endswith("/send")
     assert calls[0][1]["message"] == "floor plan"
+
+
+def test_standalone_oversight_blocks_non_home_before_http():
+    config = SimpleNamespace(
+        token="",
+        extra={
+            "bridge_port": 3000,
+            "oversight_mode": True,
+            "respond_as_owner": False,
+        },
+        home_channel=SimpleNamespace(chat_id="15550001111@s.whatsapp.net"),
+    )
+
+    with patch("aiohttp.ClientSession") as session:
+        result = asyncio.run(_standalone_send(config, "15550002222", "contact"))
+
+    assert result["success"] is True
+    assert result["suppressed"] is True
+    assert result["reason"] == "oversight_outbound_policy"
+    session.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "respond_as_owner"),
+    [
+        ("15550001111@s.whatsapp.net", False),
+        ("15550002222@s.whatsapp.net", True),
+    ],
+)
+def test_standalone_oversight_allows_home_or_explicit_owner_response(
+    chat_id, respond_as_owner
+):
+    config = SimpleNamespace(
+        token="",
+        extra={
+            "bridge_port": 3000,
+            "oversight_mode": True,
+            "respond_as_owner": respond_as_owner,
+        },
+        home_channel=SimpleNamespace(chat_id="15550001111@s.whatsapp.net"),
+    )
+    session_ctx, calls = _session_with([_resp(200, {"messageId": "m1"})])
+
+    with patch("aiohttp.ClientSession", return_value=session_ctx):
+        result = asyncio.run(_standalone_send(config, chat_id, "allowed"))
+
+    assert result["success"] is True
+    assert len(calls) == 1

@@ -62,6 +62,42 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
+def _coerce_config_bool(value: Any, default: bool = False) -> bool:
+    """Coerce a config boolean without treating ``"false"`` as true."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _oversight_target_allowed(
+    chat_id: str,
+    *,
+    oversight_mode: bool,
+    respond_as_owner: bool,
+    home_channel: str,
+    adapter_name: str,
+) -> bool:
+    """Enforce the oversight no-contact boundary for every bridge sender."""
+    if not oversight_mode or respond_as_owner:
+        return True
+    home = str(home_channel or "").strip()
+    if not home:
+        logger.error(
+            "[%s] Blocking WhatsApp outbound in oversight mode: no home channel configured",
+            adapter_name,
+        )
+        return False
+    allowed = to_whatsapp_jid(chat_id) == to_whatsapp_jid(home)
+    if not allowed:
+        logger.warning(
+            "[%s] Blocking WhatsApp outbound to non-home chat in oversight mode",
+            adapter_name,
+        )
+    return allowed
+
+
 def _listener_pids_on_port(port: int) -> list:
     """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
 
@@ -516,34 +552,17 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _coerce_bool_extra(self, key: str, default: bool) -> bool:
         """Read a boolean adapter option without treating ``"false"`` as true."""
         value = self.config.extra.get(key) if getattr(self.config, "extra", None) else None
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+        return _coerce_config_bool(value, default)
 
     def _oversight_allows_outbound(self, chat_id: str) -> bool:
         """Enforce the oversight no-contact boundary at the transport edge."""
-        if not getattr(self, "_oversight_mode", False):
-            return True
-        if getattr(self, "_respond_as_owner", False):
-            return True
-
-        home = str(getattr(self, "_oversight_home_channel", "") or "").strip()
-        if not home:
-            logger.error(
-                "[%s] Blocking WhatsApp outbound in oversight mode: no home channel configured",
-                self.name,
-            )
-            return False
-
-        allowed = to_whatsapp_jid(chat_id) == to_whatsapp_jid(home)
-        if not allowed:
-            logger.warning(
-                "[%s] Blocking WhatsApp outbound to non-home chat in oversight mode",
-                self.name,
-            )
-        return allowed
+        return _oversight_target_allowed(
+            chat_id,
+            oversight_mode=getattr(self, "_oversight_mode", False),
+            respond_as_owner=getattr(self, "_respond_as_owner", False),
+            home_channel=getattr(self, "_oversight_home_channel", ""),
+            adapter_name=self.name,
+        )
 
     def _oversight_blocked_result(self) -> SendResult:
         """Represent an intentional policy drop as handled, not retryable failure."""
@@ -1772,6 +1791,22 @@ async def _standalone_send(
     ``/send`` message beforehand.
     """
     extra = getattr(pconfig, "extra", {}) or {}
+    home = getattr(getattr(pconfig, "home_channel", None), "chat_id", "")
+    if not _oversight_target_allowed(
+        chat_id,
+        oversight_mode=_coerce_config_bool(extra.get("oversight_mode")),
+        respond_as_owner=_coerce_config_bool(extra.get("respond_as_owner")),
+        home_channel=home,
+        adapter_name="Whatsapp",
+    ):
+        return {
+            "success": True,
+            "platform": "whatsapp",
+            "chat_id": to_whatsapp_jid(chat_id),
+            "message_id": None,
+            "suppressed": True,
+            "reason": "oversight_outbound_policy",
+        }
     try:
         import aiohttp
     except ImportError:
