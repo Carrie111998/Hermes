@@ -730,6 +730,11 @@ def _evict_stale_locked() -> None:
         _TRACE_STATE.pop(key, None)
         try:
             state.root_span.end()
+            if state.root_ctx is not None:
+                try:
+                    state.root_ctx.__exit__(None, None, None)
+                except Exception:  # pragma: no cover - fail-open
+                    pass
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"evict stale trace failed: {exc}")
 
@@ -757,6 +762,17 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             state.root_span.set_trace_io(output=final_output)
             state.root_span.update(output=final_output)
         state.root_span.end()
+        # Properly exit the root context manager so the generator unwinds
+        # now, while opentelemetry.trace.Span is still a real type.  Without
+        # this the generator is left suspended; at interpreter teardown the
+        # GC calls .close(), which throws GeneratorExit through use_span
+        # __exit__ -> isinstance(span, Span) -- but Span has been torn down
+        # to None by then, producing the TypeError traceback on quit.
+        if state.root_ctx is not None:
+            try:
+                state.root_ctx.__exit__(None, None, None)
+            except Exception:  # pragma: no cover - fail-open
+                pass
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
     finally:

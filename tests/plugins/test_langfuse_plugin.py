@@ -362,6 +362,60 @@ class TestTurnTraceIsolation:
         surviving = sorted(int(k.rsplit("turn", 1)[1]) for k in mod._TRACE_STATE)
         assert surviving == list(range(42, 50))
 
+    def test_finish_trace_exits_root_context_manager(self, monkeypatch):
+        """_finish_trace must call root_ctx.__exit__(), not just root_span.end().
+
+        Regression for the "Exception ignored in: <generator>" traceback
+        on CLI exit.  The plugin enters the root observation's context
+        manager (start_as_current_observation(...).__enter__()) but must
+        also exit it; otherwise the generator is left suspended and is
+        only unwound when the GC collects it during interpreter teardown.
+        By then opentelemetry.trace.Span has been set to None, and the
+        generator's close() -> use_span.__exit__ -> isinstance(span, Span)
+        raises TypeError: isinstance() arg 2 must be a type.  Exiting the
+        context manager here unwinds the generator while modules are intact.
+        """
+        mod = self._fresh_plugin()
+        started: list = []
+        monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
+        mod._TRACE_STATE.clear()
+
+        exited: list = []
+
+        class _S:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+            def set_trace_io(self, **kw): pass
+            def start_observation(self, **kw): return _S()
+
+        class _TrackingRootCM:
+            def __enter__(self):
+                return _S()
+            def __exit__(self, *exc):
+                exited.append(exc)
+                return False
+
+        class _TrackingClient:
+            def create_trace_id(self, seed=None):
+                return f"trace::{seed}"
+            def start_as_current_observation(self, **kw):
+                started.append(kw.get("trace_context", {}).get("trace_id"))
+                return _TrackingRootCM()
+            def flush(self):
+                pass
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: _TrackingClient())
+
+        self._run_turn(mod, session="sess-exit", turn_n=1, finalize=True)
+
+        assert exited, (
+            "_finish_trace did not call root_ctx.__exit__; the generator is "
+            "left suspended and will raise TypeError on GC at interpreter "
+            "teardown when opentelemetry.trace.Span is None"
+        )
+        assert len(exited) == 1
+        assert exited[0] == (None, None, None)
+
 
 # ---------------------------------------------------------------------------
 # Placeholder-credential guard (#23823).
