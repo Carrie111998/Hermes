@@ -3884,6 +3884,138 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+# ---------------------------------------------------------------------------
+# Observational activity telemetry (enforcement: observe)
+# ---------------------------------------------------------------------------
+# This adapter only RECORDS what the scheduler already decided. It never gates
+# a fire, changes routing, or alters the (success, doc, final_response, error)
+# tuple. Every failure below degrades to "no telemetry for this run" and logs
+# the exception class only — provider/registry errors can carry credentials or
+# response bodies, so exception text must never reach the log.
+
+_ACTIVITY_REGISTRY = None
+_ACTIVITY_REGISTRY_LOADED = False
+
+#: Terminal evidence labels per early branch. The plan's ``wakeAgent:false``
+#: label is normalized to ``wake_gate_false`` because the telemetry store only
+#: accepts single-colon bounded references (``kind:identifier``).
+_ACTIVITY_EVIDENCE = {
+    "script_missing": "evidence:script_missing",
+    "script_failed": "evidence:script_failed",
+    "wake_gate_false": "evidence:wake_gate_false",
+    "empty_stdout": "evidence:empty_stdout",
+    "script_completed": "evidence:script_completed",
+    "prompt_injection_blocked": "evidence:prompt_injection_blocked",
+    "empty_prompt": "evidence:empty_prompt",
+}
+
+
+def _load_activity_registry():
+    """Load the immutable packaged policy registry (seam for tests)."""
+    from activity_policy.registry import ActivityRegistry
+
+    return ActivityRegistry.load_default()
+
+
+def _get_activity_registry():
+    """Return the process-cached registry, or None to behave as unmapped."""
+    global _ACTIVITY_REGISTRY, _ACTIVITY_REGISTRY_LOADED
+    if not _ACTIVITY_REGISTRY_LOADED:
+        _ACTIVITY_REGISTRY_LOADED = True
+        try:
+            _ACTIVITY_REGISTRY = _load_activity_registry()
+        except Exception as exc:
+            logger.warning(
+                "activity policy registry unavailable: %s", type(exc).__name__
+            )
+            _ACTIVITY_REGISTRY = None
+    return _ACTIVITY_REGISTRY
+
+
+def _resolve_cron_activity_policy(job: dict):
+    """Resolve explicit ``activity_id`` first, then the exact job-name alias.
+
+    An unknown explicit ID fails closed in the registry; here that only means
+    "unmapped", because a policy lookup must never stop a scheduled job.
+    """
+    registry = _get_activity_registry()
+    if registry is None:
+        return None
+    try:
+        explicit = str(job.get("activity_id") or "").strip()
+        if explicit:
+            return registry.resolve(activity_id=explicit)
+        return registry.resolve(alias=str(job.get("name") or ""))
+    except Exception as exc:
+        logger.warning(
+            "activity policy resolution failed for job '%s': %s",
+            job.get("id", "?"), type(exc).__name__,
+        )
+        return None
+
+
+def _open_cron_activity(
+    *,
+    job: dict,
+    policy,
+    run_id: str,
+    correlation_id: str,
+    profile: str,
+    effective_hermes_home: str,
+):
+    """Best-effort open; sanitize failures to exception class and return None."""
+    try:
+        from activity_telemetry.recorder import ActivityRecorder
+        from hermes_constants import get_default_hermes_root
+
+        db_path = Path(get_default_hermes_root()) / "telemetry" / "activity.db"
+        # Requested route is the job's declared pre-agent configuration. The
+        # SERVED route is recorded only from real responses in
+        # conversation_loop.py — never inferred from configuration here.
+        return ActivityRecorder.open(
+            db_path,
+            run_id=run_id,
+            correlation_id=correlation_id,
+            activity_id=policy.activity_id,
+            policy_version=policy.policy_version,
+            trigger_source="cron",
+            profile=profile,
+            effective_hermes_home=effective_hermes_home,
+            requested_provider=(str(job.get("provider") or "").strip() or None),
+            requested_model=(str(job.get("model") or "").strip() or None),
+        )
+    except Exception as exc:
+        logger.warning(
+            "cron activity telemetry open failed for job '%s': %s",
+            job.get("id", "?"), type(exc).__name__,
+        )
+        return None
+
+
+def _finish_cron_activity(
+    recorder,
+    *,
+    process: str,
+    evidence_refs: tuple = (),
+    escalation_reason: Optional[str] = None,
+) -> None:
+    """Best-effort single terminal enrichment; never alter cron control flow."""
+    if recorder is None:
+        return
+    try:
+        from activity_telemetry.schema import OutcomeLayers
+
+        recorder.finish(
+            OutcomeLayers(process=process),
+            tuple(evidence_refs),
+            escalation_reason,
+        )
+    except Exception as exc:
+        logger.warning(
+            "cron activity telemetry finish failed: %s", type(exc).__name__
+        )
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -3922,6 +4054,33 @@ def _run_job_impl(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
+    # Observational telemetry opens here, before any branch, so deterministic
+    # and no-work fires are recorded too. Unmapped jobs and every telemetry
+    # failure execute exactly as they did before this adapter existed. Resolved
+    # inside the profile context so effective_hermes_home reflects the job's
+    # profile rather than the scheduler default.
+    _activity_recorder = None
+    _activity_policy = _resolve_cron_activity_policy(job)
+    if _activity_policy is not None:
+        try:
+            import uuid as _uuid
+
+            _activity_run_id = str(_uuid.uuid4())
+            _activity_recorder = _open_cron_activity(
+                job=job,
+                policy=_activity_policy,
+                run_id=_activity_run_id,
+                correlation_id=str(job.get("correlation_id") or _activity_run_id),
+                profile=str(job.get("profile") or "default").strip() or "default",
+                effective_hermes_home=str(_get_hermes_home()),
+            )
+        except Exception as exc:
+            logger.warning(
+                "cron activity telemetry setup failed for job '%s': %s",
+                job_id, type(exc).__name__,
+            )
+            _activity_recorder = None
+
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
@@ -3945,6 +4104,11 @@ def _run_job_impl(
         if not script_path:
             err = "no_agent=True but no script is set for this job"
             logger.error("Job '%s': %s", job_id, err)
+            _finish_cron_activity(
+                _activity_recorder,
+                process="failed",
+                evidence_refs=(_ACTIVITY_EVIDENCE["script_missing"],),
+            )
             return False, "", "", err
 
         # Apply workdir if configured — lets scripts use predictable relative
@@ -3989,6 +4153,11 @@ def _run_job_impl(
                 f"**Status:** script failed\n\n"
                 f"{output}\n"
             )
+            _finish_cron_activity(
+                _activity_recorder,
+                process="failed",
+                evidence_refs=(_ACTIVITY_EVIDENCE["script_failed"],),
+            )
             return False, doc, alert, output
 
         # Honour the wakeAgent gate as a silent signal — `wakeAgent: false`
@@ -4004,6 +4173,11 @@ def _run_job_impl(
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (wakeAgent=false)\n"
             )
+            _finish_cron_activity(
+                _activity_recorder,
+                process="no_work",
+                evidence_refs=(_ACTIVITY_EVIDENCE["wake_gate_false"],),
+            )
             return True, silent_doc, SILENT_MARKER, None
 
         if not output.strip():
@@ -4015,6 +4189,11 @@ def _run_job_impl(
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (empty output)\n"
             )
+            _finish_cron_activity(
+                _activity_recorder,
+                process="no_work",
+                evidence_refs=(_ACTIVITY_EVIDENCE["empty_stdout"],),
+            )
             return True, silent_doc, SILENT_MARKER, None
 
         doc = (
@@ -4024,6 +4203,14 @@ def _run_job_impl(
             f"**Mode:** no_agent (script)\n\n"
             f"---\n\n"
             f"{output}\n"
+        )
+        # Process-level success only. The script produced output; whether that
+        # output was semantically correct or delivered is not evidenced here,
+        # so the derived final outcome stays `unknown`.
+        _finish_cron_activity(
+            _activity_recorder,
+            process="succeeded",
+            evidence_refs=(_ACTIVITY_EVIDENCE["script_completed"],),
         )
         return True, doc, output, None
 
@@ -4124,6 +4311,11 @@ def _run_job_impl(
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
+            _finish_cron_activity(
+                _activity_recorder,
+                process="no_work",
+                evidence_refs=(_ACTIVITY_EVIDENCE["wake_gate_false"],),
+            )
             return True, silent_doc, SILENT_MARKER, None
 
     try:
@@ -4150,12 +4342,28 @@ def _run_job_impl(
             "and the match is a false positive, rephrase the content to avoid "
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
+        _finish_cron_activity(
+            _activity_recorder,
+            process="blocked",
+            evidence_refs=(_ACTIVITY_EVIDENCE["prompt_injection_blocked"],),
+        )
         return False, blocked_doc, "", str(block_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
+        _finish_cron_activity(
+            _activity_recorder,
+            process="no_work",
+            evidence_refs=(_ACTIVITY_EVIDENCE["empty_prompt"],),
+        )
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Inference is about to start, so this run now crosses the wake/prompt
+    # boundary and has a real session. Deterministic and no-work branches
+    # above deliberately never reach here and stay session-less.
+    if _activity_recorder is not None:
+        _activity_recorder.link_session(_cron_session_id)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -4633,6 +4841,7 @@ def _run_job_impl(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            activity_recorder=_activity_recorder,
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -4893,6 +5102,14 @@ def _run_job_impl(
 """
         
         logger.info("Job '%s' completed successfully", job_name)
+        # The model loop finished, which is process evidence only. Artifact,
+        # domain, and delivery evidence are not available here, so the derived
+        # final outcome is `unknown` — never inferred success.
+        _finish_cron_activity(
+            _activity_recorder,
+            process="succeeded",
+            evidence_refs=(f"session:{_cron_session_id}",),
+        )
         return True, output, final_response, None
         
     except Exception as e:
@@ -4915,6 +5132,11 @@ def _run_job_impl(
 {error_msg}
 ```
 """
+        _finish_cron_activity(
+            _activity_recorder,
+            process="failed",
+            evidence_refs=(f"session:{_cron_session_id}",),
+        )
         return False, output, "", error_msg
 
     finally:

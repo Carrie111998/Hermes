@@ -87,8 +87,12 @@ _COUNTER_FIELDS = (
     "output_tokens",
     "reasoning_tokens",
 )
+#: Evidence references are bounded opaque pointers, never payloads. The kind
+#: list is a deliberate allowlist: extend it explicitly rather than loosening
+#: the pattern, so URLs, serialized bodies, and credential-shaped values stay
+#: rejected.
 _EVIDENCE_REF = re.compile(
-    r"^(?:artifact|event|run|session|trace|validation):"
+    r"^(?:artifact|event|evidence|run|session|trace|validation):"
     r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
 )
 

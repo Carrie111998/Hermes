@@ -192,6 +192,27 @@ def test_evidence_rejects_payloads_urls_and_credential_shaped_values(tmp_path, r
         store.finish("run-1", OutcomeLayers(process="failed"), evidence_refs=(reference,))
 
 
+@pytest.mark.parametrize(
+    "reference",
+    (
+        "artifact:report-2026-08-10",
+        "event:cron_fired",
+        "evidence:script_failed",
+        "run:9f2c1b",
+        "session:cron_a_20260810_120000",
+        "trace:abc123",
+        "validation:schema_ok",
+    ),
+)
+def test_evidence_accepts_the_bounded_reference_kinds(tmp_path, reference):
+    import json
+
+    store = ActivityStore(tmp_path / "activity.db", clock=lambda: NOW)
+    store.start(_start())
+    store.finish("run-1", OutcomeLayers(process="failed"), evidence_refs=(reference,))
+    assert json.loads(store.get_run("run-1")["evidence_refs_json"]) == [reference]
+
+
 def test_reopen_preserves_parent_child_relationship_and_terminal_data(tmp_path):
     path = tmp_path / "activity.db"
     store = ActivityStore(path, clock=lambda: NOW)
