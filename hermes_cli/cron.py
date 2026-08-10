@@ -404,7 +404,16 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
-    _warn_if_gateway_lifecycle(getattr(args, "prompt", None), getattr(args, "script", None))
+    # Gateway-lifecycle guard for edits: warn if the new prompt/script touches
+    # gateway start/stop/restart. The create path is guarded inside
+    # cron.jobs.create_job via check_gateway_lifecycle; the edit path calls it
+    # directly here. (The old _warn_if_gateway_lifecycle helper was removed in
+    # the v0.20 merge but this call site was missed.)
+    from cron.lifecycle_guard import check_gateway_lifecycle
+    check_gateway_lifecycle(
+        getattr(args, "prompt", None),
+        getattr(args, "script", None),
+    )
     result = _cron_api(
         action="update",
         job_id=args.job_id,
