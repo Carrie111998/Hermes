@@ -392,6 +392,28 @@ class ClaudeVisibilityCoordinator:
     def discover(self, *, days: int, limit: int) -> ClaudeVisibilityDiscoveryResult:
         return self._discover(days=days, limit=limit, manual=True)
 
+    @staticmethod
+    def _log_visibility_discovery_degraded(stage: str, exc: BaseException) -> None:
+        """Surface the cause behind an otherwise opaque provider_degraded.
+
+        Both discovery handlers collapse every unexpected failure into the same
+        public reason, and previously logged nothing at all. Distinct faults --
+        a duplicate session identity, a transient `database is locked` under
+        WAL contention, an unreachable provider -- were therefore
+        indistinguishable from the outside, and each one only became visible
+        after the previous had been cleared. The public reason code is
+        unchanged; only the operator-facing diagnosis improves.
+        """
+        try:
+            _LOG.warning(
+                "claude_visibility_discovery_degraded stage=%s exc=%s detail=%r",
+                stage,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+        except Exception:
+            pass
+
     def _discover(
         self, *, days: int, limit: int, manual: bool
     ) -> ClaudeVisibilityDiscoveryResult:
@@ -439,14 +461,16 @@ class ClaudeVisibilityCoordinator:
                 return ClaudeVisibilityDiscoveryResult(
                     enabled=True, degraded=True, reasons=("inventory_invalid",)
                 )
-            except Exception:
+            except Exception as exc:
+                self._log_visibility_discovery_degraded("status_cursor", exc)
                 return ClaudeVisibilityDiscoveryResult(
                     enabled=True, degraded=True, reasons=("provider_degraded",)
                 )
         try:
             inventory = self._inventory if manual else self._continuous_inventory
             sources = tuple(inventory(after))
-        except Exception:
+        except Exception as exc:
+            self._log_visibility_discovery_degraded("inventory", exc)
             return ClaudeVisibilityDiscoveryResult(
                 enabled=True, degraded=True, reasons=("provider_degraded",)
             )
@@ -677,7 +701,8 @@ class ClaudeVisibilityCoordinator:
                     error_code=result.error_code,
                     registrar_result=registrar_result,
                 )
-            except Exception:
+            except Exception as exc:
+                self._log_visibility_discovery_degraded("record_cycle", exc)
                 return ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
@@ -698,7 +723,8 @@ class ClaudeVisibilityCoordinator:
                 open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(
                     status_before_discovery
                 )
-            except Exception:
+            except Exception as exc:
+                self._log_visibility_discovery_degraded("enqueue_gates", exc)
                 return recorded(
                     ClaudeVisibilityRunResult(
                         enabled=True,
