@@ -26,16 +26,19 @@ from plugins.semantic_graph.store import SemanticGraphStore
 FIXTURE = Path(__file__).parents[1] / "tests" / "fixtures" / "semantic_graph_retrieval_benchmark.json"
 CONTROL_CODE_REVISION = "0c89ef566343dbed810cedff81c9ac405febf0da"
 CONTROL = {
-    "repo": "KGESH/nsfw-bge-m3",
+    "repo": os.environ.get("BGE_M3_REPO", "KGESH/nsfw-bge-m3"),
     "family": "BGE-M3 fine-tune",
-    "hf_revision": "e22b93e36704360fc712c8894de59a66cdb1638e",
-    "gguf_sha256": "ecc1d6cd89a82ab72ced141e63d4c5b6644f1723c94d41e3d36ce40a52a21f16",
+    "hf_revision": os.environ.get("BGE_M3_REVISION", "eaaf46c3b340d880d298ba7a03158fbe9b6e780b"),
+    "gguf_sha256": os.environ.get(
+        "BGE_M3_GGUF_SHA256",
+        "d7579f0c22023eba0c4280f9ba52310710bba8677aaf868c7a625a0a7be50640",
+    ),
     "dimensions": 1024,
-    "serializer_profile": "bge_m3_control",
+    "serializer_profile": os.environ.get("BGE_M3_SERIALIZER_PROFILE", "bge_m3_control"),
 }
 BENCHMARK_IDENTITY = EmbeddingModelIdentity(
-    provider="benchmark",
-    model="KGESH/nsfw-bge-m3",
+    provider=os.environ.get("BGE_M3_PROVIDER", "benchmark"),
+    model=CONTROL["repo"],
     revision=CONTROL["hf_revision"],
     dimensions=1024,
     serializer_version=1,
@@ -163,6 +166,60 @@ def _rank(expected: Sequence[str], rows: Sequence[dict[str, Any]]) -> int | None
     return min(ranks) if ranks else None
 
 
+def _candidate_observations(
+    fused: Sequence[Any], *, lexical_ids: Sequence[str], dense_ids: Sequence[str], top_k: int,
+) -> list[dict[str, Any]]:
+    """Serialize the complete pre-truncation fusion ranking for benchmark use."""
+    lexical_ranks = {str(node_id): rank for rank, node_id in enumerate(lexical_ids, 1)}
+    dense_ranks = {str(node_id): rank for rank, node_id in enumerate(dense_ids, 1)}
+    observations: list[dict[str, Any]] = []
+    for final_rank, candidate in enumerate(fused, 1):
+        lexical_rank = lexical_ranks.get(candidate.node_id)
+        dense_rank = dense_ranks.get(candidate.node_id)
+        ranks = [rank for rank in (lexical_rank, dense_rank) if rank is not None]
+        observations.append({
+            "node_id": candidate.node_id,
+            "lexical_rank": lexical_rank,
+            "dense_rank": dense_rank,
+            "dense_similarity": candidate.dense_similarity,
+            "rrf_score": candidate.rrf_score,
+            "source_count": candidate.source_count,
+            "best_rank": min(ranks) if ranks else None,
+            "final_rank": final_rank,
+            "selected_into_top8": final_rank <= top_k,
+        })
+    return observations
+
+
+def _query_observation(
+    *, expected: Sequence[str], lexical_ids: Sequence[str], dense_ids: Sequence[str],
+    dense_similarities: dict[str, float], fused_node_ids: Sequence[str], top_k: int,
+) -> dict[str, Any]:
+    """Aggregate score margins and channel agreement without changing retrieval."""
+    del fused_node_ids, top_k
+    fused = reciprocal_rank_fusion(
+        lexical_ids=lexical_ids, dense_ids=dense_ids,
+        k=RRF_K, dense_similarities=dense_similarities,
+    )
+    dense_scores = [dense_similarities.get(str(node_id)) for node_id in dense_ids]
+    dense_scores = [float(score) for score in dense_scores if score is not None]
+    rrf_scores = [candidate.rrf_score for candidate in fused]
+    top1_dense = dense_scores[0] if dense_scores else None
+    top2_dense = dense_scores[1] if len(dense_scores) > 1 else None
+    top1_rrf = rrf_scores[0] if rrf_scores else None
+    top2_rrf = rrf_scores[1] if len(rrf_scores) > 1 else None
+    return {
+        "top1_dense_similarity": top1_dense,
+        "top2_dense_similarity": top2_dense,
+        "dense_top_margin": top1_dense - top2_dense if top1_dense is not None and top2_dense is not None else None,
+        "top1_rrf_score": top1_rrf,
+        "top2_rrf_score": top2_rrf,
+        "rrf_top_margin": top1_rrf - top2_rrf if top1_rrf is not None and top2_rrf is not None else None,
+        "lexical_dense_top1_agreement": bool(lexical_ids and dense_ids and lexical_ids[0] == dense_ids[0]),
+        "lexical_dense_expected_overlap": len(set(expected) & set(lexical_ids) & set(dense_ids)),
+    }
+
+
 def _summary(
     results: list[dict[str, Any]],
     latencies: dict[str, list[float]],
@@ -194,6 +251,7 @@ def _summary(
         "cross_run_leak_count": cross_run,
         "secret_recall_count": secret_recall,
         "state_mutation_count": 0,
+        "query_results": results,
     }
 
 
@@ -232,8 +290,9 @@ def run_variant(
             run_id=run_a if query.get("group") == "exact_identifier" else None,
         )
         latencies["lexical_ms"].append((time.perf_counter() - lexical_started) * 1000)
-        rows = lexical[:TOP_K]
-
+        dense_rows: list[dict[str, Any]] = []
+        lexical_safe = lexical
+        eligible: list[dict[str, Any]] = []
         if dense:
             eligible = _eligible(store, run_a, query)
             expected_hashes = {
@@ -245,18 +304,35 @@ def run_variant(
                 node_ids=list(expected_hashes), expected_source_hashes=expected_hashes,
             )
             latencies["dense_scan_ms"].append((time.perf_counter() - dense_started) * 1000)
-            rrf_started = time.perf_counter()
             eligible_ids = {row["node_id"] for row in eligible}
             lexical_safe = [row for row in lexical if row["node_id"] in eligible_ids]
-            fused = reciprocal_rank_fusion(
-                lexical_ids=[row["node_id"] for row in lexical_safe],
-                dense_ids=[row["node_id"] for row in dense_rows],
-                k=RRF_K,
-                dense_similarities={row["node_id"]: row["similarity"] for row in dense_rows},
-            )[:TOP_K]
-            by_id = {row["node_id"]: row for row in eligible}
-            by_id.update({row["node_id"]: row for row in lexical})
-            rows = [by_id[item.node_id] for item in fused if item.node_id in by_id]
+
+        rrf_started = time.perf_counter()
+        dense_similarities = {row["node_id"]: row["similarity"] for row in dense_rows}
+        fused = reciprocal_rank_fusion(
+            lexical_ids=[row["node_id"] for row in lexical_safe],
+            dense_ids=[row["node_id"] for row in dense_rows],
+            k=RRF_K,
+            dense_similarities=dense_similarities,
+        )
+        candidates = _candidate_observations(
+            fused,
+            lexical_ids=[row["node_id"] for row in lexical_safe],
+            dense_ids=[row["node_id"] for row in dense_rows],
+            top_k=TOP_K,
+        )
+        observation = _query_observation(
+            expected=query["expected"],
+            lexical_ids=[row["node_id"] for row in lexical_safe],
+            dense_ids=[row["node_id"] for row in dense_rows],
+            dense_similarities=dense_similarities,
+            fused_node_ids=[item.node_id for item in fused],
+            top_k=TOP_K,
+        )
+        by_id = {row["node_id"]: row for row in (eligible or lexical)}
+        by_id.update({row["node_id"]: row for row in lexical})
+        rows = [by_id[item.node_id] for item in fused[:TOP_K] if item.node_id in by_id]
+        if dense:
             latencies["rrf_ms"].append((time.perf_counter() - rrf_started) * 1000)
 
         rank = _rank(query["expected"], rows)
@@ -266,11 +342,14 @@ def run_variant(
         cross_run += sum(int(row.get("node_id") == "run-b-only") for row in rows)
         secret_recall += sum(int("opaque-secret" in json.dumps(row, ensure_ascii=False)) for row in rows)
         results.append({
+            "query": query["query"],
             "group": query["group"], "expected": query["expected"],
             "returned": [row["identity_key"] for row in rows], "hit": rank is not None,
             "returned_any": bool(rows), "reciprocal_rank": 1.0 / rank if rank else 0.0,
             "context_chars": len(render_context(rows, 3500) or ""),
             "latency_ms": (time.perf_counter() - started) * 1000,
+            "candidates": candidates,
+            "observation": observation,
         })
         latencies["end_to_end_ms"].append(results[-1]["latency_ms"])
 
@@ -330,7 +409,7 @@ def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, outpu
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default=os.environ.get("BGE_M3_BASE_URL", "http://127.0.0.1:8084"))
-    parser.add_argument("--model", default="nsfw-bge-m3-v4.gguf")
+    parser.add_argument("--model", default=os.environ.get("BGE_M3_MODEL", "nsfw-bge-m3-v4.gguf"))
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--live", action="store_true")
@@ -349,4 +428,8 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
-__all__ = ["CONTROL_CODE_REVISION", "CONTROL", "HttpEmbeddingClient", "benchmark_code_revision", "make_store", "run_benchmark", "run_variant", "serialize_bge_query"]
+__all__ = [
+    "CONTROL_CODE_REVISION", "CONTROL", "HttpEmbeddingClient", "benchmark_code_revision",
+    "make_store", "run_benchmark", "run_variant", "serialize_bge_query",
+    "_candidate_observations", "_query_observation",
+]

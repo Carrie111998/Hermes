@@ -10,6 +10,8 @@ from scripts.semantic_graph_embedding_ab_benchmark import (
     NAMESPACE,
     HttpEmbeddingClient,
     _eligible,
+    _query_observation,
+    _candidate_observations,
     load_fixture,
     make_store,
     run_variant,
@@ -111,3 +113,80 @@ def test_http_client_validates_dimension_and_finite_values(monkeypatch: pytest.M
     )
     client = HttpEmbeddingClient("http://127.0.0.1:8084")
     assert len(client.embed_query("raw query")) == 1024
+
+
+def test_candidate_observation_preserves_full_fused_ranks() -> None:
+    from plugins.semantic_graph.fusion import reciprocal_rank_fusion
+
+    fused = reciprocal_rank_fusion(
+        lexical_ids=["lexical-only", "shared", "expected"],
+        dense_ids=["shared", "expected", "dense-only"],
+        dense_similarities={"shared": 0.91, "expected": 0.73, "dense-only": 0.52},
+    )
+
+    observed = _candidate_observations(
+        fused,
+        lexical_ids=["lexical-only", "shared", "expected"],
+        dense_ids=["shared", "expected", "dense-only"],
+        top_k=2,
+    )
+
+    assert observed[0]["node_id"] == "shared"
+    assert observed[0]["lexical_rank"] == 2
+    assert observed[0]["dense_rank"] == 1
+    assert observed[0]["dense_similarity"] == 0.91
+    assert observed[0]["source_count"] == 2
+    assert observed[0]["best_rank"] == 1
+    assert observed[0]["final_rank"] == 1
+    assert observed[0]["selected_into_top8"] is True
+
+    dense_only = next(row for row in observed if row["node_id"] == "dense-only")
+    assert dense_only["final_rank"] > 2
+    assert dense_only["selected_into_top8"] is False
+
+
+def test_query_observation_handles_negative_and_positive_queries() -> None:
+    positive = _query_observation(
+        expected=["expected"],
+        lexical_ids=["expected", "other"],
+        dense_ids=["expected", "other"],
+        dense_similarities={"expected": 0.8, "other": 0.4},
+        fused_node_ids=["expected", "other"],
+        top_k=8,
+    )
+    negative = _query_observation(
+        expected=[],
+        lexical_ids=["other"],
+        dense_ids=["other"],
+        dense_similarities={"other": 0.4},
+        fused_node_ids=["other"],
+        top_k=8,
+    )
+
+    assert positive["top1_dense_similarity"] == 0.8
+    assert positive["top2_dense_similarity"] == 0.4
+    assert positive["dense_top_margin"] == 0.4
+    assert positive["top1_rrf_score"] > positive["top2_rrf_score"]
+    assert positive["lexical_dense_top1_agreement"] is True
+    assert positive["lexical_dense_expected_overlap"] == 1
+    assert negative["lexical_dense_expected_overlap"] == 0
+    assert negative["lexical_dense_top1_agreement"] is True
+
+
+def test_run_variant_emits_observation_schema_for_lexical_variant(tmp_path: Path) -> None:
+    fixture = load_fixture()
+    store, run_a, _run_b = make_store(tmp_path / "benchmark.db")
+
+    summary = run_variant(store, fixture, run_a, dense=False, client=None)
+    result = summary["query_results"][0]
+
+    assert result["candidates"]
+    assert set(result["candidates"][0]) >= {
+        "node_id", "lexical_rank", "dense_rank", "dense_similarity", "rrf_score",
+        "source_count", "best_rank", "final_rank", "selected_into_top8",
+    }
+    assert set(result["observation"]) >= {
+        "top1_dense_similarity", "top2_dense_similarity", "dense_top_margin",
+        "top1_rrf_score", "top2_rrf_score", "rrf_top_margin",
+        "lexical_dense_top1_agreement", "lexical_dense_expected_overlap",
+    }
