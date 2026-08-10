@@ -159,7 +159,8 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert records[0]["id"] == execution_id
     assert records[0]["status"] == "unknown"
     assert records[0]["finished_at"]
-    assert "restart" in records[0]["error"].lower()
+    assert "owner exited" in records[0]["error"].lower()
+    assert "unknown" in records[0]["error"].lower()
     # Recovery only classifies the old attempt. It must not manufacture a new
     # claimed record (which would imply an automatic retry).
     assert [r["status"] for r in records] == ["unknown"]
@@ -182,7 +183,20 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
         lambda execution_id, **kwargs: finished.append((execution_id, kwargs)),
     )
     monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "submit-fail"}])
-    monkeypatch.setattr(scheduler, "advance_next_runs", lambda _ids: 0)
+    monkeypatch.setattr(
+        scheduler,
+        "claim_job_for_fire_token",
+        lambda _job_id: "claim-submit-fail",
+    )
+    released = []
+    monkeypatch.setattr(
+        scheduler,
+        "release_fire_claim",
+        lambda job_id, *, expected_claim_id: released.append(
+            (job_id, expected_claim_id)
+        )
+        or True,
+    )
     monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: BrokenPool())
 
     assert scheduler.tick(verbose=False, sync=False) == 0
@@ -192,7 +206,30 @@ def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch)
             "error": "Executor dispatch failed: executor rejected",
         })
     ]
+    assert released == [("submit-fail", "claim-submit-fail")]
     assert "submit-fail" not in scheduler.get_running_job_ids()
+
+
+def test_claim_acquisition_failure_releases_running_guard(monkeypatch):
+    """A runtime-store error cannot wedge the job in the local running set."""
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [{"id": "claim-fail"}])
+
+    def fail_claim(_job_id):
+        raise RuntimeError("runtime store unavailable")
+
+    monkeypatch.setattr(scheduler, "claim_job_for_fire_token", fail_claim)
+    monkeypatch.setattr(
+        scheduler,
+        "create_execution",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("execution must not be created without ownership")
+        ),
+    )
+
+    assert scheduler.tick(verbose=False, sync=False) == 0
+    assert "claim-fail" not in scheduler.get_running_job_ids()
 
 
 def test_run_one_job_records_running_then_terminal(monkeypatch):
@@ -214,12 +251,14 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
     monkeypatch.setattr(
         scheduler,
-        "run_job",
-        lambda job, *, defer_agent_teardown=None, **_kw: (True, "output", "response", None),
+        "_run_job_in_killable_process",
+        lambda job, *, verbose=False, **_kw: (True, "output", "response", None),
     )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: None)
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(scheduler, "claim_job_for_fire_token", lambda _job_id: "claim-3")
+    monkeypatch.setattr(scheduler, "heartbeat_fire_claim", lambda *a, **k: True)
 
     assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
     assert events[0] == ("running", "exec-3")
@@ -227,7 +266,7 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     assert events[-1][2]["success"] is True
 
 
-def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
+def test_provider_start_does_no_recovery_after_shutdown_requested(monkeypatch):
     import cron.scheduler_provider as provider
 
     events = []
@@ -242,7 +281,7 @@ def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
 
     provider.InProcessCronScheduler().start(stop, interval=1)
 
-    assert events[:2] == ["recover", "heartbeat"]
+    assert events == []
 
 
 def test_external_provider_start_recovers_interrupted_records(monkeypatch):
@@ -260,6 +299,40 @@ def test_external_provider_start_recovers_interrupted_records(monkeypatch):
     provider.start(__import__("threading").Event())
 
     assert events == ["recover", "reconcile"]
+
+
+def test_external_provider_recovery_error_does_not_skip_reconcile(monkeypatch):
+    """Audit maintenance is never a prerequisite for arming remote schedules."""
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    provider = ChronosCronScheduler()
+    events = []
+    monkeypatch.setattr(
+        provider,
+        "recover_interrupted",
+        lambda: (_ for _ in ()).throw(OSError("ledger busy")),
+    )
+    monkeypatch.setattr(provider, "reconcile", lambda: events.append("reconcile"))
+
+    provider.start(__import__("threading").Event())
+
+    assert events == ["reconcile"]
+
+
+def test_external_provider_honors_preset_shutdown_before_maintenance(monkeypatch):
+    """A provider that is already stopping must not scan or arm anything."""
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+
+    provider = ChronosCronScheduler()
+    events = []
+    stop = __import__("threading").Event()
+    stop.set()
+    monkeypatch.setattr(provider, "recover_interrupted", lambda: events.append("recover"))
+    monkeypatch.setattr(provider, "reconcile", lambda: events.append("reconcile"))
+
+    provider.start(stop)
+
+    assert events == []
 
 
 class _TrackingConnection:

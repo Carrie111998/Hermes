@@ -19,6 +19,7 @@ selected via the `cron.provider` config key (empty = built-in).
 """
 from __future__ import annotations
 
+import logging
 import threading
 from abc import ABC, abstractmethod
 from typing import Any
@@ -98,6 +99,71 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
+    def _recover_interrupted_safely(
+        self,
+        logger: logging.Logger,
+        *,
+        profile_home: Any = None,
+    ) -> int:
+        """Run audit recovery without making it a dispatch prerequisite."""
+        suffix = f" for profile at {profile_home}" if profile_home is not None else ""
+        try:
+            recovered = self.recover_interrupted()
+        except BaseException as exc:
+            logger.error(
+                "Cron execution reconciliation error%s: %s",
+                suffix,
+                exc,
+                exc_info=True,
+            )
+            return 0
+        if recovered:
+            logger.warning(
+                "Marked %d interrupted cron execution(s) unknown after owner exit%s",
+                recovered,
+                suffix,
+            )
+        return recovered
+
+    def _recover_profiles_safely(
+        self,
+        logger: logging.Logger,
+        *,
+        stop_event: Any = None,
+        profile_homes: Any = None,
+    ) -> int:
+        """Recover each served profile, stopping before scans after shutdown."""
+        if stop_event is not None and stop_event.is_set():
+            return 0
+        if not profile_homes:
+            return self._recover_interrupted_safely(logger)
+
+        from cron.jobs import use_cron_store
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        recovered = 0
+        for entry in profile_homes:
+            if stop_event is not None and stop_event.is_set():
+                break
+            home = entry[1] if isinstance(entry, tuple) else entry
+            home_token = set_hermes_home_override(str(home))
+            try:
+                with use_cron_store(home):
+                    recovered += self._recover_interrupted_safely(
+                        logger,
+                        profile_home=home,
+                    )
+            finally:
+                reset_hermes_home_override(home_token)
+        return recovered
+
+    def maintenance(self) -> None:
+        """Optional warm-process maintenance hook. Default no-op."""
+        return None
+
     def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
@@ -110,16 +176,23 @@ class CronScheduler(ABC):
         Returns True if THIS caller claimed and ran the job, False if the claim
         was lost (another machine/retry won it) or the job no longer exists.
         """
-        from cron.jobs import claim_job_for_fire, get_job
+        from cron.jobs import claim_job_for_fire_token, get_job, release_fire_claim
         from cron.executions import create_execution
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        claim_id = claim_job_for_fire_token(job_id)
+        if claim_id is None:
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
-            return False  # job removed (e.g. repeat-N exhausted) between arm and fire
-        job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+            release_fire_claim(job_id, expected_claim_id=claim_id)
+            return False  # job removed between arm and fire
+        job["_fire_claim_id"] = claim_id
+        try:
+            job["execution_id"] = create_execution(job_id, source=self.name)["id"]
+        except Exception:
+            release_fire_claim(job_id, expected_claim_id=claim_id)
+            raise
         return run_one_job(job, adapters=adapters, loop=loop)
 
     def reconcile(self) -> None:
@@ -203,6 +276,8 @@ class InProcessCronScheduler(CronScheduler):
 
         logger = logging.getLogger("cron.scheduler_provider")
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
+        if stop_event.is_set():
+            return
 
         # ── Multiplex profiles ────────────────────────────────────────────
         # When profile_homes is set (multiplex_profiles on), tick EACH profile's
@@ -223,12 +298,7 @@ class InProcessCronScheduler(CronScheduler):
             return
 
         # ── Single-profile (legacy) path ──────────────────────────────────
-        recovered = self.recover_interrupted()
-        if recovered:
-            logger.warning(
-                "Marked %d interrupted cron execution(s) unknown after restart",
-                recovered,
-            )
+        self._recover_interrupted_safely(logger)
         # Heartbeat once before the first sleep so `hermes cron status` sees a
         # live ticker immediately after startup, not only after the first tick.
         record_ticker_heartbeat()
@@ -269,6 +339,12 @@ class InProcessCronScheduler(CronScheduler):
             if ok:
                 clear_ticker_error()
             stop_event.wait(interval)
+            if stop_event.is_set():
+                break
+            # Piggyback maintenance on the existing bounded wait cadence: no
+            # extra thread, overlapping scan, or shutdown work to leak. Keep it
+            # outside the dispatch gate so paused scheduling still recovers.
+            self._recover_interrupted_safely(logger)
 
     def _start_multiplex(
         self,
@@ -307,17 +383,16 @@ class InProcessCronScheduler(CronScheduler):
 
         # Recovery + initial heartbeat for every profile.
         for entry in profile_homes:
+            if stop_event.is_set():
+                break
             home = entry[1] if isinstance(entry, tuple) else entry
             home_token = set_hermes_home_override(str(home))
             try:
                 with use_cron_store(home):
-                    recovered = self.recover_interrupted()
-                    if recovered:
-                        logger.warning(
-                            "Marked %d interrupted cron execution(s) for profile at %s",
-                            recovered,
-                            home,
-                        )
+                    self._recover_interrupted_safely(
+                        logger,
+                        profile_home=home,
+                    )
                     record_ticker_heartbeat()
             finally:
                 reset_hermes_home_override(home_token)
@@ -365,3 +440,22 @@ class InProcessCronScheduler(CronScheduler):
                 finally:
                     reset_hermes_home_override(home_token)
             stop_event.wait(interval)
+            if stop_event.is_set():
+                break
+            # Reconcile every served profile even when dispatch is paused.
+            # Each call remains inside the same profile scope as startup
+            # recovery and tick dispatch, and failures are isolated per profile
+            # so one damaged ledger cannot stop the others.
+            for entry in profile_homes:
+                if stop_event.is_set():
+                    break
+                home = entry[1] if isinstance(entry, tuple) else entry
+                home_token = set_hermes_home_override(str(home))
+                try:
+                    with use_cron_store(home):
+                        self._recover_interrupted_safely(
+                            logger,
+                            profile_home=home,
+                        )
+                finally:
+                    reset_hermes_home_override(home_token)
