@@ -1801,6 +1801,25 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def find_operations_binding(thread_id: str) -> Optional[Dict[str, Any]]:
+    """Return the retained Discord work binding for a thread, if authenticated."""
+    needle = str(thread_id or "")
+    if not needle:
+        return None
+    for job in load_jobs():
+        binding = job.get("operations_binding")
+        if not isinstance(binding, dict) or binding.get("platform") != "discord":
+            continue
+        if str(binding.get("thread_id") or "") != needle:
+            continue
+        if binding.get("state") not in {"running", "retained", "needs_intervention"}:
+            continue
+        result = dict(binding)
+        result.setdefault("job_id", str(job.get("id") or ""))
+        return result
+    return None
+
+
 class AmbiguousJobReference(LookupError):
     """Raised when a job name matches more than one job."""
 

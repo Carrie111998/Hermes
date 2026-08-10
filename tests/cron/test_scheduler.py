@@ -9,9 +9,75 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _operations_binding_for_job
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
+
+
+def test_retained_operations_binding_is_resolved_by_thread(tmp_path, monkeypatch):
+    from cron import jobs
+    monkeypatch.setattr(jobs, "CRON_DIR", tmp_path)
+    monkeypatch.setattr(jobs, "JOBS_FILE", tmp_path / "jobs.json")
+    jobs.save_jobs([{
+        "id": "job-1", "name": "Nightly", "enabled": True,
+        "operations_binding": {"platform": "discord", "thread_id": "thread-1", "state": "retained"},
+    }])
+    assert jobs.find_operations_binding("thread-1")["job_id"] == "job-1"
+    assert jobs.find_operations_binding("thread-2") is None
+
+
+def test_operations_binding_contains_authoritative_run_identity():
+    binding = _operations_binding_for_job(
+        {"id": "job-1", "name": "Nightly"},
+        run_id="run-1",
+        session_id="cron-session-1",
+        handle=type("Handle", (), {
+            "parent_channel_id": "123456789012345678",
+            "thread_id": "234567890123456789",
+            "guild_id": "345678901234567890",
+        })(),
+    )
+
+    assert binding == {
+        "platform": "discord",
+        "guild_id": "345678901234567890",
+        "channel_id": "123456789012345678",
+        "thread_id": "234567890123456789",
+        "job_id": "job-1",
+        "run_id": "run-1",
+        "session_id": "cron-session-1",
+        "state": "running",
+    }
+
+
+def test_send_media_via_adapter_reports_explicit_attachment_failure(tmp_path, monkeypatch):
+    media_path = tmp_path / "report.pdf"
+    media_path.write_bytes(b"pdf")
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path,))
+    adapter = MagicMock()
+    adapter.send_document.return_value = AsyncMock()
+    loop = MagicMock()
+    failed = MagicMock(success=False, error="discord unavailable")
+    future = MagicMock()
+    future.result.return_value = failed
+    with patch("agent.async_utils.safe_schedule_threadsafe", return_value=future):
+        assert _send_media_via_adapter(
+            adapter, "thread-1", [(str(media_path), False)], {}, loop,
+            {"id": "job-1"}, platform="discord",
+        ) is False
+
+
+def test_retained_cron_reply_binding_preserves_authoritative_session_id(monkeypatch):
+    from gateway.config import Platform
+    from gateway.run import _find_retained_cron_reply_binding
+    event = MagicMock()
+    event.source.platform = Platform.DISCORD
+    event.source.thread_id = "thread-1"
+    monkeypatch.setattr(
+        "cron.jobs.find_operations_binding",
+        lambda _thread_id: {"job_id": "job-1", "run_id": "run-1", "session_id": "cron-session-1"},
+    )
+    assert _find_retained_cron_reply_binding(event)["session_id"] == "cron-session-1"
 
 
 class TestPerJobToolsetMcpMerge:

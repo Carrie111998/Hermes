@@ -2450,6 +2450,16 @@ def coerce_plaintext_gateway_command(event: "MessageEvent") -> None:
         return
 
 
+@dataclass(frozen=True)
+class NonInteractiveWorkThreadHandle:
+    """Platform-neutral identity for a non-interactive work thread."""
+
+    parent_channel_id: str
+    thread_id: str
+    thread_name: str
+    guild_id: Optional[str] = None
+
+
 @dataclass
 class SendResult:
     """Result of sending a message."""
@@ -3921,6 +3931,40 @@ class BasePlatformAdapter(ABC):
           - Slack:    seed-message thread anchoring
         """
         return None
+
+
+    async def create_noninteractive_work_thread(
+        self,
+        parent_channel_id: str,
+        name: str,
+        *,
+        auto_archive_duration: int = 1440,
+    ) -> Optional[NonInteractiveWorkThreadHandle]:
+        """Create a platform thread for autonomous/non-interactive work."""
+        return None
+
+    async def archive_noninteractive_work_thread(
+        self, handle: Optional[NonInteractiveWorkThreadHandle]
+    ) -> bool:
+        """Archive a non-interactive work thread, if supported."""
+        return False
+
+    async def delete_noninteractive_work_thread(
+        self, handle: Optional[NonInteractiveWorkThreadHandle]
+    ) -> bool:
+        """Delete a non-interactive work thread, if supported."""
+        return False
+
+    async def send_noninteractive_work_notification(
+        self,
+        handle: Optional[NonInteractiveWorkThreadHandle],
+        content: str,
+        *,
+        event: str,
+        chief_user_id: Optional[str] = None,
+    ) -> SendResult:
+        """Send an actionable/routine work notification, if supported."""
+        return SendResult(success=False, error="Not supported")
 
 
     async def edit_message(

@@ -14,7 +14,8 @@ import re
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Any
+from types import MappingProxyType
+from typing import Dict, List, Optional, Any, Mapping
 
 from hermes_cli.config import get_hermes_home
 
@@ -54,7 +55,7 @@ def _is_silence_narration(content: Optional[str]) -> bool:
         return False
     return bool(_SILENCE_NARRATION.match(stripped))
 
-from .config import Platform, GatewayConfig, PlatformConfig
+from .config import Platform, GatewayConfig, PlatformConfig, _coerce_bool
 from .session import SessionSource
 from .dead_targets import DeadTargetRegistry
 
@@ -642,5 +643,189 @@ class DeliveryRouter:
         return result
 
 
+_NONINTERACTIVE_ARCHIVE_DURATIONS = frozenset({60, 1440, 4320, 10080})
+_NONINTERACTIVE_CLEANUP_MODES = frozenset({"archive", "delete", "retain"})
+_NONINTERACTIVE_ROUTES = frozenset({"operations", "origin", "local"})
+_NONINTERACTIVE_MENTION_EVENTS = frozenset({"failure", "intervention"})
+_NONINTERACTIVE_DEFAULT_MENTION_EVENTS = ("failure", "intervention")
 
 
+def _freeze_noninteractive_value(value: Any) -> Any:
+    """Return a recursively copied immutable snapshot of a contract value."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            key: _freeze_noninteractive_value(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, list):
+        return tuple(_freeze_noninteractive_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_noninteractive_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_noninteractive_value(item) for item in value)
+    return value
+
+
+def _normalize_noninteractive_user_id(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value if re.fullmatch(r"[0-9]{17,20}", value) else None
+
+
+def _normalize_noninteractive_mention_on(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple, set, frozenset)) or not value:
+        return _NONINTERACTIVE_DEFAULT_MENTION_EVENTS
+    normalized = []
+    for item in value:
+        if not isinstance(item, str):
+            return _NONINTERACTIVE_DEFAULT_MENTION_EVENTS
+        event = item.strip().lower()
+        if event not in _NONINTERACTIVE_MENTION_EVENTS:
+            return _NONINTERACTIVE_DEFAULT_MENTION_EVENTS
+        normalized.append(event)
+    return tuple(event for event in _NONINTERACTIVE_DEFAULT_MENTION_EVENTS if event in normalized)
+
+
+@dataclass(frozen=True)
+class NonInteractiveWorkDescriptor:
+    """Producer-neutral identity and lifecycle state for autonomous work."""
+
+    producer: str
+    work_id: str
+    title: str
+    origin: Mapping[str, Any]
+    interaction_mode: str = "terminal"
+    terminal_status: str = "running"
+    reply_binding: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "origin", _freeze_noninteractive_value(self.origin or {}))
+        if self.reply_binding is not None:
+            object.__setattr__(self, "reply_binding", _freeze_noninteractive_value(self.reply_binding))
+
+
+@dataclass(frozen=True)
+class NonInteractiveWorkPolicy:
+    """Validated Discord operations-channel policy for non-interactive work."""
+
+    enabled: bool = False
+    channel_id: Optional[str] = None
+    chief_user_id: Optional[str] = None
+    mention_on: tuple[str, ...] = _NONINTERACTIVE_DEFAULT_MENTION_EVENTS
+    channel_name: Optional[str] = None
+    auto_archive_duration: int = 1440
+    cleanup: str = "archive"
+    retain_failures: bool = True
+    fallback_to_origin: bool = True
+    include_start_message: bool = True
+    include_cron: bool = True
+    include_background: bool = True
+    include_delegated: bool = True
+    routing: Optional[Mapping[str, str]] = None
+
+    def __post_init__(self) -> None:
+        channel_id = _normalize_noninteractive_user_id(self.channel_id)
+        object.__setattr__(self, "channel_id", channel_id)
+        if self.enabled and channel_id is None:
+            object.__setattr__(self, "enabled", False)
+        object.__setattr__(self, "chief_user_id", _normalize_noninteractive_user_id(self.chief_user_id))
+        object.__setattr__(self, "mention_on", _normalize_noninteractive_mention_on(self.mention_on))
+        object.__setattr__(self, "routing", _freeze_noninteractive_value(self.routing or {}))
+
+    def route_for(self, producer: str) -> str:
+        """Resolve a producer route, retaining origin behavior when disabled."""
+        producer = str(producer).strip().lower()
+        route = (self.routing or {}).get(producer)
+        included = {
+            "cron": self.include_cron,
+            "background": self.include_background,
+            "delegated": self.include_delegated,
+        }.get(producer, True)
+        if not included:
+            return route if route in {"origin", "local"} else "origin"
+        if route in {"origin", "local"}:
+            return route
+        if self.enabled:
+            return "operations"
+        return "origin"
+
+
+def _noninteractive_block(value: Any) -> dict:
+    """Extract the block from a raw config, PlatformConfig-like object, or block."""
+    def from_platform(platform: Any) -> dict:
+        extra = platform.get("extra") if isinstance(platform, Mapping) else getattr(platform, "extra", None)
+        if isinstance(extra, Mapping):
+            return dict(extra.get("noninteractive_work") or {})
+        return {}
+
+    if isinstance(value, Mapping):
+        platforms = value.get("platforms")
+        if isinstance(platforms, Mapping):
+            discord = platforms.get(Platform.DISCORD) or platforms.get("discord") or platforms.get("DISCORD")
+            if discord is not None:
+                return from_platform(discord)
+        if "noninteractive_work" in value:
+            return dict(value.get("noninteractive_work") or {})
+        # A mapping containing policy keys is itself the policy block.
+        return dict(value)
+    platforms = getattr(value, "platforms", None)
+    if isinstance(platforms, Mapping):
+        discord = platforms.get(Platform.DISCORD) or platforms.get("discord") or platforms.get("DISCORD")
+        if discord is not None:
+            return from_platform(discord)
+    extra = getattr(value, "extra", None)
+    return dict(extra.get("noninteractive_work") or {}) if isinstance(extra, Mapping) else {}
+
+
+def _noninteractive_bool(value: Any, default: bool) -> bool:
+    return _coerce_bool(value, default=default)
+
+
+def resolve_noninteractive_work_policy(config: Any) -> NonInteractiveWorkPolicy:
+    """Return a normalized, non-mutating policy for Discord autonomous work."""
+    raw = _noninteractive_block(config)
+    channel_id = _normalize_noninteractive_user_id(raw.get("channel_id"))
+
+    try:
+        archive_duration = int(raw.get("auto_archive_duration", 1440))
+    except (TypeError, ValueError):
+        archive_duration = 1440
+    if archive_duration not in _NONINTERACTIVE_ARCHIVE_DURATIONS:
+        archive_duration = 1440
+
+    cleanup = str(raw.get("cleanup", "archive") or "archive").strip().lower()
+    if cleanup not in _NONINTERACTIVE_CLEANUP_MODES:
+        cleanup = "archive"
+
+    routing_raw = raw.get("routing")
+    routing = {}
+    if isinstance(routing_raw, Mapping):
+        for producer, route in routing_raw.items():
+            producer = str(producer).strip().lower()
+            route = str(route).strip().lower()
+            if producer and route in _NONINTERACTIVE_ROUTES:
+                routing[producer] = route
+
+    enabled = _noninteractive_bool(raw.get("enabled"), False) and channel_id is not None
+    return NonInteractiveWorkPolicy(
+        enabled=enabled,
+        channel_id=channel_id,
+        chief_user_id=_normalize_noninteractive_user_id(raw.get("chief_user_id")),
+        mention_on=_normalize_noninteractive_mention_on(raw.get("mention_on")),
+        channel_name=str(raw["channel_name"]) if raw.get("channel_name") is not None else None,
+        auto_archive_duration=archive_duration,
+        cleanup=cleanup,
+        retain_failures=_noninteractive_bool(raw.get("retain_failures"), True),
+        fallback_to_origin=_noninteractive_bool(raw.get("fallback_to_origin"), True),
+        include_start_message=_noninteractive_bool(raw.get("include_start_message"), True),
+        include_cron=_noninteractive_bool(raw.get("include_cron"), True),
+        include_background=_noninteractive_bool(raw.get("include_background"), True),
+        include_delegated=_noninteractive_bool(raw.get("include_delegated"), True),
+        routing=routing,
+    )
+
+
+# Short aliases for callers that prefer the contract terminology.
+WorkDescriptor = NonInteractiveWorkDescriptor
+NonInteractivePolicy = NonInteractiveWorkPolicy

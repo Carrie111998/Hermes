@@ -32,8 +32,15 @@ from typing import Any, Optional, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
-from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
+from gateway.config import (
+    HomeChannel,
+    Platform,
+    PlatformConfig,
+    persist_home_channel,
+    resolve_noninteractive_work_policy,
+)
 from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.delivery import NonInteractiveWorkDescriptor
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
@@ -3331,6 +3338,45 @@ class GatewaySlashCommandsMixin:
         media_urls = list(event.media_urls) if event.media_urls else []
         media_types = list(event.media_types) if event.media_types else []
 
+        from gateway.run import _sanitize_gateway_final_response
+        safe_prompt = _sanitize_gateway_final_response(source.platform, prompt)
+
+        # Create the Discord operations surface before scheduling so failures
+        # have a retained destination and the handle is immutable per run.
+        lifecycle_handle = None
+        lifecycle_policy = None
+        operations_requested = False
+        lifecycle_start_failed = False
+        if source.platform == Platform.DISCORD:
+            try:
+                from gateway.run import _load_gateway_config
+                lifecycle_policy = resolve_noninteractive_work_policy(_load_gateway_config())
+                if lifecycle_policy.route_for("background") == "operations":
+                    operations_requested = True
+                    adapter = (
+                        self._adapter_for_source(source)
+                        if hasattr(self, "_adapter_for_source")
+                        else None
+                    ) or self.adapters.get(source.platform)
+                    safe_prompt = _sanitize_gateway_final_response(source.platform, prompt)
+                    lifecycle_handle = await adapter.create_noninteractive_work_thread(
+                        lifecycle_policy.channel_id,
+                        f"background {task_id}: {safe_prompt[:70]}",
+                        auto_archive_duration=lifecycle_policy.auto_archive_duration,
+                    )
+                    if lifecycle_handle and lifecycle_policy.include_start_message:
+                        from gateway.run import _delivery_succeeded
+                        start_result = await adapter.send_noninteractive_work_notification(
+                            lifecycle_handle,
+                            f"▶️ Background task {task_id} started. Prompt: {_sanitize_gateway_final_response(source.platform, prompt)[:240]}",
+                            event="start",
+                        )
+                        if not _delivery_succeeded(start_result):
+                            lifecycle_start_failed = True
+            except Exception as exc:
+                logger.warning("Background operations thread setup failed for %s: %s", task_id, exc)
+                lifecycle_start_failed = lifecycle_handle is not None
+
         # Fire-and-forget the background task
         _task = asyncio.create_task(
             self._run_background_task(
@@ -3340,13 +3386,18 @@ class GatewaySlashCommandsMixin:
                 event_message_id=event_message_id,
                 media_urls=media_urls,
                 media_types=media_types,
+                lifecycle_handle=lifecycle_handle,
+                lifecycle_policy=lifecycle_policy,
+                lifecycle_start_failed=lifecycle_start_failed,
+                lifecycle_adapter=adapter if lifecycle_handle is not None else None,
             )
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
-        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-        return t("gateway.background.started", preview=preview, task_id=task_id)
+        preview = safe_prompt[:60] + ("..." if len(safe_prompt) > 60 else "")
+        fallback_note = " Operations thread unavailable; results will be sent here." if operations_requested and lifecycle_handle is None else ""
+        return t("gateway.background.started", preview=preview, task_id=task_id) + fallback_note
 
     def _save_gateway_config_key(self, key_path: str, value) -> bool:
         """Save a dot-separated key to config.yaml (shared by /reasoning, /fast

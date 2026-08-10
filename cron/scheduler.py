@@ -1477,18 +1477,20 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
-    """Send extracted MEDIA files as native platform attachments via a live adapter.
+) -> bool:
+    """Send extracted MEDIA files and return aggregate delivery success.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
-    send_video, send_document) based on file extension — mirroring the routing logic
-    in ``BasePlatformAdapter._process_message_background``.
+    send_video, send_document) based on file extension.  A missing loop, raised
+    exception, or explicit adapter failure makes the aggregate false so callers
+    never archive a thread after only its text was delivered.
     """
     from pathlib import Path
 
     from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    all_delivered = True
 
     for media_path, _is_voice in media_files:
         try:
@@ -1510,20 +1512,24 @@ def _send_media_via_adapter(
                     "Job '%s': cannot send media %s, gateway loop unavailable",
                     job.get("id", "?"), media_path,
                 )
-                return
+                all_delivered = False
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
                 raise
-            if result and not getattr(result, "success", True):
+            if not _confirm_adapter_delivery(result):
+                all_delivered = False
                 logger.warning(
                     "Job '%s': media send failed for %s: %s",
                     job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
                 )
         except Exception as e:
+            all_delivered = False
             logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
 
+    return all_delivered
 
 def _confirm_adapter_delivery(send_result) -> bool:
     """Return True only if ``send_result`` unambiguously confirms delivery.
@@ -3163,7 +3169,7 @@ def _preflight_job_config(job: dict, cfg: dict) -> Optional[str]:
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None,
-    extra_prompt: Optional[str] = None,
+    extra_prompt: Optional[str] = None, session_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """
     Execute a single cron job.
@@ -3474,7 +3480,7 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
-    _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_session_id = session_id or f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -4516,6 +4522,119 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
+def _operations_binding_for_job(job: dict, *, run_id: str, session_id: str, handle) -> dict:
+    """Build the durable, authenticated reply binding for one cron run."""
+    return {
+        "platform": "discord",
+        "guild_id": getattr(handle, "guild_id", None),
+        "channel_id": str(handle.parent_channel_id),
+        "thread_id": str(handle.thread_id),
+        "job_id": str(job["id"]),
+        "run_id": str(run_id),
+        "session_id": str(session_id),
+        "state": "running",
+    }
+
+
+def _cron_operations_setup(job: dict, run_id: str, session_id: str, adapters, loop):
+    """Create and durably bind a fresh Discord operations thread, if enabled."""
+    try:
+        from gateway.config import Platform, resolve_noninteractive_work_policy
+        from gateway.run import _load_gateway_config
+        policy = resolve_noninteractive_work_policy(_load_gateway_config())
+        if policy.route_for("cron") != "operations" or not adapters or loop is None:
+            return None, None, None
+        adapter = adapters.get(Platform.DISCORD)
+        if adapter is None or not getattr(loop, "is_running", lambda: False)():
+            return None, policy, None
+        from agent.async_utils import safe_schedule_threadsafe
+        title = (job.get("name") or job.get("id") or "cron").strip()[:70]
+        future = safe_schedule_threadsafe(
+            adapter.create_noninteractive_work_thread(
+                policy.channel_id, f"cron {job['id']}: {title}",
+                auto_archive_duration=policy.auto_archive_duration,
+            ), loop,
+        )
+        handle = future.result(timeout=30) if future is not None else None
+        if handle is None:
+            return None, policy, None
+        binding = _operations_binding_for_job(job, run_id=run_id, session_id=session_id, handle=handle)
+        from cron.jobs import update_job
+        try:
+            update_job(job["id"], {"operations_binding": binding})
+        except Exception as exc:
+            # A remote thread without a durable binding is an untracked live
+            # resource. Best-effort cleanup before reporting setup failure.
+            try:
+                cleanup = "delete" if not policy.retain_failures and policy.cleanup == "delete" else "archive"
+                cleanup_result = getattr(adapter, f"{cleanup}_noninteractive_work_thread")(handle)
+                cleanup_future = safe_schedule_threadsafe(cleanup_result, loop)
+                if cleanup_future is not None:
+                    cleanup_future.result(timeout=30)
+            except Exception:
+                logger.error("Cron '%s': failed to clean untracked operations thread", job.get("id"), exc_info=True)
+            raise RuntimeError("operations thread was created but its durable binding could not be saved") from exc
+        return adapter, policy, handle
+    except Exception as exc:
+        logger.warning("Cron '%s' operations thread setup failed: %s", job.get("id"), exc)
+        return None, None, None
+
+
+def _cron_operations_send(adapter, handle, content: str, *, event: str, policy, loop) -> bool:
+    """Send one bounded lifecycle message through the live adapter."""
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+        from gateway.run import _delivery_succeeded
+        from gateway.platforms.base import BasePlatformAdapter
+        media_files, clean_content = BasePlatformAdapter.extract_media(content)
+    except Exception:
+        return False
+    result = adapter.send_noninteractive_work_notification(
+        handle, clean_content[:3500], event=event,
+        chief_user_id=(policy.chief_user_id if event in policy.mention_on or event == "intervention" else None),
+    )
+    future = safe_schedule_threadsafe(result, loop)
+    delivered = bool(future and _delivery_succeeded(future.result(timeout=30)))
+    if delivered and media_files:
+        delivered = _send_media_via_adapter(
+            adapter, handle.thread_id, media_files,
+            {"thread_id": handle.thread_id}, loop,
+            {"id": handle.thread_id}, platform="discord",
+        ) and delivered
+    return delivered
+
+
+def _cron_operations_finalize(job_id: str, adapter, handle, policy, loop, *,
+                              successful: bool, needs_intervention: bool) -> None:
+    """Apply cleanup only after the adapter confirms it succeeded."""
+    from cron.jobs import get_job, update_job
+    binding = dict((get_job(job_id) or {}).get("operations_binding") or {})
+    failure = (not successful) or needs_intervention
+    retain = policy.cleanup == "retain" or (failure and policy.retain_failures)
+    cleanup_ok = True
+    if not retain and policy.cleanup in {"archive", "delete"}:
+        try:
+            from agent.async_utils import safe_schedule_threadsafe
+            method = getattr(adapter, f"{policy.cleanup}_noninteractive_work_thread")
+            future = safe_schedule_threadsafe(method(handle), loop)
+            cleanup_ok = bool(future and future.result(timeout=30) is True)
+        except Exception:
+            cleanup_ok = False
+    if retain:
+        state = "needs_intervention" if failure else "retained"
+    elif cleanup_ok:
+        state = "archived"
+    else:
+        state = "needs_intervention"
+    binding["state"] = state
+    if not cleanup_ok:
+        binding["cleanup_error"] = f"{policy.cleanup} operation failed"
+    try:
+        update_job(job_id, {"operations_binding": binding})
+    except Exception:
+        logger.warning("Cron '%s': operations binding finalization persistence failed", job_id, exc_info=True)
+
+
 def run_one_job(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None,
@@ -4535,6 +4654,11 @@ def run_one_job(
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
     execution_id = job.get("execution_id")
+    operations_adapter = None
+    operations_policy = None
+    operations_handle = None
+    operations = False
+    operations_needs_intervention = False
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
     try:
@@ -4560,6 +4684,36 @@ def run_one_job(
         # The attempt is claimed durably before executor/provider dispatch and
         # becomes running only immediately before the actual run.
         mark_execution_running(execution_id)
+        cron_session_id = f"cron_{job['id']}_{execution_id}"
+        operations_adapter, operations_policy, operations_handle = _cron_operations_setup(
+            job, execution_id, cron_session_id, adapters, loop
+        )
+        operations = operations_handle is not None
+        operations_needs_intervention = False
+        if operations:
+            started = _cron_operations_send(
+                operations_adapter, operations_handle,
+                f"▶️ Cron job {job.get('name') or job['id']} started (run {execution_id}).",
+                event="start", policy=operations_policy, loop=loop,
+            )
+            if not started:
+                operations_needs_intervention = True
+                try:
+                    from cron.jobs import get_job, update_job
+                    binding = dict((get_job(job["id"]) or {}).get("operations_binding") or {})
+                    binding["state"] = "needs_intervention"
+                    update_job(job["id"], {"operations_binding": binding})
+                except Exception:
+                    logger.warning("Cron '%s': failed to persist start failure state", job["id"], exc_info=True)
+                try:
+                    _cron_operations_send(
+                        operations_adapter, operations_handle,
+                        f"⚠️ Cron job {job.get('name') or job['id']} needs intervention: "
+                        "the start notification was not delivered; this thread is retained.",
+                        event="intervention", policy=operations_policy, loop=loop,
+                    )
+                except Exception:
+                    logger.warning("Cron '%s': intervention notification failed", job["id"], exc_info=True)
 
         # Run the job under the profile's secret scope. get_secret() fails
         # closed outside a scope once profile isolation is in play (multiple
@@ -4588,7 +4742,7 @@ def run_one_job(
         try:
             success, output, final_response, error = run_job(
                 job, defer_agent_teardown=_deferred_agents,
-                extra_prompt=extra_prompt,
+                extra_prompt=extra_prompt, session_id=cron_session_id,
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -4678,7 +4832,13 @@ def run_one_job(
                 logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                 should_deliver = False
 
-            if should_deliver:
+            if should_deliver and operations:
+                delivery_error = None if _cron_operations_send(
+                    operations_adapter, operations_handle, deliver_content,
+                    event="success" if success else "failure",
+                    policy=operations_policy, loop=loop,
+                ) else "operations thread delivery failed"
+            elif should_deliver:
                 unresolved_origin = (
                     _normalize_deliver_value(job.get("deliver", "local")) == "origin"
                     and not _resolve_delivery_targets(job)
@@ -4709,7 +4869,18 @@ def run_one_job(
                     status="blocked_config",
                 )
             else:
-                mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+                if operations and not success:
+                    mark_job_run(job["id"], success, error, delivery_error=delivery_error,
+                                 status="needs_intervention")
+                else:
+                    mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        if operations:
+            _cron_operations_finalize(
+                job["id"], operations_adapter, operations_handle,
+                operations_policy, loop,
+                successful=success and not delivery_error,
+                needs_intervention=operations_needs_intervention,
+            )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
@@ -4739,6 +4910,29 @@ def run_one_job(
         # anything that isn't a plain Exception.
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
+        if operations and operations_adapter is not None and operations_handle is not None:
+            # Any cancellation/unexpected exception after thread setup must not
+            # leave a running binding. Keep it retained and publish only a
+            # bounded, non-sensitive intervention alert.
+            operations_needs_intervention = True
+            try:
+                _cron_operations_send(
+                    operations_adapter, operations_handle,
+                    f"⚠️ Cron job {job.get('name') or job['id']} needs intervention: "
+                    f"run {execution_id} terminated unexpectedly ({type(e).__name__}); "
+                    "the operations thread was retained for investigation.",
+                    event="intervention", policy=operations_policy, loop=loop,
+                )
+            except BaseException:
+                logger.warning("Cron '%s': failed to publish exception alert", job["id"], exc_info=True)
+            try:
+                _cron_operations_finalize(
+                    job["id"], operations_adapter, operations_handle,
+                    operations_policy, loop,
+                    successful=False, needs_intervention=True,
+                )
+            except BaseException:
+                logger.warning("Cron '%s': failed to finalize exception binding", job["id"], exc_info=True)
         try:
             if not _consume_interrupted_flag(job["id"]):
                 mark_job_run(job["id"], False, _err_text)

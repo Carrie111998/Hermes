@@ -65,6 +65,32 @@ from agent.turn_context import (
 )
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from gateway.platforms.base import SendResult
+
+
+def _delivery_succeeded(result: Any) -> bool:
+    """Interpret adapter delivery results without breaking legacy adapters.
+
+    Current adapters return :class:`SendResult`, whose explicit failure must
+    prevent archival. Older adapters returned ``None`` (or other opaque
+    values), and those remain successful unless they expose an explicit,
+    concrete failure or error value.
+    """
+    if isinstance(result, SendResult):
+        return result.success is True
+    if isinstance(result, dict):
+        if result.get("success") is False or result.get("error"):
+            return False
+        return True
+
+    success = getattr(result, "success", None)
+    if isinstance(success, bool) and not success:
+        return False
+    error = getattr(result, "error", None)
+    if isinstance(error, str) and error:
+        return False
+    return True
+
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -5843,6 +5869,18 @@ class TurnRunner:
             "agent_persisted": (ctx.result_holder[0].get("agent_persisted", True) if ctx.result_holder[0] else True),
         }
 
+
+
+def _find_retained_cron_reply_binding(event: MessageEvent):
+    """Resolve a retained Discord cron thread without trusting thread names."""
+    source = getattr(event, "source", None)
+    if not source or getattr(source, "platform", None) != Platform.DISCORD:
+        return None
+    thread_id = getattr(source, "thread_id", None)
+    if not thread_id:
+        return None
+    from cron.jobs import find_operations_binding
+    return find_operations_binding(str(thread_id))
 
 
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
@@ -14650,6 +14688,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = event.source
 
+        # Retained cron work threads are authenticated bindings for a new,
+        # bounded follow-up; they never imply resuming the completed process.
+        if not getattr(event, "internal", False):
+            try:
+                binding = _find_retained_cron_reply_binding(event)
+                if binding:
+                    # Keep the authenticated binding on the event so the inner
+                    # dispatch can switch the durable SessionStore mapping. The
+                    # visible prefix is only context; it is not the binding.
+                    event._cron_reply_binding = dict(binding)
+                    event.text = (
+                        f"[Cron follow-up for job {binding['job_id']}, run "
+                        f"{binding['run_id']}; bounded follow-up]\n"
+                        f"{(event.text or '')[:3500]}"
+                    )
+            except Exception:
+                logger.debug("Retained cron reply binding lookup failed", exc_info=True)
+
         # 🔴 Cross-session leak guard. This handler runs inside a per-message
         # asyncio task created via create_task(), which snapshots the spawning
         # context with copy_context(). If a *concurrent* message had already
@@ -16776,6 +16832,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
         session_entry = await self.async_session_store.get_or_create_session(source)
+        cron_reply_binding = getattr(event, "_cron_reply_binding", None)
+        bound_cron_session_id = str((cron_reply_binding or {}).get("session_id") or "").strip()
+        if bound_cron_session_id:
+            switched = await self.async_session_store.switch_session(
+                session_entry.session_key, bound_cron_session_id
+            )
+            if switched is None:
+                logger.warning(
+                    "Cron reply binding target %s is unavailable; keeping a new session",
+                    bound_cron_session_id,
+                )
+            else:
+                session_entry = switched
         session_key = session_entry.session_key
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
@@ -20014,6 +20083,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        lifecycle_handle=None,
+        lifecycle_policy=None,
+        lifecycle_start_failed: bool = False,
+        lifecycle_adapter=None,
     ) -> None:
         """Profile-scoping wrapper around the background agent task.
 
@@ -20025,12 +20098,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
+                lifecycle_handle, lifecycle_policy,
+                lifecycle_start_failed, lifecycle_adapter,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
             return await self._run_background_task_inner(
                 prompt, source, task_id, event_message_id, media_urls, media_types,
+                lifecycle_handle, lifecycle_policy,
+                lifecycle_start_failed, lifecycle_adapter,
             )
 
     async def _run_background_task_inner(
@@ -20041,6 +20118,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event_message_id: Optional[str] = None,
         media_urls: Optional[List[str]] = None,
         media_types: Optional[List[str]] = None,
+        lifecycle_handle=None,
+        lifecycle_policy=None,
+        lifecycle_start_failed: bool = False,
+        lifecycle_adapter=None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -20051,9 +20132,124 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(source)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            if lifecycle_handle is not None and lifecycle_policy is not None and lifecycle_adapter is not None:
+                try:
+                    if lifecycle_policy.retain_failures:
+                        return
+                    if lifecycle_policy.cleanup == "delete":
+                        await lifecycle_adapter.delete_noninteractive_work_thread(lifecycle_handle)
+                    elif lifecycle_policy.cleanup != "retain":
+                        await lifecycle_adapter.archive_noninteractive_work_thread(lifecycle_handle)
+                except Exception:
+                    logger.debug("Background orphan cleanup failed", exc_info=True)
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        operations = lifecycle_handle is not None and lifecycle_policy is not None
+        delivery_disabled = (
+            lifecycle_handle is None
+            and lifecycle_policy is not None
+            and not lifecycle_policy.fallback_to_origin
+        )
+        # A failed start notification is independent from final-result/media
+        # delivery.  It should not turn a successfully delivered result into a
+        # delivery failure (or suppress success cleanup).
+        delivery_ok = True
+        failure_escalated = False
+        failure_escalation_delivered = False
+        notification_exception = False
+        if lifecycle_start_failed:
+            logger.warning("Background task %s start notification was not delivered", task_id)
+        _delivery_chat_id = lifecycle_handle.thread_id if operations else source.chat_id
+        _delivery_metadata = {"thread_id": lifecycle_handle.thread_id} if operations else _thread_metadata
+        safe_prompt = _sanitize_gateway_final_response(source.platform, prompt)
+
+        async def _notify(content: str, event: str) -> bool:
+            nonlocal delivery_ok, notification_exception
+            content = _sanitize_gateway_final_response(source.platform, content)
+            if delivery_disabled:
+                logger.error("Background task %s result undelivered: operations thread unavailable and origin fallback disabled", task_id)
+                delivery_ok = False
+                return False
+            try:
+                if operations:
+                    result = await adapter.send_noninteractive_work_notification(
+                        lifecycle_handle,
+                        content,
+                        event=event,
+                        chief_user_id=(lifecycle_policy.chief_user_id if event in lifecycle_policy.mention_on else None),
+                    )
+                else:
+                    origin_metadata = dict(_thread_metadata or {})
+                    origin_metadata["_hermes_origin_background"] = True
+                    result = await adapter.send(source.chat_id, content, metadata=origin_metadata)
+            except Exception:
+                notification_exception = True
+                delivery_ok = False
+                logger.debug("Background notification failed", exc_info=True)
+                return False
+            delivery_succeeded = _delivery_succeeded(result)
+            if not delivery_succeeded:
+                delivery_ok = False
+            return delivery_succeeded
+
+        async def _origin_failure(content: str) -> bool:
+            nonlocal delivery_ok
+            if (
+                not operations
+                or not lifecycle_policy.fallback_to_origin
+            ):
+                return True
+            content = _sanitize_gateway_final_response(source.platform, content)
+            guild_id = getattr(lifecycle_handle, "guild_id", None)
+            location = (
+                f"see https://discord.com/channels/{guild_id}/{lifecycle_handle.parent_channel_id}/{lifecycle_handle.thread_id}"
+                if guild_id
+                else f"see thread {lifecycle_handle.thread_id} in channel {lifecycle_handle.parent_channel_id}"
+            )
+            chief_user_id = lifecycle_policy.chief_user_id
+            valid_chief_user_id = (
+                isinstance(chief_user_id, str)
+                and chief_user_id.isdigit()
+                and 17 <= len(chief_user_id) <= 20
+            )
+            mention = f"<@{chief_user_id}> " if valid_chief_user_id else ""
+            origin_metadata = dict(_thread_metadata or {})
+            origin_metadata["_hermes_origin_failure"] = True
+            origin_metadata["_hermes_chief_user_id"] = chief_user_id if valid_chief_user_id else None
+            try:
+                result = await adapter.send(
+                    source.chat_id,
+                    f"{mention}Background task {task_id} failed: {content}; {location}",
+                    metadata=origin_metadata,
+                )
+                succeeded = _delivery_succeeded(result)
+                if not succeeded:
+                    delivery_ok = False
+                return succeeded
+            except Exception:
+                delivery_ok = False
+                logger.debug("Background origin failure notification failed", exc_info=True)
+                return False
+
+        async def _cleanup_failure() -> None:
+            if (
+                not operations
+                or lifecycle_policy.retain_failures
+                or lifecycle_policy.cleanup == "retain"
+                or (
+                    not delivery_ok
+                    and (not failure_escalation_delivered or notification_exception)
+                )
+            ):
+                return
+            try:
+                if lifecycle_policy.cleanup == "delete":
+                    await adapter.delete_noninteractive_work_thread(lifecycle_handle)
+                else:
+                    await adapter.archive_noninteractive_work_thread(lifecycle_handle)
+            except Exception:
+                logger.debug("Background failure cleanup failed", exc_info=True)
 
         try:
             user_config = _load_gateway_config()
@@ -20062,11 +20258,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
-                await adapter.send(
-                    source.chat_id,
+                final_delivered = await _notify(
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
-                    metadata=_thread_metadata,
+                    "failure",
                 )
+                if not final_delivered:
+                    failure_escalation_delivered = await _notify(
+                        f"❌ Background task {task_id} failure notification could not be delivered.", "failure"
+                    )
+                    failure_escalated = True
+                await _origin_failure("no provider credentials configured")
+                await _cleanup_failure()
                 return
 
             platform_key = _platform_config_key(source.platform)
@@ -20144,9 +20346,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             result = await self._run_in_executor_with_context(run_sync)
 
+            result_error = result.get("error") if isinstance(result, dict) else getattr(result, "error", None)
+            if result_error:
+                safe_error = _redact_gateway_user_facing_secrets(str(result_error))
+                safe_error = re.sub(r"(?i)(secret|token|password|api[_-]?key)\s*[=:]\s*\S+", r"\1=[REDACTED]", safe_error)
+                await _notify(f"❌ Background task {task_id} failed: {safe_error}", "failure")
+                await _origin_failure(safe_error)
+                await _cleanup_failure()
+                return
+
             response = result.get("final_response", "") if result else ""
-            if not response and result and result.get("error"):
-                response = f"Error: {result['error']}"
 
             # Extract media files from the response
             if response:
@@ -20155,33 +20364,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
                 images, text_content = adapter.extract_images(response)
 
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+                preview = safe_prompt[:60] + ("..." if len(safe_prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
 
                 if text_content:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + text_content,
-                        metadata=_thread_metadata,
+                    final_delivered = await _notify(
+                        header + text_content,
+                        "success",
                     )
                 elif not images and not media_files:
-                    await adapter.send(
-                        chat_id=source.chat_id,
-                        content=header + "(No response generated)",
-                        metadata=_thread_metadata,
+                    final_delivered = await _notify(
+                        header + "(No response generated)",
+                        "success",
                     )
 
-                # Send extracted images
+                # Send extracted images and result media into the lifecycle thread.
+                _media_metadata = _delivery_metadata
                 for image_url, alt_text in (images or []):
                     try:
-                        await adapter.send_image(
-                            chat_id=source.chat_id,
+                        send_result = await adapter.send_image(
+                            chat_id=_delivery_chat_id,
                             image_url=image_url,
                             caption=alt_text,
-                            metadata=_thread_metadata,
+                            metadata=_media_metadata,
                         )
+                        if not _delivery_succeeded(send_result):
+                            delivery_ok = False
                     except Exception:
-                        pass
+                        delivery_ok = False
 
                 # Send media files, routing each by type so a TTS clip
                 # arrives as a voice bubble / a clip as a video rather than
@@ -20195,47 +20405,74 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _ext = os.path.splitext(media_path)[1].lower()
                     try:
                         if _should_send_media_as_audio(source.platform, _ext, _is_voice):
-                            await adapter.send_voice(
-                                chat_id=source.chat_id,
+                            send_result = await adapter.send_voice(
+                                chat_id=_delivery_chat_id,
                                 audio_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=_media_metadata,
                             )
                         elif _ext in _VIDEO_EXTS:
-                            await adapter.send_video(
-                                chat_id=source.chat_id,
+                            send_result = await adapter.send_video(
+                                chat_id=_delivery_chat_id,
                                 video_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=_media_metadata,
                             )
                         elif _ext in _IMAGE_EXTS:
-                            await adapter.send_image_file(
-                                chat_id=source.chat_id,
+                            send_result = await adapter.send_image_file(
+                                chat_id=_delivery_chat_id,
                                 image_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=_media_metadata,
                             )
                         else:
-                            await adapter.send_document(
-                                chat_id=source.chat_id,
+                            send_result = await adapter.send_document(
+                                chat_id=_delivery_chat_id,
                                 file_path=media_path,
-                                metadata=_thread_metadata,
+                                metadata=_media_metadata,
                             )
                     except Exception:
-                        pass
+                        delivery_ok = False
+                        continue
+                    if not _delivery_succeeded(send_result):
+                        delivery_ok = False
+                if not delivery_ok and not failure_escalated:
+                    failure_escalation_delivered = await _notify(
+                        f"❌ Background task {task_id} completed, but result delivery failed.", "failure"
+                    )
+                    failure_escalated = True
+                    await _origin_failure("result delivery failed")
+                    await _cleanup_failure()
             else:
-                preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
-                    metadata=_thread_metadata,
+                preview = safe_prompt[:60] + ("..." if len(safe_prompt) > 60 else "")
+                final_delivered = await _notify(
+                    f'✅ Background task complete\nPrompt: "{preview}"\n\n(No response generated)',
+                    "success",
                 )
+                if not delivery_ok and not failure_escalated:
+                    failure_escalation_delivered = await _notify(
+                        f"❌ Background task {task_id} result delivery failed.", "failure"
+                    )
+                    failure_escalated = True
+                    await _origin_failure("result delivery failed")
+                    await _cleanup_failure()
+            if operations and delivery_ok and lifecycle_policy.cleanup != "retain":
+                try:
+                    if lifecycle_policy.cleanup == "delete":
+                        await adapter.delete_noninteractive_work_thread(lifecycle_handle)
+                    else:
+                        await adapter.archive_noninteractive_work_thread(lifecycle_handle)
+                except Exception:
+                    logger.debug("Background operations archive failed", exc_info=True)
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
             try:
-                await adapter.send(
-                    chat_id=source.chat_id,
-                    content=f"❌ Background task {task_id} failed: {e}",
-                    metadata=_thread_metadata,
+                safe_error = _redact_gateway_user_facing_secrets(str(e))
+                safe_error = re.sub(r"(?i)(secret|token|password|api[_-]?key)\s*[=:]\s*\S+", r"\1=[REDACTED]", safe_error)
+                await _notify(
+                    f"❌ Background task {task_id} failed: {safe_error}",
+                    "failure",
                 )
+                await _origin_failure(safe_error)
+                await _cleanup_failure()
             except Exception:
                 pass
 

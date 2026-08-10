@@ -70,6 +70,7 @@ class _Snowflake:
         self.id = id
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
+_DISCORD_NONINTERACTIVE_MISSING = object()
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
 _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
@@ -154,6 +155,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    NonInteractiveWorkThreadHandle,
     cache_image_from_url,
     cache_image_from_bytes,
     cache_audio_from_url,
@@ -3083,6 +3085,27 @@ class DiscordAdapter(BasePlatformAdapter):
                 thread_id = metadata["thread_id"]
             nonconversational = _metadata_marks_nonconversational(metadata)
             final_delivery = bool(metadata and metadata.get("notify"))
+            origin_failure = bool(metadata and metadata.get("_hermes_origin_failure"))
+            origin_background = bool(metadata and metadata.get("_hermes_origin_background"))
+            allowed_mentions = None
+            if origin_failure:
+                chief_user_id = metadata.get("_hermes_chief_user_id") if metadata else None
+                valid_chief_user_id = (
+                    isinstance(chief_user_id, str)
+                    and chief_user_id.isdigit()
+                    and 17 <= len(chief_user_id) <= 20
+                )
+                if valid_chief_user_id:
+                    allowed_mentions = discord.AllowedMentions(
+                        everyone=False,
+                        roles=False,
+                        replied_user=False,
+                        users=[discord.Object(id=int(chief_user_id))],
+                    )
+                else:
+                    allowed_mentions = discord.AllowedMentions.none()
+            elif origin_background:
+                allowed_mentions = discord.AllowedMentions.none()
 
             if thread_id:
                 # Fetch the thread directly — threads are addressed by their own ID.
@@ -3101,7 +3124,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Forum channels reject channel.send() — create a thread post instead.
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(channel, content, allowed_mentions=allowed_mentions)
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3128,6 +3151,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        **({"allowed_mentions": allowed_mentions} if allowed_mentions is not None else {}),
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -3150,6 +3174,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            **({"allowed_mentions": allowed_mentions} if allowed_mentions is not None else {}),
                         )
                     else:
                         raise
@@ -3190,7 +3215,13 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(
+        self,
+        forum_channel: Any,
+        content: str,
+        *,
+        allowed_mentions: Any = None,
+    ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3213,6 +3244,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread = await forum_channel.create_thread(
                 name=thread_name,
                 content=starter_content,
+                **({"allowed_mentions": allowed_mentions} if allowed_mentions is not None else {}),
             )
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
@@ -3229,7 +3261,10 @@ class DiscordAdapter(BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
-                msg = await thread_channel.send(content=chunk)
+                msg = await thread_channel.send(
+                    content=chunk,
+                    **({"allowed_mentions": allowed_mentions} if allowed_mentions is not None else {}),
+                )
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
@@ -6934,6 +6969,175 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("[%s] Failed to rename Discord thread %s", self.name, thread_id, exc_info=True)
             return False
+
+    async def create_noninteractive_work_thread(
+        self,
+        parent_channel_id: str,
+        name: str,
+        *,
+        auto_archive_duration: int = 1440,
+    ) -> Optional[NonInteractiveWorkThreadHandle]:
+        """Create an operations thread, preferring Discord's direct API path."""
+        if auto_archive_duration not in VALID_THREAD_AUTO_ARCHIVE_MINUTES:
+            return None
+        if not self._client or not DISCORD_AVAILABLE:
+            return None
+        try:
+            parent_id = str(int(parent_channel_id))
+            parent = self._client.get_channel(int(parent_id))
+            if parent is None:
+                parent = await self._client.fetch_channel(int(parent_id))
+            if parent is None:
+                return None
+            thread_name = (name or "non-interactive work").strip()[:100] or "non-interactive work"
+            create = getattr(parent, "create_thread", None)
+            if callable(create):
+                try:
+                    thread = await create(
+                        name=thread_name,
+                        auto_archive_duration=auto_archive_duration,
+                        reason="Hermes non-interactive work",
+                    )
+                except Exception:
+                    thread = None
+                if thread is not None:
+                    return NonInteractiveWorkThreadHandle(
+                        parent_channel_id=parent_id,
+                        thread_id=str(thread.id),
+                        thread_name=getattr(thread, "name", None) or thread_name,
+                        guild_id=(str(getattr(getattr(parent, "guild", None), "id", "")) or None),
+                    )
+
+            send = getattr(parent, "send", None)
+            if not callable(send):
+                return None
+            seed = await send(
+                f"🧵 Hermes non-interactive work: **{thread_name}**",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            try:
+                thread = await seed.create_thread(
+                    name=thread_name,
+                    auto_archive_duration=auto_archive_duration,
+                    reason="Hermes non-interactive work",
+                )
+            except Exception:
+                # The seed is only an implementation detail of the fallback
+                # path.  Do not leave it in the parent when thread creation
+                # fails, but preserve the original failure result.
+                try:
+                    await seed.delete(reason="Hermes non-interactive work cleanup")
+                except Exception:
+                    logger.debug("[%s] Failed to delete orphaned non-interactive seed", self.name, exc_info=True)
+                raise
+            return NonInteractiveWorkThreadHandle(
+                parent_channel_id=parent_id,
+                thread_id=str(thread.id),
+                thread_name=getattr(thread, "name", None) or thread_name,
+                guild_id=(str(getattr(getattr(parent, "guild", None), "id", "")) or None),
+            )
+        except Exception:
+            logger.warning("[%s] Failed to create non-interactive work thread", self.name, exc_info=True)
+            return None
+
+    async def _noninteractive_thread(self, handle: NonInteractiveWorkThreadHandle) -> Optional[Any]:
+        if not self._client or not handle:
+            return None
+        try:
+            thread_id = int(handle.thread_id)
+        except (TypeError, ValueError):
+            return None
+        thread = self._client.get_channel(thread_id)
+        if thread is None:
+            try:
+                thread = await self._client.fetch_channel(thread_id)
+                if thread is None:
+                    return _DISCORD_NONINTERACTIVE_MISSING
+            except Exception as exc:
+                if "unknown channel" in str(exc).lower() or "unknown thread" in str(exc).lower():
+                    return _DISCORD_NONINTERACTIVE_MISSING
+                logger.warning("[%s] Failed to look up non-interactive thread %s", self.name, handle.thread_id, exc_info=True)
+                return None
+        return thread
+
+    async def archive_noninteractive_work_thread(
+        self, handle: Optional[NonInteractiveWorkThreadHandle]
+    ) -> bool:
+        thread = await self._noninteractive_thread(handle)
+        if thread is None:
+            return False
+        if thread is _DISCORD_NONINTERACTIVE_MISSING:
+            return True
+        if getattr(thread, "archived", False):
+            return True
+        try:
+            await thread.edit(archived=True, reason="Hermes non-interactive work cleanup")
+            return True
+        except Exception as exc:
+            if "unknown channel" in str(exc).lower() or "unknown thread" in str(exc).lower():
+                return True
+            logger.warning("[%s] Failed to archive non-interactive thread %s", self.name, handle.thread_id, exc_info=True)
+            return False
+
+    async def delete_noninteractive_work_thread(
+        self, handle: Optional[NonInteractiveWorkThreadHandle]
+    ) -> bool:
+        thread = await self._noninteractive_thread(handle)
+        if thread is None:
+            return False
+        if thread is _DISCORD_NONINTERACTIVE_MISSING:
+            return True
+        try:
+            await thread.delete(reason="Hermes non-interactive work cleanup")
+            return True
+        except Exception as exc:
+            if "unknown channel" in str(exc).lower() or "unknown thread" in str(exc).lower():
+                return True
+            logger.warning("[%s] Failed to delete non-interactive thread %s", self.name, handle.thread_id, exc_info=True)
+            return False
+
+    async def send_noninteractive_work_notification(
+        self,
+        handle: Optional[NonInteractiveWorkThreadHandle],
+        content: str,
+        *,
+        event: str,
+        chief_user_id: Optional[str] = None,
+    ) -> SendResult:
+        """Send a work update with explicit mention gating and allowed mentions."""
+        thread = await self._noninteractive_thread(handle)
+        if thread is None:
+            return SendResult(success=False, error="Thread not found")
+        valid_chief_user_id = (
+            isinstance(chief_user_id, str)
+            and chief_user_id.isdigit()
+            and 17 <= len(chief_user_id) <= 20
+        )
+        actionable = event in {"failure", "intervention"} and valid_chief_user_id
+        message = f"<@{chief_user_id}> {content}" if actionable else content
+        try:
+            if actionable:
+                allowed_mentions = discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    replied_user=False,
+                    users=[discord.Object(id=int(chief_user_id))],
+                )
+            else:
+                allowed_mentions = discord.AllowedMentions.none()
+            chunks = self.truncate_message(message, self.MAX_MESSAGE_LENGTH)
+            last_message_id = None
+            for index, chunk in enumerate(chunks):
+                # Only the first chunk is permitted to notify the Chief.  The
+                # remainder must be mention-free even if its text contains
+                # mention-looking content.
+                chunk_mentions = allowed_mentions if index == 0 else discord.AllowedMentions.none()
+                sent = await thread.send(content=chunk, allowed_mentions=chunk_mentions)
+                last_message_id = str(getattr(sent, "id", "")) or last_message_id
+            return SendResult(success=True, message_id=last_message_id)
+        except Exception as exc:
+            logger.warning("[%s] Failed to send non-interactive notification", self.name, exc_info=True)
+            return SendResult(success=False, error=str(exc))
 
     async def create_handoff_thread(
         self,

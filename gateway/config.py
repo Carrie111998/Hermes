@@ -23,6 +23,18 @@ from utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 
+def resolve_noninteractive_work_policy(config: Any):
+    """Normalize Discord non-interactive delivery settings without mutation.
+
+    The implementation lives with the gateway delivery contracts; this
+    configuration-facing entry point keeps callers from depending on the
+    delivery module's broader transport helpers.
+    """
+    from gateway.delivery import resolve_noninteractive_work_policy as _resolve
+
+    return _resolve(config)
+
+
 def _coerce_bool(value: Any, default: bool = True) -> bool:
     """Coerce bool-ish config values, preserving a caller-provided default."""
     if value is None:
