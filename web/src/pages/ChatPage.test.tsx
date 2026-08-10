@@ -17,6 +17,7 @@ class FakeWebglAddon {
 }
 
 class FakeTerminal {
+  static instances: FakeTerminal[] = [];
   options: Record<string, unknown>;
   rows = 24;
   cols = 80;
@@ -24,12 +25,15 @@ class FakeTerminal {
     registerOscHandler: vi.fn(),
   };
   unicode = { activeVersion: "" };
+  keyHandler: ((ev: KeyboardEvent) => boolean) | null = null;
 
   constructor(options: Record<string, unknown>) {
     this.options = options;
+    FakeTerminal.instances.push(this);
   }
 
-  attachCustomKeyEventHandler() {
+  attachCustomKeyEventHandler(handler: (ev: KeyboardEvent) => boolean) {
+    this.keyHandler = handler;
     return true;
   }
 
@@ -146,6 +150,25 @@ type CloseEventLike = {
 let container: HTMLDivElement;
 let root: Root;
 
+// jsdom runs without an origin here (per-file @vitest-environment jsdom on a
+// node-default config), so localStorage is undefined. Stub it so components
+// that persist UI state (side panel collapse) can be exercised.
+const localStorageMock = (() => {
+  let store: Record<string, string> = {};
+  return {
+    getItem: (key: string) => store[key] ?? null,
+    setItem: (key: string, value: string) => {
+      store[key] = String(value);
+    },
+    removeItem: (key: string) => {
+      delete store[key];
+    },
+    clear: () => {
+      store = {};
+    },
+  };
+})();
+
 async function render(ui: ReactNode) {
   container = document.createElement("div");
   document.body.append(container);
@@ -155,6 +178,7 @@ async function render(ui: ReactNode) {
 
 beforeEach(() => {
   FakeWebSocket.instances = [];
+  FakeTerminal.instances = [];
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   apiMocks.buildWsUrl.mockReset();
   apiMocks.buildWsUrl.mockResolvedValue("ws://localhost/api/pty?channel=chat-1");
@@ -208,6 +232,8 @@ beforeEach(() => {
     },
   });
   sessionStorage.clear();
+  vi.stubGlobal("localStorage", localStorageMock);
+  localStorageMock.clear();
 });
 
 afterEach(async () => {
@@ -322,5 +348,62 @@ describe("ChatPage PTY ticket connect deadline", () => {
     // force-close a wedged handshake — the two must not both fire.
     await advance(PTY_TICKET_TIMEOUT_MS);
     expect(apiMocks.buildWsUrl).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Paste shortcut handling: the dashboard is often opened over plain http
+// from a remote host (non-secure context), where the async Clipboard API is
+// undefined. In that case Cmd/Ctrl+Shift+V must NOT be intercepted — the
+// keydown handler returns true so the DOM paste event reaches xterm, whose
+// hidden textarea pastes without the Clipboard API (same path as
+// context-menu paste). When the API exists, the shortcut stays intercepted.
+describe("ChatPage paste shortcut", () => {
+  async function renderChat() {
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+  }
+
+  function pasteKeydown() {
+    return {
+      type: "keydown",
+      key: "v",
+      ctrlKey: true,
+      shiftKey: true,
+      metaKey: false,
+      preventDefault: vi.fn(),
+    } as unknown as KeyboardEvent;
+  }
+
+  it("falls through to the DOM paste path when the Clipboard API is unavailable", async () => {
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: undefined,
+    });
+
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    const term = FakeTerminal.instances[0];
+    expect(term.keyHandler).toBeDefined();
+
+    // Non-mac test runner: the paste modifier is Ctrl+Shift (see hotkeys).
+    const ev = pasteKeydown();
+    expect(term.keyHandler!(ev)).toBe(true);
+    expect(ev.preventDefault).not.toHaveBeenCalled();
+  });
+
+  it("still intercepts the paste shortcut when the Clipboard API exists", async () => {
+    // beforeEach defines navigator.clipboard.readText/writeText.
+    await renderChat();
+    await vi.waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+
+    const term = FakeTerminal.instances[0];
+    const ev = pasteKeydown();
+    expect(term.keyHandler!(ev)).toBe(false);
+    expect(ev.preventDefault).toHaveBeenCalled();
   });
 });
