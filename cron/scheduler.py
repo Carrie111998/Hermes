@@ -4228,10 +4228,45 @@ def _run_job_impl(
         return True, doc, output, None
 
     # ---------------------------------------------------------------
+    # Wake gate — the inference boundary. This runs BEFORE any model
+    # machinery so a "nothing to do" tick costs no AIAgent import, no
+    # SessionDB row, and no delivery. The gate used to sit after SessionDB
+    # init, which meant every idle poll still opened and migrated state.db
+    # and left a cron session behind for work that never happened.
+    #
+    # The script runs exactly once: its result is threaded into
+    # _build_job_prompt below via ``prerun_script``.
+    # ---------------------------------------------------------------
+    prerun_script = None
+    script_path = job.get("script")
+    if script_path:
+        # Claim-heartbeat wrapper resolves the per-job
+        # script_timeout_seconds override internally.
+        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
+        _ran_ok, _script_output = prerun_script
+        if _ran_ok and not _parse_wake_gate(_script_output):
+            logger.info(
+                "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
+                job_name, job_id,
+            )
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                "Script gate returned `wakeAgent=false` — agent skipped.\n"
+            )
+            _finish_cron_activity(
+                _activity_recorder,
+                process="no_work",
+                evidence_refs=(_ACTIVITY_EVIDENCE["wake_gate_false"],),
+            )
+            return True, silent_doc, SILENT_MARKER, None
+
+    # ---------------------------------------------------------------
     # Default (LLM) path — import and construct the agent machinery now
-    # that we know we actually need it. Doing these imports here instead of
-    # at module top keeps no_agent ticks from paying for AIAgent / SessionDB
-    # construction costs.
+    # that the gate has confirmed there is semantic work to do. Doing these
+    # imports here instead of at module top keeps no_agent and no-work ticks
+    # from paying for AIAgent / SessionDB construction costs.
     # ---------------------------------------------------------------
     from run_agent import AIAgent
 
@@ -4301,35 +4336,6 @@ def _run_job_impl(
         )
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
-
-    # Wake-gate: if this job has a pre-check script, run it BEFORE building
-    # the prompt so a ``{"wakeAgent": false}`` response can short-circuit
-    # the whole agent run. We pass the result into _build_job_prompt so
-    # the script is only executed once.
-    prerun_script = None
-    script_path = job.get("script")
-    if script_path:
-        # Claim-heartbeat wrapper resolves the per-job
-        # script_timeout_seconds override internally.
-        prerun_script = _run_job_script_with_claim_heartbeat(job, script_path)
-        _ran_ok, _script_output = prerun_script
-        if _ran_ok and not _parse_wake_gate(_script_output):
-            logger.info(
-                "Job '%s' (ID: %s): wakeAgent=false, skipping agent run",
-                job_name, job_id,
-            )
-            silent_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-                "Script gate returned `wakeAgent=false` — agent skipped.\n"
-            )
-            _finish_cron_activity(
-                _activity_recorder,
-                process="no_work",
-                evidence_refs=(_ACTIVITY_EVIDENCE["wake_gate_false"],),
-            )
-            return True, silent_doc, SILENT_MARKER, None
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
