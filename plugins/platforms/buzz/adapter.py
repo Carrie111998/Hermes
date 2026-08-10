@@ -638,7 +638,7 @@ class BuzzAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
         reply_target = reply_to or (metadata or {}).get("thread_id")
-        mention_pubkey = "" 
+        mention_pubkey = ""
         if reply_target:
             args += ["--reply-to", str(reply_target)]
             # Thread replies stay in the thread (e-tag anchor above) but must
