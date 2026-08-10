@@ -110,7 +110,7 @@ async def _dispatch(runner, event):
 
 @pytest.mark.asyncio
 async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
-    """Arbitrary prose during a pending button-clarify continues as a normal turn."""
+    """Arbitrary prose is queued once while the pending choice stays armed."""
     _clear_clarify_state()
     from tools import clarify_gateway as cm
 
@@ -120,16 +120,19 @@ async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
     entry = cm.register("cl-native", SESSION_KEY, "Pick a UI variant", ["buttons", "dropdown"])
     assert entry.awaiting_text is False
 
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(runner, _event("just checking the visual UI, no need to pass any data"))
+    event = _event("just checking the visual UI, no need to pass any data")
+    result = await _dispatch(runner, event)
 
-    # The prose is not accepted as the answer, but the clarify must be
-    # released before normal busy routing so redirect-to-steer can drain.
     with cm._lock:
         entry = cm._entries.get("cl-native")
     assert entry is not None
-    assert entry.event.is_set()
-    assert entry.response == ""
+    assert not entry.event.is_set()
+    assert entry.response is None
+    assert result
+    assert "saved" in result.lower()
+    assert "1. buttons" in result
+    assert "2. dropdown" in result
+    assert adapter._pending_messages == {SESSION_KEY: event}
     _clear_clarify_state()
 
 
@@ -214,8 +217,8 @@ async def test_native_multi_select_bad_comma_list_keeps_clarify_pending():
 
 
 @pytest.mark.asyncio
-async def test_native_multi_select_prose_releases_clarify_before_routing():
-    """Free prose on multi-select still breaks the redirect/steer deadlock."""
+async def test_native_multi_select_prose_queues_without_releasing_clarify():
+    """Free prose queues once while a multi-select prompt remains retryable."""
     _clear_clarify_state()
     from tools import clarify_gateway as cm
 
@@ -229,17 +232,19 @@ async def test_native_multi_select_prose_releases_clarify_before_routing():
         multi_select=True,
     )
 
-    with pytest.raises(_FellThroughIntercept):
-        await _dispatch(
-            runner,
-            _event("just checking the visual UI, no need to pass any data"),
-        )
+    event = _event("just checking the visual UI, no need to pass any data")
+    result = await _dispatch(runner, event)
 
     with cm._lock:
         entry = cm._entries.get("cl-ms-prose")
     assert entry is not None
-    assert entry.event.is_set()
-    assert entry.response == ""
+    assert not entry.event.is_set()
+    assert entry.response is None
+    assert result
+    assert "saved" in result.lower()
+    assert "1. staging" in result
+    assert "2. prod" in result
+    assert adapter._pending_messages == {SESSION_KEY: event}
     _clear_clarify_state()
 
 
@@ -264,3 +269,24 @@ async def test_prose_still_accepted_after_other_flips_text_capture():
     assert entry.response == "a carousel actually"
     _clear_clarify_state()
 
+
+@pytest.mark.asyncio
+async def test_prose_reports_queue_full_without_claiming_it_was_saved():
+    """A dropped follow-up must not be reported as preserved."""
+    _clear_clarify_state()
+    from tools import clarify_gateway as cm
+
+    adapter = _StubAdapter()
+    runner = _make_runner(adapter)
+    runner._queue_or_replace_pending_event = lambda _key, _event: False
+    entry = cm.register("cl-queue-full", SESSION_KEY, "Pick one", ["a", "b"])
+
+    result = await _dispatch(runner, _event("save this for later"))
+
+    assert not entry.event.is_set()
+    assert entry.response is None
+    assert result
+    assert "couldn't save" in result.lower()
+    assert "send that message again" in result.lower()
+    assert adapter._pending_messages == {}
+    _clear_clarify_state()

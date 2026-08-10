@@ -8863,10 +8863,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # still small enough to never threaten memory.
     _BUSY_QUEUE_MAX_PENDING = 32
 
-    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
+    def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> bool:
         adapter = self._adapter_for_source(event.source)
         if not adapter:
-            return
+            return False
         # #28503 — Previously this called ``merge_pending_message_event``
         # with the default ``merge_text=False``, which silently OVERWROTE
         # the single pending slot when consecutive text messages arrived
@@ -8890,7 +8890,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
-            return
+            return True
 
         if self._queue_depth(session_key, adapter=adapter) >= self._BUSY_QUEUE_MAX_PENDING:
             logger.warning(
@@ -8898,9 +8898,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
                 self._BUSY_QUEUE_MAX_PENDING,
             )
-            return
+            return False
 
         self._enqueue_fifo(session_key, event, adapter)
+        return True
 
     async def _prepare_busy_steer_text(self, event: MessageEvent) -> str:
         """Return steerable text for a busy follow-up, transcribing voice first.
@@ -15047,15 +15048,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     return ""
                 if _text_outcome == _clarify_mod.TEXT_REJECTED_PROSE:
-                    # Native-choice prompts deliberately reject unmatched
-                    # prose so it can continue through normal busy-message
-                    # routing. Release this clarify first: redirect()
-                    # degrades to steer() while tools are executing, and
-                    # that steer cannot drain until the clarify tool returns.
-                    _clarify_mod.resolve_gateway_clarify(
-                        _pending_clarify.clarify_id,
-                        "",
-                    )
+                    # Preserve unmatched prose as the next turn instead of
+                    # cancelling this native-choice clarify or routing the
+                    # prose into redirect→steer while the agent is blocked on
+                    # the clarify tool. The adapter sends this non-empty
+                    # guidance immediately; after a valid choice unblocks the
+                    # current turn, the normal FIFO drain handles the prose.
+                    _clarify_adapter = self._adapter_for_source(source)
+                    if _clarify_adapter is not None:
+                        _queued = self._queue_or_replace_pending_event(_quick_key, event)
+                        _choice_lines = "\n".join(
+                            f"{index}. {choice}"
+                            for index, choice in enumerate(
+                                _pending_clarify.choices,
+                                start=1,
+                            )
+                        )
+                        if not _queued:
+                            logger.warning(
+                                "Gateway could not preserve non-choice clarify reply "
+                                "(session=%s, id=%s)",
+                                _quick_key,
+                                _pending_clarify.clarify_id,
+                            )
+                            return (
+                                "I couldn't save that message because the pending queue "
+                                "is full. Please answer the current question first:\n"
+                                f"{_choice_lines}\n"
+                                "Then send that message again."
+                            )
+                        logger.info(
+                            "Gateway preserved non-choice clarify reply for the next turn "
+                            "(session=%s, id=%s)",
+                            _quick_key,
+                            _pending_clarify.clarify_id,
+                        )
+                        return (
+                            "I saved that message for the next turn. "
+                            "Please answer the current question first:\n"
+                            f"{_choice_lines}\n"
+                            "Reply with a number or the exact option text, or choose "
+                            "Other to enter a custom answer."
+                        )
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are

@@ -194,7 +194,7 @@ def get_pending_for_session(
         ids = _session_index.get(session_key) or []
         for cid in ids:
             entry = _entries.get(cid)
-            if entry is None:
+            if entry is None or entry.event.is_set():
                 continue
             if include_choice_prompts or entry.awaiting_text:
                 return entry
