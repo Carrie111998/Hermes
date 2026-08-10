@@ -409,3 +409,109 @@ async def test_4401_after_handshake_is_terminal_no_reconnect():
         await srv.stop()
 
 
+# ── one raising frame must not take the rest of its chunk with it ────────────
+
+
+@pytest.mark.asyncio
+async def test_raising_frame_does_not_discard_the_rest_of_its_chunk(caplog):
+    """A frame whose handler raises must not drop the frames batched behind it.
+
+    Relay frames are newline-delimited and several of them can ride a SINGLE
+    WebSocket message, so the read loop splits one chunk into N frames and
+    dispatches them in a row. Dispatching them unguarded made the first raising
+    frame end the ``async for`` outright: the socket was dropped, every frame
+    already parsed behind the failing one was discarded, and ``buf`` had already
+    been reassigned so the trailing partial frame went with them.
+
+    The cost lands on a caller that had nothing to do with the bad frame. An
+    ``outbound_result`` batched behind a poisoned ``inbound`` never reaches
+    ``_pending``, so the future ``send_outbound`` is awaiting gets settled by the
+    connection-lost path instead of by its own result — one bad inbound frame
+    fails an unrelated outbound send.
+    """
+
+    async def handler(ws):
+        async for raw in ws:
+            for line in str(raw).split("\n"):
+                if not line.strip():
+                    continue
+                frame = json.loads(line)
+                if frame.get("type") == "hello":
+                    await ws.send(
+                        json.dumps({"type": "descriptor", "descriptor": DESCRIPTOR}) + "\n"
+                    )
+                elif frame.get("type") == "outbound":
+                    # ONE WebSocket message carrying TWO frames: a poisoned
+                    # inbound, then the result the caller is blocked on.
+                    poisoned = {
+                        "type": "inbound",
+                        "event": {
+                            "text": "boom",
+                            "message_type": "text",
+                            "source": {
+                                "platform": "discord",
+                                "chat_id": "c1",
+                                "chat_type": "group",
+                                "scope_id": "guildA",
+                            },
+                        },
+                    }
+                    answer = {
+                        "type": "outbound_result",
+                        "requestId": frame["requestId"],
+                        "result": {"success": True, "message_id": "srv-send"},
+                    }
+                    await ws.send(json.dumps(poisoned) + "\n" + json.dumps(answer) + "\n")
+
+    async def raising_inbound(_event):
+        raise RuntimeError("inbound handler blew up")
+
+    srv, url = await _serve(handler)
+    t = WebSocketRelayTransport(url, "discord", "appShared", outbound_timeout_s=4.0)
+    t.set_inbound_handler(raising_inbound)
+    caplog.set_level(logging.WARNING, logger="gateway.relay.ws_transport")
+    try:
+        await t.connect()
+        await t.handshake()
+        result = await t.send_outbound({"op": "send", "chat_id": "c1", "content": "hi"})
+        # The result shared its chunk with the frame that raised, so this is the
+        # assertion that matters: it was still dispatched.
+        assert result == {"success": True, "message_id": "srv-send"}
+        # And the loop skipped one frame rather than ending: the socket is still
+        # live, so the reconnect supervisor was never needed.
+        assert t._ws is not None
+        assert t._reader is not None and not t._reader.done()
+        assert t._supervisor is None
+        # The skip is loud — a handler that raises is still a defect to chase.
+        assert any(
+            r.exc_info and r.exc_info[0] is RuntimeError for r in caplog.records
+        ), "the skipped frame's traceback must be recorded"
+    finally:
+        await t.disconnect()
+        srv.close()
+        await srv.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_non_object_frame_is_skipped_like_an_undecodable_one(caplog):
+    """A frame that is valid JSON but not an OBJECT is skipped, not raised on.
+
+    ``_handle_frame`` opens by guarding the decode precisely so a bad frame from
+    the connector is skipped rather than fatal. ``json.loads`` succeeds on a bare
+    array/string/number/null, though, so those walked past that guard into
+    ``frame.get("type")`` and raised ``AttributeError`` out of the one function
+    whose stated contract is that a bad frame cannot do that.
+    """
+    t = WebSocketRelayTransport("ws://127.0.0.1:1", "discord", "appShared")
+    caplog.set_level(logging.WARNING, logger="gateway.relay.ws_transport")
+
+    # Valid JSON, no object: nothing this protocol has a reading for.
+    for line in ("[]", '["descriptor"]', '"descriptor"', "3", "null"):
+        await t._handle_frame(line)
+
+    assert caplog.text.count("skipping malformed frame") == 5
+    # Nothing was mistaken for a real frame.
+    assert t._descriptor is None
+    assert t._descriptors_by_platform == {}
+
+
