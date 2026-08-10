@@ -981,6 +981,58 @@ class TestInstallLoadSmoke:
         assert f"{module_name}._helper" not in sys.modules
 
 
+class TestStubContextPublicMembers:
+    """The smoke-test stub must satisfy the real PluginContext public surface
+    a valid plugin may touch at register() time, so it never emits a false
+    "load check failed" warning.
+
+    Regression guard for review C2 on hermes-agent#73243: the real
+    ``PluginContext`` exposes public non-register_ members (``llm``,
+    ``subagent_lifecycle``, ``profile_name``, ``inject_message``,
+    ``dispatch_tool``, ``config``) in addition to the ``register_*`` methods.
+    A stub that raised ``AttributeError`` on those would falsely warn on a
+    valid plugin that reads them. The permissive stub no-ops them.
+    """
+
+    def test_plugin_using_public_members_loads_without_false_warning(
+        self, tmp_path
+    ):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        d = tmp_path / "public_members_plugin"
+        d.mkdir()
+        (d / "plugin.yaml").write_text("name: public-members-plugin\nversion: 1.0.0\n")
+        # Exercise every non-register_ public member the real context exposes,
+        # plus a register_* call. Only a genuine error should return non-None.
+        (d / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    _ = ctx.llm\n"
+            "    _ = ctx.subagent_lifecycle\n"
+            "    _ = ctx.profile_name\n"
+            "    _ = ctx.inject_message('hi')\n"
+            "    _ = ctx.dispatch_tool('t', {})\n"
+            "    _ = ctx.config\n"
+            "    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_unknown_member_still_raises(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        d = tmp_path / "unknown_member_plugin"
+        d.mkdir()
+        (d / "plugin.yaml").write_text("name: unknown-member-plugin\nversion: 1.0.0\n")
+        (d / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    ctx.this_is_not_a_real_context_method()\n"
+        )
+        # A genuinely unknown member must still surface as a load failure so
+        # real breakage is not silently swallowed.
+        err = _smoke_test_plugin_load(d)
+        assert err is not None
+        assert "register() raised" in err
+
+
 class TestCmdInstallConsentGating:
     """The load smoke test must NOT execute plugin code before the user
     affirmatively opts in to enabling the plugin.

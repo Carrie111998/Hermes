@@ -293,23 +293,40 @@ class _StubPluginContext:
 
     The real ``PluginContext`` exposes ~18 ``register_*`` methods (tool, hook,
     command, middleware, web_search_provider, platform, secret_source, …) plus
-    attributes like ``manifest``/``config``/``logger``. Rather than hand-mirror
-    that surface (which silently breaks whenever plugins.py gains a registrar),
-    this stub returns a no-op for any ``register_*`` access and a few other
-    well-known attributes, and raises ``AttributeError`` for anything else.
-    That lets a valid provider/platform/secret-source plugin run ``register()``
-    without mutating the live tool registry.
+    a handful of public attributes/methods used by plugins at ``register()``
+    time: ``llm``, ``subagent_lifecycle``, ``profile_name`` (properties),
+    ``inject_message``, ``dispatch_tool``, ``config`` (mapping access), and
+    ``get_config``/``get_secret`` helpers, plus ``logger``. Rather than
+    hand-mirror the full surface (which silently breaks whenever plugins.py
+    gains a registrar), this stub returns a no-op for any ``register_*`` access
+    and for the known non-register_ members above, and raises ``AttributeError``
+    only for anything genuinely unexpected. That lets a valid provider/platform/
+    secret-source plugin run ``register()`` without mutating the live tool
+    registry or tripping a false "load check failed" warning.
     """
+
+    # Real PluginContext public members a plugin may legitimately touch during
+    # register(); the stub answers each with a non-mutating no-op so the smoke
+    # test never emits a false warning on a valid plugin.
+    _NOOP_MEMBERS = {
+        "llm",
+        "subagent_lifecycle",
+        "profile_name",
+        "inject_message",
+        "dispatch_tool",
+        "config",
+        "get_config",
+        "get_secret",
+        "logger",
+    }
 
     def __init__(self, name: str):
         self.manifest = {"name": name}
 
     def __getattr__(self, attr: str):
-        if attr.startswith("register_") or attr in {
-            "get_config",
-            "get_secret",
-            "logger",
-        }:
+        if attr.startswith("register_") or attr in self._NOOP_MEMBERS:
+            # Properties on the real context return values; a None-returning
+            # no-op is the safe permissive answer for a throwaway smoke context.
             return lambda *a, **k: None
         raise AttributeError(attr)
 
