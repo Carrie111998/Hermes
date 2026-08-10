@@ -903,6 +903,10 @@ _CODEX_SCAN_STAGES = frozenset({
 _CODEX_STDERR_TAIL_LINES = 12
 _CODEX_DIAGNOSTIC_MAX_LINES = 8
 _CODEX_DIAGNOSTIC_MAX_CHARS = 2048
+_WINDOWS_TERMINAL_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]+|[\\/]{2}(?:\?[\\/]+(?:UNC[\\/]+)?|[^\\/\s]+[\\/]+))"
+    r"[^\r\n'\"<>|]*$"
+)
 _PATH_FRAGMENT_RE = re.compile(
     r"(?:[A-Za-z]:[\\/]|/|(?:\.{1,2}|~)[\\/]|\b[^\s'\"<>|\\/]+[\\/])"
     r"(?:[^\s'\"<>|\\/]+[\\/])*[^\s'\"<>|]*"
@@ -5073,6 +5077,7 @@ def _redacted_codex_diagnostic_text(value: object) -> str:
     if not isinstance(value, str):
         return ""
     redacted = redact_sensitive_text(value, force=True, redact_url_credentials=True)
+    redacted = _WINDOWS_TERMINAL_PATH_RE.sub("[REDACTED_PATH]", redacted)
     redacted = _PATH_FRAGMENT_RE.sub("[REDACTED_PATH]", redacted)
     return redacted[:_CODEX_DIAGNOSTIC_MAX_CHARS]
 

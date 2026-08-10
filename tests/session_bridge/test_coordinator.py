@@ -1649,6 +1649,10 @@ def test_codex_scan_stderr_diagnostics_are_bounded_and_redact_relative_paths() -
         r"\\server\\private share\\Codex Logs\\thread.jsonl",
         r"\\?\\C:\\Users\\Private Owner\\Codex Logs\\thread.jsonl",
         r"\\?\\UNC\\server\\private share\\Codex Logs\\thread.jsonl",
+        r"C:\\Users\\Private Owner",
+        r"\\server\\private share",
+        r"\\?\\C:\\Users\\Private Owner",
+        r"\\?\\UNC\\server\\private share",
     ),
 )
 def test_codex_scan_diagnostic_redacts_windows_path_forms(native_path: str) -> None:
@@ -1660,6 +1664,33 @@ def test_codex_scan_diagnostic_redacts_windows_path_forms(native_path: str) -> N
     assert "Private Owner" not in result
     assert "private share" not in result
     assert "[REDACTED_PATH]" in result
+
+
+@pytest.mark.parametrize(
+    "native_path",
+    (
+        r"C:\\Users\\Private Owner",
+        r"\\server\\private share",
+        r"\\?\\C:\\Users\\Private Owner",
+        r"\\?\\UNC\\server\\private share",
+    ),
+)
+def test_codex_scan_diagnostic_redacts_entire_terminal_windows_path(
+    native_path: str,
+) -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    assert _redacted_codex_diagnostic_text(f"failed at {native_path}") == (
+        "failed at [REDACTED_PATH]"
+    )
+
+
+def test_codex_scan_diagnostic_does_not_over_redact_ordinary_prose() -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    prose = "Private Owner reviewed the failure after retry"
+
+    assert _redacted_codex_diagnostic_text(prose) == prose
 
 
 @pytest.mark.asyncio
