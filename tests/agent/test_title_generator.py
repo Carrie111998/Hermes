@@ -425,6 +425,52 @@ class TestImageEnvelopeStripping:
         )
         assert _strip_image_envelope(msg) == "Fix the login flow"
 
+    def test_strips_envelope_when_description_contains_brackets(self):
+        # The vision model echoes code/text that may contain ']' (e.g.
+        # ``array[0] = 1``). The envelope must strip to its real closing
+        # bracket, not stop at the first ']' inside the description
+        # (#82339 follow-up from triage review).
+        msg = (
+            "[The user attached an image:\n"
+            "A screenshot of code: array[0] = 1\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "Fix the bug"
+        )
+        assert _strip_image_envelope(msg) == "Fix the bug"
+
+    def test_strips_envelope_with_multiple_bracketed_tokens(self):
+        msg = (
+            "[The user attached an image:\n"
+            "code: a[1], b[2], c[3]\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "Fix it"
+        )
+        assert _strip_image_envelope(msg) == "Fix it"
+
+    def test_strips_cli_envelope_when_description_contains_brackets(self):
+        msg = (
+            "[The user attached an image. Here's what it contains:\n"
+            "a struct with fields f[0], f[1]\n"
+            "]\n"
+            "[If you need a closer look, use vision_analyze with image_url: /tmp/x.png]\n"
+            "Rime 候选词排序问题"
+        )
+        assert _strip_image_envelope(msg) == "Rime 候选词排序问题"
+
+    def test_derive_title_not_poisoned_by_envelope_with_brackets(self):
+        from agent.title_generator import derive_title
+
+        enriched = (
+            "[The user attached an image:\n"
+            "array[0] = 1\n"
+            "]\n"
+            "[You can examine it with vision_analyze using image_url: /tmp/x.png]\n"
+            "Fix the indexing bug"
+        )
+        assert derive_title(enriched) == "Fix the indexing bug"
+
     def test_keeps_user_text_that_mentions_images_mid_sentence(self):
         # A user who literally types about an image (not an enrichment envelope
         # at the start of the message) must keep their text.

@@ -157,9 +157,15 @@ _MACHINE_PREFIXES = (
 #   cli.py:                 "[The user attached an image. Here's what it
 #                            contains:\n<desc>]\n[hint]"
 # Failure variants ("...but analysis failed.") are matched by the same rule.
+# The description body may itself contain brackets (the vision model echoes
+# code like ``array[0] = 1``), so the body is matched as a mix of non-bracket
+# chars and ``[xxx]`` atomic blocks — the closing ``]`` terminates the
+# envelope, not the first ``]`` inside the description (2026-08-10 #82339
+# follow-up from triage review).
 _IMAGE_ENVELOPE_RE = re.compile(
-    r"\[\s*The user attached an image[^\]]*\]"
-    r"(?:\s*\[[^\]]*\])?",
+    r"\[\s*The user attached an image"
+    r"(?:[^\[\]]|\[[^\]\n]*\])*\]"
+    r"(?:\s*\[[^\]\n]*\])?",
     re.DOTALL,
 )
 
