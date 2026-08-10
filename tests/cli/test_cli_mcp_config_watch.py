@@ -31,6 +31,15 @@ def _make_cli(tmp_path, mcp_servers=None, extra_config=None):
 
 class TestMCPConfigWatch:
 
+    def test_reload_merge_preserves_exact_toolset(self):
+        from cli import _merge_reload_mcp_toolsets
+
+        result = _merge_reload_mcp_toolsets(
+            ["restricted-command", "terminal"],
+            {"github", "playwright"},
+        )
+        assert result == ["restricted-command"]
+
 
 
     def test_new_mcp_server_triggers_reload(self, tmp_path):

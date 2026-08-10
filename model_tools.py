@@ -364,6 +364,56 @@ def get_tool_definitions(
     return result
 
 
+def resolve_disabled_tool_names(
+    disabled_toolsets: Optional[List[str]],
+    *,
+    quiet_mode: bool = True,
+) -> set[str]:
+    """Resolve denials with the same shared-core preservation as runtime."""
+    tools_to_remove: set[str] = set()
+    for toolset_name in disabled_toolsets or []:
+        if validate_toolset(toolset_name):
+            from toolsets import bundle_non_core_tools, get_toolset
+            if toolset_name.startswith("hermes-") or (
+                get_toolset(toolset_name) or {}
+            ).get("posture"):
+                resolved = sorted(bundle_non_core_tools(toolset_name))
+                if (
+                    not quiet_mode
+                    and toolset_name.startswith("hermes-")
+                    and toolset_name not in _WARNED_DISABLED_BUNDLES
+                ):
+                    _WARNED_DISABLED_BUNDLES.add(toolset_name)
+                    logger.info(
+                        "agent.disabled_toolsets contains platform-bundle "
+                        "name '%s'; core tools are preserved and only its "
+                        "platform-specific tools (%s) are removed. Bundle "
+                        "names usually belong in `toolsets:`, not "
+                        "`disabled_toolsets` (#33924).",
+                        toolset_name,
+                        ", ".join(resolved) if resolved else "none",
+                    )
+            else:
+                resolved = resolve_toolset(toolset_name)
+            tools_to_remove.update(resolved)
+            if not quiet_mode:
+                print(
+                    f"🚫 Disabled toolset '{toolset_name}': "
+                    f"{', '.join(resolved) if resolved else 'no tools'}"
+                )
+        elif toolset_name in _LEGACY_TOOLSET_MAP:
+            legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
+            tools_to_remove.update(legacy_tools)
+            if not quiet_mode:
+                print(
+                    f"🚫 Disabled legacy toolset '{toolset_name}': "
+                    f"{', '.join(legacy_tools)}"
+                )
+        elif not quiet_mode:
+            print(f"⚠️  Unknown toolset: {toolset_name}")
+    return tools_to_remove
+
+
 def _compute_tool_definitions(
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
@@ -375,11 +425,21 @@ def _compute_tool_definitions(
     tools_to_include: set = set()
 
     if enabled_toolsets is not None:
-        effective_enabled_toolsets = list(enabled_toolsets)
+        from toolsets import (
+            authoritative_toolset_selection,
+            has_exact_toolset_selection,
+        )
+        effective_enabled_toolsets = authoritative_toolset_selection(
+            list(enabled_toolsets)
+        )
+        has_exact_toolset = has_exact_toolset_selection(
+            effective_enabled_toolsets
+        )
         if (
             os.environ.get("HERMES_KANBAN_TASK")
             and not _is_delegated_child_context()
             and "kanban" not in effective_enabled_toolsets
+            and not has_exact_toolset
         ):
             # Dispatcher-spawned workers are scoped by HERMES_KANBAN_TASK and
             # must always receive the lifecycle handoff tools. Assignee
@@ -411,43 +471,12 @@ def _compute_tool_definitions(
     # is enabled, any tools belonging to a disabled toolset are strictly
     # stripped out. See issue #17309.
     if disabled_toolsets:
-        for toolset_name in disabled_toolsets:
-            if validate_toolset(toolset_name):
-                from toolsets import bundle_non_core_tools, get_toolset
-                if toolset_name.startswith("hermes-") or (get_toolset(toolset_name) or {}).get("posture"):
-                    # Platform bundles (hermes-*) include _HERMES_CORE_TOOLS, and
-                    # posture toolsets (`posture: True`, e.g. `coding`) re-list
-                    # those same core tools without owning them, so subtracting
-                    # the whole toolset would strip core tools shared by other
-                    # enabled toolsets and empty the tool list (#33924, #57315).
-                    # Subtract only the non-core delta; keep core.
-                    to_remove = bundle_non_core_tools(toolset_name)
-                    tools_to_include.difference_update(to_remove)
-                    resolved = sorted(to_remove)
-                    if (not quiet_mode and toolset_name.startswith("hermes-")
-                            and toolset_name not in _WARNED_DISABLED_BUNDLES):
-                        _WARNED_DISABLED_BUNDLES.add(toolset_name)
-                        logger.info(
-                            "agent.disabled_toolsets contains platform-bundle "
-                            "name '%s'; core tools are preserved and only its "
-                            "platform-specific tools (%s) are removed. Bundle "
-                            "names usually belong in `toolsets:`, not "
-                            "`disabled_toolsets` (#33924).",
-                            toolset_name,
-                            ", ".join(resolved) if resolved else "none",
-                        )
-                else:
-                    resolved = resolve_toolset(toolset_name)
-                    tools_to_include.difference_update(resolved)
-                if not quiet_mode:
-                    print(f"🚫 Disabled toolset '{toolset_name}': {', '.join(resolved) if resolved else 'no tools'}")
-            elif toolset_name in _LEGACY_TOOLSET_MAP:
-                legacy_tools = _LEGACY_TOOLSET_MAP[toolset_name]
-                tools_to_include.difference_update(legacy_tools)
-                if not quiet_mode:
-                    print(f"🚫 Disabled legacy toolset '{toolset_name}': {', '.join(legacy_tools)}")
-            elif not quiet_mode:
-                print(f"⚠️  Unknown toolset: {toolset_name}")
+        tools_to_include.difference_update(
+            resolve_disabled_tool_names(
+                disabled_toolsets,
+                quiet_mode=quiet_mode,
+            )
+        )
 
     # Plugin-registered tools are now resolved through the normal toolset
     # path — validate_toolset() / resolve_toolset() / get_all_toolsets()

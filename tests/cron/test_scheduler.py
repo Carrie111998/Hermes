@@ -47,6 +47,12 @@ class TestPerJobToolsetMcpMerge:
         assert result == ["web"]
         assert not (set(result) & self._enabled_names())
 
+    def test_exact_toolset_blocks_mcp_merge(self):
+        result = _merge_mcp_into_per_job_toolsets(
+            ["restricted-command", "web"], self.CFG
+        )
+        assert result == ["restricted-command"]
+
 
     def test_resolver_empty_per_job_falls_through_to_platform(self):
         # No per-job list -> must delegate to _get_platform_tools (the platform

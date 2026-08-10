@@ -812,7 +812,14 @@ def init_agent(
     agent.provider_data_collection = provider_data_collection
     agent.openrouter_min_coding_score = openrouter_min_coding_score
 
-    # Store toolset filtering options
+    # Store the authoritative toolset selection, not a mixed caller input.
+    # Exact composites must remain authority boundaries for later refresh and
+    # delegated-child narrowing paths as well as initial schema assembly.
+    if enabled_toolsets is not None:
+        from toolsets import authoritative_toolset_selection
+        enabled_toolsets = authoritative_toolset_selection(
+            list(enabled_toolsets)
+        )
     agent.enabled_toolsets = enabled_toolsets
     agent.disabled_toolsets = disabled_toolsets
     

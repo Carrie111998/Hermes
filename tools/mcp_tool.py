@@ -6367,11 +6367,15 @@ def refresh_agent_mcp_tools(
     if enabled_override is not None or disabled_override is not None:
         enabled = enabled_override if enabled_override is not None else getattr(agent, "enabled_toolsets", None)
         disabled = disabled_override if disabled_override is not None else getattr(agent, "disabled_toolsets", None)
-        agent.enabled_toolsets = enabled
-        agent.disabled_toolsets = disabled
     else:
         enabled = getattr(agent, "enabled_toolsets", None)
         disabled = getattr(agent, "disabled_toolsets", None)
+
+    if enabled is not None:
+        from toolsets import authoritative_toolset_selection
+        enabled = authoritative_toolset_selection(list(enabled))
+    agent.enabled_toolsets = enabled
+    agent.disabled_toolsets = disabled
 
     # Capture the registry generation this rebuild is derived from BEFORE the
     # (potentially slow) get_tool_definitions call. Used at publish time to

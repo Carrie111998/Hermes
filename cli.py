@@ -4191,6 +4191,23 @@ class _VoiceInputMessage:
         return self.text
 
 
+def _merge_reload_mcp_toolsets(enabled_toolsets, connected_servers):
+    """Return the safe enabled-toolset override for an MCP reload."""
+    if not enabled_toolsets or "all" in enabled_toolsets or "*" in enabled_toolsets:
+        return None
+    from toolsets import (
+        authoritative_toolset_selection,
+        has_exact_toolset_selection,
+    )
+    merged = authoritative_toolset_selection(list(enabled_toolsets))
+    if has_exact_toolset_selection(merged):
+        return merged
+    for name in sorted(connected_servers):
+        if name not in merged:
+            merged.append(name)
+    return merged
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -11483,14 +11500,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # user pinned `all`/`*`, which already includes everything) so a
                 # freshly-added server isn't filtered out. Mirrors startup, where
                 # MCP server names are part of enabled_toolsets (see __init__).
-                enabled_override = None
                 et = self.enabled_toolsets
-                if et and "all" not in et and "*" not in et:
-                    merged = list(et)
-                    for _name in sorted(connected_servers):
-                        if _name not in merged:
-                            merged.append(_name)
-                    enabled_override = merged
+                enabled_override = _merge_reload_mcp_toolsets(
+                    et, connected_servers
+                )
                 refresh_agent_mcp_tools(
                     self.agent,
                     enabled_override=enabled_override,

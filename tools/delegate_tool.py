@@ -679,6 +679,12 @@ def _expand_parent_toolsets(parent_toolsets: set) -> set:
     the names of any individual toolsets whose tools are a *subset* of the
     parent's available tools.  The original parent toolset names are preserved.
     """
+    # Exact composites are authority boundaries, not convenience bundles.
+    # Expanding one into ordinary category names would let a narrowed child
+    # replace the exact surface with a registry-widenable category.
+    if any(bool((TOOLSETS.get(name) or {}).get("exact")) for name in parent_toolsets):
+        return set(parent_toolsets)
+
     parent_tool_names: set = set()
     for ts_name in parent_toolsets:
         ts_def = TOOLSETS.get(ts_name)
@@ -1294,9 +1300,13 @@ def _build_child_agent(
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
         inherited_disabled = []
-    if effective_role == "orchestrator":
+    from toolsets import has_exact_toolset_selection
+    parent_selection = sorted(parent_toolsets)
+    parent_has_exact_boundary = has_exact_toolset_selection(parent_selection)
+    if effective_role == "orchestrator" and not parent_has_exact_boundary:
         # Role grants delegate_task explicitly, matching the unconditional
-        # delegation toolset re-add below.
+        # ordinary delegation toolset re-add below. Exact parents retain every
+        # inherited denial so a child cannot exceed the parent's runtime set.
         inherited_disabled = [
             name for name in inherited_disabled if name != "delegation"
         ]
@@ -1306,12 +1316,18 @@ def _build_child_agent(
         )
     )
 
-    # Orchestrators retain the 'delegation' toolset that _strip_blocked_tools
-    # removed.  The re-add is unconditional on parent-toolset membership because
-    # orchestrator capability is granted by role, not inherited — see the
-    # test_intersection_preserves_delegation_bound test for the design rationale.
-    if effective_role == "orchestrator" and "delegation" not in child_toolsets:
-        child_toolsets.append("delegation")
+    # Ordinary orchestrators retain the 'delegation' toolset that
+    # _strip_blocked_tools removed. Exact parents already carry delegate_task
+    # inside their authored boundary, so preserve that exact selection instead
+    # of converting the child to registry-widenable ordinary delegation.
+    if effective_role == "orchestrator":
+        from toolsets import authoritative_toolset_selection
+        if parent_has_exact_boundary:
+            child_toolsets = authoritative_toolset_selection(parent_selection)
+        elif "delegation" not in child_toolsets:
+            # For ordinary parents, orchestrator capability remains role-granted
+            # rather than inherited; preserve the historical behavior.
+            child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
     child_prompt = _build_child_system_prompt(

@@ -2222,6 +2222,20 @@ def _get_platform_tools(
     # Normalise to str so downstream sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
 
+    # An explicitly selected exact toolset is an authored allowlist, so it is
+    # authoritative for the platform. Fail closed on mixed configuration by
+    # ignoring ordinary categories, recently shipped toolsets, plugins, and
+    # default MCP servers rather than allowing any of them to widen the agent
+    # schema. Multiple exact toolsets may be intentionally unioned.
+    exact_toolsets = {
+        ts for ts in toolset_names
+        if bool((TOOLSETS.get(ts) or {}).get("exact"))
+    }
+    if exact_toolsets:
+        agent_cfg = config.get("agent") or {}
+        disabled = {str(ts) for ts in (agent_cfg.get("disabled_toolsets") or [])}
+        return exact_toolsets - disabled
+
     configurable_keys = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
     plugin_ts_keys = _get_plugin_toolset_keys()
     platform_default_keys = {p["default_toolset"] for p in PLATFORMS.values()}

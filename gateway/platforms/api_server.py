@@ -1165,6 +1165,17 @@ class _ProviderAuthResolutionError(RuntimeError):
     """
 
 
+def _configured_disabled_toolsets(config: Dict[str, Any]) -> List[str]:
+    """Return validated global toolset denials for API runtime and attestation."""
+    agent_config = config.get("agent")
+    if not isinstance(agent_config, dict):
+        return []
+    raw = agent_config.get("disabled_toolsets")
+    if not isinstance(raw, (list, tuple, set)):
+        return []
+    return list(dict.fromkeys(str(name) for name in raw if str(name)))
+
+
 class APIServerAdapter(BasePlatformAdapter):
     """
     OpenAI-compatible HTTP API server adapter.
@@ -2633,6 +2644,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
+        disabled_toolsets = _configured_disabled_toolsets(user_config)
 
         max_iterations = _current_max_iterations()
 
@@ -2653,6 +2665,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "verbose_logging": False,
             "ephemeral_system_prompt": ephemeral_system_prompt or None,
             "enabled_toolsets": enabled_toolsets,
+            "disabled_toolsets": disabled_toolsets,
             "session_id": session_id,
             "platform": "api_server",
             "stream_delta_callback": stream_delta_callback,
@@ -2990,7 +3003,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 _get_platform_tools,
                 _toolset_has_keys,
             )
-            from toolsets import resolve_toolset
+            from toolsets import get_toolset, resolve_toolset
 
             config = load_config()
             enabled_toolsets = _get_platform_tools(
@@ -2998,13 +3011,52 @@ class APIServerAdapter(BasePlatformAdapter):
                 "api_server",
                 include_default_mcp_servers=False,
             )
+            disabled_toolsets = _configured_disabled_toolsets(config)
+            catalog = list(_get_effective_configurable_toolsets())
+            from model_tools import get_tool_definitions
+            effective_runtime_tools = {
+                tool["function"]["name"]
+                for tool in get_tool_definitions(
+                    enabled_toolsets=sorted(enabled_toolsets),
+                    disabled_toolsets=disabled_toolsets,
+                    quiet_mode=True,
+                )
+            }
+            catalog_names = {name for name, _, _ in catalog}
+            platform_config = config.get("platform_toolsets")
+            configured_rows = (
+                platform_config.get("api_server", [])
+                if isinstance(platform_config, dict)
+                else []
+            )
+            configured_exact_names = {
+                str(name)
+                for name in configured_rows
+                if isinstance(name, str)
+                and (get_toolset(name, include_registry=False) or {}).get("exact")
+            }
+            for name in sorted(
+                (enabled_toolsets | configured_exact_names) - catalog_names
+            ):
+                definition = get_toolset(name, include_registry=False)
+                if not definition or not definition.get("exact"):
+                    continue
+                catalog.append((
+                    name,
+                    name,
+                    str(definition.get("description") or "Exact static toolset"),
+                ))
+
             data: List[Dict[str, Any]] = []
-            for name, label, desc in _get_effective_configurable_toolsets():
+            for name, label, desc in catalog:
                 try:
                     tools = sorted(set(resolve_toolset(name)))
                 except Exception:
                     tools = []
                 is_enabled = name in enabled_toolsets
+                definition = get_toolset(name, include_registry=False)
+                if is_enabled and definition and definition.get("exact"):
+                    tools = sorted(set(tools) & effective_runtime_tools)
                 data.append({
                     "name": name,
                     "label": label,

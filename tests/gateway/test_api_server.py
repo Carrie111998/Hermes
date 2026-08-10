@@ -153,6 +153,12 @@ class TestIdempotencyCache:
 
 
 class TestAdapterInit:
+    def test_malformed_disabled_toolsets_scalar_is_rejected(self):
+        from gateway.platforms.api_server import _configured_disabled_toolsets
+
+        assert _configured_disabled_toolsets({"agent": {"disabled_toolsets": "delegation"}}) == []
+        assert _configured_disabled_toolsets({"agent": {"disabled_toolsets": ["delegation", "delegation"]}}) == ["delegation"]
+
     def test_default_config(self):
         config = PlatformConfig(enabled=True)
         adapter = APIServerAdapter(config)
@@ -198,7 +204,10 @@ class TestAdapterInit:
         monkeypatch.setattr(
             "gateway.run._load_gateway_config",
             lambda: {
-                "agent": {"reasoning_effort": "xhigh"},
+                "agent": {
+                    "reasoning_effort": "xhigh",
+                    "disabled_toolsets": ["delegation"],
+                },
                 "checkpoints": {
                     "enabled": True,
                     "max_snapshots": 7,
@@ -225,6 +234,7 @@ class TestAdapterInit:
         assert captured["checkpoint_max_snapshots"] == 7
         assert captured["checkpoint_max_total_size_mb"] == 321
         assert captured["checkpoint_max_file_size_mb"] == 4
+        assert captured["disabled_toolsets"] == ["delegation"]
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +745,147 @@ class TestToolsetsEndpoint:
                 assert by_name["web"]["enabled"] is False
                 assert by_name["web"]["tools"] == ["web_search"]
                 assert by_name["default"]["configured"] is True
+
+    @pytest.mark.asyncio
+    async def test_toolsets_reports_configured_exact_static_toolset(self, adapter):
+        config = {
+            "platform_toolsets": {"api_server": ["restricted-command"]},
+            "agent": {"disabled_toolsets": ["delegation"]},
+        }
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/toolsets")
+                assert resp.status == 200
+                data = await resp.json()
+
+        by_name = {toolset["name"]: toolset for toolset in data["data"]}
+        restricted = by_name["restricted-command"]
+        assert restricted["enabled"] is True
+        from model_tools import get_tool_definitions
+        expected = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(
+                enabled_toolsets=["restricted-command"],
+                disabled_toolsets=["delegation"],
+                quiet_mode=True,
+            )
+        }
+        assert set(restricted["tools"]) == expected
+        assert "delegate_task" not in restricted["tools"]
+
+    @pytest.mark.asyncio
+    async def test_toolsets_exact_static_posture_denial_preserves_core(self, adapter):
+        config = {
+            "platform_toolsets": {"api_server": ["restricted-command"]},
+            "agent": {"disabled_toolsets": ["coding"]},
+        }
+        with patch("hermes_cli.config.load_config", return_value=config):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/toolsets")
+                assert resp.status == 200
+                data = await resp.json()
+        restricted = {ts["name"]: ts for ts in data["data"]}["restricted-command"]
+        assert restricted["enabled"] is True
+        from model_tools import get_tool_definitions
+        expected = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(
+                enabled_toolsets=["restricted-command"],
+                disabled_toolsets=["coding"],
+                quiet_mode=True,
+            )
+        }
+        assert set(restricted["tools"]) == expected
+        assert "terminal" in restricted["tools"]
+
+    @pytest.mark.asyncio
+    async def test_toolsets_reports_configured_exact_static_denial(self, adapter):
+        config = {
+            "platform_toolsets": {"api_server": ["restricted-command"]},
+            "agent": {"disabled_toolsets": ["restricted-command"]},
+        }
+        with patch("hermes_cli.config.load_config", return_value=config):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/toolsets")
+                assert resp.status == 200
+                data = await resp.json()
+        restricted = {ts["name"]: ts for ts in data["data"]}["restricted-command"]
+        assert restricted["enabled"] is False
+        assert restricted["configured"] is True
+
+    @pytest.mark.asyncio
+    async def test_toolsets_exact_static_uses_runtime_availability_projection(self, adapter):
+        config = {"platform_toolsets": {"api_server": ["restricted-command"]}}
+        runtime_tools = [
+            {"type": "function", "function": {"name": "terminal"}},
+            {"type": "function", "function": {"name": "todo"}},
+        ]
+        events = []
+
+        def discover_catalog():
+            events.append("catalog")
+            return []
+
+        def project_runtime(**kwargs):
+            assert events == ["catalog"]
+            return runtime_tools
+
+        with patch("hermes_cli.config.load_config", return_value=config), patch(
+            "hermes_cli.tools_config._get_effective_configurable_toolsets",
+            side_effect=discover_catalog,
+        ), patch(
+            "model_tools.get_tool_definitions",
+            side_effect=project_runtime,
+        ) as projected:
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/toolsets")
+                assert resp.status == 200
+                data = await resp.json()
+        restricted = {ts["name"]: ts for ts in data["data"]}["restricted-command"]
+        assert restricted["tools"] == ["terminal", "todo"]
+        projected.assert_called_once_with(
+            enabled_toolsets=["restricted-command"],
+            disabled_toolsets=[],
+            quiet_mode=True,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raw_disabled",
+        (["delegation"], ["coding"], ["hermes-cli"], "delegation"),
+    )
+    async def test_toolsets_exact_static_matches_runtime_projection(
+        self, adapter, raw_disabled
+    ):
+        from model_tools import get_tool_definitions
+
+        config = {
+            "platform_toolsets": {"api_server": ["restricted-command"]},
+            "agent": {"disabled_toolsets": raw_disabled},
+        }
+        valid_disabled = raw_disabled if isinstance(raw_disabled, list) else []
+        expected = {
+            tool["function"]["name"]
+            for tool in get_tool_definitions(
+                enabled_toolsets=["restricted-command"],
+                disabled_toolsets=valid_disabled,
+                quiet_mode=True,
+            )
+        }
+        with patch("hermes_cli.config.load_config", return_value=config):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.get("/v1/toolsets")
+                assert resp.status == 200
+                data = await resp.json()
+        restricted = {ts["name"]: ts for ts in data["data"]}["restricted-command"]
+        assert restricted["enabled"] is True
+        assert set(restricted["tools"]) == expected
 
 
 # ---------------------------------------------------------------------------

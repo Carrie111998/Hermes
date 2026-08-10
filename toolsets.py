@@ -275,6 +275,23 @@ TOOLSETS = {
         "includes": []
     },
 
+    "restricted-command": {
+        "description": (
+            "Exact static command-agent surface for tightly scoped API and "
+            "delegated execution"
+        ),
+        "tools": [
+            "terminal", "process",
+            "read_file", "write_file", "patch", "search_files",
+            "web_search", "web_extract",
+            "vision_analyze", "delegate_task", "todo",
+        ],
+        "includes": [],
+        # Exact toolsets are authored allowlists. Registry/plugin additions to
+        # a shared category (for example ``terminal``) must never widen them.
+        "exact": True,
+    },
+
     # "honcho" toolset removed — Honcho is now a memory provider plugin.
     # Tools are injected via MemoryManager, not the toolset system.
 
@@ -622,7 +639,8 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
     Args:
         name (str): Name of the toolset
         include_registry (bool): When True (default), merge in tools that
-            plugins/overlays registered into this toolset via the registry.
+            plugins/overlays registered into this toolset via the registry,
+            except for definitions marked ``exact`` (authored allowlists).
             When False, return only the static ``TOOLSETS`` definition (the
             composite-authored view). Platform reverse-mapping in
             ``_get_platform_tools`` uses False so that a tool registered into a
@@ -638,7 +656,7 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
     """
     toolset = TOOLSETS.get(name)
 
-    if not include_registry:
+    if not include_registry or (toolset and toolset.get("exact")):
         # Static view only: return the built-in definition (copying the nested
         # tools/includes lists so callers can't mutate TOOLSETS), or None for
         # registry/MCP-only toolsets that have no static counterpart.
@@ -653,8 +671,7 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
     try:
         from tools.registry import registry
     except Exception:
-        return toolset if toolset else None
-
+        return toolset
     if toolset:
         merged_tools = sorted(
             set(toolset.get("tools", []))
@@ -686,6 +703,28 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
         "tools": registry.get_tool_names_for_toolset(registry_toolset),
         "includes": [],
     }
+
+
+def has_exact_toolset_selection(names: List[str]) -> bool:
+    """Return whether a requested toolset list contains an exact boundary."""
+    return any(bool((TOOLSETS.get(name) or {}).get("exact")) for name in names)
+
+
+def authoritative_toolset_selection(names: List[str]) -> List[str]:
+    """Keep only exact entries when a selection contains an exact toolset.
+
+    Exact toolsets are authority boundaries, not composable convenience
+    bundles. Ordinary entries alongside one must never widen model assembly,
+    MCP refresh, cron jobs, or any other direct enabled-toolset consumer.
+    Lists without an exact entry retain their historical ordering and content.
+    """
+    requested = list(names)
+    if not has_exact_toolset_selection(requested):
+        return requested
+    return [
+        name for name in requested
+        if bool((TOOLSETS.get(name) or {}).get("exact"))
+    ]
 
 
 def bundle_non_core_tools(toolset_name: str) -> Set[str]:
@@ -727,11 +766,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
         name (str): Name of the toolset to resolve
         visited (Set[str]): Set of already visited toolsets (for cycle detection)
         include_registry (bool): When True (default), include tools that
-            plugins/overlays registered into a toolset. When False, resolve only
-            the static ``TOOLSETS`` definition (includes are still resolved, but
-            statically). Platform reverse-mapping uses False so a registry-added
-            tool cannot drop the whole toolset from inference (see #49622 and
-            ``_get_platform_tools``).
+            plugins/overlays registered into a toolset. Definitions marked
+            ``exact`` always resolve statically, including their include graph.
+            When False, resolve only the static ``TOOLSETS`` definition
+            (includes are still resolved, but statically). Platform reverse-
+            mapping uses False so a registry-added tool cannot drop the whole
+            toolset from inference (see #49622 and ``_get_platform_tools``).
 
     Returns:
         List[str]: List of all tool names in the toolset
@@ -785,6 +825,11 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
 
         return []
 
+    # Exact toolsets are static through their full include graph, not merely
+    # at the root. This keeps future exact composites from being widened by a
+    # registry addition to one of their included categories.
+    child_include_registry = include_registry and not toolset.get("exact", False)
+
     # Collect direct tools
     tools = set(toolset.get("tools", []))
 
@@ -792,7 +837,11 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
     # sibling includes so diamond dependencies are only resolved once and
     # cycle warnings don't fire multiple times for the same cycle.
     for included_name in toolset.get("includes", []):
-        included_tools = resolve_toolset(included_name, visited, include_registry=include_registry)
+        included_tools = resolve_toolset(
+            included_name,
+            visited,
+            include_registry=child_include_registry,
+        )
         tools.update(included_tools)
 
     return sorted(tools)

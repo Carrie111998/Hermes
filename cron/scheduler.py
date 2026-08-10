@@ -195,7 +195,14 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
         add nothing further (the user named exactly the servers they want)
       * otherwise -> union in every globally-enabled MCP server
     """
-    result = [t for t in per_job if t != "no_mcp"]
+    from toolsets import (
+        authoritative_toolset_selection,
+        has_exact_toolset_selection,
+    )
+    stripped = [t for t in per_job if t != "no_mcp"]
+    result = authoritative_toolset_selection(stripped)
+    if result != stripped or has_exact_toolset_selection(result):
+        return result
     if "no_mcp" in per_job:
         return result
     # lazy import: avoid heavy hermes_cli import at cron module load (matches
