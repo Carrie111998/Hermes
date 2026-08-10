@@ -13,8 +13,9 @@ Architecture:
   aspect_ratio) into the model-specific payload and filters to the
   ``supports`` whitelist so models never receive rejected keys.
 - Upscaling via FAL's Clarity Upscaler is gated per-model via the ``upscale``
-  flag — on for FLUX 2 Pro (backward-compat), off for all faster/newer models
-  where upscaling would either hurt latency or add marginal quality.
+  flag — default-on for most models (including sub-2MP variants) where the
+  quality benefit outweighs the latency cost, off for a small set of models
+  where it would add marginal quality.
 
 Pricing shown in UI strings is as-of the initial commit; we accept drift and
 update when it's noticed.
