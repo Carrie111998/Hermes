@@ -2265,11 +2265,53 @@ def dispatch(
     max_n: int = Query(8, alias="max"),
     board: Optional[str] = Query(None),
 ):
+    # Read kanban concurrency caps from config so the dashboard's
+    # /dispatch endpoint honours the same limits as the gateway tick
+    # (kanban_watchers.py) and CLI (kanban.py _cmd_dispatch). Without
+    # this, the dashboard bypasses max_in_progress_per_profile and
+    # max_in_progress entirely — the Desktop app's auto-nudge after
+    # every board write then spawns unlimited concurrent workers per
+    # profile, circumventing the cap the gateway tick enforces.
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+
+        def _coerce_positive_int(value):
+            if value is None:
+                return None
+            try:
+                ival = int(value)
+            except (TypeError, ValueError):
+                return None
+            return ival if ival >= 1 else None
+
+        max_in_progress_per_profile = _coerce_positive_int(
+            _kanban_cfg.get("max_in_progress_per_profile")
+        )
+        max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        failure_limit = _coerce_positive_int(_kanban_cfg.get("failure_limit"))
+        if failure_limit is None:
+            failure_limit = kanban_db.DEFAULT_SPAWN_FAILURE_LIMIT
+    except Exception:
+        default_assignee = None
+        max_in_progress_per_profile = None
+        max_in_progress = None
+        failure_limit = kanban_db.DEFAULT_SPAWN_FAILURE_LIMIT
+
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
         result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+            conn,
+            dry_run=dry_run,
+            max_spawn=max_n,
+            board=board,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
         )
         # DispatchResult is a dataclass.
         try:
