@@ -373,6 +373,57 @@ Paths support `~` expansion and `${VAR}` environment variable substitution.
 
 All four skills appear in your skill index. If you create a new skill called `my-custom-workflow` locally, it shadows the external version.
 
+## SkillHub Registry
+
+Hermes can use a self-hosted [SkillHub](https://github.com/iflytek/skillhub)
+instance as a first-class Skills Hub source. This is useful when a team needs
+namespaces, a web registry, and one versioned package source shared by Hermes,
+Codex, and Claude Code. It is different from `external_dirs`: the registry is
+queried for search/resolve, packages are downloaded through the SkillHub REST
+API, and Hermes still materializes them locally after quarantine and scanning.
+
+Configure the registry in the active profile's `config.yaml`:
+
+```yaml
+skills:
+  skillhub:
+    registry: "https://skillhub.example.internal"
+    namespace: "company-common"  # optional search filter and bare-name scope
+    auto_update: true             # default true when registry is configured
+```
+
+Keep the optional bearer token in the profile secret environment, not YAML:
+
+```bash
+export SKILLHUB_TOKEN="..."
+```
+
+The provider is opt-in: without `skills.skillhub.registry`, the normal source
+router and network behavior are unchanged. Once enabled, these commands use
+the same provider selection and provenance lock as other sources:
+
+```bash
+hermes skills search deployment
+hermes skills inspect skillhub://company-common/deploy-k8s
+hermes skills install skillhub://company-common/deploy-k8s
+hermes skills check
+hermes skills update
+```
+
+SkillHub identifiers are recorded in `skills/.hub/lock.json` as
+`skillhub://<namespace>/<slug>`. Updates remain pinned to the configured
+SkillHub source; Hermes never falls back to a same-named GitHub or public-hub
+skill. The SkillHub bundle is still validated for safe paths, scanned, and
+installed through the existing quarantine gate.
+
+When background skill review is enabled, Hermes refreshes already-installed
+SkillHub entries before creating the review fork when `auto_update` is true.
+The current turn is not rebuilt: if a refresh changes a skill, the review fork
+builds a fresh skill prompt and the parent prompt cache is invalidated for its
+next turn. Background review does not publish arbitrary local edits back to
+SkillHub in this path; SkillHub publishing has namespace membership, version,
+and review-state semantics and must be an explicit publication workflow.
+
 ## Skill Bundles
 
 Skill bundles are tiny YAML files that group several skills under a single slash command. When you run `/<bundle-name>`, every skill listed in the bundle loads at once — useful when a particular task always benefits from the same set of skills together.
