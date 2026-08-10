@@ -36,7 +36,7 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
 | Item | Valor |
 |---|---|
-| Branch | `local/harness` @ `b34f1a28b9` |
+| Branch | `local/harness` @ `667c85c773` (0 atrás / 8 à frente de origin/main) |
 | Config | v34 · `minimax-oauth` / `MiniMax-M3` |
 | SQLite prod | **3.53.1** |
 | Gateway | ✅ PID principal + profiles |
@@ -59,7 +59,7 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
 | # | Item | Prioridade |
 |---|---|---|
-| 1 | Sync 5 commits de `origin/main` (com patch-guard) | Média |
+| 1 | Revalidar `avaliacao-agente-dande` (stale `tool_delay`) | Baixa |
 | 2 | Evitar doctor/gateway via `.venv` (SQLite 3.50.4) | Baixa |
 | 3 | Fix/revalidar `avaliacao-agente-dande` | Baixa |
 | 4 | Pluginizar patches Hermes One (D-004) | Baixa |
