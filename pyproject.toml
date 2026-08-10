@@ -5,12 +5,11 @@ name = "hermes-agent"
 version = "0.20.0"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
-# Upper bound raised from <3.14 to <3.15 (2026-08-10, py314 validation):
-# the original <3.14 cap existed because "Rust-backed transitives (e.g.
-# pydantic-core) have no cp314 wheel yet" — verified STALE: pydantic-core,
-# numpy, uvloop, watchfiles all ship cp314 wheels; full CI-shaped install
-# succeeds on 3.14.4. One code fix (tools/daemon_pool.py WorkerContext)
-# completes 3.14 support.
+# Upper bound raised from <3.14 to <3.15: the original cap existed because
+# "Rust-backed transitives (e.g. pydantic-core) have no cp314 wheel yet" —
+# now stale: pydantic-core, numpy, uvloop, watchfiles all ship cp314 wheels
+# and the full CI-shaped install succeeds on 3.14.4. One code fix
+# (tools/daemon_pool.py WorkerContext) completes 3.14 support.
 requires-python = ">=3.11,<3.15"
 authors = [{ name = "Nous Research" }]
 license = "MIT"
