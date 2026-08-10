@@ -89,6 +89,7 @@ export function useSubmission(opts: UseSubmissionOptions) {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
       const displayKind = typeof displayKindOrExpandOverride === 'string' ? displayKindOrExpandOverride : undefined
+
       const expand =
         typeof displayKindOrExpandOverride === 'function'
           ? displayKindOrExpandOverride
