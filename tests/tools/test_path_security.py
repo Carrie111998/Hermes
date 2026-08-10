@@ -297,8 +297,9 @@ class TestExtractFilesystemTargets:
         )
         # End-to-end hardline must NOT fire.
         is_hl, desc = detect_hardline_command(cmd)
-        assert not is_hl, (
-            f"wrapped UNC non-root must not be hardline-blocked, got desc={desc!r}"
+        assert (is_hl, desc) == (False, None), (
+            f"wrapped UNC non-root must hardline to (False, None), "
+            f"got ({is_hl!r}, {desc!r})"
         )
 
     def test_unconditional_fallback_emits_root_when_only_drive_seen(self):
