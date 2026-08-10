@@ -61,6 +61,41 @@ XXE_PAYLOAD = b"""<?xml version="1.0"?>
 <rss version="2.0"><channel><title>&xxe;</title></channel></rss>
 """
 
+RDF_ONTOLOGY = b"""<?xml version="1.0"?>
+<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+         xmlns:owl="http://www.w3.org/2002/07/owl#">
+  <owl:Class rdf:about="http://example.com/Foo"/>
+</rdf:RDF>
+"""
+
+EMPTY_RSS = (
+    b'<?xml version="1.0"?><rss version="2.0"><channel>'
+    b"<title>Empty</title></channel></rss>"
+)
+
+
+def _use_stdlib_xml(monkeypatch):
+    import xml.etree.ElementTree as stdlib_et
+
+    monkeypatch.setattr(rss, "_HAS_DEFUSEDXML", False)
+    monkeypatch.setattr(rss, "ET", stdlib_et)
+    monkeypatch.setattr(rss, "_PARSE_ERRORS", (stdlib_et.ParseError,))
+
+
+def _padded_doctype_payload() -> bytes:
+    padding = b"x" * 9000
+    return padding + BILLION_LAUGHS
+
+
+def _utf16_doctype_payload() -> bytes:
+    text = (
+        '<?xml version="1.0"?>\n'
+        "<!DOCTYPE foo [\n  <!ENTITY xxe \"test\">\n]>\n"
+        '<rss version="2.0"><channel><title>T</title>'
+        "<item><title>One</title></item></channel></rss>"
+    )
+    return b"\xff\xfe" + text.encode("utf-16-le")
+
 
 def test_parse_rss_normalizes_and_deduplicates():
     result = rss.parse_feed(RSS_XML, "https://example.com/feed")
@@ -103,14 +138,101 @@ def test_xxe_doctype_rejected():
 
 
 def test_billion_laughs_rejected_when_defusedxml_absent(monkeypatch):
-    monkeypatch.setattr(rss, "_HAS_DEFUSEDXML", False)
+    _use_stdlib_xml(monkeypatch)
     assert rss.parse_feed(BILLION_LAUGHS, "https://example.com/feed") is None
 
 
 def test_xxe_rejected_when_defusedxml_absent(monkeypatch):
-    monkeypatch.setattr(rss, "_HAS_DEFUSEDXML", False)
+    _use_stdlib_xml(monkeypatch)
     assert rss.parse_feed(XXE_PAYLOAD, "https://example.com/feed") is None
 
+
+def test_padded_doctype_rejected_on_stdlib_path_without_expansion(monkeypatch):
+    _use_stdlib_xml(monkeypatch)
+    payload = _padded_doctype_payload()
+    assert len(payload) > 8192
+    assert rss.parse_feed(payload, "https://example.com/feed") is None
+
+
+def test_utf16_doctype_rejected_on_stdlib_path(monkeypatch):
+    _use_stdlib_xml(monkeypatch)
+    assert rss.parse_feed(_utf16_doctype_payload(), "https://example.com/feed") is None
+
+
+def test_malformed_xml_returns_none_on_stdlib_path(monkeypatch):
+    _use_stdlib_xml(monkeypatch)
+    assert rss.parse_feed(b"<rss><channel>", "https://example.com/feed") is None
+
+
+def test_rdf_ontology_falls_back_without_overwriting():
+    assert rss.parse_feed(RDF_ONTOLOGY, "https://example.com/ontology.rdf") is None
+
+
+def test_empty_rss_feed_falls_back():
+    assert rss.parse_feed(EMPTY_RSS, "https://example.com/empty") is None
+
+
+def test_empty_rss_feed_apply_leaves_content_unchanged():
+    original = {
+        "url": "https://example.com/empty",
+        "title": "Provider",
+        "content": EMPTY_RSS.decode(),
+        "raw_content": EMPTY_RSS.decode(),
+    }
+    before = dict(original)
+    rss.apply_rss_specialization(original)
+    assert original["content"] == before["content"]
+
+
+def test_oversized_content_is_never_parsed():
+    sniff_prefix = b"<?xml version='1.0'?><rss><channel><title>x</title>"
+    oversized = sniff_prefix + (b" " * (rss._MAX_FEED_BYTES + 1))
+    assert len(oversized) > rss._MAX_FEED_BYTES
+    assert rss.parse_feed(oversized, "https://example.com/huge") is None
+
+
+def test_oversized_apply_specialization_leaves_content_unchanged(monkeypatch):
+    sniff_prefix = b"<?xml version='1.0'?><rss><channel><title>x</title>"
+    oversized = sniff_prefix + (b" " * (rss._MAX_FEED_BYTES + 1))
+    original = {
+        "url": "https://example.com/huge",
+        "title": "Provider",
+        "content": oversized.decode("latin-1"),
+        "raw_content": oversized,
+    }
+    before = dict(original)
+    called = []
+
+    def forbidden_parse(*args, **kwargs):
+        called.append(1)
+        raise AssertionError("parse_feed must not run for oversized content")
+
+    monkeypatch.setattr(rss, "parse_feed", forbidden_parse)
+    rss.apply_rss_specialization(original)
+    assert not called
+    assert original["content"] == before["content"]
+
+
+def test_rss_specialization_disabled_when_extract_specializations_not_dict(monkeypatch):
+    from tools import web_tools
+
+    monkeypatch.setattr(
+        web_tools,
+        "_load_web_config",
+        lambda: {"extract_specializations": "yes"},
+    )
+    assert web_tools._rss_specialization_enabled() is False
+
+
+def test_rss_specialization_disabled_when_web_section_null(monkeypatch):
+    from tools import web_tools
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"web": None},
+    )
+    assert web_tools._load_web_config() == {}
+    assert web_tools._rss_specialization_enabled() is False
 
 def test_apply_specialization_leaves_plain_html_unchanged():
     original = {

@@ -9,7 +9,7 @@ from __future__ import annotations
 import html
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Type
 
 logger = logging.getLogger(__name__)
 
@@ -34,16 +34,31 @@ _FEED_SNIFF_MARKERS = (
     b"<rdf ",
 )
 
+_UNSAFE_MARKERS_ASCII = (b"<!DOCTYPE", b"<!ENTITY")
+_UTF16LE_MARKERS = (
+    b"<\x00!\x00D\x00O\x00C\x00T\x00Y\x00P\x00E\x00",
+    b"<\x00!\x00E\x00N\x00T\x00I\x00T\x00Y\x00",
+    b"<\x00!\x00d\x00o\x00c\x00t\x00y\x00p\x00e\x00",
+    b"<\x00!\x00e\x00n\x00t\x00i\x00t\x00y\x00",
+)
+_UTF16BE_MARKERS = (
+    b"\x00<\x00!\x00D\x00O\x00C\x00T\x00Y\x00P\x00E",
+    b"\x00<\x00!\x00E\x00N\x00T\x00I\x00T\x00Y",
+    b"\x00<\x00!\x00d\x00o\x00c\x00t\x00y\x00p\x00e",
+    b"\x00<\x00!\x00e\x00n\x00t\x00i\x00t\x00y",
+)
+
 try:
     from defusedxml import ElementTree as ET  # type: ignore[import-untyped]
     from defusedxml.common import EntitiesForbidden  # type: ignore[import-untyped]
 
     _HAS_DEFUSEDXML = True
+    _PARSE_ERRORS: Tuple[Type[BaseException], ...] = (ET.ParseError, EntitiesForbidden)
 except ImportError:
     import xml.etree.ElementTree as ET
 
     _HAS_DEFUSEDXML = False
-    EntitiesForbidden = ()  # type: ignore[misc,assignment]
+    _PARSE_ERRORS = (ET.ParseError,)
 
 
 def _local_name(tag: Any) -> str:
@@ -92,15 +107,67 @@ def _entry_link(entry: Any) -> str:
     return fallback
 
 
+def _scan_utf16_for_unsafe_markers(buf: bytes) -> Optional[bool]:
+    """Return True/False when UTF-16 scan is decisive; None if not UTF-16."""
+    if buf.startswith(b"\xff\xfe") or buf.startswith(b"\xfe\xff"):
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be"):
+            try:
+                text = buf.decode(encoding)
+                sample = text.upper()
+                return "<!DOCTYPE" in sample or "<!ENTITY" in sample
+            except UnicodeDecodeError:
+                continue
+            except Exception:
+                return True
+        return True
+
+    if b"\x00" not in buf[:512]:
+        return None
+
+    if buf.lstrip().startswith(b"<?") or buf.lstrip().startswith(b"<r"):
+        return None
+
+    decoded_any = False
+    for encoding in ("utf-16-le", "utf-16-be", "utf-16"):
+        try:
+            text = buf.decode(encoding)
+            decoded_any = True
+            sample = text.upper()
+            if "<!DOCTYPE" in sample or "<!ENTITY" in sample:
+                return True
+        except UnicodeDecodeError:
+            continue
+        except Exception:
+            return True
+
+    if decoded_any:
+        return False
+    return True
+
+
 def _reject_unsafe_xml_text(xml_bytes: bytes) -> bool:
     """Return True when stdlib parsing must be rejected (XXE / entity expansion)."""
     if _HAS_DEFUSEDXML:
         return False
-    try:
-        sample = xml_bytes[:8192].decode("utf-8", errors="ignore").upper()
-    except Exception:
+    if not xml_bytes:
+        return False
+
+    buf = xml_bytes[:_MAX_FEED_BYTES]
+
+    upper = buf.upper()
+    if any(marker in upper for marker in _UNSAFE_MARKERS_ASCII):
         return True
-    return "<!DOCTYPE" in sample or "<!ENTITY" in sample
+
+    if any(marker in buf for marker in _UTF16LE_MARKERS + _UTF16BE_MARKERS):
+        return True
+
+    utf16_result = _scan_utf16_for_unsafe_markers(buf)
+    if utf16_result is True:
+        return True
+    if utf16_result is False:
+        return False
+
+    return False
 
 
 def _safe_fromstring(xml_bytes: bytes) -> Optional[Any]:
@@ -108,7 +175,9 @@ def _safe_fromstring(xml_bytes: bytes) -> Optional[Any]:
         return None
     try:
         return ET.fromstring(xml_bytes)
-    except (ET.ParseError, EntitiesForbidden):
+    except _PARSE_ERRORS:
+        return None
+    except Exception:
         return None
 
 
@@ -140,31 +209,7 @@ def _looks_like_feed_content(result: Dict[str, Any], xml_bytes: bytes) -> bool:
     return any(marker in sample for marker in _FEED_SNIFF_MARKERS)
 
 
-def parse_feed(xml_bytes: bytes, source_url: str) -> Optional[Dict[str, Any]]:
-    """Parse RSS 2.0, Atom, or RDF/RSS bytes into a web-extract result.
-
-    Returns ``None`` when XML is malformed, rejected as unsafe, or valid but
-    not a recognized feed. Never raises.
-    """
-    if not xml_bytes or len(xml_bytes) > _MAX_FEED_BYTES:
-        return None
-
-    root = _safe_fromstring(xml_bytes)
-    if root is None:
-        return None
-
-    root_name = _local_name(root.tag)
-    if root_name not in {"rss", "feed", "rdf"}:
-        return None
-
-    channel = _child(root, "channel") if root_name in {"rss", "rdf"} else root
-    if channel is None:
-        channel = root
-
-    feed_title = _text(_child(channel, "title")) or "Feed"
-    feed_description = _clean_summary(_text(_child(channel, "description", "subtitle")))
-    feed_updated = _text(_child(channel, "lastbuilddate", "updated", "pubdate"))
-
+def _collect_entries(root: Any) -> list:
     entries = []
     seen = set()
     for candidate in root.iter():
@@ -196,39 +241,79 @@ def parse_feed(xml_bytes: bytes, source_url: str) -> Optional[Dict[str, Any]]:
                 "summary": summary,
             }
         )
+    return entries
 
-    lines = [f"# {feed_title}", "", f"- Source: {source_url}"]
-    if feed_updated:
-        lines.append(f"- Updated: {feed_updated}")
-    if feed_description:
-        lines.extend(["", feed_description])
-    lines.extend(["", "## Entries"])
 
-    if not entries:
-        lines.extend(["", "No entries found."])
-    for entry in entries:
-        heading = f"[{entry['title']}]({entry['link']})" if entry["link"] else entry["title"]
-        lines.extend(["", f"### {heading}"])
-        if entry["published"]:
-            lines.append(f"- Published: {entry['published']}")
-        if entry["author"]:
-            lines.append(f"- Author: {entry['author']}")
-        if entry["summary"]:
-            lines.extend(["", entry["summary"]])
+def parse_feed(xml_bytes: bytes, source_url: str) -> Optional[Dict[str, Any]]:
+    """Parse RSS 2.0, Atom, or RDF/RSS bytes into a web-extract result.
 
-    content = "\n".join(lines).strip()
-    return {
-        "url": source_url,
-        "title": feed_title,
-        "content": content,
-        "raw_content": content,
-        "metadata": {
-            "sourceURL": source_url,
+    Returns ``None`` when XML is malformed, rejected as unsafe, or valid but
+    not a recognized feed. Never raises.
+    """
+    try:
+        if not xml_bytes or len(xml_bytes) > _MAX_FEED_BYTES:
+            return None
+
+        root = _safe_fromstring(xml_bytes)
+        if root is None:
+            return None
+
+        root_name = _local_name(root.tag)
+        if root_name not in {"rss", "feed", "rdf"}:
+            return None
+
+        if root_name == "rdf":
+            channel = _child(root, "channel")
+            if channel is None:
+                return None
+        elif root_name == "rss":
+            channel = _child(root, "channel")
+            if channel is None:
+                return None
+        else:
+            channel = root
+
+        entries = _collect_entries(root)
+        if not entries:
+            return None
+
+        feed_title = _text(_child(channel, "title")) or "Feed"
+        feed_description = _clean_summary(_text(_child(channel, "description", "subtitle")))
+        feed_updated = _text(_child(channel, "lastbuilddate", "updated", "pubdate"))
+
+        lines = [f"# {feed_title}", "", f"- Source: {source_url}"]
+        if feed_updated:
+            lines.append(f"- Updated: {feed_updated}")
+        if feed_description:
+            lines.extend(["", feed_description])
+        lines.extend(["", "## Entries"])
+
+        for entry in entries:
+            heading = f"[{entry['title']}]({entry['link']})" if entry["link"] else entry["title"]
+            lines.extend(["", f"### {heading}"])
+            if entry["published"]:
+                lines.append(f"- Published: {entry['published']}")
+            if entry["author"]:
+                lines.append(f"- Author: {entry['author']}")
+            if entry["summary"]:
+                lines.extend(["", entry["summary"]])
+
+        content = "\n".join(lines).strip()
+        return {
+            "url": source_url,
             "title": feed_title,
-            "contentType": "feed",
-            "entryCount": len(entries),
-        },
-    }
+            "content": content,
+            "raw_content": content,
+            "metadata": {
+                "sourceURL": source_url,
+                "title": feed_title,
+                "contentType": "feed",
+                "entryCount": len(entries),
+            },
+        }
+    except Exception as exc:
+        logger.debug("RSS/Atom parse_feed skipped: %s", exc)
+        return None
 
 
 def apply_rss_specialization(result: Dict[str, Any]) -> None:
