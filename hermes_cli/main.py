@@ -1288,7 +1288,7 @@ def _session_browse_picker(sessions: list) -> Optional[str]:
         curses.wrapper(_curses_browse)
         return result_holder[0]
 
-    except Exception:
+    except (Exception, KeyboardInterrupt):
         pass
 
     # Fallback: numbered list (Windows without curses, etc.)
