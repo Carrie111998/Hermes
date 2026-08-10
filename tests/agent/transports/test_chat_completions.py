@@ -150,6 +150,45 @@ class TestChatCompletionsBasic:
         assert "extra_content" in msgs[1]["tool_calls"][1]
 
 
+    def test_convert_messages_drops_empty_tool_calls_array(self, transport):
+        """Empty ``tool_calls`` arrays on assistant messages never reach the wire.
+
+        DeepSeek v4 rejects any assistant message carrying ``tool_calls: []``
+        with HTTP 400 ("Expected an array with minimum length 1"), which then
+        fails every subsequent request in the session (#83312). The transport
+        is the final chokepoint before serialization, so it must drop the key
+        even when earlier sanitizers missed it, and it must not mutate the
+        caller's history.
+        """
+        msgs = [
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "answer", "tool_calls": []},
+        ]
+        result = transport.convert_messages(msgs)
+
+        assert result is not msgs  # dirty history requires a sanitized copy
+        assert "tool_calls" not in result[1]
+        assert result[1]["content"] == "answer"
+        # Original history is untouched — the empty array survives there so
+        # the persisted transcript stays byte-stable.
+        assert msgs[1]["tool_calls"] == []
+
+    def test_convert_messages_keeps_nonempty_tool_calls_identity(self, transport):
+        """A healthy non-empty tool_calls list passes through without a copy."""
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "t", "arguments": "{}"}}
+                ],
+            },
+        ]
+        result = transport.convert_messages(msgs)
+        assert result is msgs
+
+
 
 class TestChatCompletionsBuildKwargs:
 

@@ -69,6 +69,43 @@ def test_repair_preserves_user_content_when_one_side_empty():
     assert messages == [{"role": "user", "content": "real message"}]
 
 
+def test_repair_merge_drops_empty_tool_calls_on_surviving_turn():
+    """Consecutive-assistant merge must not preserve ``tool_calls: []``.
+
+    The merge previously kept a pre-existing empty array on the surviving
+    turn when neither side carried calls. Strict providers (DeepSeek v4)
+    reject ``tool_calls: []`` with HTTP 400 and the poisoned message then
+    fails every subsequent request in the session (#83312).
+    """
+    agent = _bare_agent()
+    messages = [
+        {"role": "assistant", "content": "interim", "tool_calls": []},
+        {"role": "assistant", "content": "final"},
+    ]
+
+    repairs = AIAgent._repair_message_sequence(agent, messages)
+
+    assert repairs == 1
+    assert len(messages) == 1
+    assert messages[0]["content"] == "interim\nfinal"
+    assert "tool_calls" not in messages[0]
+
+def test_repair_merge_keeps_nonempty_tool_calls_union():
+    """A real tool_calls union on the surviving turn is preserved."""
+    agent = _bare_agent()
+    messages = [
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "call_A", "type": "function",
+                         "function": {"name": "f", "arguments": "{}"}}]},
+        {"role": "assistant", "content": "note"},
+    ]
+
+    AIAgent._repair_message_sequence(agent, messages)
+
+    assert len(messages) == 1
+    assert [tc["id"] for tc in messages[0]["tool_calls"]] == ["call_A"]
+
+
 def test_repair_does_not_rewind_ongoing_dialog_tool_pair():
     """assistant(tool_calls) + tool + user is a VALID pattern (user redirect
     before the model gets its continuation turn). Repair must not touch it —

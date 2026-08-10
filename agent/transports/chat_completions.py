@@ -272,6 +272,14 @@ class ChatCompletionsTransport(ProviderTransport):
                 break
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
+                # Strict OpenAI-compatible providers (DeepSeek v4) reject an
+                # assistant message carrying an empty ``tool_calls`` array
+                # outright ("Expected an array with minimum length 1"). The
+                # key must be omitted when there are no calls, so flag the
+                # message for the sanitize pass below.
+                if msg.get("role") == "assistant" and not tool_calls:
+                    needs_sanitize = True
+                    break
                 for tc in tool_calls:
                     if isinstance(tc, dict) and (
                         "call_id" in tc
@@ -327,6 +335,21 @@ class ChatCompletionsTransport(ProviderTransport):
                     out_msg.pop(key, None)
 
             tool_calls = msg.get("tool_calls")
+            # Drop empty ``tool_calls`` arrays on assistant messages before
+            # they reach the wire — strict providers (DeepSeek v4) reject
+            # them with HTTP 400 ("Expected an array with minimum length 1")
+            # and the poisoned message then fails every subsequent request
+            # in the session. This is the final chokepoint before the HTTP
+            # body is serialized, so it catches arrays reintroduced after
+            # earlier sanitizers (e.g. the consecutive-assistant merge in
+            # repair_message_sequence) regardless of the source path.
+            if (
+                msg.get("role") == "assistant"
+                and isinstance(tool_calls, list)
+                and not tool_calls
+            ):
+                mutable_msg().pop("tool_calls", None)
+                tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
                 copied_tool_calls: list[Any] | None = None
                 for tc_idx, tc in enumerate(tool_calls):

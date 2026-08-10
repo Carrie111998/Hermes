@@ -650,6 +650,13 @@ def repair_message_sequence(agent, messages: List[Dict]) -> int:
                 prev["tool_calls"] = prev_calls + new_calls
             elif prev_calls:
                 prev["tool_calls"] = prev_calls
+            else:
+                # Neither turn carries calls. If the surviving turn kept a
+                # pre-existing empty ``tool_calls`` array, drop the key —
+                # strict providers (DeepSeek) reject ``tool_calls: []`` with
+                # HTTP 400 and the poisoned message fails every subsequent
+                # request in the session (#83312).
+                prev.pop("tool_calls", None)
             # Concatenate plain-text content; leave multimodal (list)
             # content on either side alone to avoid mangling attachment
             # blocks — fall back to keeping the existing content.
