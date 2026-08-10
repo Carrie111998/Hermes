@@ -2178,8 +2178,18 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         # temp-write inherits the process umask and ``Path.replace`` swaps the
         # symlink itself, so renaming a profile silently widened the mode and
         # detached a symlinked config (#16743).
+        #
+        # Hand the helper the RESOLVED target, not the candidate: it stages its
+        # temp in the parent of whatever path it is given, so passing a symlink
+        # stages on the link's filesystem and renames onto the real file's.
+        # When those differ — a config linked into a dotfiles repo, an
+        # encrypted volume or a mounted secrets share — the rename fails EXDEV
+        # and the fallback copies onto the real file, truncating the user's
+        # credentials before the replacement exists. Staging beside the real
+        # file makes that rename same-filesystem by construction, and the
+        # symlink survives because it is never written through.
         try:
-            atomic_json_write(path, raw, mode=0o600)
+            atomic_json_write(resolved, raw, mode=0o600)
         except OSError:
             continue
 
