@@ -478,21 +478,20 @@ class MemoryManager:
         if not new_session_id:
             return
         for provider in self._providers:
-            def _switch(provider=provider):
-                try:
-                    provider.on_session_switch(
-                        new_session_id,
-                        parent_session_id=parent_session_id,
-                        reset=reset,
-                        **kwargs,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "Memory provider '%s' on_session_switch failed: %s",
-                        provider.name, e,
-                    )
-
-            self._submit_background(_switch)
+            # Session rotation is a lifecycle boundary. Providers must see
+            # the new id before the caller can enqueue the next turn.
+            try:
+                provider.on_session_switch(
+                    new_session_id,
+                    parent_session_id=parent_session_id,
+                    reset=reset,
+                    **kwargs,
+                )
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' on_session_switch failed: %s",
+                    provider.name, e,
+                )
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Notify all providers before context compression.
