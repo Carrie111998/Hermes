@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+crypto_tax_raw.json
+crypto_tax_wallet_raw.json

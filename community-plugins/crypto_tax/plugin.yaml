@@ -1,0 +1,14 @@
+name: crypto_tax
+version: 1.2.0
+description: "Fetch on-chain wallet transactions (Blockscout) and CEX trades (CCXT), then calculate capital gains / cost basis with FIFO/LIFO lot matching."
+provides_tools:
+  - calculate_crypto_gains
+  - fetch_cex_transactions
+  - fetch_wallet_transactions
+optional_env:
+  - name: EXCHANGE_API_KEY
+    description: "API key for CEX (e.g., Coinbase, Binance, Kraken)"
+  - name: EXCHANGE_SECRET
+    description: "API secret for CEX"
+  - name: ETHERSCAN_API_KEY
+    description: "Optional Etherscan API key for higher rate limits (Blockscout is keyless by default)"
