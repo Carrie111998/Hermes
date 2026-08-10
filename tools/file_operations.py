@@ -2688,7 +2688,7 @@ class ShellFileOperations(FileOperations):
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_pattern_arg(pattern)} {self._escape_native_exe_arg(path)} "
+            f"-e {self._escape_pattern_arg(pattern)} -- {self._escape_native_exe_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2710,7 +2710,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_pattern_arg(pattern)} {self._escape_native_exe_arg(path)} "
+            f"-e {self._escape_pattern_arg(pattern)} -- {self._escape_native_exe_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2730,7 +2730,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_pattern_arg(pattern)} {self._escape_native_exe_arg(path)} "
+                f"-e {self._escape_pattern_arg(pattern)} -- {self._escape_native_exe_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -2947,8 +2947,13 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path. The pattern is a regex, not a path, so it
         # must be quoted without the MSYS drive rewrite (#69183 carry).
-        cmd_parts.append(self._escape_pattern_arg(pattern))
-        cmd_parts.append(self._escape_native_exe_arg(path))
+        # ``-e`` and ``--`` keep option-like patterns/paths on the data side.
+        cmd_parts.extend([
+            "-e",
+            self._escape_pattern_arg(pattern),
+            "--",
+            self._escape_native_exe_arg(path),
+        ])
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
@@ -3084,8 +3089,13 @@ class ShellFileOperations(FileOperations):
         
         # Add pattern and path. The pattern is a regex, not a path, so it
         # must be quoted without the MSYS drive rewrite (#69183 carry).
-        cmd_parts.append(self._escape_pattern_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        # ``-e`` and ``--`` keep option-like patterns/paths on the data side.
+        cmd_parts.extend([
+            "-e",
+            self._escape_pattern_arg(pattern),
+            "--",
+            self._escape_shell_arg(path),
+        ])
         
         # Fetch generously so we can compute total before slicing
         fetch_limit = limit + offset + (200 if context > 0 else 0)

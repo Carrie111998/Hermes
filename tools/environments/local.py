@@ -140,6 +140,7 @@ def _native_windows_path_for_exe(path: str) -> str:
     They *do* accept ``D:/...``.
 
     - Native ``D:\foo`` / ``D:/foo`` -> ``D:/foo``
+    - Drive-relative ``D:foo`` -> ``D:foo`` (only separators normalize)
     - MSYS ``/d/foo`` / ``/cygdrive/d/foo`` / ``/mnt/d/foo`` -> ``D:/foo``
     - Otherwise leave unchanged (relative paths, pure POSIX strings)
 
@@ -151,7 +152,7 @@ def _native_windows_path_for_exe(path: str) -> str:
         return path
 
     # Already native drive-qualified -> normalize separators only.
-    m = re.match(r'^([a-zA-Z]):[\\/]*(.*)$', path)
+    m = re.match(r'^([a-zA-Z]):[\\/]+(.*)$', path)
     if m:
         drive = m.group(1).upper()
         tail = (m.group(2) or "").replace("\\", "/").lstrip("/")
@@ -160,7 +161,7 @@ def _native_windows_path_for_exe(path: str) -> str:
     # MSYS / Cygwin / WSL drive forms -> native forward-slash.
     win = _msys_to_windows_path(path)
     if win != path:
-        m2 = re.match(r'^([a-zA-Z]):[\\/]*(.*)$', win)
+        m2 = re.match(r'^([a-zA-Z]):[\\/]+(.*)$', win)
         if m2:
             drive = m2.group(1).upper()
             tail = (m2.group(2) or "").replace("\\", "/").lstrip("/")

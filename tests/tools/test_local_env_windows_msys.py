@@ -352,3 +352,14 @@ def test_native_windows_path_for_exe_leaves_relative(monkeypatch):
     import tools.environments.local as local_mod
     monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
     assert _native_windows_path_for_exe("Apps/The-Pulse") == "Apps/The-Pulse"
+
+
+def test_native_windows_path_for_exe_preserves_drive_relative(monkeypatch):
+    import ntpath
+    import tools.environments.local as local_mod
+
+    monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+    converted = _native_windows_path_for_exe(r"D:logs\app.txt")
+    assert converted == "D:logs/app.txt"
+    assert not ntpath.isabs(converted)
+    assert _native_windows_path_for_exe("D:logs/app.txt") == "D:logs/app.txt"

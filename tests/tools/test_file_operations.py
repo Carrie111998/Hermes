@@ -423,6 +423,69 @@ class TestShellFileOpsHelpers:
             assert "'/d/Ivo/project'" not in command
             assert "'/d+'" not in command
 
+    def test_search_with_rg_uses_argument_boundaries_for_option_like_pattern(self, mock_env, monkeypatch):
+        """A pattern starting with '-' is data, not an rg option."""
+        import tools.environments.local as local_mod
+        from tools.file_operations import ShellFileOperations, ExecuteResult
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._is_local_backend = lambda: True
+        ops._has_command = lambda cmd: cmd == "rg"
+        captured = {}
+
+        def _capture(command, cwd=None, timeout=None, stdin_data=None):
+            captured["cmd"] = command
+            return ExecuteResult(stdout="", exit_code=1)
+
+        ops._exec = _capture
+        ops._search_with_rg("-foo", r"D:\Ivo\dir with space", None, 10, 0, "content", 0)
+        assert "-e '-foo'" in captured["cmd"]
+        assert "-- 'D:/Ivo/dir with space'" in captured["cmd"]
+
+    def test_search_with_grep_uses_argument_boundaries_for_option_like_pattern(self, mock_env, monkeypatch):
+        """The grep fallback needs the same option/data boundary as rg."""
+        import tools.environments.local as local_mod
+        from tools.file_operations import ShellFileOperations, ExecuteResult
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        ops = ShellFileOperations(mock_env)
+        ops._is_local_backend = lambda: True
+        ops._has_command = lambda cmd: cmd == "grep"
+        captured = {}
+
+        def _capture(command, cwd=None, timeout=None, stdin_data=None):
+            captured["cmd"] = command
+            return ExecuteResult(stdout="", exit_code=1)
+
+        ops._exec = _capture
+        ops._search_with_grep("-foo", "/tmp/project", None, 10, 0, "content", 0)
+        assert "-e '-foo'" in captured["cmd"]
+        assert "-- '/tmp/project'" in captured["cmd"]
+
+    def test_zero_match_probe_uses_argument_boundaries_for_option_like_pattern(self, monkeypatch, file_ops):
+        """Zero-match probes must not let '-foo' become an rg option."""
+        import tools.environments.local as local_mod
+        from tools.file_operations import ExecuteResult
+
+        monkeypatch.setattr(local_mod, "_IS_WINDOWS", True)
+        monkeypatch.setattr(file_ops, "_is_local_backend", lambda: True)
+        file_ops._has_command = lambda cmd: cmd == "rg"
+        captured = []
+
+        def _capture(command, cwd=None, timeout=None, stdin_data=None):
+            captured.append(command)
+            return ExecuteResult(stdout="", exit_code=1)
+
+        file_ops._exec = _capture
+        assert file_ops._zero_match_probe("-foo", r"D:\Ivo\project", "*.py") is None
+
+        rg_probes = [cmd for cmd in captured if cmd.startswith("rg ")]
+        assert len(rg_probes) == 2
+        for command in rg_probes:
+            assert "-e '-foo'" in command
+            assert "-- 'D:/Ivo/project'" in command
+
     @pytest.mark.windows_only
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env):
         """Windows-only: proves read_file's shell commands carry the MSYS path
