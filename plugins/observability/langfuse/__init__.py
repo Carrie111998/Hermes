@@ -914,7 +914,18 @@ def _finalize_all_traces() -> None:
             for queue in state.pending_tools_by_name.values():
                 for observation in queue:
                     _end_observation(observation)
+            for observation in state.subagents.values():
+                _end_observation(observation)
             state.root_span.end()
+            # Exit the root observation's context manager so its generator
+            # unwinds now, while opentelemetry.trace.Span is still a real
+            # type — otherwise GC closes it during interpreter teardown and
+            # use_span's isinstance(span, Span) raises TypeError.
+            if state.root_ctx is not None:
+                try:
+                    state.root_ctx.__exit__(None, None, None)
+                except Exception:  # pragma: no cover - fail-open
+                    pass
         except Exception as exc:  # pragma: no cover - fail-open
             _debug(f"atexit finalize failed for {_key}: {exc}")
     if states:
