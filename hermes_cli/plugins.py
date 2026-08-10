@@ -398,6 +398,23 @@ def _audit_mandatory_hook(
     )
 
 
+def _audit_mandatory_failure(exc: MandatoryHookError) -> None:
+    """Emit one payload-free audit outcome for a fail-closed decision."""
+    outcome_by_code = {
+        "mandatory_hook_missing": "missing",
+        "mandatory_hook_malformed_result": "malformed",
+        "mandatory_hook_exception": "exception",
+        "mandatory_hook_blocked": "blocked",
+        "mandatory_hook_config_invalid": "config_invalid",
+        "mandatory_hook_ambiguous": "ambiguous",
+    }
+    _audit_mandatory_hook(
+        exc.hook_name,
+        exc.plugin_id,
+        outcome_by_code.get(exc.code, "failed"),
+    )
+
+
 def _log_hook_callback_failure(
     hook_name: str,
     callback: Callable,
@@ -2292,11 +2309,31 @@ class PluginManager:
         Every callback owned by a configured mandatory plugin must return
         exactly ``{"action": "allow"}``. Missing callbacks, ``None``,
         exceptions, malformed directives, and explicit blocks fail closed
-        before audit, middleware, observers, or transport can run.
+        before audit, observers, or transport can run. Request/execution
+        middleware may transform the outbound payload before this final gate.
         """
         required = _get_mandatory_hook_plugins(hook_name)
         if not required:
             return [], []
+
+        resolved_required: List[str] = []
+        for configured_id in required:
+            if configured_id in self._plugins:
+                resolved = configured_id
+            else:
+                matches = sorted(
+                    key
+                    for key, plugin in self._plugins.items()
+                    if plugin.enabled and plugin.manifest.name == configured_id
+                )
+                if len(matches) > 1:
+                    raise MandatoryHookError(
+                        "mandatory_hook_ambiguous", hook_name, configured_id
+                    )
+                resolved = matches[0] if matches else configured_id
+            if resolved not in resolved_required:
+                resolved_required.append(resolved)
+        required = resolved_required
 
         callbacks = self._hooks.get(hook_name, [])
         owners = self._hook_owners.get(hook_name, [])
@@ -2570,7 +2607,11 @@ def invoke_mandatory_hook(
     **kwargs: Any,
 ) -> tuple[List[Any], List[str]]:
     """Run only configured mandatory callbacks for *hook_name*."""
-    return get_plugin_manager().invoke_mandatory_hook(hook_name, **kwargs)
+    try:
+        return get_plugin_manager().invoke_mandatory_hook(hook_name, **kwargs)
+    except MandatoryHookError as exc:
+        _audit_mandatory_failure(exc)
+        raise
 
 
 def invoke_hook_observers(
@@ -2595,10 +2636,13 @@ def invoke_hook_enforced(
         # Preserve the public observer seam (including callers/tests that patch
         # module-level invoke_hook) when no mandatory contract is configured.
         return invoke_hook(hook_name, **kwargs)
-    return get_plugin_manager().invoke_hook_enforced(
-        hook_name,
-        before_observers=before_observers,
-        **kwargs,
+    mandatory_results, mandatory_plugins = invoke_mandatory_hook(
+        hook_name, **kwargs
+    )
+    if before_observers is not None:
+        before_observers()
+    return mandatory_results + invoke_hook_observers(
+        hook_name, mandatory_plugins, **kwargs
     )
 
 

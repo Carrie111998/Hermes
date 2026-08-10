@@ -319,9 +319,11 @@ class TestMoaAggregatorSharedResolution:
         import yaml
 
         home = self._write_moa_config(tmp_path, monkeypatch)
-        cfg = yaml.safe_load((home / "config.yaml").read_text())
+        cfg = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8"))
         cfg["auxiliary"] = {"title_generation": {"provider": "moa", "model": "opus-gpt"}}
-        (home / "config.yaml").write_text(yaml.safe_dump(cfg))
+        (home / "config.yaml").write_text(
+            yaml.safe_dump(cfg), encoding="utf-8"
+        )
 
         resolved_provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(
             task="title_generation",
@@ -3162,10 +3164,13 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        yielded_events = []
+
         class _SlowAliveCreateStream:
             def __iter__(self):
-                for _ in range(5):
+                for index in range(5):
                     time.sleep(0.03)
+                    yielded_events.append(index)
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -3177,14 +3182,15 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        # Assert the timeout interrupted the live stream rather than relying
+        # on a brittle wall-clock bound that includes cold import/setup time.
+        assert len(yielded_events) < 5
 
 
 class TestCodexAuxiliaryAdapterCacheScope:
