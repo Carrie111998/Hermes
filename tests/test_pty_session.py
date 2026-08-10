@@ -161,6 +161,23 @@ async def _spawn_then_detach(reg, key, bridge):
     return session
 
 
+async def _wait_until(predicate, what, timeout=5.0):
+    """Poll until ``predicate()`` holds.
+
+    Used instead of a fixed sleep to synchronise on the non-evicted session's
+    close actually completing. That close goes through ``asyncio.to_thread``,
+    so its duration depends on thread-pool scheduling; a wall-clock guess
+    would let a loaded runner leave ``close_all()`` still inside its
+    ``_sessions`` loop and make the assertions below pass for the wrong
+    reason.
+    """
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError(f"timed out waiting for {what}")
+        await asyncio.sleep(0.001)
+
+
 @pytest.mark.asyncio
 async def test_close_all_awaits_an_in_flight_capacity_eviction():
     # A capacity eviction is popped from _sessions before its close is
@@ -178,7 +195,13 @@ async def test_close_all_awaits_an_in_flight_capacity_eviction():
         assert a_bridge.closed is False          # eviction close parked on the gate
 
         drain = asyncio.create_task(reg.close_all())
-        await asyncio.sleep(0.05)                # ample time to return if unaware
+        # Synchronise on the non-evicted session's close finishing. Until
+        # then close_all() is legitimately still busy and being unfinished
+        # would say nothing about the eviction. Once "b" is closed the only
+        # work left is the eviction drain, so the slack below is generous:
+        # a close_all() that ignores evictions returns immediately here.
+        await _wait_until(lambda: b_bridge.closed, "the non-evicted session to close")
+        await asyncio.sleep(0.05)
         awaited_the_eviction = not drain.done()
     finally:
         # Release unconditionally: a failed assertion above must not strand
@@ -252,7 +275,13 @@ async def test_close_all_drains_even_when_an_eviction_close_raises():
     try:
         await reg.attach_or_spawn("b", spawn=lambda: b_bridge)   # evicts "a"
         drain = asyncio.create_task(reg.close_all())
-        await asyncio.sleep(0.05)                # close_all reaches the gather
+        # Release the gate only once close_all() has finished its _sessions
+        # loop and can be parked on the eviction drain. Releasing earlier
+        # would let the raising close finish — and be discarded from
+        # _closing — before the gather ever snapshots it, so the drain would
+        # have nothing to re-raise and the test would pass vacuously.
+        await _wait_until(lambda: b_bridge.closed, "the non-evicted session to close")
+        await asyncio.sleep(0.05)
     finally:
         gate.set()
         if drain is not None:
