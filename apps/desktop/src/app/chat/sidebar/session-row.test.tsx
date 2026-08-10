@@ -432,9 +432,11 @@ describe('SidebarSessionRow', () => {
   })
 
   it.each([{ altKey: true }, { metaKey: true }])(
-    'does not archive a Ctrl+Shift-click with extra modifiers',
+    'keeps Ctrl+Shift-click with extra modifiers as a standalone-window gesture',
     (modifiers: { altKey?: boolean; metaKey?: boolean }) => {
       const onArchive = vi.fn()
+      const onPin = vi.fn()
+      const onResume = vi.fn()
 
       render(
         <SidebarSessionRow
@@ -442,8 +444,8 @@ describe('SidebarSessionRow', () => {
           isSelected={false}
           onArchive={onArchive}
           onDelete={noop}
-          onPin={noop}
-          onResume={noop}
+          onPin={onPin}
+          onResume={onResume}
           session={makeSession({ title: 'Keep me active' })}
         />
       )
@@ -455,6 +457,9 @@ describe('SidebarSessionRow', () => {
       })
 
       expect(onArchive).not.toHaveBeenCalled()
+      expect(onPin).not.toHaveBeenCalled()
+      expect(onResume).not.toHaveBeenCalled()
+      expect(openSession).toHaveBeenCalledWith('s1', expect.any(Function), 'window')
     }
   )
 
