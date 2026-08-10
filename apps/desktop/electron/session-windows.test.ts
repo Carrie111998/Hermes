@@ -120,6 +120,32 @@ test('registry opens one window per session and focuses on re-open', () => {
   assert.equal(win.calls.focus, 1, 'second open focuses the existing window')
 })
 
+test('registry keeps identical session ids separate across backend target scopes', () => {
+  const registry = createSessionWindowRegistry()
+  const configured = makeFakeWindow()
+  const forcedLocal = makeFakeWindow()
+
+  const first = registry.openOrFocus('s1', () => configured, { scopeId: 'configured-profile:worker' })
+  const second = registry.openOrFocus('s1', () => forcedLocal, { scopeId: 'forced-local-profile:worker' })
+
+  assert.equal(first, configured)
+  assert.equal(second, forcedLocal)
+  assert.equal(registry.size, 2)
+  assert.equal(configured.calls.focus, 0)
+})
+
+test('registry still focuses duplicate session ids within the same target scope', () => {
+  const registry = createSessionWindowRegistry()
+  const win = makeFakeWindow()
+
+  registry.openOrFocus('s1', () => win, { scopeId: 'configured-profile:worker' })
+  const duplicate = registry.openOrFocus('s1', () => makeFakeWindow(), { scopeId: 'configured-profile:worker' })
+
+  assert.equal(duplicate, win)
+  assert.equal(win.calls.focus, 1)
+  assert.equal(registry.size, 1)
+})
+
 test('registry restores + shows a minimized/hidden window on re-open', () => {
   const registry = createSessionWindowRegistry()
   const win = makeFakeWindow()

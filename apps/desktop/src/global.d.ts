@@ -12,6 +12,13 @@ import type { QuickEntryStatePush, QuickEntryStatus, QuickEntrySubmitPayload } f
 export {}
 
 declare global {
+  interface WindowBackendTargetChoice {
+    current: boolean
+    description: string
+    id: string
+    label: string
+  }
+
   interface Window {
     hermesDesktop: {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
@@ -38,7 +45,8 @@ declare global {
       // Open a new full-chrome app window — a peer instance of the primary that
       // renders the complete app against the shared backend, so the user can run
       // multiple GUI windows at once.
-      openWindow: () => Promise<{ ok: boolean; error?: string }>
+      listWindowBackendTargets: () => Promise<WindowBackendTargetChoice[]>
+      openWindow: (targetId?: string) => Promise<{ ok: boolean; error?: string }>
       // Claim a one-shot cross-window ambient cue (turn-end sound / spoken
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.
@@ -286,6 +294,7 @@ declare global {
         write: (id: string, data: string) => Promise<boolean>
       }
       onClosePreviewRequested?: (callback: () => void) => () => void
+      onNewWindowRequested?: (callback: () => void) => () => void
       onOpenFolderRequested?: (callback: () => void) => () => void
       onOpenUpdatesRequested?: (callback: () => void) => () => void
       onDeepLink?: (

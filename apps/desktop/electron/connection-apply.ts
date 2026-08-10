@@ -4,7 +4,7 @@ async function applyConnectionChange({
   rehomePrimary = null,
   scope,
   sendApplied,
-  stopPool,
+  stopProfilePool,
   teardownPrimary,
   teardownSsh
 }) {
@@ -12,7 +12,7 @@ async function applyConnectionChange({
   await teardownSsh(scope)
 
   if (!isPrimary) {
-    stopPool(scope)
+    await stopProfilePool(scope)
 
     return
   }

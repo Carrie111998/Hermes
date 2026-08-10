@@ -25,6 +25,7 @@ import {
   cookiesHaveSession,
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
+  inheritedRemoteToken,
   isGatewayAuthRejection,
   localProfileEntry,
   modeIsRemoteLike,
@@ -57,6 +58,43 @@ test('normAuthMode coerces to token unless explicitly oauth', () => {
   assert.equal(normAuthMode('token'), 'token')
   assert.equal(normAuthMode(undefined), 'token')
   assert.equal(normAuthMode('weird'), 'token')
+})
+
+test('inheritedRemoteToken retains a blank token only for an unchanged credential binding', () => {
+  const token = { encoding: 'safeStorage', value: 'ciphertext' }
+
+  assert.equal(
+    inheritedRemoteToken(
+      { authMode: 'token', mode: 'remote', token, url: 'https://gateway.example/api/' },
+      { authMode: 'token', mode: 'remote', url: 'https://gateway.example/api' }
+    ),
+    token
+  )
+  assert.equal(
+    inheritedRemoteToken(
+      { authMode: 'token', mode: 'local', token, url: 'https://gateway.example/api' },
+      { authMode: 'token', mode: 'remote', url: 'https://gateway.example/api' }
+    ),
+    token
+  )
+})
+
+test('inheritedRemoteToken retires a bearer when URL, auth mode, or provenance changes', () => {
+  const token = { encoding: 'safeStorage', value: 'ciphertext' }
+  const existing = { authMode: 'token', mode: 'remote', token, url: 'https://old.example/api' }
+
+  assert.equal(
+    inheritedRemoteToken(existing, { authMode: 'token', mode: 'remote', url: 'https://new.example/api' }),
+    undefined
+  )
+  assert.equal(
+    inheritedRemoteToken(existing, { authMode: 'oauth', mode: 'remote', url: 'https://old.example/api' }),
+    undefined
+  )
+  assert.equal(
+    inheritedRemoteToken(existing, { authMode: 'token', mode: 'cloud', url: 'https://old.example/api' }),
+    undefined
+  )
 })
 
 // --- modeIsRemoteLike ---

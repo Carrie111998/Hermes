@@ -114,15 +114,21 @@ type WindowOpenResult = { ok: boolean; error?: string } | undefined
 
 // Run a window-open bridge call, surfacing any failure as a toast. Shared by the
 // session pop-out and the new-window opener.
-async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage: string): Promise<void> {
+async function runWindowOpen(call: () => Promise<WindowOpenResult>, failMessage: string): Promise<boolean> {
   try {
     const result = await call()
 
     if (!result?.ok) {
       notifyError(new Error(result?.error || 'unknown error'), failMessage)
+
+      return false
     }
+
+    return true
   } catch (err) {
     notifyError(err, failMessage)
+
+    return false
   }
 }
 
@@ -142,10 +148,18 @@ export async function openSessionInNewWindow(sessionId: string, opts?: { watch?:
 
 // Open a new full-chrome app window — a peer instance of the primary that
 // renders the complete app against the shared backend. No-ops outside Electron.
-export async function openNewWindow(): Promise<void> {
+export async function openNewWindow(targetId?: string): Promise<boolean> {
   if (!canOpenNewWindow()) {
-    return
+    return false
   }
 
-  await runWindowOpen(() => window.hermesDesktop.openWindow(), 'Could not open a new window')
+  return runWindowOpen(() => window.hermesDesktop.openWindow(targetId), 'Could not open a new window')
+}
+
+export async function listWindowBackendTargets(): Promise<WindowBackendTargetChoice[]> {
+  if (typeof window === 'undefined' || typeof window.hermesDesktop?.listWindowBackendTargets !== 'function') {
+    return []
+  }
+
+  return window.hermesDesktop.listWindowBackendTargets()
 }

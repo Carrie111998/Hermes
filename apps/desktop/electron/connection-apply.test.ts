@@ -28,7 +28,7 @@ describe('applyConnectionChange', () => {
         isPrimary: true,
         scope: '',
         sendApplied: () => events.push('applied'),
-        stopPool: vi.fn(),
+        stopProfilePool: vi.fn(),
         teardownPrimary: async () => {
           events.push('primary')
         },
@@ -54,7 +54,7 @@ describe('applyConnectionChange', () => {
       isPrimary: false,
       scope: 'worker',
       sendApplied: () => events.push('applied'),
-      stopPool: scope => events.push(`pool:${scope}`),
+      stopProfilePool: scope => events.push(`pool:${scope}`),
       teardownPrimary: async () => {
         events.push('primary')
       },
@@ -63,6 +63,39 @@ describe('applyConnectionChange', () => {
       }
     })
     expect(events).toEqual(['cancel:worker', 'ssh:worker', 'pool:worker'])
+  })
+
+  it('does not finish a profile apply until every profile pool backend is stopped', async () => {
+    const gate = deferred()
+    const events: string[] = []
+    let completed = false
+
+    const run = applyConnectionChange({
+      cancelAndWait: async () => {
+        events.push('cancel')
+      },
+      isPrimary: false,
+      scope: 'worker',
+      sendApplied: vi.fn(),
+      stopProfilePool: async () => {
+        events.push('pool')
+        await gate.promise
+        events.push('pool-stopped')
+      },
+      teardownPrimary: vi.fn(),
+      teardownSsh: async () => {
+        events.push('ssh')
+      }
+    }).then(() => {
+      completed = true
+    })
+
+    await vi.waitFor(() => expect(events).toEqual(['cancel', 'ssh', 'pool']))
+    expect(completed).toBe(false)
+
+    gate.resolve()
+    await run
+    expect(events).toEqual(['cancel', 'ssh', 'pool', 'pool-stopped'])
   })
 })
 

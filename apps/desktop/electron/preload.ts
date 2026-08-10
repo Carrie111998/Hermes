@@ -6,7 +6,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
-  openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
+  listWindowBackendTargets: () => ipcRenderer.invoke('hermes:window:listBackendTargets'),
+  openWindow: targetId => ipcRenderer.invoke('hermes:window:openInstance', targetId),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
   wakeIndicator: {
     getState: () => ipcRenderer.invoke('hermes:wake-indicator:get'),
@@ -261,6 +262,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:close-preview-requested', listener)
 
     return () => ipcRenderer.removeListener('hermes:close-preview-requested', listener)
+  },
+  onNewWindowRequested: callback => {
+    const listener = () => callback()
+    ipcRenderer.on('hermes:new-window-requested', listener)
+
+    return () => ipcRenderer.removeListener('hermes:new-window-requested', listener)
   },
   onOpenFolderRequested: callback => {
     const listener = () => callback()

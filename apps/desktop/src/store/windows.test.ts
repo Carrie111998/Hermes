@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { canOpenNewWindow, canOpenSessionWindow, openNewWindow, openSessionInNewWindow } from './windows'
+import {
+  canOpenNewWindow,
+  canOpenSessionWindow,
+  listWindowBackendTargets,
+  openNewWindow,
+  openSessionInNewWindow
+} from './windows'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
 const initialHermesDesktop = desktopWindow.hermesDesktop
@@ -13,11 +19,13 @@ vi.mock('./notifications', () => ({
 
 function installBridge(
   openSessionWindow?: Window['hermesDesktop']['openSessionWindow'],
-  openWindow?: Window['hermesDesktop']['openWindow']
+  openWindow?: Window['hermesDesktop']['openWindow'],
+  listBackendTargets?: Window['hermesDesktop']['listWindowBackendTargets']
 ) {
   desktopWindow.hermesDesktop = {
     ...(openSessionWindow ? { openSessionWindow } : {}),
-    ...(openWindow ? { openWindow } : {})
+    ...(openWindow ? { openWindow } : {}),
+    ...(listBackendTargets ? { listWindowBackendTargets: listBackendTargets } : {})
   } as unknown as Window['hermesDesktop']
 }
 
@@ -144,7 +152,7 @@ describe('openNewWindow', () => {
     const openWindow = vi.fn().mockResolvedValue({ ok: true })
     installBridge(undefined, openWindow)
 
-    await openNewWindow()
+    expect(await openNewWindow()).toBe(true)
 
     expect(openWindow).toHaveBeenCalledTimes(1)
     expect(notifyError).not.toHaveBeenCalled()
@@ -153,8 +161,36 @@ describe('openNewWindow', () => {
   it('notifies on an ok:false result', async () => {
     installBridge(undefined, vi.fn().mockResolvedValue({ ok: false, error: 'nope' }))
 
-    await openNewWindow()
+    expect(await openNewWindow()).toBe(false)
 
     expect(notifyError).toHaveBeenCalledTimes(1)
+  })
+
+  it('forwards an opaque backend target id', async () => {
+    const openWindow = vi.fn().mockResolvedValue({ ok: true })
+    installBridge(undefined, openWindow)
+
+    expect(await openNewWindow('forced-local-profile:coder')).toBe(true)
+    expect(openWindow).toHaveBeenCalledWith('forced-local-profile:coder')
+  })
+})
+
+describe('listWindowBackendTargets', () => {
+  it('returns an empty list when the bridge is unavailable', async () => {
+    delete desktopWindow.hermesDesktop
+
+    await expect(listWindowBackendTargets()).resolves.toEqual([])
+  })
+
+  it('returns only the safe choices exposed by main', async () => {
+    const choices = [
+      { current: true, description: 'Current backend', id: 'primary', label: 'Current backend' }
+    ]
+
+    const list = vi.fn().mockResolvedValue(choices)
+    installBridge(undefined, undefined, list)
+
+    await expect(listWindowBackendTargets()).resolves.toEqual(choices)
+    expect(list).toHaveBeenCalledTimes(1)
   })
 })

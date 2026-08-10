@@ -2,7 +2,15 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
+import { makeBackendTarget } from './backend-target'
+import {
+  createProfileRevocationGuard,
+  decideProfileDeleteAction,
+  profileNameFromCreateRequest,
+  profileNameFromDeleteRequest,
+  removeProfileConnectionOverride,
+  resolveRouteTarget
+} from './profile-delete-routing'
 
 // ---------------------------------------------------------------------------
 // profileNameFromDeleteRequest
@@ -30,6 +38,26 @@ test('profileNameFromDeleteRequest returns null for an empty/whitespace name', (
 
 test('profileNameFromDeleteRequest returns null for an undecodable path segment', () => {
   assert.equal(profileNameFromDeleteRequest({ method: 'DELETE', path: '/api/profiles/%E0%A4%A' }), null)
+})
+
+test('profileNameFromCreateRequest parses a valid POST /api/profiles body', () => {
+  assert.equal(
+    profileNameFromCreateRequest({ method: 'POST', path: '/api/profiles', body: { name: 'Worker' } }),
+    'worker'
+  )
+})
+
+test('profileNameFromCreateRequest parses a query-bearing profile collection path', () => {
+  assert.equal(
+    profileNameFromCreateRequest({ method: 'POST', path: '/api/profiles?source=desktop', body: { name: 'Worker' } }),
+    'worker'
+  )
+})
+
+test('profileNameFromCreateRequest rejects other methods, paths, and invalid names', () => {
+  assert.equal(profileNameFromCreateRequest({ method: 'GET', path: '/api/profiles', body: { name: 'worker' } }), null)
+  assert.equal(profileNameFromCreateRequest({ method: 'POST', path: '/api/profiles/worker', body: { name: 'worker' } }), null)
+  assert.equal(profileNameFromCreateRequest({ method: 'POST', path: '/api/profiles', body: { name: '../worker' } }), null)
 })
 
 // ---------------------------------------------------------------------------
@@ -66,17 +94,130 @@ test('decideProfileDeleteAction tears down the pool backend for any other valid 
 })
 
 // ---------------------------------------------------------------------------
-// resolveRouteProfile
+// resolveRouteTarget
 // ---------------------------------------------------------------------------
 
-test('resolveRouteProfile routes to the primary backend (null) when a profile was torn down', () => {
-  assert.equal(resolveRouteProfile('worker', 'other-profile'), null)
+test('resolveRouteTarget routes deletion through primary instead of recreating the deleted target', () => {
+  assert.deepEqual(
+    resolveRouteTarget('worker', makeBackendTarget({ kind: 'configured-profile', profile: 'worker' })),
+    makeBackendTarget({ kind: 'primary' })
+  )
 })
 
-test('resolveRouteProfile passes the requested profile through when nothing was torn down', () => {
-  assert.equal(resolveRouteProfile(null, 'other-profile'), 'other-profile')
+test('resolveRouteTarget preserves the already-authorized target when nothing was torn down', () => {
+  const target = makeBackendTarget({ kind: 'configured-profile', profile: 'worker' })
+
+  assert.deepEqual(resolveRouteTarget(null, target), target)
 })
 
-test('resolveRouteProfile passes through undefined when nothing was torn down and no profile was requested', () => {
-  assert.equal(resolveRouteProfile(null, undefined), undefined)
+test('profile revocation guard remains revoked until explicitly restored', () => {
+  const guard = createProfileRevocationGuard()
+
+  assert.equal(guard.isRevoked('worker'), false)
+  guard.revoke('worker')
+  assert.equal(guard.isRevoked('worker'), true)
+  guard.restore('worker')
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('a current successful deletion retires its tombstone and reports the connection profile to remove', () => {
+  const guard = createProfileRevocationGuard()
+  const creation = guard.startCreation('worker')
+  const deletion = guard.revoke('worker')
+
+  guard.completeMutation({ mutation: creation, succeeded: true })
+  assert.equal(guard.isRevoked('worker'), true)
+  const completion = guard.completeMutation({ mutation: deletion, succeeded: true })
+
+  assert.deepEqual(completion, { retiredProfile: 'worker' })
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('a creation completing after deletion restores the recreated profile', () => {
+  const guard = createProfileRevocationGuard()
+  const deletion = guard.revoke('worker')
+
+  assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: true }), {
+    retiredProfile: 'worker'
+  })
+  const creation = guard.startCreation('worker')
+  guard.completeMutation({ mutation: creation, succeeded: true })
+
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('an ambiguous deletion failure remains revoked fail closed', () => {
+  const guard = createProfileRevocationGuard()
+  const deletion = guard.revoke('worker')
+
+  assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: false }), {
+    retiredProfile: null
+  })
+
+  assert.equal(guard.isRevoked('worker'), true)
+})
+
+test('a create that started before a later delete cannot clear the newer tombstone', () => {
+  const guard = createProfileRevocationGuard()
+  const staleCreate = guard.startCreation('worker')
+  const deletion = guard.revoke('worker')
+
+  assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: true }), {
+    retiredProfile: 'worker'
+  })
+  guard.completeMutation({ mutation: staleCreate, succeeded: true })
+
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('a successful create that started after a delete restores once that older delete drains', () => {
+  const guard = createProfileRevocationGuard()
+  const deletion = guard.revoke('worker')
+  const recreation = guard.startCreation('worker')
+
+  guard.completeMutation({ mutation: recreation, succeeded: true })
+  assert.equal(guard.isRevoked('worker'), true)
+
+  assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: true }), {
+    retiredProfile: null
+  })
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('successful unique deletions do not retain old tombstones', () => {
+  const guard = createProfileRevocationGuard()
+
+  for (let index = 0; index < 5_000; index += 1) {
+    const profile = `worker-${index}`
+    const deletion = guard.revoke(profile)
+
+    assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: true }), {
+      retiredProfile: profile
+    })
+  }
+
+  assert.equal(guard.isRevoked('worker-0'), false)
+  assert.equal(guard.isRevoked('worker-4999'), false)
+})
+
+test('removeProfileConnectionOverride removes only the deleted profile without mutating input', () => {
+  const original = {
+    mode: 'remote',
+    remote: { url: 'https://primary.example' },
+    profiles: {
+      coder: { mode: 'remote', url: 'https://coder.example' },
+      worker: { mode: 'remote', url: 'https://worker.example' }
+    }
+  }
+
+  const next = removeProfileConnectionOverride(original, 'worker')
+
+  assert.deepEqual(next, {
+    mode: 'remote',
+    remote: { url: 'https://primary.example' },
+    profiles: {
+      coder: { mode: 'remote', url: 'https://coder.example' }
+    }
+  })
+  assert.equal('worker' in original.profiles, true)
 })

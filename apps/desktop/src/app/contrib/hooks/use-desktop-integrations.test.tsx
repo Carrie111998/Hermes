@@ -10,7 +10,14 @@ import { useDesktopIntegrations } from './use-desktop-integrations'
 // Mutable HUD-window flag so the restore tests can flip the window kind the
 // hook believes it runs in. Default false keeps the pre-existing restore
 // coverage exercising the real main-window path.
-const { hudWindowMock } = vi.hoisted(() => ({ hudWindowMock: vi.fn(() => false) }))
+const { hudWindowMock, requestNewWindowMock } = vi.hoisted(() => ({
+  hudWindowMock: vi.fn(() => false),
+  requestNewWindowMock: vi.fn()
+}))
+
+vi.mock('@/store/window-backend-picker', () => ({
+  requestNewWindow: () => requestNewWindowMock()
+}))
 
 vi.mock('@/store/windows', async importOriginal => {
   const actual = await importOriginal<typeof WindowsStore>()
@@ -59,6 +66,7 @@ describe('useDesktopIntegrations', () => {
     navigate = vi.fn()
     // Every test starts as a main window; only the HUD describe flips this.
     hudWindowMock.mockReturnValue(false)
+    requestNewWindowMock.mockReset()
 
     // Stub the desktop bridge so the hook's useEffect callbacks don't try to
     // reach real Electron IPC. The established desktop-test pattern assigns a
@@ -71,6 +79,7 @@ describe('useDesktopIntegrations', () => {
       onDeepLink: vi.fn(),
       signalDeepLinkReady: vi.fn(),
       onClosePreviewRequested: vi.fn(),
+      onNewWindowRequested: vi.fn(),
       onOpenFolderRequested: vi.fn()
     } as unknown as Window['hermesDesktop']
   })
@@ -132,6 +141,17 @@ describe('useDesktopIntegrations', () => {
       }
     )
   }
+
+  it('routes the native File menu new-window request through the renderer policy', () => {
+    render()
+
+    const subscribe = vi.mocked(desktopWindow.hermesDesktop!.onNewWindowRequested!)
+    const callback = subscribe.mock.calls[0]?.[0]
+
+    expect(callback).toBeTypeOf('function')
+    callback?.()
+    expect(requestNewWindowMock).toHaveBeenCalledTimes(1)
+  })
 
   describe('profile-ready gate', () => {
     it('does NOT restore before profileReady is true', () => {

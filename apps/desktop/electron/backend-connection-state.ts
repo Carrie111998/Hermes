@@ -8,14 +8,53 @@ export type BackendProcessOwner<TProcess> = {
   process: TProcess
 }
 
+interface BackendAttemptInvalidator<TProcess, TConnection> {
+  invalidateAttempt(attempt: BackendConnectionAttempt<TConnection>): {
+    process: TProcess | null
+    promise: Promise<TConnection> | null
+  } | null
+}
+
+export function invalidateAndStopBackendAttempt<TProcess, TConnection>(
+  state: BackendAttemptInvalidator<TProcess, TConnection>,
+  attempt: BackendConnectionAttempt<TConnection>,
+  stopProcess: (process: TProcess) => void
+): boolean {
+  const failed = state.invalidateAttempt(attempt)
+
+  if (!failed) {
+    return false
+  }
+
+  if (failed.process !== null) {
+    stopProcess(failed.process)
+  }
+
+  return true
+}
+
 export function createBackendConnectionState<TProcess, TConnection>() {
   let generation = 0
   let process: TProcess | null = null
   let promise: Promise<TConnection> | null = null
 
+  const invalidateSnapshot = () => {
+    const snapshot = { process, promise }
+
+    generation += 1
+    process = null
+    promise = null
+
+    return snapshot
+  }
+
   return {
     startAttempt(): BackendConnectionAttempt<TConnection> {
       return { generation, promise: null }
+    },
+
+    isCurrentAttempt(attempt: BackendConnectionAttempt<TConnection>): boolean {
+      return attempt.generation === generation
     },
 
     setPromise(attempt: BackendConnectionAttempt<TConnection>, nextPromise: Promise<TConnection>): boolean {
@@ -63,6 +102,14 @@ export function createBackendConnectionState<TProcess, TConnection>() {
       return true
     },
 
+    invalidateAttempt(attempt: BackendConnectionAttempt<TConnection>) {
+      if (attempt.generation !== generation || (promise !== null && attempt.promise !== promise)) {
+        return null
+      }
+
+      return invalidateSnapshot()
+    },
+
     getProcess(): TProcess | null {
       return process
     },
@@ -71,14 +118,10 @@ export function createBackendConnectionState<TProcess, TConnection>() {
       return promise
     },
 
+    invalidateSnapshot,
+
     invalidate(): TProcess | null {
-      const currentProcess = process
-
-      generation += 1
-      process = null
-      promise = null
-
-      return currentProcess
+      return invalidateSnapshot().process
     }
   }
 }

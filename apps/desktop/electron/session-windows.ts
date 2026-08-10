@@ -100,8 +100,15 @@ function instanceWindowBounds(base: { x: number; y: number; width: number; heigh
 function createSessionWindowRegistry() {
   const windows = new Map()
 
-  function openOrFocus(sessionId, factory) {
-    const key = typeof sessionId === 'string' ? sessionId.trim() : ''
+  function registryKey(sessionId, scopeId = 'primary') {
+    const session = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const scope = typeof scopeId === 'string' && scopeId.trim() ? scopeId.trim() : 'primary'
+
+    return session ? `${scope}\u0000${session}` : ''
+  }
+
+  function openOrFocus(sessionId, factory, { scopeId = 'primary' }: any = {}) {
+    const key = registryKey(sessionId, scopeId)
 
     if (!key) {
       return null
@@ -124,7 +131,8 @@ function createSessionWindowRegistry() {
       return existing
     }
 
-    const win = factory(key)
+    const normalizedSessionId = typeof sessionId === 'string' ? sessionId.trim() : ''
+    const win = factory(normalizedSessionId)
 
     if (!win) {
       return null
@@ -144,8 +152,8 @@ function createSessionWindowRegistry() {
 
   return {
     openOrFocus,
-    get: key => windows.get(key),
-    has: key => windows.has(key),
+    get: (sessionId, options: any = {}) => windows.get(registryKey(sessionId, options.scopeId)),
+    has: (sessionId, options: any = {}) => windows.has(registryKey(sessionId, options.scopeId)),
     get size() {
       return windows.size
     }

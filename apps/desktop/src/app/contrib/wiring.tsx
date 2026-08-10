@@ -120,6 +120,7 @@ import {
 } from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
+import { WindowBackendPickerOverlay } from '../window-backend-picker-overlay'
 
 import { ContribWiringContext } from './context'
 import { useBackgroundSync } from './hooks/use-background-sync'
@@ -1048,6 +1049,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <GatewayConnectingOverlay />
       <BootFailureOverlay />
       <CommandPalette />
+      <WindowBackendPickerOverlay />
       <PetGenerateOverlay />
       <SessionSwitcher />
       <FileActionDialogs />

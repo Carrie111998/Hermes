@@ -3,6 +3,7 @@ import type { FirstRunSetupDecision } from './first-run-setup-gate'
 export interface PrimaryBackendStartupOptions<Backend, RuntimeBackend, Remote, Connection> {
   connectRemote: (remote: Remote) => Promise<Connection>
   ensureLocalRuntime: (backend: Backend) => Promise<RuntimeBackend>
+  ensureCurrent: () => void
   prepareLocalBackend: () => Backend | Promise<Backend>
   resolveRemote: () => Promise<Remote | null>
   waitForDecision: (backend: Backend) => Promise<FirstRunSetupDecision>
@@ -29,6 +30,7 @@ export class FirstRunSetupResetError extends Error {
 export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, Connection>({
   connectRemote,
   ensureLocalRuntime,
+  ensureCurrent,
   prepareLocalBackend,
   resolveRemote,
   waitForDecision,
@@ -37,29 +39,43 @@ export async function runPrimaryBackendStartup<Backend, RuntimeBackend, Remote, 
   PrimaryBackendStartupResult<RuntimeBackend, Connection>
 > {
   const savedRemote = await resolveRemote()
+  ensureCurrent()
 
   if (savedRemote) {
-    return { kind: 'remote', connection: await connectRemote(savedRemote) }
+    const connection = await connectRemote(savedRemote)
+    ensureCurrent()
+
+    return { kind: 'remote', connection }
   }
 
   await waitForLocalStart()
+  ensureCurrent()
 
   const backend = await prepareLocalBackend()
+  ensureCurrent()
   const decision = await waitForDecision(backend)
+  ensureCurrent()
 
   if (decision === 'remote-applied') {
     const appliedRemote = await resolveRemote()
+    ensureCurrent()
 
     if (!appliedRemote) {
       throw new Error('First-run remote setup completed without a saved remote backend.')
     }
 
-    return { kind: 'remote', connection: await connectRemote(appliedRemote) }
+    const connection = await connectRemote(appliedRemote)
+    ensureCurrent()
+
+    return { kind: 'remote', connection }
   }
 
   if (decision === 'reset') {
     throw new FirstRunSetupResetError()
   }
 
-  return { kind: 'local', backend: await ensureLocalRuntime(backend) }
+  const runtimeBackend = await ensureLocalRuntime(backend)
+  ensureCurrent()
+
+  return { kind: 'local', backend: runtimeBackend }
 }

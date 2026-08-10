@@ -205,6 +205,37 @@ function normAuthMode(mode) {
   return mode === 'oauth' ? 'oauth' : 'token'
 }
 
+/**
+ * Reuse a saved static bearer only when the edited connection still names the
+ * same credential binding. Scope is enforced by the caller selecting the
+ * existing block for that profile before calling this helper.
+ *
+ * Global local mode intentionally keeps its last remote block as an inactive
+ * draft, so local -> remote may restore that exact binding. Cloud provenance
+ * is never interchangeable with a user-entered remote connection.
+ */
+function inheritedRemoteToken(existing: any = {}, next: any = {}) {
+  if (!existing.token || normAuthMode(existing.authMode) !== 'token' || normAuthMode(next.authMode) !== 'token') {
+    return undefined
+  }
+
+  const sameProvenance = existing.mode === next.mode || (existing.mode === 'local' && next.mode === 'remote')
+
+  if (!sameProvenance) {
+    return undefined
+  }
+
+  try {
+    if (normalizeRemoteBaseUrl(existing.url) !== normalizeRemoteBaseUrl(next.url)) {
+      return undefined
+    }
+  } catch {
+    return undefined
+  }
+
+  return existing.token
+}
+
 // True for connection modes that resolve to a REMOTE backend. 'cloud' is a
 // Hermes Cloud connection (cloud-auto-discovery Q3/Q6): it carries a
 // remote-shaped block and reuses the entire remote connect/probe/reconnect
@@ -569,6 +600,7 @@ export {
   gatewayTicketFailure,
   gatewayWsUrlIpcResult,
   hostLabelFromBaseUrl,
+  inheritedRemoteToken,
   isGatewayAuthRejection,
   localProfileEntry,
   modeIsRemoteLike,

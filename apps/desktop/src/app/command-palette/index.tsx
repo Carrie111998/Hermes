@@ -79,7 +79,8 @@ import {
   $updateStatus,
   requestActiveUpdate
 } from '@/store/updates'
-import { canOpenNewWindow, openNewWindow } from '@/store/windows'
+import { openWindowBackendPicker, requestNewWindow } from '@/store/window-backend-picker'
+import { canOpenNewWindow } from '@/store/windows'
 import { luminance } from '@/themes/color'
 import { type ThemeMode, useTheme } from '@/themes/context'
 import { isUserTheme, resolveTheme } from '@/themes/user-themes'
@@ -765,7 +766,14 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                   id: 'nav-new-window',
                   keywords: ['window', 'instance', 'open', 'new'],
                   label: t.keybinds.actions['session.newWindow'],
-                  run: () => void openNewWindow()
+                  run: () => void requestNewWindow()
+                },
+                {
+                  icon: AppWindow,
+                  id: 'nav-new-window-with-backend',
+                  keywords: ['window', 'backend', 'profile', 'local', 'remote'],
+                  label: t.windowBackend.openWithBackend,
+                  run: openWindowBackendPicker
                 }
               ]
             : []),

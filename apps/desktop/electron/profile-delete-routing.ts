@@ -9,6 +9,10 @@
 //
 // These helpers are pure so they can be unit-tested without Electron.
 
+import { type BackendTarget, makeBackendTarget } from './backend-target'
+import { PROFILE_NAME_RE } from './profile-name'
+import { isProfileCollectionPath, profileNameFromRequestPath, requestPathname } from './profile-request-path'
+
 /**
  * Parse a `hermes:api` request into the profile name a DELETE targets, or
  * null when the request is not a profile-delete at all (wrong method, wrong
@@ -19,21 +23,13 @@ export function profileNameFromDeleteRequest(request) {
     return null
   }
 
-  const match = String(request.path || '').match(/^\/api\/profiles\/([^/?#]+)(?:[?#].*)?$/)
+  const pathname = requestPathname(request.path)
 
-  if (!match) {
+  if (!pathname || !/^\/api\/profiles\/[^/]+$/.test(pathname)) {
     return null
   }
 
-  let raw = ''
-
-  try {
-    raw = decodeURIComponent(match[1])
-  } catch {
-    return null
-  }
-
-  const name = raw.trim()
+  const name = profileNameFromRequestPath(request.path)
 
   if (!name) {
     return null
@@ -43,7 +39,204 @@ export function profileNameFromDeleteRequest(request) {
     return 'default'
   }
 
-  return name.toLowerCase()
+  return name
+}
+
+export function profileNameFromCreateRequest(request) {
+  if (
+    !request ||
+    String(request.method || 'GET').toUpperCase() !== 'POST' ||
+    !isProfileCollectionPath(request.path)
+  ) {
+    return null
+  }
+
+  const name = typeof request.body?.name === 'string' ? request.body.name.trim().toLowerCase() : ''
+
+  return PROFILE_NAME_RE.test(name) && name !== 'default' ? name : null
+}
+
+export function createProfileRevocationGuard() {
+  const revoked = new Set<string>()
+  const pendingDeletes = new Map<string, number>()
+  const latestMutations = new Map<string, ProfileMutationToken>()
+  const successfulCreates = new Set<number>()
+  const successfulDeletes = new Set<number>()
+  const retirableDeletes = new Set<number>()
+  let nextEpoch = 0
+
+  const startMutation = (profile: string, kind: ProfileMutationKind): ProfileMutationToken => {
+    const previous = latestMutations.get(profile)
+
+    if (previous) {
+      successfulCreates.delete(previous.epoch)
+      successfulDeletes.delete(previous.epoch)
+      retirableDeletes.delete(previous.epoch)
+    }
+
+    const mutation = { epoch: ++nextEpoch, kind, profile }
+
+    latestMutations.set(profile, mutation)
+
+    return mutation
+  }
+
+  const forgetLatestMutation = (profile: string, clearRevocation: boolean): void => {
+    const latest = latestMutations.get(profile)
+
+    if (latest) {
+      successfulCreates.delete(latest.epoch)
+      successfulDeletes.delete(latest.epoch)
+      retirableDeletes.delete(latest.epoch)
+    }
+
+    latestMutations.delete(profile)
+
+    if (clearRevocation) {
+      revoked.delete(profile)
+    }
+  }
+
+  const restoreLatestSuccessfulCreate = (profile: string): boolean => {
+    const latest = latestMutations.get(profile)
+
+    if (
+      latest?.kind === 'create' &&
+      successfulCreates.has(latest.epoch) &&
+      !pendingDeletes.has(profile)
+    ) {
+      forgetLatestMutation(profile, true)
+
+      return true
+    }
+
+    return false
+  }
+
+  const retireLatestSuccessfulDelete = (profile: string): boolean => {
+    const latest = latestMutations.get(profile)
+
+    if (
+      latest?.kind === 'delete' &&
+      successfulDeletes.has(latest.epoch) &&
+      !pendingDeletes.has(profile)
+    ) {
+      const canRetire = retirableDeletes.has(latest.epoch)
+
+      forgetLatestMutation(profile, canRetire)
+
+      return canRetire
+    }
+
+    return false
+  }
+
+  return {
+    isRevoked(profile: string): boolean {
+      return revoked.has(profile)
+    },
+    isCurrent(mutation: ProfileMutationToken): boolean {
+      return latestMutations.get(mutation.profile)?.epoch === mutation.epoch
+    },
+    startCreation(profile: string): ProfileMutationToken {
+      return startMutation(profile, 'create')
+    },
+    revoke(profile: string): ProfileMutationToken {
+      const mutation = startMutation(profile, 'delete')
+
+      revoked.add(profile)
+      pendingDeletes.set(profile, (pendingDeletes.get(profile) || 0) + 1)
+
+      return mutation
+    },
+    restore(profile: string): void {
+      pendingDeletes.delete(profile)
+      forgetLatestMutation(profile, true)
+    },
+    completeMutation({
+      mutation,
+      retireSucceeded = true,
+      succeeded
+    }: {
+      mutation: ProfileMutationToken
+      retireSucceeded?: boolean
+      succeeded: boolean
+    }): ProfileMutationCompletion {
+      const { epoch, kind, profile } = mutation
+
+      if (kind === 'delete') {
+        const pending = pendingDeletes.get(profile) || 0
+
+        if (pending > 1) {
+          pendingDeletes.set(profile, pending - 1)
+        } else {
+          pendingDeletes.delete(profile)
+        }
+
+        if (latestMutations.get(profile)?.epoch === epoch) {
+          if (succeeded) {
+            successfulDeletes.add(epoch)
+
+            if (retireSucceeded) {
+              retirableDeletes.add(epoch)
+            }
+          } else {
+            // Ambiguous response failure remains fail-closed. A later
+            // successful creation is the only event that restores authority.
+            revoked.add(profile)
+          }
+        }
+
+        if (restoreLatestSuccessfulCreate(profile)) {
+          return { retiredProfile: null }
+        }
+
+        return {
+          retiredProfile: retireLatestSuccessfulDelete(profile) ? profile : null
+        }
+      }
+
+      if (succeeded && latestMutations.get(profile)?.epoch === epoch) {
+        successfulCreates.add(epoch)
+        restoreLatestSuccessfulCreate(profile)
+      } else if (!succeeded && latestMutations.get(profile)?.epoch === epoch && !pendingDeletes.has(profile)) {
+        // A failed standalone create needs no tombstone and must not retain its
+        // mutation token. Preserve any earlier deletion revocation.
+        forgetLatestMutation(profile, false)
+      }
+
+      return { retiredProfile: null }
+    }
+  }
+}
+
+export type ProfileMutationKind = 'create' | 'delete'
+
+export interface ProfileMutationToken {
+  epoch: number
+  kind: ProfileMutationKind
+  profile: string
+}
+
+export interface ProfileMutationCompletion {
+  retiredProfile: string | null
+}
+
+export interface DesktopConnectionConfigLike {
+  [key: string]: unknown
+  profiles?: Record<string, unknown>
+}
+
+/** Remove one deleted profile route without changing global or sibling settings. */
+export function removeProfileConnectionOverride<T extends DesktopConnectionConfigLike>(
+  config: T,
+  profile: string
+): T {
+  const profiles = { ...(config.profiles || {}) }
+
+  delete profiles[profile]
+
+  return { ...config, profiles }
 }
 
 export type ProfileDeleteAction = 'noop' | 'teardown-primary' | 'teardown-pool'
@@ -87,9 +280,6 @@ export function decideProfileDeleteAction(
  * spawn a fresh pool backend for the deleted profile, whose
  * ensure_hermes_home() recreates the directory the delete just removed.
  */
-export function resolveRouteProfile(
-  tornDownProfile: string | null,
-  profile: string | undefined
-): string | null | undefined {
-  return tornDownProfile ? null : profile
+export function resolveRouteTarget(tornDownProfile: string | null, authorizedTarget: BackendTarget): BackendTarget {
+  return tornDownProfile ? makeBackendTarget({ kind: 'primary' }) : authorizedTarget
 }

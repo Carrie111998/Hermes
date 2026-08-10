@@ -14,6 +14,7 @@ import {
 } from '@/store/session'
 import { onSessionsChanged } from '@/store/session-sync'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '@/store/updates'
+import { requestNewWindow } from '@/store/window-backend-picker'
 import { isHudWindow, isSecondaryWindow } from '@/store/windows'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -223,6 +224,15 @@ export function useDesktopIntegrations({
 
     return () => unsubscribe?.()
   }, [navigate])
+
+  // File > New Window — same persisted backend policy as the keyboard shortcut
+  // and Command Center. Main sends this to the exact menu window, and the
+  // eventual openInstance IPC derives inheritance from that renderer sender.
+  useEffect(() => {
+    const unsubscribe = window.hermesDesktop?.onNewWindowRequested?.(() => void requestNewWindow())
+
+    return () => unsubscribe?.()
+  }, [])
 
   // File > Open Folder… — same open-folder-as-project upsert as the ⌘O keybind.
   useEffect(() => {
