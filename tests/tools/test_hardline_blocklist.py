@@ -216,6 +216,11 @@ _WINDOWS_ROOT_DELETE_BLOCK = [
     "echo $(cmd /d /c rd /s /q K:/)",
     "cmd /c rd /s /q L:\\.",
     "cmd /c rd M:/.. /s /q",
+    'powershell -ExecutionPolicy Bypass -Command "cmd /c rd /s /q N:\\"',
+    "command -- cmd /c rd /s /q O:/",
+    "C:\\Windows\\System32\\cmd.exe /c rd /s /q P:/",
+    "cmd /c rd /s /q Q:\\folder\\..",
+    "cmd /c rd /s /q \\\\server\\share\\folder\\..",
     (
         r'''powershell -NoProfile -Command 'cmd /c \"rd /s /q '''
         r'''\\\"C:\Users\Art\Documents\ChatGPT\Software\clipsift-release\\\"\"' '''
@@ -230,6 +235,8 @@ _WINDOWS_ROOT_DELETE_ALLOW = [
     "cmd /d /c rd /s /q E:\\scoped",
     "cmd /c rd /s /q F:\\...",
     "cmd /c rd /s /q G:\\.config",
+    "cmd /c rd /s /q H:\\folder\\..\\kept",
+    'powershell -File script.ps1 -Command "cmd /c rd /s /q I:\\"',
     r'''cmd /c "rd /s /q \"C:\Users\Art\Documents\clipsift-release\""''',
     'echo "cmd /c rd /s /q C:\\"',
     'echo "cmd /d /c rd /s /q D:\\"',
@@ -271,6 +278,8 @@ def test_windows_scoped_or_non_recursive_delete_is_not_hardline(command):
     [
         _WINDOWS_ROOT_DELETE_BLOCK[2],
         _WINDOWS_ROOT_DELETE_BLOCK[5],
+        _WINDOWS_ROOT_DELETE_BLOCK[-6],
+        _WINDOWS_ROOT_DELETE_BLOCK[-3],
         _WINDOWS_ROOT_DELETE_BLOCK[-1],
     ],
 )

@@ -14,6 +14,7 @@ import fnmatch
 import functools
 import hashlib
 import logging
+import ntpath
 import os
 import re
 import shlex
@@ -435,15 +436,30 @@ _RM_FLAG_PREFIX = _CMDPOS + r'rm\s+(-[^\s]*\s+)*'
 # bypass just like ``rm -rf /``.  ``cmd`` accepts its own switches before
 # ``/c`` or ``/k``; those switches must be consumed by the cmd-owned prefix
 # rather than mistaken for the nested command payload.
-_WINDOWS_CMD_INVOKE = (
-    r'cmd(?:\.exe)?'
-    r'(?:\s+/(?:d|q|a|u|s|e:(?:on|off)|f:(?:on|off)|v:(?:on|off)))*'
-    r'\s+/(?:c|k)\s+'
+_WINDOWS_CMD_EXECUTABLE = (
+    r'["\']?'
+    r'(?:(?:[a-z]:)?[\\/]+)?(?:[^\s\\/"\']+[\\/])*'
+    r'cmd(?:\.exe)?["\']?'
 )
-_WINDOWS_CMD_PREFIX = _CMDPOS + _WINDOWS_CMD_INVOKE
+_WINDOWS_COMMAND_WRAPPERS = (
+    r'(?:(?:command(?:\s+--)?|builtin\s+command(?:\s+--)?)\s+)*'
+)
+_WINDOWS_CMD_INVOKE = (
+    _WINDOWS_CMD_EXECUTABLE
+    + r'(?:\s+/(?:d|q|a|u|s|e:(?:on|off)|f:(?:on|off)|v:(?:on|off)))*'
+    + r'\s+/(?:c|k)\s+'
+)
+_WINDOWS_CMD_PREFIX = _CMDPOS + _WINDOWS_COMMAND_WRAPPERS + _WINDOWS_CMD_INVOKE
+_WINDOWS_POWERSHELL_OPTION_WITH_ARG = (
+    r'-(?:executionpolicy|inputformat|outputformat|windowstyle|workingdirectory|'
+    r'configurationname|settingsfile|version)\s+\S+'
+)
 _WINDOWS_POWERSHELL_CMD_PREFIX = (
     _CMDPOS
-    + r'(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+'
+    + _WINDOWS_COMMAND_WRAPPERS
+    + r'(?:powershell|pwsh)(?:\.exe)?\b'
+    + r'(?:\s+(?:' + _WINDOWS_POWERSHELL_OPTION_WITH_ARG
+    + r'|-(?!(?:command|c)\b)\S+))*\s+'
     + r'-(?:command|c)\s+["\']?'
     + _WINDOWS_CMD_INVOKE
 )
@@ -487,6 +503,11 @@ _WINDOWS_ROOT_DELETE_PATTERN = (
     + _WINDOWS_RECURSIVE_FLAGS_PREFIX
     + r'[\\/]+["\'][a-z]:[\\/]'
     + r')'
+)
+_WINDOWS_RD_INVOCATION_PATTERN = (
+    r'(?:' + _WINDOWS_CMD_PREFIX + r'|' + _WINDOWS_POWERSHELL_CMD_PREFIX + r')'
+    + _WINDOWS_RD_PREFIX
+    + r'(?P<arguments>[^;\n|&)]*)'
 )
 
 HARDLINE_PATTERNS = [
@@ -541,6 +562,33 @@ HARDLINE_PATTERNS_COMPILED = [
     for pattern, description in HARDLINE_PATTERNS
 ]
 _WINDOWS_ROOT_DELETE_RE = re.compile(_WINDOWS_ROOT_DELETE_PATTERN, _RE_FLAGS)
+_WINDOWS_RD_INVOCATION_RE = re.compile(_WINDOWS_RD_INVOCATION_PATTERN, _RE_FLAGS)
+_WINDOWS_ARGUMENT_TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
+
+
+def _windows_literal_path_is_root(token: str) -> bool:
+    """Return whether a literal cmd path token normalizes to a filesystem root."""
+    token = token.strip().strip("\"'")
+    if not token or any(marker in token for marker in ("%", "$", "`")):
+        return False
+    normalized = ntpath.normpath(token.replace("/", "\\"))
+    drive, tail = ntpath.splitdrive(normalized)
+    return tail == "\\" and (bool(drive) or normalized == "\\")
+
+
+def _windows_recursive_delete_targets_root(command: str) -> bool:
+    """Parse cmd-owned rd arguments and classify literal normalized roots."""
+    for match in _WINDOWS_RD_INVOCATION_RE.finditer(command):
+        tokens = _WINDOWS_ARGUMENT_TOKEN_RE.findall(match.group("arguments"))
+        normalized_tokens = [token.strip("\"'").lower() for token in tokens]
+        if "/s" not in normalized_tokens:
+            continue
+        for token, normalized_token in zip(tokens, normalized_tokens):
+            if normalized_token in {"/s", "/q"}:
+                continue
+            if _windows_literal_path_is_root(token):
+                return True
+    return False
 
 
 # =========================================================================
@@ -592,7 +640,10 @@ def detect_hardline_command(command: str) -> tuple:
     # deobfuscates command words but turns a quoted drive root such as ``C:\``
     # into ``C:`` before the hardline regex can classify its target.
     windows_command = _mark_command_starts(_mask_quoted_newlines(command))
-    if _WINDOWS_ROOT_DELETE_RE.search(windows_command):
+    if (
+        _WINDOWS_ROOT_DELETE_RE.search(windows_command)
+        or _windows_recursive_delete_targets_root(windows_command)
+    ):
         return (True, "recursive delete of Windows filesystem root")
     normalized = _normalize_command_for_detection(command)
     _, malformed_grep = _grep_safe_detection_variant(normalized)
