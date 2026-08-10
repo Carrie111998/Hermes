@@ -225,7 +225,7 @@ class TestSlackInteractiveAuth:
         assert len(runner.seen_sources) == 2
         assert runner.seen_sources[0].platform == Platform.SLACK
         assert runner.seen_sources[0].chat_id == "C1"
-        assert runner.seen_sources[0].chat_type == "group"
+        assert runner.seen_sources[0].chat_type == "interaction"
 
 
 class TestSlackSlashConfirmAction:
