@@ -62,14 +62,12 @@ def test_opencode_go_known_model_case_insensitive():
 
 
 @_patched
-def test_opencode_go_typo_auto_corrected():
-    """A close typo (>= 0.9 similarity) is auto-corrected to the catalog
-    entry."""
-    # 'kimi-k2.55' vs 'kimi-k2.5' ratio ≈ 0.95 — within the 0.9 cutoff.
+def test_opencode_go_typo_is_suggested_without_rewrite():
     result = validate_requested_model("kimi-k2.55", "opencode-go")
     assert result["accepted"] is True
-    assert result["recognized"] is True
-    assert result.get("corrected_model") == "kimi-k2.5"
+    assert result["recognized"] is False
+    assert result.get("corrected_model") is None
+    assert "kimi-k2.5" in result["message"]
 
 
 @_patched

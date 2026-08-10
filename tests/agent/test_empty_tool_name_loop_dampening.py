@@ -30,6 +30,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from types import SimpleNamespace
 
 # Repo root = three levels up from tests/agent/<file>.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -152,6 +153,17 @@ def _tool_results(handler) -> list[str]:
             if m.get("role") == "tool":
                 out.append(m.get("content", ""))
     return out
+
+
+def test_runtime_deferred_names_are_dispatchable_but_not_advertised():
+    from agent.conversation_loop import _accepted_tool_names
+
+    agent = SimpleNamespace(
+        valid_tool_names={"tool_search"},
+        _runtime_deferred_tool_names={"media.generate_video"},
+    )
+    assert _accepted_tool_names(agent) == {"tool_search", "media.generate_video"}
+    assert "media.generate_video" not in agent.valid_tool_names
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])

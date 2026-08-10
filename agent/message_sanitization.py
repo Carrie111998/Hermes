@@ -182,16 +182,20 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     return "".join(out)
 
 
-def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
+def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str | None:
     """Attempt to repair malformed tool_call argument JSON.
 
     Models like GLM-5.1 via Ollama can produce truncated JSON, trailing
     commas, Python ``None``, etc.  The API proxy rejects these with HTTP 400
     "invalid tool call arguments".  This function applies common repairs;
-    if all fail it returns ``"{}"`` so the request succeeds (better than
-    crashing the session).  All repairs are logged at WARNING level.
+    if all fail it returns ``None`` so callers can fail closed without
+    substituting a different argument object. All repairs are logged at
+    WARNING level.
     """
-    raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
+    if not isinstance(raw_args, str):
+        logger.warning("Unrepairable non-string tool_call arguments for %s", tool_name)
+        return None
+    raw_stripped = raw_args.strip()
 
     # Fast-path: empty / whitespace-only -> empty object
     if not raw_stripped:
@@ -224,25 +228,38 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     fixed = raw_stripped
     # 1. Strip trailing commas before } or ]
     fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
-    # 2. Close unclosed structures
-    open_curly = fixed.count('{') - fixed.count('}')
-    open_bracket = fixed.count('[') - fixed.count(']')
-    if open_curly > 0:
-        fixed += '}' * open_curly
-    if open_bracket > 0:
-        fixed += ']' * open_bracket
-    # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
-    for _ in range(50):
-        try:
-            json.loads(fixed)
-            break
-        except json.JSONDecodeError:
-            if fixed.endswith('}') and fixed.count('}') > fixed.count('{'):
-                fixed = fixed[:-1]
-            elif fixed.endswith(']') and fixed.count(']') > fixed.count('['):
-                fixed = fixed[:-1]
-            else:
-                break
+    fixed = re.sub(r',\s*$', '', fixed)
+    # 2. Balance only JSON delimiters outside strings. Mismatched extra
+    # closers can be dropped without inventing keys or values; an unclosed
+    # string is not repairable because its intended value is unknown.
+    stack: list[str] = []
+    balanced: list[str] = []
+    in_string = False
+    escaped = False
+    for char in fixed:
+        if in_string:
+            balanced.append(char)
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            balanced.append(char)
+        elif char in '{[':
+            stack.append('}' if char == '{' else ']')
+            balanced.append(char)
+        elif char in '}]':
+            if stack and stack[-1] == char:
+                stack.pop()
+                balanced.append(char)
+        else:
+            balanced.append(char)
+    if not in_string:
+        fixed = ''.join(balanced) + ''.join(reversed(stack))
 
     try:
         json.loads(fixed)
@@ -269,14 +286,14 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    # Last resort: replace with empty object so the API request doesn't
-    # crash the entire session.
+    # Last resort: preserve the failure. Replacing malformed arguments with an
+    # empty object can turn a rejected side effect into a different executable
+    # call when the Tool has defaults.
     logger.warning(
-        "Unrepairable tool_call arguments for %s — "
-        "replaced with empty object (was: %s)",
+        "Unrepairable tool_call arguments for %s (was: %s)",
         tool_name, raw_stripped[:80],
     )
-    return "{}"
+    return None
 
 
 def close_interrupted_tool_sequence(messages: list, final_response: Any = None) -> bool:

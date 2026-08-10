@@ -257,6 +257,8 @@ class _RuntimeAdapter(_TestRuntimeAdapter):
         assert agent._primary_runtime["compressor_model"] == "chat-test"
         assert agent._fallback_chain == []
         assert agent._fallback_model is None
+        assert agent._skip_mcp_refresh is True
+        assert agent._runtime_deferred_tool_names == {"ultra_media_job_create"}
         assert agent.valid_tool_names == {
             "ask_user_question",
             "image_analyze",
@@ -636,6 +638,47 @@ def test_runtime_image_tool_allows_remote_and_scopes_local_sources(tmp_path):
         }
     finally:
         runtime_module._SESSIONS.pop("agent_image", None)
+        session.loop.close()
+
+
+def test_runtime_tool_middleware_fails_closed_for_process_global_tools():
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_scoped",
+        asyncio.new_event_loop(),
+        queue,
+        [],
+        1_000,
+        "agent_scoped",
+    )
+    halt_decisions = []
+    session.agent_ref[0] = SimpleNamespace(
+        _set_tool_guardrail_halt=halt_decisions.append,
+    )
+    runtime_module._SESSIONS["agent_scoped"] = session
+    try:
+        denied = _runtime_tool_middleware(
+            tool_name="mcp_higgsfield_media_upload",
+            args={"filename": "reference.png"},
+            session_id="agent_scoped",
+            tool_call_id="unscoped_tool",
+            next_call=lambda _args: pytest.fail(
+                "process-global MCP tool escaped the Runtime scope"
+            ),
+        )
+        assert json.loads(denied)["error"] == {
+            "code": "tool_not_allowed",
+            "message": (
+                "Tool 'mcp_higgsfield_media_upload' is not authorized "
+                "for this Runtime Run."
+            ),
+            "retryable": False,
+        }
+        assert len(halt_decisions) == 1
+        assert halt_decisions[0].should_halt is True
+        assert halt_decisions[0].code == "runtime_tool_scope_violation"
+    finally:
+        runtime_module._SESSIONS.pop("agent_scoped", None)
         session.loop.close()
 
 
@@ -1438,23 +1481,24 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
 
 
 @pytest.mark.asyncio
-async def test_runtime_media_requires_exact_private_contract_before_submission():
+@pytest.mark.parametrize("tool_name", ["media.generate_image", "media.generate_audio"])
+async def test_runtime_media_requires_exact_private_contract_before_submission(tool_name):
     queue = asyncio.Queue()
     session = RuntimeBridgeSession(
         "run_media_schema_required",
         asyncio.get_running_loop(),
         queue,
-        [{"name": "media.generate_image", "input_schema": {"type": "object"}}],
+        [{"name": tool_name, "input_schema": {"type": "object"}}],
         10_000,
         "agent_media_schema_required",
         _runtime_call_db(
             "agent_media_schema_required",
-            ("call_generate", "media.generate_image"),
+            ("call_generate", tool_name),
         ),
     )
     call = asyncio.create_task(asyncio.to_thread(
         session.invoke_platform_tool,
-        "media.generate_image",
+        tool_name,
         {"requests": [{"model": "openai/gpt-image-2/text-to-image", "prompt": "poster"}]},
         "call_generate",
     ))

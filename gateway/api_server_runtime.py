@@ -62,12 +62,14 @@ _LOCAL_ACTIVITY_TOOLS = {
     "web_search",
     "web_extract",
 }
-_MAX_ARGUMENT_CORRECTIONS = 1
-_MODEL_SCHEMA_GATED_MEDIA_TOOLS = frozenset({
-    "media.estimate_cost",
-    "media.generate_image",
-    "media.generate_video",
+_RUNTIME_NATIVE_TOOLS = frozenset({
+    "skill_view",
+    "image_analyze",
+    "video_analyze",
+    "web_search",
+    "web_extract",
 })
+_MAX_ARGUMENT_CORRECTIONS = 1
 _MODEL_SCHEMA_ENVELOPE_FIELDS = frozenset({"request_id", "model", "medias"})
 _FAILED_ALLOWED_STRING_FIELDS = {"media_type", "model", "provider"}
 _FAILED_ALLOWED_STRING_LIST_FIELDS = {"aspect_ratios", "resolutions"}
@@ -103,6 +105,10 @@ _TERMINAL_PLATFORM_ERROR_CODES = {
 # default executor. Runs use a dedicated bounded pool gated before streaming.
 _RUNTIME_MAX_CONCURRENT_ENV = "HERMES_RUNTIME_MAX_CONCURRENT"
 _RUNTIME_MAX_CONCURRENT_DEFAULT = 8
+
+
+def _requires_model_parameter_contract(tool_name: str) -> bool:
+    return tool_name == "media.estimate_cost" or tool_name.startswith("media.generate_")
 _RUNTIME_STREAM_HEARTBEAT_SECONDS = 15.0
 # Safety cap for pending.ready.wait when the run carries no explicit deadline;
 # prevents a lost tool result from pinning an executor thread forever.
@@ -510,7 +516,7 @@ def _model_request_contract_error(
     contracts: dict[str, dict[str, dict[str, Any]]],
 ) -> dict[str, Any] | None:
     """Validate media requests against contracts fetched for their exact models."""
-    if tool_name not in _MODEL_SCHEMA_GATED_MEDIA_TOOLS:
+    if not _requires_model_parameter_contract(tool_name):
         return None
     requests = args.get("requests") if isinstance(args, dict) else None
     if not isinstance(requests, list) or not requests:
@@ -1312,7 +1318,23 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
                 "success": False,
                 "error": "video_analyze may only read video attachments owned by this run.",
             })
-    return next_call(args) if callable(next_call) else args
+    if tool_name in _RUNTIME_NATIVE_TOOLS:
+        return next_call(args) if callable(next_call) else args
+
+    session._halt_tool_loop(
+        tool_name,
+        args,
+        "runtime_tool_scope_violation",
+        f"Tool '{tool_name}' is not authorized for this Runtime Run.",
+        1,
+    )
+    return json.dumps({
+        "error": {
+            "code": "tool_not_allowed",
+            "message": f"Tool '{tool_name}' is not authorized for this Runtime Run.",
+            "retryable": False,
+        },
+    }, ensure_ascii=False, separators=(",", ":"))
 
 
 def _image_analysis_sources(args: dict[str, Any]) -> list[str]:
@@ -1427,6 +1449,12 @@ class RuntimeBridgeSession:
     def bind_agent(self, agent: Any, native_tool_schemas: list[dict[str, Any]]) -> None:
         self.agent_ref[0] = agent
         self.native_tool_schemas = [dict(schema) for schema in native_tool_schemas]
+        # Deferred Tools are granted to the Run but intentionally absent from
+        # the model schema until tool_search loads them. Keep that state
+        # separate from valid_tool_names so an exact direct call can reach the
+        # middleware's tool_not_loaded response instead of being mislabeled as
+        # an unknown Tool.
+        agent._runtime_deferred_tool_names = set(self.tool_exposure.deferred_names)
         self._refresh_agent_tools()
 
     def _refresh_agent_tools(self) -> None:
@@ -1480,7 +1508,7 @@ class RuntimeBridgeSession:
         args: Any,
         parent_call_id: str,
     ) -> dict[str, Any] | None:
-        if tool_name not in _MODEL_SCHEMA_GATED_MEDIA_TOOLS:
+        if not _requires_model_parameter_contract(tool_name):
             return None
         requests = args.get("requests") if isinstance(args, dict) else None
         if not isinstance(requests, list):
@@ -2123,6 +2151,10 @@ class APIServerRuntimeMixin:
             agent.session_id = agent_session_id
             _configure_run_llm_egress(agent, llm_egress, body.get("model"))
             _pin_run_model(agent, body.get("model"))
+            # The Orchestrator owns the complete per-Run Tool grant. Hermes'
+            # ordinary between-turn MCP refresh rebuilds from a process-global
+            # registry and must not widen this scoped snapshot.
+            agent._skip_mcp_refresh = True
             agent.ephemeral_system_prompt = None
             agent._cached_system_prompt = instructions
             agent._build_system_prompt = lambda _system_message=None: instructions

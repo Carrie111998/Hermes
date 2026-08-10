@@ -2132,10 +2132,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # commas, unclosed brackets, Python None, etc.
                         # Without repair, these hit the truncation handler
                         # and kill the session.  _repair_tool_call_arguments
-                        # returns "{}" for unrepairable args, which is far
-                        # better than a crashed session.
+                        # returns None for unrepairable args so the truncation
+                        # path fails closed without inventing an empty object.
                         repaired = _repair_tool_call_arguments(arguments, tool_name)
-                        if repaired != "{}":
+                        if repaired is not None:
                             # Successfully repaired — use the fixed args
                             arguments = repaired
                         else:
