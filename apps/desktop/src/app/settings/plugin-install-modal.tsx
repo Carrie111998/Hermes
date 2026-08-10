@@ -31,7 +31,9 @@ import {
 import { $activeGatewayProfile, $profileScope } from '@/store/profile'
 import { $connection } from '@/store/session'
 
-type ProbeResult = NonNullable<Awaited<ReturnType<NonNullable<Window['hermesDesktop']>['probePluginRepo']>>>
+type ProbeResult = Awaited<
+  ReturnType<NonNullable<NonNullable<Window['hermesDesktop']>['probePluginRepo']>>
+>
 
 type ProbePhase = 'idle' | 'probing' | 'ready' | 'error'
 
