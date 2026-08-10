@@ -1,6 +1,6 @@
 ---
 name: file-watcher
-description: Use when monitoring files/dirs for changes during dev. `hermes watch` filesystem monitor.
+description: Watch filesystem changes with hermes watch polling command.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
