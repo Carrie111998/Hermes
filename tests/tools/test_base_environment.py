@@ -7,7 +7,11 @@ init_session() failure handling, and the CWD marker contract.
 from unittest.mock import MagicMock
 
 import tools.terminal_tool as terminal_tool
-from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+from tools.environments.base import (
+    BaseEnvironment,
+    _BoundedOutputCollector,
+    _ThreadedProcessHandle,
+)
 
 
 class _TestableEnv(BaseEnvironment):
@@ -63,6 +67,17 @@ def test_nopasswd_probe_fails_closed_on_backend_error(monkeypatch):
     monkeypatch.setattr(env, "_run_bash", MagicMock(side_effect=RuntimeError("offline")))
 
     assert env._sudo_nopasswd_works() is False
+
+
+def test_nopasswd_probe_does_not_short_timeout_sdk_sandbox(monkeypatch):
+    env = _TestableEnv(timeout=10)
+    proc = _ThreadedProcessHandle(lambda: ("", 0), cancel_fn=lambda: None)
+    wait = MagicMock(return_value={"returncode": 0})
+    monkeypatch.setattr(env, "_run_bash", MagicMock(return_value=proc))
+    monkeypatch.setattr(env, "_wait_for_process", wait)
+
+    assert env._sudo_nopasswd_works() is True
+    wait.assert_called_once_with(proc, timeout=10)
 
 
 class TestBoundedOutputCollector:
