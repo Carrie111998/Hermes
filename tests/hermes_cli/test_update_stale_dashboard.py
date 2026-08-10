@@ -1,9 +1,9 @@
 """Tests for the stale-dashboard handling run at the end of ``hermes update``.
 
 ``hermes update`` detects ``hermes dashboard`` processes left over from the
-previous version and kills them (SIGTERM + SIGKILL grace, or ``taskkill /F``
-on Windows).  Without this, the running backend silently serves stale Python
-against a freshly-updated JS bundle, producing 401s / empty data.
+previous version and stops them through stable kernel process handles. Without
+this, the running backend silently serves stale Python against a freshly-updated
+JS bundle, producing 401s / empty data.
 
 History:
 - #16872 introduced the warn-only helper (``_warn_stale_dashboard_processes``).
@@ -86,6 +86,23 @@ def _ps_runner(stdout: str):
     return _side_effect
 
 
+class _FakeStableHandle:
+    def __init__(self, pid: int):
+        self.pid = pid
+        self.signals: list[int] = []
+        self.alive = True
+
+    def send_signal(self, sig: int) -> None:
+        self.signals.append(sig)
+        self.alive = False
+
+    def is_alive(self) -> bool:
+        return self.alive
+
+    def close(self) -> None:
+        pass
+
+
 class TestFindStaleDashboardPids:
     """Unit tests for the ps/wmic-based detection step."""
 
@@ -105,6 +122,57 @@ class TestFindStaleDashboardPids:
         assert os.getpid() not in pids
         assert 12345 in pids
 
+    def test_ancestor_launcher_pid_excluded(self):
+        ancestor = MagicMock(pid=54321)
+        with patch("psutil.Process") as mock_process, patch("subprocess.run") as mock_run:
+            mock_process.return_value.parents.return_value = [ancestor]
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="\n".join([
+                    _ps_line(54321, "hermes dashboard --status"),
+                    _ps_line(12345, "hermes dashboard --port 9119"),
+                ]) + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+
+        assert 54321 not in pids
+        assert 12345 in pids
+
+    def test_ancestor_lookup_failure_fails_closed(self):
+        with patch("psutil.Process", side_effect=RuntimeError("access denied")), patch(
+            "subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=_ps_line(12345, "hermes dashboard --port 9119") + "\n",
+                stderr="",
+            )
+            assert _find_stale_dashboard_pids() == []
+
+    @pytest.mark.parametrize(
+        "flag", ["--status", "--stop", '\"--status\"', "'--stop'"]
+    )
+    def test_management_command_is_not_a_dashboard_runtime(self, flag):
+        with patch("psutil.Process") as mock_process, patch(
+            "subprocess.run"
+        ) as mock_run:
+            mock_process.return_value.parents.return_value = []
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="\n".join(
+                    [
+                        _ps_line(54321, f"bash -c hermes dashboard {flag}"),
+                        _ps_line(12345, "hermes dashboard --port 9119"),
+                    ]
+                )
+                + "\n",
+                stderr="",
+            )
+            pids = _find_stale_dashboard_pids()
+
+        assert pids == [12345]
+
 
     def test_ps_timeout_returns_empty(self):
         import subprocess as sp
@@ -120,30 +188,23 @@ class TestKillStaleDashboardPosix:
 
 
     def test_sigterm_graceful_exit(self, capsys):
-        """Processes that exit on SIGTERM (the probe gets ProcessLookupError)
-        are reported as stopped and SIGKILL is never sent."""
+        """Stable handles receive SIGTERM; raw PID signalling is never used."""
         import signal as _signal
 
-        killed_signals: list[tuple[int, int]] = []
-
-        def fake_kill(pid, sig):
-            killed_signals.append((pid, sig))
-            if sig == 0:
-                # Probe after SIGTERM → "process gone".
-                raise ProcessLookupError
-            # SIGTERM itself: succeed silently.
+        handles = {pid: _FakeStableHandle(pid) for pid in (12345, 12346)}
 
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[12345, 12346]), \
-             patch("os.kill", side_effect=fake_kill), \
+             patch("hermes_cli.dashboard_procs._open_verified_dashboard_handle",
+                   side_effect=lambda pid: handles[pid]), \
+             patch("os.kill") as raw_kill, \
+             patch("subprocess.run") as raw_taskkill, \
              patch("time.sleep"):
             result = _kill_stale_dashboard_processes()
 
-        # Both got SIGTERM.
-        sigterms = [pid for pid, sig in killed_signals if sig == _signal.SIGTERM]
-        assert sorted(sigterms) == [12345, 12346]
-        # No SIGKILL was needed.
-        assert not any(sig == _signal.SIGKILL for _, sig in killed_signals)
+        assert all(handle.signals == [_signal.SIGTERM] for handle in handles.values())
+        raw_kill.assert_not_called()
+        raw_taskkill.assert_not_called()
         assert result["matched"] == [12345, 12346]
         assert result["killed"] == [12345, 12346]
         assert result["failed"] == []
@@ -194,32 +255,22 @@ class TestKillStaleDashboardPosix:
 
 
 class TestKillStaleDashboardWindows:
-    """Kill path on Windows: taskkill /F."""
+    """Windows also terminates stable handles, never recyclable PIDs."""
 
-    @pytest.mark.windows_only
-    def test_taskkill_invoked_for_each_pid(self, capsys):
-        """``windows_only``: ``taskkill.exe`` only exists on Windows, and the
-        faked platform also silently skipped the POSIX-only cgroup/argv
-        snapshot the real Windows path must not take.
-        """
-
-        def fake_run(args, *a, **kw):
-            # taskkill returns 0 on success
-            return MagicMock(returncode=0, stdout="", stderr="")
+    def test_stable_handle_invoked_for_each_pid(self, capsys):
+        handles = {pid: _FakeStableHandle(pid) for pid in (12345, 12346)}
 
         with patch("hermes_cli.main._find_stale_dashboard_pids",
                    return_value=[12345, 12346]), \
-             patch("subprocess.run", side_effect=fake_run) as mock_run:
+             patch("hermes_cli.dashboard_procs._open_verified_dashboard_handle",
+                   side_effect=lambda pid: handles[pid]), \
+             patch("subprocess.run") as raw_taskkill:
             _kill_stale_dashboard_processes()
 
-        # Each PID triggered a taskkill /PID <n> /F invocation.
-        taskkill_calls = [
-            c for c in mock_run.call_args_list
-            if c.args and isinstance(c.args[0], list) and c.args[0][:1] == ["taskkill"]
-        ]
-        assert len(taskkill_calls) == 2
-        assert ["taskkill", "/PID", "12345", "/F"] in [c.args[0] for c in taskkill_calls]
-        assert ["taskkill", "/PID", "12346", "/F"] in [c.args[0] for c in taskkill_calls]
+        import signal as _signal
+
+        assert all(handle.signals == [_signal.SIGTERM] for handle in handles.values())
+        raw_taskkill.assert_not_called()
 
         out = capsys.readouterr().out
         assert "✓ stopped PID 12345" in out
@@ -288,6 +339,19 @@ class TestWindowsWmicEncoding:
             "down the reader thread (#17049)."
         )
 
+    def test_malformed_process_id_is_ignored(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "win32")
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout=(
+                    "CommandLine=python -m hermes_cli.main dashboard\n"
+                    "ProcessId=not-a-pid\n"
+                ),
+                stderr="",
+            )
+            assert _find_stale_dashboard_pids() == []
+
 
 class TestSupervisedBackendRestart:
     """After the kill, systemd-supervised PIDs get their owning unit
@@ -301,18 +365,17 @@ class TestSupervisedBackendRestart:
         """A killed PID whose cgroup names a custom unit → systemctl restart."""
         live = self._live()
 
-        def fake_kill(pid, sig):
-            if sig == 0:
-                raise ProcessLookupError
+        handle = _FakeStableHandle(4321)
 
         with patch.object(live, "_restart_managed_dashboard_service", return_value=False), \
              patch.object(live, "_find_stale_dashboard_pids", return_value=[4321]), \
+             patch("hermes_cli.dashboard_procs._open_verified_dashboard_handle",
+                   return_value=handle), \
              patch.object(live, "_get_pid_cgroup_path",
                           return_value="/system.slice/hermes-serve.service"), \
              patch.object(live, "_get_systemd_service_for_pid",
                           return_value="hermes-serve.service"), \
              patch.object(live, "_try_restart_systemd_service", return_value=True) as restart, \
-             patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"):
             _kill_stale_dashboard_processes(restart_managed=True)
 

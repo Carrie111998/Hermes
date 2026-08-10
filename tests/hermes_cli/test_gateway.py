@@ -6,11 +6,50 @@ import signal
 import subprocess
 import sys
 import textwrap
+from io import BytesIO
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
 import hermes_cli.gateway as gateway
+
+
+def test_find_gateway_pids_only_includes_service_units_for_all_profiles(monkeypatch):
+    """A service owned by another profile is not a current-profile process."""
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(gateway, "_get_service_pids", lambda: {31415})
+    monkeypatch.setattr(gateway, "_scan_gateway_pids", lambda *a, **k: [])
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+
+    assert gateway.find_gateway_pids() == []
+    assert gateway.find_gateway_pids(all_profiles=True) == [31415]
+
+
+@pytest.mark.parametrize(
+    ("profile_arg", "command"),
+    [
+        ("", "python -m hermes_cli.main --profile=work gateway run"),
+        (
+            "--profile work",
+            "python -m hermes_cli.main --profile worker gateway run",
+        ),
+    ],
+)
+def test_scan_gateway_pids_requires_exact_profile(monkeypatch, profile_arg, command):
+    """Process discovery never attributes another profile by substring."""
+    monkeypatch.setattr(gateway, "is_windows", lambda: False)
+    monkeypatch.setattr(gateway, "_get_ancestor_pids", lambda: set())
+    monkeypatch.setattr(gateway, "get_hermes_home", lambda: Path("/tmp/hermes"))
+    monkeypatch.setattr(gateway, "_profile_arg", lambda _home: profile_arg)
+    monkeypatch.setattr(gateway.os.path, "isdir", lambda path: path == "/proc")
+    monkeypatch.setattr(gateway.os, "listdir", lambda _path: ["12345"])
+    monkeypatch.setattr(
+        "builtins.open",
+        lambda *_args, **_kwargs: BytesIO(command.replace(" ", "\0").encode()),
+    )
+
+    assert gateway._scan_gateway_pids(set()) == []
 
 
 def _install_fake_gateway_run(monkeypatch, start_gateway):

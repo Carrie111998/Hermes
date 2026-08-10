@@ -51,6 +51,94 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+def test_empty_env_does_not_require_api_key_when_codex_oauth_is_logged_in(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / ".env").write_text("", encoding="utf-8")
+    (home / "config.yaml").write_text(
+        "model:\n  provider: openai-codex\n  default: gpt-5.6-sol\n"
+        "memory: {}\n",
+        encoding="utf-8",
+    )
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        ),
+    )
+    from hermes_cli import auth as auth_mod
+
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status_local", lambda: {})
+    monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {"logged_in": True})
+    monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", lambda: {})
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "OpenAI Codex auth" in out and "logged in" in out
+    assert "No API key found" not in out
+    assert "Run 'hermes setup' to configure API keys" not in out
+
+
+def test_auth_provider_failures_are_isolated_and_reported(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir(parents=True)
+    (home / ".env").write_text("", encoding="utf-8")
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", project)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(
+            check_tool_availability=lambda *a, **kw: ([], []),
+            TOOLSET_REQUIREMENTS={},
+        ),
+    )
+    from hermes_cli import auth as auth_mod
+
+    def _fail_nous():
+        raise RuntimeError("nous probe failed")
+
+    def _fail_xai():
+        raise RuntimeError("xai probe failed")
+
+    monkeypatch.setattr(auth_mod, "get_nous_auth_status_local", _fail_nous)
+    monkeypatch.setattr(auth_mod, "get_codex_auth_status", lambda: {"logged_in": True})
+    monkeypatch.setattr(
+        auth_mod,
+        "get_minimax_oauth_auth_status",
+        lambda: {"logged_in": True, "region": "global"},
+    )
+    monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", _fail_xai)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=False))
+
+    out = buf.getvalue()
+    assert "Nous Portal auth" in out and "nous probe failed" in out
+    assert "OpenAI Codex auth" in out and "logged in" in out
+    assert "MiniMax OAuth" in out and "region=global" in out
+    assert "xAI OAuth" in out and "xai probe failed" in out
+
+
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):
         unavailable = [
