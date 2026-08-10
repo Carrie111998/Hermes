@@ -3,10 +3,15 @@
 Follow-up to #50767, which redacted the chat-platform and SSE/API approval
 transports. The TUI JSON-RPC transport is the third egress: three
 `register_gateway_notify` callbacks in `tui_gateway/server.py` emit the raw
-`approval_data` (with an unredacted `command`) to the TUI client. They now
-route through the module-level `_emit_approval_request` helper, which redacts
-`payload["command"]` via the shared `gateway.run._redact_approval_command` seam
+`approval_data` (with an unredacted `command`) to the TUI client. They route
+through `_emit_approval_request` → `_approval_request_payload`, which redacts
+`payload["command"]` via `agent.redact.redact_sensitive_text(force=True)`
 before emitting.
+
+Importing `gateway.run` from this path is deliberately avoided: a long-lived
+dashboard/TUI process can already have a stale `agent.turn_context` in
+`sys.modules`, and `gateway.run`'s import chain then raises ImportError.
+Approval notify treats that as hard-block ("Failed to send approval request").
 """
 
 import inspect
@@ -20,19 +25,25 @@ class TestTuiApprovalEmitRedaction:
 
         emitted = {}
         monkeypatch.setattr(
-            tui_server, "_emit",
+            tui_server,
+            "_emit",
             lambda event, sid, payload=None: emitted.update(
                 {"event": event, "sid": sid, "payload": payload}
             ),
         )
-        raw = "curl -H 'Authorization: token ghp_01...6789' https://api.github.com"
-        tui_server._emit_approval_request("sess-1", {"command": raw, "description": "x"})
+        raw = (
+            "curl -H 'Authorization: token "
+            "ghp_01...uvwx' https://api.github.com"
+        )
+        tui_server._emit_approval_request(
+            "sess-1", {"command": raw, "description": "x"}
+        )
 
         assert emitted["event"] == "approval.request"
-        # credential removed, non-command field + command structure preserved
-        assert "ghp_01...6789" not in emitted["payload"]["command"]
+        cmd = emitted["payload"]["command"]
+        assert "ghp_01...uvwx" not in cmd
         assert emitted["payload"]["description"] == "x"
-        assert "github.com" in emitted["payload"]["command"]
+        assert "github.com" in cmd
 
     @pytest.mark.parametrize(
         ("allow_session", "allow_permanent", "expected"),
@@ -65,3 +76,11 @@ class TestTuiApprovalEmitRedaction:
 
         assert emitted["payload"]["choices"] == expected
 
+    def test_approval_payload_source_avoids_gateway_run_import(self):
+        """TUI payload builder must not import gateway.run (stale-process ImportError)."""
+        from tui_gateway import server as tui_server
+
+        source = inspect.getsource(tui_server._approval_request_payload)
+        assert "from gateway.run import" not in source
+        assert "agent.redact" in source
+        assert "redact_sensitive_text" in source
