@@ -3015,10 +3015,17 @@ def test_codex_uses_supported_method_order_instructions_and_exact_verification(
 
 
 def test_codex_exact_placeholder_verification_uses_state_db_without_global_scan() -> None:
+    first_page = _codex_inventory()
+    first_page["data"].append({
+        "id": "unrelated",
+        "createdAt": 90.0,
+        "updatedAt": 91.0,
+    })
+    first_page["nextCursor"] = "must-not-be-read"
     adapter, client = _codex_adapter({
         "thread/start": [{"thread": {"id": CODEX_ID}}],
         "thread/name/set": [{}],
-        "thread/list": [_codex_inventory()],
+        "thread/list": [first_page],
         "thread/read": [_codex_signed_read()],
     })
 
@@ -3195,7 +3202,14 @@ def test_codex_exact_discovery_can_include_sidebar_and_app_server_threads() -> N
 
 
 def test_codex_exact_discovery_can_use_the_bounded_state_database() -> None:
-    client = FakeRequestClient({"thread/list": [_codex_inventory()]})
+    first_page = _codex_inventory()
+    first_page["data"].append({
+        "id": "unrelated",
+        "createdAt": 90.0,
+        "updatedAt": 91.0,
+    })
+    first_page["nextCursor"] = "must-not-be-read"
+    client = FakeRequestClient({"thread/list": [first_page]})
     source = CodexSourceAdapter(client, marker_secret=SECRET)
 
     found = source.find_native_thread(
