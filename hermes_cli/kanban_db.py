@@ -9590,6 +9590,27 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def build_worker_query(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kickoff: str,
+) -> str:
+    """Combine the dispatcher kickoff with authoritative task context.
+
+    Dispatcher workers receive this as their first user turn. Loading the
+    context before the agent starts keeps task orientation off the tool-result
+    transport, where oversized ``kanban_show`` results may be replaced by an
+    opaque provider-side content reference. ``build_worker_context`` owns the
+    existing size bounds and raises for an unknown task, so callers can fail
+    worker startup instead of running without an authoritative assignment.
+    """
+    context = build_worker_context(conn, task_id)
+    prefix = str(kickoff or "").rstrip()
+    if not prefix:
+        return context
+    return f"{prefix}\n\n{context}"
+
+
 # ---------------------------------------------------------------------------
 # Stats + SLA helpers
 # ---------------------------------------------------------------------------
