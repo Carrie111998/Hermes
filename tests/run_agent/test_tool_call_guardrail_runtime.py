@@ -438,3 +438,42 @@ def test_web_budget_halt_response_is_actionable_and_not_an_internal_loop_dump():
     assert "12 search/extract requests" in response
     assert "direct/official data source" in response
     assert "loop_web_research_cap" not in response
+
+
+def test_web_budget_denial_allows_next_model_iteration_to_synthesize():
+    agent = _make_agent(
+        "web_search",
+        max_iterations=4,
+        config={
+            "tool_loop_guardrails": {
+                "loop_caps": {"max_web_searches": 1},
+            }
+        },
+    )
+    calls = [
+        _mock_tool_call("web_search", json.dumps({"query": "focused"}), "c-allowed"),
+        _mock_tool_call("web_search", json.dumps({"query": "fanout"}), "c-denied"),
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=calls),
+        _mock_response(content="Encontré un resultado verificado.", finish_reason="stop"),
+    ]
+    agent._disable_streaming = True
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"success": True})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("find results")
+
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "Encontré un resultado verificado."
+    assert "guardrail" not in result
+    denied = [
+        message for message in result["messages"]
+        if message.get("tool_call_id") == "c-denied"
+    ]
+    assert len(denied) == 1
+    assert "loop_web_research_cap" in denied[0]["content"]

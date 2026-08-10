@@ -145,8 +145,9 @@ class LoopCapConfig:
     loops. Here the caps count *within a single agent loop* (one turn): the
     counters reset in ``reset_for_turn`` at the start of every
     ``run_conversation``, so a legitimate multi-turn session is never starved,
-    but a single turn that spirals into an unbounded search / delegation loop
-    is stopped.
+    but a single turn cannot keep executing an unbounded search / delegation
+    loop. Web calls beyond the budget are denied so the model can synthesize
+    from collected results; runaway delegation still halts the turn.
 
     Semantics differ from the per-turn loop *detector* above (which keys on
     repeated identical/failing calls): these caps are a hard ceiling on the
@@ -194,7 +195,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | deny | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -299,7 +300,7 @@ class ToolCallGuardrailController:
         # These are hard ceilings on how many times a runaway-prone tool may
         # be called within a single agent loop (turn). They apply regardless
         # of hard_stop_enabled (which only governs the per-turn loop detector).
-        # We block BEFORE the call runs once the count is already at the cap,
+        # We deny BEFORE the call runs once the count is already at the cap,
         # then increment for an allowed call so the (cap+1)-th is refused.
         cap_block = self._check_loop_cap(tool_name, _coerce_args(args), signature)
         if cap_block is not None:
@@ -463,21 +464,20 @@ class ToolCallGuardrailController:
             cap = caps.max_web_searches
             if cap and self._turn_web_request_count >= cap:
                 decision = ToolGuardrailDecision(
-                    action="block",
+                    action="deny",
                     code="loop_web_research_cap",
                     message=(
                         f"Blocked {tool_name}: this turn has already made {cap} "
-                        "web search/extract requests, the per-turn limit. Stop "
-                        "reformulating the same research path. Work with the "
-                        "results already collected, use a non-web source when "
-                        "available, or clearly report that verification was "
-                        "not possible."
+                        "web search/extract requests, the per-turn limit. Do not "
+                        "call web_search or web_extract again in this turn. "
+                        "Synthesize the answer now from the results already "
+                        "collected, explicitly distinguishing verified facts, "
+                        "candidates, and missing evidence."
                     ),
                     tool_name=tool_name,
                     count=self._turn_web_request_count,
                     signature=signature,
                 )
-                self._halt_decision = decision
                 return decision
             self._turn_web_request_count += 1
             return None

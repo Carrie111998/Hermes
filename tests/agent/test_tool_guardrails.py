@@ -164,9 +164,11 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     for i in range(3):
         assert controller.before_call("web_search", {"query": f"q{i}"}).action == "allow"
     decision = controller.before_call("web_search", {"query": "q4"})
-    assert decision.action == "block"
+    assert decision.action == "deny"
     assert decision.code == "loop_web_research_cap"
-    assert decision.should_halt is True
+    assert decision.allows_execution is False
+    assert decision.should_halt is False
+    assert controller.halt_decision is None
 
 
 def test_web_search_and_extract_share_one_research_budget():
@@ -183,10 +185,10 @@ def test_web_search_and_extract_share_one_research_budget():
     decision = controller.before_call(
         "web_extract", {"urls": ["https://example.com/b"]}
     )
-    assert decision.action == "block"
+    assert decision.action == "deny"
     assert decision.code == "loop_web_research_cap"
     assert decision.count == 3
-
+    assert decision.should_halt is False
 
 
 

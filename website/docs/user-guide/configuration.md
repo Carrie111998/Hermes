@@ -1670,7 +1670,7 @@ tool_loop_guardrails:
 
 ### Per-turn runaway-loop caps
 
-Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on the shared `web_search`/`web_extract` request budget and on subagent spawns within a single agent loop (turn). The counters reset at the start of every turn, so a legitimate multi-turn session is never starved — but a single turn that spirals into an unbounded research or delegation loop is stopped. These are always on and fire regardless of `hard_stop_enabled`. When a cap is reached, the offending tool call is blocked with an explanatory message and the turn stops cleanly instead of burning the rest of the budget. Set either value to `0` to disable that cap entirely.
+Separate from the failure-based thresholds above, `loop_caps` sets hard ceilings on the shared `web_search`/`web_extract` request budget and on subagent spawns within a single agent loop (turn). The counters reset at the start of every turn, so a legitimate multi-turn session is never starved. These limits are always on and fire regardless of `hard_stop_enabled`. When the web budget is reached, additional search/extract calls are denied and the model is instructed to synthesize an answer from the evidence already collected; the turn is not aborted. A subagent-cap violation still halts the turn. Set either value to `0` to disable that cap entirely.
 
 A single `delegate_task` batch counts each task toward `max_subagents` (a batch of 3 spends 3), so the cap tracks real subagents spawned rather than `delegate_task` invocations.
 

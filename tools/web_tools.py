@@ -630,7 +630,8 @@ def web_search_tool(query: str, limit: int = 5) -> str:
     with multiple backends (Parallel or Firecrawl).
 
     Note: This function returns search result metadata only (URLs, titles, descriptions).
-    Use web_extract_tool to get full content from specific URLs.
+    Use web_extract_tool to get full content from specific URLs when it is
+    available; otherwise open promising results with the browser tools.
     
     Args:
         query (str): The search query to look up
@@ -1195,7 +1196,7 @@ from tools.registry import registry, tool_error
 
 WEB_SEARCH_SCHEMA = {
     "name": "web_search",
-    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
+    "description": "Search the web for information. Returns up to 5 results by default with titles, URLs, and descriptions. Use a small number of focused searches, inspect each batch before reformulating, and stop searching once enough relevant candidates exist. Open promising URLs with web_extract when available or browser tools otherwise. If the available evidence supports fewer items than requested, answer with the verified subset and state the gap instead of issuing a broad query fan-out. The query is passed through to the configured backend, so operators such as site:domain, filetype:pdf, intitle:word, -term, and \"exact phrase\" may work when the backend supports them.",
     "parameters": {
         "type": "object",
         "properties": {

@@ -316,6 +316,14 @@ class TestWebSearchSchema:
         assert limit_schema["default"] == 5
         assert "limit" not in tools.web_tools.WEB_SEARCH_SCHEMA["parameters"]["required"]
 
+    def test_schema_tells_model_to_inspect_then_synthesize(self):
+        import tools.web_tools
+
+        description = tools.web_tools.WEB_SEARCH_SCHEMA["description"]
+        assert "inspect each batch before reformulating" in description
+        assert "browser tools otherwise" in description
+        assert "verified subset" in description
+
 
     def test_web_search_clamps_limit_before_backend_call(self):
         import tools.web_tools
