@@ -137,3 +137,42 @@ class TestDurability:
 
         monkeypatch.setattr(store._local, "conn", original)
         assert store.claim("m1", "cron.jobflow.matcher", now=1000) is True
+
+
+class TestSharedLedgerPath:
+    def test_dispatcher_and_reconciler_agree_on_one_ledger(self):
+        """Divergence here means duplicate model calls with no error anywhere.
+
+        The subscriber claims into its ledger; the reconciler checks the same
+        one to decide what was missed. Two paths = the reconciler re-dispatches
+        everything the subscriber already took.
+        """
+        import importlib.util
+        import pathlib
+        import sys
+
+        from jobflow_dispatch.store import default_ledger_path
+
+        wrapper_path = (
+            pathlib.Path.home() / ".hermes" / "profiles" / "main" / "scripts"
+            / "jobflow_reconcile.py"
+        )
+        if not wrapper_path.is_file():
+            pytest.skip("reconcile wrapper not present")
+
+        spec = importlib.util.spec_from_file_location("jobflow_reconcile_probe", wrapper_path)
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod
+        try:
+            spec.loader.exec_module(mod)
+            assert mod.LEDGER_PATH == default_ledger_path()
+        finally:
+            sys.modules.pop(spec.name, None)
+
+    def test_ledger_lives_under_the_canonical_root_not_a_profile(self):
+        from jobflow_dispatch.store import default_ledger_path
+
+        path = default_ledger_path()
+        assert path.name == "jobflow_dispatch.db"
+        assert path.parent.name == "telemetry"
+        assert "profiles" not in path.parts

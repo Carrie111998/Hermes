@@ -44,6 +44,23 @@ CREATE INDEX IF NOT EXISTS activations_pending
 DEFAULT_LEASE_SECONDS = 900
 
 
+def default_ledger_path() -> Path:
+    """The one ledger the dispatcher and the reconciler must both use.
+
+    If these ever diverge the reconciler re-dispatches work the subscriber
+    already claimed — duplicate model calls with no error anywhere. Resolved
+    from the canonical Hermes root (not the profile) because activation is
+    cross-profile, matching the telemetry store.
+    """
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = Path(get_default_hermes_root())
+    except Exception:
+        root = Path.home() / ".hermes"
+    return root / "telemetry" / "jobflow_dispatch.db"
+
+
 @dataclass(frozen=True)
 class ActivationRow:
     message_key: str
