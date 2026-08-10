@@ -1767,3 +1767,15 @@ class TestGitHubReviewDelivery:
             await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
         settlement_script.assert_not_called()
+
+
+def test_required_pr_review_skill_is_bundled_with_generation_contract():
+    skill_path = (
+        Path(__file__).parents[2] / "skills" / "github" / "pr-review" / "SKILL.md"
+    )
+    content = skill_path.read_text(encoding="utf-8")
+
+    assert "name: pr-review" in content
+    assert "positive GitHub review-request timeline event ID" in content
+    assert "request=REQUEST_ID" in content
+    assert "older generation's marker must not block" in content
