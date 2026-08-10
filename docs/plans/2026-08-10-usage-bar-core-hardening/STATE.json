@@ -1,0 +1,60 @@
+{
+  "task": "usage-bar-core-hardening",
+  "phase": "M0_COMPLETE_MOCKUP_SUBMITTED",
+  "status": "AWAITING_MOCKUP_APPROVAL",
+  "session_id": "20260810_115223_1ade7f",
+  "suggested_session_title": "Usage Bar 内建化 M0 固化 + M1/M2 mockup",
+  "writer": "20260810_115223_1ade7f",
+  "parent_role": "read-only acceptance (实际观察: 存在并行写者, 详见 CHECKPOINT 遗留5)",
+  "updated_at": "2026-08-10T12:45:00Z",
+  "git": {
+    "branch": "codex/hermes-custom-migrate-v020",
+    "head_at_start": "299d5d7d9",
+    "head_now": "2ab1a7e00",
+    "commits_this_round": [
+      "c64d5af1f feat(agent): harden usage.accounts contract with cache identity and concurrent fetch",
+      "05b6a1de4 fix(desktop): keep account usage reachable in the statusbar by default",
+      "2ab1a7e00 docs: usage bar core hardening M0 control plane + M1/M2 mockup"
+    ],
+    "uncommitted_not_mine": [
+      "agent/account_usage.py (并行写者 R1 修复进行中)",
+      "agent/usage_contract.py (同上)",
+      "apps/desktop/src/store/statusbar-prefs.ts (同上)",
+      "tests/agent/test_account_usage.py (同上)",
+      "tests/agent/test_usage_contract.py (同上)",
+      "apps/desktop/src/store/statusbar-prefs.test.ts (新增, 同上)"
+    ],
+    "backup_branch": "backup/usage-bar-hardening-pre-m0-20260810",
+    "dirty_snapshot": "history/pre-m0-dirty.patch",
+    "noise_reverted": [
+      "package-lock.json"
+    ],
+    "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree exit 0 零冲突; live-checkout guard 禁止运行中 merge)"
+  },
+  "tests_final": {
+    "backend": "24 passed (usage_contract + usage_accounts + account_usage)",
+    "desktop": "19 passed (context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
+    "total": "43 passed",
+    "typecheck": "tsc x3 exit 0",
+    "git_diff_check": "clean"
+  },
+  "milestones": {
+    "M0": "DONE",
+    "M1": "PLAN_APPROVED (Codex 4 轮终审 APPROVE); 并行写者已开始 R1 修复; 生产实施待 mockup 批准",
+    "M2": "PLANNED_AWAITING_MOCKUP_APPROVAL",
+    "M3": "PLANNED"
+  },
+  "codex_plan_review": "APPROVE (R1:5 -> R2:3 -> R3:2 -> R4:0; history/codex-review-round*.md)",
+  "blockers": [
+    "上游 merge 推迟: live-checkout guard (merge-tree 零冲突已证实, 需停 Hermes 后外部执行)",
+    "package/release smoke 未执行 (非发布机; 回滚包已归档 cache/release-backups/)",
+    "Codex CLI 0.144.4 与用户主 config.toml [agents] 不兼容, 评审用专用 CODEX_HOME 绕行"
+  ],
+  "artifacts": {
+    "release_backup_archived_to": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\release-backups\\release-backup-usage-20260810-114009",
+    "mockup_html": "docs/plans/2026-08-10-usage-bar-core-hardening/mockup/usage-bar-mockup.html",
+    "mockup_screenshots": 11,
+    "control_plane_commit": "2ab1a7e00"
+  },
+  "not_claimed": "M1/M2/M3 生产实现未宣称完成; 本轮仅 M0 固化 + 计划 APPROVE + mockup"
+}

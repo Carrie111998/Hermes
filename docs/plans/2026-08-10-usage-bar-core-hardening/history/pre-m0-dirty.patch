@@ -1,0 +1,1283 @@
+diff --git a/agent/account_usage.py b/agent/account_usage.py
+index b62a33738..fbb402777 100644
+--- a/agent/account_usage.py
++++ b/agent/account_usage.py
+@@ -519,7 +519,9 @@ def _fetch_codex_account_usage(
+     }
+     if account_id:
+         headers["ChatGPT-Account-Id"] = account_id
+-    with httpx.Client(timeout=15.0) as client:
++    # This endpoint is advisory UI data. Keep its latency below the contract's
++    # global 6.5s deadline so a degraded ChatGPT edge cannot stall the panel.
++    with httpx.Client(timeout=6.0) as client:
+         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
+         response.raise_for_status()
+     payload = response.json() or {}
+@@ -883,7 +885,131 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
+     )
+ 
+ 
+-ACCOUNT_USAGE_PROVIDERS = frozenset({"anthropic", "openai-codex", "openrouter"})
++_KIMI_DEFAULT_BASE_URL = "https://api.kimi.com/coding"
++
++
++def _kimi_plan_label(payload: Any) -> Optional[str]:
++    level = str(
++        (((payload.get("user") or {}).get("membership") or {}).get("level")) or ""
++    ).strip()
++    if not level:
++        return None
++    return _title_case_slug(level.removeprefix("LEVEL_"))
++
++
++def _kimi_window_label(duration: Any, time_unit: Any) -> str:
++    """Map a Kimi limit window's real duration onto a human label."""
++    try:
++        value = float(duration)
++    except (TypeError, ValueError):
++        return "Window"
++    unit = str(time_unit or "").strip().upper()
++    if "MINUTE" in unit:
++        seconds = value * 60
++    elif "HOUR" in unit:
++        seconds = value * 3600
++    elif "DAY" in unit:
++        seconds = value * 86400
++    elif "WEEK" in unit:
++        seconds = value * 604800
++    elif "MONTH" in unit:
++        seconds = value * 2629800
++    else:
++        seconds = value
++    if seconds >= 604800:
++        weeks = round(seconds / 604800)
++        return "Weekly" if weeks == 1 else f"{weeks} week"
++    if seconds >= 86400:
++        days = round(seconds / 86400)
++        return "Weekly" if days == 7 else f"{days} day"
++    if seconds >= 3600:
++        return f"{seconds / 3600:g} hour"
++    minutes = max(1, round(seconds / 60))
++    return f"{minutes} min"
++
++
++def _kimi_quota_window(detail: Any, label: str) -> Optional[AccountUsageWindow]:
++    if not isinstance(detail, dict):
++        return None
++    try:
++        limit = float(detail.get("limit"))
++        used = float(detail.get("used"))
++    except (TypeError, ValueError):
++        return None
++    if limit <= 0:
++        return None
++    detail_text = None
++    try:
++        remaining = detail.get("remaining")
++        if remaining is not None:
++            detail_text = f"{float(remaining):g} of {limit:g} remaining"
++    except (TypeError, ValueError):
++        detail_text = None
++    return AccountUsageWindow(
++        label=label,
++        used_percent=round((used / limit) * 100, 2),
++        reset_at=_parse_dt(detail.get("resetTime")),
++        detail=detail_text,
++    )
++
++
++def _fetch_kimi_account_usage(
++    base_url: Optional[str] = None,
++    api_key: Optional[str] = None,
++) -> Optional[AccountUsageSnapshot]:
++    """Fetch the Kimi Code Plan quota from ``GET {base}/v1/usages``.
++
++    The top-level ``usage`` object is the plan's primary (weekly) quota; each
++    entry in ``limits`` carries an explicit window duration that is mapped to
++    its real length (e.g. 300 minutes -> "5 hour").
++    """
++    token = str(api_key or "").strip()
++    if not token:
++        return None
++    normalized = str(base_url or "").strip().rstrip("/") or _KIMI_DEFAULT_BASE_URL
++    if normalized.endswith("/usages"):
++        url = normalized
++    elif normalized.endswith("/v1"):
++        url = f"{normalized}/usages"
++    else:
++        url = f"{normalized}/v1/usages"
++    headers = {
++        "Authorization": f"Bearer {token}",
++        "Accept": "application/json",
++        # Kimi's coding edge expects the same UA family as the inference path.
++        "User-Agent": "claude-code/0.1.0",
++    }
++    with httpx.Client(timeout=10.0) as client:
++        response = client.get(url, headers=headers)
++        response.raise_for_status()
++    payload = response.json() or {}
++    windows: list[AccountUsageWindow] = []
++    primary = _kimi_quota_window(payload.get("usage"), "Weekly")
++    if primary is not None:
++        windows.append(primary)
++    for extra in payload.get("limits") or []:
++        if not isinstance(extra, dict):
++            continue
++        window_info = extra.get("window") or {}
++        label = _kimi_window_label(window_info.get("duration"), window_info.get("timeUnit"))
++        window = _kimi_quota_window(extra.get("detail"), label)
++        if window is not None:
++            windows.append(window)
++    details: list[str] = []
++    parallel = (payload.get("parallel") or {}).get("limit")
++    if isinstance(parallel, (int, float)) and float(parallel) > 0:
++        details.append(f"Parallel limit: {int(parallel)}")
++    return AccountUsageSnapshot(
++        provider="kimi-coding",
++        source="usage_api",
++        fetched_at=_utc_now(),
++        plan=_kimi_plan_label(payload),
++        windows=tuple(windows),
++        details=tuple(details),
++    )
++
++
++ACCOUNT_USAGE_PROVIDERS = frozenset({"anthropic", "kimi-coding", "openai-codex", "openrouter"})
+ 
+ 
+ def fetch_account_usage_for_credential(
+@@ -906,6 +1032,8 @@ def fetch_account_usage_for_credential(
+         return _fetch_anthropic_account_usage(api_key=api_key)
+     if normalized == "openrouter":
+         return _fetch_openrouter_account_usage(base_url, api_key)
++    if normalized == "kimi-coding":
++        return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
+     return None
+ 
+ 
+@@ -925,6 +1053,8 @@ def fetch_account_usage(
+             return _fetch_anthropic_account_usage()
+         if normalized == "openrouter":
+             return _fetch_openrouter_account_usage(base_url, api_key)
++        if normalized == "kimi-coding":
++            return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
+     except Exception:
+         return None
+     return None
+diff --git a/agent/usage_contract.py b/agent/usage_contract.py
+index 7a8cd7569..1a0e35ddc 100644
+--- a/agent/usage_contract.py
++++ b/agent/usage_contract.py
+@@ -8,21 +8,40 @@ only to perform provider requests; no secret-bearing field is serialized.
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import math
++import threading
++import time
++from collections import OrderedDict
++from concurrent.futures import Future, wait
+ from datetime import datetime, timezone
+ from typing import Any, Callable, Mapping, Optional
++from urllib.parse import urlsplit, urlunsplit
++
++import httpx
+ 
+ from agent.account_usage import (
+     ACCOUNT_USAGE_PROVIDERS,
+     AccountUsageSnapshot,
+     fetch_account_usage_for_credential,
+ )
+-from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED
+-from hermes_cli.auth import read_credential_pool
++from agent.credential_pool import STATUS_DEAD, STATUS_EXHAUSTED, get_env_prefer_dotenv
++from hermes_cli.auth import _codex_access_token_is_expiring, read_credential_pool
++from hermes_constants import get_hermes_home
++from tools.daemon_pool import DaemonThreadPoolExecutor
+ 
+ USAGE_CONTRACT_NAME = "usage.accounts"
+ USAGE_CONTRACT_VERSION = 1
+ 
++_FETCH_DEADLINE_SECONDS = 6.5
++_FETCH_MAX_WORKERS = 4
++_CACHE_FRESH_SECONDS = 60.0
++_CACHE_STALE_SECONDS = 600.0
++_CACHE_MAX_ENTRIES = 128
++_CACHE_LOCK = threading.Lock()
++_CACHE: "OrderedDict[str, tuple[float, AccountUsageSnapshot]]" = OrderedDict()
++_monotonic = time.monotonic
++
+ UsageFetcher = Callable[..., Optional[AccountUsageSnapshot]]
+ 
+ 
+@@ -75,6 +94,112 @@ def sanitized_account_id(provider: str, entry: Mapping[str, Any]) -> str:
+     return f"acct_{digest}"
+ 
+ 
++def _runtime_access_token(entry: Mapping[str, Any]) -> str:
++    """Return the credential's live secret, re-reading env-backed entries.
++
++    Env-sourced entries persist only a reference (``env:<VAR>``) plus a
++    fingerprint — never the secret itself — so the on-disk payload alone would
++    wrongly mark every API-key credential unavailable.
++    """
++    token = str(entry.get("access_token") or "").strip()
++    if token:
++        return token
++    source = str(entry.get("source") or "").strip()
++    if source.startswith("env:"):
++        env_var = source[len("env:") :].strip()
++        if env_var:
++            try:
++                return str(get_env_prefer_dotenv(env_var) or "").strip()
++            except Exception:
++                return ""
++    return ""
++
++
++def _credential_fingerprint(entry: Mapping[str, Any], runtime_token: str) -> str:
++    persisted = str(entry.get("secret_fingerprint") or "").strip()
++    if persisted:
++        return persisted
++    return hashlib.sha256(runtime_token.encode()).hexdigest() if runtime_token else "missing"
++
++
++def _canonical_endpoint(raw: Any) -> str:
++    value = str(raw or "").strip()
++    if not value:
++        return "<provider-default>"
++    try:
++        parsed = urlsplit(value)
++        scheme = parsed.scheme.lower()
++        host = (parsed.hostname or "").lower()
++        if not scheme or not host or parsed.username or parsed.password:
++            return value.rstrip("/")
++        explicit_port = parsed.port
++        effective_port = explicit_port or (443 if scheme == "https" else 80 if scheme == "http" else None)
++        authority = host if effective_port is None else f"{host}:{effective_port}"
++        path = "/" + "/".join(part for part in parsed.path.split("/") if part)
++        return urlunsplit((scheme, authority, path.rstrip("/") or "/", parsed.query, ""))
++    except (TypeError, ValueError):
++        return value.rstrip("/")
++
++
++def _cache_identity(
++    provider: str,
++    entry: Mapping[str, Any],
++    runtime_token: str,
++) -> Optional[str]:
++    # Empty fetch keys trigger a native resolver that may rotate to another
++    # Codex account. Without the final credential identity caching is unsafe.
++    if not runtime_token:
++        return None
++    seed = {
++        "profile": str(get_hermes_home().resolve()),
++        "provider": provider,
++        "entry_id": str(entry.get("id") or ""),
++        "source": str(entry.get("source") or ""),
++        "endpoint": _canonical_endpoint(entry.get("base_url")),
++        "credential": _credential_fingerprint(entry, runtime_token),
++    }
++    canonical = json.dumps(seed, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
++    return hashlib.sha256(canonical.encode()).hexdigest()
++
++
++def _cache_read(key: Optional[str]) -> tuple[Optional[AccountUsageSnapshot], Optional[AccountUsageSnapshot]]:
++    """Return (fresh, stale) while lazily evicting expired entries."""
++    if key is None:
++        return None, None
++    now = _monotonic()
++    with _CACHE_LOCK:
++        expired = [cache_key for cache_key, (saved_at, _) in _CACHE.items() if now - saved_at > _CACHE_STALE_SECONDS]
++        for cache_key in expired:
++            _CACHE.pop(cache_key, None)
++        cached = _CACHE.get(key)
++        if cached is None:
++            return None, None
++        _CACHE.move_to_end(key)
++        age = max(0.0, now - cached[0])
++        if age <= _CACHE_FRESH_SECONDS:
++            return cached[1], None
++        return None, cached[1]
++
++
++def _cache_write(key: Optional[str], snapshot: AccountUsageSnapshot) -> None:
++    if key is None or not snapshot.available or snapshot.unavailable_reason:
++        return
++    now = _monotonic()
++    with _CACHE_LOCK:
++        expired = [cache_key for cache_key, (saved_at, _) in _CACHE.items() if now - saved_at > _CACHE_STALE_SECONDS]
++        for cache_key in expired:
++            _CACHE.pop(cache_key, None)
++        _CACHE[key] = (now, snapshot)
++        _CACHE.move_to_end(key)
++        while len(_CACHE) > _CACHE_MAX_ENTRIES:
++            _CACHE.popitem(last=False)
++
++
++def _clear_usage_cache_for_tests() -> None:
++    with _CACHE_LOCK:
++        _CACHE.clear()
++
++
+ def _health(entry: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+     expiry = _parse_expiry(entry)
+     last_status = str(entry.get("last_status") or "").strip().lower()
+@@ -103,7 +228,7 @@ def _health(entry: Mapping[str, Any], now: datetime) -> dict[str, Any]:
+     return result
+ 
+ 
+-def _quota_payload(snapshot: AccountUsageSnapshot) -> dict[str, Any]:
++def _quota_payload(snapshot: AccountUsageSnapshot, *, stale: bool = False) -> dict[str, Any]:
+     if snapshot.unavailable_reason:
+         return {"status": "unavailable", "reason": snapshot.unavailable_reason, "windows": []}
+     if not snapshot.available:
+@@ -119,12 +244,17 @@ def _quota_payload(snapshot: AccountUsageSnapshot) -> dict[str, Any]:
+                 "detail": window.detail,
+             }
+         )
++    details = list(snapshot.details)
++    if stale:
++        details.append(f"Cached · {_iso(snapshot.fetched_at)}")
+     return {
+         "status": "available",
+         "plan": snapshot.plan,
+         "source": "provider_reported",
++        "fetched_at": _iso(snapshot.fetched_at),
++        "stale": stale,
+         "windows": windows,
+-        "details": list(snapshot.details),
++        "details": details,
+     }
+ 
+ 
+@@ -167,23 +297,39 @@ def build_usage_contract(
+     fetcher: UsageFetcher = fetch_account_usage_for_credential,
+     now: Optional[datetime] = None,
+ ) -> dict[str, Any]:
+-    """Build the canonical sanitized usage contract for the active profile."""
++    """Build the canonical sanitized usage contract for the active profile.
++
++    Independent provider reads run concurrently behind a hard request deadline.
++    Workers are deliberately pure: only the request thread reads or mutates the
++    process cache, so a detached late worker cannot alter state after return.
++    """
+     generated_at = now or _utc_now()
+     raw_pool = read_credential_pool()
+     providers: list[dict[str, Any]] = []
++    jobs: list[dict[str, Any]] = []
+ 
+-    for raw_provider in sorted(raw_pool):
+-        provider = str(raw_provider or "").strip().lower()
++    normalized_providers = sorted(
++        (
++            (str(raw_provider or "").strip().lower(), raw_provider)
++            for raw_provider in raw_pool
++        ),
++        key=lambda item: item[0],
++    )
++    for provider, raw_provider in normalized_providers:
+         raw_entries = raw_pool.get(raw_provider)
+         if not provider or not isinstance(raw_entries, list):
+             continue
+         usage_supported = provider in ACCOUNT_USAGE_PROVIDERS
+         accounts: list[dict[str, Any]] = []
+-        for raw_entry in raw_entries:
+-            if not isinstance(raw_entry, dict):
+-                continue
++        valid_entries = [entry for entry in raw_entries if isinstance(entry, dict)]
++        for raw_entry in valid_entries:
+             account_id = sanitized_account_id(provider, raw_entry)
+-            health = _health(raw_entry, generated_at)
++            runtime_token = _runtime_access_token(raw_entry)
++            health = _health({**raw_entry, "access_token": runtime_token}, generated_at)
++            quota: dict[str, Any]
++            fetch_key: Optional[str] = runtime_token
++            cache_key: Optional[str] = None
++
+             if not usage_supported:
+                 quota = {"status": "unsupported", "windows": []}
+             elif not fetch_provider_usage:
+@@ -192,42 +338,130 @@ def build_usage_contract(
+                 reason = "Credential is cooling down" if health["status"] == "cooldown" else "Credential is not usable"
+                 quota = {"status": "unavailable", "reason": reason, "windows": []}
+             else:
+-                try:
+-                    snapshot = fetcher(
+-                        provider,
+-                        api_key=str(raw_entry.get("access_token") or ""),
+-                        base_url=str(raw_entry.get("base_url") or "") or None,
+-                    )
+-                except Exception:
+-                    quota = {"status": "error", "reason": "Provider usage request failed", "windows": []}
++                if (
++                    provider == "openai-codex"
++                    and runtime_token
++                    and _codex_access_token_is_expiring(runtime_token, 0)
++                ):
++                    if len(valid_entries) == 1:
++                        # The fetcher's empty-key path delegates to the native
++                        # resolver. The final rotated identity is unknown here,
++                        # so this request intentionally bypasses the cache.
++                        fetch_key = None
++                    else:
++                        quota = {
++                            "status": "unavailable",
++                            "reason": "Credential token expired",
++                            "windows": [],
++                        }
++                        account = {
++                            "account_id": account_id,
++                            "health": health,
++                            "quota": quota,
++                            "routing": {
++                                "priority": int(raw_entry.get("priority") or 0),
++                                "request_count": int(raw_entry.get("request_count") or 0),
++                            },
++                        }
++                        accounts.append(account)
++                        continue
++
++                cache_key = _cache_identity(provider, raw_entry, runtime_token) if fetch_key is not None else None
++                fresh, stale = _cache_read(cache_key)
++                if fresh is not None:
++                    quota = _quota_payload(fresh)
+                 else:
+-                    quota = (
+-                        _quota_payload(snapshot)
+-                        if snapshot is not None
+-                        else {"status": "unavailable", "reason": "No provider usage data was returned", "windows": []}
+-                    )
+-            accounts.append(
++                    quota = {"status": "loading", "windows": []}
++
++            account = {
++                "account_id": account_id,
++                "health": health,
++                "quota": quota,
++                "routing": {
++                    "priority": int(raw_entry.get("priority") or 0),
++                    "request_count": int(raw_entry.get("request_count") or 0),
++                },
++            }
++            accounts.append(account)
++            if quota.get("status") == "loading":
++                jobs.append(
++                    {
++                        "account": account,
++                        "provider": provider,
++                        "api_key": fetch_key,
++                        "base_url": str(raw_entry.get("base_url") or "") or None,
++                        "cache_key": cache_key,
++                        "stale": stale,
++                    }
++                )
++
++        accounts.sort(key=lambda account: (account["routing"]["priority"], account["account_id"]))
++        if accounts:
++            providers.append(
+                 {
+-                    "account_id": account_id,
+-                    "health": health,
+-                    "quota": quota,
+-                    "routing": {
+-                        "priority": int(raw_entry.get("priority") or 0),
+-                        "request_count": int(raw_entry.get("request_count") or 0),
+-                    },
++                    "provider": provider,
++                    "usage_capability": "supported" if usage_supported else "unsupported",
++                    "routing": _routing_summary(accounts),
++                    "accounts": accounts,
+                 }
+             )
+-        accounts.sort(key=lambda account: (account["routing"]["priority"], account["account_id"]))
+-        if not accounts:
+-            continue
+-        providers.append(
+-            {
+-                "provider": provider,
+-                "usage_capability": "supported" if usage_supported else "unsupported",
+-                "routing": _routing_summary(accounts),
+-                "accounts": accounts,
+-            }
++
++    if jobs:
++        executor = DaemonThreadPoolExecutor(
++            max_workers=min(_FETCH_MAX_WORKERS, len(jobs)),
++            thread_name_prefix="usage-account",
+         )
++        future_jobs: dict[Future, dict[str, Any]] = {}
++        try:
++            for job in jobs:
++                future = executor.submit(
++                    fetcher,
++                    job["provider"],
++                    api_key=job["api_key"],
++                    base_url=job["base_url"],
++                )
++                future_jobs[future] = job
++            done, pending = wait(future_jobs, timeout=_FETCH_DEADLINE_SECONDS)
++
++            for future in done:
++                job = future_jobs[future]
++                try:
++                    snapshot = future.result()
++                except httpx.TimeoutException:
++                    cached = job["stale"]
++                    job["account"]["quota"] = (
++                        _quota_payload(cached, stale=True)
++                        if cached is not None
++                        else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
++                    )
++                except Exception:
++                    job["account"]["quota"] = {
++                        "status": "error",
++                        "reason": "Provider usage request failed",
++                        "windows": [],
++                    }
++                else:
++                    if snapshot is None:
++                        job["account"]["quota"] = {
++                            "status": "unavailable",
++                            "reason": "No provider usage data was returned",
++                            "windows": [],
++                        }
++                    else:
++                        job["account"]["quota"] = _quota_payload(snapshot)
++                        _cache_write(job["cache_key"], snapshot)
++
++            for future in pending:
++                job = future_jobs[future]
++                cached = job["stale"]
++                job["account"]["quota"] = (
++                    _quota_payload(cached, stale=True)
++                    if cached is not None
++                    else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
++                )
++                future.cancel()
++        finally:
++            executor.shutdown(wait=False, cancel_futures=True)
+ 
+     return {
+         "contract": {"name": USAGE_CONTRACT_NAME, "version": USAGE_CONTRACT_VERSION},
+diff --git a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+index 4cfa12a21..d5145fde0 100644
+--- a/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
++++ b/apps/desktop/src/app/shell/hooks/use-statusbar-items.tsx
+@@ -526,9 +526,9 @@ export function useStatusbarItems({
+       },
+       {
+         detail: contextBar || undefined,
+-        hidden: !contextUsage,
++        hidden: gatewayState !== 'open',
+         id: 'context-usage',
+-        label: contextUsage,
++        label: contextUsage || copy.contextUsage,
+         menuAlign: 'end',
+         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
+         menuContent: (
+diff --git a/apps/desktop/src/app/shell/statusbar-visibility.test.tsx b/apps/desktop/src/app/shell/statusbar-visibility.test.tsx
+index b4bce684b..c31b1a5a6 100644
+--- a/apps/desktop/src/app/shell/statusbar-visibility.test.tsx
++++ b/apps/desktop/src/app/shell/statusbar-visibility.test.tsx
+@@ -103,7 +103,7 @@ describe('statusbar item visibility', () => {
+     expect(screen.getByText('Plugin thing')).toBeTruthy()
+   })
+ 
+-  it('starts the per-turn session readouts hidden and restores them from the menu', async () => {
++  it('keeps coding-plan usage visible and hides only per-turn timers by default', () => {
+     const statusbar = bar([
+       item('running-timer', 'Turn timer', { variant: 'text' }),
+       item('context-usage', 'Context meter', { variant: 'menu' }),
+@@ -111,9 +111,22 @@ describe('statusbar item visibility', () => {
+       item('gateway-health', 'Gateway')
+     ])
+ 
+-    for (const label of ['Turn timer', 'Context meter', 'Session timer']) {
++    for (const label of ['Turn timer', 'Session timer']) {
+       expect(screen.queryByText(label)).toBeNull()
+     }
++    expect(within(statusbar).getByText('Context meter')).toBeTruthy()
++    expect($statusbarHiddenIds.get()).not.toContain('context-usage')
++  })
++
++  it('restores a hidden per-turn item from the menu', async () => {
++    const statusbar = bar([
++      item('running-timer', 'Turn timer', { variant: 'text' }),
++      item('context-usage', 'Context meter', { variant: 'menu' }),
++      item('session-timer', 'Session timer', { variant: 'text' }),
++      item('gateway-health', 'Gateway')
++    ])
++
++    expect(screen.queryByText('Session timer')).toBeNull()
+ 
+     openContextMenu(statusbar)
+ 
+diff --git a/apps/desktop/src/store/statusbar-prefs.ts b/apps/desktop/src/store/statusbar-prefs.ts
+index a5f9468c8..6a22cf9dc 100644
+--- a/apps/desktop/src/store/statusbar-prefs.ts
++++ b/apps/desktop/src/store/statusbar-prefs.ts
+@@ -1,4 +1,5 @@
+ import { Codecs, persistentAtom } from '@/lib/persisted'
++import { readJson, readKey, writeJson, writeKey } from '@/lib/storage'
+ 
+ const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
+ const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
+@@ -14,15 +15,15 @@ export function toggleStatusbarVisible() {
+ }
+ 
+ // Items the bar hides until the user turns them on from its context menu. The
+-// bar's job is to answer "is the backend healthy, where am I, what's it doing" —
+-// route shortcuts (cron/webhooks/agents), the terminal toggle, and the approval
+-// pill are navigation, not status, so they start out of the way. The per-turn
+-// session readouts (running/session timers, context meter) are diagnostics most
+-// users don't watch, so they start hidden too and the bar stays quiet mid-turn.
++// bar's job is to answer "is the backend healthy, where am I, what's it doing"
++// — route shortcuts (cron/webhooks/agents), the terminal toggle, and the
++// approval pill are navigation, not status, so they start out of the way. The
++// per-turn timers are diagnostics most users don't watch, so they start hidden
++// too. Context/account usage stays visible by default: it carries provider plan
++// limits (Codex/Kimi/…), not only the session token meter.
+ export const STATUSBAR_HIDDEN_BY_DEFAULT: readonly string[] = [
+   'agents',
+   'approval-mode',
+-  'context-usage',
+   'cron',
+   'running-timer',
+   'session-timer',
+@@ -30,6 +31,21 @@ export const STATUSBAR_HIDDEN_BY_DEFAULT: readonly string[] = [
+   'webhooks'
+ ]
+ 
++// Existing installs already persisted the old default set that included
++// context-usage. Drop that id once so coding-plan limits stay reachable without
++// forcing users who intentionally hid other items to reset their prefs.
++const STATUSBAR_HIDDEN_MIGRATION_KEY = 'hermes.desktop.statusbarHidden.migrate.v2-show-context-usage'
++if (readKey(STATUSBAR_HIDDEN_MIGRATION_KEY) !== '1') {
++  const parsed = readJson<unknown>(STATUSBAR_HIDDEN_STORAGE_KEY)
++  if (Array.isArray(parsed) && parsed.includes('context-usage')) {
++    writeJson(
++      STATUSBAR_HIDDEN_STORAGE_KEY,
++      parsed.filter(id => id !== 'context-usage')
++    )
++  }
++  writeKey(STATUSBAR_HIDDEN_MIGRATION_KEY, '1')
++}
++
+ // Stored as the explicit hidden set (not the visible one) so an item added to
+ // the bar in a later version shows up for existing users instead of silently
+ // staying off. An empty array is a real value — the user turned everything on —
+diff --git a/apps/desktop/src/types/hermes.ts b/apps/desktop/src/types/hermes.ts
+index 97dad91f5..11d134f87 100644
+--- a/apps/desktop/src/types/hermes.ts
++++ b/apps/desktop/src/types/hermes.ts
+@@ -723,9 +723,11 @@ export interface AccountUsageWindow {
+ 
+ export interface AccountUsageQuota {
+   details?: string[]
++  fetched_at?: string
+   plan?: null | string
+   reason?: string
+   source?: 'provider_reported'
++  stale?: boolean
+   status: AccountUsageState
+   windows: AccountUsageWindow[]
+ }
+diff --git a/package-lock.json b/package-lock.json
+index 362218b97..0d425009e 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1835,7 +1835,6 @@
+       "os": [
+         "aix"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1852,7 +1851,6 @@
+       "os": [
+         "android"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1869,7 +1867,6 @@
+       "os": [
+         "android"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1886,7 +1883,6 @@
+       "os": [
+         "android"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1903,7 +1899,6 @@
+       "os": [
+         "darwin"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1920,7 +1915,6 @@
+       "os": [
+         "darwin"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1937,7 +1931,6 @@
+       "os": [
+         "freebsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1954,7 +1947,6 @@
+       "os": [
+         "freebsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1971,7 +1963,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -1988,7 +1979,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2005,7 +1995,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2022,7 +2011,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2039,7 +2027,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2056,7 +2043,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2073,7 +2059,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2090,7 +2075,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2107,7 +2091,6 @@
+       "os": [
+         "linux"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2124,7 +2107,6 @@
+       "os": [
+         "netbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2141,7 +2123,6 @@
+       "os": [
+         "netbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2158,7 +2139,6 @@
+       "os": [
+         "openbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2175,7 +2155,6 @@
+       "os": [
+         "openbsd"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2192,7 +2171,6 @@
+       "os": [
+         "openharmony"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2209,7 +2187,6 @@
+       "os": [
+         "sunos"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2226,7 +2203,6 @@
+       "os": [
+         "win32"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2243,7 +2219,6 @@
+       "os": [
+         "win32"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -2260,7 +2235,6 @@
+       "os": [
+         "win32"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": ">=18"
+       }
+@@ -17986,7 +17960,6 @@
+       "os": [
+         "darwin"
+       ],
+-      "peer": true,
+       "engines": {
+         "node": "^8.16.0 || ^10.6.0 || >=11.0.0"
+       }
+diff --git a/tests/agent/test_account_usage.py b/tests/agent/test_account_usage.py
+index 4de28b882..52682cac0 100644
+--- a/tests/agent/test_account_usage.py
++++ b/tests/agent/test_account_usage.py
+@@ -227,3 +227,65 @@ def test_redeem_missing_credentials_reports_unavailable(monkeypatch):
+ 
+     assert result.status == "unavailable"
+     assert "hermes auth" in result.message
++
++
++@pytest.fixture
++def kimi_usage_payload():
++    return {
++        "user": {"userId": "u-1", "membership": {"level": "LEVEL_ADVANCED"}},
++        "usage": {
++            "limit": "100",
++            "used": "77",
++            "remaining": "23",
++            "resetTime": "2026-08-10T16:51:42.536576Z",
++        },
++        "limits": [
++            {
++                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
++                "detail": {
++                    "limit": "100",
++                    "used": "7",
++                    "remaining": "93",
++                    "resetTime": "2026-08-10T02:51:42.536576Z",
++                },
++            }
++        ],
++        "parallel": {"limit": 30},
++        "authentication": {"method": "METHOD_API_KEY", "scope": "FEATURE_CODING"},
++    }
++
++
++def test_kimi_usage_maps_membership_windows_and_details(monkeypatch, kimi_usage_payload):
++    calls = []
++    monkeypatch.setattr(
++        account_usage.httpx,
++        "Client",
++        lambda timeout: _FakeClient(calls, kimi_usage_payload),
++    )
++
++    snapshot = account_usage.fetch_account_usage(
++        "kimi-coding",
++        base_url="https://api.kimi.com/coding",
++        api_key="sk-kimi-test",
++    )
++
++    assert snapshot is not None
++    assert snapshot.provider == "kimi-coding"
++    assert snapshot.plan == "Advanced"
++    assert snapshot.source == "usage_api"
++    assert [w.label for w in snapshot.windows] == ["Weekly", "5 hour"]
++    assert snapshot.windows[0].used_percent == 77.0
++    assert snapshot.windows[0].reset_at is not None
++    assert snapshot.windows[1].used_percent == 7.0
++    assert any("30" in detail for detail in snapshot.details)
++    assert calls[0]["url"] == "https://api.kimi.com/coding/v1/usages"
++    assert calls[0]["headers"]["Authorization"] == "Bearer sk-kimi-test"
++    assert calls[0]["headers"]["User-Agent"] == "claude-code/0.1.0"
++    assert "sk-kimi-test" not in repr(snapshot)
++
++
++def test_kimi_usage_requires_api_key():
++    assert account_usage.fetch_account_usage("kimi-coding", api_key="") is None
++    assert (
++        account_usage.fetch_account_usage_for_credential("kimi-coding", api_key="") is None
++    )
+diff --git a/tests/agent/test_usage_contract.py b/tests/agent/test_usage_contract.py
+index 1055026d7..a25766fed 100644
+--- a/tests/agent/test_usage_contract.py
++++ b/tests/agent/test_usage_contract.py
+@@ -1,7 +1,11 @@
+ import json
++import time
+ from datetime import datetime, timezone
+ 
++import httpx
++
+ from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
++from agent import usage_contract
+ from agent.usage_contract import build_usage_contract
+ 
+ 
+@@ -163,3 +167,290 @@ def test_usage_contract_reports_health_and_truthful_usage_states(tmp_path, monke
+     assert "cooldown-token" not in serialized
+     assert "expired-token" not in serialized
+     assert "local-secret" not in serialized
++
++
++def _expired_jwt() -> str:
++    import base64
++
++    def seg(obj) -> str:
++        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
++
++    return f"{seg({'alg': 'none', 'typ': 'JWT'})}.{seg({'exp': 1_700_000_000})}.signature"
++
++
++def test_usage_contract_rehydrates_env_sourced_credentials(tmp_path, monkeypatch):
++    """Env-sourced pool entries persist without the secret value. The contract
++    must re-read the env var at build time so the credential is usable and the
++    fetcher receives the live key."""
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.setenv("KIMI_API_KEY", "sk-kimi-fixture")
++    _write_fixture(
++        hermes_home,
++        {
++            "kimi-coding": [
++                {
++                    "id": "kimi-1",
++                    "label": "KIMI_API_KEY",
++                    "auth_type": "api_key",
++                    "priority": 0,
++                    "source": "env:KIMI_API_KEY",
++                    "base_url": "https://api.kimi.com/coding",
++                    # access_token intentionally absent — sanitized on persist.
++                }
++            ]
++        },
++    )
++
++    seen = {}
++
++    def fake_fetch(provider, *, api_key, base_url=None):
++        seen["api_key"] = api_key
++        return AccountUsageSnapshot(
++            provider=provider,
++            source="fixture",
++            fetched_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
++            windows=(AccountUsageWindow(label="Weekly", used_percent=77.0),),
++        )
++
++    payload = build_usage_contract(
++        fetcher=fake_fetch,
++        now=datetime(2026, 8, 10, tzinfo=timezone.utc),
++    )
++    kimi = payload["providers"][0]
++    assert kimi["provider"] == "kimi-coding"
++    assert kimi["usage_capability"] == "supported"
++    account = kimi["accounts"][0]
++    assert account["health"]["status"] == "ready"
++    assert account["quota"]["status"] == "available"
++    assert seen["api_key"] == "sk-kimi-fixture"
++    assert "sk-kimi-fixture" not in json.dumps(payload)
++
++
++def test_usage_contract_marks_env_credential_unavailable_when_env_missing(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    monkeypatch.delenv("KIMI_API_KEY", raising=False)
++    _write_fixture(
++        hermes_home,
++        {
++            "kimi-coding": [
++                {
++                    "id": "kimi-1",
++                    "label": "KIMI_API_KEY",
++                    "auth_type": "api_key",
++                    "priority": 0,
++                    "source": "env:KIMI_API_KEY",
++                    "base_url": "https://api.kimi.com/coding",
++                }
++            ]
++        },
++    )
++
++    def fake_fetch(provider, *, api_key, base_url=None):
++        raise AssertionError("fetcher must not run for an unavailable credential")
++
++    payload = build_usage_contract(
++        fetcher=fake_fetch,
++        now=datetime(2026, 8, 10, tzinfo=timezone.utc),
++    )
++    account = payload["providers"][0]["accounts"][0]
++    assert account["health"]["status"] == "unavailable"
++    assert account["quota"]["status"] == "unavailable"
++
++
++def test_usage_contract_delegates_expired_single_codex_token_to_refreshing_resolver(tmp_path, monkeypatch):
++    """A single-account Codex credential whose JWT access_token has expired
++    must be fetched through the refreshing resolver (api_key=None) rather than
++    the stale token, so the quota fetch self-heals instead of 401-ing."""
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    _write_fixture(
++        hermes_home,
++        {
++            "openai-codex": [
++                {
++                    "id": "codex-1",
++                    "label": "device_code",
++                    "auth_type": "oauth",
++                    "priority": 0,
++                    "source": "device_code",
++                    "access_token": _expired_jwt(),
++                    "refresh_token": "rt-1",
++                }
++            ]
++        },
++    )
++
++    seen = {}
++
++    def fake_fetch(provider, *, api_key, base_url=None):
++        seen["api_key"] = api_key
++        return AccountUsageSnapshot(
++            provider=provider,
++            source="fixture",
++            fetched_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
++            windows=(AccountUsageWindow(label="Session", used_percent=66.0),),
++        )
++
++    payload = build_usage_contract(
++        fetcher=fake_fetch,
++        now=datetime(2026, 8, 10, tzinfo=timezone.utc),
++    )
++    account = payload["providers"][0]["accounts"][0]
++    assert account["health"]["status"] == "ready"
++    assert account["quota"]["status"] == "available"
++    assert seen["api_key"] is None
++
++
++def test_usage_contract_marks_expired_codex_token_unavailable_in_multi_account_pool(tmp_path, monkeypatch):
++    """With multiple Codex accounts, an expired token must NOT delegate to the
++    resolver (it could return a different account's usage). The account shows
++    an explicit expired state instead of another account's windows."""
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    entries = [
++        {
++            "id": f"codex-{idx}",
++            "label": "device_code",
++            "auth_type": "oauth",
++            "priority": idx,
++            "source": "device_code",
++            "access_token": _expired_jwt(),
++            "refresh_token": f"rt-{idx}",
++        }
++        for idx in range(2)
++    ]
++    _write_fixture(hermes_home, {"openai-codex": entries})
++
++    def fake_fetch(provider, *, api_key, base_url=None):
++        raise AssertionError("expired multi-account tokens must not be fetched")
++
++    payload = build_usage_contract(
++        fetcher=fake_fetch,
++        now=datetime(2026, 8, 10, tzinfo=timezone.utc),
++    )
++    accounts = payload["providers"][0]["accounts"]
++    assert len(accounts) == 2
++    for account in accounts:
++        assert account["quota"]["status"] == "unavailable"
++        assert "expired" in account["quota"]["reason"].lower()
++
++
++def _available_snapshot(provider: str, used: float = 25.0) -> AccountUsageSnapshot:
++    return AccountUsageSnapshot(
++        provider=provider,
++        source="fixture",
++        fetched_at=datetime(2026, 8, 10, tzinfo=timezone.utc),
++        windows=(AccountUsageWindow(label="Weekly", used_percent=used),),
++    )
++
++
++def test_usage_contract_fetches_accounts_concurrently_and_orders_deterministically(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    _write_fixture(
++        hermes_home,
++        {
++            "openrouter": [
++                {"id": "second", "priority": 2, "source": "manual", "access_token": "token-b"},
++                {"id": "first", "priority": 1, "source": "manual", "access_token": "token-a"},
++            ],
++            "kimi-coding": [
++                {"id": "kimi", "priority": 0, "source": "manual", "access_token": "token-k"}
++            ],
++        },
++    )
++    usage_contract._clear_usage_cache_for_tests()
++
++    def slow_fetch(provider, *, api_key, base_url=None):
++        time.sleep(0.2)
++        return _available_snapshot(provider)
++
++    started = time.perf_counter()
++    payload = build_usage_contract(fetcher=slow_fetch)
++    elapsed = time.perf_counter() - started
++
++    assert elapsed < 0.38
++    assert [item["provider"] for item in payload["providers"]] == ["kimi-coding", "openrouter"]
++    openrouter = payload["providers"][1]
++    assert [account["routing"]["priority"] for account in openrouter["accounts"]] == [1, 2]
++
++
++def test_usage_contract_global_deadline_does_not_wait_for_running_worker(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    _write_fixture(
++        hermes_home,
++        {"openrouter": [{"id": "slow", "source": "manual", "access_token": "token-slow"}]},
++    )
++    usage_contract._clear_usage_cache_for_tests()
++    monkeypatch.setattr(usage_contract, "_FETCH_DEADLINE_SECONDS", 0.05)
++
++    def blocked_fetch(provider, *, api_key, base_url=None):
++        time.sleep(0.3)
++        return _available_snapshot(provider)
++
++    started = time.perf_counter()
++    payload = build_usage_contract(fetcher=blocked_fetch)
++    elapsed = time.perf_counter() - started
++
++    assert elapsed < 0.18
++    quota = payload["providers"][0]["accounts"][0]["quota"]
++    assert quota["status"] == "error"
++    assert "timed out" in quota["reason"].lower()
++
++
++def test_usage_contract_uses_stale_cache_only_for_timeout(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    _write_fixture(
++        hermes_home,
++        {"openrouter": [{"id": "cached", "source": "manual", "access_token": "token-a"}]},
++    )
++    usage_contract._clear_usage_cache_for_tests()
++    clock = [1000.0]
++    monkeypatch.setattr(usage_contract, "_monotonic", lambda: clock[0])
++
++    first = build_usage_contract(fetcher=lambda provider, **kwargs: _available_snapshot(provider, 42))
++    assert first["providers"][0]["accounts"][0]["quota"]["stale"] is False
++
++    clock[0] += 61
++
++    def timeout_fetch(provider, **kwargs):
++        raise httpx.ReadTimeout("fixture timeout")
++
++    stale = build_usage_contract(fetcher=timeout_fetch)
++    stale_quota = stale["providers"][0]["accounts"][0]["quota"]
++    assert stale_quota["status"] == "available"
++    assert stale_quota["stale"] is True
++    assert stale_quota["fetched_at"] == "2026-08-10T00:00:00Z"
++
++    def programming_error(provider, **kwargs):
++        raise RuntimeError("fixture bug")
++
++    failed = build_usage_contract(fetcher=programming_error)
++    assert failed["providers"][0]["accounts"][0]["quota"]["status"] == "error"
++
++
++def test_usage_contract_cache_isolated_across_credential_rotation(tmp_path, monkeypatch):
++    hermes_home = tmp_path / "fixture-home"
++    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++    entry = {"id": "same-id", "source": "manual", "access_token": "token-before"}
++    _write_fixture(hermes_home, {"openrouter": [entry]})
++    usage_contract._clear_usage_cache_for_tests()
++    clock = [2000.0]
++    monkeypatch.setattr(usage_contract, "_monotonic", lambda: clock[0])
++    build_usage_contract(fetcher=lambda provider, **kwargs: _available_snapshot(provider))
++
++    clock[0] += 61
++    entry["access_token"] = "token-after"
++    _write_fixture(hermes_home, {"openrouter": [entry]})
++
++    def timeout_fetch(provider, **kwargs):
++        raise httpx.ConnectTimeout("fixture timeout")
++
++    payload = build_usage_contract(fetcher=timeout_fetch)
++    quota = payload["providers"][0]["accounts"][0]["quota"]
++    assert quota["status"] == "error"
++    assert quota.get("stale") is not True
