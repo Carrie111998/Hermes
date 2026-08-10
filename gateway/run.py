@@ -6355,6 +6355,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # dormant before the drained backlog has a chance to update the clock.
         self._scale_to_zero_cooldown_until: float = 0.0
 
+        # DEV-0159: state-spine context object.  Created alongside the
+        # existing self.X attributes as a parallel view.  No consumer
+        # uses self._ctx yet — this is infrastructure for the state-first
+        # refactoring sequence.
+        from gateway.context import GatewayContext
+        self._ctx = GatewayContext(
+            config=self.config,
+            adapters=self.adapters,
+            session_store=self.session_store,
+            async_session_store=self._async_session_store,
+            delivery_router=self.delivery_router,
+            _running=self._running,
+        )
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
