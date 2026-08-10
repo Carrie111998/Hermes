@@ -374,6 +374,37 @@ class TestCLI:
             str(path) for _, path in paths
         }
 
+    def test_boards_list_honors_custom_default_db_override(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        """HERMES_KANBAN_DB may relocate the default board without pinning others."""
+        from hermes_cli import kanban as kanban_cli
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        custom = tmp_path / "custom-default.db"
+        with sqlite3.connect(custom) as conn:
+            conn.execute("CREATE TABLE tasks (status TEXT NOT NULL)")
+            conn.executemany(
+                "INSERT INTO tasks(status) VALUES (?)",
+                [("todo",), ("running",)],
+            )
+        other = tmp_path / "kanban" / "boards" / "alpha" / "kanban.db"
+        other.parent.mkdir(parents=True)
+        with sqlite3.connect(other) as conn:
+            conn.execute("CREATE TABLE tasks (status TEXT NOT NULL)")
+            conn.execute("INSERT INTO tasks(status) VALUES (?)", ("blocked",))
+
+        monkeypatch.setenv("HERMES_KANBAN_DB", str(custom))
+        monkeypatch.setattr(kb, "get_current_board", lambda: "default")
+
+        assert kanban_cli._cmd_boards_list(argparse.Namespace(all=False, json=True)) == 0
+        data = json.loads(capsys.readouterr().out)
+        by_slug = {board["slug"]: board for board in data}
+        assert by_slug["default"]["db_path"] == str(custom)
+        assert by_slug["default"]["counts"] == {"todo": 1, "running": 1}
+        assert by_slug["alpha"]["db_path"] == str(other)
+        assert by_slug["alpha"]["counts"] == {"blocked": 1}
+
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
         res = _cli(["boards", "list", "--json"], env_extra=env)

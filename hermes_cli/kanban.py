@@ -1207,10 +1207,41 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
 
 
 def _board_list_db_path(slug: str) -> Path:
-    """Return a board's physical DB path, ignoring worker handoff pins."""
-    if slug == kb.DEFAULT_BOARD:
-        return kb.kanban_home() / "kanban.db"
-    return kb.board_dir(slug) / "kanban.db"
+    """Return a board's physical DB path for registry listing.
+
+    Named boards always use their on-disk path under ``boards/<slug>/``.
+    The default board honors a legitimate ``HERMES_KANBAN_DB`` relocation
+    (single-DB deployments / tests), but ignores a worker handoff pin that
+    points at another board's database — otherwise every listed board
+    collapses onto the pinned file.
+    """
+    if slug != kb.DEFAULT_BOARD:
+        return kb.board_dir(slug) / "kanban.db"
+
+    canonical = kb.kanban_home() / "kanban.db"
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if not override:
+        return canonical
+
+    override_path = Path(override).expanduser()
+    try:
+        resolved = override_path.resolve()
+    except OSError:
+        return override_path
+
+    # Worker pins inject the active board DB.  If that path is clearly
+    # another board under boards_root, keep default on its canonical file.
+    try:
+        rel = resolved.relative_to(kb.boards_root().resolve())
+    except ValueError:
+        # Outside the boards tree — treat as intentional default relocation.
+        return override_path
+    except OSError:
+        return override_path
+
+    if rel.parts and rel.parts[0] not in {"", kb.DEFAULT_BOARD}:
+        return canonical
+    return override_path
 
 
 def _board_task_counts(
