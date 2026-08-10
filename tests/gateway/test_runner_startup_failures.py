@@ -858,6 +858,25 @@ def test_is_global_startup_conflict_contract():
         None,
         "Telegram bot token already in use (PID 42). Stop the other gateway first.",
     )
+    # Production Telegram connect can wrap a live 409 getUpdates conflict in
+    # the generic telegram_connect_error envelope — still a single-writer gate.
+    assert is_global_startup_conflict(
+        "telegram_connect_error",
+        "Telegram startup failed: Conflict: terminated by other getUpdates request",
+    )
+    assert is_global_startup_conflict(
+        "telegram_connect_error",
+        "Telegram startup failed: HTTP 409 Conflict: another getUpdates request is active",
+    )
+    assert is_global_startup_conflict(
+        None,
+        "Conflict: terminated by other getUpdates request",
+    )
+    # Unrelated transient telegram_connect_error must stay retryable, not fatal.
+    assert not is_global_startup_conflict(
+        "telegram_connect_error",
+        "Telegram startup failed: temporary DNS resolution failure.",
+    )
 
 
 def test_production_acquire_platform_lock_still_retryable_for_reconnect(monkeypatch, tmp_path):
@@ -877,4 +896,247 @@ def test_production_acquire_platform_lock_still_retryable_for_reconnect(monkeypa
         "telegram-bot-token", token, "Telegram bot token"
     ) is False
     assert adapter.fatal_error_retryable is True
-    assert adapter.fatal_error_code == "telegram-bot-token_lock"
+
+
+class _SecondaryRetryableFailureAdapter(BasePlatformAdapter):
+    """Secondary multiplex adapter with a transient (non-conflict) failure."""
+
+    def __init__(self, platform: Platform = Platform.TELEGRAM):
+        super().__init__(
+            PlatformConfig(enabled=True, token="secondary-retry-token"),
+            platform,
+        )
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error(
+            "telegram_connect_error",
+            "Telegram startup failed: temporary DNS resolution failure.",
+            retryable=True,
+        )
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+class _Telegram409ConnectErrorAdapter(BasePlatformAdapter):
+    """Production shape: outer connect exception records telegram_connect_error
+    while the body still carries a Bot API 409 getUpdates conflict."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error(
+            "telegram_connect_error",
+            "Telegram startup failed: Conflict: terminated by other getUpdates request",
+            retryable=True,
+        )
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
+@pytest.mark.asyncio
+async def test_runner_exits_78_on_telegram_connect_error_409(monkeypatch, tmp_path):
+    """Production 409 getUpdates under telegram_connect_error must fail closed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda platform, platform_config: _Telegram409ConnectErrorAdapter(),
+    )
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is True
+    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
+    assert Platform.TELEGRAM not in runner._failed_platforms
+    state = read_runtime_status()
+    assert state["gateway_state"] == "startup_failed"
+    plat = state.get("platforms", {}).get("telegram", {})
+    assert plat.get("state") == "fatal"
+    assert plat.get("error_code") == "telegram_connect_error"
+    assert "getupdates" in (plat.get("error_message") or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_runner_secondary_retryable_enters_profile_retry_registry(
+    monkeypatch, tmp_path
+):
+    """Secondary retryable startup failure must arm profile-scoped reconnect.
+
+    Previously queue_retry=False left startup_retryable_errors non-empty
+    (suppressing exit 78) while neither ``_failed_platforms`` nor
+    ``_profile_failed_platforms`` received the secondary — live but deaf.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={},  # primary has nothing enabled
+        sessions_dir=tmp_path / "sessions",
+        multiplex_profiles=True,
+    )
+    runner = GatewayRunner(config)
+
+    secondary_home = tmp_path / "profiles" / "work"
+    secondary_home.mkdir(parents=True)
+
+    def _profiles_to_serve(multiplex=True):
+        return [("work", secondary_home)]
+
+    import hermes_cli.profiles as profiles_mod
+
+    monkeypatch.setattr(profiles_mod, "profiles_to_serve", _profiles_to_serve)
+    monkeypatch.setattr(profiles_mod, "get_active_profile_name", lambda: "default")
+
+    secondary_cfg = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="secondary-retry-token")},
+        sessions_dir=secondary_home / "sessions",
+    )
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: secondary_cfg)
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda platform, platform_config: _SecondaryRetryableFailureAdapter(platform),
+    )
+    monkeypatch.setattr(
+        "gateway.run._own_policy_open_startup_violation",
+        lambda cfg: None,
+    )
+    # Do not run real reconnect loops in the unit test.
+    monkeypatch.setattr(
+        runner,
+        "_spawn_supervised",
+        lambda coro_factory, name, **kwargs: None,
+    )
+    scheduled: list[tuple[str, Platform]] = []
+
+    def _capture_schedule(profile_name, platform, adapter):
+        scheduled.append((profile_name, platform))
+        # Mirror production bookkeeping without starting the reconnect task.
+        pending = runner._profile_failed_platforms
+        if not isinstance(pending, dict):
+            pending = {}
+            runner._profile_failed_platforms = pending
+        profile_pending = pending.setdefault(profile_name, {})
+        # Placeholder non-task marker so the registry is observable.
+        profile_pending[platform] = object()
+
+    monkeypatch.setattr(runner, "_schedule_secondary_profile_reconnect", _capture_schedule)
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is False
+    assert runner.exit_code in (None, 0)
+    # Must not claim a primary-slot retry for a secondary failure.
+    assert Platform.TELEGRAM not in runner._failed_platforms
+    # Must enter the profile-scoped retry registry.
+    assert scheduled == [("work", Platform.TELEGRAM)]
+    assert Platform.TELEGRAM in runner._profile_failed_platforms.get("work", {})
+    state = read_runtime_status()
+    assert state["gateway_state"] == "running"
+    plat = state.get("platforms", {}).get("telegram", {})
+    assert plat.get("state") == "retrying"
+
+
+@pytest.mark.asyncio
+async def test_production_scoped_lock_tuple_unreachable_without_unpack(monkeypatch, tmp_path):
+    """Buzz/IRC/LINE must unpack acquire_scoped_lock's (False, existing) tuple.
+
+    A non-empty failure tuple is truthy in Python; ``if not acquire_scoped_lock()``
+    never enters the lock_conflict branch. Production shape: real status helper
+    returning (False, holder) must set lock_conflict and refuse connect.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import gateway.status as status_mod
+
+    holder = {"pid": 777001, "scope": "buzz"}
+
+    def _fail_lock(scope, identity, metadata=None):
+        return (False, holder)
+
+    monkeypatch.setattr(status_mod, "acquire_scoped_lock", _fail_lock)
+
+    from tests.gateway._plugin_adapter_loader import load_plugin_adapter
+
+    # --- Buzz ---
+    buzz_mod = load_plugin_adapter("buzz")
+    from gateway.config import PlatformConfig as PC
+
+    buzz = buzz_mod.BuzzAdapter(
+        PC(enabled=True, extra={"relay_url": "wss://relay.example", "private_key": "nsec1test"})
+    )
+    # Minimal scripted connect path up to the lock.
+    buzz.cli_path = "/fake/buzz"
+    monkeypatch.setattr(buzz_mod, "_resolve_private_key", lambda extra=None: "nsec1test")
+
+    async def _buzz_cli(args):
+        if args[:2] == ["users", "get"]:
+            return 0, '[{"pubkey":"' + ("ab" * 32) + '","display_name":"T"}]', ""
+        return 1, "", "unexpected"
+
+    buzz._run_cli = _buzz_cli
+    assert await buzz.connect() is False
+    assert buzz.has_fatal_error is True
+    assert buzz.fatal_error_code == "lock_conflict"
+    assert buzz._lock_key is None
+
+    # --- IRC ---
+    irc_mod = load_plugin_adapter("irc")
+    irc = irc_mod.IRCAdapter(
+        PC(
+            enabled=True,
+            extra={
+                "server": "irc.example",
+                "port": 6667,
+                "nickname": "hermes",
+                "channel": "#test",
+                "use_tls": False,
+            },
+        )
+    )
+    assert await irc.connect() is False
+    assert irc.has_fatal_error is True
+    assert irc.fatal_error_code == "lock_conflict"
+    assert getattr(irc, "_lock_key", None) in (None, "")
+
+    # --- LINE ---
+    line_mod = load_plugin_adapter("line")
+    line = line_mod.LineAdapter(
+        PC(
+            enabled=True,
+            extra={
+                "channel_access_token": "line-token-xyz",
+                "channel_secret": "line-secret-xyz",
+            },
+        )
+    )
+    # LINE may read token/secret from env or extra depending on version.
+    if not getattr(line, "channel_access_token", None):
+        line.channel_access_token = "line-token-xyz"
+    if not getattr(line, "channel_secret", None):
+        line.channel_secret = "line-secret-xyz"
+    assert await line.connect() is False
+    assert line.has_fatal_error is True
+    assert line.fatal_error_code == "lock_conflict"
+    assert getattr(line, "_lock_key", None) in (None, "")

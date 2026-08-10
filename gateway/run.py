@@ -11305,6 +11305,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         startup_global_conflicts: list[tuple[str, str | None, str]] = []
         startup_local_nonretryable: list[tuple[str, str | None, str]] = []
         startup_retryable_errors: list[str] = []
+        # Secondary multiplex retryable failures cannot use the primary
+        # ``_failed_platforms`` registry (different HERMES_HOME/secrets).
+        # Collect them here and arm ``_profile_failed_platforms`` once the
+        # runner is marked running — otherwise exit-78 is suppressed while
+        # nothing ever retries (live but deaf secondary).
+        startup_secondary_retries: list[tuple[str, "Platform", "BasePlatformAdapter"]] = []
 
         def _format_startup_entries(
             entries: list[tuple[str, str | None, str]],
@@ -11350,7 +11356,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error_message=message,
                     )
                     startup_retryable_errors.append(detail)
-                    if queue_retry and profile_name is None and platform_config is not None:
+                    if profile_name is not None:
+                        # Profile-scoped retry registry (not primary
+                        # _failed_platforms — secrets/home differ).
+                        startup_secondary_retries.append(
+                            (profile_name, platform, adapter)
+                        )
+                        return
+                    if queue_retry and platform_config is not None:
                         self._failed_platforms[platform] = {
                             "config": platform_config,
                             "attempts": 1,
@@ -11381,6 +11394,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 error_message=message,
             )
             startup_retryable_errors.append(detail)
+            if profile_name is not None and adapter is not None:
+                # Treat unknown secondary connect failure as retryable and
+                # enter the profile-scoped reconnect registry.
+                startup_secondary_retries.append((profile_name, platform, adapter))
+                return
             if (
                 queue_retry
                 and profile_name is None
@@ -11627,11 +11645,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     #     proxy, etc.)
                     # Exiting here used to convert a single misconfigured
                     # platform into an infinite systemd restart loop.
+                    # Secondary multiplex failures land in the profile-
+                    # scoped retry registry (armed after _running=True);
+                    # primary failures land in ``_failed_platforms``.
                     reason = "; ".join(startup_retryable_errors)
+                    queued = len(self._failed_platforms) + len(startup_secondary_retries)
                     logger.warning(
                         "Gateway started with no connected platforms — "
                         "%d platform(s) queued for retry: %s",
-                        len(self._failed_platforms), reason,
+                        queued, reason,
                     )
                     # Fall through to the normal "running" state — reconnect
                     # watcher takes it from here. Lifecycle remains "running"
@@ -11662,6 +11684,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # platform fatal/retrying detail lives on per-platform status so
         # busy/drain controls keep working for active cron/Kanban work.
         self._update_runtime_status("running")
+
+        # Arm profile-scoped reconnects only after _running is True —
+        # ``_schedule_secondary_profile_reconnect`` refuses work while the
+        # runner is still starting. Secondary retryable startup failures
+        # must not suppress exit 78 without entering this registry.
+        for _sec_profile, _sec_platform, _sec_adapter in startup_secondary_retries:
+            try:
+                self._schedule_secondary_profile_reconnect(
+                    _sec_profile, _sec_platform, _sec_adapter
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to schedule secondary %s reconnect for profile %s",
+                    _sec_platform.value,
+                    _sec_profile,
+                    exc_info=True,
+                )
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
