@@ -734,6 +734,7 @@ export interface AccountUsageQuota {
 
 export interface UsageAccount {
   account_id: string
+  display_name?: string
   health: {
     auth_type: string
     expires_at?: string

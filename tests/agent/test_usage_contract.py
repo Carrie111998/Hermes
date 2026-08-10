@@ -602,11 +602,18 @@ def test_usage_contract_stale_masking_only_for_retryable_failures(tmp_path, monk
     assert quota_after(_status_error(500))["stale"] is True
     assert quota_after(httpx.ConnectError("fixture connect"))["stale"] is True
 
-    # Never masked: auth failures and rate limiting must surface as errors.
-    for status_code in (401, 403, 429):
+    # Auth failures surface as unavailable with a safe reason — never stale,
+    # never error-swallowed. Rate limiting surfaces as error. Each negative
+    # classification is cached briefly, so advance past its TTL between cases.
+    for status_code in (401, 403):
         quota = quota_after(_status_error(status_code))
-        assert quota["status"] == "error"
+        assert quota["status"] == "unavailable"
+        assert "authentication failed" in quota["reason"]
         assert quota.get("stale") is not True
+        clock[0] += 31  # expire the auth negative entry
+    quota = quota_after(_status_error(429))
+    assert quota["status"] == "error"
+    assert quota.get("stale") is not True
 
 
 def test_stale_classifier_excludes_protocol_and_programming_errors(tmp_path, monkeypatch):
@@ -650,3 +657,365 @@ def test_stale_classifier_excludes_protocol_and_programming_errors(tmp_path, mon
     quota = payload["providers"][0]["accounts"][0]["quota"]
     assert quota["status"] == "error"
     assert quota.get("stale") is not True
+
+
+def _status_error_with_retry_after(status_code: int, retry_after: str) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://provider.fixture/usage")
+    response = httpx.Response(status_code=status_code, request=request, headers={"Retry-After": retry_after})
+    return httpx.HTTPStatusError(f"fixture {status_code}", request=request, response=response)
+
+
+def test_display_names_stable_across_shuffle_priority_and_cooldown(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entries = [
+        {"id": "beta-id", "label": "b@example.test", "priority": 9, "source": "manual", "access_token": "tok-b"},
+        {"id": "alpha-id", "label": "a@example.test", "priority": 0, "source": "manual", "access_token": "tok-a"},
+    ]
+    _write_fixture(hermes_home, {"openai-codex": entries})
+    usage_contract._clear_usage_cache_for_tests()
+    first = build_usage_contract(fetcher=lambda provider, **kw: _available_snapshot(provider))
+    names_first = {a["account_id"]: a["display_name"] for a in first["providers"][0]["accounts"]}
+
+    reversed_entries = [dict(entries[1], priority=0), dict(entries[0], priority=1, last_status="exhausted")]
+    _write_fixture(hermes_home, {"openai-codex": reversed_entries})
+    usage_contract._clear_usage_cache_for_tests()
+    second = build_usage_contract(fetcher=lambda provider, **kw: _available_snapshot(provider))
+    names_second = {a["account_id"]: a["display_name"] for a in second["providers"][0]["accounts"]}
+
+    assert names_first == names_second
+    assert sorted(names_first.values()) == ["Codex 1", "Codex 2"]
+    serialized = json.dumps(second)
+    for forbidden in ("a@example.test", "b@example.test", "alpha-id", "beta-id", "manual"):
+        assert forbidden not in serialized
+
+
+def test_display_names_legacy_entries_without_ids(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    legacy = [
+        {"source": "env", "auth_type": "api_key", "label": "x@example.test", "access_token": "tok-x"},
+        {"source": "manual", "auth_type": "oauth", "label": "y@example.test", "access_token": "tok-y"},
+    ]
+    _write_fixture(hermes_home, {"kimi-coding": legacy})
+    usage_contract._clear_usage_cache_for_tests()
+    first = build_usage_contract(fetcher=lambda provider, **kw: _available_snapshot(provider))
+    names_first = {a["account_id"]: a["display_name"] for a in first["providers"][0]["accounts"]}
+    _write_fixture(hermes_home, {"kimi-coding": list(reversed(legacy))})
+    usage_contract._clear_usage_cache_for_tests()
+    second = build_usage_contract(fetcher=lambda provider, **kw: _available_snapshot(provider))
+    names_second = {a["account_id"]: a["display_name"] for a in second["providers"][0]["accounts"]}
+    assert names_first == names_second
+    assert sorted(names_first.values()) == ["Kimi 1", "Kimi 2"]
+    assert "example.test" not in json.dumps(second)
+
+
+def test_is_current_omitted_without_authoritative_signal(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+    payload = build_usage_contract(fetcher=lambda provider, **kw: _available_snapshot(provider))
+    assert "is_current" not in payload["providers"][0]["accounts"][0]
+
+
+def test_negative_cache_short_circuits_repeat_failures(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+    calls = []
+
+    def failing(provider, **kw):
+        calls.append(provider)
+        raise _status_error(500)
+
+    first = build_usage_contract(fetcher=failing)
+    assert first["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+    second = build_usage_contract(fetcher=failing)
+    assert second["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+    assert len(calls) == 1  # second build served from the negative cache
+
+
+def test_429_retry_after_delta_and_date_capped(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+    clock = [9000.0]
+    monkeypatch.setattr(usage_contract, "_monotonic", lambda: clock[0])
+
+    calls = []
+
+    def limited(provider, **kw):
+        calls.append(provider)
+        raise _status_error_with_retry_after(429, "45")
+
+    first = build_usage_contract(fetcher=limited)
+    assert first["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+    clock[0] += 30  # inside the Retry-After window
+    build_usage_contract(fetcher=limited)
+    assert len(calls) == 1
+    clock[0] += 16  # past 45s
+    build_usage_contract(fetcher=limited)
+    assert len(calls) == 2
+
+    # HTTP-date form and the 120s cap.
+    delta = usage_contract._retry_after_seconds(_status_error_with_retry_after(429, "999999"))
+    assert delta == 120.0
+    from email.utils import formatdate
+    import time as _time
+
+    http_date = formatdate(_time.time() + 60, usegmt=True)
+    delta_date = usage_contract._retry_after_seconds(_status_error_with_retry_after(429, http_date))
+    assert 55.0 <= delta_date <= 61.0
+
+
+def test_concurrent_builds_same_key_single_fetch(tmp_path, monkeypatch):
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+    calls = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(4)
+
+    def slow(provider, **kw):
+        with lock:
+            calls.append(provider)
+        time.sleep(0.15)
+        return _available_snapshot(provider)
+
+    results = []
+
+    def worker():
+        barrier.wait(timeout=5)
+        results.append(build_usage_contract(fetcher=slow))
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert len(results) == 4
+    assert len(calls) == 1
+    assert all(r["providers"][0]["accounts"][0]["quota"]["status"] == "available" for r in results)
+
+
+def test_expired_entry_replacement_and_orphan_safety(tmp_path, monkeypatch):
+    """Owner misses its deadline; a later build registers a replacement; the
+    orphan's late settle must not write cache nor remove the replacement."""
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+    monkeypatch.setattr(usage_contract, "_FETCH_DEADLINE_SECONDS", 0.05)
+
+    calls = []
+
+    def slow(provider, **kw):
+        calls.append(provider)
+        time.sleep(0.25)
+        return _available_snapshot(provider)
+
+    first = build_usage_contract(fetcher=slow)  # owner times out at 0.05s
+    assert first["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+    # Owner removed its registration after finishing; replacement flight starts.
+    second = build_usage_contract(fetcher=slow)
+    assert second["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+    time.sleep(0.6)  # let both orphan futures settle
+    stats = usage_contract._usage_fetch_stats_for_tests()
+    assert stats["in_flight_submitted"] == 0
+    assert stats["registered_flights"] == 0
+    # Orphan completions never wrote the positive cache.
+    third = build_usage_contract(fetcher=slow)
+    assert third["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+    assert len(calls) == 3
+
+
+def test_process_wide_bound_across_keys_and_rounds(tmp_path, monkeypatch):
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entries = [{"id": f"e{i}", "source": "manual", "access_token": f"tok-{i}"} for i in range(6)]
+    _write_fixture(hermes_home, {"openrouter": entries})
+    usage_contract._clear_usage_cache_for_tests()
+    monkeypatch.setattr(usage_contract, "_FETCH_DEADLINE_SECONDS", 0.05)
+
+    calls = []
+    running = [0]
+    running_peak = [0]
+    lock = threading.Lock()
+
+    def slow(provider, **kw):
+        with lock:
+            calls.append(provider)
+            running[0] += 1
+            running_peak[0] = max(running_peak[0], running[0])
+        try:
+            time.sleep(0.3)
+            return _available_snapshot(provider)
+        finally:
+            with lock:
+                running[0] -= 1
+
+    peak = 0
+    for _ in range(4):  # K rounds of deadline misses across multiple keys
+        build_usage_contract(fetcher=slow)
+        peak = max(peak, usage_contract._usage_fetch_stats_for_tests()["in_flight_submitted"])
+    # Real work happened, submissions (running + queued) stayed under the
+    # process-wide admission cap, and the shared executor capped actual
+    # concurrency at its worker count.
+    assert len(calls) > 0
+    assert 0 < peak <= 8  # _MAX_IN_FLIGHT
+    assert running_peak[0] <= 4  # _FETCH_MAX_WORKERS
+    time.sleep(1.2)
+    assert usage_contract._usage_fetch_stats_for_tests()["in_flight_submitted"] == 0
+
+
+def test_native_refresh_flight_dedupes_without_cache_key(tmp_path, monkeypatch):
+    """cache_key=None (Codex native refresh shape) still singleflights on a
+    non-secret flight key and never writes cache."""
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openai-codex": [{"id": "solo", "source": "device_code", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+
+    calls = []
+
+    def resolver_fetch(provider, *, api_key, base_url=None):
+        assert api_key is None  # native resolver path
+        calls.append(provider)
+        time.sleep(0.15)
+        return _available_snapshot(provider)
+
+    entry_job = {
+        "account": {"account_id": "acct_test"},
+        "provider": "openai-codex",
+        "api_key": None,
+        "base_url": None,
+        "cache_key": None,
+        "stale": None,
+    }
+    deadline = usage_contract._monotonic() + 1.0
+    results = []
+
+    def worker():
+        results.append(usage_contract._begin_fetch(entry_job, resolver_fetch, deadline))
+
+    threads = [threading.Thread(target=worker) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    modes = sorted(h["mode"] for h in results)
+    assert modes == ["join", "join", "owner"]
+    for h in results:
+        usage_contract._finish_fetch(entry_job, h, deadline)
+    assert len(calls) == 1
+    assert usage_contract._usage_fetch_stats_for_tests()["cached_snapshots"] == 0
+
+
+def test_begin_fetch_rechecks_cache_inside_critical_section(tmp_path, monkeypatch):
+    """Both builds cache-miss at job creation, but B reaches _begin_fetch only
+    after A's flight completed and wrote the cache — B must still not fetch."""
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+
+    entry = {"id": "a", "source": "manual", "access_token": "tok"}
+    key = usage_contract._cache_identity("openrouter", entry, "tok")
+    job = {
+        "account": {"account_id": "acct_a"},
+        "provider": "openrouter",
+        "api_key": "tok",
+        "base_url": None,
+        "cache_key": key,
+        "stale": None,
+    }
+    calls = []
+
+    def slow(provider, **kw):
+        calls.append(provider)
+        time.sleep(0.15)
+        return _available_snapshot(provider)
+
+    deadline = usage_contract._monotonic() + 2.0
+    # A becomes owner and finishes, writing the positive cache.
+    handle_a = usage_contract._begin_fetch(job, slow, deadline)
+    assert handle_a["mode"] == "owner"
+    outcome_a = usage_contract._finish_fetch(job, handle_a, deadline)
+    assert outcome_a["status"] == "available"
+    assert len(calls) == 1
+
+    # B enters _begin_fetch only now: the in-lock cache re-check must serve it.
+    handle_b = usage_contract._begin_fetch(job, slow, usage_contract._monotonic() + 2.0)
+    assert handle_b["mode"] == "done"
+    assert handle_b["outcome"]["status"] == "available"
+    assert len(calls) == 1
+
+
+def test_orphan_generation_cannot_remove_replacement(tmp_path, monkeypatch):
+    """An old owner's compare-and-remove after a replacement registered must
+    leave the replacement entry intact; late orphan settles write nothing."""
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(hermes_home, {"openrouter": [{"id": "a", "source": "manual", "access_token": "tok"}]})
+    usage_contract._clear_usage_cache_for_tests()
+
+    entry = {"id": "a", "source": "manual", "access_token": "tok"}
+    key = usage_contract._cache_identity("openrouter", entry, "tok")
+    job = {
+        "account": {"account_id": "acct_a"},
+        "provider": "openrouter",
+        "api_key": "tok",
+        "base_url": None,
+        "cache_key": key,
+        "stale": None,
+    }
+
+    a_may_finish = threading.Event()
+
+    def slow_a(provider, **kw):
+        a_may_finish.wait(timeout=5)
+        return _available_snapshot(provider)
+
+    def fast_b(provider, **kw):
+        return _available_snapshot(provider)
+
+    # A owns the flight with a deadline that expires before it may finish.
+    handle_a = usage_contract._begin_fetch(job, slow_a, usage_contract._monotonic() + 0.05)
+    assert handle_a["mode"] == "owner"
+    flight = handle_a["flight"]
+    time.sleep(0.1)  # A's original deadline is now past; future still blocked.
+
+    # B cannot join the expired entry; it registers a replacement (gen+1).
+    handle_b = usage_contract._begin_fetch(job, fast_b, usage_contract._monotonic() + 2.0)
+    assert handle_b["mode"] == "owner"
+    assert handle_b["generation"] != handle_a["generation"]
+
+    # A finally finishes — past its own deadline, so it must render a timeout,
+    # write no cache, and its compare-and-remove must NOT remove B's entry.
+    a_may_finish.set()
+    outcome_a = usage_contract._finish_fetch(job, handle_a)
+    assert outcome_a["status"] == "error"
+    with usage_contract._CACHE_LOCK:
+        assert usage_contract._INFLIGHT.get(flight, {}).get("generation") == handle_b["generation"]
+    # A's late success never reached the positive cache.
+    fresh, _stale = usage_contract._cache_read(key)
+    assert fresh is None
+
+    outcome_b = usage_contract._finish_fetch(job, handle_b)
+    assert outcome_b["status"] == "available"
+    with usage_contract._CACHE_LOCK:
+        assert flight not in usage_contract._INFLIGHT

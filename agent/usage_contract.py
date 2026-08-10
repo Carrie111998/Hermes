@@ -13,7 +13,8 @@ import math
 import threading
 import time
 from collections import OrderedDict
-from concurrent.futures import Future, wait
+from concurrent.futures import Future
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit, urlunsplit
@@ -35,12 +36,38 @@ USAGE_CONTRACT_VERSION = 1
 
 _FETCH_DEADLINE_SECONDS = 6.5
 _FETCH_MAX_WORKERS = 4
+# Process-wide admission bound: futures submitted but not yet finished
+# (running + queued). Builds that cannot acquire a permit serve stale /
+# negative cache / an immediate error instead of queueing unboundedly.
+_MAX_IN_FLIGHT = 8
 _CACHE_FRESH_SECONDS = 60.0
 _CACHE_STALE_SECONDS = 600.0
 _CACHE_MAX_ENTRIES = 128
-_CACHE_LOCK = threading.Lock()
+_NEGATIVE_TTL_SECONDS = 30.0
+_NEGATIVE_TTL_MAX_SECONDS = 120.0
+_CACHE_LOCK = threading.RLock()
+_SUBMITTED = 0  # futures handed to the shared executor and not yet finished
 _CACHE: "OrderedDict[str, tuple[float, AccountUsageSnapshot]]" = OrderedDict()
+_NEGATIVE: "dict[str, tuple[float, dict[str, Any]]]" = {}
+# Singleflight registry: cache_key -> {"future", "deadline", "generation"}.
+# Only request threads that observe an outcome within their deadline may
+# write caches or remove entries (compare-and-remove by generation).
+_INFLIGHT: "dict[str, dict[str, Any]]" = {}
+_GENERATION = 0
+_ADMISSION = threading.Semaphore(_MAX_IN_FLIGHT)
+_EXECUTOR: "Optional[DaemonThreadPoolExecutor]" = None
 _monotonic = time.monotonic
+
+
+def _shared_executor() -> DaemonThreadPoolExecutor:
+    global _EXECUTOR
+    with _CACHE_LOCK:
+        if _EXECUTOR is None:
+            _EXECUTOR = DaemonThreadPoolExecutor(
+                max_workers=_FETCH_MAX_WORKERS,
+                thread_name_prefix="usage-account",
+            )
+        return _EXECUTOR
 
 UsageFetcher = Callable[..., Optional[AccountUsageSnapshot]]
 
@@ -212,8 +239,110 @@ def _cache_write(key: Optional[str], snapshot: AccountUsageSnapshot) -> None:
 
 
 def _clear_usage_cache_for_tests() -> None:
+    global _EXECUTOR
     with _CACHE_LOCK:
         _CACHE.clear()
+        _NEGATIVE.clear()
+        _INFLIGHT.clear()
+        if _EXECUTOR is not None:
+            _EXECUTOR.shutdown(wait=False, cancel_futures=True)
+            _EXECUTOR = None
+
+
+def _negative_read(key: Optional[str]) -> Optional[dict[str, Any]]:
+    if key is None:
+        return None
+    now = _monotonic()
+    with _CACHE_LOCK:
+        entry = _NEGATIVE.get(key)
+        if entry is None:
+            return None
+        expires_at, payload = entry
+        if now >= expires_at:
+            _NEGATIVE.pop(key, None)
+            return None
+        return dict(payload)
+
+
+def _negative_write(key: Optional[str], payload: dict[str, Any], ttl: float) -> None:
+    if key is None:
+        return
+    ttl = max(1.0, min(ttl, _NEGATIVE_TTL_MAX_SECONDS))
+    with _CACHE_LOCK:
+        if len(_NEGATIVE) >= _CACHE_MAX_ENTRIES:
+            oldest = min(_NEGATIVE, key=lambda k: _NEGATIVE[k][0])
+            _NEGATIVE.pop(oldest, None)
+        _NEGATIVE[key] = (_monotonic() + ttl, dict(payload))
+
+
+def _retry_after_seconds(exc: httpx.HTTPStatusError) -> float:
+    """Parse Retry-After (delta-seconds or HTTP-date), capped at the max TTL."""
+    raw = exc.response.headers.get("retry-after", "").strip()
+    if raw:
+        try:
+            return max(1.0, min(float(raw), _NEGATIVE_TTL_MAX_SECONDS))
+        except ValueError:
+            from email.utils import parsedate_to_datetime
+
+            try:
+                target = parsedate_to_datetime(raw)
+                delta = (target - datetime.now(timezone.utc)).total_seconds()
+                return max(1.0, min(delta, _NEGATIVE_TTL_MAX_SECONDS))
+            except (TypeError, ValueError):
+                pass
+    return _NEGATIVE_TTL_SECONDS
+
+
+def _failure_outcome(exc: BaseException, stale: Optional[AccountUsageSnapshot]) -> tuple[dict[str, Any], Optional[float]]:
+    """Map a fetch failure to (quota payload, negative-cache TTL or None).
+
+    401/403 -> unavailable with a safe auth reason (short negative TTL to
+    short-circuit pointless repeats; never served from stale). 429 -> error
+    with Retry-After-aware negative TTL. Retryable transient/upstream faults
+    serve an eligible stale snapshot when present; otherwise an error plus a
+    short negative entry. Local misconfiguration (UnsupportedProtocol /
+    LocalProtocolError) and programming errors are never masked and are not
+    negatively cached (they need a fix, not a cooldown).
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        if status in (401, 403):
+            return (
+                {
+                    "status": "unavailable",
+                    "reason": f"Credential authentication failed (HTTP {status})",
+                    "windows": [],
+                },
+                _NEGATIVE_TTL_SECONDS,
+            )
+        if status == 429:
+            return (
+                {"status": "error", "reason": "Provider rate limited the usage request", "windows": []},
+                _retry_after_seconds(exc),
+            )
+        if status >= 500:
+            if stale is not None:
+                return _quota_payload(stale, stale=True), None
+            return (
+                {"status": "error", "reason": "Provider usage request failed", "windows": []},
+                _NEGATIVE_TTL_SECONDS,
+            )
+        return {"status": "error", "reason": "Provider usage request failed", "windows": []}, None
+    if isinstance(exc, httpx.TimeoutException):
+        if stale is not None:
+            return _quota_payload(stale, stale=True), None
+        return (
+            {"status": "error", "reason": "Provider usage request timed out", "windows": []},
+            _NEGATIVE_TTL_SECONDS,
+        )
+    if _is_retryable_fetch_error(exc):
+        if stale is not None:
+            return _quota_payload(stale, stale=True), None
+        return (
+            {"status": "error", "reason": "Provider usage request failed", "windows": []},
+            _NEGATIVE_TTL_SECONDS,
+        )
+    return {"status": "error", "reason": "Provider usage request failed", "windows": []}, None
 
 
 def _is_retryable_fetch_error(exc: BaseException) -> bool:
@@ -296,6 +425,189 @@ def _quota_payload(snapshot: AccountUsageSnapshot, *, stale: bool = False) -> di
     }
 
 
+_PROVIDER_LABELS = {
+    "anthropic": "Claude",
+    "kimi-coding": "Kimi",
+    "nous": "Nous",
+    "openai-codex": "Codex",
+    "openrouter": "OpenRouter",
+    "xai": "xAI",
+}
+
+
+def _provider_label(provider: str) -> str:
+    return _PROVIDER_LABELS.get(provider) or provider.replace("-", " ").replace("_", " ").title()
+
+
+def _display_names(provider: str, entries: list[Mapping[str, Any]]) -> dict[int, str]:
+    """Stable per-account display names: ``Codex 1``/``Codex 2``...
+
+    The ordinal comes from sorting by ``sanitized_account_id`` only — never by
+    priority, cooldown state, request counts, or array position — so a name
+    cannot change because routing, health, or input order shifted. Legacy
+    no-id rows sort by their non-secret metadata hash on the same path. No
+    label, email, or credential source ever reaches the display string.
+    """
+    order = sorted(range(len(entries)), key=lambda i: sanitized_account_id(provider, entries[i]))
+    return {entry_index: f"{_provider_label(provider)} {ordinal}" for ordinal, entry_index in enumerate(order, start=1)}
+
+
+def _flight_key(job: dict[str, Any]) -> str:
+    """Dedupe identity for every fetch, including cache-less native refreshes.
+
+    ``cache_key`` is reused when present. Codex native-resolver fetches have
+    ``cache_key=None`` (their post-rotation identity is unknowable, so caching
+    is disabled) — but they still singleflight on a non-secret identity of
+    profile + provider + sanitized account id.
+    """
+    if job["cache_key"] is not None:
+        return str(job["cache_key"])
+    seed = "|".join(
+        (
+            str(get_hermes_home().resolve()),
+            str(job["provider"]),
+            str(job["account"].get("account_id") or ""),
+        )
+    )
+    return "flight:" + hashlib.sha256(seed.encode()).hexdigest()
+
+
+def _release_admission(_f: Future) -> None:
+    # Worker-side callbacks only ever release admission and (un)count — they
+    # never touch caches, the registry, or the contract.
+    global _SUBMITTED
+    with _CACHE_LOCK:
+        _SUBMITTED = max(0, _SUBMITTED - 1)
+    _ADMISSION.release()
+
+
+def _usage_fetch_stats_for_tests() -> dict[str, int]:
+    """Read-only introspection for tests; contains no secrets."""
+    with _CACHE_LOCK:
+        return {
+            "in_flight_submitted": _SUBMITTED,
+            "registered_flights": len(_INFLIGHT),
+            "negative_entries": len(_NEGATIVE),
+            "cached_snapshots": len(_CACHE),
+        }
+
+
+def _begin_fetch(job: dict[str, Any], fetcher: UsageFetcher, deadline: float) -> dict[str, Any]:
+    """Start or join the account's flight. Never blocks on the future.
+
+    Per flight_key: an existing entry with time left is joined; otherwise —
+    inside ONE critical section — a non-blocking admission acquire, submit,
+    and generation-stamped registration, so each flight submits at most once.
+    Negative classifications short-circuit before any of that.
+    """
+    global _GENERATION, _SUBMITTED
+    key = job["cache_key"]
+    flight = _flight_key(job)
+    negative = _negative_read(key)
+    if negative is not None:
+        return {"mode": "done", "outcome": negative}
+    with _CACHE_LOCK:
+        # Re-check the positive cache inside the critical section: a concurrent
+        # build may have completed this flight between our cache read at job
+        # creation and now. RLock makes the nested read safe.
+        fresh, _stale_again = _cache_read(key)
+        if fresh is not None:
+            return {"mode": "done", "outcome": _quota_payload(fresh)}
+        entry = _INFLIGHT.get(flight)
+        if entry is not None and _monotonic() < entry["deadline"]:
+            return {"mode": "join", "future": entry["future"], "deadline": entry["deadline"]}
+        if not _ADMISSION.acquire(blocking=False):
+            return {"mode": "busy"}
+        future = _shared_executor().submit(
+            fetcher,
+            job["provider"],
+            api_key=job["api_key"],
+            base_url=job["base_url"],
+        )
+        _SUBMITTED += 1
+        future.add_done_callback(_release_admission)
+        _GENERATION += 1
+        _INFLIGHT[flight] = {"future": future, "deadline": deadline, "generation": _GENERATION}
+        return {
+            "mode": "owner",
+            "future": future,
+            "flight": flight,
+            "generation": _GENERATION,
+            "deadline": deadline,
+        }
+
+
+def _finish_fetch(job: dict[str, Any], handle: dict[str, Any], deadline: Optional[float] = None) -> dict[str, Any]:
+    """Render the flight's outcome for this build.
+
+    Only the owner, only within its deadline, writes positive/negative cache
+    and compare-and-removes its registry entry. Joiners and timed-out owners
+    never write; an orphaned future's late settle writes nothing and cannot
+    remove a replacement entry. Admission pressure falls back to a fresh
+    negative classification, then eligible stale, then an immediate error.
+    The flight's own deadline (captured at registration) wins over the
+    caller's, so a late finish can never masquerade as in-deadline.
+    """
+    key = job["cache_key"]
+    stale = job["stale"]
+    mode = handle["mode"]
+    if mode == "done":
+        return handle["outcome"]
+    if mode == "busy":
+        negative = _negative_read(key)
+        if negative is not None:
+            return negative
+        if stale is not None:
+            return _quota_payload(stale, stale=True)
+        return {"status": "error", "reason": "Provider usage request timed out", "windows": []}
+
+    future = handle["future"]
+    owner = mode == "owner"
+    deadline = handle.get("deadline") or deadline or _monotonic()
+    remaining = deadline - _monotonic()
+    outcome: dict[str, Any]
+    if remaining <= 0:
+        outcome = (
+            _quota_payload(stale, stale=True)
+            if stale is not None
+            else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
+        )
+    else:
+        try:
+            snapshot = future.result(timeout=remaining)
+        except FuturesTimeoutError:
+            # No negative write here: the flight is still running and the next
+            # build past the deadline must be free to register a replacement.
+            outcome = (
+                _quota_payload(stale, stale=True)
+                if stale is not None
+                else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
+            )
+        except Exception as exc:
+            outcome, negative_ttl = _failure_outcome(exc, stale)
+            # Owner writes only while inside its deadline window.
+            if owner and negative_ttl is not None and _monotonic() <= deadline:
+                _negative_write(key, outcome, negative_ttl)
+        else:
+            if snapshot is None:
+                outcome = {
+                    "status": "unavailable",
+                    "reason": "No provider usage data was returned",
+                    "windows": [],
+                }
+            else:
+                outcome = _quota_payload(snapshot)
+                if owner and _monotonic() <= deadline:
+                    _cache_write(key, snapshot)
+
+    if owner:
+        with _CACHE_LOCK:
+            current = _INFLIGHT.get(handle["flight"])
+            if current is not None and current["generation"] == handle["generation"]:
+                _INFLIGHT.pop(handle["flight"], None)
+    return outcome
+
+
 def _routing_summary(accounts: list[dict[str, Any]]) -> dict[str, int]:
     summary = {"ready": 0, "cooldown": 0, "expired": 0, "error": 0, "unavailable": 0}
     for account in accounts:
@@ -360,7 +672,8 @@ def build_usage_contract(
         usage_supported = provider in ACCOUNT_USAGE_PROVIDERS
         accounts: list[dict[str, Any]] = []
         valid_entries = [entry for entry in raw_entries if isinstance(entry, dict)]
-        for raw_entry in valid_entries:
+        display_names = _display_names(provider, valid_entries)
+        for entry_index, raw_entry in enumerate(valid_entries):
             account_id = sanitized_account_id(provider, raw_entry)
             runtime_token = _runtime_access_token(raw_entry)
             health = _health({**raw_entry, "access_token": runtime_token}, generated_at)
@@ -394,6 +707,7 @@ def build_usage_contract(
                         }
                         account = {
                             "account_id": account_id,
+                            "display_name": display_names[entry_index],
                             "health": health,
                             "quota": quota,
                             "routing": {
@@ -409,10 +723,17 @@ def build_usage_contract(
                 if fresh is not None:
                     quota = _quota_payload(fresh)
                 else:
-                    quota = {"status": "loading", "windows": []}
+                    negative = _negative_read(cache_key)
+                    if negative is not None:
+                        # Short-circuit: recent failure classification (auth,
+                        # rate limit, transient) is still true; do not re-hit.
+                        quota = negative
+                    else:
+                        quota = {"status": "loading", "windows": []}
 
             account = {
                 "account_id": account_id,
+                "display_name": display_names[entry_index],
                 "health": health,
                 "quota": quota,
                 "routing": {
@@ -445,66 +766,10 @@ def build_usage_contract(
             )
 
     if jobs:
-        executor = DaemonThreadPoolExecutor(
-            max_workers=min(_FETCH_MAX_WORKERS, len(jobs)),
-            thread_name_prefix="usage-account",
-        )
-        future_jobs: dict[Future, dict[str, Any]] = {}
-        try:
-            for job in jobs:
-                future = executor.submit(
-                    fetcher,
-                    job["provider"],
-                    api_key=job["api_key"],
-                    base_url=job["base_url"],
-                )
-                future_jobs[future] = job
-            done, pending = wait(future_jobs, timeout=_FETCH_DEADLINE_SECONDS)
-
-            for future in done:
-                job = future_jobs[future]
-                try:
-                    snapshot = future.result()
-                except Exception as exc:
-                    cached = job["stale"]
-                    if cached is not None and _is_retryable_fetch_error(exc):
-                        # Stale data only ever masks retryable transport or
-                        # upstream (5xx) failures — never an auth rejection.
-                        job["account"]["quota"] = _quota_payload(cached, stale=True)
-                    elif isinstance(exc, httpx.TimeoutException):
-                        job["account"]["quota"] = {
-                            "status": "error",
-                            "reason": "Provider usage request timed out",
-                            "windows": [],
-                        }
-                    else:
-                        job["account"]["quota"] = {
-                            "status": "error",
-                            "reason": "Provider usage request failed",
-                            "windows": [],
-                        }
-                else:
-                    if snapshot is None:
-                        job["account"]["quota"] = {
-                            "status": "unavailable",
-                            "reason": "No provider usage data was returned",
-                            "windows": [],
-                        }
-                    else:
-                        job["account"]["quota"] = _quota_payload(snapshot)
-                        _cache_write(job["cache_key"], snapshot)
-
-            for future in pending:
-                job = future_jobs[future]
-                cached = job["stale"]
-                job["account"]["quota"] = (
-                    _quota_payload(cached, stale=True)
-                    if cached is not None
-                    else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
-                )
-                future.cancel()
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+        deadline = _monotonic() + _FETCH_DEADLINE_SECONDS
+        handles = [_begin_fetch(job, fetcher, deadline) for job in jobs]
+        for job, handle in zip(jobs, handles):
+            job["account"]["quota"] = _finish_fetch(job, handle, deadline)
 
     return {
         "contract": {"name": USAGE_CONTRACT_NAME, "version": USAGE_CONTRACT_VERSION},
