@@ -88,8 +88,8 @@ import {
   shouldRemoveAppBundle,
   uninstallArgsForMode
 } from './desktop-uninstall'
-import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installDesktopPluginFromGit, probePluginRepo } from './desktop-plugin-install'
+import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'

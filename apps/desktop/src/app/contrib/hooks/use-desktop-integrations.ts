@@ -4,8 +4,8 @@ import { closeActiveTab } from '@/app/chat/close-tab'
 import { openSession } from '@/app/open-session'
 import { resolveDeepLinkAction } from '@/lib/deeplink-routes'
 import { storedSessionIdForNotification } from '@/lib/session-ids'
-import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { respondToApprovalAction } from '@/store/native-notifications'
+import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { openFolderAsProject } from '@/store/projects'
 import {
   getRememberedRoute,

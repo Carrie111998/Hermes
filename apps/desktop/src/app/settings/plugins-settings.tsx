@@ -2,8 +2,8 @@ import { useStore } from '@nanostores/react'
 import { type ReactNode, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 
-import { NEW_CHAT_ROUTE } from '@/app/routes'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
+import { NEW_CHAT_ROUTE } from '@/app/routes'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Switch } from '@/components/ui/switch'
@@ -14,7 +14,6 @@ import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
 import { FolderOpen, Monitor, Package, RefreshCw } from '@/lib/icons'
 import { normalize } from '@/lib/text'
-import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import {
   $agentPluginBusy,
   $agentPlugins,
@@ -25,6 +24,7 @@ import {
   loadAgentPlugins,
   toggleAgentPlugin
 } from '@/store/agent-plugins'
+import { openPluginInstallRequest } from '@/store/plugin-install-request'
 import { notifyError } from '@/store/notifications'
 import { $connection, $gatewayState } from '@/store/session'
 
