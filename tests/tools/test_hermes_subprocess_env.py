@@ -67,6 +67,15 @@ class TestStripByDefault:
         result = _build()
         assert result.get("PYTHONUTF8") == "1"
 
+    def test_pythonpath_pythonhome_stripped(self):
+        """Issue #83427: PYTHONPATH/PYTHONHOME point at Hermes's own venv (a
+        different Python version). Leaking them into a child that manages its
+        own interpreter (uvx browser-use, system Python) makes it import
+        binary-incompatible compiled extensions and crash."""
+        result = _build({"PYTHONPATH": "/hermes/venv/site-packages", "PYTHONHOME": "/hermes/venv"})
+        assert "PYTHONPATH" not in result
+        assert "PYTHONHOME" not in result
+
 
 class TestInheritCredentials:
     def test_provider_keys_preserved_when_inheriting(self):

@@ -635,6 +635,14 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         env.pop(_marker, None)
 
+    # PYTHONPATH / PYTHONHOME point at Hermes's own venv site-packages — a
+    # different (older) Python than the one a subprocess may manage for itself
+    # (uvx / pipx / system Python). Leaking them forces the child to import
+    # binary-incompatible compiled extensions (e.g. pydantic_core
+    # ModuleNotFoundError in browser_exec under the desktop app, #83427).
+    for _var in ("PYTHONPATH", "PYTHONHOME"):
+        env.pop(_var, None)
+
     _apply_windows_msys_bash_env_defaults(env)
 
     # Cross-session leak guard, same as the terminal spawn paths: this helper
