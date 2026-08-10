@@ -2,7 +2,7 @@ from pathlib import Path
 
 from plugins.memory.obsidian_duo.broker import EmbeddedMemoryBroker
 from plugins.memory.obsidian_duo.config import ObsidianDuoConfig
-from plugins.memory.obsidian_duo.contracts import MemoryCandidate, MemoryEvent
+from plugins.memory.obsidian_duo.contracts import MemoryCandidate, MemoryEvent, MemoryRecord
 from plugins.memory.obsidian_duo.policy import MemoryPolicy
 from plugins.memory.obsidian_duo.retrieval import MemoryRetriever
 from plugins.memory.obsidian_duo.store import SqliteMemoryStore
@@ -55,3 +55,31 @@ def test_broker_recovers_written_journal_by_rescanning(tmp_path):
     assert broker.store.connection().execute(
         "SELECT state FROM journal WHERE txn_id='tx_1'"
     ).fetchone()[0] == "committed"
+
+
+def test_manual_edit_becomes_user_authority_without_rewriting_note(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "agent text", "Facts", "global"))
+    broker.vault.scan_managed_changes(broker.store)
+    note.write_text(note.read_text().replace("agent text", "user correction"), encoding="utf-8")
+
+    assert broker.process_manual_changes() == 1
+    assert "user correction" in note.read_text()
+    assert broker.store.get_memory("mem_1").content == "user correction"
+    assert broker.store.get_memory("mem_1").authority.value == "user"
+
+
+def test_malformed_manual_edit_is_left_untouched(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "valid", "Facts", "global"))
+    broker.vault.scan_managed_changes(broker.store)
+    note.write_text("---\nmalformed", encoding="utf-8")
+    broken = note.read_text()
+
+    assert broker.process_manual_changes() == 0
+    assert note.read_text() == broken
+    assert broker.store.connection().execute(
+        "SELECT parse_status FROM note_index WHERE memory_id='mem_1'"
+    ).fetchone()[0] == "needs_attention"

@@ -299,6 +299,13 @@ class SqliteMemoryStore:
                 "INSERT INTO memory_fts(memory_id,title,body,tags,entities) SELECT memory_id,memory_type,content,scope,'' FROM memories"
             )
 
+    def hot_memory_candidates(self, limit: int = 12) -> list[MemoryRecord]:
+        rows = self.connection().execute(
+            "SELECT memory_id FROM memories WHERE status='active' ORDER BY importance DESC, confidence DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [record for row in rows if (record := self.get_memory(row["memory_id"])) is not None]
+
     def close(self) -> None:
         conn = getattr(self._local, "connection", None)
         if conn is not None:

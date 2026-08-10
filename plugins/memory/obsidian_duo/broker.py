@@ -6,13 +6,16 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from .config import ObsidianDuoConfig
 from .contracts import (
+    Authority,
     BrokerStatus,
     CandidateDecision,
     MemoryCandidate,
     MemoryEvent,
+    Verification,
     MemoryPacket,
     RetrievalRequest,
 )
@@ -135,6 +138,50 @@ class EmbeddedMemoryBroker:
             self.store.record_journal(row["txn_id"], "recovery", "committed", {"recovered": True})
         self._state = "READY"
         return RecoveryResult(recovered=len(rows), malformed=len(scan.malformed_paths))
+
+    def process_manual_changes(self) -> int:
+        """Index changed managed notes as user corrections without rewriting them."""
+        changed = 0
+        conn = self.store.connection()
+        for path in sorted(self.vault.managed_root.rglob("*.md")):
+            stat = path.stat()
+            previous = conn.execute(
+                "SELECT memory_id,mtime_ns,size,content_hash FROM note_index WHERE path=?",
+                (str(path),),
+            ).fetchone()
+            if previous is None or (previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size):
+                continue
+            content_hash = self.vault._hash(path)
+            if content_hash == previous["content_hash"]:
+                continue
+            try:
+                parsed = self.vault.parse_note(path)
+                old = self.store.get_memory(previous["memory_id"] or parsed.memory_id)
+                if old is None:
+                    continue
+                updated = self.policy.apply_user_edit(old, parsed)
+                self.store.upsert_memory(updated, "manual user edit")
+                self.store.set_note_index(str(path), updated.memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
+                changed += 1
+            except Exception:
+                self.store.set_note_index(
+                    str(path), previous["memory_id"], stat.st_mtime_ns, stat.st_size,
+                    content_hash, "needs_attention"
+                )
+        return changed
+
+    def consolidate(self, reason: str, events: list[MemoryEvent]) -> int:
+        retained = [event for event in events if event.event_type in {"task_complete", "session_end", "delegation_result"}][:32]
+        if self.inference is not None and retained:
+            result = self.inference.consolidate(retained, [])
+            candidates = result.parsed.get("candidates", []) if result.parsed else []
+            for item in candidates:
+                if isinstance(item, dict) and item.get("content"):
+                    self.propose(MemoryCandidate(str(item["content"]), metadata={"reason": reason}))
+            return len(candidates)
+        for event in retained:
+            self.propose(MemoryCandidate(event.content, metadata={"reason": reason, "event_kind": event.event_type}))
+        return len(retained)
 
     def status(self) -> BrokerStatus:
         return BrokerStatus(
