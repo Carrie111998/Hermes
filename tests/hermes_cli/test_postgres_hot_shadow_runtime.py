@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import sys
 import types
 from unittest.mock import MagicMock
 
@@ -21,6 +23,22 @@ class InlineThread:
 
     def start(self) -> None:
         self.target()
+
+
+def test_shadow_runtime_imports_without_posix_fcntl() -> None:
+    """Native Windows must reach the default-off gate before any POSIX import."""
+    probe = (
+        "import sys; "
+        "sys.modules['fcntl'] = None; "
+        "import hermes_cli.postgres_hot_shadow_runtime"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_default_off_does_not_touch_sqlite_or_start_thread(monkeypatch) -> None:
@@ -214,9 +232,11 @@ def test_keyboard_interrupt_propagates_and_releases_slot() -> None:
 
 
 @pytest.mark.asyncio
-async def test_shadow_once_connects_once_and_closes_with_sanitized_metadata(monkeypatch, caplog) -> None:
+async def test_shadow_once_connects_once_and_closes_with_sanitized_metadata(
+    monkeypatch, caplog
+) -> None:
     from hermes_cli import postgres_hot_shadow_runtime as runtime
-    from hermes_cli.postgres_hot_migration import TargetConfig
+    from hermes_cli.postgres_hot_target import TargetConfig
 
     connect_calls: list[dict[str, object]] = []
 
@@ -235,7 +255,11 @@ async def test_shadow_once_connects_once_and_closes_with_sanitized_metadata(monk
 
     target = TargetConfig("db.example", 5432, "role", "private", "neondb", True)
     monkeypatch.setattr(runtime, "parse_target_dsn", lambda _dsn: target)
-    monkeypatch.setitem(__import__("sys").modules, "asyncpg", types.SimpleNamespace(connect=connect))
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "asyncpg",
+        types.SimpleNamespace(connect=connect),
+    )
 
     async def compare(**_kwargs):
         return adapter.ShadowComparison(
