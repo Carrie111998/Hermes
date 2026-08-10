@@ -215,6 +215,57 @@ def test_auto_mounted_host_cwd_is_selinux_labeled(monkeypatch, tmp_path):
     assert f"{project_dir}:/workspace:z" in run_args_str
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("/home/user/projects:/workspace/projects", "/home/user/projects:/workspace/projects:z"),
+        ("/home/user/data:/data:ro", "/home/user/data:/data:ro,z"),
+        ("~/datasets:/data", "~/datasets:/data:z"),
+        ("./relative:/data", "./relative:/data:z"),
+    ],
+)
+def test_docker_volumes_host_paths_are_selinux_labeled(monkeypatch, tmp_path, raw, expected):
+    """User-configured `terminal.docker_volumes` host-directory bind mounts
+    need the same :z label as the internal mount sites — otherwise a
+    correctly-configured docker_volumes entry still hits Permission denied
+    on SELinux-enforcing hosts. Preserves any user-provided mode (:ro).
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(volumes=[raw])
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert expected in run_args_str
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "my-named-volume:/data",
+        "my-named-volume:/data:ro",
+    ],
+)
+def test_docker_volumes_named_volumes_are_not_selinux_labeled(monkeypatch, tmp_path, raw):
+    """Named Docker/podman volumes (no leading /, ~, or .) aren't host
+    directories — SELinux relabeling doesn't apply, and appending :z would
+    silently change the volume driver's interpretation of the mount, so
+    these must pass through unmodified."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(volumes=[raw])
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert raw in run_args_str
+    assert f"{raw}:z" not in run_args_str
+    assert f"{raw},z" not in run_args_str
+
+
 def test_non_persistent_cleanup_removes_container(monkeypatch):
     """When persist_across_processes=false, cleanup() must docker stop AND
     docker rm so containers don't leak across hermes processes.

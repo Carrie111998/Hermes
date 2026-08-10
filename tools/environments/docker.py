@@ -100,6 +100,30 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     return normalized
 
 
+def _selinux_label_user_volume(vol: str) -> str:
+    """Append the SELinux ``z`` relabel option to a user-configured
+    ``docker_volumes`` entry, iff it's a host-directory bind mount.
+
+    ``-v`` entries come in two shapes: ``host_path:container_path[:opts]``
+    (a bind mount — needs the label, same as every other internal mount
+    site) and ``volume_name:container_path[:opts]`` (a named Docker/podman
+    volume, which is unaffected by the host's SELinux context and whose
+    user-provided opts — e.g. ``:ro``, ``:nocopy`` — should pass through
+    untouched). Host paths are distinguished by a leading ``/``, ``~``, or
+    ``.`` per the documented ``docker_volumes`` format; anything else is
+    treated as a named volume and left alone.
+    """
+    parts = vol.split(":")
+    if len(parts) not in (2, 3) or not parts[0].startswith(("/", "~", ".")):
+        return vol
+
+    host_path, container_path = parts[0], parts[1]
+    opts = [o for o in parts[2].split(",") if o] if len(parts) == 3 else []
+    if "z" not in opts and "Z" not in opts:
+        opts.append("z")
+    return f"{host_path}:{container_path}:{','.join(opts)}"
+
+
 def _load_hermes_env_vars() -> dict[str, str]:
     """Load ~/.hermes/.env values without failing Docker command execution."""
     try:
@@ -960,6 +984,7 @@ class DockerEnvironment(BaseEnvironment):
             if not vol:
                 continue
             if ":" in vol:
+                vol = _selinux_label_user_volume(vol)
                 volume_args.extend(["-v", vol])
                 if ":/workspace" in vol:
                     workspace_explicitly_mounted = True
