@@ -630,6 +630,74 @@ def _handle_list(args: dict, **kw) -> str:
         return tool_error(f"kanban_list: {e}")
 
 
+def _handle_submit_review(args: dict, **kw) -> str:
+    """Submit the worker's running implementation to the Review lane."""
+    delegated_err = _reject_delegated_child_mutation("kanban_submit_review")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = str(args.get("summary") or "").strip()
+    metadata = args.get("metadata")
+    if isinstance(metadata, dict):
+        metadata = json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            ok = kb.submit_for_review(
+                conn, tid, summary=summary, reviewer=args.get("reviewer"),
+                metadata=metadata, expected_run_id=task.current_run_id,
+            )
+            return json.dumps({"ok": True, "task_id": tid}) if ok else tool_error(
+                f"kanban_submit_review could not submit {tid}"
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        return tool_error(f"kanban_submit_review: {e}")
+
+
+def _handle_review_changes(args: dict, **kw) -> str:
+    """Request changes on a claimed review card."""
+    delegated_err = _reject_delegated_child_mutation("kanban_review_changes")
+    if delegated_err:
+        return delegated_err
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error("task_id is required (or set HERMES_KANBAN_TASK in the env)")
+    ownership_err = _enforce_worker_task_ownership(tid)
+    if ownership_err:
+        return ownership_err
+    summary = str(args.get("summary") or "").strip()
+    metadata = args.get("metadata")
+    if isinstance(metadata, dict):
+        metadata = json.loads(redact_sensitive_text(json.dumps(metadata), force=True))
+    try:
+        kb, conn = _connect(board=args.get("board"))
+        try:
+            task = kb.get_task(conn, tid)
+            if task is None:
+                return tool_error(f"task {tid} not found")
+            remediation = kb.request_review_changes(
+                conn, tid, summary=summary, metadata=metadata,
+                expected_run_id=task.current_run_id,
+            )
+            return json.dumps({"ok": True, "task_id": remediation}) if remediation else tool_error(
+                f"kanban_review_changes could not update {tid}"
+            )
+        finally:
+            conn.close()
+    except Exception as e:
+        return tool_error(f"kanban_review_changes: {e}")
+
+
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
     delegated_err = _reject_delegated_child_mutation("kanban_complete")
@@ -793,6 +861,20 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"Retry kanban_complete with the same summary/metadata "
                     f"and either drop these ids from created_cards, or pass "
                     f"created_cards=[] to skip the card-claim check entirely."
+                )
+            except kb.ReviewRequiredError as review_err:
+                # Hard gate: implementation cards that declare an open PR
+                # must enter the review lane (kanban_submit_review or the
+                # submit-review path) BEFORE kanban_complete. The task was
+                # NOT mutated — the worker must route the PR through the
+                # native review handoff and then stop mutating the card.
+                return tool_error(
+                    f"kanban_complete blocked: {review_err} "
+                    f"Your task is still in-flight (no state change). "
+                    f"Call kanban_submit_review (reviewer=orion) with the "
+                    f"PR evidence metadata before completing, or pass an "
+                    f"explicit review_waiver in this completion metadata "
+                    f"if review is genuinely waived."
                 )
             if not ok:
                 return tool_error(
@@ -1265,6 +1347,11 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
+    metadata = args.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        return tool_error(
+            f"metadata must be an object, got {type(metadata).__name__}"
+        )
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
     if isinstance(skills, str):
@@ -1320,6 +1407,7 @@ def _handle_create(args: dict, **kw) -> str:
                     int(max_runtime_seconds)
                     if max_runtime_seconds is not None else None
                 ),
+                metadata=metadata,
                 skills=skills,
                 model_override=model_override,
                 provider_override=provider_override,
@@ -2025,6 +2113,15 @@ KANBAN_CREATE_SCHEMA = {
                     "task with outcome='timed_out'."
                 ),
             },
+            "metadata": {
+                "type": "object",
+                "description": (
+                    "Optional task metadata. The narrowly-scoped "
+                    "'remediate_existing_pr': true flag is required when "
+                    "intentionally repairing an existing PR; ordinary "
+                    "implementation tasks remain duplicate-protected."
+                ),
+            },
             "initial_status": {
                 "type": "string",
                 "enum": ["running", "blocked"],
@@ -2137,6 +2234,30 @@ KANBAN_LINK_SCHEMA = {
 }
 
 
+KANBAN_SUBMIT_REVIEW_SCHEMA = {
+    "name": "kanban_submit_review",
+    "description": "Submit the current implementation to the Review lane with immutable PR evidence.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "reviewer": {"type": "string", "description": "Optional reviewer profile; defaults to orion when installed, otherwise default."},
+        "summary": {"type": "string"},
+        "metadata": {"type": "object", "description": "PR identity and verification evidence."},
+        "board": _board_schema_prop(),
+    }, "required": ["summary", "metadata"]},
+}
+
+KANBAN_REVIEW_CHANGES_SCHEMA = {
+    "name": "kanban_review_changes",
+    "description": "Request implementation changes on the currently claimed review card.",
+    "parameters": {"type": "object", "properties": {
+        "task_id": {"type": "string", "description": _DESC_TASK_ID_DEFAULT},
+        "summary": {"type": "string"},
+        "metadata": {"type": "object"},
+        "board": _board_schema_prop(),
+    }, "required": ["summary"]},
+}
+
+
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -2157,6 +2278,24 @@ registry.register(
     handler=_handle_list,
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
+)
+
+registry.register(
+    name="kanban_submit_review",
+    toolset="kanban",
+    schema=KANBAN_SUBMIT_REVIEW_SCHEMA,
+    handler=_handle_submit_review,
+    check_fn=_check_kanban_mode,
+    emoji="🔎",
+)
+
+registry.register(
+    name="kanban_review_changes",
+    toolset="kanban",
+    schema=KANBAN_REVIEW_CHANGES_SCHEMA,
+    handler=_handle_review_changes,
+    check_fn=_check_kanban_mode,
+    emoji="🛠",
 )
 
 registry.register(

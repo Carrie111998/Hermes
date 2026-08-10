@@ -503,16 +503,32 @@ class TestProtectedInstructionFiles:
     def test_real_hermes_home_not_gated_by_this_check(
         self, tmp_path, approvals, monkeypatch
     ):
-        """~/.hermes itself is governed by existing guards, not this gate."""
+        """The universal root AGENTS.md uses the profile-wide policy."""
         import tools.file_tools as ft
         fake_home = tmp_path / ".hermes"
-        (fake_home / "notes").mkdir(parents=True)
+        fake_home.mkdir(parents=True)
         monkeypatch.setattr(
             ft, "_get_real_hermes_home", lambda: str(fake_home.resolve())
         )
-        res = self._write(fake_home / "notes" / "scratch.txt", "ok")
+        res = self._write(fake_home / "AGENTS.md", "ok")
         assert not res.get("error"), res
         assert approvals["calls"] == []
+
+    def test_profile_local_instruction_file_remains_gated(
+        self, tmp_path, approvals, monkeypatch
+    ):
+        """Profile mode must not turn the root exemption into a subtree exemption."""
+        import tools.file_tools as ft
+        fake_home = tmp_path / ".hermes"
+        profile_agents = fake_home / "profiles" / "dev" / "AGENTS.md"
+        profile_agents.parent.mkdir(parents=True)
+        monkeypatch.setattr(
+            ft, "_get_real_hermes_home", lambda: str(fake_home.resolve())
+        )
+        approvals["answer"] = "deny"
+        res = self._write(profile_agents, "blocked")
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert len(approvals["calls"]) == 1
 
     # ---- patch tool -----------------------------------------------------
 

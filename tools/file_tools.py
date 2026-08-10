@@ -734,14 +734,20 @@ _real_hermes_home_loaded = False
 
 
 def _get_real_hermes_home() -> str | None:
-    """Return the realpath of the authoritative Hermes home (cached)."""
+    """Return the realpath of the authoritative Hermes root (cached).
+
+    In profile mode ``get_hermes_home()`` points at ``profiles/<name>``.
+    The profile-wide instruction file lives at the root, so use the
+    non-profile-aware resolver here; otherwise every file in the active
+    profile would accidentally inherit the root exemption.
+    """
     global _real_hermes_home_cached, _real_hermes_home_loaded
     if _real_hermes_home_loaded:
         return _real_hermes_home_cached
     _real_hermes_home_loaded = True
     try:
-        from hermes_constants import get_hermes_home
-        _real_hermes_home_cached = os.path.realpath(str(get_hermes_home()))
+        from hermes_constants import get_default_hermes_root
+        _real_hermes_home_cached = os.path.realpath(str(get_default_hermes_root()))
     except Exception:
         try:
             _real_hermes_home_cached = os.path.realpath(_expand_tilde("~/.hermes"))
@@ -801,14 +807,12 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     except (OSError, ValueError, RuntimeError):
         resolved = os.path.realpath(normalized)
 
-    # The authoritative ~/.hermes home is governed by its own guards
-    # (config.yaml hard-block, cross-profile guard, write_approval); this
-    # gate targets PROJECT-LOCAL instruction files only. Checked before the
-    # ``.hermes`` component rule below, which would otherwise match the
-    # home directory itself.
+    # The single universal root AGENTS.md is maintained by profile-mode
+    # agents under the user's explicit profile-wide policy. Keep that one
+    # path available to the normal write-approval flow; project-local
+    # instruction files, including files under profiles/<name>, remain gated.
     real_home = _get_real_hermes_home()
-    if real_home and (resolved == real_home
-                      or resolved.startswith(real_home + os.sep)):
+    if real_home and resolved == os.path.join(real_home, "AGENTS.md"):
         return None
 
     import fnmatch

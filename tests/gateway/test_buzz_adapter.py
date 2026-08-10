@@ -421,6 +421,242 @@ class TestBuzzAdapterSend:
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
 
+# ── Reply tag / thread_id parsing ─────────────────────────────────────────
+
+
+class TestBuzzThreadIdParsing:
+
+    @pytest.fixture
+    def adapter(self):
+        a = _make_adapter()
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        a._channel_names[CHANNEL] = "general"
+        return a
+
+    @pytest.mark.asyncio
+    async def test_reply_tag_sets_thread_id_on_source(self, adapter):
+        """An event with an ``e``-tag with 4th element \"reply\" sets thread_id."""
+        reply_to_id = "root-event-123"
+        event = _tagged_event(
+            "e42", CHANNEL,
+            content="@Chip replying in thread",
+            reply_to=reply_to_id,
+            created_at=200,
+        )
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [event])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+        assert len(adapter._dispatched) == 1
+        kwargs = adapter._dispatched[0]
+        assert kwargs["message_id"] == "e42"
+        assert kwargs["thread_id"] == reply_to_id
+
+    @pytest.mark.asyncio
+    async def test_flat_message_has_no_thread_id(self, adapter):
+        """A plain event with no reply tags has thread_id=None."""
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [
+            _event("e99", content="@Chip hey there", created_at=200),
+        ])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+        assert len(adapter._dispatched) == 1
+        kwargs = adapter._dispatched[0]
+        assert kwargs["thread_id"] is None
+
+    @pytest.mark.asyncio
+    async def test_dm_without_reply_tag_has_no_thread_id(self, adapter):
+        """A DM (p-tagged, no reply tag) has thread_id=None."""
+        adapter._channel_state[CHANNEL]["chat_type"] = "dm"
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [
+            _tagged_event("e100", CHANNEL, content="dm message", p=SELF_PUBKEY, created_at=200),
+        ])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+
+        assert len(adapter._dispatched) == 1
+        kwargs = adapter._dispatched[0]
+        assert kwargs["thread_id"] is None
+
+
+# ── Thread reply mention (p-tag) — t_128ba197 ────────────────────────────
+
+
+class TestBuzzAdapterThreadReplyMention:
+
+    @pytest.fixture
+    def adapter(self):
+        a = _make_adapter()
+        a._dispatched = []
+
+        async def capture(**kwargs):
+            a._dispatched.append(kwargs)
+
+        a._dispatch_message = capture
+        a._message_handler = AsyncMock()
+        a._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        return a
+
+    def _make(self, channel_state=None):
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = channel_state or {
+            "chat_type": "dm", "last_ts": 0, "seen": {}
+        }
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_appends_mention_to_known_author(self):
+        adapter = self._make()
+        adapter._event_authors["evt-user-msg"] = OTHER_PUBKEY
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "thread reply", reply_to="evt-user-msg")
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "evt-user-msg"
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_mentions_thread_id_target_when_reply_to_unset(self):
+        adapter = self._make()
+        adapter._event_authors["root-event"] = OTHER_PUBKEY
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "thread reply", metadata={"thread_id": "root-event"})
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "root-event"
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_does_not_mention_self(self):
+        adapter = self._make()
+        adapter._event_authors["evt-own-msg"] = SELF_PUBKEY
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "thread reply", reply_to="evt-own-msg")
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "evt-own-msg"
+        assert "--mention" not in args
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_unknown_author_no_mention(self):
+        adapter = self._make()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "thread reply", reply_to="evt-unknown")
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "evt-unknown"
+        assert "--mention" not in args
+
+    @pytest.mark.asyncio
+    async def test_non_thread_send_unchanged(self):
+        adapter = self._make()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-plain", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "plain message")
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert "--mention" not in args
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_mention_membership_failure_retries_without_mention_keeps_anchor(self):
+        adapter = self._make()
+        adapter._event_authors["evt-user-msg"] = OTHER_PUBKEY
+        cli = _ScriptedCli()
+        cli.script(
+            "messages", "send", {"accepted": False},
+            code=1,
+            stderr=json.dumps({"error": "user_error", "message": "target is not a member of this channel"}),
+        )
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "thread reply", reply_to="evt-user-msg")
+        assert result.success is True
+        assert len(cli.calls) == 2
+        first_args, _ = cli.calls[0]
+        second_args, _ = cli.calls[1]
+        assert "--mention" in first_args
+        assert "--mention" not in second_args
+        # The retry keeps the thread anchor — threads remain the model.
+        assert second_args[second_args.index("--reply-to") + 1] == "evt-user-msg"
+
+    @pytest.mark.asyncio
+    async def test_non_membership_failure_does_not_retry(self):
+        adapter = self._make()
+        adapter._event_authors["evt-user-msg"] = OTHER_PUBKEY
+        cli = _ScriptedCli()
+        cli.script(
+            "messages", "send", {"accepted": False},
+            code=1,
+            stderr=json.dumps({"error": "relay_error", "message": "relay unreachable"}),
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "thread reply", reply_to="evt-user-msg")
+        assert result.success is False
+        assert len(cli.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_send_image_thread_reply_appends_mention(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = self._make()
+        adapter._event_authors["evt-user-msg"] = OTHER_PUBKEY
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-reply", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(CHANNEL, str(img), caption="shot", reply_to="evt-user-msg")
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "evt-user-msg"
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+
+    @pytest.mark.asyncio
+    async def test_handle_event_records_author_for_reply(self, adapter):
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [
+            _tagged_event("e1", CHANNEL, content="hey @Chip ping", created_at=10),
+        ])
+        adapter._run_cli = cli
+        await adapter._poll_channel(CHANNEL)
+        assert adapter._event_authors["e1"] == OTHER_PUBKEY
+
+    def test_event_authors_bounded_to_cap(self):
+        adapter = _make_adapter()
+        for i in range(_buzz_mod._SEEN_CAP + 50):
+            adapter._remember_author(f"evt-{i}", OTHER_PUBKEY)
+        assert len(adapter._event_authors) == _buzz_mod._SEEN_CAP
+        # Oldest entries evicted, newest retained.
+        assert "evt-0" not in adapter._event_authors
+        assert f"evt-{_buzz_mod._SEEN_CAP + 49}" in adapter._event_authors
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 

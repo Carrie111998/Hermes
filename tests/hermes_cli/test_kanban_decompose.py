@@ -161,3 +161,235 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert "not in triage" in outcome.reason
 
 
+def test_tool_only_run_title_promotes_single_task_without_llm(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="run gen_scene.py", triage=True)
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        # The pre-check must promote BEFORE any LLM call; a call would raise.
+        with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called")), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    assert outcome.child_ids is None
+    assert "single script run" in outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    # Promoted out of triage as exactly ONE card. `recompute_ready` flips a
+    # parent-free todo to ready immediately (the dispatcher would do the same
+    # on its next tick), so the landing column is ready, not todo.
+    assert task.status == "ready"
+    assert task.assignee == "dev"
+    assert "gen_scene.py" in (task.body or "")
+
+
+def test_tool_only_run_body_prefix_promotes_single_task_without_llm(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="whatever",
+            body="Run: python3 /tmp/gen_scene.py\n\nAcceptance criteria:\n- report output",
+            triage=True,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called")), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    assert "python3 /tmp/gen_scene.py" in (task.body or "")
+
+
+def test_prose_run_title_still_uses_llm_path(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="run the marketing campaign", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened title",
+        "body": "Run the campaign.",
+        "assignee": None,
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    # Prose titles keep the normal LLM fanout path (tightened here).
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.title == "Tightened title"
+
+
+def test_tool_only_run_title_extracts_command_prefix_not_prose(kanban_home):
+    # The historical decompose-noise shape: a run title with trailing prose
+    # (e.g. after a specify rewrite).  The promoted card must carry only the
+    # matched script-run prefix as the command, never the prose.
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Run gen_scene.py in /home/solo and verify change",
+            triage=True,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called")), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    assert "gen_scene.py" in (task.body or "")
+    # The trailing prose must not leak into the command block.
+    assert "in /home/solo and verify change" not in (task.body or "")
+
+
+def test_tool_only_run_body_prefix_preserves_full_command(kanban_home):
+    # The coding gate's exact scope line: an env-prefixed cd chain plus the
+    # script invocation.  The promoted card must preserve the FULL command.
+    full_command = (
+        'cd /home/solo && SOLODESIGNSTUDIO_API_KEY="$SOLODESIGNSTUDIO_API_KEY" '
+        "python3 gen_scene.py"
+    )
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="whatever",
+            body=f"Run: {full_command}\n\nAcceptance criteria:\n- Implement",
+            triage=True,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called")), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    assert full_command in (task.body or "")
+    # The acceptance criteria must carry the read-only classification.
+    assert "Do not modify repository files" in (task.body or "")
+
+
+def test_tool_only_run_body_prefix_is_case_insensitive(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="whatever",
+            body="run: python3 /tmp/gen_scene.py\n\nAcceptance criteria:\n- report",
+            triage=True,
+        )
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called")), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "ready"
+    assert "python3 /tmp/gen_scene.py" in (task.body or "")
+
+
+def test_tool_only_run_decompose_creates_exactly_one_card(kanban_home):
+    # Acceptance replay: a simple `run gen_scene.py` request must produce at
+    # most one card and no overlapping Run cards.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="run gen_scene.py", triage=True)
+
+    patches = _patch_list_profiles(["orchestrator", "dev"])
+    for p in patches:
+        p.start()
+    try:
+        with patch("agent.auxiliary_client.call_llm", side_effect=AssertionError("LLM must not be called")), \
+             patch("hermes_cli.kanban_decompose._load_config",
+                   return_value={"kanban": {"default_assignee": "dev"}}):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    assert outcome.child_ids is None
+
+    with kb.connect() as conn:
+        all_tasks = kb.list_tasks(conn)
+        task = kb.get_task(conn, tid)
+    # The promoted card is the ONLY card on the board — no duplicate
+    # run/verify children and no extra `Run:` wrapper cards.
+    assert len(all_tasks) == 1
+    assert all_tasks[0].id == tid
+    assert task is not None
+    assert task.status == "ready"
+    assert task.assignee == "dev"
+    assert "gen_scene.py" in (task.body or "")
+    assert "Do not modify repository files" in (task.body or "")
+
+

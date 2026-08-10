@@ -100,6 +100,16 @@ def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
         assert kb.get_task(conn, child).status == "ready"
 
 
+def test_parentless_dependency_does_not_requeue_forever(kanban_home: Path) -> None:
+    """A worker cannot park an unparented task in a dispatcher loop."""
+    with kb.connect_closing() as conn:
+        task = _running_task(conn, title="external dependency")
+        kb.block_task(conn, task, reason="waiting on DEV", kind="dependency")
+        stored = kb.get_task(conn, task)
+        assert stored.status == "blocked"
+        assert stored.block_kind == "dependency"
+
+
 # ---------------------------------------------------------------------------
 # Completion resets loop memory
 # ---------------------------------------------------------------------------

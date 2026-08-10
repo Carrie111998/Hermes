@@ -441,6 +441,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
             return None, True
+
         # Sniff a small prefix first: files that are clearly compiled
         # binaries (executable magic, or NUL bytes in the head) are never
         # shell scripts, so skip them WITHOUT reading the rest — reading a
@@ -458,7 +459,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
             if not chunk:
                 break
             data += chunk
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     finally:
         os.close(descriptor)
