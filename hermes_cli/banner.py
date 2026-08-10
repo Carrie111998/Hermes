@@ -220,10 +220,12 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
     if _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+        # Pass the sentinel through untouched: UPDATE_AVAILABLE_NO_COUNT (-1)
+        # means "update available, count unknown" and every consumer renders
+        # that honestly. Collapsing it to a literal 1 here made the banner and
+        # `hermes version` claim "1 commit behind" — the same fake precision
+        # the desktop UI showed as "1 change included".
+        return _check_via_rev(head_rev) if head_rev else None
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
