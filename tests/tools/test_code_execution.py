@@ -331,7 +331,7 @@ class TestExecuteCodeHelpers(unittest.TestCase):
             self.assertEqual(captured["cwd"], "/repo")
             self.assertEqual(captured["timeout"], 12)
             self.assertEqual(captured["local_config"], {"persistent": True})
-            self.assertEqual(captured["host_cwd"], "/host/repo")
+            self.assertIsNone(captured["host_cwd"])
             self.assertIsNone(captured["container_config"])
             self.assertIn("default", terminal_tool._active_environments)
             start_cleanup.assert_called_once()
