@@ -205,8 +205,14 @@ class _StubAgent:
     def _anthropic_prompt_cache_policy(self, **k):
         return False, False
 
-    def _ensure_lmstudio_runtime_loaded(self):
-        pass
+    def _ensure_lmstudio_runtime_loaded(self, context_intent=None):
+        return None
+
+    def _lmstudio_load_was_unverified(self, runtime_context_length=None):
+        return False
+
+    def _effective_lmstudio_context_length(self, context_intent=None, runtime_context_length=None):
+        return context_intent
 
 
 def test_transient_recovery_rebuilds_vertex_via_chokepoint(monkeypatch):
