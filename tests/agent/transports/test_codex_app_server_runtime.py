@@ -7,7 +7,7 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -125,7 +125,7 @@ class TestConfiguredMcpDynamicTools:
             {
                 "mcp__law_firm_ops__list_email_obligations": "law_firm_ops",
                 "mcp__law_firm_ops__get_email_obligation": "law_firm_ops",
-                "mcp__law_firm_ops__list_obligation_receipts": "law_firm_ops",
+                "mcp__law_firm_ops__get_email_obligation_monitor_status": "law_firm_ops",
                 "mcp__other__unconfigured": "other",
             },
         )
@@ -177,8 +177,16 @@ class TestConfiguredMcpDynamicTools:
                 {
                     "type": "function",
                     "function": {
-                        "name": "mcp__law_firm_ops__list_obligation_receipts",
-                        "description": "List canonical receipts.",
+                        "name": "mcp__spoofed__tool",
+                        "description": "Unregistered MCP-looking tool.",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__law_firm_ops__get_email_obligation_monitor_status",
+                        "description": "Get monitor status.",
                         "parameters": {"type": "object", "properties": {}},
                     },
                 },
@@ -224,7 +232,7 @@ class TestConfiguredMcpDynamicTools:
             disabled_toolsets=["outlook"],
         )
 
-        dynamic_tools = _configured_mcp_dynamic_tools(agent)
+        dynamic_tools, targets = _configured_mcp_dynamic_tools(agent)
 
         assert calls == [
             {
@@ -237,23 +245,32 @@ class TestConfiguredMcpDynamicTools:
         assert dynamic_tools == [
             {
                 "type": "function",
-                "name": "mcp__law_firm_ops__list_email_obligations",
+                "name": "list_email_obligations",
                 "description": "List canonical obligations.",
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {
                 "type": "function",
-                "name": "mcp__law_firm_ops__get_email_obligation",
+                "name": "get_email_obligation",
                 "description": "Get one canonical obligation.",
                 "inputSchema": {"type": "object", "properties": {}},
             },
             {
                 "type": "function",
-                "name": "mcp__law_firm_ops__list_obligation_receipts",
-                "description": "List canonical receipts.",
+                "name": "get_email_obligation_monitor_status",
+                "description": "Get monitor status.",
                 "inputSchema": {"type": "object", "properties": {}},
             }
         ]
+        assert dict(targets) == {
+            "list_email_obligations": "mcp__law_firm_ops__list_email_obligations",
+            "get_email_obligation": "mcp__law_firm_ops__get_email_obligation",
+            "get_email_obligation_monitor_status": (
+                "mcp__law_firm_ops__get_email_obligation_monitor_status"
+            ),
+        }
+        with pytest.raises(TypeError):
+            targets["other"] = "mcp__other__tool"
 
     def test_explicit_empty_toolsets_are_deny_all(self, monkeypatch) -> None:
         from agent.codex_runtime import _configured_mcp_dynamic_tools
@@ -267,7 +284,7 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=[], disabled_toolsets=None)
-        ) == []
+        ) == ([], {})
 
     def test_catalog_or_registry_errors_fail_closed(self, monkeypatch) -> None:
         from agent.codex_runtime import _configured_mcp_dynamic_tools
@@ -287,7 +304,7 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
-        ) == []
+        ) == ([], {})
 
         monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", object())
         monkeypatch.setattr(
@@ -298,7 +315,162 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
-        ) == []
+        ) == ([], {})
+
+    @pytest.mark.parametrize(
+        ("registered", "raw_name"),
+        [
+            (
+                {
+                    "mcp__one__shared": "one",
+                    "mcp__two__shared": "two",
+                },
+                None,
+            ),
+            ({"mcp__law_firm_ops__": "law_firm_ops"}, "mcp__law_firm_ops__"),
+            (
+                {"mcp__law_firm_ops__tool": "other"},
+                "mcp__law_firm_ops__tool",
+            ),
+        ],
+    )
+    def test_ambiguous_or_malformed_aliases_fail_closed(
+        self, monkeypatch, registered, raw_name
+    ) -> None:
+        from agent.codex_runtime import _configured_mcp_dynamic_tools
+        import model_tools
+        from tools import mcp_tool
+
+        monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", registered)
+        raw_names = list(registered) if raw_name is None else [raw_name]
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+                for name in raw_names
+            ],
+        )
+
+        assert _configured_mcp_dynamic_tools(
+            SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
+        ) == ([], {})
+
+    def test_alias_dispatches_registered_name_and_rejects_unknown(self, monkeypatch) -> None:
+        from agent import codex_runtime
+        from agent.transports.codex_app_server_session import TurnResult
+        import model_tools
+
+        captured = {}
+        dispatched = []
+
+        class FakeSession:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_turn(self, **kwargs):
+                return TurnResult(
+                    final_text="done",
+                    projected_messages=[],
+                    tool_iterations=0,
+                    turn_id="turn-1",
+                    thread_id="thread-1",
+                )
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(
+            "agent.transports.codex_app_server_session.CodexAppServerSession",
+            FakeSession,
+        )
+        monkeypatch.setattr(
+            codex_runtime,
+            "_configured_mcp_dynamic_tools",
+            lambda agent: (
+                [
+                    {
+                        "type": "function",
+                        "name": "list_email_obligations",
+                        "description": "Canonical obligations.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    }
+                ],
+                MappingProxyType(
+                    {
+                        "list_email_obligations": (
+                            "mcp__law_firm_ops__list_email_obligations"
+                        )
+                    }
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            model_tools,
+            "handle_function_call",
+            lambda *args, **kwargs: dispatched.append((args, kwargs)) or "ok",
+        )
+        agent = SimpleNamespace(
+            session_cwd=None,
+            _codex_session=None,
+            _cached_system_prompt=None,
+            enabled_toolsets=["law-firm-ops"],
+            disabled_toolsets=None,
+            session_id="session-1",
+            tool_progress_callback=None,
+            _fire_stream_delta=lambda *_: None,
+            _fire_reasoning_delta=lambda *_: None,
+            _emit_interim_assistant_message=lambda *_: None,
+            _iters_since_skill=0,
+            _skill_nudge_interval=0,
+            valid_tool_names=set(),
+            _sync_external_memory_for_turn=lambda **_: None,
+            _spawn_background_review=lambda **_: None,
+            session_api_calls=0,
+            session_prompt_tokens=0,
+            session_completion_tokens=0,
+            session_reasoning_tokens=0,
+            session_cached_tokens=0,
+            session_total_tokens=0,
+            context_compressor=None,
+            event_callback=None,
+            _session_db=None,
+        )
+
+        codex_runtime.run_codex_app_server_turn(
+            agent,
+            user_message="hi",
+            original_user_message="hi",
+            messages=[],
+            effective_task_id="task-1",
+        )
+
+        handler = captured["dynamic_tool_handler"]
+        assert handler("list_email_obligations", {"status": "open"}, "call-1") == "ok"
+        assert dispatched == [
+            (
+                ("mcp__law_firm_ops__list_email_obligations", {"status": "open"}, "task-1"),
+                {
+                    "tool_call_id": "call-1",
+                    "session_id": "session-1",
+                    "enabled_tools": ["mcp__law_firm_ops__list_email_obligations"],
+                    "enabled_toolsets": ["law-firm-ops"],
+                    "disabled_toolsets": None,
+                },
+            )
+        ]
+        with pytest.raises(ValueError, match="unknown Codex dynamic tool"):
+            handler("unknown", {}, "call-2")
+        assert len(dispatched) == 1
+        assert [tool["name"] for tool in captured["dynamic_tools"]] == [
+            "list_email_obligations"
+        ]
 
 
 class TestSpawnEnvIsolation:

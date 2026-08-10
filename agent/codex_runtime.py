@@ -19,31 +19,34 @@ from __future__ import annotations
 import json
 import logging
 import time
-from types import SimpleNamespace
-from typing import Any, Callable, Dict, List
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Callable, Dict, List, Mapping
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
 
 
-def _configured_mcp_dynamic_tools(agent) -> list[dict[str, Any]]:
-    """Project this session's registered MCP schemas onto Codex dynamic tools.
+def _configured_mcp_dynamic_tools(
+    agent,
+) -> tuple[list[dict[str, Any]], Mapping[str, str]]:
+    """Project registered MCP schemas as safe aliases and their targets.
 
     ``agent.tools`` may be the tool-search bridge surface, so resolve the raw
     catalog under the exact session policy first.  The registered-name map is
     the extra provenance check: a registry/native tool that merely resembles
     an MCP name never crosses this boundary.
     """
+    empty_result = ([], MappingProxyType({}))
     enabled_toolsets = getattr(agent, "enabled_toolsets", None)
     if enabled_toolsets == []:
-        return []
+        return empty_result
 
     try:
         from model_tools import get_tool_definitions
-        from tools.mcp_tool import _mcp_tool_server_names
+        from tools.mcp_tool import _mcp_tool_server_names, mcp_prefixed_tool_name
 
-        registered = set(_mcp_tool_server_names)
+        registered = dict(_mcp_tool_server_names)
         raw_tools = get_tool_definitions(
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=getattr(agent, "disabled_toolsets", None),
@@ -51,9 +54,10 @@ def _configured_mcp_dynamic_tools(agent) -> list[dict[str, Any]]:
             skip_tool_search_assembly=True,
         ) or []
     except Exception:
-        return []
+        return empty_result
 
     dynamic_tools: list[dict[str, Any]] = []
+    aliases: dict[str, str] = {}
     seen: set[str] = set()
     for tool in raw_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
@@ -63,21 +67,36 @@ def _configured_mcp_dynamic_tools(agent) -> list[dict[str, Any]]:
         parameters = function.get("parameters")
         if (
             not isinstance(name, str)
-            or name not in registered
             or not isinstance(parameters, dict)
-            or name in seen
         ):
             continue
+        if name not in registered:
+            continue
+        if name in seen:
+            continue
+        server_name = registered[name]
+        if not isinstance(server_name, str):
+            return empty_result
+        prefix = mcp_prefixed_tool_name(server_name, "")
+        alias = name.removeprefix(prefix)
+        if (
+            not alias
+            or alias.startswith("mcp__")
+            or mcp_prefixed_tool_name(server_name, alias) != name
+            or alias in aliases
+        ):
+            return empty_result
         seen.add(name)
+        aliases[alias] = name
         dynamic_tools.append(
             {
                 "type": "function",
-                "name": name,
+                "name": alias,
                 "description": str(function.get("description") or ""),
                 "inputSchema": parameters,
             }
         )
-    return dynamic_tools
+    return dynamic_tools, MappingProxyType(aliases)
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -733,8 +752,8 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
-        dynamic_tools = _configured_mcp_dynamic_tools(agent)
-        allowed_dynamic_tools = {tool["name"] for tool in dynamic_tools}
+        dynamic_tools, dynamic_tool_targets = _configured_mcp_dynamic_tools(agent)
+        allowed_dynamic_tools = frozenset(dynamic_tool_targets.values())
 
         def dispatch_dynamic_tool(
             tool_name: str, arguments: dict[str, Any], call_id: str
@@ -743,8 +762,12 @@ def run_codex_app_server_turn(
             # callback. Keep the dispatcher scoped to the same exact snapshot.
             import model_tools
 
+            registered_name = dynamic_tool_targets.get(tool_name)
+            if registered_name is None:
+                raise ValueError("unknown Codex dynamic tool")
+
             return model_tools.handle_function_call(
-                tool_name,
+                registered_name,
                 arguments,
                 effective_task_id,
                 tool_call_id=call_id,
