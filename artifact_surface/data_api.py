@@ -334,6 +334,18 @@ def _coerce_config_id_list(raw: Any) -> frozenset[str]:
     return frozenset(str(item).strip() for item in items if str(item).strip())
 
 
+# Keep this local and explicit: importing gateway configuration can initialize
+# runtime-only dependencies, while accepting arbitrary YAML mapping names leaks
+# unrelated configuration sections into the read-only Canvas projection.
+# ``local`` is deliberately absent because it is not an external command transport.
+_DDP_AUTH_PLATFORM_NAMES = frozenset({
+    "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack", "signal",
+    "mattermost", "matrix", "homeassistant", "email", "sms", "dingtalk",
+    "api_server", "webhook", "msgraph_webhook", "feishu", "wecom",
+    "wecom_callback", "weixin", "bluebubbles", "qqbot", "yuanbao", "relay",
+})
+
+
 def _read_gateway_auth_summary(path: Path, errors: list[str]) -> dict[str, dict[str, object]]:
     if not path.exists():
         return {}
@@ -354,12 +366,12 @@ def _read_gateway_auth_summary(path: Path, errors: list[str]) -> dict[str, dict[
         return {}
 
     nested = parsed.get("platforms") if isinstance(parsed.get("platforms"), dict) else {}
-    names = set(nested) | {
-        name for name, value in parsed.items()
-        if isinstance(value, dict) and name not in {"platforms", "gateway"}
+    names = {
+        name for name in set(nested) | set(parsed)
+        if isinstance(name, str) and name in _DDP_AUTH_PLATFORM_NAMES
     }
     out: dict[str, dict[str, object]] = {}
-    for name in sorted(names, key=str):
+    for name in sorted(names):
         nested_block = nested.get(name, {}) if isinstance(nested, dict) else {}
         nested_extra = nested_block.get("extra", {}) if isinstance(nested_block, dict) else {}
         nested_extra = nested_extra if isinstance(nested_extra, dict) else {}

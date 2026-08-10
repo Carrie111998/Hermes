@@ -415,6 +415,39 @@ platforms:
     assert "123" not in json.dumps(result["ddp_auth_readiness"])
 
 
+def test_read_devflow_auth_readiness_ignores_non_platform_config_sections(tmp_path):
+    config = tmp_path / "config.yaml"
+    config.write_text(
+        """
+telegram:
+  allow_admin_from: ["123"]
+model:
+  allow_admin_from: ["model-admin"]
+secrets:
+  allow_admin_from: ["secret-admin"]
+platforms:
+  slack:
+    extra:
+      allow_admin_from: ["s1"]
+  providers:
+    extra:
+      allow_admin_from: ["provider-admin"]
+""",
+        encoding="utf-8",
+    )
+
+    result = data_api.read_devflow(
+        ledger_path=tmp_path / "missing.db",
+        gateway_config_path=config,
+    )
+
+    assert set(result["ddp_auth_readiness"]) == {"slack", "telegram"}
+    rendered = json.dumps(result["ddp_auth_readiness"])
+    assert "model" not in rendered
+    assert "secret" not in rendered
+    assert "provider" not in rendered
+
+
 def test_read_devflow_redacts_malformed_gateway_config_errors(tmp_path):
     config = tmp_path / "config.yaml"
     configured_id = "telegram-admin-4242"
