@@ -145,7 +145,7 @@ describe('useUsageAccounts', () => {
     )
   }
 
-  it('refresh re-requests and a superseded earlier response cannot overwrite a newer one', async () => {
+  it('a slower superseded refresh cannot overwrite a newer in-flight response', async () => {
     const resolvers: Array<(value: UsageAccountsContract) => void> = []
     const requestGateway = vi.fn(
       () =>
@@ -159,9 +159,11 @@ describe('useUsageAccounts', () => {
 
     const v1 = makeContract()
     const v2 = makeContract()
-    v2.providers[0].accounts[0].display_name = 'Codex Updated'
+    const v3 = makeContract()
+    v2.providers[0].accounts[0].display_name = 'Codex Stale'
+    v3.providers[0].accounts[0].display_name = 'Codex Updated'
 
-    // Resolve the initial load, then trigger a refresh.
+    // Initial load completes; two refreshes overlap in flight.
     await act(async () => {
       resolvers[0](v1)
     })
@@ -169,18 +171,40 @@ describe('useUsageAccounts', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
     await waitFor(() => expect(resolvers).toHaveLength(2))
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh' }))
+    await waitFor(() => expect(resolvers).toHaveLength(3))
 
-    // Newer response lands first...
+    // The newer refresh (request 3) resolves first...
     await act(async () => {
-      resolvers[1](v2)
+      resolvers[2](v3)
     })
     expect(await screen.findByText('Codex Updated')).toBeTruthy()
 
-    // ...then the superseded earlier refresh response arrives late and must be dropped.
+    // ...then the genuinely-still-pending older refresh (request 2) lands late
+    // and must be dropped — this fails without the monotonic request id guard.
     await act(async () => {
-      resolvers[0](v1)
+      resolvers[1](v2)
     })
     expect(screen.getByText('Codex Updated')).toBeTruthy()
+  })
+
+  it('ignores a response that arrives after unmount', async () => {
+    const resolvers: Array<(value: UsageAccountsContract) => void> = []
+    const requestGateway = vi.fn(
+      () =>
+        new Promise<UsageAccountsContract>(resolve => {
+          resolvers.push(resolve)
+        })
+    )
+
+    const { unmount } = render(<Harness requestGateway={requestGateway as never} />)
+    await waitFor(() => expect(resolvers).toHaveLength(1))
+
+    unmount()
+    // Late resolution after unmount must not throw or set state.
+    await act(async () => {
+      resolvers[0](makeContract())
+    })
   })
 
   it('keeps the last-known contract visible when a refresh fails', async () => {

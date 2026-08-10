@@ -2651,6 +2651,73 @@ class TestNewEndpoints:
         by_provider = {row["provider"]: row for row in resp.json()["by_provider"]}
         assert by_provider["unknown"]["input_tokens"] >= 10
 
+    def test_analytics_usage_by_provider_splits_mid_session_switch(self):
+        """A session that switches provider mid-flight must attribute tokens to
+        the provider that served them (session_model_usage), not pile everything
+        onto the sessions row's single recorded provider."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="provider-switch-test",
+                source="cli",
+                model="model-a",
+            )
+            db.update_token_counts(
+                "provider-switch-test",
+                input_tokens=100,
+                output_tokens=40,
+                billing_provider="nous",
+                api_call_count=1,
+            )
+            db.update_token_counts(
+                "provider-switch-test",
+                input_tokens=200,
+                output_tokens=80,
+                billing_provider="openrouter",
+                api_call_count=1,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/usage?days=7")
+        assert resp.status_code == 200
+
+        by_provider = {row["provider"]: row for row in resp.json()["by_provider"]}
+        assert by_provider["nous"]["input_tokens"] == 100
+        assert by_provider["openrouter"]["input_tokens"] == 200
+
+    def test_analytics_usage_by_provider_reconciles_absolute_residual(self):
+        """Absolute (cumulative) writes never reach session_model_usage; the
+        positive residual is reconciled against the session's recorded provider."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(
+                session_id="provider-residual-test",
+                source="cli",
+                model="model-a",
+            )
+            db.update_token_counts(
+                "provider-residual-test",
+                input_tokens=300,
+                output_tokens=120,
+                billing_provider="nous",
+                api_call_count=2,
+                absolute=True,
+            )
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/analytics/usage?days=7")
+        assert resp.status_code == 200
+
+        by_provider = {row["provider"]: row for row in resp.json()["by_provider"]}
+        assert by_provider["nous"]["input_tokens"] == 300
+        assert by_provider["nous"]["output_tokens"] == 120
+
 # ---------------------------------------------------------------------------
 # Model context length: normalize/denormalize + /api/model/info
 # ---------------------------------------------------------------------------

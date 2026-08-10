@@ -282,7 +282,7 @@ export function AccountLimitsView({
           <span className="flex shrink-0 items-center gap-2">
             {onRefresh && (
               <button
-                className="text-[0.6875rem] text-(--ui-text-tertiary) underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-(--dt-primary) disabled:opacity-50"
+                className="text-[0.6875rem] text-(--ui-text-tertiary) underline-offset-2 hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline disabled:opacity-50"
                 disabled={refreshing}
                 onClick={onRefresh}
                 type="button"
@@ -292,7 +292,7 @@ export function AccountLimitsView({
             )}
             {onOpenCommandCenter && (
               <button
-                className="text-[0.6875rem] text-(--ui-text-tertiary) underline-offset-2 hover:text-foreground hover:underline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-(--dt-primary)"
+                className="text-[0.6875rem] text-(--ui-text-tertiary) underline-offset-2 hover:text-foreground hover:underline focus-visible:text-foreground focus-visible:underline"
                 onClick={onOpenCommandCenter}
                 type="button"
               >

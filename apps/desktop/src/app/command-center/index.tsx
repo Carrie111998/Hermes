@@ -576,7 +576,10 @@ export function UsagePanel({
       )}
 
       {error && (
-        <span className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive">
+        <span
+          className="inline-flex items-center gap-1 text-[length:var(--conversation-caption-font-size)] text-destructive"
+          role="alert"
+        >
           <AlertCircle className="size-3.5" />
           {error}
         </span>

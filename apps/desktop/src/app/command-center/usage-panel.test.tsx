@@ -166,7 +166,7 @@ describe('UsagePanel', () => {
     )
 
     expect(await screen.findByText('Codex 1')).toBeTruthy()
-    expect(screen.getByText('analytics backend offline')).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toContain('analytics backend offline')
   })
 
   it('degrades safely against an older backend without by_provider/by_task', async () => {
