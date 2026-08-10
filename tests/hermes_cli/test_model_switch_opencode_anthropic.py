@@ -105,6 +105,7 @@ class TestOpenCodeZenV1Strip:
             current_model="claude-sonnet-4-6",
             current_base_url="https://opencode.ai/zen",
             runtime_base_url="https://opencode.ai/zen/v1",
+            explicit_provider="opencode-zen",
         )
 
         assert result.success

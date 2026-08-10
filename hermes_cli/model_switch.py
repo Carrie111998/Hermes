@@ -290,6 +290,62 @@ def _check_hermes_model_warning(model_name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# OpenCode Zen free-only default policy (#82764)
+# ---------------------------------------------------------------------------
+#
+# The picker intentionally exposes Zen's full free+paid catalog (see
+# _UNCAPPED_PICKER_PROVIDERS above), but switching onto a paid or
+# unknown-cost model without the user asking for it by name is a silent
+# billing surprise. Ordinary /model switches (no --provider flag) are
+# gated to verified-zero-cost models unless the user opts in via
+# ``model.allow_paid_opencode_zen: true``.
+
+def _model_info_is_verified_free(info: Optional[ModelInfo]) -> bool:
+    """True only if *info* reports verified-zero cost for every category.
+
+    Fails closed: ``None`` (model missing from models.dev, unknown pricing)
+    is treated as not free.
+    """
+    if info is None:
+        return False
+    if info.cost_input > 0 or info.cost_output > 0:
+        return False
+    if (info.cost_cache_read or 0) > 0 or (info.cost_cache_write or 0) > 0:
+        return False
+    return True
+
+
+def opencode_zen_model_is_free(model: str) -> bool:
+    """True only if models.dev reports verified-zero cost for *model*."""
+    return _model_info_is_verified_free(get_model_info("opencode-zen", model))
+
+
+def _opencode_zen_paid_model_blocked(new_model: str, model_info: Optional[ModelInfo]) -> str:
+    """Return an error message if the free-only Zen policy blocks *new_model*.
+
+    Returns "" when the switch is allowed. Callers must only invoke this
+    when the target provider is "opencode-zen" and the switch was not an
+    explicit ``--provider opencode-zen`` request (that flag is itself the
+    override).
+    """
+    if _model_info_is_verified_free(model_info):
+        return ""
+
+    from hermes_cli.config import load_config
+
+    model_cfg = load_config().get("model")
+    if isinstance(model_cfg, dict) and model_cfg.get("allow_paid_opencode_zen"):
+        return ""
+
+    return (
+        f"{new_model!r} is a paid or unknown-cost OpenCode Zen model. "
+        "OpenCode Zen defaults to free models only. Run "
+        f"'/model {new_model} --provider opencode-zen' to override, or set "
+        "model.allow_paid_opencode_zen: true in config.yaml."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Model aliases -- short names -> (vendor, family) with NO version numbers.
 # Resolved dynamically against the live models.dev catalog.
 # ---------------------------------------------------------------------------
@@ -1915,6 +1971,22 @@ def switch_model(
 
     # --- Get full model info from models.dev ---
     model_info = get_model_info(target_provider, new_model)
+
+    # --- OpenCode Zen free-only default policy (#82764) ---
+    # An explicit --provider opencode-zen selection is itself the override;
+    # only gate ordinary switches (bare model name, aggregator resolution,
+    # alias fallback) that land on opencode-zen.
+    if target_provider == "opencode-zen" and not explicit_provider:
+        block_msg = _opencode_zen_paid_model_blocked(new_model, model_info)
+        if block_msg:
+            return ModelSwitchResult(
+                success=False,
+                new_model=new_model,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=block_msg,
+            )
 
     # --- Collect warnings ---
     warnings: list[str] = []
