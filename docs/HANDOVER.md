@@ -1,8 +1,8 @@
 # Project Handover - hermes-agent
 
-**Plan key:** `hermes-agent`  
-**Last verified:** 2026-08-10 18:25:47 +08:00  
-**Handover owner/session:** Codex  
+**Plan key:** `hermes-agent`
+**Last verified:** 2026-08-10 18:25:47 +08:00
+**Handover owner/session:** Codex
 **Authoritative project log:** [`docs/ROADMAP-HERMES-DGX.md`](ROADMAP-HERMES-DGX.md)
 
 ## 1. Project identity and boundary
@@ -40,9 +40,9 @@
     `backup/pre-arch-001-deploy-20260810T031625Z`.
   - Deployment record merged to main as
     `5fb3d5cd1ee8358570e86d9fbce95e8e73dd584b`.
-- **Active:** `CI-BASELINE-001` is implemented and pushed as `d20c48132`;
-  draft PR [#3](https://github.com/cwliao/hermes-agent/pull/3) is open; GitHub
-  Actions, review, merge, and deployment gates remain.
+- **Active:** `CI-BASELINE-001` is implemented in `d20c48132` and the branch
+  head is `ea05d7f1c`; draft PR [#3](https://github.com/cwliao/hermes-agent/pull/3)
+  is open. GitHub Actions is green; review, merge, and deployment gates remain.
 - **Deferred / not goals:** No DGX deploy or service restart for CI-BASELINE-001
   before remote CI and merge gates pass. Do not reset or edit Claude-owned
   dirty/diverged worktrees.
@@ -60,8 +60,8 @@
   - Ruff, compileall, and `git diff --check`: passed.
 - **Health:** Last DGX read-only check showed `hermes-gateway.service`
   `active/running` and no error entries in the checked recent journal window.
-  Draft PR #3 is the active repository review object; the two prior main CI
-  runs were red before CI-BASELINE-001 implementation.
+  Draft PR #3 is the active repository review object; GitHub Actions run
+  `31379116076` completed successfully, including `All required checks pass`.
 - **UI/runtime smoke:** No new UI smoke was run for CI-BASELINE-001. The DGX
   gateway process remains the existing runtime evidence boundary.
 - **Data/storage safety:** No DGX `.hermes` storage mutation was performed for
@@ -69,15 +69,14 @@
 - **Deployment:** DGX remains on `ec50a154eeb44e7206f24b7703f9032b8f97069c`.
   CI-BASELINE-001 has **not** been deployed. Rollback ref remains
   `backup/pre-arch-001-deploy-20260810T031625Z`.
-- **Known risks:** GitHub Actions has recurring failures in Codex response
-  normalization, unauthorized Telegram DM gating, OpenRouter model tests,
-  and builtin CLI subcommand gating. The pushed implementation fixes them
-  locally, but remote CI is not yet verified.
+- **Known risks:** The former recurring CI failures are covered by the
+  successful run above. Code review is still pending; no DGX deployment is
+  authorized by this ticket.
 
 ## 4. Next ticket
 
 - **Ticket:** `CI-BASELINE-001 - Restore the blocking Python CI baseline`
-- **Status:** `IMPLEMENTED_PENDING_CI` on pushed branch `d20c48132`, draft PR #3.
+- **Status:** `IMPLEMENTED_PENDING_REVIEW` on branch head `ea05d7f1c`, draft PR #3.
 - **Scope:** `agent/codex_responses_adapter.py`, `gateway/run.py`,
   `hermes_cli/main.py`, affected tests, and the ticket/roadmap documents.
 - **Dependencies:** Clean Hermes `main`; preserve ARCH-001 runtime-state
@@ -85,10 +84,9 @@
 - **Acceptance gates:** Five named failures pass; affected Python modules pass;
   ARCH-001 regression remains green; Ruff/OSV/attribution/uv/Docker/JS checks
   remain green; GitHub Actions `All required checks pass` is green; then code
-  review, commit, push, merge, and only later consider deployment.
-- **Open questions:** Whether remote OpenRouter catalog conditions remain
-  stable after the test snapshot pin; verify in GitHub Actions rather than
-  assuming local network behavior represents CI.
+  review, merge, and only later consider deployment.
+- **Open questions:** None for the CI gate after successful GitHub Actions;
+  review findings, if any, must still be resolved before merge.
 
 ## 5. Safe continuation instructions
 
