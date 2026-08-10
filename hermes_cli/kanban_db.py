@@ -8095,8 +8095,10 @@ def _record_task_failure(
 
     * ``release_claim=True, end_run=True`` — spawn-failure path.
       Caller has a running task with an open run; this transitions
-      it back to ``ready`` (or ``blocked`` when the breaker trips),
-      releases the claim, and closes the run with ``outcome=<outcome>``.
+      it back to the claim's source lane (``ready`` or ``review``, via
+      :func:`_claim_source_status`) or ``blocked`` when the breaker
+      trips, releases the claim, and closes the run with
+      ``outcome=<outcome>``.
 
     * ``release_claim=False, end_run=False`` — timeout/crash path.
       Caller has ALREADY flipped the task to its requeue lane
@@ -8129,12 +8131,23 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, current_run_id "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
         failures = int(row["consecutive_failures"]) + 1
+        current_run_id = (
+            row["current_run_id"] if "current_run_id" in row.keys() else None
+        )
+        # Spawn-failure reclaim must restore the claim's source lane
+        # (ready vs review). Reading before mutations keeps the claimed
+        # event for the open run visible to _claim_source_status.
+        requeue_status = (
+            _claim_source_status(conn, task_id, current_run_id)
+            if release_claim
+            else "ready"
+        )
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -8182,6 +8195,8 @@ def _record_task_failure(
                         "trigger_outcome": outcome,
                         "effective_limit": effective_limit,
                         "limit_source": limit_source,
+                        "source_status": requeue_status,
+                        "requeue_status": requeue_status,
                     },
                 )
             payload = {
@@ -8191,6 +8206,9 @@ def _record_task_failure(
                 "error": error[:500],
                 "trigger_outcome": outcome,
             }
+            if release_claim:
+                payload["source_status"] = requeue_status
+                payload["requeue_status"] = requeue_status
             if event_payload_extra:
                 payload.update(event_payload_extra)
             _append_event(
@@ -8200,13 +8218,15 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: restore the claim's source lane and clear
+                # claim bookkeeping. Review launches must not fall into
+                # the ready/implementation queue.
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (requeue_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash/never-started path: task is already at its
@@ -8223,11 +8243,22 @@ def _record_task_failure(
                     conn, task_id,
                     outcome=outcome, status=outcome,
                     error=error[:500],
-                    metadata={"failures": failures},
+                    metadata={
+                        "failures": failures,
+                        "source_status": requeue_status,
+                        "requeue_status": requeue_status,
+                    },
                 )
+                event_payload = {
+                    "error": error[:500],
+                    "failures": failures,
+                }
+                if release_claim:
+                    event_payload["source_status"] = requeue_status
+                    event_payload["requeue_status"] = requeue_status
                 _append_event(
                     conn, task_id, outcome,
-                    {"error": error[:500], "failures": failures},
+                    event_payload,
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.

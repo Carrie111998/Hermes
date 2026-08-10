@@ -292,3 +292,89 @@ def test_never_started_review_recovery_trips_failure_limit_to_blocked(conn):
     assert task.status == "blocked"
     assert task.consecutive_failures == 2
     assert getattr(kb.detect_never_started, "_last_auto_blocked") == [task_id]
+
+
+def test_record_spawn_failure_requeues_review_claim_to_review(conn):
+    task_id = kb.create_task(conn, title="review spawn boom", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status = 'review' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    claimed = kb.claim_review_task(
+        conn, task_id, claimer=kb._dispatcher_claimer_id()
+    )
+    assert claimed is not None
+
+    blocked = kb._record_spawn_failure(
+        conn,
+        task_id,
+        "workspace: missing worktree",
+        failure_limit=2,
+    )
+
+    assert blocked is False
+    task = kb.get_task(conn, task_id)
+    assert task.status == "review"
+    assert task.claim_lock is None
+    assert task.worker_pid is None
+    assert task.consecutive_failures == 1
+
+    run = kb.latest_run(conn, task_id)
+    assert run.status == "spawn_failed"
+    assert run.outcome == "spawn_failed"
+
+    events = kb.list_events(conn, task_id)
+    failure = next(event for event in events if event.kind == "spawn_failed")
+    assert failure.payload["source_status"] == "review"
+    assert failure.payload["requeue_status"] == "review"
+
+
+def test_record_spawn_failure_keeps_ready_claim_on_ready(conn):
+    task_id = kb.create_task(conn, title="ready spawn boom", assignee="worker")
+    claimed = kb.claim_task(conn, task_id, claimer=kb._dispatcher_claimer_id())
+    assert claimed is not None
+
+    assert kb._record_spawn_failure(
+        conn,
+        task_id,
+        "spawn failed",
+        failure_limit=2,
+    ) is False
+
+    task = kb.get_task(conn, task_id)
+    assert task.status == "ready"
+    assert task.claim_lock is None
+    assert task.consecutive_failures == 1
+
+
+def test_review_dispatch_spawn_exception_requeues_to_review(conn, monkeypatch):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    task_id = kb.create_task(conn, title="review dispatch boom", assignee="worker")
+    conn.execute(
+        "UPDATE tasks SET status = 'review' WHERE id = ?",
+        (task_id,),
+    )
+    conn.commit()
+
+    def _boom(_task, _workspace, **_kwargs):
+        raise RuntimeError("reviewer binary missing")
+
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=_boom,
+        failure_limit=2,
+        board="default",
+    )
+
+    assert result.spawned == []
+    task = kb.get_task(conn, task_id)
+    assert task.status == "review"
+    assert task.claim_lock is None
+    assert task.consecutive_failures == 1
+
+    run = kb.latest_run(conn, task_id)
+    assert run.outcome == "spawn_failed"
