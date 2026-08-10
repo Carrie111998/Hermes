@@ -788,8 +788,10 @@ def run_codex_app_server_turn(
                     )
                 break
 
-            # The outer conversation loop consumed the initial app-server turn.
-            # Every native recovery must consume another iteration before launch.
+            # The app-server path bypasses the outer conversation loop's
+            # iteration accounting. This secondary budget therefore caps only
+            # native recovery turns; the initial native turn is counted by
+            # `native_turn_attempts` above but does not consume this budget.
             iteration_budget = getattr(agent, "iteration_budget", None)
             if iteration_budget is not None and not iteration_budget.consume():
                 pause_candidate_text = current_turn.final_text

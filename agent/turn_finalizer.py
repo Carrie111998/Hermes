@@ -154,15 +154,18 @@ def finalize_turn(
         and bool(_pending_verification_response)
         and budget_fallback_eligible
     )
+    terminal_continuation_restored = False
     if (
         terminal_continuation_fallback
         and terminal_continuation_has_no_answer
         and not (final_response is None and budget_fallback_eligible)
     ):
+        # Defer transcript closure until trailing empty-response scaffolding
+        # has been removed below. Appending here would put the restored
+        # checkpoint after an `_empty_terminal_sentinel`, hiding that sentinel
+        # from the trailing-only cleanup and creating assistant→assistant rows.
         final_response = terminal_continuation_fallback
-        messages.append(
-            {"role": "assistant", "content": terminal_continuation_fallback}
-        )
+        terminal_continuation_restored = True
         if terminal_continuation_previewed:
             agent._response_was_previewed = True
     continuation_budget_exhausted = pending_verification_fallback
@@ -365,7 +368,9 @@ def finalize_turn(
         # Compare content (not just role) so a verification candidate that
         # matches the final response is not duplicated at budget
         # exhaustion. (#65919 §7)
-        if final_response and not interrupted:
+        if final_response and (
+            not interrupted or terminal_continuation_restored
+        ):
             try:
                 _tail = messages[-1] if messages else None
             except Exception:
