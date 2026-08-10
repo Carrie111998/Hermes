@@ -13,7 +13,7 @@ from .contracts import (
     MemoryRecord,
     Verification,
 )
-from .security import assert_safe_to_persist
+from .security import assert_candidate_safe_to_persist, assert_safe_to_persist
 from .vault import ParsedNote
 
 
@@ -36,7 +36,7 @@ _TRANSIENT_RE = re.compile(r"(?i)(?:terminal output|traceback|stack trace|tempor
 class MemoryPolicy:
     def evaluate(self, candidate: MemoryCandidate) -> CandidateDecision:
         try:
-            assert_safe_to_persist(candidate.content)
+            assert_candidate_safe_to_persist(candidate)
         except ValueError:
             return CandidateDecision("reject", reason="secret credentials detected")
         if _TRANSIENT_RE.search(candidate.content) and candidate.metadata.get("event_kind") not in {
@@ -46,12 +46,22 @@ class MemoryPolicy:
             return CandidateDecision("discard", reason="transient operational output")
 
         event_kind = str(candidate.metadata.get("event_kind") or EventKind.TURN.value)
+        if event_kind == "auto_consolidated":
+            if (
+                candidate.authority in {Authority.AGENT, Authority.SOURCE}
+                and candidate.verification in {Verification.SOURCE_SUPPORTED, Verification.DIRECTLY_OBSERVED}
+                and float(candidate.metadata.get("confidence", 0.0) or 0.0) >= 0.75
+                and candidate.evidence
+            ):
+                return CandidateDecision("promote", reason="confidence-gated source-supported consolidation")
+            return CandidateDecision("stage", reason="insufficient source evidence or confidence")
         if event_kind in {
             EventKind.EXPLICIT_REMEMBER.value,
             EventKind.USER_CORRECTION.value,
             EventKind.DECISION_CONFIRMED.value,
             EventKind.TASK_COMPLETE.value,
             EventKind.MANUAL_VAULT_EDIT.value,
+            EventKind.BUILTIN_MEMORY_WRITE.value,
         }:
             return CandidateDecision("promote", reason=event_kind)
         return CandidateDecision("stage", reason="requires confirmation or stronger evidence")

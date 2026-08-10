@@ -14,6 +14,7 @@ from plugins.memory.obsidian_duo.contracts import (
 from plugins.memory.obsidian_duo.policy import MemoryPolicy
 from plugins.memory.obsidian_duo.retrieval import MemoryRetriever
 from plugins.memory.obsidian_duo.store import SqliteMemoryStore
+from plugins.memory.obsidian_duo.sync import CommandSyncAdapter
 from plugins.memory.obsidian_duo.vault import ObsidianVault
 
 
@@ -52,7 +53,7 @@ def test_ordinary_turn_does_not_mark_external_sync_dirty(tmp_path):
     broker.observe(MemoryEvent("turn", content="ordinary conversation"))
     broker.observe(MemoryEvent("explicit_remember", content="durable decision"))
 
-    assert calls == ["explicit_remember"]
+    assert calls == []
     broker.shutdown(5)
 
 
@@ -93,6 +94,92 @@ def test_session_end_consolidates_last_session_when_event_has_no_session_id(tmp_
     broker.shutdown(5)
 
 
+def test_consolidation_auto_promotes_source_supported_candidate_with_evidence(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+
+    class Inference:
+        def consolidate(self, events, evidence):
+            return type("Result", (), {"parsed": {"candidates": [{
+                "content": "The project uses SQLite for durable memory",
+                "memory_type": "decision",
+                "confidence": 0.95,
+                "verification": "source_supported",
+                "evidence_ids": [evidence[0].evidence_id],
+                "project_id": "project-hermes",
+            }]}})()
+
+    broker.inference = Inference()
+    broker.consolidate("session_end", [MemoryEvent(
+        "decision_confirmed", "The project uses SQLite for durable memory", session_id="s1",
+        project_id="project-hermes",
+    )])
+
+    record = broker.store.connection().execute(
+        "SELECT content, authority, verification FROM memories"
+    ).fetchone()
+    assert record is not None
+    assert record["authority"] == "source"
+    assert record["verification"] == "source_supported"
+    assert "SQLite" in record["content"]
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 0
+    memory_id = broker.store.connection().execute("SELECT memory_id FROM memories").fetchone()[0]
+    assert list(broker.vault.managed_root.rglob(f"{memory_id}.md"))
+    packet = broker.retrieve(RetrievalRequest("SQLite durable memory", max_memories=2, max_tokens=40))
+    assert packet.memories[0].content == record["content"]
+    broker.shutdown(5)
+
+
+def test_consolidation_keeps_speculative_candidate_staged(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+
+    class Inference:
+        def consolidate(self, events, evidence):
+            return type("Result", (), {"parsed": {"candidates": [{
+                "content": "The user may prefer blue",
+                "memory_type": "preference",
+                "confidence": 0.4,
+                "verification": "inferred",
+                "evidence_ids": [],
+            }]}})()
+
+    broker.inference = Inference()
+    broker.consolidate("session_end", [MemoryEvent("turn", "Maybe blue", session_id="s1")])
+
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 1
+    broker.shutdown(5)
+
+
+def test_consolidation_without_inference_stages_without_alternate_provider(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    broker.inference = None
+
+    broker.consolidate("session_end", [MemoryEvent("turn", "Observed SQLite", session_id="s1")])
+
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 1
+    broker.shutdown(5)
+
+
+def test_deferred_inference_keeps_useful_events_staged(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+
+    class Inference:
+        def consolidate(self, events, evidence):
+            return type("Result", (), {"parsed": None, "deferred": True})()
+
+    broker.inference = Inference()
+    broker.consolidate("session_end", [MemoryEvent("decision_confirmed", "Use SQLite", session_id="s1")])
+
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM memories").fetchone()[0] == 0
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0] == 1
+    broker.shutdown(5)
+
+
 def test_broker_recovers_written_journal_by_rescanning(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()
@@ -115,6 +202,39 @@ def test_explicit_promotion_persists_note_index_and_memory(tmp_path):
     assert decision.action == "promote"
     assert broker.store.get_memory(decision.memory_id).content == "Use SQLite for durable memory"
     assert list(broker.vault.managed_root.rglob(f"{decision.memory_id}.md"))
+
+
+def test_durable_promotion_marks_sync_dirty_but_staging_does_not(tmp_path):
+    broker = make_broker(tmp_path)
+    reasons = []
+    broker.sync_adapter = type("Sync", (), {
+        "mark_dirty": lambda self, reason: reasons.append(reason),
+        "flush": lambda self: type("Result", (), {"success": True, "attempted": False})(),
+    })()
+    broker.start()
+
+    broker.propose(MemoryCandidate("ordinary candidate"))
+    assert reasons == []
+    broker.propose(MemoryCandidate("durable choice", metadata={"event_kind": "explicit_remember"}), host_confirmed=True)
+    assert reasons == ["promotion"]
+    broker.shutdown(5)
+
+
+def test_successful_durable_promotion_is_synced_on_flush(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "plugins.memory.obsidian_duo.sync.subprocess.run",
+        lambda command, **kwargs: (calls.append(command) or type("Result", (), {"returncode": 0, "stderr": ""})()),
+    )
+    broker = make_broker(tmp_path)
+    broker.sync_adapter = CommandSyncAdapter(["obsidian", "sync"], debounce_seconds=30)
+    broker.start()
+
+    broker.propose(MemoryCandidate("durable choice", metadata={"event_kind": "explicit_remember"}), host_confirmed=True)
+    assert calls == []
+    assert broker.flush("promotion", 5)
+    assert len(calls) == 1
+    broker.shutdown(5)
 
 
 def test_model_proposal_cannot_claim_user_confirmation(tmp_path):

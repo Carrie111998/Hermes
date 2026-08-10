@@ -4,6 +4,7 @@ import json
 from agent.plugin_llm import PluginLlm
 from plugins.memory.obsidian_duo import ObsidianDuoMemoryProvider
 from plugins.memory.obsidian_duo.config import ObsidianDuoConfig
+from plugins.memory.obsidian_duo.contracts import Authority
 
 
 def test_provider_captures_host_owned_llm():
@@ -53,4 +54,22 @@ def test_provider_lifecycle_uses_profile_scoped_broker(tmp_path, monkeypatch):
     assert provider.prefetch("thanks") == ""
     assert provider.get_tool_schemas()[0]["name"] == "memory_duo"
     assert '"commit"' not in json.dumps(provider.get_tool_schemas())
+    provider.shutdown()
+
+
+def test_hot_memory_bridge_maps_memory_and_user_targets_to_supported_types(tmp_path):
+    home = tmp_path / "home"
+    vault = tmp_path / "vault"
+    ObsidianDuoConfig(vault_path=str(vault), inference_mode="disabled").save(home)
+    provider = ObsidianDuoMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(home))
+
+    provider.on_memory_write("add", "memory", "durable fact", {"write_origin": "user"})
+    provider.on_memory_write("add", "user", "prefers dark mode", {"write_origin": "user"})
+
+    records = provider._broker._broker.store.connection().execute(
+        "SELECT memory_type, authority FROM memories ORDER BY rowid"
+    ).fetchall()
+    assert [row[0] for row in records] == ["fact", "preference"]
+    assert all(row[1] == Authority.USER.value for row in records)
     provider.shutdown()

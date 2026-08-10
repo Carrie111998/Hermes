@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .contracts import EvidenceRecord, MemoryEvent, MemoryRecord
-from .security import scan_for_secrets
+from .security import assert_safe_value, scan_for_secrets
 
 
 RERANK_SCHEMA = {
@@ -21,7 +21,19 @@ RERANK_SCHEMA = {
 _CANDIDATE_SCHEMA = {
     "type": "object",
     "properties": {
-        "candidates": {"type": "array", "items": {"type": "object"}},
+        "candidates": {"type": "array", "items": {"type": "object", "properties": {
+            "content": {"type": "string"},
+            "memory_type": {"type": "string"},
+            "scope": {"type": "string"},
+            "confidence": {"type": "number"},
+            "verification": {"type": "string"},
+            "evidence_ids": {"type": "array", "items": {"type": "string"}},
+            "source_session_id": {"type": "string"},
+            "task_id": {"type": "string"},
+            "project_id": {"type": "string"},
+            "mission_id": {"type": "string"},
+            "agent_id": {"type": "string"},
+        }}},
         "uncertainties": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["candidates", "uncertainties"],
@@ -101,5 +113,9 @@ class MemoryInference:
         for candidate in result.parsed.get("candidates", []):
             content = str(candidate.get("content", "")) if isinstance(candidate, dict) else ""
             if scan_for_secrets(content).matches:
+                return InferenceResult("deferred", deferred=True, reason="secret in inference output")
+            try:
+                assert_safe_value(candidate)
+            except ValueError:
                 return InferenceResult("deferred", deferred=True, reason="secret in inference output")
         return result

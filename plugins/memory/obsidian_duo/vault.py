@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ import yaml
 
 from .contracts import Authority, MemoryRecord, MemoryStatus, Verification
 from .store import SqliteMemoryStore
-from .security import assert_safe_to_persist, redact_secrets
+from .security import assert_safe_to_persist, assert_safe_value, redact_secrets
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,13 @@ class ObsidianVault:
         return "---\n" + yaml.safe_dump(metadata, sort_keys=False).rstrip() + "\n---\n" + record.content.rstrip() + "\n"
 
     def write_managed_note(self, record: MemoryRecord) -> Path:
+        assert_safe_to_persist(record.content)
+        assert_safe_value((
+            record.memory_id, record.memory_type, record.scope,
+            record.evidence_ids, record.relationships,
+            record.source_session_id, record.task_id, record.project_id,
+            record.child_session_id, record.mission_id, record.agent_id,
+        ))
         self.ensure_managed_structure()
         path = self._managed_path(record)
         text = self._render(record)
@@ -249,9 +257,31 @@ class ObsidianVault:
                 store.connection().execute("DELETE FROM memory_fts WHERE memory_id LIKE 'external_%'")
                 store.connection().execute("DELETE FROM memories WHERE memory_id LIKE 'external_%'")
         result = self.scan_managed_changes(store)
-        external_reparsed = 0
+        external_paths, external_reparsed = self.index_external_paths(
+            store,
+            limit=None if full else 32,
+        )
+        return RebuildResult(
+            scanned=len(list(self.managed_root.rglob("*.md"))) + len(external_paths),
+            reparsed=len(result.reparsed_paths) + external_reparsed,
+            malformed=len(result.malformed_paths),
+        )
+
+    def index_external_paths(self, store: SqliteMemoryStore, *, limit: int | None = 32, query: str = ""):
+        """Incrementally index a bounded set of read-only external Markdown notes."""
         external_paths = tuple(self.catalog_external_markdown_paths() or ())
-        for path in external_paths:
+        query_tokens = set(re.findall(r"[\w-]+", query.lower()))
+        ranked = sorted(
+            external_paths,
+            key=lambda path: (
+                -sum(token in str(path).lower() for token in query_tokens),
+                str(path).lower(),
+            ),
+        )
+        if limit is not None:
+            ranked = ranked[:max(0, limit)]
+        external_reparsed = 0
+        for path in ranked:
             stat = path.stat()
             previous = store.connection().execute(
                 "SELECT memory_id,mtime_ns,size,content_hash FROM external_index WHERE path=?",
@@ -272,8 +302,4 @@ class ObsidianVault:
             ), "external markdown index")
             store.set_external_index(str(path), memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
             external_reparsed += 1
-        return RebuildResult(
-            scanned=len(list(self.managed_root.rglob("*.md"))) + len(external_paths),
-            reparsed=len(result.reparsed_paths) + external_reparsed,
-            malformed=len(result.malformed_paths),
-        )
+        return external_paths, external_reparsed

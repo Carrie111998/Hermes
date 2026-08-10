@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -28,19 +29,23 @@ class CommandSyncAdapter:
         self.debounce_seconds = debounce_seconds
         self.timeout = timeout
         self.dirty = False
+        self._dirty_since = 0.0
         self._reasons: list[str] = []
 
     def mark_dirty(self, reason: str) -> None:
         if reason not in self._reasons:
             self._reasons.append(reason)
         self.dirty = True
+        self._dirty_since = time.monotonic()
 
     def sync(self, reason: str) -> SyncResult:
         self.mark_dirty(reason)
         return self.flush()
 
-    def flush(self) -> SyncResult:
+    def flush(self, *, force: bool = True) -> SyncResult:
         if not self.dirty:
+            return SyncResult(True, False)
+        if not force and time.monotonic() - self._dirty_since < self.debounce_seconds:
             return SyncResult(True, False)
         try:
             completed = subprocess.run(
@@ -56,5 +61,9 @@ class CommandSyncAdapter:
         if completed.returncode != 0:
             return SyncResult(False, True, "command failed")
         self.dirty = False
+        self._dirty_since = 0.0
         self._reasons.clear()
         return SyncResult(True, True)
+
+    def flush_if_due(self) -> SyncResult:
+        return self.flush(force=False)

@@ -27,7 +27,7 @@ from .retrieval import MemoryRetriever
 from .store import SqliteMemoryStore
 from .vault import ObsidianVault
 from .store import new_id
-from .security import redact_secrets
+from .security import assert_candidate_safe_to_persist, redact_secrets
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,8 @@ class EmbeddedMemoryBroker:
         self.store.initialize()
         self.vault.ensure_managed_structure()
         self.recover()
+        if self.config.index_mode in {"lazy", "managed_first"}:
+            self.vault.index_external_paths(self.store, limit=32)
         self._state = "READY"
 
     def _ensure_worker(self) -> None:
@@ -106,12 +108,6 @@ class EmbeddedMemoryBroker:
 
     def observe(self, event: MemoryEvent) -> None:
         self.store.initialize()
-        if (
-            event.event_type in {"user_correction", "explicit_remember", "decision_confirmed", "builtin_memory_write", "manual_vault_edit"}
-            and self.sync_adapter is not None
-            and hasattr(self.sync_adapter, "mark_dirty")
-        ):
-            self.sync_adapter.mark_dirty(event.event_type)
         self._ensure_worker()
         try:
             self._events.put_nowait(event)
@@ -170,16 +166,31 @@ class EmbeddedMemoryBroker:
             self.vault.scan_managed_changes(self.store)
             self.process_manual_changes()
             self._last_managed_scan = now
+        if self.config.index_mode in {"lazy", "managed_first"}:
+            self.vault.index_external_paths(self.store, limit=32, query=request.query)
         return self.retriever.retrieve(request)
 
-    def propose(self, candidate: MemoryCandidate, *, host_confirmed: bool = False) -> CandidateDecision:
-        if not host_confirmed:
+    def propose(self, candidate: MemoryCandidate, *, host_confirmed: bool = False, auto_promote: bool = False) -> CandidateDecision:
+        try:
+            assert_candidate_safe_to_persist(candidate)
+        except ValueError:
+            return CandidateDecision("reject", reason="secret credentials detected")
+        try:
+            self.vault._canonical_folder(candidate.memory_type)
+        except ValueError:
+            return CandidateDecision("reject", reason="unsupported memory_type")
+        if not host_confirmed and not auto_promote:
             candidate = replace(
                 candidate,
                 authority=Authority.AGENT,
                 verification=Verification.UNVERIFIED,
                 metadata={**dict(candidate.metadata), "event_kind": "tool_proposal"},
             )
+        elif auto_promote:
+            if candidate.authority is Authority.USER:
+                candidate = replace(candidate, authority=Authority.AGENT)
+            if candidate.verification is Verification.USER_CONFIRMED:
+                candidate = replace(candidate, verification=Verification.INFERRED)
         existing = self.store.hot_memory_candidates(limit=max(32, self.config.recall_max_memories * 2))
         decision = self.policy.merge_or_conflict(existing, candidate)
         if decision.action in {"promote", "supersede"}:
@@ -232,6 +243,8 @@ class EmbeddedMemoryBroker:
             self.store.set_note_index(str(path), memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
             self.store.record_journal(txn_id, "promote", "indexed", payload)
             self.store.record_journal(txn_id, "promote", "committed", payload)
+            if self.sync_adapter is not None and hasattr(self.sync_adapter, "mark_dirty"):
+                self.sync_adapter.mark_dirty("promotion")
             return CandidateDecision("promote", memory_id=memory_id, reason=decision.reason)
         if decision.action == "conflict":
             candidate_id = self.store.stage_candidate(candidate)
@@ -314,6 +327,8 @@ class EmbeddedMemoryBroker:
                 updated = self.policy.apply_user_edit(old, parsed)
                 self.store.upsert_memory(updated, "manual user edit")
                 self.store.set_note_index(str(path), updated.memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
+                if self.sync_adapter is not None and hasattr(self.sync_adapter, "mark_dirty"):
+                    self.sync_adapter.mark_dirty("manual_edit")
                 changed += 1
             except Exception:
                 self.store.set_note_index(
@@ -328,15 +343,79 @@ class EmbeddedMemoryBroker:
             lifecycle_types |= {"turn", "user_correction", "explicit_remember", "decision_confirmed"}
         retained = [event for event in events if event.event_type in lifecycle_types][:32]
         if self.inference is not None and retained:
-            result = self.inference.consolidate(retained, [])
+            evidence = self._event_evidence(retained)
+            result = self.inference.consolidate(retained, evidence)
+            if getattr(result, "deferred", False) or not result.parsed:
+                for event in retained:
+                    self.propose(MemoryCandidate(
+                        event.content,
+                        metadata={"reason": reason, "event_kind": event.event_type},
+                    ))
+                return len(retained)
             candidates = result.parsed.get("candidates", []) if result.parsed else []
             for item in candidates:
                 if isinstance(item, dict) and item.get("content"):
-                    self.propose(MemoryCandidate(str(item["content"]), metadata={"reason": reason}))
+                    self.propose(
+                        self._candidate_from_extraction(item, retained, evidence, reason),
+                        auto_promote=True,
+                    )
             return len(candidates)
         for event in retained:
             self.propose(MemoryCandidate(event.content, metadata={"reason": reason, "event_kind": event.event_type}))
         return len(retained)
+
+    @staticmethod
+    def _event_evidence(events: list[MemoryEvent]):
+        import hashlib
+        from .contracts import EvidenceRecord
+
+        return [EvidenceRecord(
+            evidence_id="event_" + hashlib.sha256(
+                f"{event.session_id}|{event.event_type}|{event.content}".encode()
+            ).hexdigest()[:20],
+            kind=event.event_type,
+            content=event.content,
+            source="memory_duo",
+            session_id=event.session_id,
+        ) for event in events if event.content]
+
+    @staticmethod
+    def _candidate_from_extraction(item, events, evidence, reason):
+        from .contracts import Verification
+
+        try:
+            verification = Verification(str(item.get("verification") or Verification.INFERRED.value))
+        except ValueError:
+            verification = Verification.INFERRED
+        if verification is Verification.USER_CONFIRMED:
+            verification = Verification.INFERRED
+        confidence = float(item.get("confidence") or 0.0)
+        evidence_ids = {str(value) for value in item.get("evidence_ids", ()) if value}
+        selected = tuple(record for record in evidence if not evidence_ids or record.evidence_id in evidence_ids)
+        auto_safe = (
+            verification in {Verification.SOURCE_SUPPORTED, Verification.DIRECTLY_OBSERVED}
+            and confidence >= 0.75
+            and bool(selected)
+        )
+        metadata = {
+            "reason": reason,
+            "event_kind": "auto_consolidated" if auto_safe else "turn",
+            "confidence": confidence,
+            "source_session_id": str(item.get("source_session_id") or next((event.session_id for event in events if event.session_id), "")),
+            "task_id": str(item.get("task_id") or next((event.task_id for event in events if event.task_id), "")),
+            "project_id": str(item.get("project_id") or next((event.project_id for event in events if event.project_id), "")),
+            "mission_id": str(item.get("mission_id") or next((event.mission_id for event in events if event.mission_id), "")),
+            "agent_id": str(item.get("agent_id") or next((event.agent_id for event in events if event.agent_id), "")),
+        }
+        return MemoryCandidate(
+            str(item["content"]),
+            memory_type=str(item.get("memory_type") or "fact"),
+            scope=str(item.get("scope") or "global"),
+            authority=Authority.SOURCE if auto_safe else Authority.AGENT,
+            verification=verification,
+            evidence=selected,
+            metadata=metadata,
+        )
 
     def status(self) -> BrokerStatus:
         return BrokerStatus(

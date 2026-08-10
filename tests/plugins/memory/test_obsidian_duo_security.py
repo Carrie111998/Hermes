@@ -9,6 +9,25 @@ from plugins.memory.obsidian_duo.security import (
     redact_secrets,
     scan_for_secrets,
 )
+from plugins.memory.obsidian_duo.contracts import EvidenceRecord, MemoryCandidate
+from plugins.memory.obsidian_duo.broker import EmbeddedMemoryBroker
+from plugins.memory.obsidian_duo.config import ObsidianDuoConfig
+from plugins.memory.obsidian_duo.policy import MemoryPolicy
+from plugins.memory.obsidian_duo.retrieval import MemoryRetriever
+from plugins.memory.obsidian_duo.store import SqliteMemoryStore
+
+
+def make_broker(tmp_path):
+    config = ObsidianDuoConfig(str(tmp_path / "Vault"))
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    vault = ObsidianVault(Path(config.vault_path), config.managed_folder)
+    return EmbeddedMemoryBroker(
+        config=config,
+        store=store,
+        vault=vault,
+        policy=MemoryPolicy(),
+        retriever=MemoryRetriever(store),
+    )
 
 
 @pytest.mark.parametrize(
@@ -45,6 +64,27 @@ def test_rejection_never_logs_raw_secret(caplog):
         assert_safe_to_persist(secret)
 
     assert all(secret not in record.getMessage() for record in caplog.records)
+
+
+def test_candidate_evidence_and_metadata_secrets_are_rejected_before_sqlite(tmp_path, caplog):
+    broker = make_broker(tmp_path)
+    broker.start()
+    secret = "API_KEY=sk-proj-1234567890abcdefghijklmnop"
+
+    decision = broker.propose(MemoryCandidate(
+        "safe durable fact",
+        evidence=(EvidenceRecord("ev-secret", "tool", secret),),
+        metadata={"tool_output": {"raw": secret}},
+    ))
+
+    assert decision.action == "reject"
+    db_blob = " ".join(
+        str(row[0]) for table in ("candidates", "evidence", "memory_versions", "journal")
+        for row in broker.store.connection().execute(f"SELECT * FROM {table}").fetchall()
+    )
+    assert secret not in db_blob
+    assert all(secret not in record.getMessage() for record in caplog.records)
+    broker.shutdown(5)
 
 
 def _record(memory_type: str) -> MemoryRecord:

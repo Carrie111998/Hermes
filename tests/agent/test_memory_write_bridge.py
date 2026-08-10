@@ -102,3 +102,36 @@ def test_build_metadata_callback_is_merged_per_op():
             "metadata": {"session_id": "s1", "tool_name": "memory"},
         }
     ]
+
+
+def test_actual_memory_manager_bridge_preserves_host_provenance_for_memory_targets(tmp_path):
+    from plugins.memory.obsidian_duo import ObsidianDuoMemoryProvider
+    from plugins.memory.obsidian_duo.config import ObsidianDuoConfig
+
+    home = tmp_path / "home"
+    ObsidianDuoConfig(vault_path=str(tmp_path / "vault"), inference_mode="disabled").save(home)
+    provider = ObsidianDuoMemoryProvider()
+    provider.initialize("session-1", hermes_home=str(home))
+    manager = MemoryManager()
+    manager.add_provider(provider)
+
+    manager.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "add", "target": "memory", "content": "host fact"},
+        build_metadata=lambda: {"session_id": "s1", "task_id": "t1"},
+    )
+    manager.notify_memory_tool_write(
+        json.dumps({"success": True}),
+        {"action": "add", "target": "user", "content": "host preference"},
+        build_metadata=lambda: {"session_id": "s1", "task_id": "t1"},
+    )
+
+    payloads = [row[0] for row in provider._broker._broker.store.connection().execute(
+        "SELECT payload FROM candidates ORDER BY created_at"
+    ).fetchall()]
+    assert len(payloads) == 2
+    assert '"memory_type": "fact"' in payloads[0]
+    assert '"memory_type": "preference"' in payloads[1]
+    assert '"source_session_id": "s1"' in payloads[0]
+    assert '"task_id": "t1"' in payloads[0]
+    provider.shutdown()

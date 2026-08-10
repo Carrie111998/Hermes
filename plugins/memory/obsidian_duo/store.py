@@ -18,6 +18,7 @@ from .contracts import (
     MemoryStatus,
     Verification,
 )
+from .security import assert_candidate_safe_to_persist, assert_safe_to_persist, assert_safe_value, redact_value
 
 
 def new_id(prefix: str) -> str:
@@ -210,13 +211,21 @@ class SqliteMemoryStore:
         )
 
     def upsert_memory(self, record: MemoryRecord, version_reason: str) -> None:
+        assert_safe_to_persist(record.content)
+        assert_safe_value((
+            record.memory_id, record.memory_type, record.scope,
+            record.authority.value, record.verification.value,
+            record.evidence_ids, record.relationships,
+            record.source_session_id, record.task_id, record.project_id,
+            record.child_session_id, record.mission_id, record.agent_id,
+        ))
         conn = self.connection()
         with conn:
             old = conn.execute("SELECT * FROM memories WHERE memory_id=?", (record.memory_id,)).fetchone()
             if old is not None:
                 conn.execute(
                     "INSERT INTO memory_versions(memory_id, content, payload, version_reason) VALUES(?,?,?,?)",
-                    (record.memory_id, old["content"], json.dumps(dict(old)), version_reason),
+                    (record.memory_id, redact_value(old["content"]), json.dumps(redact_value(dict(old))), version_reason),
                 )
             conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (record.memory_id,))
             conn.execute(
@@ -263,6 +272,8 @@ class SqliteMemoryStore:
         )
 
     def insert_evidence(self, record: EvidenceRecord) -> None:
+        assert_safe_to_persist(record.content)
+        assert_safe_value((record.evidence_id, record.kind, record.source, record.session_id))
         with self.connection():
             self.connection().execute(
                 "INSERT OR REPLACE INTO evidence(evidence_id,kind,content,source,session_id) VALUES(?,?,?,?,?)",
@@ -298,6 +309,7 @@ class SqliteMemoryStore:
             )
 
     def stage_candidate(self, candidate: MemoryCandidate) -> str:
+        assert_candidate_safe_to_persist(candidate)
         candidate_id = new_id("candidate")
         payload = {
             "content": candidate.content,
@@ -316,6 +328,7 @@ class SqliteMemoryStore:
         return candidate_id
 
     def record_journal(self, txn_id: str, operation: str, state: str, payload: dict) -> None:
+        assert_safe_value(payload)
         with self.connection():
             self.connection().execute(
                 "INSERT OR REPLACE INTO journal(txn_id,operation,state,payload,updated_at) VALUES(?,?,?,?,CURRENT_TIMESTAMP)",

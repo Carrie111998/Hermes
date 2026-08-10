@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 
@@ -51,9 +52,17 @@ def scan_for_secrets(text: str) -> SecretScanResult:
 
 def redact_secrets(text: str) -> str:
     result = text or ""
-    matches = scan_for_secrets(result).matches
-    for match in reversed(matches):
-        result = result[:match.start] + f"<REDACTED:{match.category}>" + result[match.end:]
+    for _ in range(4):
+        matches = scan_for_secrets(result).matches
+        if not matches:
+            break
+        for match in reversed(matches):
+            replacement = "<REDACTED>"
+            if match.category in {"credential_assignment", "credential_entropy"}:
+                original = result[match.start:match.end]
+                label = re.split(r"\s*[:=]\s*", original, maxsplit=1)[0]
+                replacement = f"{label} <REDACTED>"
+            result = result[:match.start] + replacement + result[match.end:]
     return result
 
 
@@ -62,3 +71,40 @@ def assert_safe_to_persist(text: str) -> None:
     if result.matches:
         categories = ", ".join(sorted({match.category for match in result.matches}))
         raise ValueError(f"secret credentials detected ({categories}); refusing persistence")
+
+
+def _walk_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            yield from _walk_strings(key)
+            yield from _walk_strings(item)
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        for item in value:
+            yield from _walk_strings(item)
+
+
+def assert_safe_value(value) -> None:
+    for text in _walk_strings(value):
+        assert_safe_to_persist(text)
+
+
+def redact_value(value):
+    if isinstance(value, str):
+        return redact_secrets(value)
+    if isinstance(value, Mapping):
+        return {redact_value(key): redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_value(item) for item in value)
+    return value
+
+
+def assert_candidate_safe_to_persist(candidate) -> None:
+    assert_safe_to_persist(candidate.content)
+    for evidence in candidate.evidence:
+        assert_safe_to_persist(evidence.content)
+        assert_safe_value((evidence.evidence_id, evidence.kind, evidence.source, evidence.session_id))
+    assert_safe_value(candidate.metadata)

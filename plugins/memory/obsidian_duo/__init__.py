@@ -138,12 +138,22 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
             metadata = dict(metadata or {})
             authority = Authority.USER if metadata.get("write_origin") == "user" else Authority.AGENT
             verification = Verification.USER_CONFIRMED if authority is Authority.USER else Verification.UNVERIFIED
+            requested_type = str(metadata.get("memory_type") or "").strip().lower()
+            if requested_type not in ObsidianVault.MEMORY_TYPE_FOLDERS:
+                requested_type = "preference" if target == "user" else "fact"
+            provenance = {
+                "source_session_id": metadata.get("session_id", ""),
+                "task_id": metadata.get("task_id", ""),
+                "project_id": metadata.get("project_id", ""),
+                "mission_id": metadata.get("mission_id", ""),
+                "agent_id": metadata.get("agent_id", ""),
+            }
             self._broker.propose(MemoryCandidate(
                 content=content,
-                memory_type=target,
+                memory_type=requested_type,
                 authority=authority,
                 verification=verification,
-                metadata={**metadata, "event_kind": "builtin_memory_write"},
+                metadata={**metadata, **provenance, "event_kind": "builtin_memory_write"},
             ), host_confirmed=authority is Authority.USER)
 
     def on_delegation(self, task: str, result: str, **kwargs) -> None:
