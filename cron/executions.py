@@ -276,20 +276,33 @@ def create_delivery_execution(
             "is_voice": bool(entry.get("is_voice", False)),
         })
 
-    normalized_targets = []
-    for target in delivery_targets:
-        platform = str(target.get("platform") or "").strip().lower()
-        chat_id = str(target.get("chat_id") or "").strip()
-        thread_id = target.get("thread_id")
-        if not platform or not chat_id:
-            raise ValueError("delivery target is invalid")
-        normalized_targets.append({
-            "platform": platform,
-            "chat_id": chat_id,
-            "thread_id": None if thread_id is None else str(thread_id),
-        })
+    normalized_targets = [
+        _normalize_target(target, label="delivery target") for target in delivery_targets
+    ]
     if not normalized_targets:
         raise ValueError("delivery execution requires concrete delivery targets")
+
+    filesystem_manifest = []
+    filesystem_targets = [
+        target for target in normalized_targets if target.get("kind") == "filesystem"
+    ]
+    if filesystem_targets:
+        from cron.filesystem_delivery import derive_destination_path, stable_read_source
+
+        if len(normalized_media) != 1 or normalized_media[0]["is_voice"]:
+            raise ValueError("filesystem delivery requires exactly one MEDIA image artifact")
+        media_source = normalized_media[0]["source_path"]
+        for target in filesystem_targets:
+            stable_path, stable_payload = stable_read_source(
+                media_source, target["source_roots"],
+            )
+            if stable_payload != normalized_media[0]["payload"]:
+                raise ValueError("filesystem source changed before delivery claim")
+            filesystem_manifest.append({
+                "target_id": target["target_id"],
+                "source_path": str(stable_path),
+                "destination_path": str(derive_destination_path(target, stable_path)),
+            })
 
     execution_id = uuid.uuid4().hex
     artifact_dir = EXECUTIONS_FILE.parent / "artifacts"
@@ -338,6 +351,7 @@ def create_delivery_execution(
                     write_owned(media_owned_path, entry["payload"])
                 owned_media.append({
                     "path": str(media_owned_path),
+                    "source_path": str(entry["source_path"]),
                     "sha256": entry["sha256"],
                     "size_bytes": entry["size_bytes"],
                     "is_voice": entry["is_voice"],
@@ -346,10 +360,12 @@ def create_delivery_execution(
                 "version": 1,
                 "payload": {
                     "path": str(owned_path),
+                    "source_path": str(resolved),
                     "sha256": actual_digest,
                     "size_bytes": len(payload),
                 },
                 "media": owned_media,
+                "filesystem": filesystem_manifest,
             }
             conn.execute(
                 """INSERT INTO executions
@@ -431,6 +447,15 @@ def read_delivery_artifacts(execution_id: str) -> tuple[Dict[str, Any], Dict[str
 def _normalize_target(target: Dict[str, Any], *, label: str) -> Dict[str, Any]:
     if not isinstance(target, dict):
         raise ValueError(f"{label} is invalid")
+    if target.get("kind") == "filesystem" or any(
+        key in target for key in ("target_id", "destination_root", "source_roots", "layout")
+    ):
+        from cron.filesystem_delivery import normalize_filesystem_target
+
+        try:
+            return normalize_filesystem_target(target)
+        except ValueError as exc:
+            raise ValueError(f"{label} is invalid: {exc}") from exc
     platform = str(target.get("platform") or "").strip().lower()
     chat_id = str(target.get("chat_id") or "").strip()
     thread_id = target.get("thread_id")
@@ -443,9 +468,33 @@ def _normalize_target(target: Dict[str, Any], *, label: str) -> Dict[str, Any]:
     }
 
 
+def _normalize_actual_target(
+    target: Dict[str, Any], *, requested: Dict[str, Any], label: str,
+) -> Dict[str, Any]:
+    if requested.get("kind") != "filesystem":
+        return _normalize_target(target, label=label)
+    if not isinstance(target, dict) or set(target) != {"kind", "target_id", "destination_path"}:
+        raise ValueError(f"{label} is invalid")
+    if target.get("kind") != "filesystem" or target.get("target_id") != requested["target_id"]:
+        raise ValueError(f"{label} is invalid")
+    destination = Path(str(target.get("destination_path") or ""))
+    if not destination.is_absolute():
+        raise ValueError(f"{label} is invalid")
+    return {
+        "kind": "filesystem",
+        "target_id": requested["target_id"],
+        "destination_path": str(destination),
+    }
+
+
 def _validate_delivery_evidence(
     *,
     state: str,
+    execution_id: str,
+    artifact_path: str,
+    artifact_sha256: str,
+    artifact_size_bytes: int,
+    artifact_manifest: Dict[str, Any],
     authorized_targets: List[Dict[str, Any]],
     actual_targets: Optional[List[Dict[str, Any]]],
     receipts: Optional[List[Dict[str, Any]]],
@@ -455,10 +504,6 @@ def _validate_delivery_evidence(
         _normalize_target(target, label="authorized delivery target")
         for target in authorized_targets
     ]
-    normalized_actual = [
-        _normalize_target(target, label="actual delivery target")
-        for target in actual_targets or []
-    ]
     normalized_receipts: List[Dict[str, Any]] = []
     for receipt in receipts or []:
         if not isinstance(receipt, dict):
@@ -466,8 +511,9 @@ def _validate_delivery_evidence(
         requested = _normalize_target(
             receipt.get("requested_target"), label="delivery receipt requested target",
         )
-        actual = _normalize_target(
-            receipt.get("actual_target"), label="delivery receipt actual target",
+        actual = _normalize_actual_target(
+            receipt.get("actual_target"), requested=requested,
+            label="delivery receipt actual target",
         )
         status = str(receipt.get("status") or "")
         transport = str(receipt.get("transport") or "")
@@ -476,32 +522,66 @@ def _validate_delivery_evidence(
             None if receipt.get("provider_receipt_id") is None
             else str(receipt.get("provider_receipt_id")).strip() or None
         )
+        is_filesystem = requested.get("kind") == "filesystem"
         if status not in ("delivered", "failed", "ambiguous"):
             raise ValueError("delivery receipt status is invalid")
-        if transport not in ("live", "standalone", "none"):
+        allowed_transports = ("filesystem", "none") if is_filesystem else ("live", "standalone", "none")
+        if transport not in allowed_transports:
             raise ValueError("delivery receipt transport is invalid")
         if status == "delivered" and error is not None:
             raise ValueError("delivered receipt cannot carry an error")
         if status == "delivered" and transport == "none":
             raise ValueError("delivered receipt requires a dispatched transport")
-        if status == "delivered" and not provider_receipt_id:
+        if status == "delivered" and not is_filesystem and not provider_receipt_id:
             raise ValueError("delivered receipt requires provider receipt evidence")
+        if is_filesystem and provider_receipt_id is not None:
+            raise ValueError("filesystem receipt cannot carry provider receipt evidence")
         if status in ("failed", "ambiguous") and not error:
             raise ValueError(f"{status} receipt requires error evidence")
         if status == "ambiguous" and transport == "none":
             raise ValueError("ambiguous receipt requires a dispatched transport")
         if requested not in authorized:
             raise ValueError("delivery receipts do not match authorized targets")
-        if requested["platform"] != actual["platform"] or requested["chat_id"] != actual["chat_id"]:
+
+        filesystem_receipt = receipt.get("filesystem_receipt")
+        if is_filesystem:
+            if status == "ambiguous":
+                raise ValueError("filesystem delivery outcome cannot be ambiguous")
+            frozen = next((entry for entry in artifact_manifest.get("filesystem", [])
+                           if entry.get("target_id") == requested["target_id"]), None)
+            if frozen is None or actual["destination_path"] != frozen.get("destination_path"):
+                raise ValueError("delivery receipt actual target is outside requested route")
+            if status == "delivered":
+                if transport != "filesystem":
+                    raise ValueError("delivered filesystem receipt requires filesystem transport")
+                from cron.filesystem_delivery import validate_filesystem_receipt
+
+                filesystem_receipt = validate_filesystem_receipt(
+                    filesystem_receipt,
+                    target=requested,
+                    execution_id=execution_id,
+                    source_path=str(frozen["source_path"]),
+                    destination_path=str(frozen["destination_path"]),
+                    artifact_path=artifact_path,
+                    artifact_sha256=artifact_sha256,
+                    artifact_size_bytes=artifact_size_bytes,
+                )
+            elif filesystem_receipt is not None or transport != "none":
+                raise ValueError("failed filesystem receipt cannot fabricate copy evidence")
+        elif requested["platform"] != actual["platform"] or requested["chat_id"] != actual["chat_id"]:
             raise ValueError("delivery receipt actual target is outside requested route")
-        normalized_receipts.append({
+
+        normalized = {
             "requested_target": requested,
             "actual_target": actual,
             "status": status,
             "transport": transport,
             "error": error,
             "provider_receipt_id": provider_receipt_id,
-        })
+        }
+        if is_filesystem:
+            normalized["filesystem_receipt"] = filesystem_receipt
+        normalized_receipts.append(normalized)
 
     requested_evidence = [receipt["requested_target"] for receipt in normalized_receipts]
     if requested_evidence != authorized:
@@ -510,9 +590,19 @@ def _validate_delivery_evidence(
         receipt["actual_target"] for receipt in normalized_receipts
         if receipt["status"] == "delivered"
     ]
+    normalized_actual = []
+    for target in actual_targets or []:
+        matched = next((receipt["requested_target"] for receipt in normalized_receipts
+                        if receipt["actual_target"] == target), None)
+        if matched is None:
+            raise ValueError("delivery targets must contain only confirmed actual targets")
+        normalized_actual.append(_normalize_actual_target(
+            target, requested=matched, label="actual delivery target",
+        ))
     delivered_provider_ids = [
         receipt["provider_receipt_id"] for receipt in normalized_receipts
         if receipt["status"] == "delivered"
+        and receipt["requested_target"].get("kind") != "filesystem"
     ]
     if len(set(delivered_provider_ids)) != len(delivered_provider_ids):
         raise ValueError("delivery provider receipt IDs must be unique")
@@ -568,7 +658,9 @@ def finish_execution(
     output_path = str(output_file) if output_file else None
     with _transaction() as conn:
         existing = conn.execute(
-            "SELECT kind, authorized_delivery_targets FROM executions WHERE id=?",
+            """SELECT kind, authorized_delivery_targets, artifact_path,
+                      artifact_sha256, artifact_size_bytes, artifact_manifest
+               FROM executions WHERE id=?""",
             (str(execution_id),),
         ).fetchone()
         if existing is not None and existing["kind"] == "delivery" and delivery_status is None:
@@ -586,6 +678,11 @@ def finish_execution(
             authorized = json.loads(existing["authorized_delivery_targets"] or "[]")
             normalized_targets, normalized_receipts = _validate_delivery_evidence(
                 state=delivery_status,
+                execution_id=str(execution_id),
+                artifact_path=str(existing["artifact_path"]),
+                artifact_sha256=str(existing["artifact_sha256"]),
+                artifact_size_bytes=int(existing["artifact_size_bytes"]),
+                artifact_manifest=json.loads(existing["artifact_manifest"] or "{}"),
                 authorized_targets=authorized,
                 actual_targets=delivery_targets,
                 receipts=delivery_receipts,
@@ -626,13 +723,20 @@ def mark_execution_ambiguous(
     detail = str(error or "delivery outcome is ambiguous")
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT kind, authorized_delivery_targets FROM executions WHERE id=?",
+            """SELECT kind, authorized_delivery_targets, artifact_path,
+                      artifact_sha256, artifact_size_bytes, artifact_manifest
+               FROM executions WHERE id=?""",
             (str(execution_id),),
         ).fetchone()
         if row is None or row["kind"] != "delivery":
             raise ValueError("ambiguous outcome is valid only for a delivery execution")
         actual_targets, normalized_receipts = _validate_delivery_evidence(
             state="ambiguous",
+            execution_id=str(execution_id),
+            artifact_path=str(row["artifact_path"]),
+            artifact_sha256=str(row["artifact_sha256"]),
+            artifact_size_bytes=int(row["artifact_size_bytes"]),
+            artifact_manifest=json.loads(row["artifact_manifest"] or "{}"),
             authorized_targets=json.loads(row["authorized_delivery_targets"] or "[]"),
             actual_targets=[
                 receipt.get("actual_target") for receipt in delivery_receipts or []
@@ -663,21 +767,137 @@ def mark_execution_ambiguous(
     return record
 
 
+def _recover_filesystem_execution(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Resume or reconcile one abandoned filesystem-only delivery execution."""
+    targets = json.loads(row.get("authorized_delivery_targets") or "[]")
+    if not targets or any(target.get("kind") != "filesystem" for target in targets):
+        return None
+    manifest = json.loads(row.get("artifact_manifest") or "{}")
+    media = manifest.get("media") or []
+    frozen_entries = manifest.get("filesystem") or []
+    if len(media) != 1:
+        raise ValueError("filesystem recovery requires exactly one frozen MEDIA artifact")
+    owned = media[0]
+    receipts: List[Dict[str, Any]] = []
+    actual_targets: List[Dict[str, Any]] = []
+    failure: Optional[str] = None
+    from cron.filesystem_delivery import copy_filesystem_delivery
+
+    for target in targets:
+        frozen = next((entry for entry in frozen_entries
+                       if entry.get("target_id") == target.get("target_id")), None)
+        if frozen is None:
+            failure = "filesystem recovery is missing its frozen destination path"
+            destination = str(Path(target["destination_root"]) / ".invalid")
+        else:
+            destination = str(frozen["destination_path"])
+        actual = {
+            "kind": "filesystem",
+            "target_id": target["target_id"],
+            "destination_path": destination,
+        }
+        if failure is None:
+            try:
+                proof = copy_filesystem_delivery(
+                    target=target,
+                    execution_id=str(row["id"]),
+                    source_path=str(frozen["source_path"]),
+                    artifact_path=str(owned["path"]),
+                    artifact_sha256=str(owned["sha256"]),
+                    artifact_size_bytes=int(owned["size_bytes"]),
+                    destination_path=destination,
+                )
+            except Exception as exc:
+                failure = f"filesystem crash recovery failed: {exc}"
+            else:
+                actual_targets.append(actual)
+                receipts.append({
+                    "requested_target": target,
+                    "actual_target": actual,
+                    "status": "delivered",
+                    "transport": "filesystem",
+                    "error": None,
+                    "provider_receipt_id": None,
+                    "filesystem_receipt": proof,
+                })
+                continue
+        receipts.append({
+            "requested_target": target,
+            "actual_target": actual,
+            "status": "failed",
+            "transport": "none",
+            "error": failure,
+            "provider_receipt_id": None,
+            "filesystem_receipt": None,
+        })
+
+    if failure is None:
+        return finish_execution(
+            str(row["id"]), success=True, delivery_status="delivered",
+            delivery_targets=actual_targets, delivery_receipts=receipts,
+        )
+    return finish_execution(
+        str(row["id"]), success=False, error=failure, delivery_status="failed",
+        delivery_error=failure, delivery_targets=actual_targets,
+        delivery_receipts=receipts,
+    )
+
+
 def recover_interrupted_executions() -> int:
-    """Mark provably abandoned attempts unknown without scheduling retries."""
-    now = _hermes_now().isoformat()
+    """Recover filesystem copies; classify other abandoned attempts as unknown."""
+    with _transaction() as conn:
+        candidates = [dict(row) for row in conn.execute(
+            "SELECT * FROM executions WHERE status IN ('claimed','running')"
+        ).fetchall()]
+
     changed = 0
     recovered: List[Dict[str, Any]] = []
-    with _transaction() as conn:
-        rows = conn.execute(
-            """SELECT id, process_id, pid, process_started_at FROM executions
-               WHERE status IN ('claimed','running')"""
-        ).fetchall()
-        for row in rows:
-            if row["process_id"] == _PROCESS_ID:
-                continue
-            if _owner_is_live(int(row["pid"]), row["process_started_at"]):
-                continue
+    for row in candidates:
+        if row["process_id"] == _PROCESS_ID:
+            continue
+        if _owner_is_live(int(row["pid"]), row["process_started_at"]):
+            continue
+        targets = json.loads(row.get("authorized_delivery_targets") or "[]")
+        filesystem_only = (
+            row.get("kind") == "delivery"
+            and bool(targets)
+            and all(target.get("kind") == "filesystem" for target in targets)
+        )
+        if filesystem_only:
+            try:
+                record = _recover_filesystem_execution(row)
+            except Exception as exc:
+                # A malformed frozen row still terminalizes as a known filesystem
+                # failure; it is never broadened into provider retry semantics.
+                detail = f"filesystem crash recovery failed: {exc}"
+                frozen = (json.loads(row.get("artifact_manifest") or "{}")
+                          .get("filesystem") or [])
+                receipts = []
+                for target in targets:
+                    entry = next((item for item in frozen
+                                  if item.get("target_id") == target.get("target_id")), {})
+                    receipts.append({
+                        "requested_target": target,
+                        "actual_target": {
+                            "kind": "filesystem",
+                            "target_id": target["target_id"],
+                            "destination_path": str(entry.get("destination_path") or
+                                                    Path(target["destination_root"]) / ".invalid"),
+                        },
+                        "status": "failed", "transport": "none", "error": detail,
+                        "provider_receipt_id": None, "filesystem_receipt": None,
+                    })
+                record = finish_execution(
+                    str(row["id"]), success=False, error=detail,
+                    delivery_status="failed", delivery_error=detail,
+                    delivery_receipts=receipts,
+                )
+            if record is not None:
+                changed += 1
+            continue
+
+        now = _hermes_now().isoformat()
+        with _transaction() as conn:
             cur = conn.execute(
                 """UPDATE executions SET status='unknown', finished_at=?, error=?
                    WHERE id=? AND status IN ('claimed','running')""",
@@ -686,15 +906,14 @@ def recover_interrupted_executions() -> int:
                  "terminal state; whether side effects ran is unknown.",
                  row["id"]),
             )
-            changed += cur.rowcount
             if cur.rowcount:
+                changed += 1
                 record = _record(conn.execute(
                     "SELECT * FROM executions WHERE id=?", (row["id"],)
                 ).fetchone())
                 if record is not None:
                     recovered.append(record)
-        if changed:
-            _prune_unlocked(conn)
+                _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
     return changed

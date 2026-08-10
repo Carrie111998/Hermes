@@ -294,7 +294,7 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import canonicalize_stored_fire_at, get_due_jobs, mark_job_run, save_delivery_payload, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_delivery_execution, create_execution, finish_execution, get_execution, mark_execution_ambiguous, mark_execution_running, read_delivery_artifacts, require_canonical_scheduled_for, require_scheduler_source
+from cron.executions import create_delivery_execution, create_execution, finish_execution, get_execution, mark_execution_ambiguous, mark_execution_running, read_delivery_artifact_manifest, read_delivery_artifacts, require_canonical_scheduled_for, require_scheduler_source
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1311,6 +1311,23 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
                 }
         return None
 
+    if deliver_value.lower().startswith("filesystem:"):
+        target_id = deliver_value.split(":", 1)[1]
+        try:
+            configured = (load_config().get("cron") or {}).get(
+                "filesystem_delivery_targets", {},
+            )
+        except Exception as exc:
+            raise ValueError("configured filesystem delivery target registry is unavailable") from exc
+        if not isinstance(configured, dict) or target_id not in configured:
+            raise ValueError(
+                f"configured filesystem delivery target {target_id!r} does not exist; "
+                "arbitrary paths are forbidden"
+            )
+        from cron.filesystem_delivery import normalize_configured_target
+
+        return normalize_configured_target(target_id, configured[target_id])
+
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
@@ -1453,10 +1470,22 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     for part in parts:
         target = _resolve_single_delivery_target(job, part)
         if target:
-            key = (target["platform"].lower(), str(target["chat_id"]), target.get("thread_id"))
+            if target.get("kind") == "filesystem":
+                key = ("filesystem", target["target_id"])
+            else:
+                key = (
+                    target["platform"].lower(), str(target["chat_id"]),
+                    target.get("thread_id"),
+                )
             if key not in seen:
                 seen.add(key)
                 targets.append(target)
+    target_kinds = {
+        "filesystem" if target.get("kind") == "filesystem" else "platform"
+        for target in targets
+    }
+    if len(target_kinds) > 1:
+        raise ValueError("filesystem and platform delivery targets cannot be mixed")
     return targets
 
 
@@ -1639,6 +1668,11 @@ class DeliveryOutcome:
 
 def _delivery_target_key(target: dict) -> str:
     """Canonical per-target identity shared by contact and receipt evidence."""
+    if target.get("kind") == "filesystem":
+        return json.dumps({
+            "kind": "filesystem",
+            "target_id": str(target.get("target_id") or ""),
+        }, sort_keys=True)
     return json.dumps({
         "platform": str(target.get("platform") or "").lower(),
         "chat_id": str(target.get("chat_id") or ""),
@@ -1666,6 +1700,64 @@ def _delivery_outcome(
         state = DeliveryState.FAILED
         detail = detail or "delivery path returned no receipt evidence"
     return DeliveryOutcome(state=state, receipts=tuple(receipts), error=detail)
+
+
+def _deliver_filesystem_result(
+    *, targets: List[dict], receipts: List[dict], delivery_execution_id: str,
+) -> DeliveryOutcome:
+    """Deliver execution-owned media without loading gateway configuration."""
+    from cron.filesystem_delivery import copy_filesystem_delivery
+
+    manifest = read_delivery_artifact_manifest(delivery_execution_id)
+    media = manifest.get("media") or []
+    frozen_entries = manifest.get("filesystem") or []
+    if len(media) != 1 or media[0].get("is_voice"):
+        detail = "filesystem delivery requires exactly one MEDIA image artifact"
+        return _delivery_outcome(receipts=receipts, errors=[detail])
+    owned = media[0]
+    errors: List[str] = []
+    for target in targets:
+        detail = "filesystem delivery failed"
+        frozen = next((entry for entry in frozen_entries
+                       if entry.get("target_id") == target.get("target_id")), None)
+        if frozen is None:
+            detail = "filesystem delivery is missing its frozen destination path"
+            destination = str(Path(target["destination_root"]) / ".invalid")
+            proof = None
+        else:
+            destination = str(frozen["destination_path"])
+            try:
+                proof = copy_filesystem_delivery(
+                    target=target,
+                    execution_id=delivery_execution_id,
+                    source_path=str(frozen["source_path"]),
+                    artifact_path=str(owned["path"]),
+                    artifact_sha256=str(owned["sha256"]),
+                    artifact_size_bytes=int(owned["size_bytes"]),
+                    destination_path=destination,
+                )
+            except Exception as exc:
+                detail = f"filesystem delivery failed: {exc}"
+                proof = None
+        actual = {
+            "kind": "filesystem",
+            "target_id": target["target_id"],
+            "destination_path": destination,
+        }
+        if proof is None:
+            errors.append(detail)
+            receipts.append({
+                "requested_target": target, "actual_target": actual,
+                "status": "failed", "transport": "none", "error": detail,
+                "provider_receipt_id": None, "filesystem_receipt": None,
+            })
+        else:
+            receipts.append({
+                "requested_target": target, "actual_target": actual,
+                "status": "delivered", "transport": "filesystem", "error": None,
+                "provider_receipt_id": None, "filesystem_receipt": proof,
+            })
+    return _delivery_outcome(receipts=receipts, errors=errors)
 
 
 def _deliver_result(
@@ -1707,6 +1799,18 @@ def _deliver_result(
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
         return _delivery_outcome(receipts=receipt_evidence, errors=[msg])
+
+    if all(target.get("kind") == "filesystem" for target in targets):
+        if not delivery_execution_id:
+            return _delivery_outcome(
+                receipts=receipt_evidence,
+                errors=["filesystem delivery requires an owning delivery execution"],
+            )
+        return _deliver_filesystem_result(
+            targets=targets,
+            receipts=receipt_evidence,
+            delivery_execution_id=delivery_execution_id,
+        )
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -3271,11 +3375,23 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
     """
     deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
     platform_parts: list[str] = []
+    filesystem_parts: list[str] = []
     for part in deliver_value.split(","):
         part = part.strip()
         if not part or part.lower() in {"local", "origin", "all"}:
             continue
+        if part.lower().startswith("filesystem:"):
+            filesystem_parts.append(part)
+            try:
+                _resolve_single_delivery_target(job, part)
+            except ValueError as exc:
+                return str(exc)
+            continue
         platform_parts.append(part.split(":", 1)[0].strip())
+    if filesystem_parts and platform_parts:
+        return "filesystem and platform delivery targets cannot be mixed"
+    if filesystem_parts:
+        return None
     if not platform_parts:
         return None
 
@@ -3894,7 +4010,7 @@ def run_job(
         load_hermes_dotenv(hermes_home=_get_hermes_home())
 
         delivery_target = _resolve_delivery_target(job)
-        if delivery_target:
+        if delivery_target and delivery_target.get("kind") != "filesystem":
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_CHAT_ID"].set(str(delivery_target["chat_id"]))
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_THREAD_ID"].set(
@@ -4798,16 +4914,33 @@ def _clear_cron_execution_context() -> None:
 
 def _materialize_delivery_artifact(
     job_id: str, execution_id: str, content: str,
+    delivery_targets: Optional[List[dict]] = None,
 ) -> tuple[str, str, List[dict]]:
     """Bind a delivery attempt to exact media bytes or exact delivered text."""
     from gateway.platforms.base import BasePlatformAdapter
 
     media_files, _cleaned = BasePlatformAdapter.extract_media(content)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+    filesystem_targets = [
+        target for target in (delivery_targets or [])
+        if target.get("kind") == "filesystem"
+    ]
+    if filesystem_targets and len(media_files) != 1:
+        raise ValueError("filesystem delivery requires exactly one MEDIA image artifact")
     media_artifacts = []
     for media_path, is_voice in media_files:
-        media = Path(media_path).expanduser().resolve(strict=True)
-        payload = media.read_bytes()
+        requested_media = Path(media_path).expanduser()
+        if filesystem_targets:
+            from cron.filesystem_delivery import stable_read_source
+
+            if is_voice:
+                raise ValueError("filesystem delivery requires one non-voice image artifact")
+            media, payload = stable_read_source(
+                requested_media, filesystem_targets[0]["source_roots"],
+            )
+        else:
+            media = requested_media.resolve(strict=True)
+            payload = media.read_bytes()
         media_artifacts.append({
             "path": str(media),
             "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
@@ -5084,7 +5217,7 @@ def run_one_job(
                 delivery_targets = list(job["_resolved_delivery_targets"])
                 if delivery_targets:
                     artifact_path, artifact_sha256, media_artifacts = _materialize_delivery_artifact(
-                        job["id"], execution_id, deliver_content,
+                        job["id"], execution_id, deliver_content, delivery_targets,
                     )
                     delivery_execution = create_delivery_execution(
                         producer_execution_id=execution_id,
@@ -5148,7 +5281,10 @@ def run_one_job(
                     }
                     evidence_failures = []
                     for receipt in delivery_receipts:
-                        if receipt.get("status") != "delivered":
+                        if (
+                            receipt.get("status") != "delivered"
+                            or (receipt.get("requested_target") or {}).get("kind") == "filesystem"
+                        ):
                             continue
                         provider_id = str(receipt.get("provider_receipt_id") or "").strip()
                         if provider_id and provider_id not in duplicate_ids:
