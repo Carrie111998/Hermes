@@ -146,6 +146,38 @@ class TestBindMechanics:
 
 
     @pytest.mark.asyncio
+    async def test_foreign_host_sets_non_retryable_fatal_error(self):
+        """Binding an address that is not local (EADDRNOTAVAIL) must be
+        non-retryable.
+
+        Only EADDRINUSE was handled, so a config naming another machine's
+        IP — the #52132 shape, seen after the gateway moved hosts but the
+        config kept the old box's Tailscale address — fell through to a
+        bare ``False`` and retried every 5 minutes indefinitely. No retry
+        can make a foreign address appear on this interface.
+        """
+        # TEST-NET-1 (RFC 5737): routable-looking, never local.
+        adapter = APIServerAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "host": "192.0.2.1",
+                    "port": self._free_port(),
+                    "key": self._KEY,
+                },
+            )
+        )
+        try:
+            result = await adapter.connect()
+            assert result is False
+            assert adapter.has_fatal_error is True
+            assert adapter.fatal_error_retryable is False
+            assert adapter.fatal_error_code == "api_server_host_not_local"
+            assert "192.0.2.1" in (adapter.fatal_error_message or "")
+        finally:
+            await adapter.disconnect()
+
+    @pytest.mark.asyncio
     async def test_port_conflict_sets_non_retryable_fatal_error(self):
         """A real port conflict (EADDRINUSE) must set a non-retryable fatal
         error so the reconnect watcher drops the platform from the retry

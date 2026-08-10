@@ -6981,6 +6981,25 @@ class APIServerAdapter(BasePlatformAdapter):
             return False
         return True
 
+    def _probe_bind_errno(self) -> int | None:
+        """Return the errno a direct bind to the configured host yields.
+
+        Recovers the real failure reason when asyncio has flattened the
+        per-address errors into an aggregate ``OSError`` carrying no errno.
+        Purely diagnostic: the probe socket is closed immediately and never
+        serves traffic, so it cannot hold the port from the real listener.
+        """
+        import socket as _socket
+
+        try:
+            with _socket.socket() as probe:
+                probe.bind((self._host, 0))
+        except OSError as probe_exc:
+            return getattr(probe_exc, "errno", None)
+        except Exception:
+            return None
+        return None
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp web server."""
         if not AIOHTTP_AVAILABLE:
@@ -7100,7 +7119,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
                 self._site = None
-                if getattr(exc, "errno", None) == errno.EADDRINUSE:
+                bind_errno = getattr(exc, "errno", None)
+                # asyncio only preserves errno when a candidate address was
+                # resolved and the bind itself was refused (EADDRINUSE). When
+                # no candidate is bindable at all — the EADDRNOTAVAIL case —
+                # create_server aggregates the per-address failures into a
+                # bare OSError with errno=None ("could not bind on any
+                # address out of [...]"), so the errno check alone cannot
+                # see it. Re-probe the address directly to recover the real
+                # reason instead of guessing from the message text.
+                if bind_errno is None:
+                    bind_errno = self._probe_bind_errno()
+                if bind_errno == errno.EADDRINUSE:
                     # A port conflict is a configuration error, not a
                     # transient blip — another process holds the port for
                     # its lifetime. A bare ``return False`` makes the
@@ -7119,10 +7149,34 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"different value, then `/platform resume api_server`.",
                         retryable=False,
                     )
+                elif bind_errno == errno.EADDRNOTAVAIL:
+                    # The host is not an address on this machine — e.g. a
+                    # config shared across hosts that still names another
+                    # box's Tailscale IP. Waiting cannot help: no retry will
+                    # make a foreign address appear on this interface. Left
+                    # retryable this reproduced the #52132 loop exactly
+                    # (5-min backoff cap, forever) after a gateway migration
+                    # moved the host but not the config.
+                    self._set_fatal_error(
+                        "api_server_host_not_local",
+                        f"Host {self._host} is not an address on this "
+                        f"machine. Set platforms.api_server.host in "
+                        f"config.yaml to a local address, then "
+                        f"`/platform resume api_server`.",
+                        retryable=False,
+                    )
+                # Name the knob that actually applies: EADDRNOTAVAIL is a
+                # host misconfiguration, and telling the operator to change
+                # the port sends them down the wrong path.
+                remedy = (
+                    "platforms.api_server.host"
+                    if bind_errno == errno.EADDRNOTAVAIL
+                    else "platforms.api_server.port"
+                )
                 logger.error(
-                    "[%s] Could not bind %s:%d: %s. Set a different port in "
-                    "config.yaml: platforms.api_server.port",
-                    self.name, self._host, self._port, exc,
+                    "[%s] Could not bind %s:%d: %s. Set a different value in "
+                    "config.yaml: %s",
+                    self.name, self._host, self._port, exc, remedy,
                 )
                 return False
 
