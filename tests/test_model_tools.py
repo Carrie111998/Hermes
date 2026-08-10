@@ -8,8 +8,10 @@ from model_tools import (
     handle_function_call,
     get_all_tool_names,
     get_toolset_for_tool,
+    get_unavailable_config_gated_tools,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
+    _resolve_tool_names,
     TOOL_TO_TOOLSET_MAP,
 )
 
@@ -509,3 +511,118 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+# =========================================================================
+# get_unavailable_config_gated_tools (issue #1433, Phase 2)
+# =========================================================================
+
+class TestResolveToolNames:
+    def test_unions_enabled_and_subtracts_disabled(self):
+        with (
+            patch("model_tools.validate_toolset", return_value=True),
+            patch(
+                "model_tools.resolve_toolset",
+                side_effect=lambda ts: {
+                    "web": {"web_search", "web_extract"},
+                    "terminal": {"terminal"},
+                }[ts],
+            ),
+        ):
+            result = _resolve_tool_names(
+                enabled_toolsets=["web", "terminal"],
+                disabled_toolsets=["terminal"],
+            )
+        assert result == {"web_search", "web_extract"}
+
+
+class TestGetUnavailableConfigGatedTools:
+    def test_reports_config_gated_missing_tools_sorted(self):
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"web_search", "browser_navigate", "terminal", "read_file"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "terminal"}},
+                    {"type": "function", "function": {"name": "read_file"}},
+                ],
+            ),
+            patch(
+                "model_tools.registry.get_toolset_for_tool",
+                side_effect=lambda name: {
+                    "web_search": "web",
+                    "browser_navigate": "browser",
+                    "terminal": "terminal",
+                    "read_file": "file",
+                }.get(name),
+            ),
+        ):
+            result = get_unavailable_config_gated_tools()
+        # browser/web are config-gated and missing -> reported, sorted.
+        assert result == ["browser_navigate", "web_search"]
+
+    def test_empty_when_nothing_missing(self):
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"web_search", "terminal"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "web_search"}},
+                    {"type": "function", "function": {"name": "terminal"}},
+                ],
+            ),
+        ):
+            result = get_unavailable_config_gated_tools()
+        assert result == []
+
+    def test_excludes_non_config_gated_missing_tools(self):
+        # `terminal` is dropped by check_fn but its toolset is not
+        # config-gated (environment condition, not a setup gap) -> silent.
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"terminal", "web_search"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "web_search"}},
+                ],
+            ),
+            patch(
+                "model_tools.registry.get_toolset_for_tool",
+                side_effect=lambda name: {
+                    "terminal": "terminal",
+                    "web_search": "web",
+                }.get(name),
+            ),
+        ):
+            result = get_unavailable_config_gated_tools()
+        assert result == []
+
+    def test_disabled_toolset_tools_never_reported(self):
+        # Tools removed via agent.disabled_toolsets are subtracted during
+        # name resolution, so they never appear in the missing set at all.
+        with (
+            patch(
+                "model_tools._resolve_tool_names",
+                return_value={"web_search"},
+            ),
+            patch(
+                "model_tools.registry.get_definitions",
+                return_value=[
+                    {"type": "function", "function": {"name": "web_search"}},
+                ],
+            ),
+        ):
+            result = get_unavailable_config_gated_tools(
+                enabled_toolsets=["web", "browser"],
+                disabled_toolsets=["browser"],
+            )
+        assert result == []

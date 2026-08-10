@@ -797,6 +797,39 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
       }
 
+      case 'tools.unavailable': {
+        // Issue #1433 Phase 2: config-gated tools (browser, vision, tts, ...)
+        // failed their check_fn — surface them once at the top of a fresh
+        // session so the user knows what `hermes tools` could enable. The
+        // model never sees these tools, so without this line they're
+        // invisible. Only show on a fresh transcript (intro only); a resumed
+        // session already had its chance.
+        const names = Array.isArray(ev.payload?.names)
+          ? ev.payload.names.filter((n: unknown): n is string => typeof n === 'string')
+          : []
+
+        if (names.length === 0) {
+          return
+        }
+
+        setHistoryItems(prev => {
+          if (prev.length > 1) {
+            return prev
+          }
+
+          const shown = names.slice(0, 3).join(', ')
+          const rest = names.length > 3 ? `, +${names.length - 3} more` : ''
+
+          const line =
+            `ⓘ ${names.length} tools unavailable (missing config/deps): ${shown}${rest}. ` +
+            'Run `hermes tools` to configure.'
+
+          return [...prev, { kind: 'event', role: 'system', text: line }]
+        })
+
+        return
+      }
+
       case 'thinking.delta': {
         if (!getUiState().busy) {
           return
