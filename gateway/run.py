@@ -6244,6 +6244,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
+        # Modes saved at voice-channel join, restored on leave/timeout so a
+        # reconnect of a voice_only (or off) session is not silently degraded
+        # (#81041).
+        self._voice_saved_modes: Dict[str, str] = {}
         # Recent voice transcripts per (guild,user) for duplicate suppression.
         # Protects against the same utterance being emitted twice by the voice
         # capture / STT pipeline, which otherwise produces a second delayed reply.
@@ -19195,6 +19199,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # (#81041).
             voice_key = self._voice_key(event.source.platform, event.source.chat_id)
             mode = self._voice_mode.setdefault(voice_key, "all")
+            # Snapshot the mode now in force so leave/timeout can restore it
+            # instead of clobbering it with "off" — otherwise a voice_only
+            # session that disconnects and rejoins comes back silent (#81041).
+            self._voice_saved_modes[voice_key] = self._voice_mode.get(voice_key, "off")
             self._save_voice_modes()
             if mode in {"all", "voice_only"}:
                 self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
@@ -19237,7 +19245,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Error leaving voice channel: %s", e)
         # Always clean up state even if leave raised an exception
-        self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "off"
+        voice_key = self._voice_key(event.source.platform, event.source.chat_id)
+        self._voice_mode[voice_key] = self._voice_saved_modes.pop(voice_key, "off")
         self._save_voice_modes()
         self._set_adapter_auto_tts_disabled(adapter, event.source.chat_id, disabled=True)
         if hasattr(adapter, "_voice_input_callback"):
@@ -19249,7 +19258,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         Cleans up runner-side voice_mode state that the adapter cannot reach.
         """
-        self._voice_mode[self._voice_key(Platform.DISCORD, chat_id)] = "off"
+        voice_key = self._voice_key(Platform.DISCORD, chat_id)
+        self._voice_mode[voice_key] = self._voice_saved_modes.pop(voice_key, "off")
         self._save_voice_modes()
         adapter = self.adapters.get(Platform.DISCORD)
         self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
