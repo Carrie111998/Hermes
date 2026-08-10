@@ -319,3 +319,157 @@ def test_fallback_source_reconstruction_without_scope_still_routes():
     assert source is not None
     assert source.scope_id is None
     assert source.user_id == "U1"
+
+
+# ---------------------------------------------------------------------------
+# 5. Cancellation-safe pending-future failure (round-3 finding 1)
+# ---------------------------------------------------------------------------
+
+def _bare_transport():
+    t = object.__new__(WebSocketRelayTransport)
+    t._closing = False
+    t._supervisor = None
+    t._reader = None
+    t._ws = None
+    t._pending = {}
+    t._going_idle_ack = None
+    return t
+
+
+@pytest.mark.asyncio
+async def test_disconnect_cancellation_still_fails_pending_futures():
+    """A cancellation landing during the drain (outer cleanup deadline,
+    runner wait_for) must NOT leave registered futures unresolved — a
+    stranded waiter would block until _OUTBOUND_TIMEOUT_S (30s). The
+    fail-pending loop runs in a finally, so cancellation cannot skip it."""
+    t = _bare_transport()
+    loop = asyncio.get_running_loop()
+    fut = loop.create_future()
+    t._pending["req-1"] = fut
+
+    task = asyncio.create_task(t.disconnect(budget_s=60.0))
+    # Let the drain start waiting on the pending future...
+    await asyncio.sleep(0.05)
+    assert not task.done(), "disconnect should be inside the drain wait"
+    # ...then cancel it mid-drain, as the runner's wait_for would.
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert fut.done(), (
+        "pending outbound future left unresolved after cancelled disconnect"
+    )
+    with pytest.raises(RuntimeError, match="relay transport closed"):
+        fut.result()
+    assert not t._pending
+
+
+@pytest.mark.asyncio
+async def test_disconnect_idempotent_second_pass():
+    """A second disconnect() (adapter and outer cleanup can both run one)
+    must be safe: done futures are skipped, cleared map stays cleared."""
+    t = _bare_transport()
+    await t.disconnect()
+    await t.disconnect()  # must not raise
+    assert not t._pending
+
+
+# ---------------------------------------------------------------------------
+# 6. Durable routing origin: scope_id survives dispatch -> restart -> replay
+# ---------------------------------------------------------------------------
+
+def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
+    """End-to-end restart shape: dispatch with a scoped session context bound,
+    simulate owner death, recover — the recovered completion event must carry
+    scope_id/user_id, and the reconstructed SessionSource must prime them."""
+    import tools.async_delegation as ad
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    ad._reset_for_tests()
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+
+    tokens = set_session_vars(
+        platform="discord",
+        chat_id="C123",
+        chat_type="group",
+        user_id="U9",
+        scope_id="G777",
+        session_key="agent:main:discord:group:C123:U9",
+    )
+    try:
+        record = {
+            "delegation_id": "d-scope-1",
+            "session_key": "agent:main:discord:group:C123:U9",
+            "origin_ui_session_id": "",
+            "origin_session_id": "",
+            "parent_session_id": "sess-p",
+            "goal": "scoped goal",
+            "dispatched_at": 100.0,
+            **ad._capture_routing_origin(),
+        }
+        assert record.get("scope_id") == "G777", (
+            "dispatch-time capture must snapshot HERMES_SESSION_SCOPE_ID"
+        )
+        ad._persist_dispatch(record)
+    finally:
+        clear_session_vars(tokens)
+
+    # Simulate the owner process being gone: recovery marks the row unknown
+    # and rebuilds the completion event from the durable task_json.
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: False)
+    ad.recover_abandoned_delegations()
+
+    with ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id='d-scope-1'"
+        ).fetchone()
+    assert row and row[0], "recovered row must have an event_json"
+    import json as _json
+
+    evt = _json.loads(row[0])
+    assert evt.get("scope_id") == "G777", (
+        "recovered completion event lost scope_id — post-restart scoped "
+        "relay egress would be declined by the connector's tenant guard"
+    )
+    assert evt.get("user_id") == "U9"
+
+    # The gateway-side fallback reconstruction must carry it into the source.
+    runner = _fallback_runner()
+    source = runner._build_process_event_source(evt)
+    assert source is not None
+    assert source.scope_id == "G777"
+    assert source.user_id == "U9"
+
+
+def test_live_completion_event_carries_scope_id(tmp_path, monkeypatch):
+    """The live (non-restart) completion event must carry the dispatch-time
+    routing origin too, so priming works even when the in-memory source
+    cache was evicted."""
+    import tools.async_delegation as ad
+
+    record = {
+        "delegation_id": "d-live-1",
+        "session_key": "agent:main:discord:group:C123:U9",
+        "scope_id": "G777",
+        "user_id": "U9",
+        "goal": "g",
+        "dispatched_at": 100.0,
+        "completed_at": 101.0,
+    }
+
+    captured = {}
+
+    class _Q:
+        def put(self, evt):
+            captured.update(evt)
+
+    class _PR:
+        completion_queue = _Q()
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry", _PR(), raising=False
+    )
+    ad._push_completion_event(record, {"summary": "ok"}, "completed")
+    assert captured.get("scope_id") == "G777"
+    assert captured.get("user_id") == "U9"
