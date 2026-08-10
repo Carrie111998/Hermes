@@ -1865,10 +1865,40 @@ def _run_post_setup(post_setup_key: str):
             "https://github.com/KittenML/KittenTTS/releases/download/"
             "0.8.1/kittentts-0.8.1-py3-none-any.whl"
         )
+        # Supply-chain hardening: the wheel is Python code (installed via pip,
+        # which executes build/import hooks), shipped from a third-party GitHub
+        # release rather than PyPI. Pin its sha256 so a tampered/replaced
+        # release can't be installed silently. Hash computed 2026-08-10 from
+        # the official 0.8.1 release artifact; if upstream ever bumps the
+        # version, update BOTH the URL and this hash together.
+        _KITTENTTS_WHEEL_SHA256 = "482a436c4f1f3192153710376e459ff3689517ebcda7c2b051e2fd4187b41851"
+        import tempfile as _tf
+        import hashlib as _hl
+        _fd, wheel_path = _tf.mkstemp(prefix="kittentts-", suffix=".whl")
+        os.close(_fd)
         try:
-            result = _pip_install(["-U", wheel_url, "soundfile", "--quiet"], timeout=300)
+            dl = subprocess.run(
+                ["curl", "-fsSL", "--connect-timeout", "10", "--max-time", "120",
+                 "-o", wheel_path, wheel_url],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            if dl.returncode != 0:
+                _print_warning(
+                    "    kittentts wheel download failed: "
+                    f"{(dl.stderr or '').strip()[:200]}"
+                )
+                return
+            actual_sha = _hl.sha256(open(wheel_path, "rb").read()).hexdigest()
+            if actual_sha != _KITTENTTS_WHEEL_SHA256:
+                _print_warning(
+                    "    kittentts wheel sha256 mismatch "
+                    f"(expected {_KITTENTTS_WHEEL_SHA256[:12]}…, got {actual_sha[:12]}…) — "
+                    "refusing to install a possibly tampered release"
+                )
+                return
+            result = _pip_install(["-U", wheel_path, "soundfile", "--quiet"], timeout=300)
             if result.returncode == 0:
-                _print_success("    kittentts installed")
+                _print_success("    kittentts installed (wheel sha256 verified)")
                 _print_info("    Voices: Jasper, Bella, Luna, Bruno, Rosie, Hugo, Kiki, Leo")
                 _print_info("    Models: KittenML/kitten-tts-nano-0.8-int8 (25MB), micro (41MB), mini (80MB)")
             else:
@@ -1878,6 +1908,11 @@ def _run_post_setup(post_setup_key: str):
         except subprocess.TimeoutExpired:
             _print_warning("    kittentts install timed out (>5min)")
             _print_info(f"    Run manually: uv pip install -U '{wheel_url}' soundfile")
+        finally:
+            try:
+                os.remove(wheel_path)
+            except OSError:
+                pass
 
     elif post_setup_key == "piper":
         try:
