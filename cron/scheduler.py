@@ -108,24 +108,30 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+    fallback_note = ""
+    if not job.get("no_agent"):
+        fallback_note = " Fallback chain was exhausted or unavailable."
 
     # Provider/API failures are the common noisy path. Keep these short.
-    if "429" in text or "rate limit" in lower or "usage limit" in lower:
+    if re.search(r"\b429\b", text) or "rate limit" in lower or "usage limit" in lower:
         reason = "rate limit"
         if "weekly usage limit" in lower:
             reason = "weekly usage limit"
         elif "quota" in lower:
             reason = "quota limit"
         return (
-            f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            "Fallback chain was exhausted or unavailable. "
+            f"⚠️ Cron '{job_name}' failed: provider {reason}."
+            f"{fallback_note} "
             "Full details saved in cron output."
         )
 
     if "readtimeout" in lower or "timed out" in lower or "timeout" in lower:
+        timeout_source = "provider"
+        if job.get("no_agent") and "script timed out" in lower:
+            timeout_source = "script"
         return (
-            f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            "Fallback chain was exhausted or unavailable. "
+            f"⚠️ Cron '{job_name}' failed: {timeout_source} timeout."
+            f"{fallback_note} "
             "Full details saved in cron output."
         )
 
