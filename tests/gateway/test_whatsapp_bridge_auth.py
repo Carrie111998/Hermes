@@ -49,3 +49,17 @@ def test_bridge_headers_include_bearer_token_and_optional_challenge():
         "Authorization": "Bearer secret",
         "X-Hermes-Bridge-Challenge": "nonce",
     }
+
+
+def test_bridge_source_hash_changes_when_auth_helper_changes(tmp_path: Path):
+    from plugins.platforms.whatsapp.adapter import _bridge_source_hash
+
+    bridge = tmp_path / "bridge.js"
+    auth = tmp_path / "bridge_auth.js"
+    bridge.write_text("// bridge\n")
+    auth.write_text("// auth v1\n")
+    first = _bridge_source_hash(bridge)
+
+    auth.write_text("// auth v2\n")
+
+    assert _bridge_source_hash(bridge) != first

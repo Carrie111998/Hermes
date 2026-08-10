@@ -535,18 +535,18 @@ def resolve_whatsapp_bridge_dir() -> Path:
     if install_writable:
         return install_bridge
 
-    # Install dir is read-only, mirror to HERMES_HOME if needed
-    if hermes_home_bridge.exists():
-        return hermes_home_bridge
-
-    # Mirror the bridge source to HERMES_HOME
+    # Install dir is read-only. Refresh packaged source files on every
+    # resolution so an existing writable mirror cannot keep running bridge
+    # code from before an update. Preserve node_modules; the adapter's package
+    # hash stamp owns dependency refreshes independently.
     try:
         hermes_home_bridge.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(
             install_bridge,
             hermes_home_bridge,
-            dirs_exist_ok=False,
+            dirs_exist_ok=True,
+            ignore=shutil.ignore_patterns("node_modules"),
         )
         return hermes_home_bridge
     except Exception:
-        return install_bridge
+        return hermes_home_bridge if hermes_home_bridge.exists() else install_bridge

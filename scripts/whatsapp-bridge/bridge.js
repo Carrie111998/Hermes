@@ -104,10 +104,15 @@ const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
 // keeps serving the old behavior forever).
 let SCRIPT_HASH = '';
 try {
-  SCRIPT_HASH = createHash('sha256')
-    .update(readFileSync(fileURLToPath(import.meta.url)))
-    .digest('hex')
-    .slice(0, 16);
+  const entryPath = fileURLToPath(import.meta.url);
+  const digest = createHash('sha256');
+  for (const sourcePath of [entryPath, path.join(path.dirname(entryPath), 'bridge_auth.js')]) {
+    digest.update(path.basename(sourcePath));
+    digest.update('\0');
+    digest.update(readFileSync(sourcePath));
+    digest.update('\0');
+  }
+  SCRIPT_HASH = digest.digest('hex').slice(0, 16);
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');

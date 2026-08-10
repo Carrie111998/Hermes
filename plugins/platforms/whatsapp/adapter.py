@@ -358,6 +358,25 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _bridge_source_hash(bridge_path: Path) -> str:
+    """Hash the managed bridge entrypoint and its authentication helper."""
+    source_paths = [bridge_path]
+    auth_path = bridge_path.with_name("bridge_auth.js")
+    if auth_path.exists():
+        source_paths.append(auth_path)
+
+    digest = hashlib.sha256()
+    try:
+        for path in source_paths:
+            digest.update(path.name.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    except OSError:
+        return ""
+    return digest.hexdigest()[:16]
+
+
 def _load_or_create_bridge_token(session_path: Path) -> str:
     """Return the persistent per-session secret used to authenticate bridge IPC."""
     session_path.mkdir(parents=True, exist_ok=True)
@@ -699,7 +718,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # bridges that don't report scriptHash are
                                 # treated as stale by definition.
                                 running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
+                                disk_hash = _bridge_source_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
                                 config_matches = running_read_receipts == self._send_read_receipts
                                 if (

@@ -98,6 +98,7 @@ def _setup_bridge_dir(tmp_path: Path) -> Path:
     bridge_dir = tmp_path / "whatsapp-bridge"
     bridge_dir.mkdir()
     (bridge_dir / "bridge.js").write_text("// current bridge code\n")
+    (bridge_dir / "bridge_auth.js").write_text("// current auth code\n")
     (bridge_dir / "package.json").write_text('{"name": "bridge"}\n')
     session_path = tmp_path / "session"
     session_path.mkdir()
@@ -132,7 +133,7 @@ class TestStaleBridgeHandshake:
 
     @pytest.mark.asyncio
     async def test_reuses_only_authenticated_matching_bridge(self, tmp_path):
-        from plugins.platforms.whatsapp.adapter import _file_content_hash
+        from plugins.platforms.whatsapp.adapter import _bridge_source_hash
 
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
@@ -140,7 +141,7 @@ class TestStaleBridgeHandshake:
             bridge_script=str(bridge_dir / "bridge.js"),
             session_path=tmp_path / "session",
         )
-        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        disk_hash = _bridge_source_hash(bridge_dir / "bridge.js")
         mock_client = _mock_health(
             {
                 "status": "connected",
@@ -164,7 +165,7 @@ class TestStaleBridgeHandshake:
 
     @pytest.mark.asyncio
     async def test_rejects_matching_listener_without_auth_proof(self, tmp_path):
-        from plugins.platforms.whatsapp.adapter import _file_content_hash
+        from plugins.platforms.whatsapp.adapter import _bridge_source_hash
 
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
@@ -172,7 +173,7 @@ class TestStaleBridgeHandshake:
             bridge_script=str(bridge_dir / "bridge.js"),
             session_path=tmp_path / "session",
         )
-        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        disk_hash = _bridge_source_hash(bridge_dir / "bridge.js")
         mock_client = _mock_health(
             {
                 "status": "connected",
@@ -200,7 +201,7 @@ class TestStaleBridgeHandshake:
 
     @pytest.mark.asyncio
     async def test_restarts_bridge_when_read_receipt_config_changed(self, tmp_path):
-        from plugins.platforms.whatsapp.adapter import _file_content_hash
+        from plugins.platforms.whatsapp.adapter import _bridge_source_hash
 
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
@@ -209,7 +210,7 @@ class TestStaleBridgeHandshake:
             session_path=tmp_path / "session",
         )
         adapter._send_read_receipts = True
-        disk_hash = _file_content_hash(bridge_dir / "bridge.js")
+        disk_hash = _bridge_source_hash(bridge_dir / "bridge.js")
         mock_client = _mock_health(
             {
                 "status": "connected",
