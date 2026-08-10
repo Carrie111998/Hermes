@@ -607,3 +607,46 @@ def test_usage_contract_stale_masking_only_for_retryable_failures(tmp_path, monk
         quota = quota_after(_status_error(status_code))
         assert quota["status"] == "error"
         assert quota.get("stale") is not True
+
+
+def test_stale_classifier_excludes_protocol_and_programming_errors(tmp_path, monkeypatch):
+    """Parent acceptance A1: LocalProtocolError/UnsupportedProtocol are local
+    configuration or call-site bugs, not transient upstream failures — a stale
+    snapshot must never mask them. Timeouts, network errors, remote protocol
+    and proxy failures, and 5xx remain maskable."""
+    # Unit-level classification.
+    assert usage_contract._is_retryable_fetch_error(httpx.ReadTimeout("x")) is True
+    assert usage_contract._is_retryable_fetch_error(httpx.ConnectError("x")) is True
+    assert usage_contract._is_retryable_fetch_error(httpx.WriteError("x")) is True
+    assert usage_contract._is_retryable_fetch_error(httpx.CloseError("x")) is True
+    assert usage_contract._is_retryable_fetch_error(httpx.RemoteProtocolError("x")) is True
+    assert usage_contract._is_retryable_fetch_error(httpx.ProxyError("x")) is True
+    assert usage_contract._is_retryable_fetch_error(_status_error(500)) is True
+    assert usage_contract._is_retryable_fetch_error(_status_error(503)) is True
+
+    assert usage_contract._is_retryable_fetch_error(httpx.UnsupportedProtocol("x")) is False
+    assert usage_contract._is_retryable_fetch_error(httpx.LocalProtocolError("x")) is False
+    assert usage_contract._is_retryable_fetch_error(RuntimeError("x")) is False
+    for status_code in (401, 403, 429, 400, 404):
+        assert usage_contract._is_retryable_fetch_error(_status_error(status_code)) is False
+
+    # End-to-end: a cached stale snapshot must not mask a LocalProtocolError.
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(
+        hermes_home,
+        {"openrouter": [{"id": "cached", "source": "manual", "access_token": "token-a"}]},
+    )
+    usage_contract._clear_usage_cache_for_tests()
+    clock = [5000.0]
+    monkeypatch.setattr(usage_contract, "_monotonic", lambda: clock[0])
+    build_usage_contract(fetcher=lambda provider, **kwargs: _available_snapshot(provider))
+    clock[0] += 61  # demote to stale
+
+    def protocol_bug(provider, **kwargs):
+        raise httpx.LocalProtocolError("fixture misconfiguration")
+
+    payload = build_usage_contract(fetcher=protocol_bug)
+    quota = payload["providers"][0]["accounts"][0]["quota"]
+    assert quota["status"] == "error"
+    assert quota.get("stale") is not True

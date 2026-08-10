@@ -307,9 +307,18 @@ class _TimeoutRecordingClient:
         return _FakeResponse(self.payload)
 
 
-def test_provider_fetch_timeout_budget_fits_contract_deadline(monkeypatch):
-    """Every provider read on the contract path must fit the 6.5s global
-    deadline — per-request and in total for multi-request fetchers."""
+def test_provider_fetch_phase_timeout_budget_within_deadline(monkeypatch):
+    """Assert the CONFIGURED httpx phase timeouts (connect/read/write/pool,
+    whichever the scalar applies to per phase) on the contract path stay under
+    the 6.5s panel deadline — per request, and in total for multi-request
+    fetchers.
+
+    This does NOT prove a wall-clock bound: httpx applies the scalar to each
+    phase, a provider call can span several phases/requests, and the Codex
+    native-refresh path may block far longer on its own lock. The wall-clock
+    bound arrives with M1 (singleflight + process-wide semaphore), tracked as
+    a release gate.
+    """
     providers_payloads = {
         "openai-codex": {"rate_limit": {}},
         "anthropic": {},
@@ -339,5 +348,6 @@ def test_provider_fetch_timeout_budget_fits_contract_deadline(monkeypatch):
         )
         assert record["gets"] >= 1, provider
         assert all(0 < timeout <= 6.5 for timeout in record["timeouts"]), (provider, record)
-        # Multi-request fetchers (openrouter) must fit the deadline in total.
+        # Multi-request fetchers (openrouter) must fit the deadline in total
+        # configured phase-timeout budget (not a wall-clock guarantee).
         assert sum(record["timeouts"]) <= 6.5, (provider, record)

@@ -219,16 +219,23 @@ def _clear_usage_cache_for_tests() -> None:
 def _is_retryable_fetch_error(exc: BaseException) -> bool:
     """Classify failures that may be masked by a stale cached snapshot.
 
-    Retryable: timeouts, transport-level failures (connect/read errors), and
-    upstream 5xx responses. Never retryable-maskable: 401/403 (auth failure
-    must surface, staleness would hide it) and 429 (rate limiting is a routing
-    signal, not usage data).
+    Retryable: timeouts, network failures (connect/read/write/close), remote
+    protocol and proxy failures (upstream/transit-side), and 5xx responses.
+    Never maskable: 401/403/429 (auth and rate limiting must surface) and
+    local faults — ``UnsupportedProtocol``/``LocalProtocolError`` indicate a
+    misconfigured endpoint or call-site bug that staleness would hide.
     """
-    if isinstance(exc, httpx.TimeoutException):
-        return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code >= 500
-    return isinstance(exc, httpx.TransportError)
+    return isinstance(
+        exc,
+        (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            httpx.ProxyError,
+        ),
+    )
 
 
 def _health(entry: Mapping[str, Any], now: datetime) -> dict[str, Any]:
