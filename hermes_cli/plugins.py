@@ -1338,6 +1338,27 @@ class PluginManager:
     # Public
     # -----------------------------------------------------------------------
 
+    def _extract_shell_hook_callbacks(
+        self,
+    ) -> Dict[str, List[Callable]]:
+        """Snapshot shell-hook callbacks so a forced reset can restore."""
+        preserved: Dict[str, List[Callable]] = {}
+        for event, callbacks in self._hooks.items():
+            kept = [
+                cb for cb in callbacks
+                if getattr(cb, "__name__", "").startswith("shell_hook[")
+            ]
+            if kept:
+                preserved[event] = kept
+        return preserved
+
+    def _restore_shell_hook_callbacks(
+        self, preserved: Dict[str, List[Callable]],
+    ) -> None:
+        """Re-attach shell-hook callbacks preserved across a forced reset."""
+        for event, callbacks in preserved.items():
+            self._hooks.setdefault(event, []).extend(callbacks)
+
     def discover_and_load(self, force: bool = False) -> None:
         """Scan all plugin sources and load each plugin found.
 
@@ -1352,6 +1373,10 @@ class PluginManager:
             self._discovered = True
             return
         if force:
+            # Shell hooks are wired by register_from_config, not by the
+            # discovery sweep, so a bare _hooks.clear() drops them with no
+            # path to restore them. Preserve them across the reset.
+            preserved_hooks = self._extract_shell_hook_callbacks()
             self._plugins.clear()
             self._hooks.clear()
             self._middleware.clear()
@@ -1364,6 +1389,7 @@ class PluginManager:
             self._aux_tasks.clear()
             self._slack_action_handlers.clear()
             self._context_engine = None
+            self._restore_shell_hook_callbacks(preserved_hooks)
         # Set the flag up front as a re-entrancy guard (a plugin's register()
         # can transitively trigger discovery again), but reset it if the sweep
         # raises so a failed scan is NOT cached as "discovered with an empty
