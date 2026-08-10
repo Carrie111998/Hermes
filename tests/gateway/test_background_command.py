@@ -160,6 +160,7 @@ class TestRunBackgroundTask:
         assert "Hello from background!" in content
         agent_kwargs = MockAgent.call_args.kwargs
         assert agent_kwargs["checkpoints_enabled"] is True
+        assert agent_kwargs["gateway_session_key"] == runner._session_key_for_source(source)
         assert agent_kwargs["checkpoint_max_snapshots"] == 8
         assert agent_kwargs["checkpoint_max_total_size_mb"] == 222
         assert agent_kwargs["checkpoint_max_file_size_mb"] == 3

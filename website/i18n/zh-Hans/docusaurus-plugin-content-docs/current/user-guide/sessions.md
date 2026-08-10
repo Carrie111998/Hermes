@@ -436,7 +436,9 @@ Database size: 12.4 MB
 
 Agent 内置了 `session_search` 工具，使用 SQLite 的 FTS5 引擎对所有历史对话进行全文搜索，并允许 agent 滚动浏览找到的任何 session。无需 LLM 调用、无需摘要、无截断。每种调用形式都从数据库返回实际消息。
 
-### 三种调用形式
+在带有聊天/session 来源的 gateway 上下文中，发现和浏览默认限定在当前聊天历史中，避免把其他房间或私信的召回内容泄漏进当前对话。只有明确需要跨对话召回时才传入 `scope="all"`。当前来源之外的结果会标记 `same_origin=false`；分享前应把它当作跨聊天历史并先确认。范围内无结果时会包含 `recall_scope` 计数，用于区分“本聊天没有结果”和“只有其他聊天有匹配”。
+
+### 调用形式
 
 工具根据你设置的参数推断意图，没有 `mode` 参数。
 
@@ -478,7 +480,7 @@ session_search(session_id="20260510_174648_805cc2", around_message_id=590803, wi
 session_search()
 ```
 
-按时间顺序返回最近的 session（标题、预览、时间戳）。当用户询问"我在做什么"而未指定主题时很有用。
+按时间顺序返回最近的 session（标题、预览、时间戳）。在带有聊天/session 来源的 gateway 上下文中，默认限定在当前聊天，除非传入 `scope="all"`。当用户询问"我在做什么"而未指定主题时很有用。
 
 ### FTS5 查询语法
 
@@ -492,6 +494,7 @@ session_search()
 ### 可选参数
 
 - `sort` — `newest` 或 `oldest`，在 FTS5 排名之上排序。省略则仅按相关性排序（默认；适合探索性召回）。对于"我们在哪里停下了 X"的问题使用 `newest`，对于"X 是怎么开始的"的问题使用 `oldest`。
+- `scope` — `chat` 或 `all`。在带有聊天/session 来源的 gateway 上下文中，发现和浏览默认使用 `chat`；通过 `session_id` 显式读取不受此范围限制。只有用户要求更广泛的跨对话召回时才使用 `scope="all"`。范围内无结果时会返回 `recall_scope.matches_before_scope` / `matches_after_scope` 计数。
 - `role_filter` — 逗号分隔的角色列表。发现模式默认为 `user,assistant`（工具输出通常是噪音）。传入 `user,assistant,tool` 以包含工具输出（调试工具行为），或传入 `tool` 仅搜索工具输出。
 
 ### 使用时机
