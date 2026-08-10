@@ -14,6 +14,11 @@ from .store import ActivityStore
 
 logger = logging.getLogger(__name__)
 
+# Tool calls and retries are not served by any model, but the store keys usage
+# by served route. They are booked to this one reserved route so per-model cost
+# and quality reports can exclude it by symbol rather than by string literal.
+NON_MODEL_ROUTE = ServedRoute("activity", "non-model")
+
 
 class ActivityRecorder:
     def __init__(self, store: ActivityStore, run_id: str) -> None:
@@ -82,11 +87,7 @@ class ActivityRecorder:
     def _record_counter(self, operation: str, delta: RouteUsageDelta) -> None:
         try:
             with self._lock:
-                self.store.record_usage(
-                    self.run_id,
-                    ServedRoute("activity", "non-model"),
-                    delta,
-                )
+                self.store.record_usage(self.run_id, NON_MODEL_ROUTE, delta)
         except Exception as exc:
             self._log_failure(operation, exc)
 

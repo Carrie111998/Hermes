@@ -66,6 +66,30 @@ def test_response_forwards_only_canonical_usage_fields():
     assert delta.reasoning_tokens == 55
 
 
+def test_non_model_counters_use_the_documented_excludable_route():
+    """Tool calls and retries are not served by a model.
+
+    They are booked to one reserved, clearly-labelled route so downstream
+    per-model cost reports can exclude it by symbol instead of by string.
+    """
+    from activity_telemetry.recorder import NON_MODEL_ROUTE
+
+    calls = []
+
+    class SpyStore:
+        def record_usage(self, *args):
+            calls.append(args)
+
+    recorder = ActivityRecorder(SpyStore(), "r")
+    recorder.record_tool_call(2)
+    recorder.record_retry(3)
+    routes = [args[1] for args in calls]
+    assert all(route == NON_MODEL_ROUTE for route in routes)
+    assert (NON_MODEL_ROUTE.provider, NON_MODEL_ROUTE.model) == ("activity", "non-model")
+    assert calls[0][2].tool_calls == 2
+    assert calls[1][2].retries == 3
+
+
 def test_tool_retry_session_and_finish_failures_are_best_effort(caplog):
     class BrokenStore:
         def link_session(self, *args):

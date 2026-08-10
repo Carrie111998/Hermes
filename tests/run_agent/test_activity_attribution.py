@@ -4,9 +4,23 @@ from unittest.mock import MagicMock, patch
 from run_agent import AIAgent
 
 
+def _tool_defs(*names):
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": f"{name} tool",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        for name in names
+    ]
+
+
 def _agent(recorder=None):
     with (
-        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.get_tool_definitions", return_value=_tool_defs("web_search")),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):
@@ -27,15 +41,23 @@ def _agent(recorder=None):
     return agent
 
 
-def _response(model="served/model"):
+def _tool_call(call_id="c1"):
+    return SimpleNamespace(
+        id=call_id,
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments="{}"),
+    )
+
+
+def _response(model="served/model", content="done", finish_reason="stop", tool_calls=None):
     message = SimpleNamespace(
-        content="done",
-        tool_calls=None,
+        content=content,
+        tool_calls=tool_calls,
         reasoning_content=None,
         reasoning=None,
     )
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=message, finish_reason="stop")],
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)],
         model=model,
         usage=SimpleNamespace(
             prompt_tokens=100,
@@ -86,17 +108,27 @@ def test_success_records_canonical_usage_without_post_hook_listener():
 
 
 def test_response_model_switches_are_attributed_separately():
+    """A mid-conversation served-model switch must produce two distinct routes.
+
+    This drives the real ``run_conversation`` loop across two API responses so
+    the conversation-loop wiring itself is covered, not just the helper.
+    """
     recorder = MagicMock()
     agent = _agent(recorder)
     agent.client.chat.completions.create.side_effect = [
-        _response("first/model"),
+        _response("first/model", content="", finish_reason="tool_calls", tool_calls=[_tool_call()]),
         _response("second/model"),
     ]
-    first = agent.client.chat.completions.create()
-    second = agent.client.chat.completions.create()
-    # Exercise the same isolated attribution seam used by the conversation loop.
-    agent._record_activity_response(first)
-    agent._record_activity_response(second)
+    with (
+        patch("run_agent.handle_function_call", return_value="search result"),
+        patch("hermes_cli.plugins.has_hook", return_value=False),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search something")
+    assert result["final_response"] == "done"
+    assert result["api_calls"] == 2
     assert [call.kwargs["model"] for call in recorder.record_response.call_args_list] == [
         "first/model",
         "second/model",
