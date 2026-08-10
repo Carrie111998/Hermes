@@ -148,6 +148,7 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
 
   const drawW = Math.round(frameW * scale)
   const drawH = Math.round(frameH * scale)
+  const dpr = Math.min(window.devicePixelRatio || 1, 2)
 
   const image = useMemo(() => {
     if (!info.spritesheetBase64) {
@@ -175,6 +176,8 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
     if (!ctx) {
       return
     }
+
+    ctx.scale(dpr, dpr)
 
     // Track state via subscription, not a prop — no re-render on activity ticks.
     stateRef.current = $petState.get()
@@ -353,15 +356,15 @@ function PetSpriteImpl({ info, zoom = 1, stateOverride, rowOverride, pauseWhenUn
       pauseController?.dispose()
       unsubState()
     }
-  }, [image, frameW, frameH, frames, framesByState, framesByRow, loopMs, drawW, drawH, rows, pauseWhenUnfocused])
+  }, [image, frameW, frameH, frames, framesByState, framesByRow, loopMs, drawW, drawH, dpr, rows, pauseWhenUnfocused])
 
   return (
     <canvas
       aria-label={info.displayName ? `${info.displayName} pet` : 'pet'}
-      height={drawH}
+      height={drawH * dpr}
       ref={canvasRef}
       style={{ height: drawH, width: drawW }}
-      width={drawW}
+      width={drawW * dpr}
     />
   )
 }
