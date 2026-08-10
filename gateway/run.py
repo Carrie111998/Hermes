@@ -8485,6 +8485,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return "queue"
         if mode == "steer":
             return "steer"
+        if mode:
+            logger.warning(
+                "busy_input_mode=%r is not a recognized value (expected "
+                "interrupt|queue|steer); falling back to 'interrupt'",
+                mode,
+            )
         return "interrupt"
 
     @staticmethod
