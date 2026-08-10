@@ -695,6 +695,15 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_malformed_referenced_path_does_not_crash_guard(self, monkeypatch):
+        from cron import lifecycle_guard
+
+        monkeypatch.setattr(lifecycle_guard.os, "open", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("embedded null byte")))
+        text, unsafe = lifecycle_guard._read_referenced_script(lifecycle_guard.Path("malformed"))
+
+        assert text is None
+        assert unsafe is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

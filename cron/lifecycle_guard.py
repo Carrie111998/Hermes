@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # A recursively tokenized malformed/binary payload can contain a NUL.
+        # Treat it like any unreadable reference; lifecycle scanning must not
+        # crash the caller while examining an unrelated command.
         return None, False
     try:
         metadata = os.fstat(descriptor)

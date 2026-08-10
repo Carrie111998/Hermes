@@ -2834,6 +2834,21 @@ def _append_node_dir_for_service(
         path_entries.append(resolved_node_dir)
 
 
+def _systemd_runtime_preflight_command(python_path: str, venv_dir: str) -> str:
+    """Build the stdlib-only preflight executed before the gateway launcher.
+
+    This is deliberately a script path rather than ``python -m hermes_cli``:
+    an editable-install finder can itself be the broken component, so the guard
+    must be able to report and block that state before importing Hermes.
+    """
+    runtime_root = Path(venv_dir).parent
+    script = runtime_root / "scripts" / "runtime_preflight.py"
+    return (
+        f"ExecStartPre={python_path} {script} "
+        f"--runtime-root {runtime_root} --venv-root {venv_dir}"
+    )
+
+
 def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) -> str:
     python_path = get_python_path()
     working_dir = _stable_service_working_dir()
@@ -2894,16 +2909,19 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         path_entries.extend(_build_wsl_interop_paths(path_entries))
         path_entries.extend(common_bin_paths)
         sane_path = ":".join(path_entries)
+        runtime_preflight = _systemd_runtime_preflight_command(python_path, venv_dir)
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=0
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type={systemd_type}
 {systemd_watchdog_directives}User={username}
 Group={group_name}
+{runtime_preflight}
 ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
 Environment="HOME={home_dir}"
@@ -2937,15 +2955,18 @@ WantedBy=multi-user.target
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend(common_bin_paths)
     sane_path = ":".join(path_entries)
+    runtime_preflight = _systemd_runtime_preflight_command(python_path, venv_dir)
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=0
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type={systemd_type}
-{systemd_watchdog_directives}ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
+{systemd_watchdog_directives}{runtime_preflight}
+ExecStart={python_path} -m hermes_cli.main{f" {profile_arg}" if profile_arg else ""} gateway run
 WorkingDirectory={working_dir}
 Environment="PATH={sane_path}"
 Environment="VIRTUAL_ENV={venv_dir}"

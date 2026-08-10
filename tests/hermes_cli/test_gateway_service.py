@@ -641,6 +641,17 @@ class TestSystemUnitHermesHome:
         hermes_home = str(gateway_cli.get_hermes_home().resolve())
         assert f'HERMES_HOME={hermes_home}' in unit
 
+    @pytest.mark.parametrize("system", [False, True])
+    def test_generated_unit_blocks_broken_runtime_before_gateway_start(self, system):
+        unit = gateway_cli.generate_systemd_unit(system=system)
+
+        assert "StartLimitIntervalSec=300" in unit
+        assert "StartLimitBurst=5" in unit
+        assert "scripts/runtime_preflight.py" in unit
+        assert "--runtime-root" in unit
+        assert "--venv-root" in unit
+        assert unit.index("ExecStartPre=") < unit.index("ExecStart=")
+
 
 class TestSystemUnitRefreshSyncsHermesHome:
     """sudo system refresh must not flip TimeoutStopSec via /root/.hermes."""
