@@ -178,7 +178,50 @@ def test_synthetic_executor_cli_has_no_pr_authority(queue_mode, capsys):
     # The production CLI intentionally supplies no PR client. A synthetic flag
     # can expose status/no-op behavior but cannot create a remote PR.
     assert cli.main(["executor", "--synthetic-only"]) == 0
-    assert "mode=synthetic-only-no-pr-client" in capsys.readouterr().out
+    assert "mode=shadow" in capsys.readouterr().out
+
+
+def test_executor_shadow_cli_runs_without_pr_authority(queue_mode, capsys):
+    # No eligible canary target in the SAMPLE allowlist (hermes is live_gateway) ->
+    # a safe no-op that never constructs a PR client.
+    assert cli.main(["executor-shadow"]) == 0
+    out = capsys.readouterr().out
+    assert "mode=shadow" in out
+    assert "processed=0" in out
+
+
+def test_executor_canary_cli_refuses_without_understanding_flag(queue_mode, capsys, monkeypatch):
+    import devflow_delegation.executor as executor_mod
+
+    def _boom(*a, **k):
+        raise AssertionError("GhPrClient must not be constructed without the flag")
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _boom)
+    rc = cli.main(["executor-canary", "--request-id", "dwr_x"])
+    assert rc == 2
+    assert "--i-understand-this-opens-a-real-pr" in capsys.readouterr().err
+
+
+def test_executor_canary_cli_requires_request_id(queue_mode, capsys):
+    rc = cli.main(["executor-canary", "--i-understand-this-opens-a-real-pr"])
+    assert rc == 2
+    assert "--request-id" in capsys.readouterr().err
+
+
+def test_executor_canary_cli_no_eligible_target_is_safe_noop(queue_mode, capsys, monkeypatch):
+    import devflow_delegation.executor as executor_mod
+
+    class _Fake:
+        def create_pr(self, **kwargs):
+            raise AssertionError("no eligible target -> create_pr must never be called")
+
+    monkeypatch.setattr(executor_mod, "GhPrClient", _Fake)
+    rc = cli.main([
+        "executor-canary", "--i-understand-this-opens-a-real-pr", "--request-id", "dwr_missing",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "mode=canary" in out and "processed=0" in out
 
 
 def test_gate_cli_records_shadow_decision_without_authority(queue_mode, allowlist_file, capsys, monkeypatch):
