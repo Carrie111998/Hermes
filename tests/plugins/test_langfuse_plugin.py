@@ -885,3 +885,95 @@ class TestModelAttribution:
             assistant_content_chars=2,
         )
         assert seen["model"] == "actual/served-model"
+
+
+# ---------------------------------------------------------------------------
+# Cost total: explicit "total" alongside the per-type breakdown
+# ---------------------------------------------------------------------------
+
+class TestCostTotal:
+    """Langfuse ingests per-type ``cost_details`` keys but does not derive
+    ``calculatedTotalCost`` from them. Without an explicit ``total`` the
+    dashboard reads 0 for every priced generation."""
+
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def test_response_path_totals_the_breakdown(self):
+        mod = self._fresh_plugin()
+
+        class _Usage:
+            input_tokens = 1000
+            output_tokens = 500
+            cache_read_input_tokens = 2000
+            cache_creation_input_tokens = 0
+
+        class _Resp:
+            usage = _Usage()
+
+        _, cost_details = mod._usage_and_cost(
+            _Resp(),
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            model="claude-sonnet-4-6",
+            base_url="",
+        )
+
+        assert cost_details["total"] == pytest.approx(0.0111)
+        components = {k: v for k, v in cost_details.items() if k != "total"}
+        assert components
+        assert cost_details["total"] == pytest.approx(sum(components.values()))
+
+    def test_usage_summary_path_totals_the_breakdown(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        state = mod.TraceState(trace_id="trace-1", root_ctx=None, root_span=None)
+        state.generations[mod._request_key(1)] = object()
+        monkeypatch.setitem(mod._TRACE_STATE, mod._trace_key("task-1", "session-1"), state)
+        captured = {}
+
+        def fake_end_observation(obs, *, output=None, metadata=None, usage_details=None, cost_details=None):
+            captured["cost_details"] = cost_details
+
+        monkeypatch.setattr(mod, "_end_observation", fake_end_observation)
+
+        # A dict response has no ``.usage``, so the handler takes the
+        # usage-summary path rather than the response-object path.
+        mod.on_post_llm_call(
+            task_id="task-1",
+            session_id="session-1",
+            api_call_count=1,
+            model="claude-sonnet-4-6",
+            provider="anthropic",
+            response={"model": "claude-sonnet-4-6"},
+            usage={"input_tokens": 1000, "output_tokens": 500},
+            assistant_content_chars=42,
+        )
+
+        cost_details = captured["cost_details"]
+        components = {k: v for k, v in cost_details.items() if k != "total"}
+        assert components
+        assert cost_details["total"] == pytest.approx(sum(components.values()))
+
+    def test_priced_model_with_no_tokens_reports_no_total(self):
+        mod = self._fresh_plugin()
+
+        class _Usage:
+            input_tokens = 0
+            output_tokens = 0
+
+        class _Resp:
+            usage = _Usage()
+
+        _, cost_details = mod._usage_and_cost(
+            _Resp(),
+            provider="anthropic",
+            api_mode="anthropic_messages",
+            model="claude-sonnet-4-6",
+            base_url="",
+        )
+
+        # A priced model that billed nothing writes no per-type keys, so
+        # summing them must not invent a 0.0 total on an empty breakdown.
+        assert cost_details == {}
