@@ -73,3 +73,70 @@ def _repo_root():
     import pathlib
 
     return pathlib.Path(__file__).resolve().parents[2]
+
+
+def test_worker_context_signature_compat():
+    """Workers spawn and run under both the pre-3.14 and 3.14+ worker APIs.
+
+    CPython 3.14 changed ``concurrent.futures.thread._worker`` from
+    ``(executor_reference, work_queue, initializer, initargs)`` to
+    ``(executor_reference, ctx, work_queue)`` with a ``WorkerContext``
+    carrying the initializer/initargs. This executor must keep spawning
+    daemon workers on both signatures (the regression fixed in the 3.14
+    compatibility change). Runs in a subprocess so a failure cannot wedge
+    the test runner's own thread pool.
+    """
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from tools.daemon_pool import DaemonThreadPoolExecutor\n"
+        "import threading\n"
+        "thread_local = threading.local()\n"
+        "def _init(x):\n"
+        "    thread_local.tag = x\n"
+        "def _work():\n"
+        "    return getattr(thread_local, 'tag', None)\n"
+        "pool = DaemonThreadPoolExecutor(max_workers=2, initializer=_init, initargs=('tagged',))\n"
+        "try:\n"
+        "    results = [pool.submit(_work).result(timeout=10) for _ in range(4)]\n"
+        "    print('results:', results, flush=True)\n"
+        "    assert results == ['tagged'] * 4, results\n"
+        "    print('WORKER-OK', flush=True)\n"
+        "finally:\n"
+        "    pool.shutdown(wait=True)\n"
+    ) % (str(_repo_root()),)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "WORKER-OK" in proc.stdout
+    assert "results: ['tagged', 'tagged', 'tagged', 'tagged']" in proc.stdout
+
+
+def test_no_initializer_spawns_and_reuses():
+    """Pool without initializer still spawns and reuses workers (3.14 path)."""
+    script = (
+        "import sys; sys.path.insert(0, %r)\n"
+        "from tools.daemon_pool import DaemonThreadPoolExecutor\n"
+        "import threading, time\n"
+        "pool = DaemonThreadPoolExecutor(max_workers=2)\n"
+        "try:\n"
+        "    tid1 = pool.submit(threading.get_ident).result(timeout=10)\n"
+        "    time.sleep(0.05)\n"
+        "    tid2 = pool.submit(threading.get_ident).result(timeout=10)\n"
+        "    print('reused:', tid1 == tid2, flush=True)\n"
+        "    assert tid1 == tid2\n"
+        "    print('REUSE-OK', flush=True)\n"
+        "finally:\n"
+        "    pool.shutdown(wait=True)\n"
+    ) % (str(_repo_root()),)
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "REUSE-OK" in proc.stdout
