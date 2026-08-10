@@ -1,7 +1,7 @@
 # Project Handover - hermes-agent
 
 **Plan key:** `hermes-agent`  
-**Last verified:** 2026-08-10 18:22:48 +08:00  
+**Last verified:** 2026-08-10 18:25:47 +08:00  
 **Handover owner/session:** Codex  
 **Authoritative project log:** [`docs/ROADMAP-HERMES-DGX.md`](ROADMAP-HERMES-DGX.md)
 
