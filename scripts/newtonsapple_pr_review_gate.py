@@ -438,11 +438,12 @@ class ReviewStateStore:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             deleted = connection.execute(
-                "DELETE FROM leases WHERE key = ? AND lease_token = ?",
+                "DELETE FROM leases WHERE key = ? AND lease_token = ? "
+                "AND publication_claimed_at IS NOT NULL",
                 (key, lease_token),
             )
             if deleted.rowcount != 1:
-                raise ValueError("review lease not found")
+                raise ValueError("claimed review lease not found")
             connection.execute(
                 "INSERT OR REPLACE INTO completions(key, completed_at) VALUES (?, ?)",
                 (key, now),
@@ -1845,11 +1846,12 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
     if operation != "complete":
         raise RuntimeError("invalid settlement operation")
 
-    live_pr, selected, bodies = _recoverable_live_tuple(
-        review_tuple.pr_number, expected_login
-    )
-    if selected != review_tuple:
-        raise RuntimeError("review request generation changed before settlement")
+    # GitHub normally removes a requested reviewer when that reviewer submits
+    # the formal review. The generation was revalidated and publication-fenced
+    # immediately before the side effect, so post-publication settlement must
+    # verify the exact bot marker and live SHAs without requiring the reviewer
+    # request to remain current.
+    live_pr, bodies = _live_review_state(review_tuple.pr_number, expected_login)
     marker = review_marker(review_tuple)
     matching_body = next((body for body in bodies if marker in body), None)
     if matching_body is None:

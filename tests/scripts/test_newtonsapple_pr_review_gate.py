@@ -297,7 +297,15 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
     )
     lease_token = store.reserve(review_tuple, now=100, lease_seconds=60)
     assert isinstance(lease_token, str)
+    store.claim_publication(
+        review_tuple,
+        lease_token=lease_token,
+        now=110,
+        lease_seconds=300,
+    )
     live_pr = _live_pr()
+    # GitHub removes the reviewer request when that reviewer publishes.
+    live_pr["requested_reviewers"] = []
     marker_body = (
         "## Findings\n\n"
         "### P2 — Example finding\n\n"
@@ -310,8 +318,8 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
     )
     monkeypatch.setattr(
         gate,
-        "_recoverable_live_tuple",
-        lambda *args: (live_pr, review_tuple, [marker_body]),
+        "_live_review_state",
+        lambda *args: (live_pr, [marker_body]),
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     delivered = []
