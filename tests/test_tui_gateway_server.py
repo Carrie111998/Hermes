@@ -8157,6 +8157,52 @@ def test_refine_uses_live_agent_and_persisted_history_without_spawning_worker(mo
     }
 
 
+def test_refine_forwards_to_compute_host_owner_without_spawning_worker(monkeypatch):
+    calls = []
+
+    class _ExplodingWorker:
+        def __init__(self, *_args, **_kwargs):
+            raise AssertionError("/refine must not run in the isolated slash worker")
+
+    session = _session(_compute_host_active=True)
+    session["agent"] = None
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_SlashWorker", _ExplodingWorker)
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+
+    def send_control(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"type": "control.ack", "output": "host review started"}
+
+    monkeypatch.setattr(server, "_send_compute_host_control", send_control)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "refine-host",
+                "method": "slash.exec",
+                "params": {
+                    "command": "refine save the workflow",
+                    "session_id": "sid",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    assert response["result"]["output"] == "host review started"
+    assert calls == [
+        (
+            ("sid",),
+            {
+                "route_name": "slash.refine",
+                "command": "/refine save the workflow",
+                "wait": True,
+            },
+        )
+    ]
+
+
 def test_prompt_submit_sets_approval_session_key(monkeypatch):
     from tools.approval import get_current_session_key
 

@@ -12881,6 +12881,21 @@ def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg
             return "Refine unavailable (no session)."
         if session.get("running"):
             return "Agent is running — wait for the turn to finish, then /refine."
+        if _session_uses_compute_host(session):
+            command = "/refine" + (f" {arg}" if arg.strip() else "")
+            try:
+                ack = _send_compute_host_control(
+                    sid,
+                    route_name="slash.refine",
+                    command=command,
+                    wait=True,
+                )
+            except Exception as exc:
+                return f"compute-host slash.refine failed: {exc}"
+            if ack.get("type") in {"control.error", "error"}:
+                return str(ack.get("message") or "compute-host slash.refine failed")
+            _apply_compute_host_metadata_mirror(session, ack)
+            return str(ack.get("output") or "")
         agent = session.get("agent")
         if agent is None:
             return "Nothing to refine yet — send a message first."
