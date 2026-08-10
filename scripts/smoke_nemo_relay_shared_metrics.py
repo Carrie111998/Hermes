@@ -269,6 +269,9 @@ security:
 telemetry:
   shared_metrics:
     enabled: true
+auxiliary:
+  title_generation:
+    enabled: false
 """,
         encoding="utf-8",
     )
