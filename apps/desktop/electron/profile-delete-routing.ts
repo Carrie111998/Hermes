@@ -56,6 +56,74 @@ export function profileNameFromCreateRequest(request) {
   return PROFILE_NAME_RE.test(name) && name !== 'default' ? name : null
 }
 
+export interface ProfileRename {
+  from: string
+  to: string
+}
+
+export function profileRenameFromRequest(request): ProfileRename | null {
+  if (!request || String(request.method || 'GET').toUpperCase() !== 'PATCH') {
+    return null
+  }
+
+  const pathname = requestPathname(request.path)
+
+  if (!pathname || !/^\/api\/profiles\/[^/]+$/.test(pathname)) {
+    return null
+  }
+
+  const from = profileNameFromRequestPath(request.path)
+  const to = typeof request.body?.new_name === 'string' ? request.body.new_name.trim().toLowerCase() : ''
+
+  if (!from || from === 'default' || !PROFILE_NAME_RE.test(to) || to === 'default') {
+    return null
+  }
+
+  return { from, to }
+}
+
+export type ProfileRenameAction = 'teardown-primary' | 'teardown-pool'
+
+export function decideProfileRenameAction(rename: ProfileRename, primaryProfile: string) {
+  return {
+    action: rename.from === primaryProfile ? 'teardown-primary' : 'teardown-pool',
+    ...rename
+  } as const
+}
+
+export interface ProfileRenameLifecycleDeps<T> {
+  completeRevocation: (mutation: T) => void
+  destroyRevokedWindows: (webContentsIds: number[]) => void
+  migrateConnectionOverride: (from: string, to: string) => void
+  revokeProfile: (profile: string) => T
+  revokeWindowTargets: (profile: string) => number[]
+  teardownPrimary: () => Promise<void>
+  teardownProfilePools: (profile: string) => Promise<void>
+  writeActiveProfile: (profile: string) => void
+}
+
+export async function applyProfileRenameLifecycle<T>(
+  rename: ProfileRename,
+  primaryProfile: string,
+  deps: ProfileRenameLifecycleDeps<T>
+): Promise<void> {
+  const decision = decideProfileRenameAction(rename, primaryProfile)
+  const mutation = deps.revokeProfile(decision.from)
+  const revokedWindowIds = deps.revokeWindowTargets(decision.from)
+
+  deps.destroyRevokedWindows(revokedWindowIds)
+  deps.migrateConnectionOverride(decision.from, decision.to)
+
+  if (decision.action === 'teardown-primary') {
+    deps.writeActiveProfile(decision.to)
+    await Promise.all([deps.teardownPrimary(), deps.teardownProfilePools(decision.from)])
+  } else {
+    await deps.teardownProfilePools(decision.from)
+  }
+
+  deps.completeRevocation(mutation)
+}
+
 export function createProfileRevocationGuard() {
   const revoked = new Set<string>()
   const pendingDeletes = new Map<string, number>()
@@ -235,6 +303,23 @@ export function removeProfileConnectionOverride<T extends DesktopConnectionConfi
   const profiles = { ...(config.profiles || {}) }
 
   delete profiles[profile]
+
+  return { ...config, profiles }
+}
+
+/** Move one renamed profile route without changing global or sibling settings. */
+export function renameProfileConnectionOverride<T extends DesktopConnectionConfigLike>(
+  config: T,
+  from: string,
+  to: string
+): T {
+  if (!Object.hasOwn(config.profiles || {}, from)) {
+    return { ...config, profiles: { ...(config.profiles || {}) } }
+  }
+
+  const profiles = { ...(config.profiles || {}), [to]: config.profiles?.[from] }
+
+  delete profiles[from]
 
   return { ...config, profiles }
 }

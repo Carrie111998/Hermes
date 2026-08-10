@@ -8,7 +8,7 @@ import { isProfileTargetAvailable } from './profile-target-availability'
 test('default is always available without consulting the profile directory', () => {
   let checked = false
 
-  assert.equal(isProfileTargetAvailable('default', '/home/alice', () => {
+  assert.equal(isProfileTargetAvailable('default', '/opt/hermes-data', () => {
     checked = true
 
     return false
@@ -16,17 +16,17 @@ test('default is always available without consulting the profile directory', () 
   assert.equal(checked, false)
 })
 
-test('named targets require an existing HOME-anchored profile directory', () => {
-  const expected = path.join('/home/alice', '.hermes', 'profiles', 'worker')
+test('named targets resolve from the Desktop HERMES_HOME', () => {
+  const expected = path.join('/opt/hermes-data', 'profiles', 'worker')
   let checkedPath = ''
 
-  assert.equal(isProfileTargetAvailable('worker', '/home/alice', candidate => {
+  assert.equal(isProfileTargetAvailable('worker', '/opt/hermes-data', candidate => {
     checkedPath = candidate
 
     return candidate === expected
   }), true)
   assert.equal(checkedPath, expected)
-  assert.equal(isProfileTargetAvailable('missing', '/home/alice', () => false), false)
+  assert.equal(isProfileTargetAvailable('missing', '/opt/hermes-data', () => false), false)
 })
 
 test('invalid and reserved profile names are unavailable without filesystem access', () => {
@@ -38,8 +38,8 @@ test('invalid and reserved profile names are unavailable without filesystem acce
     return true
   }
 
-  assert.equal(isProfileTargetAvailable('../escape', '/home/alice', exists), false)
-  assert.equal(isProfileTargetAvailable('hermes', '/home/alice', exists), false)
+  assert.equal(isProfileTargetAvailable('../escape', '/opt/hermes-data', exists), false)
+  assert.equal(isProfileTargetAvailable('hermes', '/opt/hermes-data', exists), false)
 
   assert.equal(checks, 0)
 })

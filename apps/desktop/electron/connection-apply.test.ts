@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  commitConnectionFailure,
+  resolveTerminalConnection,
+  terminalProfileForTarget
+} from './connection-apply'
 
 function deferred() {
   let resolve!: () => void
@@ -116,6 +121,14 @@ describe('resolveTerminalConnection', () => {
         async () => undefined
       )
     ).rejects.toThrow('not ready')
+  })
+})
+
+describe('terminalProfileForTarget', () => {
+  it('uses the sender-bound configured profile and disables SSH for forced-local targets', () => {
+    expect(terminalProfileForTarget({ kind: 'primary' }, 'default')).toBe('default')
+    expect(terminalProfileForTarget({ kind: 'configured-profile', profile: 'worker' }, 'default')).toBe('worker')
+    expect(terminalProfileForTarget({ kind: 'forced-local-profile', profile: 'coder' }, 'default')).toBe(null)
   })
 })
 

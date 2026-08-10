@@ -52,7 +52,13 @@ import { buildBackendTargetChoices, classifyOpenInstanceRequest } from './backen
 import { detectRemoteDisplay, isWindowsBinaryPathInWsl, isWslEnvironment } from './bootstrap-platform'
 import { decideBootstrapRepair } from './bootstrap-repair-guard'
 import { runBootstrap } from './bootstrap-runner'
-import { applyConnectionChange, resolveTerminalConnection } from './connection-apply'
+import {
+  applyConnectionChange,
+  applySshConnectionTeardown,
+  replacePublishedSshConnection,
+  resolveTerminalConnection,
+  terminalProfileForTarget
+} from './connection-apply'
 import {
   authModeFromStatus,
   buildGatewayWsUrl,
@@ -168,11 +174,16 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
+  applyProfileRenameLifecycle,
   createProfileRevocationGuard,
   decideProfileDeleteAction,
+  type ProfileMutationToken,
   profileNameFromCreateRequest,
   profileNameFromDeleteRequest,
+  type ProfileRename,
+  profileRenameFromRequest,
   removeProfileConnectionOverride,
+  renameProfileConnectionOverride,
   resolveRouteTarget
 } from './profile-delete-routing'
 import { PROFILE_NAME_RE } from './profile-name'
@@ -1096,7 +1107,7 @@ const profileRevocations = createProfileRevocationGuard()
 function desktopProfileAvailable(profile: string): boolean {
   const profiles = readDesktopConnectionConfig().profiles || {}
 
-  return Object.hasOwn(profiles, profile) || isProfileTargetAvailable(profile, os.homedir())
+  return Object.hasOwn(profiles, profile) || isProfileTargetAvailable(profile, HERMES_HOME)
 }
 
 // True while connection-config:apply soft-rehomes the primary — suppresses the
@@ -7476,8 +7487,7 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
-async function teardownSshConnection(profile) {
-  const scope = sshScopeKey(profile)
+async function closePublishedSshConnection(scope) {
   const state = sshConnections.get(scope)
 
   if (!state) {
@@ -7507,12 +7517,27 @@ async function teardownSshConnection(profile) {
   }
 }
 
+async function teardownSshConnection(profile) {
+  const scope = sshScopeKey(profile)
+
+  await applySshConnectionTeardown({
+    closePublishedConnection: closePublishedSshConnection,
+    retireAndRun: (retiredScope, operation) => sshBootstrapCoordinator.retireAndRun(retiredScope, operation),
+    scope
+  })
+}
+
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
 // any cached SSH state. A per-profile token/OAuth override wins over a global
 // SSH connection — so if the active profile resolves to a NON-SSH backend, the
 // terminal must NOT fall through to a global SSH host.
-function activeSshTerminalTarget() {
-  const profile = primaryProfileKey()
+function activeSshTerminalTarget(target: BackendTarget) {
+  const profile = terminalProfileForTarget(target, primaryProfileKey())
+
+  if (!profile) {
+    return null
+  }
+
   const config = readDesktopConnectionConfig()
 
   if (profileSshOverride(config, profile)) {
@@ -7577,9 +7602,12 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
   const hostLabel = sshConfig.user ? `${sshConfig.user}@${sshConfig.host}` : sshConfig.host
   const existing = sshConnections.get(scope)
 
-  if (existing && existing.fingerprint !== fingerprint) {
-    await teardownSshConnection(profile)
-  }
+  await replacePublishedSshConnection({
+    closePublishedConnection: closePublishedSshConnection,
+    existingFingerprint: existing?.fingerprint,
+    fingerprint,
+    scope
+  })
 
   let ssh = sshConnections.get(scope)?.ssh
 
@@ -8712,7 +8740,8 @@ async function prepareProfileDeleteRequest(request) {
 
 async function completeProfileMutation<T>(
   mutation,
-  operation: () => Promise<T>
+  operation: () => Promise<T>,
+  rename: ProfileRename | null = null
 ): Promise<T> {
   try {
     const result = await operation()
@@ -8731,6 +8760,42 @@ async function completeProfileMutation<T>(
       }
 
       profileRevocations.completeMutation({ mutation, retireSucceeded, succeeded: true })
+    }
+
+    if (rename) {
+      await applyProfileRenameLifecycle<ProfileMutationToken>(rename, primaryProfileKey(), {
+        completeRevocation: renameMutation => {
+          profileRevocations.completeMutation({
+            mutation: renameMutation,
+            retireSucceeded: !desktopProfileAvailable(renameMutation.profile),
+            succeeded: true
+          })
+        },
+        destroyRevokedWindows: webContentsIds =>
+          destroyRevokedWindows(webContentsIds, BrowserWindow.getAllWindows()),
+        migrateConnectionOverride: (from, to) => {
+          const current = readDesktopConnectionConfig()
+
+          if (Object.hasOwn(current.profiles || {}, from)) {
+            writeDesktopConnectionConfig(renameProfileConnectionOverride(current, from, to))
+          }
+        },
+        revokeProfile: profile => profileRevocations.revoke(profile),
+        revokeWindowTargets: profile => windowTargets.revokeProfile(profile),
+        teardownPrimary: () => teardownPrimaryBackendAndWait(),
+        teardownProfilePools: async profile => {
+          const scope = sshScopeKey(profile)
+
+          await applySshConnectionTeardown({
+            closePublishedConnection: closePublishedSshConnection,
+            retireAndRun: (retiredScope, operation) =>
+              sshBootstrapCoordinator.retireAndRun(retiredScope, operation),
+            scope,
+            teardownRelatedState: () => teardownPoolBackendsForProfile(profile)
+          })
+        },
+        writeActiveProfile: profile => writeActiveDesktopProfile(profile)
+      })
     }
 
     return result
@@ -11380,6 +11445,7 @@ ipcMain.handle('hermes:api', async (event, request) => {
 
   const initialTarget = initialResolution.target
   const createdProfile = profileNameFromCreateRequest(request)
+  const renamedProfile = profileRenameFromRequest(request)
   const creationMutation = createdProfile ? profileRevocations.startCreation(createdProfile) : null
   const deletion = await prepareProfileDeleteRequest(request)
   const tornDownProfile = deletion.profile
@@ -11433,32 +11499,38 @@ ipcMain.handle('hermes:api', async (event, request) => {
     const restAuth = resolveOauthRestAuth(nativeAt)
 
     if (restAuth.kind === 'bearer') {
-      return completeProfileMutation(profileMutation, () =>
-        fetchJson(url, null, {
+      return completeProfileMutation(
+        profileMutation,
+        () => fetchJson(url, null, {
           method: request?.method,
           body: request?.body,
           timeoutMs,
           bearer: restAuth.token
-        })
+        }),
+        renamedProfile
       )
     }
 
-    return completeProfileMutation(profileMutation, () =>
-      fetchJsonViaOauthSession(url, {
+    return completeProfileMutation(
+      profileMutation,
+      () => fetchJsonViaOauthSession(url, {
         method: request?.method,
         body: request?.body,
         timeoutMs
-      })
+      }),
+      renamedProfile
     )
   }
 
-  return completeProfileMutation(profileMutation, () =>
-    fetchJson(url, connection.token, {
+  return completeProfileMutation(
+    profileMutation,
+    () => fetchJson(url, connection.token, {
       method: request?.method,
       body: request?.body,
       upload: request?.upload,
       timeoutMs
-    })
+    }),
+    renamedProfile
   )
 })
 
@@ -12471,7 +12543,13 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
   const cols = Math.max(2, Number.parseInt(String(payload?.cols || 80), 10) || 80)
   const rows = Math.max(2, Number.parseInt(String(payload?.rows || 24), 10) || 24)
 
-  const sshTarget = await resolveTerminalConnection(activeSshTerminalTarget, () => ensureBackend(primaryProfileKey()))
+  const target = activeWindowTarget(event.sender.id)
+
+  const sshTarget = await resolveTerminalConnection(
+    () => activeSshTerminalTarget(target),
+    () => ensureBackendForTarget(target)
+  )
+
   const remote = Boolean(sshTarget)
   const remoteState = remote ? sshConnections.get(sshTarget.scope) : null
 

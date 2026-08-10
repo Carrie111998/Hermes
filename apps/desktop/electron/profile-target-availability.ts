@@ -3,10 +3,10 @@ import path from 'node:path'
 
 import { isValidProfileName } from './profile-name'
 
-/** True when a target names the root profile or an existing HOME-anchored profile. */
+/** True when a target names the root profile or an existing profile under HERMES_HOME. */
 export function isProfileTargetAvailable(
   profile: string,
-  homeDir: string,
+  hermesHome: string,
   exists: (candidate: string) => boolean = fs.existsSync
 ): boolean {
   if (profile === 'default') {
@@ -17,5 +17,5 @@ export function isProfileTargetAvailable(
     return false
   }
 
-  return exists(path.join(homeDir, '.hermes', 'profiles', profile))
+  return exists(path.join(hermesHome, 'profiles', profile))
 }

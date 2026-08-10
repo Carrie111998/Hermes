@@ -54,4 +54,41 @@ async function resolveTerminalConnection(getTarget, ensureBackend) {
   return target
 }
 
-export { applyConnectionChange, commitConnectionFailure, resolveTerminalConnection }
+async function applySshConnectionTeardown({
+  closePublishedConnection,
+  retireAndRun,
+  scope,
+  teardownRelatedState = async () => {}
+}) {
+  await retireAndRun(scope, () =>
+    Promise.all([closePublishedConnection(scope), teardownRelatedState()])
+  )
+}
+
+async function replacePublishedSshConnection({
+  closePublishedConnection,
+  existingFingerprint,
+  fingerprint,
+  scope
+}) {
+  if (existingFingerprint && existingFingerprint !== fingerprint) {
+    await closePublishedConnection(scope)
+  }
+}
+
+function terminalProfileForTarget(target, primaryProfile) {
+  if (target.kind === 'forced-local-profile') {
+    return null
+  }
+
+  return target.kind === 'primary' ? primaryProfile : target.profile
+}
+
+export {
+  applyConnectionChange,
+  applySshConnectionTeardown,
+  commitConnectionFailure,
+  replacePublishedSshConnection,
+  resolveTerminalConnection,
+  terminalProfileForTarget
+}
