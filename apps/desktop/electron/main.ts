@@ -74,7 +74,8 @@ import {
   resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
-  tokenPreview
+  tokenPreview,
+  withTransientRetries
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
 import { adoptServedDashboardToken } from './dashboard-token'
@@ -6487,15 +6488,33 @@ async function ensureNativeAccessToken(baseUrl: string): Promise<string | null> 
 // falling back to the OAuth cookie partition otherwise.
 // Throws (with statusCode 401) if the session cookie is missing/expired —
 // callers treat that as "needs re-login".
+// Transient transport blips (brief host unreachable, 5xx, timeouts) are retried
+// a few times before failing — those 1–3s flaps were promoting into the
+// full-screen "couldn't start" lockout on reconnect.
 async function mintGatewayWsTicket(baseUrl) {
-  // Native flow: mint the ticket with the bearer token, no cookie involved.
-  const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
+  return withTransientRetries(async () => {
+    // Native flow: mint the ticket with the bearer token, no cookie involved.
+    const nativeAt = await ensureNativeAccessToken(baseUrl).catch(() => null)
 
-  if (nativeAt) {
-    const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
+    if (nativeAt) {
+      const body = (await fetchJson(`${baseUrl}/api/auth/ws-ticket`, null, {
+        method: 'POST',
+        timeoutMs: 8_000,
+        bearer: nativeAt
+      })) as any
+
+      const ticket = body?.ticket
+
+      if (!ticket || typeof ticket !== 'string') {
+        throw new Error('Gateway did not return a WS ticket.')
+      }
+
+      return ticket
+    }
+
+    const body = (await fetchJsonViaOauthSession(`${baseUrl}/api/auth/ws-ticket`, {
       method: 'POST',
-      timeoutMs: 8_000,
-      bearer: nativeAt
+      timeoutMs: 8_000
     })) as any
 
     const ticket = body?.ticket
@@ -6505,20 +6524,7 @@ async function mintGatewayWsTicket(baseUrl) {
     }
 
     return ticket
-  }
-
-  const body = (await fetchJsonViaOauthSession(`${baseUrl}/api/auth/ws-ticket`, {
-    method: 'POST',
-    timeoutMs: 8_000
-  })) as any
-
-  const ticket = body?.ticket
-
-  if (!ticket || typeof ticket !== 'string') {
-    throw new Error('Gateway did not return a WS ticket.')
-  }
-
-  return ticket
+  })
 }
 
 // Build a fresh WS URL for the *current* connection. Critical for reconnects:
@@ -9952,7 +9958,7 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
         currentConnectionPromise: () => backendConnectionState.getPromise(),
         log: rememberLog,
         probe: fetchPublicJson,
-        resetConnection: resetHermesConnection,
+        resetConnection: () => resetHermesConnection({ soft: true }),
         tracker: remoteLiveness
       }),
       revalidatePool()
