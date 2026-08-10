@@ -739,14 +739,32 @@ class CDPSupervisor:
             backoff = min(backoff * 2, 10.0)
 
     async def _attach_initial_page(self) -> None:
-        """Find a page target, attach flattened session, enable domains, install dialog bridge."""
-        resp = await self._cdp("Target.getTargets")
-        targets = resp.get("result", {}).get("targetInfos", [])
-        page_target = next((t for t in targets if t.get("type") == "page"), None)
-        if page_target is None:
+        """Create (or reuse) a page target, attach flattened session, enable domains, install dialog bridge."""
+        try:
+            # Prefer creating a fresh target WE own. Real CDP backends (Chrome,
+            # obscura, ...) list ALL live page targets globally — including
+            # pages owned by other connections. Those remote pages are
+            # volatile: the owning connection may drop them between
+            # getTargets and attachToTarget, so attaching to them races and
+            # fails with "Target not found" (e.g. after an obscura server
+            # restart). A target we create ourselves is stable for the life of
+            # our connection and matches Chrome's behavior for fresh
+            # browser-level clients.
             created = await self._cdp("Target.createTarget", {"url": "about:blank"})
             target_id = created["result"]["targetId"]
-        else:
+        except Exception as e:
+            # Some backends disallow Target.createTarget — fall back to the
+            # first existing page target.
+            logger.debug(
+                "CDP supervisor %s: createTarget unavailable (%s), reusing existing page target",
+                self.task_id,
+                _redact_cdp_error_text(e),
+            )
+            resp = await self._cdp("Target.getTargets")
+            targets = resp.get("result", {}).get("targetInfos", [])
+            page_target = next((t for t in targets if t.get("type") == "page"), None)
+            if page_target is None:
+                raise
             target_id = page_target["targetId"]
 
         attach = await self._cdp(
