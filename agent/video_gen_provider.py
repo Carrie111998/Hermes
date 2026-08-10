@@ -271,50 +271,50 @@ def save_url_video(
     """
     import requests
 
-    response = requests.get(url, timeout=timeout, stream=True)
-    response.raise_for_status()
+    with requests.get(url, timeout=timeout, stream=True) as response:
+        response.raise_for_status()
 
-    content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
-    extension = _URL_VIDEO_CONTENT_TYPES.get(content_type)
-    if extension is None:
-        url_path = url.split("?", 1)[0].lower()
-        for ext in ("mp4", "webm", "mov", "mkv"):
-            if url_path.endswith(f".{ext}"):
-                extension = ext
-                break
-    if extension is None:
-        extension = "mp4"
+        content_type = (response.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        extension = _URL_VIDEO_CONTENT_TYPES.get(content_type)
+        if extension is None:
+            url_path = url.split("?", 1)[0].lower()
+            for ext in ("mp4", "webm", "mov", "mkv"):
+                if url_path.endswith(f".{ext}"):
+                    extension = ext
+                    break
+        if extension is None:
+            extension = "mp4"
 
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    short = uuid.uuid4().hex[:8]
-    path = _videos_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        short = uuid.uuid4().hex[:8]
+        path = _videos_cache_dir() / f"{prefix}_{ts}_{short}.{extension}"
 
-    partial_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.part")
-    bytes_written = 0
-    try:
-        with partial_path.open("wb") as fh:
-            for chunk in response.iter_content(chunk_size=256 * 1024):
-                if not chunk:
-                    continue
-                bytes_written += len(chunk)
-                if bytes_written > max_bytes:
-                    raise ValueError(
-                        f"Video at {url} exceeds {max_bytes // (1024 * 1024)}MB cap; refusing to cache."
-                    )
-                fh.write(chunk)
-
-        if bytes_written == 0:
-            raise ValueError(f"Video at {url} was empty (0 bytes).")
-
-        partial_path.replace(path)
-    except BaseException:
+        partial_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.part")
+        bytes_written = 0
         try:
-            partial_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+            with partial_path.open("wb") as fh:
+                for chunk in response.iter_content(chunk_size=256 * 1024):
+                    if not chunk:
+                        continue
+                    bytes_written += len(chunk)
+                    if bytes_written > max_bytes:
+                        raise ValueError(
+                            f"Video at {url} exceeds {max_bytes // (1024 * 1024)}MB cap; refusing to cache."
+                        )
+                    fh.write(chunk)
 
-    return path
+            if bytes_written == 0:
+                raise ValueError(f"Video at {url} was empty (0 bytes).")
+
+            partial_path.replace(path)
+        except BaseException:
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
+
+        return path
 
 
 def success_response(
