@@ -2410,6 +2410,15 @@ button[data-slot='aui_msg-reactions'] svg {
   background: color-mix(in srgb, var(--dt-card) 92%, transparent);
 }
 
+/* HUD drag handle. press-and-hold the composer, and the compositor takes over
+   the window move. -webkit-app-region maps to the native interactive-move
+   protocol on every platform (xdg_toplevel.move on Wayland, _NET_WM_MOVERESIZE
+   on X11, NSWindow.move on macOS). Without it, the setPosition path silently
+   no-ops on Wayland — the compositor owns window placement. */
+[data-hud-grabbing] {
+  -webkit-app-region: drag;
+}
+
 /* Flipped, the sheet hangs from the bar instead of standing on it. */
 [data-hud-shell][data-hud-edge='top'] [data-hud-glass] {
   top: var(--hud-bar-height, var(--composer-fallback-height));
