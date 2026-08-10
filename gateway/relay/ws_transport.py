@@ -970,6 +970,14 @@ class WebSocketRelayTransport:
         try:
             frame = json.loads(line)
         except json.JSONDecodeError:
+            frame = None
+        # `json.loads` also succeeds on a bare array/string/number/null, so a
+        # frame that is well-formed JSON but not an OBJECT walked past the decode
+        # guard above and reached `frame.get(...)` as an `AttributeError` — out of
+        # the one function whose stated contract is that a bad frame is skipped,
+        # never fatal. Both cases mean the same thing: the connector sent
+        # something this protocol has no reading for.
+        if not isinstance(frame, dict):
             logger.warning("relay: skipping malformed frame")
             return
         ftype = frame.get("type")
