@@ -689,6 +689,115 @@ class TestReplyCapture:
             adapter._pop_pending("task-ok")
 
 
+class TestOutOfBandReply:
+    """Out-of-band sends (no pending waiter) must be pushed back to the peer
+    that owns the context, reusing the same contextId so the message lands in
+    the caller's session — not silently dropped."""
+
+    def _adapter_with_peer(self, peer="alice"):
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-1", "ctx-x", peer)
+        adapter._context_peers["ctx-x"] = peer
+        return adapter
+
+    def test_out_of_band_send_pushes_new_task_to_peer(self, monkeypatch):
+        """A notify send with no pending waiter POSTs a new message/send to
+        the peer with the SAME contextId (session continuity)."""
+        adapter = self._adapter_with_peer()
+        monkeypatch.setattr(
+            tools, "_load_config",
+            lambda: {"a2a_agents": {"alice": {"url": "http://localhost:9999"}}},
+        )
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured["url"] = url
+            captured["body"] = body
+            return protocol.jsonrpc_result(
+                body["id"],
+                protocol.build_task("t2", "ctx-x", protocol.STATE_COMPLETED, "ok"),
+            )
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+
+        async def run():
+            res = await adapter.send("ctx-x", "here is the thing you wanted", metadata={"notify": True})
+            return res
+
+        res = asyncio.run(run())
+        assert res.success is True
+        assert captured["url"] == "http://localhost:9999"
+        msg = captured["body"]["params"]["message"]
+        assert msg["contextId"] == "ctx-x"  # same context → same caller session
+        assert msg["role"] == "ROLE_USER"
+        assert msg["parts"][0]["text"] == "here is the thing you wanted"
+
+    def test_out_of_band_send_unknown_peer_is_noop(self, monkeypatch):
+        """A context with no recorded peer must not crash or wedge the notifier."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-1", "ctx-ghost", "ghost")
+        called = []
+
+        def fake_post(url, body, headers, timeout):
+            called.append(url)
+            return {}
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+
+        async def run():
+            return await adapter.send("ctx-ghost", "late", metadata={"notify": True})
+
+        res = asyncio.run(run())
+        assert res.success is True
+        assert called == []  # no peer URL resolvable → nothing to push
+
+    def test_out_of_band_send_push_failure_reports_failure(self, monkeypatch):
+        """A failed push must surface as a failed send so the notifier can
+        rewind/retry instead of believing the event was delivered."""
+        adapter = self._adapter_with_peer()
+        monkeypatch.setattr(
+            tools, "_load_config",
+            lambda: {"a2a_agents": {"alice": {"url": "http://localhost:9999"}}},
+        )
+
+        def fake_post(url, body, headers, timeout):
+            raise urllib.error.URLError("peer down")
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+
+        async def run():
+            return await adapter.send("ctx-x", "late", metadata={"notify": True})
+
+        res = asyncio.run(run())
+        assert res.success is False
+        assert res.error
+
+    def test_normal_reply_does_not_push(self, monkeypatch):
+        """When a pending waiter exists, the reply resolves it and no
+        out-of-band push happens."""
+        adapter = _bare_adapter()
+        adapter.tasks.create("task-1", "ctx-y", "alice")
+        adapter._context_peers["ctx-y"] = "alice"
+        fut = adapter._add_pending("task-1", "ctx-y")
+        called = []
+
+        def fake_post(url, body, headers, timeout):
+            called.append(url)
+            return {}
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+
+        async def run():
+            await adapter.send("ctx-y", "normal reply", metadata={"notify": True})
+
+        try:
+            asyncio.run(run())
+            assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "normal reply")
+            assert called == []
+        finally:
+            adapter._pop_pending("task-1")
+
+
 # --------------------------------------------------------------------------
 # Adapter RPC handlers (driven directly, no HTTP)
 # --------------------------------------------------------------------------

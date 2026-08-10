@@ -64,6 +64,7 @@ _ORPHAN_TIMEOUT = 300  # seconds before a pending task is considered orphaned
 _WATCHDOG_INTERVAL = 60  # seconds between orphaned task watchdog runs
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
+_MAX_CONTEXT_PEERS = 4096  # cap on the context→peer map (LRU-ish, insertion order)
 
 
 def _reply_timeout() -> float:
@@ -378,6 +379,13 @@ class A2AAdapter(BasePlatformAdapter):
         self._pending: Dict[str, tuple[str, Future]] = {}
         self._pending_order: Dict[str, deque[str]] = {}
         self._pending_lock = threading.Lock()
+
+        # Context → peer identity map. Recorded on every inbound task so an
+        # out-of-band send (kanban notifier wake reply, late completion) with
+        # no pending waiter can be pushed back to the peer that owns the
+        # context — reusing the same contextId keeps the caller's session.
+        self._context_peers: Dict[str, str] = {}
+        self._context_peers_lock = threading.Lock()
 
         # Orphaned task watchdog
         self._watchdog_stop = threading.Event()
@@ -735,6 +743,14 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.inbound_total += 1
 
         rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        # Remember which peer owns this context so an out-of-band send with
+        # no pending waiter can be pushed back to the caller's session.
+        # Bounded: drop the oldest entry past _MAX_CONTEXT_PEERS (dicts keep
+        # insertion order) so a long-running gateway can't grow this forever.
+        with self._context_peers_lock:
+            self._context_peers[context_id] = peer
+            if len(self._context_peers) > _MAX_CONTEXT_PEERS:
+                self._context_peers.pop(next(iter(self._context_peers)), None)
         self._register_inline_push(task_id, params, agent=agent)
 
         if not agent.get("local", True):
@@ -1243,10 +1259,62 @@ class A2AAdapter(BasePlatformAdapter):
         if not (metadata or {}).get("notify"):
             logger.debug("A2A: ignoring non-final send for context %s", chat_id)
             return SendResult(success=True, message_id=message_id)
-        if not self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
-            # No waiter (e.g. a late chunk or out-of-band send) — drop it.
-            logger.debug("A2A: send() for context %s had no pending waiter", chat_id)
+        if self._resolve_oldest_for_context(chat_id, protocol.STATE_COMPLETED, content or ""):
+            return SendResult(success=True, message_id=message_id)
+        # No waiter (e.g. a late chunk or out-of-band send) — push the message
+        # back to the peer that owns this context as a NEW task, reusing the
+        # same contextId so it lands in the caller's session (session
+        # continuity). Without this, kanban notifier wake replies and late
+        # completions were silently dropped while reporting success.
+        try:
+            await asyncio.to_thread(self._push_out_of_band, chat_id, content or "")
+        except Exception as exc:
+            logger.warning("A2A: out-of-band push for context %s failed: %s", chat_id, exc)
+            return SendResult(success=False, message_id=message_id, error=str(exc))
         return SendResult(success=True, message_id=message_id)
+
+    def _push_out_of_band(self, context_id: str, text: str) -> None:
+        """POST a new message/send to the peer that owns ``context_id``.
+
+        Runs on a worker thread (blocking urllib). Resolves the peer from
+        ``a2a_agents`` config by the identity recorded on the inbound task;
+        unknown peers are a no-op (nothing to push to). The outbound message
+        reuses the SAME contextId so the caller's Hermes routes it into the
+        session that originally made the request.
+        """
+        with self._context_peers_lock:
+            peer = self._context_peers.get(context_id, "")
+        if not peer:
+            logger.debug("A2A: out-of-band send for %s has no known peer; dropping", context_id)
+            return
+        from . import tools as a2a_tools
+
+        entry = a2a_tools._resolve_peer(peer)
+        if not entry or not entry.get("url"):
+            logger.debug("A2A: out-of-band send for %s: peer %r not configured; dropping", context_id, peer)
+            return
+        base_url = entry["url"]
+        headers = a2a_tools._auth_header(entry.get("auth", {}) or {})
+        timeout = int(entry.get("timeout", 120))
+        card = None
+        try:
+            card = a2a_tools._fetch_card(base_url, headers, min(timeout, 30))
+        except Exception:
+            pass
+        rpc_body = {
+            "jsonrpc": "2.0",
+            "id": protocol.new_task_id(),
+            "method": "SendMessage",
+            "params": {
+                "message": protocol.text_message(protocol.ROLE_USER, text, context_id=context_id),
+            },
+        }
+        tenant = a2a_tools._interface_tenant(card, entry)
+        if tenant:
+            rpc_body["params"]["tenant"] = tenant
+        a2a_tools._http_post_json(a2a_tools._rpc_url(base_url, card), rpc_body, headers, timeout)
+        protocol.persist_message(context_id, "agent", text)
+        logger.info("A2A: pushed out-of-band reply for context %s to peer %s", context_id, peer)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Resolve the task future when processing ends without a reply send.
