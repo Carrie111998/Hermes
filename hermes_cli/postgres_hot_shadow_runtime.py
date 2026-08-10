@@ -1,8 +1,10 @@
 """Default-off runtime bridge for bounded PostgreSQL hot-read shadowing.
 
-SQLite is always read first and remains authoritative.  PostgreSQL work runs in
+SQLite is always read first and remains authoritative. PostgreSQL work runs in
 one best-effort daemon thread, has no retries, and never returns rows to serving.
+The import path is cross-platform and does not load the snapshot importer.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +17,6 @@ import time
 from collections.abc import Mapping
 from typing import Any, Callable
 
-from hermes_cli.postgres_hot_migration import TargetConfig, parse_target_dsn
 from hermes_cli.postgres_hot_read_adapter import (
     FETCH_TIMEOUT_SECONDS,
     MAX_LIMIT,
@@ -24,6 +25,7 @@ from hermes_cli.postgres_hot_read_adapter import (
     compare_shadow_messages,
     make_24h_request,
 )
+from hermes_cli.postgres_hot_target import TargetConfig, parse_target_dsn
 
 SHADOW_DSN_ENV = "HERMES_POSTGRES_HOT_DSN"
 CONNECT_TIMEOUT_SECONDS = 2.0
@@ -123,7 +125,7 @@ def observe_sqlite_session(
 ) -> bool:
     """Schedule one fail-open shadow comparison after a bounded SQLite read.
 
-    Returns ``True`` only when a worker was started.  The return value has no
+    Returns ``True`` only when a worker was started. The return value has no
     serving authority and callers must ignore it for transcript selection.
     """
     effective_environ = os.environ if environ is None else environ
@@ -135,7 +137,9 @@ def observe_sqlite_session(
         else:
             effective_config = config
     except Exception:
-        logger.warning("PostgreSQL hot shadow config is unavailable; observation skipped")
+        logger.warning(
+            "PostgreSQL hot shadow config is unavailable; observation skipped"
+        )
         return False
     if not _enabled(effective_config):
         return False
