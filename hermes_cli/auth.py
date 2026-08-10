@@ -550,6 +550,15 @@ _PLACEHOLDER_SECRET_VALUES = {
     "dummy",
     "null",
     "none",
+    # Deployment managers (Agent Command among them) ship "no-key" as the
+    # profile default for an endpoint with no credential. Treating it as
+    # usable let it pass the env-var provider checks and route a request to
+    # an aggregator with no real credential attached (OpenRouter's
+    # "HTTP 401: Missing Authentication header"). "no-key-required" stays
+    # OUT of this set on purpose: the credential resolver substitutes it as
+    # the deliberate non-empty bearer for no-auth endpoints, and the
+    # AuthError guard in resolve_provider_credentials relies on it passing.
+    "no-key",
 }
 
 
