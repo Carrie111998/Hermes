@@ -348,6 +348,30 @@ class _NonRetryableFailureAdapter(BasePlatformAdapter):
         return {"id": chat_id}
 
 
+class _PlatformLocalAuthFailureAdapter(BasePlatformAdapter):
+    """Optional adapter auth/config failure (e.g. Buzz membership rejected)."""
+
+    def __init__(self, platform: Platform = Platform.TELEGRAM):
+        super().__init__(PlatformConfig(enabled=True, token="***"), platform)
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._set_fatal_error(
+            "connect_failed",
+            "relay_membership_required: identity is not a member of this community (exit 1)",
+            retryable=False,
+        )
+        return False
+
+    async def disconnect(self) -> None:
+        self._mark_disconnected()
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        raise NotImplementedError
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+
 @pytest.mark.asyncio
 async def test_runner_exits_with_ex_config_on_nonretryable_startup_error(monkeypatch, tmp_path):
     """Non-retryable startup errors (token collision, no platforms) must
@@ -371,6 +395,102 @@ async def test_runner_exits_with_ex_config_on_nonretryable_startup_error(monkeyp
     assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE
     state = read_runtime_status()
     assert state["gateway_state"] == "startup_failed"
+
+
+@pytest.mark.asyncio
+async def test_runner_stays_alive_on_platform_local_auth_failure(monkeypatch, tmp_path, caplog):
+    """Optional adapter auth/config failure must not kill gateway duties.
+
+    Production outage: Buzz returned relay_membership_required (non-retryable)
+    and the gateway exited 78, stopping scheduler/Kanban ownership until the
+    platform was manually disabled. Platform-local failures park the adapter
+    and leave the process running for cron/Kanban and other platforms.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***"),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    spawned: list[str] = []
+
+    monkeypatch.setattr(
+        runner,
+        "_create_adapter",
+        lambda platform, platform_config: _PlatformLocalAuthFailureAdapter(platform),
+    )
+
+    def _capture_spawn(coro_factory, name, **kwargs):
+        spawned.append(name)
+        # Do not schedule real background loops in the unit test.
+        return None
+
+    monkeypatch.setattr(runner, "_spawn_supervised", _capture_spawn)
+
+    import logging
+    with caplog.at_level(logging.ERROR):
+        ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is False
+    assert getattr(runner, "exit_code", None) in (None, 0)
+    assert runner.adapters == {}
+    state = read_runtime_status()
+    assert state is not None
+    assert state.get("gateway_state") in {"running", "degraded"}
+    assert any(
+        "fatally misconfigured and parked" in record.message
+        for record in caplog.records
+    ), "expected platform-local failure to be parked, not exit-78"
+    # Unrelated gateway duties still wire up.
+    assert "kanban_dispatcher_watcher" in spawned
+    assert "kanban_notifier_watcher" in spawned
+    assert "session_expiry_watcher" in spawned
+    # Clean stop so status writers / tasks do not leak into later tests.
+    runner._running = False
+    await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_healthy_platform_when_optional_adapter_fails(
+    monkeypatch, tmp_path
+):
+    """One failed optional platform must not prevent other platforms or duties."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="***"),
+            Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+        },
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    spawned: list[str] = []
+
+    def _create(platform, platform_config):
+        if platform == Platform.TELEGRAM:
+            return _PlatformLocalAuthFailureAdapter(Platform.TELEGRAM)
+        return _SuccessfulAdapter()
+
+    monkeypatch.setattr(runner, "_create_adapter", _create)
+    monkeypatch.setattr(
+        runner,
+        "_spawn_supervised",
+        lambda coro_factory, name, **kwargs: spawned.append(name) or None,
+    )
+
+    ok = await runner.start()
+
+    assert ok is True
+    assert runner.should_exit_cleanly is False
+    assert getattr(runner, "exit_code", None) in (None, 0)
+    assert Platform.DISCORD in runner.adapters
+    assert Platform.TELEGRAM not in runner.adapters
+    assert "kanban_dispatcher_watcher" in spawned
+    runner._running = False
+    await runner.stop()
 
 
 @pytest.mark.asyncio
@@ -412,4 +532,22 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
 
     assert exc_info.value.code == GATEWAY_FATAL_CONFIG_EXIT_CODE
 
+
+def test_is_global_startup_conflict_contract():
+    from gateway.restart import is_global_startup_conflict
+
+    assert is_global_startup_conflict("discord-bot-token_lock", "token already in use")
+    assert is_global_startup_conflict("lock_conflict", "Buzz identity in use by another profile")
+    assert is_global_startup_conflict("telegram_polling_conflict", "getUpdates conflict")
+    assert not is_global_startup_conflict(
+        "connect_failed",
+        "relay_membership_required: identity is not a member",
+    )
+    assert not is_global_startup_conflict("config_missing", "BUZZ_PRIVATE_KEY must be set")
+    assert not is_global_startup_conflict("missing_credentials", "No bot token configured")
+    # Message fallback when adapters omit a structured code.
+    assert is_global_startup_conflict(
+        None,
+        "Telegram bot token already in use (PID 42). Stop the other gateway first.",
+    )
 
