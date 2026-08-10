@@ -85,11 +85,13 @@ const remoteGit: GitBridge = {
     revParse: async (repoPath, ref) =>
       (await gitGet<{ sha: null | string }>('review/rev-parse', { path: repoPath, ref })).sha,
 
-    commit: (repoPath, message, push) => gitPost('review/commit', { message, path: repoPath, push }),
+    commit: (repoPath, message) => gitPost('review/commit', { message, path: repoPath, push: false }),
 
     commitContext: repoPath => gitGet('review/commit-context', { path: repoPath }),
 
-    push: repoPath => gitPost('review/push', { path: repoPath }),
+    createPushRequest: repoPath => gitPost('review/push-request', { path: repoPath }),
+
+    pushApproved: (repoPath, decision) => gitPost('review/push-approved', { decision, path: repoPath }),
 
     shipInfo: repoPath => gitGet<HermesReviewShipInfo>('review/ship-info', { path: repoPath }),
 

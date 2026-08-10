@@ -88,6 +88,7 @@ const PROFILE_SCOPED_PREFIXES = [
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
   "/api/pairing",
+  "/api/workspace",
 ];
 
 function withManagementProfile(url: string): string {
@@ -336,6 +337,58 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
 
 export const api = {
   buildWsUrl,
+  getWorkspaceProjects: () =>
+    fetchJSON<WorkspaceProjectsResponse>("/api/workspace/projects"),
+  updateWorkspaceProjectContext: (
+    projectId: string,
+    context: WorkspaceProjectContext,
+  ) =>
+    fetchJSON<{ context: WorkspaceProjectContext; project_id: string }>(
+      `/api/workspace/projects/${encodeURIComponent(projectId)}/context`,
+      {
+        body: JSON.stringify(context),
+        headers: { "Content-Type": "application/json" },
+        method: "PUT",
+      },
+    ),
+  getWorkspaceApprovals: () =>
+    fetchJSON<WorkspaceApprovalsResponse>("/api/workspace/approvals"),
+  getWorkspaceLearningCandidates: () =>
+    fetchJSON<WorkspaceLearningCandidatesResponse>(
+      "/api/workspace/learning/candidates?include_terminal=false",
+    ),
+  approveWorkspaceLearningCandidate: (candidateId: string) =>
+    fetchJSON<WorkspaceLearningCandidateResponse>(
+      `/api/workspace/learning/candidates/${encodeURIComponent(candidateId)}/approve`,
+      { method: "POST" },
+    ),
+  rejectWorkspaceLearningCandidate: (candidateId: string, reason: string) =>
+    fetchJSON<WorkspaceLearningCandidateResponse>(
+      `/api/workspace/learning/candidates/${encodeURIComponent(candidateId)}/reject`,
+      {
+        body: JSON.stringify({ reason }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ),
+  rollbackWorkspaceLearningCandidate: (candidateId: string, reason: string) =>
+    fetchJSON<WorkspaceLearningCandidateResponse>(
+      `/api/workspace/learning/candidates/${encodeURIComponent(candidateId)}/rollback`,
+      {
+        body: JSON.stringify({ reason }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ),
+  decideWorkspaceApproval: (requestId: string, approved: boolean) =>
+    fetchJSON<WorkspaceApprovalDecisionResponse>(
+      `/api/workspace/approvals/${encodeURIComponent(requestId)}/decision`,
+      {
+        body: JSON.stringify({ approved }),
+        headers: { "Content-Type": "application/json" },
+        method: "POST",
+      },
+    ),
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).
@@ -1848,6 +1901,120 @@ export interface PlatformStatus {
   error_message?: string;
   state: string;
   updated_at: string;
+}
+
+export interface WorkspaceBinding {
+  binding_id: string;
+  capabilities?: string[];
+  chat_available?: boolean;
+  is_primary: boolean;
+  label: string;
+  runner_id: string;
+  status: "offline" | "online";
+}
+
+export interface WorkspaceProjectContext {
+  notion_page_ids: string[];
+  slack_channel_ids: string[];
+}
+
+export interface WorkspaceProject {
+  archived: boolean;
+  bindings: WorkspaceBinding[];
+  color: string | null;
+  conversations: WorkspaceConversation[];
+  context?: WorkspaceProjectContext;
+  created_at: number;
+  description: string | null;
+  icon: string | null;
+  id: string;
+  name: string;
+  slug: string;
+}
+
+export interface WorkspaceConversation {
+  ended_at: number | null;
+  id: string;
+  is_active: boolean;
+  last_active: number | null;
+  message_count: number;
+  model: string | null;
+  preview: string | null;
+  source: string | null;
+  started_at: number | null;
+  title: string | null;
+}
+
+export interface WorkspaceProjectsResponse {
+  generated_at: number;
+  projects: WorkspaceProject[];
+}
+
+export interface WorkspaceApprovalRequest {
+  changeSetDigest: string;
+  commitSha: string;
+  createdAt: string;
+  destinationBranch: string;
+  expiresAt: string;
+  remote: string;
+  remoteUrl: string;
+  remoteUrlDigest: string;
+  requestId: string;
+}
+
+export interface WorkspaceApproval {
+  binding_id: string | null;
+  decision: Record<string, unknown> | null;
+  error: string | null;
+  project_id: string | null;
+  request: WorkspaceApprovalRequest;
+  status: string;
+  updated_at: number;
+}
+
+export interface WorkspaceApprovalsResponse {
+  approvals: WorkspaceApproval[];
+}
+
+export interface WorkspaceApprovalDecisionResponse {
+  decision: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  status: string;
+}
+
+export interface WorkspaceLearningCandidate {
+  application: {
+    applied_at: number | null;
+    backup_id: string;
+    rolled_back_at: number | null;
+    version_id: string;
+  } | null;
+  approval: {
+    approved_at: number;
+    approved_by: string;
+    content_digest: string;
+    expires_at: number;
+  } | null;
+  candidate_id: string;
+  canary: Record<string, unknown> | null;
+  content_digest: string;
+  destination: string;
+  evaluation: Record<string, unknown> | null;
+  expires_at: number;
+  proposal: Record<string, unknown>;
+  provenance: Array<{ ref: string; source: string }>;
+  quarantine_reason: string | null;
+  risk: string;
+  status: string;
+  updated_at: number;
+}
+
+export interface WorkspaceLearningCandidatesResponse {
+  candidates: WorkspaceLearningCandidate[];
+}
+
+export interface WorkspaceLearningCandidateResponse {
+  candidate: WorkspaceLearningCandidate;
 }
 
 export interface StatusResponse {

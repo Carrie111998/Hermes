@@ -67,8 +67,9 @@ import {
 } from '@/store/command-palette'
 import { $bindings, bindingsFor } from '@/store/keybinds'
 import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
+import { notifyError } from '@/store/notifications'
 import { openPetGenerate } from '@/store/pet-generate'
-import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
+import { $projectTree, goToProject, openFolderAsProject, startIsolatedWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
 import {
@@ -680,13 +681,14 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
 
   const contributedItems = usePaletteContributions()
 
-  // The active repo's worktrees → "new conversation in <branch>". This is the
-  // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
-  // session anchored to that worktree's checkout (requestStartWorkSession),
-  // so git is the source of truth and edits land in the right tree.
+  // The active repo's worktrees → "new conversation from <branch>". Every row
+  // creates a derived branch + worktree first; a second chat never shares the
+  // selected checkout with a running chat.
   const branchGroup = useMemo<PaletteGroup[]>(
-    () =>
-      worktrees.length > 0
+    () => {
+      const repoRoot = worktrees.find(worktree => worktree.isMain)?.path
+
+      return worktrees.length > 0
         ? [
             {
               heading: t.commandCenter.branches,
@@ -698,12 +700,24 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                   id: `worktree-${wt.path}`,
                   keywords: ['branch', 'worktree', 'switch', name, wt.path],
                   label: t.commandCenter.startInBranch(name),
-                  run: () => requestStartWorkSession(wt.path)
+                  run: () => {
+                    if (!repoRoot) {
+                      return
+                    }
+
+                    void startIsolatedWorkSession(
+                      repoRoot,
+                      `new chat from ${name}`,
+                      [],
+                      { base: wt.branch || undefined }
+                    ).catch(error => notifyError(error, 'Create isolated branch chat'))
+                  }
                 }
               })
             }
           ]
-        : [],
+        : []
+    },
     [t, worktrees]
   )
 

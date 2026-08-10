@@ -3,7 +3,7 @@ import { atom, computed } from 'nanostores'
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
 import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/store'
-import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
+import type { HermesPushRequest, HermesReviewFile, HermesReviewShipInfo } from '@/global'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { desktopGit } from '@/lib/desktop-git'
 import { isExcludedPath } from '@/lib/excluded-paths'
@@ -79,8 +79,9 @@ export const $reviewDiffLoading = atom(false)
 
 // Ship state: gh availability + this branch's PR, and a busy flag for the
 // commit/push/PR action bar (disables buttons + shows progress).
-export const $reviewShipInfo = atom<HermesReviewShipInfo>({ ghReady: false, pr: null })
+export const $reviewShipInfo = atom<HermesReviewShipInfo>({ ghReady: false, pr: null, pushAvailable: false })
 export const $reviewShipBusy = atom(false)
+export const $reviewPushRequest = atom<HermesPushRequest | null>(null)
 
 // True while a commit message is being generated (drives the input's spinner).
 export const $reviewCommitMsgBusy = atom(false)
@@ -231,7 +232,7 @@ export async function refreshShipInfo(): Promise<void> {
   const seq = (shipInfoSeq += 1)
 
   if (!ctx) {
-    $reviewShipInfo.set({ ghReady: false, pr: null })
+    $reviewShipInfo.set({ ghReady: false, pr: null, pushAvailable: false })
 
     return
   }
@@ -240,12 +241,12 @@ export async function refreshShipInfo(): Promise<void> {
     const info = await ctx.review.shipInfo(ctx.cwd)
 
     if (seq === shipInfoSeq && repoCwd() === ctx.cwd) {
-      $reviewShipInfo.set(info)
+      $reviewShipInfo.set({ ...info, pushAvailable: Boolean(info.pushAvailable) })
       shipInfoLastCheckedAt = Date.now()
     }
   } catch {
     if (seq === shipInfoSeq) {
-      $reviewShipInfo.set({ ghReady: false, pr: null })
+      $reviewShipInfo.set({ ghReady: false, pr: null, pushAvailable: false })
       shipInfoLastCheckedAt = Date.now()
     }
   }
@@ -428,7 +429,7 @@ async function runShip<T>(action: () => Promise<T>): Promise<T> {
   }
 }
 
-export async function commitChanges(message: string, opts: { push?: boolean } = {}): Promise<void> {
+export async function commitChanges(message: string): Promise<void> {
   const ctx = reviewCtx()
 
   if (!ctx || !message.trim()) {
@@ -436,7 +437,7 @@ export async function commitChanges(message: string, opts: { push?: boolean } = 
   }
 
   await runShip(async () => {
-    await ctx.review.commit(ctx.cwd, message.trim(), Boolean(opts.push))
+    await ctx.review.commit(ctx.cwd, message.trim())
     await refreshReview()
     void refreshRepoStatus(repoCwd())
     void refreshShipInfo()
@@ -491,15 +492,42 @@ export async function generateCommitMessage(previous = ''): Promise<string> {
   }
 }
 
-export async function pushChanges(): Promise<void> {
+export async function requestPushApproval(): Promise<void> {
   const ctx = reviewCtx()
 
-  if (!ctx) {
+  if (!ctx?.review.createPushRequest) {
     return
   }
 
   await runShip(async () => {
-    await ctx.review.push(ctx.cwd)
+    $reviewPushRequest.set(await ctx.review.createPushRequest(ctx.cwd))
+  })
+}
+
+export function cancelPushApproval(): void {
+  $reviewPushRequest.set(null)
+}
+
+export async function confirmPushApproval(): Promise<void> {
+  const ctx = reviewCtx()
+  const request = $reviewPushRequest.get()
+
+  if (!ctx?.review.pushApproved || !request) {
+    return
+  }
+
+  await runShip(async () => {
+    try {
+      await ctx.review.pushApproved(ctx.cwd, {
+        ...request,
+        approved: true,
+        approvedBy: 'local-desktop-user',
+        decidedAt: new Date().toISOString()
+      })
+    } finally {
+      $reviewPushRequest.set(null)
+    }
+
     void refreshShipInfo()
   })
 }
@@ -574,6 +602,8 @@ $busy.subscribe(busy => {
 // straight to its loading skeleton instead of blipping the previous repo's
 // diff into the new one.
 function onReviewRepoMoved(): void {
+  $reviewPushRequest.set(null)
+
   if ($reviewOpen.get()) {
     clearReviewSelection()
     $reviewFiles.set([])

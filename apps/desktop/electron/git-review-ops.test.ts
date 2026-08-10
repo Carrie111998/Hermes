@@ -1,12 +1,21 @@
 import assert from 'node:assert/strict'
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
 import { afterEach, test } from 'vitest'
 
-import { gitFor, repoStatus, resolveRenamePath, REVIEW_FILE_CAP, reviewList } from './git-review-ops'
+import {
+  gitFor,
+  repoStatus,
+  resolveRenamePath,
+  REVIEW_FILE_CAP,
+  reviewCommit,
+  reviewCreatePushRequest,
+  reviewList,
+  reviewPushApproved
+} from './git-review-ops'
 
 const tempDirs: string[] = []
 
@@ -28,6 +37,31 @@ function makeRepo() {
   execFileSync('git', ['commit', '-qm', 'initial'], { cwd: dir })
 
   return dir
+}
+
+function makeBareRemote() {
+  const remote = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-desktop-git-remote-'))
+
+  tempDirs.push(remote)
+  execFileSync('git', ['init', '--bare', '-q'], { cwd: remote })
+
+  return remote
+}
+
+function attachBareRemote(repo: string) {
+  const remote = makeBareRemote()
+
+  execFileSync('git', ['branch', '-M', 'main'], { cwd: repo })
+  execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: repo })
+  execFileSync('git', ['push', '-qu', 'origin', 'main'], { cwd: repo })
+
+  return remote
+}
+
+function commitChange(repo: string, content: string) {
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), content)
+  execFileSync('git', ['add', 'tracked.txt'], { cwd: repo })
+  execFileSync('git', ['commit', '-qm', content.trim()], { cwd: repo })
 }
 
 test('resolveRenamePath: plain path is unchanged', () => {
@@ -116,4 +150,138 @@ test('reviewList caps the file payload returned to the renderer', async () => {
   const result = await reviewList(dir, 'uncommitted', null, 'git')
 
   assert.equal(result.files.length, REVIEW_FILE_CAP)
+})
+
+test('push approval is bound to the host-derived commit and is single use', async () => {
+  const repo = makeRepo()
+  const remote = attachBareRemote(repo)
+
+  commitChange(repo, 'approved\n')
+  const request = await reviewCreatePushRequest(repo, 'git')
+
+  const decision = {
+    ...request,
+    approved: true,
+    approvedBy: 'desktop-user',
+    decidedAt: new Date().toISOString()
+  }
+
+  await reviewPushApproved(repo, decision, 'git')
+
+  const localHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim()
+  const remoteHead = execFileSync('git', ['rev-parse', 'refs/heads/main'], { cwd: remote, encoding: 'utf8' }).trim()
+
+  assert.equal(remoteHead, localHead)
+  await assert.rejects(() => reviewPushApproved(repo, decision, 'git'), /already used|unknown/i)
+})
+
+test('first approved push of a workspace branch establishes its upstream', async () => {
+  const repo = makeRepo()
+  attachBareRemote(repo)
+  execFileSync('git', ['checkout', '-b', 'feature/workspace'], { cwd: repo })
+  commitChange(repo, 'workspace\n')
+  const request = await reviewCreatePushRequest(repo, 'git')
+  await reviewPushApproved(
+    repo,
+    {
+      ...request,
+      approved: true,
+      approvedBy: 'desktop-user',
+      decidedAt: new Date().toISOString()
+    },
+    'git'
+  )
+
+  const upstream = execFileSync(
+    'git',
+    ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'],
+    { cwd: repo, encoding: 'utf8' }
+  ).trim()
+
+  assert.equal(upstream, 'origin/feature/workspace')
+})
+
+test('push approval is invalidated when HEAD changes after the request', async () => {
+  const repo = makeRepo()
+  const remote = attachBareRemote(repo)
+  const remoteBefore = execFileSync('git', ['rev-parse', 'refs/heads/main'], { cwd: remote, encoding: 'utf8' }).trim()
+
+  commitChange(repo, 'first\n')
+  const request = await reviewCreatePushRequest(repo, 'git')
+  commitChange(repo, 'second\n')
+
+  await assert.rejects(
+    () =>
+      reviewPushApproved(
+        repo,
+        {
+          ...request,
+          approved: true,
+          approvedBy: 'desktop-user',
+          decidedAt: new Date().toISOString()
+        },
+        'git'
+      ),
+    /changed|invalid/i
+  )
+
+  const remoteAfter = execFileSync('git', ['rev-parse', 'refs/heads/main'], { cwd: remote, encoding: 'utf8' }).trim()
+
+  assert.equal(remoteAfter, remoteBefore)
+})
+
+for (const remoteSetting of ['url', 'pushurl'] as const) {
+  test(`push approval is invalidated when remote ${remoteSetting} changes`, async () => {
+    const repo = makeRepo()
+    const approvedRemote = attachBareRemote(repo)
+    const substitutedRemote = makeBareRemote()
+
+    const approvedRemoteBefore = execFileSync('git', ['rev-parse', 'refs/heads/main'], {
+      cwd: approvedRemote,
+      encoding: 'utf8'
+    }).trim()
+
+    commitChange(repo, `${remoteSetting} attack\n`)
+    const request = await reviewCreatePushRequest(repo, 'git')
+    execFileSync(
+      'git',
+      ['remote', 'set-url', ...(remoteSetting === 'pushurl' ? ['--push'] : []), 'origin', substitutedRemote],
+      { cwd: repo }
+    )
+
+    await assert.rejects(
+      () => reviewPushApproved(repo, {
+        ...request,
+        approved: true,
+        approvedBy: 'desktop-user',
+        decidedAt: new Date().toISOString()
+      }, 'git'),
+      /changed|destination|invalid/i
+    )
+
+    const approvedRemoteAfter = execFileSync('git', ['rev-parse', 'refs/heads/main'], {
+      cwd: approvedRemote,
+      encoding: 'utf8'
+    }).trim()
+
+    const substitutedRef = spawnSync('git', ['show-ref', '--verify', '--quiet', 'refs/heads/main'], {
+      cwd: substitutedRemote
+    })
+
+    assert.equal(approvedRemoteAfter, approvedRemoteBefore)
+    assert.notEqual(substitutedRef.status, 0)
+  })
+}
+
+test('legacy commit-and-push is rejected instead of bypassing approval', async () => {
+  const repo = makeRepo()
+  const remote = attachBareRemote(repo)
+  const remoteBefore = execFileSync('git', ['rev-parse', 'refs/heads/main'], { cwd: remote, encoding: 'utf8' }).trim()
+
+  fs.writeFileSync(path.join(repo, 'tracked.txt'), 'must not push\n')
+  await assert.rejects(() => reviewCommit(repo, 'unsafe combined action', true, 'git'), /approval/i)
+
+  const remoteAfter = execFileSync('git', ['rev-parse', 'refs/heads/main'], { cwd: remote, encoding: 'utf8' }).trim()
+
+  assert.equal(remoteAfter, remoteBefore)
 })

@@ -251,6 +251,11 @@ class GitCommitBody(BaseModel):
     push: bool = False
 
 
+class GitPushApprovalBody(BaseModel):
+    path: str
+    decision: dict[str, Any]
+
+
 class GitWorktreeAddBody(BaseModel):
     path: str
     name: Optional[str] = None

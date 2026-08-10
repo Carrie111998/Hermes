@@ -17,6 +17,7 @@ from hermes_cli.web_models import (
     GitFileBody,
     GitCommitBody,
     GitPrListBody,
+    GitPushApprovalBody,
     GitWorktreeAddBody,
     GitWorktreeRemoveBody,
     GitBranchSwitchBody,
@@ -110,6 +111,34 @@ async def git_commit_route(body: GitCommitBody):
 @router.post("/api/git/review/push")
 async def git_push_route(body: GitPathBody):
     return await _git_op(_web_git.review_push, _git_path(body.path))
+
+
+@router.post("/api/git/review/push-request")
+async def git_push_request_route(body: GitPathBody):
+    cwd = _git_path(body.path)
+    request = await _git_op(_web_git.review_create_push_request, cwd)
+    from hermes_cli.web_routers.workspace import publish_workspace_push_approval
+
+    publish_workspace_push_approval(request, local_path=cwd)
+    return request
+
+
+@router.post("/api/git/review/push-approved")
+async def git_push_approved_route(body: GitPushApprovalBody):
+    from hermes_cli.web_routers.workspace import complete_workspace_push_approval
+
+    request_id = str(body.decision.get("requestId") or "")
+    try:
+        result = await _git_op(
+            _web_git.review_push_approved,
+            _git_path(body.path),
+            body.decision,
+        )
+    except Exception as exc:
+        complete_workspace_push_approval(request_id, error=str(exc))
+        raise
+    complete_workspace_push_approval(request_id)
+    return result
 
 
 @router.post("/api/git/review/create-pr")

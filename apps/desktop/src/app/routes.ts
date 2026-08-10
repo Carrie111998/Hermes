@@ -18,6 +18,7 @@ export const CRON_ROUTE = '/cron'
 export const PROFILES_ROUTE = '/profiles'
 export const AGENTS_ROUTE = '/agents'
 export const STARMAP_ROUTE = '/starmap'
+export const PROJECT_WORKSPACE_ROUTE = '/workspace'
 
 export type AppView =
   | 'agents'
@@ -32,6 +33,7 @@ export type AppView =
   | 'extension'
   | 'messaging'
   | 'profiles'
+  | 'project-workspace'
   | 'settings'
   | 'skills'
   | 'starmap'
@@ -45,6 +47,7 @@ export type AppRouteId =
   | 'messaging'
   | 'new'
   | 'profiles'
+  | 'project-workspace'
   | 'settings'
   | 'skills'
   | 'starmap'
@@ -66,6 +69,7 @@ export const APP_ROUTES = [
   { id: 'artifacts', path: ARTIFACTS_ROUTE, view: 'artifacts' },
   { id: 'cron', path: CRON_ROUTE, view: 'cron' },
   { id: 'profiles', path: PROFILES_ROUTE, view: 'profiles' },
+  { id: 'project-workspace', path: PROJECT_WORKSPACE_ROUTE, view: 'project-workspace' },
   { id: 'agents', path: AGENTS_ROUTE, view: 'agents' },
   { id: 'starmap', path: STARMAP_ROUTE, view: 'starmap' }
 ] as const satisfies readonly AppRoute[]

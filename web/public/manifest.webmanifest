@@ -1,0 +1,23 @@
+{
+  "name": "Hermes Project Workspace",
+  "short_name": "Hermes",
+  "description": "Project-scoped Hermes conversations, runner status, and approvals.",
+  "start_url": "./workspace",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#090d0c",
+  "theme_color": "#0f766e",
+  "icons": [
+    {
+      "src": "./workspace-icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "./workspace-icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

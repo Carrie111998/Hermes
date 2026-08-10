@@ -66,3 +66,39 @@ export {
   type ResolveGatewayWsUrlDeps,
   type WebSocketAuthParam
 } from './websocket-url'
+export {
+  buildWorkspaceContextResearchPrompt,
+  type WorkspaceContextResearchSpec,
+  type WorkspaceContextSource
+} from './workspace-context'
+export {
+  type AssetId,
+  type AttemptId,
+  type BindingId,
+  type ContextReference,
+  type ConversationId,
+  type ConversationLane,
+  isPushApprovalCurrent,
+  isWorkspaceRunTransitionAllowed,
+  type LearningCandidate,
+  type LogicalWorkspaceProject,
+  type ProjectId,
+  type PushApprovalCheck,
+  type PushApprovalDecision,
+  type PushRequest,
+  reduceWorkspaceRunEvent,
+  type RunId,
+  type RunnerId,
+  type TaskId,
+  WORKSPACE_SCHEMA_VERSION,
+  type WorkspaceAsset,
+  type WorkspaceBinding,
+  type WorkspaceId,
+  type WorkspaceRunEvent,
+  type WorkspaceRunProjection,
+  type WorkspaceRunSpec,
+  type WorkspaceRunState,
+  type WorkspaceRunSyncStatus,
+  type WorkspaceSchemaVersion,
+  type WorktreeId
+} from './workspace-types'
