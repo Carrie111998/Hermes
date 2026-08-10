@@ -128,6 +128,38 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
+def test_clarify_expiry_is_paused_not_completed_and_closes_tool_tail(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "pick a node"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "clarify-1", "function": {"name": "clarify", "arguments": "{}"}},
+        ]},
+        {"role": "tool", "tool_call_id": "clarify-1", "name": "clarify", "content": '{"status":"expired"}'},
+    ]
+    notice = "Input request expired; no action was taken. Send a new message to continue."
+    result = finalize_turn(
+        agent,
+        final_response=notice,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="pick a node",
+        original_user_message="pick a node",
+        _should_review_memory=False,
+        _turn_exit_reason="clarify_expired",
+    )
+    assert result["completed"] is False
+    assert result["paused"] is True
+    assert result["turn_exit_reason"] == "clarify_expired"
+    assert agent.persisted_messages[-1] == {"role": "assistant", "content": notice}
+
+
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     """A tail assistant row that is a *pure tool-call turn* carries no answer.
 

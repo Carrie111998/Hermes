@@ -755,6 +755,36 @@ def _begin_tool_execution(
             pass
 
 
+def _append_clarify_cancelled_tool_results(agent, tool_calls, messages, effective_task_id: str) -> bool:
+    """Persist one cancellation result for every tool suppressed by clarify."""
+    status = getattr(agent, "_clarify_pause_status", "cancelled")
+    for tool_call in tool_calls:
+        name = tool_call.function.name
+        result = (
+            f"[Tool execution cancelled — {name} was not started because "
+            f"clarify ended with {status}]"
+        )
+        messages.append(make_tool_result_message(
+            name, result, tool_call.id, effect_disposition="none",
+        ))
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=name,
+            function_args={},
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=getattr(tool_call, "id", "") or "",
+            status="cancelled",
+            error_type=f"clarify_{status}",
+            error_message="Tool execution skipped because the turn is paused",
+        )
+        if not _flush_session_db_after_tool_progress(
+            agent, messages, stage=f"clarify-cancelled tool result {name}",
+        ):
+            return False
+    return True
+
+
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
@@ -771,6 +801,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
+
+    if getattr(agent, "_clarify_pause_status", None):
+        _append_clarify_cancelled_tool_results(
+            agent, tool_calls, messages, effective_task_id,
+        )
+        return
 
     # ── Pre-flight: interrupt check ──────────────────────────────────
     if agent._interrupt_requested:
@@ -1612,6 +1648,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_clarify_pause_status", None):
+            _append_clarify_cancelled_tool_results(
+                agent, assistant_message.tool_calls[i - 1:], messages, effective_task_id,
+            )
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -2273,6 +2314,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         ):
             return
 
+        if function_name == "clarify":
+            from tools.clarify_tool import clarify_pause_status
+            pause_status = clarify_pause_status(display_function_result)
+            if pause_status:
+                agent._clarify_pause_status = pause_status
+
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
         if not _execution_blocked and agent.tool_progress_callback:
@@ -2392,9 +2439,18 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if getattr(agent, "_clarify_pause_status", None):
+            remaining_calls = [
+                call for _, segment_calls in segments[segment_index:]
+                for call in segment_calls
+            ]
+            _append_clarify_cancelled_tool_results(
+                agent, remaining_calls, messages, effective_task_id,
+            )
+            break
         segment_message = SimpleNamespace(tool_calls=list(calls))
         if kind == "parallel":
             execute_tool_calls_concurrent(

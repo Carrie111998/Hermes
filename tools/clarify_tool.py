@@ -15,12 +15,42 @@ a thin dispatcher that delegates to a platform-provided callback.
 """
 
 import json
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Literal, TypedDict
 
 
 # Maximum number of predefined choices the agent can offer.
 # A 5th "Other (type your answer)" option is always appended by the UI.
 MAX_CHOICES = 4
+
+
+class ClarifyCallbackResult(TypedDict, total=False):
+    status: Literal["answered", "expired", "cancelled", "delivery_failed"]
+    response: object
+
+
+CLARIFY_PAUSE_STATUSES = {"expired", "cancelled", "delivery_failed"}
+
+
+def _normalize_callback_result(value) -> ClarifyCallbackResult:
+    if isinstance(value, dict):
+        status = value.get("status")
+        if status not in {"answered", *CLARIFY_PAUSE_STATUSES}:
+            return {"status": "delivery_failed"}
+        if status == "answered" and "response" not in value:
+            return {"status": "delivery_failed"}
+        return {"status": status, **({"response": value.get("response")} if status == "answered" else {})}
+    # Compatibility for third-party callbacks: a returned value is an answer.
+    return {"status": "answered", "response": value}
+
+
+def clarify_pause_status(tool_result) -> Optional[str]:
+    try:
+        parsed = json.loads(tool_result) if isinstance(tool_result, str) else tool_result
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if isinstance(parsed, dict) and parsed.get("status") in CLARIFY_PAUSE_STATUSES:
+        return str(parsed["status"])
+    return None
 
 
 def _flatten_choice(c) -> str:
@@ -157,12 +187,23 @@ def clarify_tool(
             choices = None  # empty list → open-ended
 
     if callback is None:
-        return tool_error("Clarify tool is not available in this execution context.")
+        callback_result: ClarifyCallbackResult = {"status": "delivery_failed"}
+    else:
+        try:
+            callback_result = _normalize_callback_result(
+                _invoke_callback(callback, question, choices, multi_select)
+            )
+        except Exception:
+            callback_result = {"status": "delivery_failed"}
 
-    try:
-        raw_response = _invoke_callback(callback, question, choices, multi_select)
-    except Exception as exc:
-        return tool_error(f"Failed to get user input: {exc}")
+    status = callback_result["status"]
+    if status != "answered":
+        return json.dumps({
+            "question": question,
+            "choices_offered": choices,
+            "status": status,
+        }, ensure_ascii=False)
+    raw_response = callback_result.get("response", "")
 
     if multi_select and choices is not None:
         user_response = _parse_multi_select_response(raw_response)
@@ -172,6 +213,7 @@ def clarify_tool(
     return json.dumps({
         "question": question,
         "choices_offered": choices,
+        "status": "answered",
         "user_response": user_response,
     }, ensure_ascii=False)
 

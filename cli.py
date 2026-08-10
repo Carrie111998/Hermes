@@ -13347,8 +13347,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Sets up the interactive selection UI (or freetext prompt for open-ended
         questions), then blocks until the user responds via the prompt_toolkit
-        key bindings.  If no response arrives within the configured timeout the
-        question is dismissed and the agent is told to decide on its own.
+        key bindings. If no response arrives within the configured timeout the
+        question is dismissed and the current agent turn is paused.
 
         When ``multi_select`` is True, shows checkboxes and the user can
         select multiple options with Space, confirming with Enter.
@@ -13394,7 +13394,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 result = response_queue.get(timeout=1)
                 self._clarify_deadline = None
                 self._persist_prompt_summary("?", "Clarify", question, str(result))
-                return result
+                return {"status": "answered", "response": result}
             except queue.Empty:
                 # None deadline = unlimited: never auto-skip, just keep polling.
                 if self._clarify_deadline is not None:
@@ -13406,17 +13406,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _last_countdown_refresh = now
                     self._paint_now()
 
-        # Timed out — tear down the UI and let the agent decide
+        # Timed out — tear down the UI and pause the current turn.
         self._clarify_state = None
         self._clarify_freetext = False
         self._clarify_deadline = None
         self._clarify_multi_base = None
         self._paint_now()
-        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — agent will decide){_RST}")
-        return (
-            "The user did not provide a response within the time limit. "
-            "Use your best judgement to make the choice and proceed."
-        )
+        _cprint(f"\n{_DIM}(clarify timed out after {timeout}s — turn paused){_RST}")
+        return {"status": "expired"}
 
     def _sudo_password_callback(self) -> str:
         """

@@ -9868,6 +9868,8 @@ def test_interrupt_only_clears_own_session_pending():
         server._pending.pop("rid-b", None)
         server._answers.pop("rid-a", None)
         server._answers.pop("rid-b", None)
+        server._cancelled_prompt_ids.discard("rid-a")
+        server._cancelled_prompt_ids.discard("rid-b")
 
 
 def test_interrupt_clears_multiple_own_pending():
@@ -9895,6 +9897,7 @@ def test_interrupt_clears_multiple_own_pending():
         for key in ("r1", "r2"):
             server._pending.pop(key, None)
             server._answers.pop(key, None)
+            server._cancelled_prompt_ids.discard(key)
 
 
 def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
@@ -10532,6 +10535,56 @@ def test_clear_pending_without_sid_clears_all():
         for key in ("a", "b", "c"):
             server._pending.pop(key, None)
             server._answers.pop(key, None)
+            server._cancelled_prompt_ids.discard(key)
+
+
+def test_typed_block_distinguishes_timeout_and_session_cancellation(monkeypatch):
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    assert server._block("clarify.request", "timeout-sid", {}, timeout=0, typed=True) == {
+        "status": "expired"
+    }
+
+    result = {}
+    thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            server._block("clarify.request", "cancel-sid", {}, timeout=2, typed=True),
+        ),
+        daemon=True,
+    )
+    thread.start()
+    deadline = time.time() + 1
+    while not any(owner == "cancel-sid" for owner, _event in server._pending.values()):
+        assert time.time() < deadline
+        time.sleep(0.01)
+    server._clear_pending("cancel-sid")
+    thread.join(timeout=1)
+
+    assert result["value"] == {"status": "cancelled"}
+
+
+def test_typed_block_rejects_late_clarify_reply(monkeypatch):
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload: emitted.append((event, sid, dict(payload))),
+    )
+
+    assert server._block("clarify.request", "late-sid", {}, timeout=0, typed=True) == {
+        "status": "expired"
+    }
+    request_id = emitted[0][2]["request_id"]
+    response = server.handle_request(
+        {
+            "id": "late",
+            "method": "clarify.respond",
+            "params": {"request_id": request_id, "answer": "too late"},
+        }
+    )
+
+    assert response["result"] == {"status": "expired"}
 
 
 def test_respond_unpacks_sid_tuple_correctly():
@@ -16276,17 +16329,18 @@ def test_clarify_callback_uses_configured_timeout(monkeypatch):
 
     monkeypatch.setattr(server, "_clarify_timeout_seconds", lambda: 42)
 
-    def fake_block(event, sid, payload, timeout=300):
-        captured.update(event=event, sid=sid, payload=payload, timeout=timeout)
-        return "answer"
+    def fake_block(event, sid, payload, timeout=300, **kwargs):
+        captured.update(event=event, sid=sid, payload=payload, timeout=timeout, **kwargs)
+        return {"status": "answered", "response": "answer"}
 
     monkeypatch.setattr(server, "_block", fake_block)
 
     result = server._agent_cbs("sid-1")["clarify_callback"]("Pick one", ["a", "b"])
 
-    assert result == "answer"
+    assert result == {"status": "answered", "response": "answer"}
     assert captured["event"] == "clarify.request"
     assert captured["timeout"] == 42
+    assert captured["typed"] is True
     assert captured["payload"] == {"question": "Pick one", "choices": ["a", "b"]}
 
 
@@ -16296,7 +16350,7 @@ def test_clarify_callback_multi_select_hint(monkeypatch):
     (older renderers must never see the extra field)."""
     captured = {}
 
-    def fake_block(event, sid, payload, timeout=300):
+    def fake_block(event, sid, payload, timeout=300, **_kwargs):
         captured.update(payload=payload)
         return "answer"
 

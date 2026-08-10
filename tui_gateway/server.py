@@ -145,6 +145,7 @@ _methods: dict[str, callable] = {}
 _pending: dict[str, tuple[str, threading.Event]] = {}
 _pending_prompt_payloads: dict[str, tuple[str, dict]] = {}
 _answers: dict[str, str] = {}
+_cancelled_prompt_ids: set[str] = set()
 _db = None
 _db_error: str | None = None
 _stdout_lock = threading.Lock()
@@ -3249,7 +3250,14 @@ def _enable_gateway_prompts() -> None:
 # ── Blocking prompt factory ──────────────────────────────────────────
 
 
-def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> str:
+def _block(
+    event: str,
+    sid: str,
+    payload: dict,
+    timeout: float | None = 300,
+    *,
+    typed: bool = False,
+):
     rid = uuid.uuid4().hex[:8]
     ev = threading.Event()
     with _prompt_lock:
@@ -3259,6 +3267,7 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
     answered = False
     answer = ""
     answer_present = False
+    cancelled = False
     try:
         _emit(event, sid, payload)
         # Natural Event semantics: None → wait forever (clarify configured with
@@ -3271,6 +3280,8 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
             _pending_prompt_payloads.pop(rid, None)
             answer_present = rid in _answers
             answer = _answers.pop(rid, "")
+            cancelled = rid in _cancelled_prompt_ids
+            _cancelled_prompt_ids.discard(rid)
 
     # Emit an `.expire` notification on timeout for every blocking request type
     # whose `*.respond` handler tolerates a late reply (allow_expired=True).
@@ -3292,6 +3303,12 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
             sid,
             {"request_id": rid},
         )
+    if typed:
+        if cancelled:
+            return {"status": "cancelled"}
+        if answer_present:
+            return {"status": "answered", "response": answer}
+        return {"status": "cancelled" if answered else "expired"}
     return answer
 
 
@@ -3321,6 +3338,7 @@ def _clear_pending(sid: str | None = None) -> None:
         for rid, (owner_sid, ev) in list(_pending.items()):
             if sid is None or owner_sid == sid:
                 _answers[rid] = ""
+                _cancelled_prompt_ids.add(rid)
                 ev.set()
 
 
@@ -5848,6 +5866,7 @@ def _agent_cbs(sid: str) -> dict:
                 else {"question": q, "choices": c}
             ),
             timeout=_clarify_timeout_seconds(),
+            typed=True,
         ),
         # read_terminal tool (desktop GUI): same blocking bridge as clarify — the
         # renderer answers terminal.read.respond with the serialized buffer.
@@ -10833,6 +10852,7 @@ def _respond(rid, params, key, *, allow_expired=False):
                 return _ok(rid, {"status": "expired"})
             return _err(rid, 4009, f"no pending {key} request")
         _, ev = entry
+        _cancelled_prompt_ids.discard(r)
         _answers[r] = params.get(key, "")
         ev.set()
     return _ok(rid, {"status": "ok"})

@@ -24,16 +24,16 @@ class TestClarifyToolBasics:
             return "blue"
 
         result = json.loads(clarify_tool("What color?", callback=mock_callback))
+        assert result["status"] == "answered"
         assert result["question"] == "What color?"
         assert result["choices_offered"] is None
         assert result["user_response"] == "blue"
 
 
-    def test_no_callback_returns_error(self):
-        """Should return error when no callback is provided."""
+    def test_no_callback_is_typed_delivery_failure(self):
         result = json.loads(clarify_tool("What do you want?"))
-        assert "error" in result
-        assert "not available" in result["error"].lower()
+        assert result["status"] == "delivery_failed"
+        assert "user_response" not in result
 
 
 class TestClarifyToolChoicesValidation:
@@ -68,15 +68,21 @@ class TestClarifyToolChoicesValidation:
 class TestClarifyToolCallbackHandling:
     """Tests for callback error handling."""
 
-    def test_callback_exception_returns_error(self):
-        """Should return error if callback raises exception."""
+    def test_callback_exception_is_typed_delivery_failure(self):
         def failing_callback(question: str, choices: Optional[List[str]]) -> str:
             raise RuntimeError("User cancelled")
 
         result = json.loads(clarify_tool("Question?", callback=failing_callback))
-        assert "error" in result
-        assert "Failed to get user input" in result["error"]
-        assert "User cancelled" in result["error"]
+        assert result["status"] == "delivery_failed"
+        assert "user_response" not in result
+
+    def test_non_answered_outcomes_never_become_user_responses(self):
+        for status in ("expired", "cancelled", "delivery_failed"):
+            result = json.loads(clarify_tool(
+                "Q?", callback=lambda *_args, value=status: {"status": value}
+            ))
+            assert result["status"] == status
+            assert "user_response" not in result
 
 
     def test_user_response_stripped(self):

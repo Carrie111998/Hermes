@@ -5143,12 +5143,12 @@ class TurnRunner:
         # explaining that no response arrived (so the agent can adapt
         # rather than hang forever).
         # ------------------------------------------------------------------
-        def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> str:
+        def _clarify_callback_sync(question: str, choices, multi_select: bool = False) -> dict:
             from tools import clarify_gateway as _clarify_mod
             import uuid as _uuid
 
             if not ctx._status_adapter:
-                return ""
+                return {"status": "delivery_failed"}
 
             clarify_id = _uuid.uuid4().hex[:10]
             _clarify_mod.register(
@@ -5216,14 +5216,13 @@ class TurnRunner:
                 # sentinel so the agent can fall back to a sensible
                 # default rather than hanging.
                 _clarify_mod.clear_session(ctx.session_key or "")
-                return "[clarify prompt could not be delivered]"
+                return {"status": "delivery_failed"}
 
             timeout = _clarify_mod.get_clarify_timeout()
             response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
             if response is None or response == "":
-                # Timeout or session-boundary cancellation
-                return f"[user did not respond within {int(timeout / 60)}m]"
-            return response
+                return {"status": "expired" if response is None else "cancelled"}
+            return {"status": "answered", "response": response}
 
         agent.clarify_callback = _clarify_callback_sync
 
