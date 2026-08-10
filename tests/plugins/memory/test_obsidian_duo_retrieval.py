@@ -56,3 +56,14 @@ def test_query_classification_is_deterministic(tmp_path):
     assert retriever.classify_query("") is RecallClass.NONE
     assert retriever.classify_query('"exact decision"') is RecallClass.EXACT
     assert retriever.classify_query("project:hermes status") is RecallClass.STRUCTURED
+
+
+def test_curated_fixture_has_broad_evaluation_coverage():
+    fixture = Path(__file__).parent / "fixtures" / "obsidian_duo_retrieval.json"
+    cases = json.loads(fixture.read_text(encoding="utf-8"))
+
+    assert len(cases) >= 30
+    assert any(case["forbidden"] for case in cases)
+    assert any(not case["expected"] for case in cases)
+import json
+from pathlib import Path
