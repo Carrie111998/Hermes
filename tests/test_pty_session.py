@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -26,11 +27,15 @@ def test_ringbuffer_drops_oldest_over_capacity():
 class FakeBridge:
     """Implements the bridge contract PtySession depends on."""
 
-    def __init__(self, chunks):
+    def __init__(self, chunks, close_gate=None):
         self._chunks = list(chunks)   # bytes; b"" = idle tick; None = EOF
         self.written = bytearray()
         self.closed = False
         self.resized = None
+        # Optional threading.Event held by close() so a test can keep a
+        # close in flight. close() runs via asyncio.to_thread, so the gate
+        # has to be a thread primitive rather than an asyncio one.
+        self._close_gate = close_gate
 
     def read(self, timeout):
         if not self._chunks:
@@ -44,6 +49,8 @@ class FakeBridge:
         self.resized = (cols, rows)
 
     def close(self):
+        if self._close_gate is not None:
+            self._close_gate.wait()
         self.closed = True
 
 
@@ -143,3 +150,113 @@ async def test_reaper_loop_invokes_reap(monkeypatch):
     except asyncio.CancelledError:
         pass
     assert calls["n"] >= 2
+
+
+async def _spawn_then_detach(reg, key, bridge):
+    """Spawn a session and leave it idle-but-reapable (detached + timestamped)."""
+    session, _ = await reg.attach_or_spawn(key, spawn=lambda: bridge)
+    ws = FakeWS()
+    await session.attach(ws)
+    session.detach(ws)
+    return session
+
+
+@pytest.mark.asyncio
+async def test_close_all_awaits_an_in_flight_capacity_eviction():
+    # A capacity eviction is popped from _sessions before its close is
+    # scheduled, so close_all()'s loop over _sessions cannot reach it. If the
+    # drain does not also await the eviction, shutdown returns while the PTY
+    # child is still unjoined.
+    gate = threading.Event()
+    reg = make_registry(max_sessions=1)
+    a_bridge = FakeBridge([], close_gate=gate)
+    b_bridge = FakeBridge([])
+    drain = None
+    try:
+        await _spawn_then_detach(reg, "a", a_bridge)
+        await reg.attach_or_spawn("b", spawn=lambda: b_bridge)   # evicts "a"
+        assert a_bridge.closed is False          # eviction close parked on the gate
+
+        drain = asyncio.create_task(reg.close_all())
+        await asyncio.sleep(0.05)                # ample time to return if unaware
+        awaited_the_eviction = not drain.done()
+    finally:
+        # Release unconditionally: a failed assertion above must not strand
+        # the gated bridge thread and hang the run instead of failing it.
+        gate.set()
+        if drain is not None:
+            await drain
+
+    assert awaited_the_eviction, "close_all() returned without draining the eviction"
+    assert a_bridge.closed is True
+    assert b_bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_close_task_is_strongly_referenced():
+    reg = make_registry(max_sessions=1)
+    a_bridge = FakeBridge([])
+    await _spawn_then_detach(reg, "a", a_bridge)
+
+    await reg.attach_or_spawn("b", spawn=lambda: FakeBridge([]))
+    # The loop's task table holds only a weak reference; the registry must
+    # hold its own or the close can be collected mid-flight.
+    assert len(reg._closing) == 1
+    task = next(iter(reg._closing))
+
+    await task
+    await asyncio.sleep(0)                       # let the done callback run
+    assert reg._closing == set()                 # ...and the set stays bounded
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_capacity_eviction_closes_the_evicted_bridge():
+    # Positive control: pins that the successful-eviction branch actually
+    # runs, so the assertions above cannot pass against a registry that
+    # never evicts anything.
+    reg = make_registry(max_sessions=1)
+    a_bridge = FakeBridge([])
+    await _spawn_then_detach(reg, "a", a_bridge)
+
+    b_bridge = FakeBridge([])
+    _, created = await reg.attach_or_spawn("b", spawn=lambda: b_bridge)
+    assert created is True                       # reapable idle → no RegistryFull
+
+    await reg.close_all()
+    assert a_bridge.closed is True
+    assert b_bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_close_all_drains_even_when_an_eviction_close_raises():
+    # One failing eviction close must not abort the rest of the drain. The
+    # gate keeps the raising close in flight until close_all() is parked in
+    # the gather — otherwise it would finish (and be discarded) beforehand
+    # and the drain would have nothing to re-raise.
+    gate = threading.Event()
+    reg = make_registry(max_sessions=1)
+    a_bridge = FakeBridge([], close_gate=gate)
+    session_a = await _spawn_then_detach(reg, "a", a_bridge)
+
+    real_close = session_a.close
+
+    async def close_then_raise():
+        await real_close()
+        raise RuntimeError("bridge join failed")
+
+    session_a.close = close_then_raise
+
+    b_bridge = FakeBridge([])
+    drain = None
+    try:
+        await reg.attach_or_spawn("b", spawn=lambda: b_bridge)   # evicts "a"
+        drain = asyncio.create_task(reg.close_all())
+        await asyncio.sleep(0.05)                # close_all reaches the gather
+    finally:
+        gate.set()
+        if drain is not None:
+            await drain                          # must not propagate RuntimeError
+
+    assert a_bridge.closed is True
+    assert b_bridge.closed is True
