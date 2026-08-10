@@ -10,9 +10,9 @@ import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
-import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
+import { Activity, AlertCircle, AlertTriangle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
-import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
+import { contextBarLabel, contextCompressionPressure, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
@@ -50,7 +50,7 @@ import type { StatusResponse, UsageStats } from '@/types/hermes'
 import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
 
-const EMPTY_USAGE = { calls: 0, input: 0, output: 0, total: 0 } as const
+const EMPTY_USAGE: UsageStats = { calls: 0, input: 0, output: 0, total: 0 }
 
 interface StatusbarItemsOptions {
   agentsOpen: boolean
@@ -225,9 +225,38 @@ export function useStatusbarItems({
 
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
+  const contextPressure = useMemo(() => contextCompressionPressure(currentUsage), [currentUsage])
+
+  const contextPressureLabel =
+    contextPressure === 'due'
+      ? copy.contextCompressionDue
+      : contextPressure === 'near'
+        ? copy.contextNearCompression
+        : contextUsage
+
+  const contextPressureClassName =
+    contextPressure === 'due'
+      ? 'text-destructive hover:text-destructive'
+      : contextPressure === 'near'
+        ? 'text-amber-600 hover:text-amber-600 dark:text-amber-400 dark:hover:text-amber-400'
+        : undefined
+
+  const contextPressureTitle =
+    contextPressure === 'normal'
+      ? copy.contextUsage
+      : copy.contextCompressionTooltip(Math.round(currentUsage.compression_threshold_percent ?? 0))
 
   const publishContextUsage = useCallback(
-    (snapshot: Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used'>) => {
+    (
+      snapshot: Pick<
+        UsageStats,
+        | 'compression_threshold_percent'
+        | 'compression_threshold_tokens'
+        | 'context_max'
+        | 'context_percent'
+        | 'context_used'
+      >
+    ) => {
       setCurrentUsage(current => ({ ...current, ...snapshot }))
     },
     []
@@ -525,10 +554,13 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
+        className: contextPressureClassName,
         detail: contextBar || undefined,
         hidden: !contextUsage,
+        icon: contextPressure === 'normal' ? undefined : <AlertTriangle className="size-3" />,
         id: 'context-usage',
-        label: contextUsage,
+        label: contextPressureLabel,
+        lockedVisible: contextPressure !== 'normal',
         menuAlign: 'end',
         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
         menuContent: (
@@ -539,6 +571,7 @@ export function useStatusbarItems({
             sessionId={activeSessionId}
           />
         ),
+        title: contextPressureTitle,
         toggleLabel: copy.toggleContextUsage,
         variant: 'menu'
       },
@@ -577,6 +610,10 @@ export function useStatusbarItems({
       chatOpen,
       clientVersionItem,
       contextBar,
+      contextPressure,
+      contextPressureClassName,
+      contextPressureLabel,
+      contextPressureTitle,
       contextUsage,
       copy,
       currentUsage,

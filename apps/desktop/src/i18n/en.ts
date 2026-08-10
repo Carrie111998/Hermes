@@ -2534,6 +2534,9 @@ export const en: Translations = {
       openStarmap: 'Open memory graph',
       turnRunning: 'Running',
       contextUsage: 'Context usage',
+      contextNearCompression: 'Context near compression',
+      contextCompressionDue: 'Context compression due',
+      contextCompressionTooltip: percent => `Automatic compression near ${percent}% context`,
       contextUsagePanel: {
         categories: {
           conversation: 'Conversation',
@@ -2547,8 +2550,11 @@ export const en: Translations = {
         },
         empty: 'No context data yet',
         loading: 'Loading breakdown…',
+        automaticCompression: (percent, tokens) => `Automatic compression near ${percent}% (${tokens} tokens)`,
+        compressionDue: 'Compression will start before the next model call.',
         percentFull: percent => `${percent}% Full`,
         title: 'Context Usage',
+        tokensRemaining: tokens => `${tokens} tokens remaining`,
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: 'Session',
@@ -2936,6 +2942,11 @@ export const en: Translations = {
     resumeStrandedBody:
       'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
     resumeRetry: 'Retry',
+    compactionGuardTitle: 'Compressing this session',
+    compactionGuardDescription:
+      'Hermes is summarizing earlier context. Sending messages and changing this session are temporarily disabled.',
+    compactionGuardStatus:
+      'This window will unlock automatically after the compressed session is loaded. Your draft is preserved.',
     nothingToBranch: 'Nothing to branch',
     branchNeedsChat: 'Start or resume a chat before branching.',
     sessionBusy: 'Session busy',

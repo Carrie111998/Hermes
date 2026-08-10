@@ -79,6 +79,10 @@ export function useComposerSubmit({
   // Shared send primitive: fire onSubmit, and if the gateway rejects (accepted
   // === false) or throws, re-load + re-stash the draft so the words survive.
   const dispatchSubmit = (text: string, attachments?: ComposerAttachment[]) => {
+    if (disabled || compacting) {
+      return
+    }
+
     const submittedScope = activeQueueSessionKeyRef.current
     const submittedAttachments = attachments ?? []
 
@@ -117,7 +121,7 @@ export function useComposerSubmit({
   )
 
   const submitDraft = () => {
-    if (disabled) {
+    if (disabled || compacting) {
       return
     }
 
@@ -208,6 +212,10 @@ export function useComposerSubmit({
   // active model request with its displayed context or waits for the current
   // tool boundary. If the turn already ended, queue the words instead.
   const steerDraft = () => {
+    if (compacting) {
+      return
+    }
+
     const text = draftRef.current.trim()
 
     // Guard on live editor state, not the render-lagged `canSteer`: a redirect
@@ -227,7 +235,7 @@ export function useComposerSubmit({
   }
 
   const queueDraft = () => {
-    if (disabled || !busy) {
+    if (disabled || compacting || !busy) {
       return
     }
 

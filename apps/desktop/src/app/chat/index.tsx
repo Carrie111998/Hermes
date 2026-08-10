@@ -51,6 +51,7 @@ import { titlebarHeaderBaseClass, titlebarHeaderShadowClass, titlebarHeaderTitle
 
 import { ChatDropOverlay } from './chat-drop-overlay'
 import { ChatSwapOverlay } from './chat-swap-overlay'
+import { CompactionGuard } from './compaction-guard'
 import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
@@ -528,6 +529,7 @@ export const ChatView = memo(function ChatView({
           so a tiled/background session's blocking prompt surfaces instead of
           stalling to timeout. */}
       <PromptOverlays sessionId={activeSessionId} />
+      <CompactionGuard sessionId={activeSessionId} />
 
       <ChatRuntimeBoundary
         busy={busy}

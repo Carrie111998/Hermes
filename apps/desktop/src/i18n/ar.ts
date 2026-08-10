@@ -2104,6 +2104,14 @@ export const ar = defineLocale({
       openCron: 'فتح المهام المجدولة',
       turnRunning: 'الدور يعمل',
       contextUsage: 'استخدام السياق',
+      contextNearCompression: 'اقترب ضغط السياق',
+      contextCompressionDue: 'ضغط السياق مطلوب',
+      contextCompressionTooltip: percent => `ضغط تلقائي عند نحو ${percent}% من السياق`,
+      contextUsagePanel: {
+        automaticCompression: (percent, tokens) => `ضغط تلقائي عند نحو ${percent}% (${tokens} رمزًا)`,
+        compressionDue: 'سيبدأ الضغط قبل استدعاء النموذج التالي.',
+        tokensRemaining: tokens => `متبقٍ ${tokens} رمزًا حتى الضغط التلقائي`
+      },
       session: 'الجلسة',
       yoloOn: 'YOLO مفعل',
       yoloOff: 'YOLO معطل',
@@ -2546,6 +2554,11 @@ export const ar = defineLocale({
     resumeStrandedBody:
       'فشل الاتصال بهذه الجلسة وتوقفت إعادة المحاولة التلقائية. تأكد من تشغيل البوابة، ثم حاول مجددا.',
     resumeRetry: 'إعادة المحاولة',
+    compactionGuardTitle: 'جارٍ ضغط هذه الجلسة',
+    compactionGuardDescription:
+      'يلخّص Hermes السياق السابق. تم تعطيل إرسال الرسائل وتغيير هذه الجلسة مؤقتًا.',
+    compactionGuardStatus:
+      'ستُفتح هذه النافذة تلقائيًا بعد تحميل الجلسة المضغوطة. ستبقى مسودتك محفوظة.',
     nothingToBranch: 'لا يوجد ما يمكن تفريعه',
     branchNeedsChat: 'يحتاج التفريع إلى محادثة',
     sessionBusy: 'الجلسة مشغولة',

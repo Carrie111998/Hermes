@@ -88,7 +88,7 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSubmit).not.toHaveBeenCalled()
   })
 
-  it('queues a plain-text follow-up while the active turn is compacting', () => {
+  it('blocks every submit route while the active turn is compacting', () => {
     const { hook, onCancel, onSteer, onSubmit, queueCurrentDraft } = renderSubmitHook({
       busy: true,
       compacting: true,
@@ -96,10 +96,13 @@ describe('useComposerSubmit busy-turn routing', () => {
     })
 
     act(() => {
+      hook.result.current.dispatchSubmit('blocked direct submit')
       hook.result.current.submitDraft()
+      hook.result.current.queueDraft()
+      hook.result.current.steerDraft()
     })
 
-    expect(queueCurrentDraft).toHaveBeenCalledTimes(1)
+    expect(queueCurrentDraft).not.toHaveBeenCalled()
     expect(onSteer).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()

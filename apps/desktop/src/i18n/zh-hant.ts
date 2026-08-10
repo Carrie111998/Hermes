@@ -2265,6 +2265,9 @@ export const zhHant = defineLocale({
       openStarmap: '開啟記憶圖譜',
       turnRunning: '執行中',
       contextUsage: '上下文使用量',
+      contextNearCompression: '上下文即將壓縮',
+      contextCompressionDue: '上下文需要壓縮',
+      contextCompressionTooltip: percent => `上下文達到約 ${percent}% 時自動壓縮`,
       contextUsagePanel: {
         categories: {
           conversation: '對話',
@@ -2278,8 +2281,11 @@ export const zhHant = defineLocale({
         },
         empty: '尚無上下文資料',
         loading: '正在載入明細…',
+        automaticCompression: (percent, tokens) => `約 ${percent}% 時自動壓縮（${tokens} 個權杖）`,
+        compressionDue: '壓縮將在下次模型呼叫前開始。',
         percentFull: percent => `已用 ${percent}%`,
         title: '上下文使用量',
+        tokensRemaining: tokens => `距自動壓縮還剩 ${tokens} 個權杖`,
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: '工作階段',
@@ -2646,6 +2652,9 @@ export const zhHant = defineLocale({
     resumeStrandedTitle: '無法載入此工作階段',
     resumeStrandedBody: '與此工作階段的連線失敗，自動重試已停止。請確認閘道正在執行，然後重試。',
     resumeRetry: '重試',
+    compactionGuardTitle: '正在壓縮此工作階段',
+    compactionGuardDescription: 'Hermes 正在摘要較早的上下文。傳送訊息和變更此工作階段的操作暫時已停用。',
+    compactionGuardStatus: '壓縮後的工作階段載入完成後，此視窗將自動解鎖。您的草稿會被保留。',
     nothingToBranch: '沒有可分支的內容',
     branchNeedsChat: '分支前請先開始或繼續一個聊天。',
     sessionBusy: '工作階段忙碌中',

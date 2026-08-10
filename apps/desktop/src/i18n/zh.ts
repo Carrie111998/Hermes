@@ -2713,6 +2713,9 @@ export const zh: Translations = {
       openStarmap: '打开记忆图谱',
       turnRunning: '运行中',
       contextUsage: '上下文用量',
+      contextNearCompression: '上下文即将压缩',
+      contextCompressionDue: '上下文需要压缩',
+      contextCompressionTooltip: percent => `上下文达到约 ${percent}% 时自动压缩`,
       contextUsagePanel: {
         categories: {
           conversation: '对话',
@@ -2726,8 +2729,11 @@ export const zh: Translations = {
         },
         empty: '暂无上下文数据',
         loading: '正在加载明细…',
+        automaticCompression: (percent, tokens) => `约 ${percent}% 时自动压缩（${tokens} 个令牌）`,
+        compressionDue: '压缩将在下次模型调用前开始。',
         percentFull: percent => `已用 ${percent}%`,
         title: '上下文用量',
+        tokensRemaining: tokens => `距自动压缩还剩 ${tokens} 个令牌`,
         tokenSummary: (used, max) => `${used} / ${max} Tokens`
       },
       session: '会话',
@@ -3095,6 +3101,9 @@ export const zh: Translations = {
     resumeStrandedTitle: '无法加载此会话',
     resumeStrandedBody: '与此会话的连接失败，自动重试已停止。请确认网关正在运行，然后重试。',
     resumeRetry: '重试',
+    compactionGuardTitle: '正在压缩此会话',
+    compactionGuardDescription: 'Hermes 正在总结较早的上下文。发送消息和更改此会话的操作暂时已禁用。',
+    compactionGuardStatus: '压缩后的会话加载完成后，此窗口将自动解锁。您的草稿会被保留。',
     nothingToBranch: '没有可分支的内容',
     branchNeedsChat: '分支前请先开始或恢复一个对话。',
     sessionBusy: '会话忙碌中',

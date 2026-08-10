@@ -1,4 +1,4 @@
-import { act, cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -18,6 +18,8 @@ const initialUsage: UsageStats = {
 
 const breakdown: ContextBreakdown = {
   categories: [{ color: 'teal', id: 'conversation', label: 'Conversation', tokens: 241_400 }],
+  compression_threshold_percent: 92,
+  compression_threshold_tokens: 250_000,
   context_max: 272_000,
   context_percent: 89,
   context_used: 241_400,
@@ -57,11 +59,15 @@ describe('ContextUsagePanel', () => {
 
     await waitFor(() => {
       expect(published).toHaveBeenCalledWith({
+        compression_threshold_percent: 92,
+        compression_threshold_tokens: 250_000,
         context_max: 272_000,
         context_percent: 89,
         context_used: 241_400
       })
       expect(renderedUsage.at(-1)?.context_used).toBe(241_400)
+      expect(screen.getByText('Automatic compression near 92% (250k tokens)')).not.toBeNull()
+      expect(screen.getByText('8.6k tokens remaining')).not.toBeNull()
     })
     await act(async () => {})
 
