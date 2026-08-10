@@ -24947,7 +24947,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         no route matches. Callers (``build_source``,
         ``_resolve_profile_home_for_source``) treat ``None`` as "use the
         default/active profile". When ``gateway.profile_routes`` is configured,
-        the most specific matching route wins (guild < channel < thread). See
+        the most specific matching route wins
+        (guild < channel < thread < sender). See
         :mod:`gateway.profile_routing` for matching rules.
 
         Gated on ``gateway.multiplex_profiles``: routing stamps
@@ -24972,6 +24973,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 chat_id=source.chat_id,
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
+                user_id=getattr(source, "user_id", None),
             )
         except Exception:
             logger.warning(

@@ -14,6 +14,16 @@ class TestProfileRoute:
                          guild_id="g", chat_id="c", thread_id="t")
         assert r.specificity == 14  # 2 + 4 + 8
 
+    def test_specificity_sender(self):
+        r = ProfileRoute(name="u", platform="discord", profile="p",
+                         user_id="42")
+        assert r.specificity == 16
+
+    def test_specificity_sender_thread(self):
+        r = ProfileRoute(name="ut", platform="discord", profile="p",
+                         guild_id="g", chat_id="c", thread_id="t", user_id="42")
+        assert r.specificity == 30  # 2 + 4 + 8 + 16
+
 
     def test_frozen(self):
         r = ProfileRoute(name="x", platform="discord", profile="p")
@@ -44,11 +54,36 @@ class TestProfileRouteMatching:
         # guild matches but chat differs -> NO match
         assert not r.matches("discord", guild_id="111", chat_id="333")
 
+    def test_sender_match(self):
+        r = ProfileRoute(name="u", platform="discord", profile="builder",
+                         user_id="42")
+        assert r.matches("discord", user_id="42")
+        assert not r.matches("discord", user_id="43")
+        assert not r.matches("discord")
+
+    def test_sender_and_chat_are_conjunctive(self):
+        r = ProfileRoute(name="uc", platform="discord", profile="builder",
+                         user_id="42", chat_id="222")
+        assert r.matches("discord", user_id="42", chat_id="222")
+        assert not r.matches("discord", user_id="42", chat_id="333")
+        assert not r.matches("discord", user_id="43", chat_id="222")
+
 
 class TestParseProfileRoutes:
     def test_empty(self):
         assert parse_profile_routes(None) == []
         assert parse_profile_routes([]) == []
+
+    def test_sender_route_parsed_and_coerced(self):
+        raw = [
+            {"name": "thread", "platform": "discord", "profile": "p",
+             "guild_id": "1", "chat_id": "2", "thread_id": "3"},
+            {"name": "sender", "platform": "discord", "profile": "p",
+             "user_id": 42},
+        ]
+        routes = parse_profile_routes(raw)
+        by_name = {r.name: r for r in routes}
+        assert by_name["sender"].user_id == "42"
 
 
 class TestMatchProfileRoute:
@@ -59,6 +94,24 @@ class TestMatchProfileRoute:
             ProfileRoute(name="r", platform="telegram", profile="p"),
         ]
         assert match_profile_route(routes, "discord") is None
+
+    def test_sender_route_outranks_location_only_route(self):
+        routes = parse_profile_routes([
+            {"name": "thread", "platform": "discord", "profile": "thread-profile",
+             "guild_id": "1", "chat_id": "2", "thread_id": "3"},
+            {"name": "sender", "platform": "discord", "profile": "builder",
+             "user_id": "42"},
+        ])
+        matched = match_profile_route(
+            routes,
+            "discord",
+            guild_id="1",
+            chat_id="2",
+            thread_id="3",
+            user_id="42",
+        )
+        assert matched is not None
+        assert matched.profile == "builder"
 
 
 class TestSessionKeyIntegration:

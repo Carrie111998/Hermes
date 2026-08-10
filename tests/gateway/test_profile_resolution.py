@@ -168,6 +168,26 @@ class TestNonDiscordProfileRouting:
         assert mock_runner._profile_name_for_source(telegram_source) == "tg-profile"
 
 
+class TestSenderProfileRouting:
+    def test_discord_sender_route_reaches_gateway_resolution(self, mock_runner, discord_source):
+        mock_runner.config.profile_routes = [
+            ProfileRoute(name="builder", platform="discord", profile="product-builder",
+                         user_id="392686399226380294"),
+        ]
+        discord_source.user_id = "392686399226380294"
+
+        assert mock_runner._profile_name_for_source(discord_source) == "product-builder"
+
+    def test_discord_sender_route_rejects_other_user(self, mock_runner, discord_source):
+        mock_runner.config.profile_routes = [
+            ProfileRoute(name="builder", platform="discord", profile="product-builder",
+                         user_id="392686399226380294"),
+        ]
+        discord_source.user_id = "someone-else"
+
+        assert mock_runner._profile_name_for_source(discord_source) is None
+
+
 class TestGatewayRunnerInjection:
     """``BasePlatformAdapter`` declares ``gateway_runner`` so the gateway's
     unconditional injection reaches every platform adapter — the foundation
