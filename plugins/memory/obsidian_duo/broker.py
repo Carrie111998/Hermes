@@ -93,7 +93,11 @@ class EmbeddedMemoryBroker:
 
     def observe(self, event: MemoryEvent) -> None:
         self.store.initialize()
-        if self.sync_adapter is not None and hasattr(self.sync_adapter, "mark_dirty"):
+        if (
+            event.event_type in {"user_correction", "explicit_remember", "decision_confirmed", "builtin_memory_write", "manual_vault_edit"}
+            and self.sync_adapter is not None
+            and hasattr(self.sync_adapter, "mark_dirty")
+        ):
             self.sync_adapter.mark_dirty(event.event_type)
         self._ensure_worker()
         try:

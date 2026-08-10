@@ -1,4 +1,5 @@
 from plugins.memory.obsidian_duo.contracts import (
+    EvidenceRecord,
     MemoryRecord,
     MemoryStatus,
     RetrievalRequest,
@@ -61,6 +62,20 @@ def test_unverified_recall_does_not_claim_verified_memory(tmp_path):
 
     assert packet.memories
     assert packet.no_verified_memory is True
+
+
+def test_retrieval_includes_referenced_evidence(tmp_path):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    store.insert_evidence(EvidenceRecord("ev_1", "user_message", "confirmed choice", session_id="s1"))
+    store.upsert_memory(
+        MemoryRecord("mem_1", "Use blue theme", "preference", "global", evidence_ids=("ev_1",), verification=Verification.SOURCE_SUPPORTED),
+        "seed",
+    )
+
+    packet = MemoryRetriever(store).retrieve(RetrievalRequest("blue theme"))
+
+    assert [item.evidence_id for item in packet.evidence] == ["ev_1"]
 
 
 def test_retrieval_does_not_admit_record_over_token_budget(tmp_path):

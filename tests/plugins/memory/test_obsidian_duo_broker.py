@@ -41,6 +41,21 @@ def test_broker_queue_is_bounded_and_keeps_user_correction(tmp_path):
     assert any(event.event_type == "user_correction" for event in list(broker._events.queue))
 
 
+def test_ordinary_turn_does_not_mark_external_sync_dirty(tmp_path):
+    broker = make_broker(tmp_path)
+    calls = []
+    broker.sync_adapter = type("Sync", (), {
+        "mark_dirty": lambda self, reason: calls.append(reason),
+        "flush": lambda self: type("Result", (), {"success": True})(),
+    })()
+
+    broker.observe(MemoryEvent("turn", content="ordinary conversation"))
+    broker.observe(MemoryEvent("explicit_remember", content="durable decision"))
+
+    assert calls == ["explicit_remember"]
+    broker.shutdown(5)
+
+
 def test_broker_starts_worker_lazily_and_flushes(tmp_path):
     broker = make_broker(tmp_path)
     assert broker._worker is None

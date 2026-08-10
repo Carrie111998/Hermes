@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 
-from .contracts import MemoryPacket, MemoryStatus, RetrievalRequest, Verification
+from .contracts import EvidenceRecord, MemoryPacket, MemoryStatus, RetrievalRequest, Verification
 from .store import SqliteMemoryStore
 
 
@@ -88,8 +88,19 @@ class MemoryRetriever:
                 break
 
         conflicts = []
+        evidence = []
         conn = self.store.connection()
         for record in memories:
+            for evidence_id in record.evidence_ids:
+                row = conn.execute(
+                    "SELECT evidence_id, kind, content, source, session_id FROM evidence WHERE evidence_id=?",
+                    (evidence_id,),
+                ).fetchone()
+                if row is not None:
+                    evidence.append(EvidenceRecord(
+                        row["evidence_id"], row["kind"], row["content"],
+                        row["source"], row["session_id"],
+                    ))
             rows = conn.execute(
                 "SELECT memory_id FROM conflicts WHERE memory_id=? OR conflicting_memory_id=?",
                 (record.memory_id, record.memory_id),
@@ -98,6 +109,7 @@ class MemoryRetriever:
                 conflicts.append(record.memory_id)
         return MemoryPacket(
             memories=tuple(memories),
+            evidence=tuple(evidence),
             conflicts=tuple(dict.fromkeys(conflicts)),
             no_verified_memory=not any(
                 self._verification_score(record.verification) >= self._verification_score(Verification.SOURCE_SUPPORTED)
