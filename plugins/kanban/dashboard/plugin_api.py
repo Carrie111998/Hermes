@@ -257,9 +257,8 @@ def _compute_task_diagnostics(
     rule definitions.
     """
     from hermes_cli import kanban_diagnostics as kd
-    from hermes_cli.config import load_config
 
-    diag_config = kd.config_from_runtime_config(load_config())
+    diag_config = kd.load_runtime_diagnostics_config()
 
     # Build the candidate task list. We need each task's row + its
     # events + its runs. Doing N separate queries works but scales
@@ -2675,15 +2674,21 @@ def get_orchestration_settings():
     """Return the current kanban orchestration knobs from config.yaml
     plus the resolved effective values (filling in fallbacks)."""
     try:
-        from hermes_cli.config import load_config
-        cfg = load_config() or {}
+        from hermes_cli.config import load_config_strict_current
+        cfg = load_config_strict_current() or {}
     except Exception:
         cfg = {}
-    kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
-    explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
-    auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
-    auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
+    candidate = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    kanban_cfg = candidate if isinstance(candidate, dict) else {}
+    orch_value = kanban_cfg.get("orchestrator_profile")
+    default_value = kanban_cfg.get("default_assignee")
+    explicit_orch = orch_value.strip() if isinstance(orch_value, str) else ""
+    explicit_default = default_value.strip() if isinstance(default_value, str) else ""
+    auto_decompose = kanban_cfg.get("auto_decompose") is True
+    promote_value = kanban_cfg.get("auto_promote_children", True)
+    auto_promote_children = (
+        promote_value if isinstance(promote_value, bool) else True
+    )
 
     # Resolve fallbacks the same way the decomposer does.
     resolved_orch = explicit_orch

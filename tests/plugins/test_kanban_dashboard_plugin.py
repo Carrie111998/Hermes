@@ -80,6 +80,70 @@ def test_board_empty(client):
     assert data["latest_event_id"] == 0
 
 
+@pytest.mark.parametrize(
+    ("kanban_config", "expected"),
+    [
+        ({}, False),
+        ({"auto_decompose": False}, False),
+        ({"auto_decompose": True}, True),
+        ({"auto_decompose": "false"}, False),
+        ({"auto_decompose": "true"}, False),
+        ({"auto_decompose": 1}, False),
+        ("bad", False),
+        ([], False),
+    ],
+)
+def test_orchestration_settings_auto_decompose_default_and_opt_in(
+    client, monkeypatch, kanban_config, expected
+):
+    """The dashboard must show manual-by-default without hiding explicit opt-in."""
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"kanban": kanban_config},
+    )
+    monkeypatch.setattr(
+        config_mod,
+        "load_config_strict_current",
+        lambda: {"kanban": kanban_config},
+        raising=False,
+    )
+
+    response = client.get("/api/plugins/kanban/orchestration")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_decompose"] is expected
+
+
+def test_orchestration_settings_rejects_stale_lkg_on_strict_read_failure(
+    client, monkeypatch
+):
+    from hermes_cli import config as config_mod
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config",
+        lambda: {"kanban": {"auto_decompose": True}},
+    )
+
+    def reject_current_config():
+        raise ValueError("synthetic malformed current config")
+
+    monkeypatch.setattr(
+        config_mod,
+        "load_config_strict_current",
+        reject_current_config,
+        raising=False,
+    )
+
+    response = client.get("/api/plugins/kanban/orchestration")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["auto_decompose"] is False
+
+
 # ---------------------------------------------------------------------------
 # POST /tasks then GET /board sees it
 # ---------------------------------------------------------------------------
@@ -623,6 +687,28 @@ def test_reassign_endpoint_switches_profile(client):
 # ---------------------------------------------------------------------------
 # Diagnostics endpoint (/api/plugins/kanban/diagnostics)
 # ---------------------------------------------------------------------------
+
+
+def test_dashboard_diagnostics_uses_strict_runtime_diagnostics_loader(
+    client, monkeypatch
+):
+    from hermes_cli import kanban_diagnostics as kd
+
+    calls = []
+
+    def load_diagnostics_config():
+        calls.append(True)
+        return {"triage_aux_status": {"auto_decompose": False}}
+
+    monkeypatch.setattr(
+        kd,
+        "load_runtime_diagnostics_config",
+        load_diagnostics_config,
+    )
+
+    response = client.get("/api/plugins/kanban/diagnostics")
+    assert response.status_code == 200
+    assert calls == [True]
 
 
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):

@@ -15,6 +15,7 @@ This module provides:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
@@ -117,9 +119,10 @@ def _warn_config_parse_failure(
     ``hermes config set``.
 
     ``fallback`` selects the message wording: ``"defaults"`` (fresh process,
-    nothing else to serve) or ``"last-known-good"`` (in-process retention of
+    nothing else to serve), ``"last-known-good"`` (in-process retention of
     the previously loaded config — see the codex#31188 port in
-    ``_load_config_impl``).
+    ``_load_config_impl``), or ``"reject"`` (a safety-sensitive caller that
+    refuses stale/default fallback and will fail closed).
     """
     try:
         st = config_path.stat()
@@ -137,6 +140,12 @@ def _warn_config_parse_failure(
             f"Failed to parse {config_path}: {exc}. "
             f"Keeping the previously loaded config for this process — "
             f"edits to config.yaml are being IGNORED until the YAML is fixed."
+        )
+    elif fallback == "reject":
+        msg = (
+            f"Failed to parse {config_path}: {exc}. "
+            "Rejecting the current config for a safety-sensitive read; "
+            "the guarded feature will remain disabled until the file is fixed."
         )
     else:
         msg = (
@@ -246,6 +255,43 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
 # changes value (late .env load, in-process rotation — #58514).
 _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# Paths whose current cache entry is a last-known-good fallback. Strict-current
+# safety reads bypass these entries and parse the current bytes instead.
+_LKG_CONFIG_CACHE_PATHS: Set[str] = set()
+# SHA-256 digests of config bytes that passed a strict-current load end to end.
+# The strict reader still opens and reads every time (unreadable must fail
+# closed), but unchanged valid bytes do not need an extra YAML parse per tick.
+_STRICT_CURRENT_CONFIG_DIGESTS: Dict[str, bytes] = {}
+# Equivalent successful-content digests for managed-scope config files used by
+# strict-current loads. Managed parse/read failures disable strict safety gates
+# even though ordinary configuration loading remains intentionally fail-open.
+_STRICT_CURRENT_MANAGED_DIGESTS: Dict[str, bytes] = {}
+# Managed source path and exact merged-cache tuple produced by the last successful
+# strict-current load. Digest equality alone is insufficient: an intervening
+# ordinary load can replace the mtime/size-keyed cache during a content ABA, and
+# two managed paths can have identical mtime/size signatures with different bytes.
+_STRICT_CURRENT_CACHE_ENTRIES: Dict[str, Tuple[Optional[str], object]] = {}
+
+
+@dataclass(frozen=True)
+class _StrictCurrentSourcePin:
+    """Exact sources already validated by ``load_config_strict_current``."""
+
+    config_path: Path
+    user_signature: Optional[Tuple[int, int]]
+    user_config: Dict[str, Any]
+    managed_signature: Tuple[int, int]
+    managed_config: Dict[str, Any]
+
+
+# Strict loading calls the ordinary merge/normalization pipeline through wrappers
+# used by tests and consumers.  A context-local pin prevents those wrappers (or a
+# concurrent selector change) from making the pipeline independently re-resolve
+# HERMES_HOME / HERMES_MANAGED_DIR between validation and use.
+_STRICT_CURRENT_SOURCE_PIN: ContextVar[Optional[_StrictCurrentSourcePin]] = ContextVar(
+    "strict_current_source_pin",
+    default=None,
+)
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -3161,7 +3207,7 @@ def load_config() -> Dict[str, Any]:
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
     """
-    return _load_config_impl(want_deepcopy=True)
+    return _load_config_impl(want_deepcopy=True, allow_last_known_good=True)
 
 
 def load_config_readonly() -> Dict[str, Any]:
@@ -3184,7 +3230,252 @@ def load_config_readonly() -> Dict[str, Any]:
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
     """
-    return _load_config_impl(want_deepcopy=False)
+    return _load_config_impl(want_deepcopy=False, allow_last_known_good=True)
+
+
+def load_config_strict_current() -> Dict[str, Any]:
+    """Load current config bytes without accepting last-known-good fallback.
+
+    This is for safety-sensitive live gates whose disabled value must take
+    effect immediately and whose current malformed or unreadable config must
+    never inherit a previously enabled value. It preserves the normal default,
+    migration, environment-expansion, and managed-overlay pipeline, but:
+
+    * opens and reads the current user and managed files on every call;
+    * rejects malformed YAML and non-mapping roots;
+    * bypasses cache entries known to contain last-known-good data;
+    * rejects structural load errors instead of returning last-known-good; and
+    * verifies the path still identifies the exact file descriptor that was
+      read, closing the validate/load replacement race.
+
+    Successfully parsed content is digest-cached so an unchanged valid file is
+    not YAML-parsed twice per dispatcher tick. The bytes are still read each
+    time so a transient unreadable file fails closed.
+    """
+
+    def _identity(stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+            stat_result.st_size,
+        )
+
+    with _CONFIG_LOCK:
+        config_path = get_config_path()
+        path_key = str(config_path)
+        file_identity: Optional[tuple[int, int, int, int, int]]
+        text: Optional[str]
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                file_identity = _identity(os.fstat(config_file.fileno()))
+                text = config_file.read()
+        except FileNotFoundError:
+            file_identity = None
+            text = None
+        except Exception as exc:
+            _STRICT_CURRENT_CONFIG_DIGESTS.pop(path_key, None)
+            _warn_config_parse_failure(config_path, exc, fallback="reject")
+            raise
+
+        try:
+            current_identity = _identity(config_path.stat())
+        except FileNotFoundError:
+            current_identity = None
+        if current_identity != file_identity:
+            _STRICT_CURRENT_CONFIG_DIGESTS.pop(path_key, None)
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+            raise RuntimeError("config.yaml changed while strict-current read was in progress")
+
+        digest: Optional[bytes] = None
+        parsed: Dict[str, Any] = {}
+        if text is not None:
+            digest = hashlib.sha256(text.encode("utf-8")).digest()
+            try:
+                parsed = fast_safe_load(text)
+                if parsed is None and not text.strip():
+                    parsed = {}
+                if not isinstance(parsed, dict):
+                    raise TypeError("config.yaml root must be a mapping")
+            except Exception as exc:
+                _warn_config_parse_failure(config_path, exc, fallback="reject")
+                raise
+            if _STRICT_CURRENT_CONFIG_DIGESTS.get(path_key) != digest:
+                # A same-mtime/same-size edit can otherwise hit load_config's
+                # older cache. New validated bytes must rebuild the merged view.
+                _LOAD_CONFIG_CACHE.pop(path_key, None)
+                _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+        else:
+            _STRICT_CURRENT_CONFIG_DIGESTS.pop(path_key, None)
+
+        from hermes_cli import managed_scope
+
+        managed_dir = managed_scope.get_managed_dir()
+        managed_path = managed_dir / "config.yaml" if managed_dir else None
+        managed_key = str(managed_path) if managed_path is not None else None
+        managed_identity: Optional[tuple[int, int, int, int, int]] = None
+        managed_digest: Optional[bytes] = None
+        managed_text: Optional[str] = None
+        parsed_managed: Dict[str, Any] = {}
+        if managed_path is not None:
+            try:
+                with open(managed_path, encoding="utf-8") as managed_file:
+                    managed_identity = _identity(os.fstat(managed_file.fileno()))
+                    managed_text = managed_file.read()
+            except FileNotFoundError:
+                managed_identity = None
+                managed_text = None
+            except Exception:
+                if managed_key is not None:
+                    _STRICT_CURRENT_MANAGED_DIGESTS.pop(managed_key, None)
+                logger.warning(
+                    "Failed to read managed config for strict-current safety check",
+                    exc_info=True,
+                )
+                raise
+
+            try:
+                current_managed_identity = _identity(managed_path.stat())
+            except FileNotFoundError:
+                current_managed_identity = None
+            if current_managed_identity != managed_identity:
+                if managed_key is not None:
+                    _STRICT_CURRENT_MANAGED_DIGESTS.pop(managed_key, None)
+                managed_scope.invalidate_managed_cache()
+                _LOAD_CONFIG_CACHE.pop(path_key, None)
+                _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+                raise RuntimeError(
+                    "managed config.yaml changed during strict-current read"
+                )
+
+            if managed_text is not None and managed_key is not None:
+                managed_digest = hashlib.sha256(
+                    managed_text.encode("utf-8")
+                ).digest()
+                try:
+                    parsed_managed = fast_safe_load(managed_text)
+                    if parsed_managed is None and not managed_text.strip():
+                        parsed_managed = {}
+                    if not isinstance(parsed_managed, dict):
+                        raise TypeError("managed config.yaml root must be a mapping")
+                except Exception:
+                    _STRICT_CURRENT_MANAGED_DIGESTS.pop(managed_key, None)
+                    logger.warning(
+                        "Failed to parse managed config for strict-current "
+                        "safety check",
+                        exc_info=True,
+                    )
+                    raise
+                if (
+                    _STRICT_CURRENT_MANAGED_DIGESTS.get(managed_key)
+                    != managed_digest
+                ):
+                    _LOAD_CONFIG_CACHE.pop(path_key, None)
+                    _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+            elif managed_key is not None:
+                if managed_key in _STRICT_CURRENT_MANAGED_DIGESTS:
+                    managed_scope.invalidate_managed_cache()
+                    _LOAD_CONFIG_CACHE.pop(path_key, None)
+                    _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+                _STRICT_CURRENT_MANAGED_DIGESTS.pop(managed_key, None)
+
+        strict_cache_entry = _STRICT_CURRENT_CACHE_ENTRIES.get(path_key)
+        if (
+            strict_cache_entry is None
+            or strict_cache_entry[0] != managed_key
+            or _LOAD_CONFIG_CACHE.get(path_key) is not strict_cache_entry[1]
+        ):
+            # A newer ordinary load replaced (or cleared) the merged tuple that
+            # the last strict read authorized, or the managed source path changed.
+            # Rebuild from the pinned parsed sources even when bytes and
+            # mtime/size signatures form an ABA.
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+
+        source_pin = _StrictCurrentSourcePin(
+            config_path=config_path,
+            user_signature=(file_identity[2], file_identity[4])
+            if file_identity is not None
+            else None,
+            user_config=copy.deepcopy(parsed),
+            managed_signature=(managed_identity[2], managed_identity[4])
+            if managed_identity is not None
+            else (0, 0),
+            managed_config=copy.deepcopy(parsed_managed),
+        )
+        pin_token = _STRICT_CURRENT_SOURCE_PIN.set(source_pin)
+        try:
+            config = _load_config_impl(
+                want_deepcopy=True,
+                allow_last_known_good=False,
+            )
+        finally:
+            _STRICT_CURRENT_SOURCE_PIN.reset(pin_token)
+
+        after_config_path = get_config_path()
+        if after_config_path != config_path:
+            _STRICT_CURRENT_CONFIG_DIGESTS.pop(path_key, None)
+            _STRICT_CURRENT_CONFIG_DIGESTS.pop(str(after_config_path), None)
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LOAD_CONFIG_CACHE.pop(str(after_config_path), None)
+            _STRICT_CURRENT_CACHE_ENTRIES.pop(path_key, None)
+            _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+            _LKG_CONFIG_CACHE_PATHS.discard(str(after_config_path))
+            raise RuntimeError("config source path changed during strict-current load")
+
+        after_managed_dir = managed_scope.get_managed_dir()
+        after_managed_path = (
+            after_managed_dir / "config.yaml" if after_managed_dir else None
+        )
+        if after_managed_path != managed_path:
+            if managed_key is not None:
+                _STRICT_CURRENT_MANAGED_DIGESTS.pop(managed_key, None)
+            if after_managed_path is not None:
+                _STRICT_CURRENT_MANAGED_DIGESTS.pop(str(after_managed_path), None)
+            managed_scope.invalidate_managed_cache()
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _STRICT_CURRENT_CACHE_ENTRIES.pop(path_key, None)
+            _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+            raise RuntimeError(
+                "managed config source path changed during strict-current load"
+            )
+
+        try:
+            after_identity = _identity(config_path.stat())
+        except FileNotFoundError:
+            after_identity = None
+        if after_identity != file_identity:
+            _STRICT_CURRENT_CONFIG_DIGESTS.pop(path_key, None)
+            _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+            raise RuntimeError("config.yaml changed while strict-current load was in progress")
+
+        if managed_path is not None:
+            try:
+                after_managed_identity = _identity(managed_path.stat())
+            except FileNotFoundError:
+                after_managed_identity = None
+            if after_managed_identity != managed_identity:
+                if managed_key is not None:
+                    _STRICT_CURRENT_MANAGED_DIGESTS.pop(managed_key, None)
+                managed_scope.invalidate_managed_cache()
+                _LOAD_CONFIG_CACHE.pop(path_key, None)
+                _LKG_CONFIG_CACHE_PATHS.discard(path_key)
+                raise RuntimeError(
+                    "managed config.yaml changed during strict-current load"
+                )
+
+        if digest is not None:
+            _STRICT_CURRENT_CONFIG_DIGESTS[path_key] = digest
+        if managed_digest is not None and managed_key is not None:
+            _STRICT_CURRENT_MANAGED_DIGESTS[managed_key] = managed_digest
+        _STRICT_CURRENT_CACHE_ENTRIES[path_key] = (
+            managed_key,
+            _LOAD_CONFIG_CACHE.get(path_key),
+        )
+        return config
 
 
 def write_platform_config_field(
@@ -3339,30 +3630,44 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *,
+    want_deepcopy: bool,
+    allow_last_known_good: bool,
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
-        ensure_hermes_home()
-        config_path = get_config_path()
+        source_pin = _STRICT_CURRENT_SOURCE_PIN.get()
+        if source_pin is None:
+            ensure_hermes_home()
+            config_path = get_config_path()
+        else:
+            config_path = source_pin.config_path
         path_key = str(config_path)
 
-        try:
-            st = config_path.stat()
-            user_sig: Optional[Tuple[int, int]] = (st.st_mtime_ns, st.st_size)
-        except FileNotFoundError:
-            user_sig = None
+        if source_pin is not None:
+            user_sig = source_pin.user_signature
+        else:
+            try:
+                st = config_path.stat()
+                user_sig = (st.st_mtime_ns, st.st_size)
+            except FileNotFoundError:
+                user_sig = None
 
         # Managed scope: fold the managed config file's (mtime, size) into the
         # cache signature so editing /etc/hermes/config.yaml invalidates the
         # cached merged result. (0, 0) means "no managed config file".
         from hermes_cli import managed_scope
 
-        managed_dir = managed_scope.get_managed_dir()
-        managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
-        try:
-            mst = managed_cfg_path.stat() if managed_cfg_path else None
-            managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
-        except OSError:
-            managed_sig = (0, 0)
+        if source_pin is not None:
+            managed_sig = source_pin.managed_signature
+        else:
+            managed_dir = managed_scope.get_managed_dir()
+            managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
+            try:
+                mst = managed_cfg_path.stat() if managed_cfg_path else None
+                managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+            except OSError:
+                managed_sig = (0, 0)
 
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
@@ -3379,7 +3684,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            cached is not None
+            and cache_sig is not None
+            and cached[:4] == cache_sig
+            and (allow_last_known_good or path_key not in _LKG_CONFIG_CACHE_PATHS)
+        ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
@@ -3393,8 +3703,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
         if user_sig is not None:
             try:
-                with open(config_path, encoding="utf-8") as f:
-                    user_config = fast_safe_load(f) or {}
+                if source_pin is not None:
+                    user_config = copy.deepcopy(source_pin.user_config)
+                else:
+                    with open(config_path, encoding="utf-8") as f:
+                        user_config = fast_safe_load(f) or {}
 
                 if "max_turns" in user_config:
                     agent_user_config = dict(user_config.get("agent") or {})
@@ -3421,8 +3734,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 _warn_config_parse_failure(
                     config_path,
                     e,
-                    fallback="last-known-good" if lkg is not None else "defaults",
+                    fallback=(
+                        "last-known-good"
+                        if allow_last_known_good and lkg is not None
+                        else "reject"
+                        if not allow_last_known_good
+                        else "defaults"
+                    ),
                 )
+                if not allow_last_known_good:
+                    raise
                 if lkg is not None:
                     # save_config() stores the pre-expansion normalized dict
                     # (env-ref templates preserved); the load path stores the
@@ -3443,6 +3764,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                             cache_sig[2], cache_sig[3],
                             lkg_copy, _empty_env,
                         )
+                        _LKG_CONFIG_CACHE_PATHS.add(path_key)
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
@@ -3452,11 +3774,21 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        if source_pin is not None:
+            managed_config: Dict[str, Any] = copy.deepcopy(
+                source_pin.managed_config
+            )
+        else:
+            managed_config = managed_scope.load_managed_config()
         if managed_config:
-            managed_expanded = _expand_env_vars(managed_config)
+            from typing import cast as _cast
+
+            managed_expanded = _cast(
+                Dict[str, Any], _expand_env_vars(managed_config)
+            )
             expanded = _deep_merge(expanded, managed_expanded)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
+        _LKG_CONFIG_CACHE_PATHS.discard(path_key)
         if cache_sig is not None:
             # Cache stores a separate deepcopy so subsequent ``load_config()``
             # (deepcopy=True) callers can mutate freely without affecting the
@@ -3478,6 +3810,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                 return cached_copy
         else:
             _LOAD_CONFIG_CACHE.pop(path_key, None)
+            _LKG_CONFIG_CACHE_PATHS.discard(path_key)
         # First-load result is a fresh dict (not aliased to the cache); safe
         # to return directly. For the deepcopy=True path this is the
         # canonical "freshly-built mutable result" the function has always

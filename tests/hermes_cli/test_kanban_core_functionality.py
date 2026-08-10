@@ -1039,15 +1039,26 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     corrupt_db = tmp_path / "kanban.db"
     corrupt_db.write_text("not sqlite", encoding="utf-8")
 
-    monkeypatch.setattr(
-        _cfg_mod,
-        "load_config",
-        lambda: {
+    def _dispatcher_config():
+        # Boot-time dispatcher settings still use the ordinary loader. Its
+        # auto-decompose value deliberately models stale enabled LKG state;
+        # the live safety gate below must use strict-current instead.
+        return {
             "kanban": {
                 "dispatch_in_gateway": True,
+                "auto_decompose": True,
                 "dispatch_interval_seconds": 1,
             }
-        },
+        }
+
+    def _reject_current_config():
+        raise ValueError("synthetic malformed current config")
+
+    monkeypatch.setattr(_cfg_mod, "load_config", _dispatcher_config)
+    monkeypatch.setattr(
+        _cfg_mod,
+        "load_config_strict_current",
+        _reject_current_config,
     )
     monkeypatch.setattr(
         _kb,
@@ -1106,13 +1117,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kb.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # Strict-current rejection disables auto-decomposition despite the ordinary
+    # loader's stale enabled value, so each cycle has one ready/review probe
+    # connection. The first cycle also attempts dispatch; the second skips
+    # dispatch because the corrupt-board fingerprint is quarantined: 2 + 1 = 3.
+    assert calls["connect"] == 3
 
 
 # ---------------------------------------------------------------------------

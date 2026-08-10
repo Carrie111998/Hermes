@@ -37,21 +37,21 @@ def _resolve_auto_decompose_settings(
     intend reaches for this flag to halt it, and a stale boot-captured value
     silently ignoring that change is the bug reported in #49638.
 
-    Fails **safe**: if the config read raises, return ``(False, 3)`` — a
-    transient read error must never re-enable a feature the user turned off,
-    nor fall back to the burst-prone default-on behaviour. ``per_tick`` is
-    clamped to ``>= 1``.
+    Fails **safe**: if the config read raises, the parent section is malformed,
+    or the opt-in is anything except exact boolean ``True``, return disabled.
+    A transient read error or stale last-known-good value must never re-enable
+    a feature the user turned off. ``per_tick`` accepts exact integers only and
+    is clamped to ``>= 1``.
     """
     try:
         cfg = load_config()
     except Exception:
         return False, 3
-    kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    enabled = bool(kcfg.get("auto_decompose", True))
-    try:
-        per_tick = int(kcfg.get("auto_decompose_per_tick", 3) or 3)
-    except (TypeError, ValueError):
-        per_tick = 3
+    candidate = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    kcfg = candidate if isinstance(candidate, dict) else {}
+    enabled = kcfg.get("auto_decompose") is True
+    per_tick_value = kcfg.get("auto_decompose_per_tick", 3)
+    per_tick = per_tick_value if type(per_tick_value) is int else 3
     if per_tick < 1:
         per_tick = 1
     return enabled, per_tick
@@ -989,7 +989,10 @@ class GatewayKanbanWatchersMixin:
         # watcher here. Honours HERMES_KANBAN_DISPATCH_IN_GATEWAY env var
         # as an escape hatch (false-y value disables without editing YAML).
         try:
-            from hermes_cli.config import load_config as _load_config
+            from hermes_cli.config import (
+                load_config as _load_config,
+                load_config_strict_current as _load_strict_current_config,
+            )
         except Exception:
             logger.warning("kanban dispatcher: config loader unavailable; disabled")
             return
@@ -1003,8 +1006,9 @@ class GatewayKanbanWatchersMixin:
         except Exception as exc:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
+        candidate = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        kanban_cfg = candidate if isinstance(candidate, dict) else {}
+        if kanban_cfg.get("dispatch_in_gateway") is not True:
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
             )
@@ -1346,7 +1350,7 @@ class GatewayKanbanWatchersMixin:
 
         # Auto-decompose: turn fresh triage tasks into ready workgraphs
         # before the dispatcher fans out workers. Gated by
-        # ``kanban.auto_decompose`` (default True). Capped by
+        # ``kanban.auto_decompose`` (default False). Capped by
         # ``kanban.auto_decompose_per_tick`` (default 3) so a bulk-load
         # of triage tasks doesn't burst-spend the aux LLM in one tick;
         # remainder defers to subsequent ticks.
@@ -1361,7 +1365,7 @@ class GatewayKanbanWatchersMixin:
         # disabled" because the gateway had captured its boot-time value.)
         def _read_auto_decompose_settings() -> tuple[bool, int]:
             """Re-resolve (enabled, per_tick) from current config each tick."""
-            return _resolve_auto_decompose_settings(_load_config)
+            return _resolve_auto_decompose_settings(_load_strict_current_config)
 
         def _auto_decompose_tick(auto_decompose_per_tick: int) -> int:
             """Run the auto-decomposer for up to N triage tasks across all

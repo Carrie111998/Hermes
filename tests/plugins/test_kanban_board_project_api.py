@@ -9,6 +9,7 @@ on a scoped board inheriting the project.
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,6 +19,33 @@ from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import projects_db as pdb
+
+
+def _make_repo(repo: Path) -> Path:
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "--initial-branch=main", str(repo)],
+        check=True,
+    )
+    (repo / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Hermes Test",
+            "-c",
+            "user.email=hermes@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+    )
+    return repo
 
 
 def _load_plugin_router():
@@ -49,8 +77,7 @@ def client(kanban_home):
 
 @pytest.fixture
 def project(tmp_path):
-    repo = tmp_path / "widget-repo"
-    repo.mkdir()
+    repo = _make_repo(tmp_path / "widget-repo")
     with pdb.connect_closing() as conn:
         pid = pdb.create_project(conn, name="Widget", primary_path=str(repo))
     return {"id": pid, "primary_path": str(repo)}
@@ -114,6 +141,12 @@ def test_task_on_scoped_board_inherits_project(client, project):
 
     conn = kb.connect(board="widget")
     try:
-        assert kb.get_task(conn, task_id).project_id == project["id"]
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.project_id == project["id"]
+        workspace = kb.resolve_workspace(task)
+        assert kb._git_common_dir(workspace) == kb._git_common_dir(
+            Path(project["primary_path"])
+        )
     finally:
         conn.close()

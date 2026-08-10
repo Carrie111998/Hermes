@@ -1867,9 +1867,8 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     the dashboard uses, so CLI output matches what the UI shows.
     """
     from hermes_cli import kanban_diagnostics as kd
-    from hermes_cli.config import load_config
 
-    diag_config = kd.config_from_runtime_config(load_config())
+    diag_config = kd.load_runtime_diagnostics_config()
 
     with kb.connect_closing() as conn:
         # Either one-task mode or fleet mode.

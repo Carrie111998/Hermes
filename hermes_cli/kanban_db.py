@@ -87,7 +87,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, cast
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -2878,6 +2878,107 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+@contextlib.contextmanager
+def _locked_project_authority(
+    project_db_module: Any,
+    project_db_path: Path,
+    project_id: str,
+    *,
+    expected_slug: str,
+    expected_repo: Path,
+    expected_git_identity: tuple[Path, int, int],
+    drift_message: str,
+):
+    """Pin project authority while a Kanban write transaction runs.
+
+    The projects reservation is always acquired before the Kanban reservation.
+    Every path that needs both databases uses this helper, so concurrent project
+    edits cannot create stale routes and the two SQLite locks cannot invert.
+    """
+    if project_db_module.projects_db_path() != project_db_path:
+        raise ValueError(drift_message)
+    with project_db_module.connect_closing(db_path=project_db_path) as project_conn:
+        with project_db_module.write_txn(project_conn):
+            try:
+                current = project_db_module.get_project(project_conn, project_id)
+                current_source = (
+                    Path(current.primary_path).expanduser()
+                    if current is not None and current.primary_path
+                    else None
+                )
+                current_repo = (
+                    current_source.resolve(strict=False)
+                    if current_source is not None
+                    else None
+                )
+            except Exception as exc:
+                raise ValueError(drift_message) from exc
+            if (
+                current is None
+                or current.id != project_id
+                or current.slug != expected_slug
+                or current_source is None
+                or not current_source.is_absolute()
+                or _path_has_symlink_component(current_source)
+                or current_repo != expected_repo
+                or _git_common_dir_identity(expected_repo) != expected_git_identity
+            ):
+                raise ValueError(drift_message)
+            yield current
+
+
+@contextlib.contextmanager
+def _project_authorized_write_txn(
+    conn: sqlite3.Connection,
+    authority_context: Any,
+):
+    """Acquire project authority first, then the Kanban write reservation."""
+    with authority_context:
+        with write_txn(conn):
+            yield conn
+
+
+def _canonical_project_task_route(
+    project_db_module: Any,
+    project: Any,
+    project_repo: Path,
+    task_id: str,
+    title: str,
+    *,
+    requested_workspace_kind: str,
+    requested_workspace_path: Optional[str],
+    requested_branch_name: Optional[str],
+) -> tuple[str, str, str]:
+    """Validate caller companions and return the sole project task route."""
+    if requested_workspace_kind not in {"scratch", "worktree"}:
+        raise ValueError(
+            "project-linked task must use the authoritative project worktree"
+        )
+    expected_workspace = project_repo / ".worktrees" / task_id
+    if _path_has_symlink_component(expected_workspace):
+        raise ValueError(
+            "project-linked task has a symlinked authoritative workspace route"
+        )
+    expected_workspace_path = str(expected_workspace)
+    expected_branch_name = project_db_module.branch_name_for(
+        project, task_id, title=title
+    )
+    if (
+        requested_workspace_path
+        and Path(requested_workspace_path).expanduser()
+        != Path(expected_workspace_path)
+    ):
+        raise ValueError(
+            "project-linked task workspace path does not match the authoritative "
+            "project route"
+        )
+    if requested_branch_name and requested_branch_name != expected_branch_name:
+        raise ValueError(
+            "project-linked task branch does not match the authoritative project route"
+        )
+    return "worktree", expected_workspace_path, expected_branch_name
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2940,11 +3041,10 @@ def create_task(
     ``--reasoning <level>``. It is independent of ``model_override``: a task
     can run the profile's own model at a different depth.
 
-    ``project_source_task_id`` is an internal cross-profile fallback for a
-    worker-created child. When the active profile cannot resolve ``project_id``
-    in its own projects.db, a matching canonical project-linked task in this
-    board can supply the repo and branch convention. Its literal worktree is
-    never reused; the new task still gets its own task-id-keyed path.
+    ``project_source_task_id`` is retained for caller compatibility, but a task
+    row is never accepted as project authority. Every non-empty ``project_id``
+    must resolve through the active profile's projects.db before any row is
+    written.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -2967,6 +3067,9 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    requested_workspace_kind = workspace_kind
+    requested_workspace_path = workspace_path
+    requested_branch_name = branch_name
 
     # Inherit the board's scoped project when the caller didn't name one, so a
     # project-scoped board anchors every new task to that project's repo
@@ -2984,90 +3087,55 @@ def create_task(
     # anchored to the project's primary repo as a git worktree, so its branch
     # can be named deterministically (project slug + task id) instead of the
     # random ``wt/<task-id>`` fallback the worker skill applies when no branch
-    # is set. Projects live in the creator's per-profile projects.db; the repo
-    # path is absolute (profile-independent) and the branch name is pure, so the
-    # cross-profile dispatcher needs no projects.db access at dispatch time.
+    # is set. Projects live in the active profile's projects.db; creation and
+    # dispatch both validate that registry-derived route rather than trusting a
+    # task row, board default, or caller-supplied companion.
     project_obj = None
     # Primary repo of a project-linked worktree task whose path we still need to
     # derive (a fresh worktree dir under the repo, computed once task_id exists).
     project_repo: Optional[str] = None
+    project_db_module = None
+    project_db_path: Optional[Path] = None
+    project_git_identity: Optional[tuple[Path, int, int]] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
     if project_id:
         from hermes_cli import projects_db as _pdb
 
+        project_db_module = _pdb
         try:
-            with _pdb.connect_closing() as _pconn:
+            resolved_project_db_path = _pdb.projects_db_path()
+            if not resolved_project_db_path.is_file():
+                raise LookupError("projects.db is unavailable")
+            project_db_path = resolved_project_db_path
+            with _pdb.connect_closing(db_path=resolved_project_db_path) as _pconn:
                 project_obj = _pdb.get_project(_pconn, project_id)
-        except Exception:
-            project_obj = None
-        if project_obj is None and project_source_task_id:
-            # Worker profiles have their own projects.db, while the Kanban DB is
-            # intentionally shared. Recover routing only from a canonical
-            # project-linked source task in this same board. This carries the
-            # repo + project branch convention forward without copying or
-            # opening the creator profile's project store, and without reusing
-            # the source task's literal worktree path.
-            source_task = get_task(conn, str(project_source_task_id))
-            if (
-                source_task is not None
-                and source_task.project_id == project_id
-                and source_task.workspace_kind == "worktree"
-                and source_task.workspace_path
-            ):
-                source_path = Path(source_task.workspace_path)
-                if (
-                    source_path.is_absolute()
-                    and source_path.name == source_task.id
-                    and source_path.parent.name == ".worktrees"
-                ):
-                    project_slug = None
-                    if source_task.branch_name:
-                        prefix, separator, leaf = source_task.branch_name.partition("/")
-                        if separator and (
-                            leaf == source_task.id
-                            or leaf.startswith(f"{source_task.id}-")
-                        ):
-                            try:
-                                project_slug = _pdb.normalize_slug(prefix)
-                            except ValueError:
-                                project_slug = None
-                    if project_slug is None:
-                        try:
-                            project_slug = _pdb.normalize_slug(project_id)
-                        except ValueError:
-                            project_slug = None
-                    if project_slug:
-                        project_repo = str(source_path.parent.parent)
-                        project_obj = _pdb.Project(
-                            id=project_id,
-                            slug=project_slug,
-                            name=project_slug,
-                            created_at=0,
-                            primary_path=project_repo,
-                        )
-                        if workspace_kind == "scratch":
-                            workspace_kind = "worktree"
-
-        if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
-            project_id = None
-        else:
-            # Canonicalise (a slug may have been passed) and anchor the
-            # worktree under the project's primary repo.
-            project_id = project_obj.id
-            if workspace_kind == "scratch" and project_obj.primary_path:
-                workspace_kind = "worktree"
-            if (
-                workspace_kind == "worktree"
-                and workspace_path is None
-                and project_obj.primary_path
-            ):
-                # Defer the concrete path to the insert loop: it's a fresh
-                # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
-                project_repo = str(project_obj.primary_path)
+        except Exception as exc:
+            raise ValueError(
+                "project-linked task has no authoritative project"
+            ) from exc
+        if project_obj is None or not project_obj.id or not project_obj.primary_path:
+            raise ValueError("project-linked task has no authoritative project")
+        authoritative_repo = Path(project_obj.primary_path).expanduser()
+        if not authoritative_repo.is_absolute():
+            raise ValueError(
+                "project-linked task has a non-absolute project repository"
+            )
+        if _path_has_symlink_component(authoritative_repo):
+            raise ValueError(
+                "project-linked task has a symlinked project repository"
+            )
+        # Canonicalise a caller-supplied slug to the registry's stable id. The
+        # registry row—not a task row—also supplies the only accepted repo root.
+        project_id = project_obj.id
+        authoritative_repo = authoritative_repo.resolve(strict=False)
+        project_git_identity = _git_common_dir_identity(authoritative_repo)
+        if project_git_identity is None:
+            raise ValueError(
+                "project-linked task authoritative repository is not a Git repository"
+            )
+        project_repo = str(authoritative_repo)
+        workspace_kind = "worktree"
 
     parents = tuple(p for p in parents if p)
 
@@ -3157,7 +3225,55 @@ def create_task(
     for attempt in range(2):
         task_id = _new_task_id()
         try:
-            with write_txn(conn):
+            if project_obj is not None:
+                assert project_db_module is not None
+                assert project_db_path is not None
+                assert project_repo is not None
+                authority_context = _locked_project_authority(
+                    project_db_module,
+                    project_db_path,
+                    project_obj.id,
+                    expected_slug=project_obj.slug,
+                    expected_repo=Path(project_repo),
+                    expected_git_identity=cast(
+                        tuple[Path, int, int], project_git_identity
+                    ),
+                    drift_message=(
+                        "project-linked task authority changed during creation; retry"
+                    ),
+                )
+            else:
+                authority_context = contextlib.nullcontext()
+            with _project_authorized_write_txn(conn, authority_context):
+                task_workspace_kind = workspace_kind
+                task_workspace_path = workspace_path
+                task_branch_name = branch_name
+                if project_obj is not None:
+                    assert project_db_module is not None
+                    assert project_repo is not None
+                    if (
+                        project_git_identity is None
+                        or _git_common_dir_identity(Path(project_repo))
+                        != project_git_identity
+                    ):
+                        raise ValueError(
+                            "project-linked task authority changed during creation; retry"
+                        )
+                    (
+                        task_workspace_kind,
+                        task_workspace_path,
+                        task_branch_name,
+                    ) = _canonical_project_task_route(
+                        project_db_module,
+                        project_obj,
+                        Path(project_repo),
+                        task_id,
+                        title or "",
+                        requested_workspace_kind=requested_workspace_kind,
+                        requested_workspace_path=requested_workspace_path,
+                        requested_branch_name=requested_branch_name,
+                    )
+
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -3190,24 +3306,6 @@ def create_task(
                     if missing:
                         raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
 
-                # Project-linked worktree: a fresh worktree dir under the repo
-                # plus a deterministic branch (project slug + task id). Together
-                # these kill the random ``wt/<task-id>`` worker fallback and the
-                # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
-                            project_repo, ".worktrees", task_id
-                        )
-                    if not branch_name:
-                        # _pdb was imported above when project_obj was resolved.
-                        try:
-                            branch_name = _pdb.branch_name_for(
-                                project_obj, task_id, title=title or ""
-                            )
-                        except Exception:
-                            branch_name = None
-
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3229,9 +3327,9 @@ def create_task(
                         priority,
                         created_by,
                         now,
-                        workspace_kind,
-                        workspace_path,
-                        branch_name,
+                        task_workspace_kind,
+                        task_workspace_path,
+                        task_branch_name,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -3260,9 +3358,9 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
-                        "workspace_kind": workspace_kind,
-                        "workspace_path": workspace_path,
-                        "branch_name": branch_name,
+                        "workspace_kind": task_workspace_kind,
+                        "workspace_path": task_workspace_path,
+                        "branch_name": task_branch_name,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -6137,6 +6235,168 @@ def decompose_triage_task(
     if _seen != len(children):
         raise ValueError("cyclic dependency detected in decomposed children list")
 
+    # Resolve project identity before taking the Kanban write lock. Projects
+    # live in a separate per-profile SQLite DB. The transaction below reserves
+    # that authority DB first and the Kanban DB second, matching create_task(),
+    # so a concurrent registry or task edit cannot turn this preflight into a
+    # stale authorization or invert the two database locks.
+    preflight_root = conn.execute(
+        "SELECT id, status, project_id, workspace_kind, workspace_path, "
+        "branch_name FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if preflight_root is None:
+        return None
+    if preflight_root["status"] != "triage":
+        return None
+
+    preflight_route = (
+        preflight_root["project_id"],
+        preflight_root["workspace_kind"],
+        preflight_root["workspace_path"],
+        preflight_root["branch_name"],
+    )
+    project_repo: Optional[Path] = None
+    project_obj = None
+    project_db_module = None
+    project_db_path: Optional[Path] = None
+    project_branch_name_for = None
+    project_source_path: Optional[Path] = None
+    project_source_existed = False
+    project_root_branch: Optional[str] = None
+    project_common_dir: Optional[Path] = None
+    project_git_identity: Optional[tuple[Path, int, int]] = None
+    preflight_project_id = preflight_root["project_id"]
+    preflight_ws_kind = preflight_root["workspace_kind"] or "scratch"
+    if preflight_project_id:
+        if preflight_ws_kind != "worktree":
+            raise ValueError(
+                f"project-linked task {task_id} must use an authoritative "
+                "project worktree"
+            )
+        source_path = (
+            Path(preflight_root["workspace_path"]).expanduser()
+            if preflight_root["workspace_path"]
+            else None
+        )
+        if not (
+            source_path is not None
+            and source_path.is_absolute()
+            and source_path.parent.name == ".worktrees"
+            and source_path.name == task_id
+            and not _path_has_symlink_component(source_path)
+        ):
+            raise ValueError(
+                f"project-linked worktree task {task_id} has no canonical "
+                "project workspace route"
+            )
+
+        from hermes_cli import projects_db as _pdb
+
+        project_db_module = _pdb
+
+        try:
+            resolved_project_db_path = _pdb.projects_db_path()
+            if not resolved_project_db_path.is_file():
+                raise LookupError("projects.db is unavailable")
+            project_db_path = resolved_project_db_path
+            with _pdb.connect_closing(
+                db_path=resolved_project_db_path
+            ) as project_conn:
+                authoritative_project = _pdb.get_project(
+                    project_conn, preflight_project_id
+                )
+        except Exception as exc:
+            raise ValueError(
+                f"project-linked worktree task {task_id} has no authoritative "
+                "project repository"
+            ) from exc
+
+        if (
+            authoritative_project is None
+            or authoritative_project.id != preflight_project_id
+            or not authoritative_project.primary_path
+        ):
+            raise ValueError(
+                f"project-linked worktree task {task_id} has no authoritative "
+                "project repository"
+            )
+
+        authoritative_repo = Path(
+            authoritative_project.primary_path
+        ).expanduser()
+        if not authoritative_repo.is_absolute():
+            raise ValueError(
+                f"project-linked worktree task {task_id} has a non-absolute "
+                "authoritative project repository"
+            )
+        if _path_has_symlink_component(authoritative_repo):
+            raise ValueError(
+                f"project-linked worktree task {task_id} has a symlinked "
+                "authoritative project repository"
+            )
+        authoritative_repo = authoritative_repo.resolve(strict=False)
+        source_repo = source_path.parent.parent.resolve(strict=False)
+        if source_repo != authoritative_repo:
+            raise ValueError(
+                f"project-linked worktree task {task_id} workspace repository "
+                "does not match authoritative project repository"
+            )
+
+        root_branch = (preflight_root["branch_name"] or "").strip()
+        project_git_identity = _git_common_dir_identity(authoritative_repo)
+        if project_git_identity is None:
+            raise ValueError(
+                f"project-linked worktree task {task_id} authoritative project "
+                "repository is not a Git repository"
+            )
+        authoritative_common_dir = project_git_identity[0]
+        if source_path.exists():
+            source_common_dir = _git_common_dir(source_path)
+            source_toplevel = _git_toplevel(source_path)
+            if (
+                source_common_dir != authoritative_common_dir
+                or source_toplevel != source_path.resolve(strict=False)
+                or not _is_linked_worktree_checkout(source_path)
+            ):
+                raise ValueError(
+                    f"project-linked worktree task {task_id} effective Git "
+                    "repository does not match authoritative project"
+                )
+            if _git_current_branch(source_path) != root_branch:
+                raise ValueError(
+                    f"project-linked worktree task {task_id} actual Git branch "
+                    "does not match authoritative project identity"
+                )
+
+        expected_branch_prefix = f"{authoritative_project.slug}/{task_id}"
+        if not (
+            root_branch == expected_branch_prefix
+            or root_branch.startswith(f"{expected_branch_prefix}-")
+        ):
+            raise ValueError(
+                f"project-linked worktree task {task_id} branch does not match "
+                "authoritative project identity"
+            )
+
+        project_repo = authoritative_repo
+        project_obj = authoritative_project
+        project_branch_name_for = _pdb.branch_name_for
+        project_source_path = source_path
+        project_source_existed = source_path.exists()
+        project_root_branch = root_branch
+        project_common_dir = authoritative_common_dir
+
+        for idx, child in enumerate(children):
+            requested_kind = child.get("workspace_kind")
+            if child.get("workspace_path") or (
+                requested_kind is not None and requested_kind != "worktree"
+            ):
+                raise ValueError(
+                    f"project-linked child[{idx}] cannot override authoritative "
+                    "project workspace"
+                )
+
     # We do the full decomposition in a SINGLE write_txn so it's
     # atomic: either every child is created AND the root flips to
     # ``todo``, or nothing changes. We deliberately do NOT call any
@@ -6146,9 +6406,35 @@ def decompose_triage_task(
     # _append_event calls.
     now = int(time.time())
     child_ids: list[str] = []
-    with write_txn(conn):
+    if preflight_project_id:
+        if (
+            project_repo is None
+            or project_obj is None
+            or project_db_module is None
+            or project_db_path is None
+            or project_common_dir is None
+            or project_git_identity is None
+        ):
+            raise ValueError(
+                f"task {task_id} project routing changed during decomposition; retry"
+            )
+        authority_context = _locked_project_authority(
+            project_db_module,
+            project_db_path,
+            preflight_project_id,
+            expected_slug=project_obj.slug,
+            expected_repo=project_repo,
+            expected_git_identity=project_git_identity,
+            drift_message=(
+                f"task {task_id} project routing changed during decomposition; retry"
+            ),
+        )
+    else:
+        authority_context = contextlib.nullcontext()
+    with _project_authorized_write_txn(conn, authority_context):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, project_id, workspace_kind, workspace_path, "
+            "branch_name "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -6156,7 +6442,50 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
+        current_route = (
+            root_row["project_id"],
+            root_row["workspace_kind"],
+            root_row["workspace_path"],
+            root_row["branch_name"],
+        )
+        if current_route != preflight_route:
+            raise ValueError(
+                f"task {task_id} project routing changed during decomposition; retry"
+            )
+        if preflight_project_id:
+            if (
+                project_repo is None
+                or project_obj is None
+                or project_db_module is None
+                or project_db_path is None
+                or project_source_path is None
+                or project_root_branch is None
+                or project_common_dir is None
+                or project_git_identity is None
+            ):
+                raise ValueError(
+                    f"task {task_id} project routing changed during decomposition; retry"
+                )
+            if (
+                _git_common_dir_identity(project_repo) != project_git_identity
+                or project_source_path.exists() != project_source_existed
+                or _path_has_symlink_component(project_source_path)
+            ):
+                raise ValueError(
+                    f"task {task_id} project routing changed during decomposition; retry"
+                )
+            if project_source_existed and (
+                not _is_linked_worktree_checkout(project_source_path)
+                or _git_toplevel(project_source_path)
+                != project_source_path.resolve(strict=False)
+                or _git_common_dir(project_source_path) != project_common_dir
+                or _git_current_branch(project_source_path) != project_root_branch
+            ):
+                raise ValueError(
+                    f"task {task_id} project routing changed during decomposition; retry"
+                )
         tenant = root_row["tenant"]
+        project_id = root_row["project_id"]
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -6179,26 +6508,48 @@ def decompose_triage_task(
             # child can't accidentally point a 'dir' at the root's
             # worktree path or vice versa).
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
+            child_branch_name = None
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
             elif child_ws_kind == "worktree":
-                # Never share one worktree checkout between siblings: the
-                # root's literal path would put every child in the same
-                # directory on the first-dispatched sibling's branch, with
-                # no lock — siblings can be promoted and dispatched
-                # concurrently. Leave the path unset so dispatch
-                # materializes a fresh <repo>/.worktrees/<child-id> per
-                # child from the board anchor.
-                child_ws_path = None
+                if project_id:
+                    # Project identity is an effective routing boundary, not
+                    # display-only metadata. Anchor every child to the root's
+                    # project repo and give it its own path + branch; never
+                    # fall back to a possibly unrelated board default.
+                    if (
+                        project_repo is None
+                        or project_obj is None
+                        or project_branch_name_for is None
+                    ):
+                        raise ValueError(
+                            f"project-linked child {new_id} has no project route"
+                        )
+                    child_ws_path = str(project_repo / ".worktrees" / new_id)
+                    child_branch_name = project_branch_name_for(
+                        project_obj, new_id, title=title
+                    )
+                else:
+                    # Never share one worktree checkout between siblings: the
+                    # root's literal path would put every child in the same
+                    # directory on the first-dispatched sibling's branch, with
+                    # no lock. Leave the path unset so dispatch materializes a
+                    # fresh child worktree from the board anchor.
+                    child_ws_path = None
+                    child_branch_name = None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
+                child_branch_name = None
             else:
                 child_ws_path = None
+                child_branch_name = None
+            if child.get("workspace_path"):
+                child_branch_name = None
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, branch_name, tenant, project_id, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -6206,7 +6557,9 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    child_branch_name,
                     tenant,
+                    project_id,
                     now,
                     (author or "decomposer"),
                 ),
@@ -6423,6 +6776,25 @@ def _git_common_dir(path: Path) -> Optional[Path]:
     return Path(out).expanduser().resolve(strict=False)
 
 
+def _git_common_dir_identity(path: Path) -> Optional[tuple[Path, int, int]]:
+    """Return the common-dir path plus filesystem identity for Git authority.
+
+    A path-only common-dir comparison misses repository replacement when a new
+    ``.git`` directory appears at the same lexical path. Device and inode bind
+    the authority check to the directory validated during preflight.
+    """
+    common_dir = _git_common_dir(path)
+    if common_dir is None:
+        return None
+    try:
+        metadata = common_dir.stat()
+    except OSError:
+        return None
+    if not common_dir.is_dir():
+        return None
+    return common_dir, metadata.st_dev, metadata.st_ino
+
+
 def _git_dir(path: Path) -> Optional[Path]:
     try:
         result = subprocess.run(
@@ -6460,11 +6832,36 @@ def _git_current_branch(path: Path) -> Optional[str]:
 
 
 def _is_linked_worktree_checkout(path: Path) -> bool:
+    """Return whether ``path`` owns a canonical linked-worktree registration.
+
+    Git metadata alone is not enough: a counterfeit directory can symlink or
+    copy another worktree's ``.git`` file and then report the expected branch,
+    toplevel, and common directory. Require a regular, non-symlink gitfile and
+    verify that the administrative worktree directory points back to this exact
+    checkout's gitfile.
+    """
+    git_entry = path / ".git"
+    try:
+        if git_entry.is_symlink() or not git_entry.is_file():
+            return False
+    except OSError:
+        return False
+
     git_dir = _git_dir(path)
     common_dir = _git_common_dir(path)
-    if git_dir is None or common_dir is None:
+    if git_dir is None or common_dir is None or git_dir == common_dir:
         return False
-    return git_dir != common_dir
+
+    try:
+        backpointer_text = (git_dir / "gitdir").read_text(encoding="utf-8").strip()
+        if not backpointer_text:
+            return False
+        backpointer = Path(backpointer_text).expanduser()
+        if not backpointer.is_absolute():
+            backpointer = git_dir / backpointer
+        return backpointer.resolve(strict=False) == git_entry.resolve(strict=False)
+    except OSError:
+        return False
 
 
 def _nearest_existing_path(path: Path) -> Path:
@@ -6472,6 +6869,26 @@ def _nearest_existing_path(path: Path) -> Path:
     while not current.exists() and current != current.parent:
         current = current.parent
     return current
+
+
+def _path_has_symlink_component(path: Path) -> bool:
+    """Return whether any lexical component of ``path`` is a symlink.
+
+    Resolving first would erase the alias evidence. Missing future target
+    components are allowed; lookup failures on existing ancestry fail closed.
+    """
+    current = path.expanduser()
+    if not current.is_absolute():
+        current = Path.cwd() / current
+    while True:
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
 
 
 def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
@@ -6488,11 +6905,24 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
+    if _path_has_symlink_component(target):
+        raise RuntimeError(f"git worktree target {target} uses a symlink alias")
     repo_common = _git_common_dir(repo_root)
-    if target.exists() and repo_common is not None:
+    if target.exists():
         target_common = _git_common_dir(target)
-        if target_common == repo_common:
+        actual_branch = _git_current_branch(target)
+        if (
+            repo_common is not None
+            and target_common == repo_common
+            and _is_linked_worktree_checkout(target)
+            and _git_toplevel(target) == target.resolve(strict=False)
+            and actual_branch == branch_name
+        ):
             return
+        raise RuntimeError(
+            f"git worktree target {target} is occupied by branch "
+            f"{actual_branch or '<unknown>'}; expected {branch_name}"
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
@@ -6515,6 +6945,76 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _authoritative_project_worktree_common_dir(
+    task: Task,
+    requested: Path,
+    branch_name: str,
+) -> Path:
+    """Validate a project task's persisted route at dispatch time."""
+    from hermes_cli import projects_db as _pdb
+
+    project_id = task.project_id
+    if not project_id:
+        raise ValueError(
+            f"project-linked task {task.id} has no authoritative project route"
+        )
+    try:
+        if not _pdb.projects_db_path().is_file():
+            raise LookupError("projects.db is unavailable")
+        with _pdb.connect_closing() as project_conn:
+            project = _pdb.get_project(project_conn, project_id)
+    except Exception as exc:
+        raise ValueError(
+            f"project-linked task {task.id} has no authoritative project route"
+        ) from exc
+    if (
+        project is None
+        or project.id != project_id
+        or not project.primary_path
+    ):
+        raise ValueError(
+            f"project-linked task {task.id} has no authoritative project route"
+        )
+    project_repo = Path(project.primary_path).expanduser()
+    if not project_repo.is_absolute():
+        raise ValueError(
+            f"project-linked task {task.id} has a non-absolute project repository"
+        )
+    if _path_has_symlink_component(project_repo):
+        raise ValueError(
+            f"project-linked task {task.id} has a symlinked project repository"
+        )
+    project_repo = project_repo.resolve(strict=False)
+    expected_target = project_repo / ".worktrees" / task.id
+    if (
+        not requested.is_absolute()
+        or _path_has_symlink_component(requested)
+        or _path_has_symlink_component(expected_target.parent)
+    ):
+        raise ValueError(
+            f"project-linked task {task.id} has no canonical project worktree path"
+        )
+    if requested != expected_target:
+        raise ValueError(
+            f"project-linked task {task.id} has no canonical project worktree path"
+        )
+    expected_branch_prefix = f"{project.slug}/{task.id}"
+    if not (
+        branch_name == expected_branch_prefix
+        or branch_name.startswith(f"{expected_branch_prefix}-")
+    ):
+        raise ValueError(
+            f"project-linked task {task.id} branch does not match authoritative "
+            "project identity"
+        )
+    common_dir = _git_common_dir(project_repo)
+    if common_dir is None:
+        raise ValueError(
+            f"project-linked task {task.id} authoritative repository is not Git"
+        )
+    return common_dir
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -6530,6 +7030,10 @@ def _resolve_worktree_workspace(
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
+        if task.project_id:
+            raise ValueError(
+                f"project-linked task {task.id} has no canonical project worktree path"
+            )
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
         # scatters worktrees under whatever repo the gateway started in.
@@ -6565,28 +7069,70 @@ def _resolve_worktree_workspace(
             f"{task.workspace_path!r}; use an absolute path"
         )
     requested_resolved = requested.resolve(strict=False)
+    project_common_dir = None
+    if task.project_id:
+        project_common_dir = _authoritative_project_worktree_common_dir(
+            task,
+            requested,
+            branch_name,
+        )
 
-    if requested.exists() and _is_linked_worktree_checkout(requested):
+    if requested.exists():
+        actual_common_dir = _git_common_dir(requested)
+        actual_toplevel = _git_toplevel(requested)
         actual_branch = _git_current_branch(requested)
-        if actual_branch == branch_name:
+        owns_registration = _is_linked_worktree_checkout(requested)
+        if (
+            project_common_dir is not None
+            and actual_common_dir != project_common_dir
+        ):
+            raise ValueError(
+                f"project-linked task {task.id} effective Git repository does "
+                "not match authoritative project"
+            )
+        if actual_toplevel != requested_resolved and project_common_dir is not None:
+            raise ValueError(
+                f"project-linked task {task.id} does not name the exact "
+                "linked worktree checkout"
+            )
+        if (
+            owns_registration
+            and actual_branch == branch_name
+            and actual_toplevel == requested_resolved
+        ):
             return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT
-        # task's branch. Decompose children inherit the root's
-        # workspace_path verbatim, so siblings all point here; reusing
-        # the checkout as-is would run this task on the other task's
-        # branch — silent cross-task provenance corruption, and unsafe
-        # when siblings run concurrently. Fall back to a fresh worktree
-        # of our own under the same repo.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
-        if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
-            if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        if project_common_dir is not None:
+            # A project route has one authoritative target. Never downgrade an
+            # occupied canonical target into the generic repository-root
+            # fallback, including when the project's primary path is a Git
+            # subdirectory rather than the repository root.
+            raise ValueError(
+                f"task {task.id} worktree path {requested} is occupied by branch "
+                f"{actual_branch or '<unknown>'}; expected {branch_name}"
+            )
+
+        # A nested path or counterfeit gitfile can report another linked
+        # worktree's repository and branch without owning that worktree's
+        # registration. An unlinked task may recover only by materializing a
+        # distinct target under the same repository; it must never reuse the
+        # occupied path itself.
+        git_dir = _git_dir(requested)
+        if (
+            actual_toplevel is not None
+            and actual_common_dir is not None
+            and git_dir is not None
+            and git_dir != actual_common_dir
+        ):
+            fallback_root = _repo_root_for_worktree_target(requested.parent)
+            if fallback_root is not None:
+                fallback = fallback_root / ".worktrees" / task.id
+                if fallback.resolve(strict=False) != requested_resolved:
+                    _ensure_git_worktree(fallback_root, fallback, branch_name)
+                    return fallback.resolve(strict=False), branch_name
+            raise ValueError(
+                f"task {task.id} worktree path {requested} is occupied by branch "
+                f"{actual_branch or '<unknown>'}; expected {branch_name}"
+            )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
@@ -6631,6 +7177,11 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     so subsequent runs reuse the same directory.
     """
     kind = task.workspace_kind or "scratch"
+    if task.project_id and kind != "worktree":
+        raise ValueError(
+            f"project-linked task {task.id} must use an authoritative "
+            "project worktree"
+        )
     if kind == "scratch":
         if task.workspace_path:
             # Legacy scratch tasks that were set to an explicit path get the

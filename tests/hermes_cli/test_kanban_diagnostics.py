@@ -62,6 +62,31 @@ def _run(outcome="completed", run_id=1, error=None):
     }
 
 
+@pytest.mark.parametrize("value", ["false", "true", 1, 0, [], {}])
+def test_triage_aux_status_only_exact_true_enables_auto_decompose(value):
+    status = kd.triage_aux_status(
+        {
+            "kanban": {"auto_decompose": value},
+            "model": {"provider": "test", "default": "model"},
+        }
+    )
+
+    assert status is not None
+    assert status["auto_decompose"] is False
+
+
+def test_triage_aux_status_preserves_explicit_boolean_true():
+    status = kd.triage_aux_status(
+        {
+            "kanban": {"auto_decompose": True},
+            "model": {"provider": "test", "default": "model"},
+        }
+    )
+
+    assert status is not None
+    assert status["auto_decompose"] is True
+
+
 # ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------
@@ -224,3 +249,89 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+def test_config_from_runtime_config_disables_only_stale_auto_gate():
+    runtime = {
+        "kanban": {"auto_decompose": True, "failure_limit": 7},
+        "auxiliary": {"kanban_decomposer": {"provider": "test"}},
+        "model": {"provider": "test", "default": "model"},
+    }
+
+    config = kd.config_from_runtime_config(runtime, current_config=None)
+    status = kd.triage_aux_status(config)
+
+    assert status is not None
+    assert status["auto_decompose"] is False
+    assert status["decomposer_explicit"] is True
+    assert status["main_model_visible"] is True
+    assert config["failure_threshold"] == 7
+
+
+def test_load_runtime_diagnostics_config_rejects_enabled_lkg(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import config as config_module
+
+    hermes_home = tmp_path / ".hermes-diagnostics-lkg"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
+    config_module._LOAD_CONFIG_CACHE.clear()
+    config_module._LAST_EXPANDED_CONFIG_BY_PATH.clear()
+    config_module._LKG_CONFIG_CACHE_PATHS.clear()
+    config_module._STRICT_CURRENT_CONFIG_DIGESTS.clear()
+    config_module._STRICT_CURRENT_MANAGED_DIGESTS.clear()
+
+    config_path.write_text(
+        "kanban:\n"
+        "  auto_decompose: true\n"
+        "  failure_limit: 7\n"
+        "model:\n"
+        "  provider: test\n"
+        "  default: model\n",
+        encoding="utf-8",
+    )
+    initial_status = kd.triage_aux_status(config_module.load_config())
+    assert initial_status is not None
+    assert initial_status["auto_decompose"] is True
+
+    config_path.write_text(
+        "kanban:\n  auto_decompose: [\n",
+        encoding="utf-8",
+    )
+    stale_status = kd.triage_aux_status(config_module.load_config())
+    assert stale_status is not None
+    assert stale_status["auto_decompose"] is True
+
+    diagnostics_config = kd.load_runtime_diagnostics_config()
+    diagnostics_status = kd.triage_aux_status(diagnostics_config)
+    assert diagnostics_status is not None
+    assert diagnostics_status["auto_decompose"] is False
+    assert diagnostics_config["failure_threshold"] == 7
+
+
+def test_cli_diagnostics_uses_strict_runtime_diagnostics_loader(
+    kanban_home, monkeypatch, capsys
+):
+    from argparse import Namespace
+
+    from hermes_cli import kanban as kanban_cli
+
+    calls = []
+
+    def load_diagnostics_config():
+        calls.append(True)
+        return {"triage_aux_status": {"auto_decompose": False}}
+
+    monkeypatch.setattr(
+        kd,
+        "load_runtime_diagnostics_config",
+        load_diagnostics_config,
+    )
+    args = Namespace(task=None, severity=None, json=True)
+
+    assert kanban_cli._cmd_diagnostics(args) == 0
+    assert calls == [True]
+    assert capsys.readouterr().out.strip() == "[]"

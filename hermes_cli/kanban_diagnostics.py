@@ -301,10 +301,10 @@ def triage_aux_status(config: Optional[dict]) -> Optional[dict]:
         decomposer_explicit = _aux_slot_explicit(aux.get("kanban_decomposer"))
         specifier_explicit = _aux_slot_explicit(aux.get("triage_specifier"))
 
-    # ``auto_decompose`` defaults to True per kanban DEFAULT_CONFIG.
-    auto_decompose = True
+    # ``auto_decompose`` defaults to False per kanban DEFAULT_CONFIG.
+    auto_decompose = False
     if isinstance(kanban_cfg, dict) and "auto_decompose" in kanban_cfg:
-        auto_decompose = bool(kanban_cfg.get("auto_decompose"))
+        auto_decompose = kanban_cfg.get("auto_decompose") is True
 
     return {
         "auto_decompose": auto_decompose,
@@ -372,7 +372,7 @@ def _rule_hallucinated_cards(task, events, runs, now, cfg) -> list[Diagnostic]:
 def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnostic]:
     """A triage task cannot leave triage without an auxiliary helper.
 
-    With the auto-decompose dispatcher (kanban.auto_decompose, default True),
+    With the opt-in auto-decompose dispatcher (kanban.auto_decompose, default False),
     triage tasks fan out via ``auxiliary.kanban_decomposer`` and fall back to
     ``auxiliary.triage_specifier`` when the decomposer returns ``fanout=false``.
     With auto-decompose off, the user must run ``hermes kanban specify``,
@@ -393,7 +393,7 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
     if status is None:
         return []
 
-    auto_decompose = bool(status.get("auto_decompose"))
+    auto_decompose = status.get("auto_decompose") is True
     decomposer_explicit = bool(status.get("decomposer_explicit"))
     specifier_explicit = bool(status.get("specifier_explicit"))
     main_visible = bool(status.get("main_model_visible"))
@@ -1065,13 +1065,21 @@ def config_from_kanban_config(kanban_cfg: Optional[dict]) -> dict:
     return diag_cfg
 
 
-def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
+_CURRENT_CONFIG_UNSET = object()
+
+
+def config_from_runtime_config(
+    raw_config: Optional[dict],
+    *,
+    current_config: Any = _CURRENT_CONFIG_UNSET,
+) -> dict:
     """Build diagnostics config from the full Hermes runtime config.
 
-    Carries through ``kanban``, ``auxiliary``, and ``model`` keys so triage-
-    aware rules can inspect the active aux-helper and main-model state.
-    Folds the ``kanban`` block through ``config_from_kanban_config`` so the
-    repeated-failure threshold derivation still applies.
+    Ordinary runtime config remains the source for general diagnostic settings,
+    which preserves their last-known-good behavior. When ``current_config`` is
+    supplied, the safety-sensitive auto-decompose status comes from that strict
+    current view; rejection (``None``) forces only that gate to disabled while
+    retaining unrelated runtime diagnostic context.
     """
     raw_config = raw_config or {}
     if not isinstance(raw_config, dict):
@@ -1085,7 +1093,32 @@ def config_from_runtime_config(raw_config: Optional[dict]) -> dict:
         value = raw_config.get(key)
         if value is not None:
             cfg[key] = value
+
+    if current_config is not _CURRENT_CONFIG_UNSET:
+        current_status = triage_aux_status(current_config)
+        if current_status is None:
+            current_status = triage_aux_status(raw_config)
+            if current_status is not None:
+                current_status = dict(current_status)
+                current_status["auto_decompose"] = False
+        if current_status is not None:
+            cfg["triage_aux_status"] = current_status
     return cfg
+
+
+def load_runtime_diagnostics_config() -> dict:
+    """Load diagnostics with strict-current auto-decompose gate semantics."""
+    from hermes_cli.config import load_config, load_config_strict_current
+
+    runtime_config = load_config()
+    try:
+        current_config: Optional[dict] = load_config_strict_current()
+    except Exception:
+        current_config = None
+    return config_from_runtime_config(
+        runtime_config,
+        current_config=current_config,
+    )
 
 
 def compute_task_diagnostics(
