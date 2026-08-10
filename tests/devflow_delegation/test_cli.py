@@ -183,6 +183,27 @@ def test_synthetic_executor_cli_has_no_pr_authority(queue_mode, capsys):
     assert "pr_client=none" in out
 
 
+def test_executor_cli_forwards_synthetic_only_to_the_tick(queue_mode, capsys, monkeypatch):
+    # F4 regression: --synthetic-only required the flag but did not honor
+    # it -- run_executor_tick was called with no target-posture filter, so
+    # a canary_real target would have been processed. Prove the CLI now
+    # forwards synthetic_only=True (the underlying filtering behavior is
+    # covered directly on run_executor_tick in test_executor.py).
+    import devflow_delegation.executor as executor_mod
+
+    captured = {}
+
+    def _capture(*_args, **kwargs):
+        captured.update(kwargs)
+        return {"processed": 0, "errors": 0, "skipped": 0}
+
+    monkeypatch.setattr(executor_mod, "run_executor_tick", _capture)
+    assert cli.main(["executor", "--synthetic-only"]) == 0
+    assert captured.get("synthetic_only") is True
+    assert captured.get("mode") == "shadow"
+    assert captured.get("pr_client") is None
+
+
 def test_executor_shadow_cli_runs_without_pr_authority(queue_mode, capsys):
     # No eligible canary target in the SAMPLE allowlist (hermes is live_gateway) ->
     # a safe no-op that never constructs a PR client.

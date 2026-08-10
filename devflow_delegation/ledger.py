@@ -582,16 +582,22 @@ class DelegationLedger:
         return [dict(r) for r in rows]
 
     def count_prs_for_target_since(self, target_repo: str, since_iso: str) -> int:
-        """Count PR artifacts opened for a target within a durable window.
+        """Count PR (and PR-attempt) artifacts opened for a target within a window.
 
-        Joins pr-kind artifacts to their request by ``requests.target_repo`` and
-        filters on ``artifacts.created_at``. Backs the executor's per-window PR
-        budget; independent of the gate.py merge/deploy window budget.
+        Joins ``pr``/``pr_attempt``-kind artifacts to their request by
+        ``requests.target_repo`` and filters on ``artifacts.created_at``. A
+        ``pr_attempt`` artifact is written durably immediately before the PR
+        client is invoked, so if ``gh pr create`` succeeds but a later step
+        (e.g. ``gh pr view``) fails and raises, the budget still counts that
+        attempt -- a real PR can exist on GitHub with no ``pr`` artifact, and
+        undercounting here would let another canary open a second real PR.
+        Backs the executor's per-window PR budget; independent of the
+        gate.py merge/deploy window budget.
         """
         row = self._conn().execute(
             "SELECT COUNT(*) AS n FROM artifacts a "
             "JOIN requests r ON a.request_id = r.request_id "
-            "WHERE a.kind = 'pr' AND r.target_repo = ? AND a.created_at >= ?",
+            "WHERE a.kind IN ('pr', 'pr_attempt') AND r.target_repo = ? AND a.created_at >= ?",
             (target_repo, since_iso),
         ).fetchone()
         return int(row["n"])

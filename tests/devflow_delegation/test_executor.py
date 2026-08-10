@@ -6,7 +6,7 @@ import pytest
 
 from devflow_delegation.allowlist import Allowlist, TargetConfig
 from devflow_delegation.contract import parse_request
-from devflow_delegation.executor import run_executor_tick
+from devflow_delegation.executor import ExecutorError, run_executor_tick
 from devflow_delegation.ledger import DelegationLedger
 from devflow_delegation.lifecycle import transition
 
@@ -167,7 +167,10 @@ def test_executor_advances_an_explicit_synthetic_request_to_merge_pending(tmp_pa
     ledger, request = _planned_ledger(tmp_path)
     client = FakePrClient()
 
-    result = run_executor_tick(ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None, pr_client=client, mode="canary")
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=client, mode="canary", request_id=request.request_id,
+    )
 
     assert result == {"processed": 1, "errors": 0, "skipped": 0}
     assert ledger.get_request(request.request_id)["state"] == "MERGE_PENDING"
@@ -197,6 +200,12 @@ def test_executor_refuses_live_or_disabled_targets_without_a_lease(tmp_path, mon
 
 
 def test_executor_skips_ineligible_before_eligible_work(tmp_path):
+    # mode="canary" now requires a designated request_id (F6): auto-selection
+    # across multiple PLANNED rows is exclusively a shadow-mode behavior.
+    # This test exercises that selection/skip logic in shadow mode, which
+    # still auto-selects and still exercises the same _target_is_eligible
+    # skip path; it stops at VALIDATED instead of MERGE_PENDING because
+    # shadow never pushes or opens a PR.
     repo = _fixture_repo(tmp_path)
     ledger, rejected = _planned_ledger(tmp_path, source_kind="arch-review")
     accepted = _request()
@@ -208,7 +217,7 @@ def test_executor_skips_ineligible_before_eligible_work(tmp_path):
     )
     transition(ledger, None, accepted.request_id, "PLANNED", actor="operator")
 
-    result = run_executor_tick(ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None, pr_client=FakePrClient(), mode="canary")
+    result = run_executor_tick(ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None, pr_client=FakePrClient())
 
     assert result["processed"] == 1
     # Selection scans every bounded PLANNED row; newest-first ledger ordering
@@ -216,7 +225,7 @@ def test_executor_skips_ineligible_before_eligible_work(tmp_path):
     # must never prevent eligible work from running.
     assert result["skipped"] in {0, 1}
     assert ledger.get_request(rejected.request_id)["state"] == "PLANNED"
-    assert ledger.get_request(accepted.request_id)["state"] == "MERGE_PENDING"
+    assert ledger.get_request(accepted.request_id)["state"] == "VALIDATED"
 
 
 def test_executor_rejects_out_of_scope_changes_and_releases_lease(tmp_path):
@@ -224,7 +233,10 @@ def test_executor_rejects_out_of_scope_changes_and_releases_lease(tmp_path):
     ledger, request = _planned_ledger(tmp_path)
     command = ("python", "-c", "from pathlib import Path; Path('outside.txt').write_text('bad'); print('implemented')")
 
-    result = run_executor_tick(ledger, _allowlist(_target(repo, tmp_path, command=command)), None, pr_client=FakePrClient(), mode="canary")
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=command)), None,
+        pr_client=FakePrClient(), mode="canary", request_id=request.request_id,
+    )
 
     assert result["errors"] == 1
     assert ledger.get_request(request.request_id)["state"] == "FAILED"
@@ -237,7 +249,7 @@ def test_executor_requires_a_real_pr_before_pr_open(tmp_path):
 
     result = run_executor_tick(
         ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
-        pr_client=FakePrClient({}), mode="canary",
+        pr_client=FakePrClient({}), mode="canary", request_id=request.request_id,
     )
 
     assert result["errors"] == 1
@@ -251,7 +263,7 @@ def test_canary_requires_a_pr_client_before_any_mutation(tmp_path):
 
     result = run_executor_tick(
         ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
-        mode="canary",
+        mode="canary", request_id=request.request_id,
     )
 
     assert result["processed"] == 0
@@ -284,7 +296,7 @@ def test_canary_real_target_reaches_merge_pending_with_injected_client(tmp_path)
 
     result = run_executor_tick(
         ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
-        pr_client=client, mode="canary",
+        pr_client=client, mode="canary", request_id=request.request_id,
     )
 
     assert result == {"processed": 1, "errors": 0, "skipped": 0}
@@ -304,11 +316,18 @@ def test_canary_real_still_refuses_the_live_checkout(tmp_path, monkeypatch):
 
     result = run_executor_tick(
         ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
-        pr_client=FakePrClient(), mode="canary",
+        pr_client=FakePrClient(), mode="canary", request_id=request.request_id,
     )
 
     assert result["errors"] == 1
     assert ledger.get_request(request.request_id)["state"] == "FAILED"
+    # Pin the actual refusal reason, not just the terminal state (F8): many
+    # paths now reach FAILED (out-of-scope diff, missing PR result, lease
+    # races, ...), so asserting only the state is one refactor away from a
+    # false green on the most safety-critical property in this module.
+    last_transition = ledger.transitions_for(request.request_id)[-1]
+    assert last_transition["to_state"] == "FAILED"
+    assert "refuses the live Hermes checkout" in (last_transition["evidence_ref"] or "")
 
 
 def test_canary_real_shadow_records_shadow_and_opens_no_pr(tmp_path):
@@ -334,7 +353,7 @@ def test_non_explicit_source_real_target_is_skipped(tmp_path):
 
     result = run_executor_tick(
         ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
-        pr_client=FakePrClient(), mode="canary",
+        pr_client=FakePrClient(), mode="canary", request_id=rejected.request_id,
     )
 
     assert result["processed"] == 0
@@ -394,7 +413,10 @@ def test_executor_metadata_file_is_not_committed(tmp_path):
         "pathlib.Path('src/generated.txt').write_text('ok'); print('implemented')",
     )
 
-    result = run_executor_tick(ledger, _allowlist(_target(repo, tmp_path, command=command)), None, pr_client=FakePrClient(), mode="canary")
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=command)), None,
+        pr_client=FakePrClient(), mode="canary", request_id=request.request_id,
+    )
 
     assert result["errors"] == 0
     payload = json.loads(observed.read_text(encoding="utf-8"))
@@ -411,7 +433,7 @@ def test_canary_pr_body_and_label_carry_do_not_merge_marker(tmp_path):
 
     run_executor_tick(
         ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
-        pr_client=client, mode="canary",
+        pr_client=client, mode="canary", request_id=request.request_id,
     )
 
     call = client.calls[0]
@@ -420,3 +442,153 @@ def test_canary_pr_body_and_label_carry_do_not_merge_marker(tmp_path):
     assert "Do not auto-merge" in call["body"]
     # No leakage: the body must not contain absolute paths or the worktree base.
     assert str(tmp_path) not in call["body"]
+
+
+def test_concurrent_tick_cannot_mark_an_in_flight_request_failed(tmp_path):
+    # F2 regression: the lease is the mutual-exclusion primitive, not the
+    # BUILDING transition. Simulate a second, overlapping tick by acquiring
+    # the request's lease directly first (as tick A would have), then
+    # invoke run_executor_tick as tick B. Before the fix, B transitioned
+    # PLANNED -> BUILDING (which is legal against the ledger's *state*
+    # column, since that column knows nothing about leases) and only then
+    # discovered the lease conflict via an uncaught sqlite3.IntegrityError
+    # -- either stranding the row at BUILDING (unretryable) or, on a
+    # slightly different race, marking A's in-flight request FAILED. B must
+    # now back off as soon as it fails to acquire the lease, before ever
+    # touching lifecycle state.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    held = ledger.acquire_lease(request.request_id, "other-worker", expires_in_seconds=600)
+
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=FakePrClient(),
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "PLANNED"
+    # No BUILDING/FAILED transition was ever recorded by the losing tick;
+    # only the setup transitions from _planned_ledger (TRIAGED, PLANNED) exist.
+    assert [item["to_state"] for item in ledger.transitions_for(request.request_id)] == ["TRIAGED", "PLANNED"]
+    # The original holder's lease is untouched by the losing tick.
+    current_lease = ledger.lease_for_request(request.request_id)
+    assert current_lease is not None
+    assert current_lease["lease_id"] == held["lease_id"]
+
+
+def test_shadow_run_survives_diff_line_count_failure(tmp_path, monkeypatch):
+    # F3 regression: _diff_line_count is a cosmetic diagnostic that runs
+    # AFTER the request is already VALIDATED. Any failure there (index
+    # lock, timeout, odd path) must not turn an otherwise-successful shadow
+    # run into a lost/FAILED one -- it must fall back to lines=-1 (unknown)
+    # and still record the shadow artifact.
+    import devflow_delegation.executor as executor_mod
+
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+
+    def _boom(*_args, **_kwargs):
+        raise ExecutorError("git diff numstat failed (123): fatal: index lock")
+
+    monkeypatch.setattr(executor_mod, "_diff_line_count", _boom)
+
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
+    )
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    shadow = next(i["ref"] for i in ledger.artifacts_for(request.request_id) if i["kind"] == "shadow")
+    assert "lines=-1" in shadow
+
+
+def test_synthetic_only_flag_excludes_canary_real_targets(tmp_path):
+    # F4 regression: run_executor_tick(synthetic_only=True) -- what
+    # `executor --synthetic-only` now passes -- must exclude canary_real
+    # targets even when they are otherwise fully eligible, so the
+    # "synthetic-only" CLI command can never touch a real target.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=FakePrClient(), synthetic_only=True,
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 1}
+    assert ledger.get_request(request.request_id)["state"] == "PLANNED"
+
+    # The same request on a synthetic_fixture target IS eligible under the
+    # same flag -- proving the exclusion is specific to canary_real, not a
+    # blanket refusal.
+    result = run_executor_tick(
+        ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=FakePrClient(), synthetic_only=True,
+    )
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+
+
+class _CreatesRemotePrThenRaises:
+    """Simulates gh pr create succeeding, then gh pr view raising (F5)."""
+
+    def create_pr(self, **kwargs):
+        raise ExecutorError("gh pr view failed (1): fatal: no such ref")
+
+
+def test_pr_attempt_artifact_preserves_budget_when_pr_client_raises(tmp_path):
+    # F5 regression: if the PR client raises AFTER the real remote PR was
+    # created (e.g. `gh pr create` succeeds but the follow-up `gh pr view`
+    # fails), the ledger must still count that attempt against the budget --
+    # otherwise a real, ledger-invisible PR would let a second canary open
+    # another one against a budget that still reads as unspent.
+    repo = _fixture_repo(tmp_path)
+    ledger, first = _planned_ledger(tmp_path)
+    second = _request()
+    second.idempotency_key = "test:pr-attempt-second:v1"
+    ledger.insert_request(second)
+    transition(ledger, None, second.request_id, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(
+        second.request_id, "operator", "approve", "fixture setup", f"token-{second.request_id}"
+    )
+    transition(ledger, None, second.request_id, "PLANNED", actor="operator")
+
+    allowlist = _allowlist(_canary_target(repo, tmp_path, command=_write_source_command()))
+
+    r1 = run_executor_tick(
+        ledger, allowlist, None, pr_client=_CreatesRemotePrThenRaises(),
+        mode="canary", request_id=first.request_id,
+    )
+    assert r1["errors"] == 1
+    assert ledger.get_request(first.request_id)["state"] == "FAILED"
+    kinds = {i["kind"] for i in ledger.artifacts_for(first.request_id)}
+    assert "pr_attempt" in kinds and "pr" not in kinds
+
+    # The second designated request is refused: the budget of 1 was already
+    # consumed by the first request's pr_attempt, even though it has no
+    # "pr" artifact.
+    r2 = run_executor_tick(
+        ledger, allowlist, None, pr_client=FakePrClient(), mode="canary", request_id=second.request_id,
+    )
+    assert r2 == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(second.request_id)["state"] == "PLANNED"
+
+
+def test_canary_without_designated_request_id_is_a_safe_noop(tmp_path):
+    # F6 regression: mode="canary" with request_id=None must never
+    # auto-select a PLANNED row -- a real PR requires a DESIGNATED request.
+    # The CLI already enforces --request-id, but this is defense-in-depth
+    # for any direct caller of run_executor_tick.
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=FakePrClient(), mode="canary",
+    )
+
+    assert result == {"processed": 0, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "PLANNED"
+    assert ledger.lease_for_request(request.request_id) is None
+    # No BUILDING/FAILED transition was ever recorded; only the setup
+    # transitions from _planned_ledger (TRIAGED, PLANNED) exist.
+    assert [item["to_state"] for item in ledger.transitions_for(request.request_id)] == ["TRIAGED", "PLANNED"]

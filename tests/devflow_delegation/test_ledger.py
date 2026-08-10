@@ -329,3 +329,27 @@ def test_count_prs_for_target_since_counts_only_pr_artifacts_in_window(tmp_path)
     assert ledger.count_prs_for_target_since("other", "1970-01-01T00:00:00+00:00") == 1
     # A window that starts in the far future excludes everything.
     assert ledger.count_prs_for_target_since("sandbox", "2999-01-01T00:00:00+00:00") == 0
+
+
+def test_count_prs_for_target_since_counts_pr_attempt_alone(tmp_path):
+    # A pr_attempt artifact is written durably BEFORE the PR client is
+    # invoked (see executor._stage_commit_push callers). If gh pr create
+    # succeeds but a later step (gh pr view) raises, no "pr" artifact is
+    # ever written -- but the budget must still see the attempt, or a
+    # second canary tick could open a second real PR against the same
+    # already-exhausted budget.
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    req = parse_request({
+        "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+        "idempotency_key": "k-attempt-only",
+        "source": {"agent": "operator", "kind": "explicit", "finding_id": "f"},
+        "kind": "task", "title": "t", "problem_statement": "p",
+        "evidence": [{"kind": "test", "summary": "s"}],
+        "target": {"repo": "sandbox", "subsystem": "src"},
+        "severity": "low", "priority": "P3", "confidence": 1.0,
+        "acceptance_criteria": ["a"], "safety_notes": [],
+    })
+    ledger.insert_request(req)
+    ledger.add_artifact(req.request_id, "pr_attempt", "ddp-branch-a1")
+
+    assert ledger.count_prs_for_target_since("sandbox", "1970-01-01T00:00:00+00:00") == 1

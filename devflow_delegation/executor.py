@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Protocol, Sequence
@@ -332,7 +333,14 @@ def _planned_rows(ledger: DelegationLedger) -> list[Dict[str, Any]]:
     return sorted(ledger.list_requests(state="PLANNED", limit=200), key=lambda row: (row["created_at"], row["request_id"]))
 
 
-def _target_is_eligible(row: Dict[str, Any], allowlist: Allowlist, pr_client: Optional[PrClient], mode: str) -> bool:
+def _target_is_eligible(
+    row: Dict[str, Any],
+    allowlist: Allowlist,
+    pr_client: Optional[PrClient],
+    mode: str,
+    *,
+    synthetic_only: bool = False,
+) -> bool:
     if row.get("source_kind") not in EXECUTOR_ALLOWED_SOURCES:
         return False
     # Canary opens a real PR and therefore requires an injected client; shadow
@@ -341,6 +349,8 @@ def _target_is_eligible(row: Dict[str, Any], allowlist: Allowlist, pr_client: Op
         return False
     target = resolve_target(allowlist, str(row.get("target_repo") or ""))
     if target is None:
+        return False
+    if synthetic_only and not target.synthetic_fixture:
         return False
     if SEVERITY_RANK.get(str(row.get("severity") or ""), 0) > _RISK_CEILING_RANK.get(target.risk_ceiling, 0):
         return False
@@ -432,6 +442,7 @@ def run_executor_tick(
     pr_client: Optional[PrClient] = None,
     mode: str = "shadow",
     request_id: Optional[str] = None,
+    synthetic_only: bool = False,
 ) -> Dict[str, int]:
     """Process one eligible request.
 
@@ -440,9 +451,19 @@ def run_executor_tick(
     effect; eligible without a ``pr_client``. ``mode="canary"`` runs the full
     path to ``MERGE_PENDING`` and requires an injected ``pr_client`` plus an
     available PR budget. An unknown mode is a safe no-op. ``request_id``
-    restricts selection to one designated request.
+    restricts selection to one designated request. ``synthetic_only``, when
+    true, further restricts eligibility to ``synthetic_fixture`` targets,
+    excluding ``canary_real`` targets even if otherwise eligible.
     """
     if mode not in {"shadow", "canary"}:
+        return {"processed": 0, "errors": 0, "skipped": 0}
+
+    # Defense-in-depth: a real PR requires a DESIGNATED request. The CLI
+    # already enforces this (executor-canary requires --request-id), but
+    # run_executor_tick(mode="canary", request_id=None) would otherwise
+    # auto-select the oldest eligible PLANNED row for any direct caller.
+    # Refuse before any ledger mutation.
+    if mode == "canary" and request_id is None:
         return {"processed": 0, "errors": 0, "skipped": 0}
 
     skipped = 0
@@ -451,7 +472,7 @@ def run_executor_tick(
     if request_id is not None:
         candidates = [c for c in candidates if c["request_id"] == request_id]
     for candidate in candidates:
-        if _target_is_eligible(candidate, allowlist, pr_client, mode):
+        if _target_is_eligible(candidate, allowlist, pr_client, mode, synthetic_only=synthetic_only):
             row = candidate
             break
         skipped += 1
@@ -476,18 +497,32 @@ def run_executor_tick(
     try:
         envelope = json.loads(row["envelope_json"])
         title = str(envelope.get("title") or "")
-        # Transition to BUILDING before the boundary check (not after) so a
-        # boundary failure -- e.g. the live-checkout refusal -- lands on a
-        # state _mark_failed can advance to FAILED. A failure recorded while
-        # still PLANNED would be invisible in the ledger and the request would
-        # be reselected and re-fail on every subsequent tick.
-        transition(ledger, bus, request_id, "BUILDING", actor=actor, policy_version=policy_version)
-        checkout_path, worktree_base = _validate_target_boundary(target)
+
+        # Acquire the lease FIRST: it is the mutual-exclusion primitive, not
+        # the BUILDING transition. Two overlapping ticks racing the same
+        # PLANNED row both attempt this insert; leases.request_id is a
+        # PRIMARY KEY, so only one succeeds. The loser hits IntegrityError
+        # here -- before touching lifecycle state -- and backs off as a safe
+        # no-op instead of stealing/failing the winner's in-flight request.
         validation_count = sum(len(group) for group in (
             target.test_commands, target.lint_commands, target.typecheck_commands, target.build_commands,
         ))
         lease_seconds = max(600, target.command_timeout_seconds * max(2, validation_count + 1))
-        lease = ledger.acquire_lease(request_id, actor, expires_in_seconds=lease_seconds)
+        try:
+            lease = ledger.acquire_lease(request_id, actor, expires_in_seconds=lease_seconds)
+        except sqlite3.IntegrityError:
+            logger.info("executor tick skipped %s: lease already held by another worker", request_id)
+            return {"processed": 0, "errors": 0, "skipped": skipped}
+
+        # Transition to BUILDING only after the lease is ours, so no other
+        # tick can reach this line for the same row concurrently. It still
+        # happens before the boundary check (not after) so a boundary
+        # failure -- e.g. the live-checkout refusal -- lands on a state
+        # _mark_failed can advance to FAILED. A failure recorded while still
+        # PLANNED would be invisible in the ledger and the request would be
+        # reselected and re-fail on every subsequent tick.
+        transition(ledger, bus, request_id, "BUILDING", actor=actor, policy_version=policy_version)
+        checkout_path, worktree_base = _validate_target_boundary(target)
         branch = _worktree_name(request_id, int(lease["attempt_count"]))
         worktree_path = worktree_base / branch
         if not ledger.set_lease_worktree(request_id, lease["lease_id"], str(worktree_path), branch):
@@ -514,7 +549,19 @@ def run_executor_tick(
         if mode == "shadow":
             # Shadow stops here: record the intended outcome and take no remote
             # action. No push, no PR, no lifecycle beyond VALIDATED.
-            lines = _diff_line_count(worktree_path, changed_paths)
+            # The line count is a cosmetic diagnostic, not a safety gate, and
+            # this runs AFTER the request is already VALIDATED: any failure
+            # here (index lock, timeout, odd path) must never turn an
+            # otherwise-successful shadow run into a lost/FAILED one. -1
+            # signals "unknown" rather than a real count.
+            try:
+                lines = _diff_line_count(worktree_path, changed_paths)
+            except Exception:
+                logger.warning(
+                    "diff line count failed for %s; recording lines=-1 (unknown)",
+                    request_id, exc_info=True,
+                )
+                lines = -1
             ledger.add_artifact(request_id, "shadow", _shadow_ref(len(changed_paths), lines, branch, title))
             return {"processed": 1, "errors": 0, "skipped": skipped}
 
@@ -525,6 +572,12 @@ def run_executor_tick(
             raise ExecutorError("lost lease before PR creation")
 
         assert pr_client is not None  # eligibility checks it in canary mode
+        # Record the attempt durably BEFORE invoking the PR client. If
+        # ``gh pr create`` succeeds but a later step (e.g. ``gh pr view``)
+        # raises, this row still consumes the budget -- see
+        # DelegationLedger.count_prs_for_target_since -- so a real,
+        # ledger-invisible PR can never let a second canary open another one.
+        ledger.add_artifact(request_id, "pr_attempt", branch)
         pr = pr_client.create_pr(
             worktree_path=worktree_path,
             branch=branch,
@@ -540,9 +593,16 @@ def run_executor_tick(
         ledger.add_artifact(request_id, "pr_number", str(pr["number"]))
         transition(ledger, bus, request_id, "PR_OPEN", actor=actor, policy_version=policy_version)
         transition(ledger, bus, request_id, "MERGE_PENDING", actor=actor, policy_version=policy_version)
-    except (ExecutorError, IllegalTransitionError, OSError, ValueError) as exc:
+    except (ExecutorError, IllegalTransitionError, OSError, ValueError, sqlite3.Error) as exc:
         logger.error("executor tick failed for %s: %s", request_id, exc)
-        _mark_failed(ledger, bus, request_id, actor=actor, policy_version=policy_version, error=exc)
+        # Only mark FAILED if this tick actually owns the request -- i.e. it
+        # successfully acquired the lease above. A lease-acquisition race
+        # (sqlite3.IntegrityError) already returned early as a no-op before
+        # reaching here, but this guard also covers any other pre-lease
+        # failure (e.g. a malformed envelope) so a tick can never mark a
+        # request FAILED that it never held.
+        if lease is not None:
+            _mark_failed(ledger, bus, request_id, actor=actor, policy_version=policy_version, error=exc)
         return {"processed": 1, "errors": 1, "skipped": skipped}
     finally:
         if worktree_path is not None and checkout_path is not None:

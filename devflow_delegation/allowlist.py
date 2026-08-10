@@ -164,6 +164,10 @@ def load_allowlist(path: Path) -> Allowlist:
                     raise AllowlistError(f"allowlist target '{name}' malformed: canary_real requires a low or medium risk_ceiling")
                 if pr_budget < 1:
                     raise AllowlistError(f"allowlist target '{name}' malformed: canary_real requires pr_budget >= 1")
+                if pr_budget_window_hours < 1:
+                    raise AllowlistError(
+                        f"allowlist target '{name}' malformed: canary_real requires pr_budget_window_hours >= 1"
+                    )
         targets[str(name)] = TargetConfig(
             repo=str(raw["repo"]),
             checkout_path=str(raw["checkout_path"]),

@@ -152,6 +152,7 @@ def test_canary_real_defaults_pr_budget_to_one(tmp_path):
     {"allowed_globs": []},
     {"risk_ceiling": "high"},
     {"pr_budget": 0},
+    {"pr_budget_window_hours": 0},
     {"live_gateway_imports": True},
     {"synthetic_fixture": True},                  # mutually exclusive with canary_real
 ])
