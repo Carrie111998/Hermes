@@ -21,11 +21,6 @@ function Input({ className, containerClassName, prefix, suffix, size, type, ...p
 
   const field = (
     <input
-      // Off by default for every consumer — these are code/config/search fields,
-      // not prose. Callers can re-enable per-instance by passing the prop.
-      autoCapitalize="off"
-      autoComplete="off"
-      autoCorrect="off"
       className={cn(
         // When adorned, the wrapper owns the chrome (border/background/focus
         // glow) and the input goes transparent so the whole thing reads as one
@@ -37,7 +32,6 @@ function Input({ className, containerClassName, prefix, suffix, size, type, ...p
         className
       )}
       data-slot="input"
-      spellCheck={false}
       type={type}
       {...props}
     />

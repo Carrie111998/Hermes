@@ -45,7 +45,8 @@ const ctrlChar = (letter: string) => String.fromCharCode(letter.charCodeAt(0) - 
 
 export const fixedSessionColumnStyle = () => ({ flexShrink: 0 })
 
-export const activeSessionCountLabel = (count: number) => `${count} live ${count === 1 ? 'session' : 'sessions'}`
+export const activeSessionCountLabel = (count: number) =>
+  `${count} live ${count === 1 ? 'session' : 'sessions'}`
 
 export const sessionsCountLabel = (liveCount: number, resumableCount: number) =>
   `${liveCount} live · ${resumableCount} resumable`
@@ -221,7 +222,6 @@ export const draftModelNameFromArg = (value: string) => {
 
     if (part === '--provider') {
       i++
-
       continue
     }
 
@@ -356,7 +356,6 @@ export function ActiveSessionSwitcher({
           }),
           includeHistory ? gw.request<SessionListResponse>('session.list', { limit: 200 }) : Promise.resolve(null)
         ])
-
         const r = liveRes.status === 'fulfilled' ? asRpcResult<SessionActiveListResponse>(liveRes.value) : null
 
         if (!r) {
@@ -696,7 +695,12 @@ export function ActiveSessionSwitcher({
 
       {err && <Text color={t.color.label}>error: {err}</Text>}
 
-      <Box backgroundColor={newRowStyle?.backgroundColor} flexDirection="row" onClick={handleRowClick(0)} width="100%">
+      <Box
+        backgroundColor={newRowStyle?.backgroundColor}
+        flexDirection="row"
+        onClick={handleRowClick(0)}
+        width="100%"
+      >
         <Text bold={newSelectedRow} color={newRowTextColor ?? t.color.muted}>
           {newSelectedRow ? '▸ ' : '  '}
         </Text>
@@ -744,7 +748,6 @@ export function ActiveSessionSwitcher({
         if (kind === 'history') {
           const h = history[i - 1 - items.length]!
           const pendingDelete = confirmDelete === h.id
-
           const title = pendingDelete
             ? 'press d again to delete'
             : deleting && selected
@@ -790,7 +793,7 @@ export function ActiveSessionSwitcher({
               <Box flexGrow={1} flexShrink={1} minWidth={0}>
                 <Text
                   bold={selected}
-                  color={pendingDelete ? t.color.label : (rowTextColor ?? t.color.muted)}
+                  color={pendingDelete ? t.color.label : rowTextColor ?? t.color.muted}
                   wrap="truncate-end"
                 >
                   {title}
@@ -882,9 +885,7 @@ export function ActiveSessionSwitcher({
       ) : (
         <Box flexDirection="column" marginTop={1}>
           <OrchestratorHintText
-            segments={
-              selectedKind === 'history' ? resumeRowContextHintSegments : orchestratorContextHintSegments(false)
-            }
+            segments={selectedKind === 'history' ? resumeRowContextHintSegments : orchestratorContextHintSegments(false)}
             t={t}
           />
           <Text color={t.color.muted} wrap="truncate-end">

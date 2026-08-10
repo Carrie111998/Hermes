@@ -47,8 +47,8 @@ OAuth 需要浏览器，但 loopback 回调运行在 Hermes 所在的机器上�
 ssh -N -L 8642:127.0.0.1:8642 user@remote-host    # 在本地终端执行
 hermes setup --portal                              # 在远程机器上执行，在本地浏览器中打开打印出的 URL
 
-# 方案 B：设备码登录（适用于 Cloud Shell、Codespaces、EC2 Instance Connect）
-hermes auth add nous --type oauth
+# 方案 B：手动粘贴（适用于 Cloud Shell、Codespaces、EC2 Instance Connect）
+hermes auth add nous --type oauth --manual-paste
 # 然后重新运行 `hermes setup --portal` 以连接 provider + gateway
 ```
 
@@ -183,7 +183,7 @@ OAuth 流程未完成。重新运行：
 hermes portal
 ```
 
-如果浏览器未打开或回调失败，你可能在远程/无头主机上——参见 [OAuth over SSH](/guides/oauth-over-ssh) 了解端口转发的解决方案。
+如果浏览器未打开或回调失败，你可能在远程/无头主机上——参见 [OAuth over SSH](/guides/oauth-over-ssh) 了解端口转发和手动粘贴的解决方案。
 
 ### "Model: currently openrouter"（或其他 provider）而非"using Nous as inference provider"
 
@@ -240,12 +240,12 @@ Portal 目录基于 OpenRouter 的模型列表（300+ 个），并补充了通�
 
 - `model.provider` 设置为 `openrouter`/`anthropic`/等，而非 `nous`
 - OAuth refresh 失败后回退到了其他已配置的 provider
-- 存在多个 Hermes profiles，你使用的是错误的那个（检查 `hermes profile list`）
+- 存在多个 Hermes profiles，你使用的是错误的那个（检查 `hermes profile current`）
 
 ### 想要撤销并重新开始
 
 ```bash
-hermes auth logout nous       # 清除本地 refresh token
+hermes auth remove nous       # 清除本地 refresh token
 # 然后重新运行 setup，或在 Portal 网页界面取消订阅
 ```
 

@@ -56,7 +56,8 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
-
+| [`kanban-orchestrator`](/user-guide/skills/bundled/devops/devops-kanban-orchestrator) | 面向编排器（orchestrator）配置文件的分解策略与反诱惑规则，用于通过 Kanban 路由工作。"不要自己做工作"规则和基本生命周期会自动注入每个 Kanban worker 的系统 prompt；如需更深入的细节，请加载此技能。 | `devops/kanban-orchestrator` |
+| [`kanban-worker`](/user-guide/skills/bundled/devops/devops-kanban-worker) | Hermes Kanban worker 的陷阱、示例和边界情况。生命周期本身会作为 `KANBAN_GUIDANCE` 自动注入每个 worker 的系统 prompt（来自 `agent/prompt_builder.py`）；当需要更深入细节时加载此技能。 | `devops/kanban-worker` |
 
 ## email
 

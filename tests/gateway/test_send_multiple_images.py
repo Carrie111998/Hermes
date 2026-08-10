@@ -42,7 +42,7 @@ class _StubAdapter(BasePlatformAdapter):
         self.sent_animations = []
         self.sent_files = []
 
-    async def connect(self, *, is_reconnect: bool = False):
+    async def connect(self):
         return True
 
     async def disconnect(self):
@@ -109,7 +109,7 @@ def _ensure_telegram_mock():
 
 _ensure_telegram_mock()
 
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from gateway.platforms.telegram import TelegramAdapter  # noqa: E402
 
 
 class TestTelegramMultiImage:
@@ -314,7 +314,7 @@ def _ensure_slack_mock():
 
 _ensure_slack_mock()
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from gateway.platforms.slack import SlackAdapter  # noqa: E402
 
 
 class TestSlackMultiImage:
@@ -391,7 +391,7 @@ class TestMattermostMultiImage:
 # ---------------------------------------------------------------------------
 
 
-from plugins.platforms.email.adapter import EmailAdapter  # noqa: E402
+from gateway.platforms.email import EmailAdapter  # noqa: E402
 
 
 class TestEmailMultiImage:

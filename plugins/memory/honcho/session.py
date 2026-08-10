@@ -207,12 +207,9 @@ class HonchoSessionManager:
 
     @property
     def honcho(self) -> Honcho:
-        """Get the Honcho client, refreshing a near-expiry OAuth token in place.
-
-        Routes every access through ``get_honcho_client`` (which returns the same
-        cached singleton) so a long session can't outlive its 1h access token.
-        """
-        self._honcho = get_honcho_client()
+        """Get the Honcho client, initializing if needed."""
+        if self._honcho is None:
+            self._honcho = get_honcho_client()
         return self._honcho
 
     def _record_auth_failure(self, exc: BaseException) -> None:

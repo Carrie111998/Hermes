@@ -231,7 +231,7 @@ class TestWebToolPolicy:
         # Force the firecrawl plugin to be the active extract provider.
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
 
-        result = json.loads(await web_tools.web_extract_tool(["https://blocked.test"]))
+        result = json.loads(await web_tools.web_extract_tool(["https://blocked.test"], use_llm_processing=False))
 
         assert result["results"][0]["url"] == "https://blocked.test"
         assert "Blocked by website policy" in result["results"][0]["error"]
@@ -246,7 +246,6 @@ class TestWebToolPolicy:
             return True
 
         monkeypatch.setattr(web_tools, "async_is_safe_url", _allow_ssrf)
-        monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda url: True)
 
         def fake_check(url):
             if url == "https://allowed.test":
@@ -277,7 +276,7 @@ class TestWebToolPolicy:
         monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
         monkeypatch.setenv("FIRECRAWL_API_KEY", "fake-key")
 
-        result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"]))
+        result = json.loads(await web_tools.web_extract_tool(["https://allowed.test"], use_llm_processing=False))
 
         assert result["results"][0]["url"] == "https://blocked.test/final"
         assert result["results"][0]["content"] == ""

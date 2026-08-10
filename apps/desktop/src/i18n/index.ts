@@ -28,4 +28,4 @@ export {
   usePluginI18n
 } from './plugin-i18n'
 export { setRuntimeI18nLocale, translateNow } from './runtime'
-export type { Locale, ToolTitleKey, Translations } from './types'
+export type { Locale, Translations } from './types'

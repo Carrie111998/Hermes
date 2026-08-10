@@ -21,6 +21,9 @@ class TestWriteDenyExactPaths:
         path = os.path.join(str(Path.home()), ".ssh", "id_ed25519")
         assert _is_write_denied(path) is True
 
+    def test_netrc(self):
+        path = os.path.join(str(Path.home()), ".netrc")
+        assert _is_write_denied(path) is True
 
     def test_hermes_root_env_when_running_under_profile(self, tmp_path, monkeypatch):
         """Top-level ``<root>/.env`` stays write-denied even when running under
@@ -47,14 +50,14 @@ class TestWriteDenyExactPaths:
 
         assert _is_write_denied(str(global_env)) is True
 
-    def test_shell_profiles_are_writable(self):
+    def test_shell_profiles(self):
         home = str(Path.home())
         for name in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile"]:
-            assert _is_write_denied(os.path.join(home, name)) is False, f"{name} should be writable"
+            assert _is_write_denied(os.path.join(home, name)) is True, f"{name} should be denied"
 
-    def test_credential_config_files_denied(self):
+    def test_package_manager_configs(self):
         home = str(Path.home())
-        for name in [".netrc", ".pgpass", ".npmrc", ".pypirc"]:
+        for name in [".npmrc", ".pypirc", ".pgpass"]:
             assert _is_write_denied(os.path.join(home, name)) is True, f"{name} should be denied"
 
 
@@ -87,9 +90,6 @@ class TestWriteAllowed:
         assert _is_write_denied("/tmp/safe_file.txt") is False
 
 
-    def test_hermes_control_files_requested_writable(self):
-        from hermes_constants import get_hermes_home
-
-        home = get_hermes_home()
-        for name in ["auth.json", "config.yaml", "webhook_subscriptions.json"]:
-            assert _is_write_denied(str(home / name)) is False, f"{name} should be writable"
+    def test_hermes_config_not_env(self):
+        path = os.path.join(str(Path.home()), ".hermes", "config.yaml")
+        assert _is_write_denied(path) is False

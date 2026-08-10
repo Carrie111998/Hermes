@@ -100,7 +100,7 @@ class TestDiscordTextBatching:
 
 def _make_matrix_adapter():
     """Create a minimal MatrixAdapter for testing text batching."""
-    from plugins.platforms.matrix.adapter import MatrixAdapter
+    from gateway.platforms.matrix import MatrixAdapter
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(MatrixAdapter)
@@ -154,7 +154,7 @@ class TestMatrixTextBatching:
 
 def _make_wecom_adapter():
     """Create a minimal WeComAdapter for testing text batching."""
-    from plugins.platforms.wecom.adapter import WeComAdapter
+    from gateway.platforms.wecom import WeComAdapter
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(WeComAdapter)
@@ -208,7 +208,7 @@ class TestWeComTextBatching:
 
 def _make_telegram_adapter():
     """Create a minimal TelegramAdapter for testing adaptive delay."""
-    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from gateway.platforms.telegram import TelegramAdapter
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(TelegramAdapter)
@@ -242,7 +242,7 @@ class TestTelegramAdaptiveDelay:
 
 def _make_feishu_adapter():
     """Create a minimal FeishuAdapter for testing adaptive delay."""
-    from plugins.platforms.feishu.adapter import FeishuAdapter, FeishuBatchState
+    from gateway.platforms.feishu import FeishuAdapter, FeishuBatchState
 
     config = PlatformConfig(enabled=True, token="test-token")
     adapter = object.__new__(FeishuAdapter)

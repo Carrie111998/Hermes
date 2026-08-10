@@ -163,10 +163,7 @@ declare module '@hermes/ink' {
     readonly setSelectionBgColor: (color: string) => void
   }
   export function useHasSelection(): boolean
-  export function useStdout(): {
-    readonly stdout?: NodeJS.WriteStream
-    readonly write: (data: string) => boolean
-  }
+  export function useStdout(): { readonly stdout?: NodeJS.WriteStream }
   export function useTerminalFocus(): boolean
   export function useTerminalTitle(title: string | TerminalTitlePair | null): void
   export interface TerminalTitlePair {
