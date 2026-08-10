@@ -59,8 +59,8 @@ plugin, and fail to resolve in a disk plugin). Capability comes in tiers:
 Both take the same `HermesPlugin` contract, appear in **Settings → Plugins**, and
 enable/disable live. Everything on this page is written against the disk door
 (what you and the agent write); [Bundled plugins](#bundled-plugins) notes the two
-differences. No desktop plugins ship in the core tree today — reference demos
-live in the companion
+differences. Shipped bundled plugins and small SDK authoring fixtures can live in
+the core tree; standalone reference demos live in the companion
 [`hermes-example-plugins`](https://github.com/NousResearch/hermes-example-plugins)
 repo.
 
@@ -567,8 +567,8 @@ enable/disable contract as a disk plugin. The two differences:
 2. It's still lint-fenced to `@hermes/plugin-sdk` + `react` only — no `@/…` app
    internals.
 
-No desktop plugins ship in the core tree today; the shipped app stays uncluttered
-and demos live in the
+The core tree can contain shipped bundled plugins as well as small SDK authoring
+fixtures. Standalone reference demos live in the
 [`hermes-example-plugins`](https://github.com/NousResearch/hermes-example-plugins)
 companion repo.
 
