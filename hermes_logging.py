@@ -35,6 +35,7 @@ import os
 import queue
 import sys
 import threading
+from contextvars import ContextVar
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Optional, Sequence
@@ -76,8 +77,12 @@ from hermes_constants import get_config_path, get_hermes_home
 # unless ``force=True``.
 _logging_initialized = False
 
-# Thread-local storage for per-conversation session context.
-_session_context = threading.local()
+# DEV-0150: per-task session context, backed by ContextVar.
+# threading.local silently leaks across run_in_executor threads
+# when multiple asyncio tasks share the same thread-pool worker.
+# ContextVar is task-scoped — each asyncio task (and any thread
+# it spawns via copy_context()) gets its own isolated copy.
+_session_context: ContextVar = ContextVar("hermes_logging_session_id", default=None)
 
 # Default log format — includes timestamp, level, optional session tag,
 # logger name, and message.  The ``%(session_tag)s`` field is guaranteed to
@@ -163,17 +168,19 @@ _NOISY_LOGGERS = (
 # ---------------------------------------------------------------------------
 
 def set_session_context(session_id: str) -> None:
-    """Set the session ID for the current thread.
+    """Set the session ID for the current task.
 
-    All subsequent log records on this thread will include ``[session_id]``
-    in the formatted output.  Call at the start of ``run_conversation()``.
+    All subsequent log records for this task (and any thread it
+    spawns via ``copy_context()``) will include ``[session_id]``
+    in the formatted output.  Call at the start of
+    ``run_conversation()``.
     """
-    _session_context.session_id = session_id
+    _session_context.set(session_id)
 
 
 def clear_session_context() -> None:
-    """Clear the session ID for the current thread."""
-    _session_context.session_id = None
+    """Clear the session ID for the current task."""
+    _session_context.set(None)
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +206,7 @@ def _install_session_record_factory() -> None:
 
     def _session_record_factory(*args, **kwargs):
         record = current_factory(*args, **kwargs)
-        sid = getattr(_session_context, "session_id", None)
+        sid = _session_context.get()
         record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
         return record
 
