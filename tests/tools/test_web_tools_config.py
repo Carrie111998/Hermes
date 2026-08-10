@@ -445,6 +445,38 @@ class TestCheckWebApiKey:
                     assert check_web_api_key() is True
 
 
+def test_capability_checks_hide_extract_for_search_only_provider():
+    """DDGS-like providers expose search without advertising web_extract."""
+    from tools.web_tools import (
+        check_web_api_key,
+        check_web_extract_available,
+        check_web_search_available,
+    )
+
+    search_only = MagicMock()
+    with patch(
+        "agent.web_search_registry.get_active_search_provider",
+        return_value=search_only,
+    ), patch(
+        "agent.web_search_registry.get_active_extract_provider",
+        return_value=None,
+    ), patch("tools.web_tools._ensure_web_plugins_loaded"):
+        assert check_web_search_available() is True
+        assert check_web_extract_available() is False
+        assert check_web_api_key() is True
+
+
+def test_web_registry_uses_capability_specific_availability_checks():
+    from tools.web_tools import (
+        check_web_extract_available,
+        check_web_search_available,
+    )
+    from tools.registry import registry
+
+    assert registry.get_entry("web_search").check_fn is check_web_search_available
+    assert registry.get_entry("web_extract").check_fn is check_web_extract_available
+
+
 def test_web_requires_env_includes_exa_key():
     from tools.web_tools import _web_requires_env
 
