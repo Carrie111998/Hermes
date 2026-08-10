@@ -49,6 +49,15 @@ def test_retrieval_surfaces_conflicts_and_bounded_no_result(tmp_path):
     assert empty.no_verified_memory is True
 
 
+def test_retrieval_does_not_admit_record_over_token_budget(tmp_path):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    store.upsert_memory(MemoryRecord("mem_big", "one two three four", "fact", "global"), "seed")
+    packet = MemoryRetriever(store).retrieve(RetrievalRequest("one", max_tokens=2))
+    assert packet.memories == ()
+    assert packet.no_verified_memory
+
+
 def test_query_classification_is_deterministic(tmp_path):
     store = SqliteMemoryStore(tmp_path / "memory.db")
     retriever = MemoryRetriever(store)

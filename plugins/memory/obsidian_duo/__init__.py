@@ -98,7 +98,11 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
         packet = self._broker.retrieve(RetrievalRequest(query=query, session_id=session_id))
         if packet.no_verified_memory:
             return ""
-        lines = [f"[{memory.memory_id}] {memory.content}" for memory in packet.memories]
+        lines = [
+            f"[{memory.memory_id}] authority={memory.authority.value} verification={memory.verification.value} "
+            f"confidence={memory.confidence:.2f} {memory.content}"
+            for memory in packet.memories
+        ]
         if packet.conflicts:
             lines.append("Unresolved conflicts: " + ", ".join(packet.conflicts))
         return "\n".join(lines)
@@ -159,6 +163,8 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
                 content=str(args.get("content", "")),
                 memory_type=str(args.get("memory_type") or "fact"),
                 scope=str(args.get("project") or "global"),
+                authority=Authority.USER,
+                verification=Verification.USER_CONFIRMED,
                 metadata={"event_kind": "explicit_remember"},
             ))
             return json.dumps(decision.__dict__)
@@ -169,7 +175,12 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
     def backup_paths(self):
         if not self._hermes_home:
             return []
-        return [self._hermes_home / "obsidian_duo"]
+        managed_root = (Path(ObsidianDuoConfig.load(self._hermes_home).vault_path) / ObsidianDuoConfig.load(self._hermes_home).managed_folder).resolve()
+        try:
+            managed_root.relative_to(self._hermes_home.resolve())
+        except ValueError:
+            return [managed_root]
+        return []
 
     def shutdown(self) -> None:
         if self._broker:

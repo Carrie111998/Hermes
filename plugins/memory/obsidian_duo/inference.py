@@ -43,6 +43,8 @@ class MemoryInference:
     def _complete(self, *, instructions: str, input_text: str, schema: dict, purpose: str) -> InferenceResult:
         if self._llm is None:
             return InferenceResult("deferred", deferred=True, reason="no active session llm")
+        if scan_for_secrets(input_text).matches or scan_for_secrets(instructions).matches:
+            return InferenceResult("deferred", deferred=True, reason="secret in inference input")
         try:
             result = self._llm.complete_structured(
                 instructions=instructions,

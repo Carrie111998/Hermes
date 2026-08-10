@@ -80,7 +80,7 @@ class MemoryRetriever:
         used_tokens = 0
         for _, record in scored:
             tokens = len(record.content.split())
-            if memories and used_tokens + tokens > request.max_tokens:
+            if request.max_tokens <= 0 or used_tokens + tokens > request.max_tokens:
                 break
             memories.append(record)
             used_tokens += tokens

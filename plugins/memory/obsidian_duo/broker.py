@@ -18,11 +18,13 @@ from .contracts import (
     Verification,
     MemoryPacket,
     RetrievalRequest,
+    MemoryRecord,
 )
 from .policy import MemoryPolicy
 from .retrieval import MemoryRetriever
 from .store import SqliteMemoryStore
 from .vault import ObsidianVault
+from .store import new_id
 
 
 @dataclass(frozen=True)
@@ -58,18 +60,21 @@ class EmbeddedMemoryBroker:
             self._worker.start()
 
     def _worker_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                event = self._events.get(timeout=0.05)
-            except queue.Empty:
-                continue
-            if event is None:
-                self._events.task_done()
-                break
-            try:
-                self.store.metrics_increment(f"event.{event.event_type}")
-            finally:
-                self._events.task_done()
+        try:
+            while not self._stop.is_set():
+                try:
+                    event = self._events.get(timeout=0.05)
+                except queue.Empty:
+                    continue
+                if event is None:
+                    self._events.task_done()
+                    break
+                try:
+                    self.store.metrics_increment(f"event.{event.event_type}")
+                finally:
+                    self._events.task_done()
+        finally:
+            self.store.close()
 
     def observe(self, event: MemoryEvent) -> None:
         self.store.initialize()
@@ -109,6 +114,35 @@ class EmbeddedMemoryBroker:
 
     def propose(self, candidate: MemoryCandidate) -> CandidateDecision:
         decision = self.policy.evaluate(candidate)
+        if decision.action == "promote":
+            memory_id = str(candidate.metadata.get("memory_id") or new_id("memory"))
+            record = MemoryRecord(
+                memory_id=memory_id,
+                content=candidate.content,
+                memory_type=candidate.memory_type,
+                scope=candidate.scope,
+                authority=candidate.authority,
+                verification=candidate.verification,
+                confidence=float(candidate.metadata.get("confidence", 0.0) or 0.0),
+                importance=float(candidate.metadata.get("importance", 0.0) or 0.0),
+            )
+            txn_id = new_id("txn")
+            path = self.vault._managed_path(record)
+            payload = {"path": str(path), "memory_id": memory_id}
+            self.store.record_journal(txn_id, "promote", "prepared", payload)
+            self.vault.write_managed_note(record)
+            stat = path.stat()
+            content_hash = self.vault._hash(path)
+            payload.update({"content_hash": content_hash, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+            self.store.record_journal(txn_id, "promote", "written", payload)
+            self.store.upsert_memory(record, "promotion")
+            for evidence in candidate.evidence:
+                self.store.insert_evidence(evidence)
+                self.store.link_evidence(memory_id, evidence.evidence_id)
+            self.store.set_note_index(str(path), memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
+            self.store.record_journal(txn_id, "promote", "indexed", payload)
+            self.store.record_journal(txn_id, "promote", "committed", payload)
+            return CandidateDecision("promote", memory_id=memory_id, reason=decision.reason)
         if decision.action in {"stage", "conflict"}:
             self.store.stage_candidate(candidate)
         return decision
@@ -135,7 +169,23 @@ class EmbeddedMemoryBroker:
             "SELECT txn_id FROM journal WHERE state IN ('prepared','written','indexed')"
         ).fetchall()
         for row in rows:
-            self.store.record_journal(row["txn_id"], "recovery", "committed", {"recovered": True})
+            journal = conn.execute("SELECT * FROM journal WHERE txn_id=?", (row["txn_id"],)).fetchone()
+            try:
+                import json
+                payload = json.loads(journal["payload"])
+                path = Path(payload["path"])
+                if not path.is_file() or (payload.get("content_hash") and self.vault._hash(path) != payload["content_hash"]):
+                    raise ValueError("managed note missing or changed")
+                memory_id = str(payload["memory_id"])
+                if self.store.get_memory(memory_id) is None:
+                    self.vault.scan_managed_changes(self.store)
+                indexed = conn.execute("SELECT 1 FROM note_index WHERE path=? AND memory_id=?", (str(path), memory_id)).fetchone()
+                if self.store.get_memory(memory_id) is None or indexed is None:
+                    raise ValueError("durable index incomplete")
+                self.store.record_journal(row["txn_id"], journal["operation"], "committed", {**payload, "recovered": True})
+            except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
+                self.store.record_journal(row["txn_id"], journal["operation"], "recovery_failed", {"reason": str(exc)[:120]})
+        self.process_manual_changes()
         self._state = "READY"
         return RecoveryResult(recovered=len(rows), malformed=len(scan.malformed_paths))
 
@@ -146,10 +196,12 @@ class EmbeddedMemoryBroker:
         for path in sorted(self.vault.managed_root.rglob("*.md")):
             stat = path.stat()
             previous = conn.execute(
-                "SELECT memory_id,mtime_ns,size,content_hash FROM note_index WHERE path=?",
+                "SELECT memory_id,mtime_ns,size,content_hash,parse_status FROM note_index WHERE path=?",
                 (str(path),),
             ).fetchone()
-            if previous is None or (previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size):
+            if previous is None:
+                continue
+            if previous["parse_status"] not in {"manual_pending", "needs_attention"} and previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size:
                 continue
             content_hash = self.vault._hash(path)
             if content_hash == previous["content_hash"]:
@@ -159,6 +211,8 @@ class EmbeddedMemoryBroker:
                 old = self.store.get_memory(previous["memory_id"] or parsed.memory_id)
                 if old is None:
                     continue
+                from .security import assert_safe_to_persist
+                assert_safe_to_persist(parsed.body)
                 updated = self.policy.apply_user_edit(old, parsed)
                 self.store.upsert_memory(updated, "manual user edit")
                 self.store.set_note_index(str(path), updated.memory_id, stat.st_mtime_ns, stat.st_size, content_hash)

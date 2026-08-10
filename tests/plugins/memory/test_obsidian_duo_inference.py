@@ -40,6 +40,13 @@ def test_route_failure_degrades_without_durable_mutation():
     assert result.deferred is True
 
 
+def test_inference_does_not_send_secret_bearing_input():
+    llm = FakeLlm()
+    result = MemoryInference(llm).rerank("API_KEY=sk-proj-1234567890abcdefghijklmnop", [])
+    assert result.deferred
+    assert llm.calls == []
+
+
 def test_extract_and_consolidate_are_bounded_structured_calls():
     llm = FakeLlm({"candidates": [], "uncertainties": []})
     inference = MemoryInference(llm)

@@ -13,6 +13,7 @@ import yaml
 
 from .contracts import Authority, MemoryRecord, MemoryStatus, Verification
 from .store import SqliteMemoryStore
+from .security import assert_safe_to_persist
 
 
 @dataclass(frozen=True)
@@ -124,17 +125,22 @@ class ObsidianVault:
         for path in sorted(self.managed_root.rglob("*.md")):
             stat = path.stat()
             previous = conn.execute(
-                "SELECT mtime_ns,size,content_hash FROM note_index WHERE path=?",
+                "SELECT memory_id,mtime_ns,size,content_hash FROM note_index WHERE path=?",
                 (str(path),),
             ).fetchone()
             if previous and previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size:
                 continue
             content_hash = self._hash(path)
             if previous and previous["content_hash"] == content_hash:
-                store.set_note_index(str(path), None, stat.st_mtime_ns, stat.st_size, content_hash)
+                store.set_note_index(str(path), previous["memory_id"] if previous else None, stat.st_mtime_ns, stat.st_size, content_hash)
                 continue
             try:
                 note = self.parse_note(path)
+                assert_safe_to_persist(note.body)
+                if previous is not None:
+                    store.set_note_index(str(path), previous["memory_id"], stat.st_mtime_ns, stat.st_size, content_hash, "manual_pending")
+                    changed.append(path)
+                    continue
                 metadata = note.metadata
                 record = MemoryRecord(
                     memory_id=note.memory_id,
@@ -153,7 +159,8 @@ class ObsidianVault:
                 store.set_note_index(str(path), note.memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
                 changed.append(path)
             except (ValueError, yaml.YAMLError, OSError, TypeError):
-                store.set_note_index(str(path), None, stat.st_mtime_ns, stat.st_size, content_hash, "needs_attention")
+                memory_id = previous["memory_id"] if previous is not None else None
+                store.set_note_index(str(path), memory_id, stat.st_mtime_ns, stat.st_size, content_hash, "needs_attention")
                 malformed.append(path)
         return ScanResult(tuple(changed), tuple(malformed))
 

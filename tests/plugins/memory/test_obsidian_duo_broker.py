@@ -54,7 +54,18 @@ def test_broker_recovers_written_journal_by_rescanning(tmp_path):
     assert result.recovered >= 1
     assert broker.store.connection().execute(
         "SELECT state FROM journal WHERE txn_id='tx_1'"
-    ).fetchone()[0] == "committed"
+    ).fetchone()[0] == "recovery_failed"
+
+
+def test_explicit_promotion_persists_note_index_and_memory(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    decision = broker.propose(MemoryCandidate(
+        "Use SQLite for durable memory", metadata={"event_kind": "explicit_remember"}
+    ))
+    assert decision.action == "promote"
+    assert broker.store.get_memory(decision.memory_id).content == "Use SQLite for durable memory"
+    assert list(broker.vault.managed_root.rglob(f"{decision.memory_id}.md"))
 
 
 def test_manual_edit_becomes_user_authority_without_rewriting_note(tmp_path):
