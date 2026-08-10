@@ -141,8 +141,10 @@ def _validate_target_boundary(target: TargetConfig) -> tuple[Path, Path]:
     """Return safe checkout/worktree paths or raise before any mutation."""
     if not target.executor_enabled:
         raise ExecutorError("executor is disabled for target")
-    if not target.synthetic_fixture or target.live_gateway_imports:
-        raise ExecutorError("Stage 2 accepts synthetic, non-live targets only")
+    if target.live_gateway_imports:
+        raise ExecutorError("executor refuses live-gateway targets")
+    if not (target.synthetic_fixture or target.canary_real):
+        raise ExecutorError("target is neither a synthetic fixture nor an allowlisted real canary")
     if target.max_autonomous_action != "create_pr":
         raise ExecutorError("target does not permit PR creation")
     if not target.implementation_command:
@@ -151,6 +153,10 @@ def _validate_target_boundary(target: TargetConfig) -> tuple[Path, Path]:
         raise ExecutorError("target has no GitHub repository identifier")
     if not target.worktree_base:
         raise ExecutorError("target has no explicit worktree base")
+    if not target.allowed_globs:
+        raise ExecutorError("target has no allowed globs")
+    if target.canary_real and target.pr_budget < 1:
+        raise ExecutorError("canary target has no PR budget")
 
     checkout_path = Path(target.checkout_path).expanduser().resolve()
     worktree_base = Path(target.worktree_base).expanduser().resolve()
@@ -434,6 +440,12 @@ def run_executor_tick(
     try:
         envelope = json.loads(row["envelope_json"])
         title = str(envelope.get("title") or "")
+        # Transition to BUILDING before the boundary check (not after) so a
+        # boundary failure -- e.g. the live-checkout refusal -- lands on a
+        # state _mark_failed can advance to FAILED. A failure recorded while
+        # still PLANNED would be invisible in the ledger and the request would
+        # be reselected and re-fail on every subsequent tick.
+        transition(ledger, bus, request_id, "BUILDING", actor=actor, policy_version=policy_version)
         checkout_path, worktree_base = _validate_target_boundary(target)
         validation_count = sum(len(group) for group in (
             target.test_commands, target.lint_commands, target.typecheck_commands, target.build_commands,
@@ -445,7 +457,6 @@ def run_executor_tick(
         if not ledger.set_lease_worktree(request_id, lease["lease_id"], str(worktree_path), branch):
             raise ExecutorError("lost lease before worktree creation")
 
-        transition(ledger, bus, request_id, "BUILDING", actor=actor, policy_version=policy_version)
         worktree_path = _create_worktree(checkout_path, worktree_base, branch, target.default_branch)
         ledger.add_artifact(request_id, "worktree", str(worktree_path))
         ledger.add_artifact(request_id, "branch", branch)

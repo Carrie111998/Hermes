@@ -269,6 +269,78 @@ def test_executor_rejects_above_target_risk_ceiling(tmp_path):
     assert ledger.get_request(request.request_id)["state"] == "PLANNED"
 
 
+def _canary_target(repo, tmp_path, *, command, **overrides):
+    return _target(
+        repo, tmp_path, command=command,
+        synthetic_fixture=False, canary_real=True, pr_budget=1, risk_ceiling="low",
+        **overrides,
+    )
+
+
+def test_canary_real_target_reaches_merge_pending_with_injected_client(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    client = FakePrClient()
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=client, mode="canary",
+    )
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "MERGE_PENDING"
+    assert client.calls[0]["repo"] == "example/fixture"
+    kinds = {i["kind"] for i in ledger.artifacts_for(request.request_id)}
+    assert {"pr", "pr_number"} <= kinds
+
+
+def test_canary_real_still_refuses_the_live_checkout(tmp_path, monkeypatch):
+    from events import paths
+
+    repo = _fixture_repo(tmp_path)
+    # Point the live Hermes root AT the fixture checkout so the refusal must fire.
+    monkeypatch.setattr(paths, "get_default_hermes_root", lambda: repo)
+    ledger, request = _planned_ledger(tmp_path)
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=FakePrClient(), mode="canary",
+    )
+
+    assert result["errors"] == 1
+    assert ledger.get_request(request.request_id)["state"] == "FAILED"
+
+
+def test_canary_real_shadow_records_shadow_and_opens_no_pr(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    ledger, request = _planned_ledger(tmp_path)
+    client = FakePrClient()
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=client,  # default shadow: client must stay unused
+    )
+
+    assert result == {"processed": 1, "errors": 0, "skipped": 0}
+    assert ledger.get_request(request.request_id)["state"] == "VALIDATED"
+    assert client.calls == []
+    kinds = {i["kind"] for i in ledger.artifacts_for(request.request_id)}
+    assert "shadow" in kinds and "pr" not in kinds
+
+
+def test_non_explicit_source_real_target_is_skipped(tmp_path):
+    repo = _fixture_repo(tmp_path)
+    ledger, rejected = _planned_ledger(tmp_path, source_kind="arch-review")
+
+    result = run_executor_tick(
+        ledger, _allowlist(_canary_target(repo, tmp_path, command=_write_source_command())), None,
+        pr_client=FakePrClient(), mode="canary",
+    )
+
+    assert result["processed"] == 0
+    assert ledger.get_request(rejected.request_id)["state"] == "PLANNED"
+
+
 def test_executor_metadata_file_is_not_committed(tmp_path):
     repo = _fixture_repo(tmp_path)
     ledger, request = _planned_ledger(tmp_path)
