@@ -1,108 +1,92 @@
 # Project Handover - hermes-agent
 
-**Plan key:** `hermes-agent`
-**Last verified:** 2026-08-10 18:25:47 +08:00
+**Plan key:** hermes-agent
+**Last verified:** 2026-08-10
 **Handover owner/session:** Codex
-**Authoritative project log:** [`docs/ROADMAP-HERMES-DGX.md`](ROADMAP-HERMES-DGX.md)
+**Authoritative project log:** docs/ROADMAP-HERMES-DGX.md
 
 ## 1. Project identity and boundary
 
 - **Purpose:** Hermes is a private-first agent gateway and CLI for messaging,
   model routing, approvals, runtime state, and scheduled automation.
 - **In scope:** Hermes CLI/gateway code, runtime-state integration, Telegram
-  and other platform adapters, model catalog handling, CI reliability, and
-  Hermes project documentation.
+  and other platform adapters, model catalog handling, CI reliability,
+  skills/plugin discovery, the skill catalog, and Hermes project documentation.
 - **Out of scope:** Laptop local files/checkouts as handover objects, unrelated
-  DGX services, Open WebUI/Ollama stacks, and external agent credentials or
-  tokens. Claude-owned changes are not imported into this handover.
-- **唯一交接对象:** Git repository `https://github.com/cwliao/hermes-agent.git`
-  and DGX Spark Hermes home `/home/cwliao/.hermes`.
-- **Remote/branch:** `origin` / `ticket/ci-baseline-001`.
-- **Implementation commit:** `d20c481322f4a5303f4658ff1455217c0a200b7e`.
-- **Handover state:** This file is the subsequent pushed handover record;
-  verify the branch's latest HEAD from the remote before consuming it.
-- **Local checkout rule:** A laptop checkout is only a staging workspace. Do
-  not hand over while its intended worktree is dirty; finish, commit, and push
-  in-scope changes first, while isolating unrelated local changes.
-- **Runtime/deployment:** DGX Spark host `140.96.58.171`, Hermes checkout under
-  `/home/cwliao/.hermes/hermes-agent`, user service `hermes-gateway.service`.
-- **Entry points:** `hermes_cli.main`, `gateway.run`, messaging adapters,
-  `docs/ROADMAP-HERMES-DGX.md`, and the ticket files under `docs/plans/`.
+  DGX services, Open WebUI/Ollama stacks, external agent credentials or tokens,
+  and marketplace integration unless separately ticketed.
+- **唯一交接对象:** Git repository https://github.com/cwliao/hermes-agent.git
+  and DGX Spark Hermes home /home/cwliao/.hermes.
+- **Canonical remote/branch:** origin/main; ticket work uses isolated ticket/*
+  branches.
+- **Current mainline:** 7a14e3fdc2f1f2dc2bcd2b14265e091582e5d71a.
+- **Runtime/deployment:** DGX Spark host 140.96.58.171, Hermes checkout under
+  /home/cwliao/.hermes/hermes-agent, user service hermes-gateway.service.
+- **Entry points:** hermes_cli.main, gateway.run, messaging adapters,
+  docs/ROADMAP-HERMES-DGX.md, and ticket files under docs/plans/.
 
 ## 2. Goal and roadmap
 
-- **Current goal:** Restore the blocking Python CI baseline without changing
-  ARCH-001 runtime behavior or touching the live DGX checkout.
+- **Current goal:** Advance Hermes mainline through ARCH-002 while maintaining a
+  separate, reviewed skills ecosystem lane.
 - **Completed and verified:**
-  - ARCH-001 mainline reconciliation merged as `ec50a154eeb44e7206f24b7703f9032b8f97069c`.
-  - ARCH-001 deployed to DGX; service was verified `active/running` after
-    restart, with rollback ref
-    `backup/pre-arch-001-deploy-20260810T031625Z`.
-  - Deployment record merged to main as
-    `5fb3d5cd1ee8358570e86d9fbce95e8e73dd584b`.
-- **Active:** `CI-BASELINE-001` is implemented in `d20c48132` with follow-up
-  correction commit `ac9b37924`; PR [#3](https://github.com/cwliao/hermes-agent/pull/3)
-  is ready for review. GitHub Actions run `31380833174` is green; independent
-  review and merge remain.
-- **Deferred / not goals:** No DGX deploy or service restart for CI-BASELINE-001
-  before remote CI and merge gates pass. Do not reset or edit Claude-owned
-  dirty/diverged worktrees.
-- **Next candidates:** `ARCH-002` runtime-state contract extension;
-  `ARCH-003` audit/replay integration; `ARCH-004` redaction and SQLite/WAL
-  safeguards. Start ARCH-002 only after CI-BASELINE-001 is green and merged.
+  - ARCH-001 mainline reconciliation merged as
+    ec50a154eeb44e7206f24b7703f9032b8f97069c.
+  - ARCH-001 deployed to DGX; service verified active/running after restart,
+    with rollback ref backup/pre-arch-001-deploy-20260810T031625Z.
+  - CI-BASELINE-001 merged to GitHub main as
+    7a14e3fdc2f1f2dc2bcd2b14265e091582e5d71a; CI run 31381350666 was green
+    and Codex/independent AGY review reconciled READY.
+- **Active:** HERMES-SKILLS-001 consolidates the recovered skill roadmap;
+  this branch changes documentation only. ARCH-002 remains the next core
+  implementation ticket.
+- **Deferred / not goals:** No DGX deployment or service restart for
+  CI-BASELINE-001, HERMES-SKILLS-001, or any proposed SkillClaw work.
+- **Next candidates:** ARCH-002, then skills inventory/catalog, teach
+  durability, klib discovery evidence, and HERMES-SKILLCLAW-001.
 
 ## 3. Verified state
 
-- **Tests:**
-  - Five original CI failures: **5 passed** after implementation.
-  - Affected modules: **184 passed** (26 adapter, 37 authorization, 84 model,
-    37 startup-gating).
-  - ARCH-001 regression set: **35 passed**.
-  - Ruff, compileall, and `git diff --check`: passed.
-- **Health:** Last DGX read-only check showed `hermes-gateway.service`
-  `active/running` and no error entries in the checked recent journal window.
-  PR #3 is the active repository review object. Prior run `31380083270`
-  exposed one brittle test assertion; latest run `31380833174` passed all
-  eight Python slices and `All required checks pass`.
-- **UI/runtime smoke:** No new UI smoke was run for CI-BASELINE-001. The DGX
-  gateway process remains the existing runtime evidence boundary.
-- **Data/storage safety:** No DGX `.hermes` storage mutation was performed for
-  CI-BASELINE-001. No secrets or tokens are stored in this handover.
-- **Deployment:** DGX remains on `ec50a154eeb44e7206f24b7703f9032b8f97069c`.
-  CI-BASELINE-001 has **not** been deployed. Rollback ref remains
-  `backup/pre-arch-001-deploy-20260810T031625Z`.
-- **Known risks:** No current CI failure remains. Independent code review and
-  reconciliation are still required; no DGX deployment is authorized by this
-  ticket.
+- **CI:** Required checks for CI-BASELINE-001 passed in run 31381350666; no
+  new CI run is claimed for this documentation branch.
+- **DGX health:** Last read-only check showed hermes-gateway.service
+  active/running; DGX remains at ec50a154eeb44e7206f24b7703f9032b8f97069c.
+- **Skill evidence:** klib manifest commit 674a4fb72 is repository evidence.
+  teach durability commit ab1a40040 is historical GitHub evidence and is not
+  current mainline documentation. The historical inventory checkpoint is not
+  current until re-counted.
+- **Data/storage safety:** No DGX .hermes storage mutation was performed for
+  this roadmap consolidation. No secrets or tokens are stored here.
+- **Deployment:** No CI or skills-roadmap change has been deployed to DGX.
+- **Known limitations:** This branch adds roadmap documentation only; the
+  SkillClaw client, inventory reconciliation, teach port, and klib live smoke
+  remain unimplemented/proposed.
 
 ## 4. Next ticket
 
-- **Ticket:** `CI-BASELINE-001 - Restore the blocking Python CI baseline`
-- **Status:** `IMPLEMENTED_PENDING_REVIEW` on head `ac9b37924`; PR #3 is ready
-  for review.
-- **Scope:** `agent/codex_responses_adapter.py`, `gateway/run.py`,
-  `hermes_cli/main.py`, affected tests, and the ticket/roadmap documents.
-- **Dependencies:** Clean Hermes `main`; preserve ARCH-001 runtime-state
-  behavior; no dependency on Claude or AGY for implementation.
-- **Acceptance gates:** Five named failures pass; affected Python modules pass;
-  ARCH-001 regression remains green; Ruff/OSV/attribution/uv/Docker/JS checks
-  remain green; GitHub Actions `All required checks pass` is green; then code
-  review, merge, and only later consider deployment.
-- **Open questions:** Obtain an independently valid reviewer result and
-  reconcile it before merge; deployment remains a later gate.
+- **Core ticket:** ARCH-002 — extend the runtime-state contract.
+- **Status:** proposed; no ARCH-002 ticket file exists yet.
+- **Separate long-term lane:** HERMES-SKILLS-002 inventory/catalog
+  reconciliation, followed by HERMES-SKILLS-003, HERMES-PLUGIN-001, and
+  HERMES-SKILLCLAW-001.
+- **Acceptance gates:** Each ticket requires explicit scope, focused tests or
+  verifier evidence, documentation consistency, CI, recursive review,
+  independent cross-review, reconciliation, and only then merge. DGX
+  deployment remains a separate authorization gate.
 
 ## 5. Safe continuation instructions
 
-1. Read this file, `docs/ROADMAP-HERMES-DGX.md`, and
-   `docs/plans/2026-08-10-ci-baseline-001.md`.
-2. Verify the remote repository branch/HEAD and the DGX
-   `/home/cwliao/.hermes` state before any action.
-3. Treat laptop local files as staging only; do not hand over an unresolved
-   dirty worktree, and never discard unrelated changes with reset/checkout.
+1. Read this file, docs/ROADMAP-HERMES-DGX.md, and the relevant plan under
+   docs/plans/.
+2. Verify GitHub main, the ticket branch/HEAD, and DGX
+   /home/cwliao/.hermes state before any action.
+3. Treat laptop files as staging only; do not hand over an unresolved dirty
+   worktree or discard unrelated changes.
 4. Use the repository's managed environment for tests; do not use global Python
    as CI evidence.
-5. Do not deploy CI-BASELINE-001 before remote CI and merge pass.
-6. Never edit or reset `/home/cwliao/.hermes/hermes-agent` or Claude-owned
-   runtime state without an explicit deployment gate.
+5. Keep ARCH-002 runtime work separate from the skills lane.
+6. Do not install SkillClaw, synchronize skills, or edit/reset/restart the live
+   DGX checkout without a dedicated reviewed ticket and explicit deployment
+   authorization.
 7. Refresh this handover with verified remote-repository and DGX facts before
    ending the next session.
