@@ -47,13 +47,22 @@ def has_mandatory_hook(hook_name: str) -> bool:
     return plugins.has_mandatory_hook(hook_name)
 
 
-def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
-    """Notify observers and enforce configured mandatory plugin callbacks."""
-    if not has_mandatory_hook(hook_name):
-        # Preserve the public observer seam (including callers/tests that patch
-        # module-level invoke_hook) when no mandatory contract is configured.
-        return invoke_hook(hook_name, **kwargs)
+def invoke_mandatory_hook(
+    hook_name: str,
+    **kwargs: Any,
+) -> tuple[List[Any], List[str]]:
+    """Run the mandatory security phase without invoking observers."""
+    from hermes_cli import plugins
 
+    return plugins.invoke_mandatory_hook(hook_name, **kwargs)
+
+
+def invoke_hook_observers(
+    hook_name: str,
+    mandatory_plugins: List[str],
+    **kwargs: Any,
+) -> List[Any]:
+    """Notify first-party and compatibility observers after mandatory allow."""
     try:
         from hermes_cli.observability import observe_lifecycle
 
@@ -66,7 +75,23 @@ def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
 
     from hermes_cli import plugins
 
-    return plugins.invoke_hook_enforced(hook_name, **kwargs)
+    return plugins.invoke_hook_observers(
+        hook_name, mandatory_plugins, **kwargs
+    )
+
+
+def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
+    """Enforce mandatory callbacks before any lifecycle observer side effect."""
+    if not has_mandatory_hook(hook_name):
+        # Preserve the public observer seam (including callers/tests that patch
+        # module-level invoke_hook) when no mandatory contract is configured.
+        return invoke_hook(hook_name, **kwargs)
+
+    mandatory_results, required = invoke_mandatory_hook(hook_name, **kwargs)
+    observer_results = invoke_hook_observers(
+        hook_name, required, **kwargs
+    )
+    return mandatory_results + observer_results
 
 
 def finalize_session(**kwargs: Any) -> List[Any]:

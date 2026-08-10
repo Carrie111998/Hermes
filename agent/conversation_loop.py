@@ -1435,34 +1435,42 @@ def _invoke_provider_preflight(
     request_char_count: int = 0,
     started_at: Optional[float] = None,
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> None:
-    """Run the single provider preflight gate before any transport dispatch."""
+    phase: str = "all",
+    mandatory_plugins: Optional[List[str]] = None,
+) -> List[str]:
+    """Run mandatory and observer provider-preflight phases in strict order."""
     from hermes_cli.lifecycle import (
         has_hook,
         has_mandatory_hook,
+        invoke_hook_observers,
         invoke_hook_enforced,
+        invoke_mandatory_hook,
     )
     from hermes_cli.plugins import MandatoryHookError
 
-    try:
-        mandatory = has_mandatory_hook("pre_api_request")
-    except MandatoryHookError:
-        raise
-    except Exception:
-        raise MandatoryHookError(
-            "mandatory_hook_config_invalid", "pre_api_request", "config"
-        ) from None
+    mandatory = bool(mandatory_plugins)
+    if phase != "observers":
+        try:
+            mandatory = has_mandatory_hook("pre_api_request")
+        except MandatoryHookError:
+            raise
+        except Exception:
+            raise MandatoryHookError(
+                "mandatory_hook_config_invalid", "pre_api_request", "config"
+            ) from None
+        if phase == "mandatory" and not mandatory:
+            return []
 
     try:
         observed = has_hook("pre_api_request")
     except Exception:
-        if mandatory:
+        if mandatory and phase != "observers":
             raise MandatoryHookError(
                 "mandatory_hook_exception", "pre_api_request", "runtime"
             ) from None
-        return
+        return list(mandatory_plugins or [])
     if not (observed or mandatory):
-        return
+        return []
 
     try:
         request_messages = request_kwargs.get("messages")
@@ -1471,8 +1479,7 @@ def _invoke_provider_preflight(
         if not isinstance(request_messages, list):
             request_messages = api_messages
         request_payload = agent._api_request_payload_for_hook(request_kwargs)
-        invoke_hook_enforced(
-            "pre_api_request",
+        hook_kwargs = dict(
             task_id=effective_task_id,
             turn_id=turn_id,
             api_request_id=api_request_id,
@@ -1496,13 +1503,34 @@ def _invoke_provider_preflight(
             middleware_trace=list(middleware_trace or []),
             request=request_payload,
         )
+        if phase == "mandatory":
+            _, required = invoke_mandatory_hook(
+                "pre_api_request", **hook_kwargs
+            )
+            return required
+        if phase == "observers":
+            if mandatory_plugins:
+                invoke_hook_observers(
+                    "pre_api_request",
+                    list(mandatory_plugins),
+                    **hook_kwargs,
+                )
+            else:
+                # Preserve the public observer seam (including callers/tests
+                # patching lifecycle.invoke_hook) when no mandatory contract
+                # is configured.
+                invoke_hook_enforced("pre_api_request", **hook_kwargs)
+            return list(mandatory_plugins or [])
+        invoke_hook_enforced("pre_api_request", **hook_kwargs)
+        return []
     except MandatoryHookError:
         raise
     except Exception:
-        if mandatory:
+        if mandatory and phase != "observers":
             raise MandatoryHookError(
                 "mandatory_hook_exception", "pre_api_request", "runtime"
             ) from None
+        return list(mandatory_plugins or [])
 
 
 def _mandatory_preflight_failure_result(
@@ -2637,6 +2665,36 @@ def run_conversation(
                 _sanitize_structure_surrogates(api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
+                try:
+                    from hermes_cli.plugins import MandatoryHookError
+
+                    _mandatory_preflight_plugins = _invoke_provider_preflight(
+                        agent,
+                        request_kwargs=api_kwargs,
+                        api_messages=api_messages,
+                        conversation_messages=messages,
+                        original_user_message=original_user_message,
+                        effective_task_id=effective_task_id,
+                        turn_id=turn_id,
+                        api_request_id=api_request_id,
+                        api_call_count=api_call_count,
+                        retry_count=retry_count,
+                        approx_input_tokens=approx_tokens,
+                        request_char_count=total_chars,
+                        started_at=api_start_time,
+                        phase="mandatory",
+                    )
+                except MandatoryHookError as exc:
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    agent.iteration_budget.refund()
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    agent._persist_session(messages, conversation_history)
+                    return _mandatory_preflight_failure_result(exc, messages)
                 if agent.api_mode == "codex_responses":
                     api_kwargs = agent._get_transport().preflight_kwargs(
                         api_kwargs,
@@ -2693,6 +2751,8 @@ def run_conversation(
                         request_char_count=total_chars,
                         started_at=api_start_time,
                         middleware_trace=_llm_middleware_trace,
+                        phase="observers",
+                        mandatory_plugins=_mandatory_preflight_plugins,
                     )
                 except MandatoryHookError as exc:
                     if thinking_spinner:

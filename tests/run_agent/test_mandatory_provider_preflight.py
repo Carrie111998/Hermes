@@ -1,5 +1,6 @@
 """End-to-end contract tests for mandatory provider preflight hooks."""
 
+import builtins
 import json
 import logging
 from pathlib import Path
@@ -27,6 +28,7 @@ def _write_plugin(hermes_home: Path, mode: str) -> None:
         encoding="utf-8",
     )
     callback_body = {
+        "none": "return None",
         "raise": 'raise RuntimeError("callback leaked secret SENTINEL-CREDENTIAL")',
         "malformed": 'return "not-a-directive"',
         "block": (
@@ -123,6 +125,7 @@ def _codex_transport_result() -> Dict[str, Any]:
     ("mode", "expected_code"),
     [
         (None, "mandatory_hook_missing"),
+        ("none", "mandatory_hook_malformed_result"),
         ("raise", "mandatory_hook_exception"),
         ("malformed", "mandatory_hook_malformed_result"),
         ("block", "mandatory_hook_blocked"),
@@ -167,6 +170,7 @@ def test_approved_openai_codex_official_route_dispatches_once(tmp_path, monkeypa
     ("mode", "expected_code"),
     [
         (None, "mandatory_hook_missing"),
+        ("none", "mandatory_hook_malformed_result"),
         ("raise", "mandatory_hook_exception"),
         ("malformed", "mandatory_hook_malformed_result"),
         ("block", "mandatory_hook_blocked"),
@@ -277,8 +281,13 @@ def test_unexpected_mandatory_preflight_exception_fails_closed(
     transport = MagicMock(return_value=_codex_transport_result())
     agent._run_codex_app_server_turn = transport
 
+    hook_name = (
+        "invoke_mandatory_hook"
+        if api_mode == "chat_completions"
+        else "invoke_hook_enforced"
+    )
     with patch(
-        "hermes_cli.lifecycle.invoke_hook_enforced",
+        f"hermes_cli.lifecycle.{hook_name}",
         side_effect=RuntimeError("unexpected SENTINEL-CREDENTIAL"),
     ):
         result = agent.run_conversation("must not dispatch")
@@ -351,13 +360,13 @@ def test_builtin_provider_observer_exception_does_not_leak_to_logs(
     assert "SENTINEL-CREDENTIAL" not in caplog.text
 
 
-def test_mandatory_audit_event_is_key_allowlisted_and_payload_free(
+def test_mandatory_allow_audit_event_is_key_allowlisted_and_payload_free(
     tmp_path,
     monkeypatch,
     caplog,
 ):
-    _configure_home(tmp_path, monkeypatch, mode="block")
-    agent = _run_agent()
+    _configure_home(tmp_path, monkeypatch, mode="route")
+    agent = _run_agent(provider="openai-codex", base_url=OFFICIAL_CODEX_URL)
 
     with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
         agent.run_conversation("SENTINEL-MESSAGE")
@@ -372,7 +381,7 @@ def test_mandatory_audit_event_is_key_allowlisted_and_payload_free(
     assert event == {
         "event": "mandatory_hook_preflight",
         "hook": "pre_api_request",
-        "outcome": "blocked",
+        "outcome": "allowed",
         "plugin": PLUGIN_NAME,
     }
     audit_text = audit_records[0].message
@@ -383,6 +392,176 @@ def test_mandatory_audit_event_is_key_allowlisted_and_payload_free(
         "https://blocked.invalid",
     ):
         assert forbidden not in audit_text
+
+
+def _configure_ordering_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    guard_action: str,
+) -> None:
+    hermes_home = tmp_path / "ordering-home"
+    observer_dir = hermes_home / "plugins" / "a-observer"
+    allow_guard_dir = hermes_home / "plugins" / "b-allow-guard"
+    guard_dir = hermes_home / "plugins" / "z-guard"
+    observer_dir.mkdir(parents=True)
+    allow_guard_dir.mkdir(parents=True)
+    guard_dir.mkdir(parents=True)
+    for plugin_dir in (observer_dir, allow_guard_dir, guard_dir):
+        (plugin_dir / "plugin.yaml").write_text(
+            yaml.safe_dump({"name": plugin_dir.name, "version": "0.1.0"}),
+            encoding="utf-8",
+        )
+    (observer_dir / "__init__.py").write_text(
+        "import builtins\n\n"
+        "def _observe(**kw):\n"
+        '    builtins._mandatory_preflight_events.append("observer")\n\n'
+        "def register(ctx):\n"
+        '    ctx.register_hook("pre_api_request", _observe)\n',
+        encoding="utf-8",
+    )
+    (allow_guard_dir / "__init__.py").write_text(
+        "import builtins\n\n"
+        "def _guard(**kw):\n"
+        '    builtins._mandatory_preflight_events.append("allow-guard")\n'
+        '    return {"action": "allow"}\n\n'
+        "def register(ctx):\n"
+        '    ctx.register_hook("pre_api_request", _guard)\n',
+        encoding="utf-8",
+    )
+    (guard_dir / "__init__.py").write_text(
+        "import builtins\n\n"
+        "def _guard(**kw):\n"
+        '    builtins._mandatory_preflight_events.append("guard")\n'
+        f'    return {{"action": {guard_action!r}, "reason": "blocked"}}\n\n'
+        "def register(ctx):\n"
+        '    ctx.register_hook("pre_api_request", _guard)\n',
+        encoding="utf-8",
+    )
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "plugins": {
+                    "enabled": ["a-observer", "b-allow-guard", "z-guard"],
+                    "mandatory_hooks": {
+                        "pre_api_request": ["b-allow-guard", "z-guard"]
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    plugins_mod._plugin_manager = PluginManager()
+    plugins_mod.discover_plugins()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_app_server"])
+def test_later_mandatory_blocker_runs_before_all_provider_side_effects(
+    tmp_path,
+    monkeypatch,
+    api_mode,
+):
+    from hermes_cli.middleware import apply_llm_request_middleware
+
+    events = []
+    monkeypatch.setattr(builtins, "_mandatory_preflight_events", events, raising=False)
+    _configure_ordering_home(tmp_path, monkeypatch, guard_action="block")
+    agent = _run_agent(api_mode=api_mode)
+    transport = MagicMock(side_effect=lambda **kw: events.append("transport"))
+    agent._run_codex_app_server_turn = transport
+
+    with (
+        patch(
+            "hermes_cli.observability.observe_lifecycle",
+            side_effect=lambda hook_name, **kw: (
+                events.append("builtin-observer")
+                if hook_name == "pre_api_request"
+                else None
+            ),
+        ),
+        patch(
+            "hermes_cli.plugins._audit_mandatory_hook",
+            side_effect=lambda *a, **kw: events.append("audit"),
+        ),
+        patch(
+            "hermes_cli.middleware.apply_llm_request_middleware",
+            side_effect=lambda *a, **kw: (
+                events.append("middleware")
+                or apply_llm_request_middleware(*a, **kw)
+            ),
+        ),
+    ):
+        result = agent.run_conversation("must block")
+
+    assert result["failure_reason"] == "mandatory_hook_blocked"
+    assert events == ["allow-guard", "guard"]
+    agent.client.chat.completions.create.assert_not_called()
+    transport.assert_not_called()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_app_server"])
+def test_complete_mandatory_phase_precedes_observers_audit_and_transport(
+    tmp_path,
+    monkeypatch,
+    api_mode,
+):
+    from hermes_cli.middleware import apply_llm_request_middleware
+
+    events = []
+    monkeypatch.setattr(builtins, "_mandatory_preflight_events", events, raising=False)
+    _configure_ordering_home(tmp_path, monkeypatch, guard_action="allow")
+    agent = _run_agent(api_mode=api_mode)
+    client = agent.client
+    assert client is not None
+    client.chat.completions.create.side_effect = lambda **kw: (
+        events.append("transport") or _response()
+    )
+    transport = MagicMock(
+        side_effect=lambda **kw: (
+            events.append("transport") or _codex_transport_result()
+        )
+    )
+    agent._run_codex_app_server_turn = transport
+
+    with (
+        patch(
+            "hermes_cli.observability.observe_lifecycle",
+            side_effect=lambda hook_name, **kw: (
+                events.append("builtin-observer")
+                if hook_name == "pre_api_request"
+                else None
+            ),
+        ),
+        patch(
+            "hermes_cli.plugins._audit_mandatory_hook",
+            side_effect=lambda *a, **kw: events.append("audit"),
+        ),
+        patch(
+            "hermes_cli.middleware.apply_llm_request_middleware",
+            side_effect=lambda *a, **kw: (
+                events.append("middleware")
+                or apply_llm_request_middleware(*a, **kw)
+            ),
+        ),
+    ):
+        result = agent.run_conversation("must allow")
+
+    assert result["completed"] is True
+    expected = [
+        "allow-guard",
+        "guard",
+        "audit",
+        "audit",
+    ]
+    if api_mode == "chat_completions":
+        expected.append("middleware")
+    expected.extend([
+        "builtin-observer",
+        "observer",
+        "transport",
+    ])
+    assert events == expected
 
 
 def test_default_and_legacy_config_leave_mandatory_hooks_disabled(tmp_path, monkeypatch):
