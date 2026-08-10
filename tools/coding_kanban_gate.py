@@ -302,6 +302,11 @@ def _simple_command_is_read_only(command: str) -> bool:
                 return False
             if value == "/dev/null":
                 return True
+            # Relative destinations resolve under the repository/workspace,
+            # not under the host temp directory, even when the current test
+            # cwd happens to live beneath /tmp.
+            if not value.startswith("/"):
+                return False
             for prefix in _CURL_SCRATCH_PREFIXES:
                 if value == prefix or value.startswith(prefix + "/"):
                     return True
