@@ -9,6 +9,7 @@ import pytest
 
 from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
+from hermes_cli.commands import COMMAND_REGISTRY
 
 
 @pytest.fixture
@@ -194,3 +195,8 @@ def test_recover_triage_is_classified_as_delegated_child_mutation(kanban_home):
         return_value=True,
     ):
         assert kanban_cli._is_delegated_child_cli_mutation(args) is True
+
+
+def test_recover_triage_is_listed_in_central_command_registry():
+    command = next(item for item in COMMAND_REGISTRY if item.name == "kanban")
+    assert "recover-triage" in command.subcommands
