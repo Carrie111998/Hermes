@@ -1593,7 +1593,7 @@ def run_doctor(args):
         if nous_status.get("logged_in"):
             check_ok("Nous Portal auth", "(logged in)")
         else:
-            check_warn("Nous Portal auth", "(not logged in)")
+            check_info("Nous Portal auth (not logged in — optional)")
 
         codex_status = get_codex_auth_status()
         if codex_status.get("logged_in"):
@@ -1618,7 +1618,7 @@ def run_doctor(args):
             region = minimax_status.get("region", "global")
             check_ok("MiniMax OAuth", f"(logged in, region={region})")
         else:
-            check_warn("MiniMax OAuth", "(not logged in)")
+            check_info("MiniMax OAuth (not logged in — optional)")
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
@@ -1630,7 +1630,7 @@ def run_doctor(args):
         if xai_oauth_status.get("logged_in"):
             check_ok("xAI OAuth", "(logged in)")
         else:
-            check_warn("xAI OAuth", "(not logged in)")
+            check_info("xAI OAuth (not logged in — optional)")
             if xai_oauth_status.get("error"):
                 check_info(xai_oauth_status["error"])
     except Exception:
