@@ -509,6 +509,16 @@ _WINDOWS_RD_INVOCATION_PATTERN = (
     + _WINDOWS_RD_PREFIX
     + r'(?P<arguments>[^;\n|&)]*)'
 )
+_WINDOWS_RD_PAYLOAD_PATTERN = (
+    _CMDPOS + _WINDOWS_RD_PREFIX + _WINDOWS_RECURSIVE_ROOT_ARGUMENTS
+)
+_WINDOWS_RD_PAYLOAD_INVOCATION_PATTERN = (
+    _CMDPOS + _WINDOWS_RD_PREFIX + r'(?P<arguments>[^;\n|&)]*)'
+)
+_WINDOWS_CMD_PAYLOAD_PATTERNS = (
+    _WINDOWS_CMD_PREFIX + r'(?P<payload>[^\n]*)',
+    _WINDOWS_POWERSHELL_CMD_PREFIX + r'(?P<payload>[^\n]*)',
+)
 
 HARDLINE_PATTERNS = [
     (_WINDOWS_ROOT_DELETE_PATTERN, "recursive delete of Windows filesystem root"),
@@ -563,6 +573,15 @@ HARDLINE_PATTERNS_COMPILED = [
 ]
 _WINDOWS_ROOT_DELETE_RE = re.compile(_WINDOWS_ROOT_DELETE_PATTERN, _RE_FLAGS)
 _WINDOWS_RD_INVOCATION_RE = re.compile(_WINDOWS_RD_INVOCATION_PATTERN, _RE_FLAGS)
+_WINDOWS_RD_PAYLOAD_RE = re.compile(_WINDOWS_RD_PAYLOAD_PATTERN, _RE_FLAGS)
+_WINDOWS_RD_PAYLOAD_INVOCATION_RE = re.compile(
+    _WINDOWS_RD_PAYLOAD_INVOCATION_PATTERN,
+    _RE_FLAGS,
+)
+_WINDOWS_CMD_PAYLOAD_RES = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in _WINDOWS_CMD_PAYLOAD_PATTERNS
+)
 _WINDOWS_ARGUMENT_TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
 _WINDOWS_DRIVE_VARIABLE_RE = re.compile(
     r'%(?:systemdrive|homedrive)%|!(?:systemdrive|homedrive)!|'
@@ -612,9 +631,58 @@ def _windows_path_is_root_or_unscoped_dynamic(token: str) -> bool:
     return not scoped_components
 
 
-def _windows_recursive_delete_targets_root(command: str) -> bool:
+def _windows_cmd_payload_variants(command: str):
+    """Yield cmd-owned payloads with cmd escapes and separators exposed."""
+    seen: set[str] = set()
+    for payload_re in _WINDOWS_CMD_PAYLOAD_RES:
+        for match in payload_re.finditer(command):
+            payload = match.group("payload").strip()
+            if (
+                len(payload) >= 2
+                and payload[0] == payload[-1]
+                and payload[0] in {"\"", "'"}
+            ):
+                payload = payload[1:-1]
+
+            chars: list[str] = []
+            quote = False
+            index = 0
+            while index < len(payload):
+                char = payload[index]
+                if char == "^" and index + 1 < len(payload):
+                    # cmd removes the caret and treats the next character as
+                    # literal.  In particular, an escaped ampersand is data,
+                    # while ``r^d`` still invokes the ``rd`` built-in.
+                    chars.append(payload[index + 1])
+                    index += 2
+                    continue
+                if char == '"':
+                    quote = not quote
+                    chars.append(char)
+                    index += 1
+                    continue
+                if not quote and char in "&|":
+                    chars.append("\n")
+                    if index + 1 < len(payload) and payload[index + 1] == char:
+                        index += 1
+                elif not quote and char == "(":
+                    chars.extend((char, "\n"))
+                else:
+                    chars.append(char)
+                index += 1
+
+            variant = "".join(chars)
+            if variant and variant not in seen:
+                seen.add(variant)
+                yield variant
+
+
+def _windows_recursive_delete_targets_root(
+    command: str,
+    invocation_re=_WINDOWS_RD_INVOCATION_RE,
+) -> bool:
     """Parse cmd-owned rd arguments and classify root-equivalent targets."""
-    for match in _WINDOWS_RD_INVOCATION_RE.finditer(command):
+    for match in invocation_re.finditer(command):
         tokens = _WINDOWS_ARGUMENT_TOKEN_RE.findall(match.group("arguments"))
         normalized_tokens = [token.strip("\"'").lower() for token in tokens]
         if "/s" not in normalized_tokens:
@@ -681,6 +749,15 @@ def detect_hardline_command(command: str) -> tuple:
         or _windows_recursive_delete_targets_root(windows_command)
     ):
         return (True, "recursive delete of Windows filesystem root")
+    for payload in _windows_cmd_payload_variants(windows_command):
+        if (
+            _WINDOWS_RD_PAYLOAD_RE.search(payload)
+            or _windows_recursive_delete_targets_root(
+                payload,
+                _WINDOWS_RD_PAYLOAD_INVOCATION_RE,
+            )
+        ):
+            return (True, "recursive delete of Windows filesystem root")
     normalized = _normalize_command_for_detection(command)
     _, malformed_grep = _grep_safe_detection_variant(normalized)
     if malformed_grep:

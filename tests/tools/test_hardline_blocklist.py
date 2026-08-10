@@ -221,6 +221,8 @@ _WINDOWS_ROOT_DELETE_BLOCK = [
     "C:\\Windows\\System32\\cmd.exe /c rd /s /q P:/",
     "cmd /c rd /s /q Q:\\folder\\..",
     "cmd /c rd /s /q \\\\server\\share\\folder\\..",
+    'cmd /c "echo ready & rd /s /q R:\\"',
+    "cmd /c r^d /s /q S:\\",
     (
         r'''powershell -NoProfile -Command 'cmd /c \"rd /s /q '''
         r'''\\\"C:\Users\Art\Documents\ChatGPT\Software\clipsift-release\\\"\"' '''
@@ -242,6 +244,9 @@ _WINDOWS_ROOT_DELETE_ALLOW = [
     'echo "cmd /d /c rd /s /q D:\\"',
     'echo "powershell -NoProfile -Command cmd /c rd /s /q C:\\"',
     '''python -c "print('powershell -Command cmd /c rd /s /q C:\\')"''',
+    'cmd /c "echo rd /s /q J:\\"',
+    'cmd /c "echo ready ^& rd /s /q K:\\"',
+    'cmd /c "echo ready & rd /s /q L:\\scoped"',
 ]
 
 
@@ -252,6 +257,8 @@ _WINDOWS_DYNAMIC_ROOT_DELETE_BLOCK = [
     "cmd /c rd /s /q %SystemRoot%\\..",
     "cmd /c rd /s /q %TARGET%",
     "cmd /c rd /s /q %TARGET%\\folder\\..",
+    'cmd /c "echo ready && rd /s /q %SYSTEMDRIVE%\\"',
+    "cmd /c r^d /s /q %TARGET%",
 ]
 
 
@@ -260,6 +267,7 @@ _WINDOWS_DYNAMIC_ROOT_DELETE_ALLOW = [
     "cmd /v:on /c rd /s /q !SYSTEMDRIVE!\\scoped",
     "cmd /c rd /s /q %SystemRoot%\\Temp",
     "cmd /c rd /s /q %TARGET%\\scoped",
+    'cmd /c "echo ready & rd /s /q %TARGET%\\scoped"',
 ]
 
 
