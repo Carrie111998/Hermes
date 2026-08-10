@@ -1515,8 +1515,16 @@ def clear_file_ops_cache(task_id: str = None):
             _file_ops_cache.clear()
 
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
-    """Read a file with pagination and line numbers."""
+def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default", _skip_dedup: bool = False) -> str:
+    """Read a file with pagination and line numbers.
+
+    Args:
+        _skip_dedup: If True, bypass the dedup cache and always perform a
+            full read.  Internal-only — used by execute_code sandbox to
+            ensure consistent result schemas for programmatic callers
+            (fixes #44843: dedup stub missing ``content`` causes KeyError
+            inside ``execute_code`` scripts).
+    """
     try:
         offset, limit = normalize_read_pagination(offset, limit)
 
@@ -1664,6 +1672,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
         # If we already read this exact (path, offset, limit) and the
         # file hasn't been modified since, return a lightweight stub
         # instead of re-sending the same content.  Saves context tokens.
+        # execute_code sandbox passes _skip_dedup=True to bypass this
+        # block so programmatic callers always get a consistent result
+        # schema (fixes #44843).
         resolved_str = str(_resolved)
         dedup_key = (resolved_str, offset, limit)
         with _read_tracker_lock:
@@ -1681,42 +1692,43 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
                 task_data["read_timestamps"] = {}
             cached_mtime = task_data.get("dedup", {}).get(dedup_key)
 
-        if cached_mtime is not None:
-            try:
-                current_mtime = os.path.getmtime(resolved_str)
-                if current_mtime == cached_mtime:
-                    # Count repeated stub returns so weak tool-followers that
-                    # ignore the "refer to earlier result" hint don't burn
-                    # their iteration budget in an infinite read loop.  After
-                    # 2 stubs for the same key we escalate to a hard block
-                    # mirroring the count>=4 path on real reads.
-                    with _read_tracker_lock:
-                        hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
-                        task_data["dedup_hits"][dedup_key] = hits
-                        _cap_read_tracker_data(task_data)
+        if not _skip_dedup:
+            if cached_mtime is not None:
+                try:
+                    current_mtime = os.path.getmtime(resolved_str)
+                    if current_mtime == cached_mtime:
+                        # Count repeated stub returns so weak tool-followers that
+                        # ignore the "refer to earlier result" hint don't burn
+                        # their iteration budget in an infinite read loop.  After
+                        # 2 stubs for the same key we escalate to a hard block
+                        # mirroring the count>=4 path on real reads.
+                        with _read_tracker_lock:
+                            hits = task_data["dedup_hits"].get(dedup_key, 0) + 1
+                            task_data["dedup_hits"][dedup_key] = hits
+                            _cap_read_tracker_data(task_data)
 
-                    if hits >= 2:
-                        return tool_error(
-                            f"BLOCKED: You have called read_file on this "
-                            f"exact region {hits + 1} times and the file "
-                            "has NOT changed. STOP calling read_file for "
-                            "this path — the content from your earlier "
-                            "read_file result in this conversation is "
-                            "still current. Proceed with your task using "
-                            "the information you already have.",
-                            path=path,
-                            already_read=hits + 1,
-                        )
+                        if hits >= 2:
+                            return tool_error(
+                                f"BLOCKED: You have called read_file on this "
+                                f"exact region {hits + 1} times and the file "
+                                "has NOT changed. STOP calling read_file for "
+                                "this path — the content from your earlier "
+                                "read_file result in this conversation is "
+                                "still current. Proceed with your task using "
+                                "the information you already have.",
+                                path=path,
+                                already_read=hits + 1,
+                            )
 
-                    return json.dumps({
-                        "status": "unchanged",
-                        "message": _READ_DEDUP_STATUS_MESSAGE,
-                        "path": path,
-                        "dedup": True,
-                        "content_returned": False,
-                    }, ensure_ascii=False)
-            except OSError:
-                pass  # stat failed — fall through to full read
+                        return json.dumps({
+                            "status": "unchanged",
+                            "message": _READ_DEDUP_STATUS_MESSAGE,
+                            "path": path,
+                            "dedup": True,
+                            "content_returned": False,
+                        }, ensure_ascii=False)
+                except OSError:
+                    pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)

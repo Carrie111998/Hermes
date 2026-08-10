@@ -746,6 +746,12 @@ def _rpc_server_loop(
                 # their status prints don't leak into the CLI spinner.
                 try:
                     with thread_scoped_silence():
+                        # execute_code sandbox callers are programmatic,
+                        # not agent-loop: bypass read_file dedup so scripts
+                        # always get a consistent result schema with a
+                        # "content" key (fixes #44843).
+                        if tool_name == "read_file" and isinstance(tool_args, dict):
+                            tool_args["_skip_dedup"] = True
                         result = handle_function_call(
                             tool_name, tool_args, task_id=task_id
                         )

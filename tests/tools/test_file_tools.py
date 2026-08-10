@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -38,6 +39,57 @@ class TestReadFileHandler:
         result = json.loads(read_file_tool("/tmp/test.txt"))
         assert "error" in result
         assert "terminal not available" in result["error"]
+
+    @patch("tools.file_tools._get_file_ops")
+    @patch("tools.file_tools._resolve_path_for_task")
+    @patch("os.path.getmtime")
+    def test_skip_dedup_bypasses_cache(self, mock_getmtime, mock_resolve, mock_get):
+        """_skip_dedup=True skips the dedup stub and returns full content.
+
+        When execute_code sandbox calls read_file for a path that was
+        already read natively, the dedup path normally returns a content-less
+        stub.  Programmatic callers that set _skip_dedup=True must always
+        receive the full result dict with a ``content`` key (fixes #44843).
+        """
+        from tools.file_tools import read_file_tool, reset_file_dedup
+
+        resolved = Path("/tmp/test-skip.txt")
+        mock_resolve.return_value = resolved
+
+        mock_ops = MagicMock()
+        result_obj = MagicMock()
+        result_obj.content = "line1\\nline2"
+        result_obj.to_dict.return_value = {
+            "content": "line1\\nline2",
+            "total_lines": 2,
+        }
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+        mock_getmtime.return_value = 12345.0
+
+        task_id = "tsk-skip-dedup"
+        try:
+            # Call 1 — normal read, populates dedup cache.
+            r1 = json.loads(
+                read_file_tool("/tmp/test-skip.txt", task_id=task_id))
+            assert "content" in r1
+            assert r1["content"] == "line1\\nline2"
+
+            # Call 2 — same path/offset/limit, file unchanged → dedup stub.
+            r2 = json.loads(
+                read_file_tool("/tmp/test-skip.txt", task_id=task_id))
+            assert r2.get("dedup") is True, r2
+            assert r2.get("content_returned") is False
+            assert "content" not in r2
+
+            # Call 3 — _skip_dedup=True bypasses the cache.
+            r3 = json.loads(
+                read_file_tool("/tmp/test-skip.txt", task_id=task_id,
+                               _skip_dedup=True))
+            assert "content" in r3
+            assert r3.get("dedup") is not True
+        finally:
+            reset_file_dedup(task_id)
 
 
 class TestWriteFileHandler:
