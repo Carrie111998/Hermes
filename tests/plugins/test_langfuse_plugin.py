@@ -25,11 +25,12 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # All nine hooks the plugin implements.
         assert set(data["hooks"]) == {
-            "pre_api_request", "post_api_request",
+            "pre_api_request", "post_api_request", "api_request_error",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
+            "on_session_finalize", "on_session_end",
         }
         # Required env vars are the user-facing HERMES_ prefixed keys.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
@@ -977,3 +978,286 @@ class TestCostTotal:
         # A priced model that billed nothing writes no per-type keys, so
         # summing them must not invent a 0.0 total on an empty breakdown.
         assert cost_details == {}
+
+
+# ---------------------------------------------------------------------------
+# Capture modes: metadata | sanitized | full  (HERMES_LANGFUSE_CAPTURE)
+# ---------------------------------------------------------------------------
+
+class TestCaptureModes:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def test_default_mode_is_sanitized(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.delenv("HERMES_LANGFUSE_CAPTURE", raising=False)
+        assert mod._capture_mode() == "sanitized"
+
+    def test_invalid_mode_falls_back_and_warns_once(self, monkeypatch, caplog):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "everything")
+        with caplog.at_level(logging.WARNING):
+            assert mod._capture_mode() == "sanitized"
+            assert mod._capture_mode() == "sanitized"
+        warnings = [r for r in caplog.records if "HERMES_LANGFUSE_CAPTURE" in r.getMessage()]
+        assert len(warnings) == 1
+
+    def test_metadata_mode_omits_content(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "metadata")
+        out = mod._capture_content("top secret prompt text")
+        assert out == {"omitted": True, "type": "text", "chars": 22}
+        obj = mod._capture_content({"password": "hunter22", "path": "/x"})
+        assert obj["omitted"] is True
+        assert set(obj["keys"]) == {"password", "path"}
+        assert "hunter22" not in str(obj)
+
+    def test_metadata_mode_message_serialization_keeps_roles(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "metadata")
+        msgs = mod._serialize_messages([
+            {"role": "user", "content": "my ssn is 123-45-6789"},
+            {"role": "assistant", "content": "noted"},
+        ])
+        assert [m["role"] for m in msgs] == ["user", "assistant"]
+        assert all(isinstance(m["content"], dict) and m["content"]["omitted"] for m in msgs)
+        assert "6789" not in str(msgs)
+
+    def test_sanitized_mode_redacts_secrets(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "sanitized")
+        samples = {
+            "openai": "here sk-abcdefghijklmnop1234 done",
+            "anthropic": "key sk-ant-abcdefgh1234 x",
+            "github": "tok ghp_" + "a" * 36,
+            "aws": "AKIA" + "A" * 16,
+            "langfuse": "pk-lf-12345678-abcd",
+            "bearer": "Authorization: Bearer abc123def456ghi",
+            "assignment": 'api_key="supersecretvalue"',
+        }
+        for name, text in samples.items():
+            out = mod._capture_content(text)
+            assert "REDACTED" in out, f"{name} not redacted: {out!r}"
+
+    def test_sanitized_mode_redacts_before_truncation(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "sanitized")
+        secret = "sk-" + "z" * 40
+        text = "x" * 100 + " " + secret + " " + "y" * 100
+        out = mod._truncate_text(text, 120)
+        assert "z" * 10 not in out
+        assert "REDACTED" in out
+
+    def test_sanitized_mode_keeps_ordinary_text(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "sanitized")
+        text = "refactor the memory manager to emit spans"
+        assert mod._capture_content(text) == text
+
+    def test_full_mode_keeps_secret_shaped_text(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "full")
+        text = "here sk-abcdefghijklmnop1234 done"
+        assert mod._capture_content(text) == text
+
+    def test_capture_mode_recorded_in_trace_metadata(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "metadata")
+        seen = {}
+
+        class _Span:
+            def update(self, **kw): pass
+            def end(self, **kw): pass
+            def set_trace_io(self, **kw): pass
+            def start_observation(self, **kw): return _Span()
+
+        class _RootCM:
+            def __enter__(self): return _Span()
+            def __exit__(self, *exc): return False
+
+        class _Client:
+            def create_trace_id(self, seed=None): return "t1"
+            def start_as_current_observation(self, **kw):
+                seen.update(kw)
+                return _RootCM()
+
+        state = mod._start_root_trace(
+            "k", task_id="t", session_id="s", platform="cli", provider="p",
+            model="m", api_mode="chat", messages=[{"role": "user", "content": "hi"}],
+            client=_Client(),
+        )
+        assert seen["metadata"]["capture_mode"] == "metadata"
+        assert state is not None
+
+
+# ---------------------------------------------------------------------------
+# api_request_error hook
+# ---------------------------------------------------------------------------
+
+class TestApiRequestErrorHook:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def _seed_state(self, mod, task_key, gen_key="1"):
+        class _Gen:
+            def __init__(self):
+                self.updates = []
+                self.ended = False
+            def update(self, **kw):
+                self.updates.append(kw)
+            def end(self, **kw):
+                self.ended = True
+
+        class _Root:
+            def __init__(self):
+                self.ended = False
+            def update(self, **kw): pass
+            def end(self, **kw): self.ended = True
+            def set_trace_io(self, **kw): pass
+
+        gen = _Gen()
+        root = _Root()
+        state = mod.TraceState(trace_id="t", root_ctx=None, root_span=root)
+        state.generations[gen_key] = gen
+        mod._TRACE_STATE[task_key] = state
+        return gen, root
+
+    def test_retryable_error_closes_generation_keeps_turn(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        mod._TRACE_STATE.clear()
+        turn_id = "s:t:turn1"
+        task_key = mod._trace_key("t", "s", turn_id=turn_id)
+        gen, root = self._seed_state(mod, task_key)
+
+        mod.on_api_request_error(
+            task_id="t", session_id="s", api_call_count=1,
+            turn_id=turn_id,
+            status_code=429, retryable=True, retry_count=1, max_retries=3,
+            error={"type": "RateLimitError", "message": "slow down"},
+        )
+
+        assert gen.ended is True
+        assert any(u.get("level") == "ERROR" for u in gen.updates)
+        # error metadata landed
+        meta = [u["metadata"] for u in gen.updates if "metadata" in u]
+        assert meta and meta[0]["status_code"] == 429
+        # turn stays open for the retry
+        assert task_key in mod._TRACE_STATE
+        assert root.ended is False
+
+    def test_terminal_error_finishes_turn(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: type("C", (), {"flush": lambda self: None})())
+        mod._TRACE_STATE.clear()
+        turn_id = "s:t:turn2"
+        task_key = mod._trace_key("t", "s", turn_id=turn_id)
+        gen, root = self._seed_state(mod, task_key)
+
+        mod.on_api_request_error(
+            task_id="t", session_id="s", api_call_count=1,
+            turn_id=turn_id,
+            status_code=401, retryable=False,
+            error={"type": "AuthenticationError", "message": "bad key"},
+        )
+
+        assert gen.ended is True
+        assert task_key not in mod._TRACE_STATE
+        assert root.ended is True
+
+    def test_error_hook_noops_without_state(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        mod._TRACE_STATE.clear()
+        # Must not raise
+        mod.on_api_request_error(
+            task_id="t", session_id="s", api_call_count=1,
+            error={"type": "X", "message": "y"}, retryable=False,
+        )
+
+    def test_error_message_respects_capture_mode(self, monkeypatch):
+        mod = self._fresh_plugin()
+        monkeypatch.setenv("HERMES_LANGFUSE_CAPTURE", "metadata")
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        mod._TRACE_STATE.clear()
+        turn_id = "s:t:turn3"
+        task_key = mod._trace_key("t", "s", turn_id=turn_id)
+        gen, _root = self._seed_state(mod, task_key)
+
+        mod.on_api_request_error(
+            task_id="t", session_id="s", api_call_count=1, turn_id=turn_id,
+            retryable=True,
+            error={"type": "APIError", "message": "secret prompt echo sk-abc"},
+        )
+        meta = [u["metadata"] for u in gen.updates if "metadata" in u][0]
+        assert isinstance(meta["error_message"], dict)
+        assert meta["error_message"]["omitted"] is True
+
+
+# ---------------------------------------------------------------------------
+# on_session_finalize hook
+# ---------------------------------------------------------------------------
+
+class TestSessionFinalizeHook:
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def _client(self, flushes):
+        class _Client:
+            def flush(self):
+                flushes.append(1)
+        return _Client()
+
+    def _state(self, mod):
+        class _Root:
+            def __init__(self):
+                self.ended = False
+            def update(self, **kw): pass
+            def end(self, **kw): self.ended = True
+            def set_trace_io(self, **kw): pass
+        root = _Root()
+        return mod.TraceState(trace_id="t", root_ctx=None, root_span=root), root
+
+    def test_finalize_closes_matching_session_traces(self, monkeypatch):
+        mod = self._fresh_plugin()
+        flushes = []
+        client = self._client(flushes)
+        monkeypatch.setattr(mod, "_LANGFUSE_CLIENT", client)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        mod._TRACE_STATE.clear()
+
+        s1, r1 = self._state(mod)
+        s2, r2 = self._state(mod)
+        mod._TRACE_STATE["session:sess-a:turn:1"] = s1
+        mod._TRACE_STATE["session:sess-b:turn:1"] = s2
+
+        mod.on_session_finalize(session_id="sess-a")
+
+        assert "session:sess-a:turn:1" not in mod._TRACE_STATE
+        assert "session:sess-b:turn:1" in mod._TRACE_STATE
+        assert r1.ended is True
+        assert r2.ended is False
+        assert flushes  # flushed at least once
+
+    def test_finalize_without_session_closes_all(self, monkeypatch):
+        mod = self._fresh_plugin()
+        flushes = []
+        client = self._client(flushes)
+        monkeypatch.setattr(mod, "_LANGFUSE_CLIENT", client)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        mod._TRACE_STATE.clear()
+
+        s1, r1 = self._state(mod)
+        mod._TRACE_STATE["session:sess-x:turn:1"] = s1
+        mod.on_session_finalize()
+        assert not mod._TRACE_STATE
+        assert r1.ended is True
+
+    def test_finalize_noop_when_client_never_initialized(self):
+        mod = self._fresh_plugin()
+        mod._TRACE_STATE.clear()
+        # _LANGFUSE_CLIENT is None on a fresh module; must not raise or init.
+        mod.on_session_finalize(session_id="whatever")

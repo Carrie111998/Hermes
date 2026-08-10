@@ -18,6 +18,10 @@ Optional env vars:
   HERMES_LANGFUSE_RELEASE     - release/version tag
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
   HERMES_LANGFUSE_MAX_CHARS   - max chars per field (default: 12000)
+  HERMES_LANGFUSE_CAPTURE     - content capture mode (default: "sanitized")
+      metadata  - no content: sizes, roles, tool names, IDs, usage, cost only
+      sanitized - content with secret-pattern redaction + truncation
+      full      - raw content (truncated only); explicit opt-in
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
 """
 from __future__ import annotations
@@ -99,6 +103,101 @@ def _debug_enabled() -> bool:
 def _debug(message: str) -> None:
     if _debug_enabled():
         logger.info("Langfuse tracing: %s", message)
+
+
+# ---------------------------------------------------------------------------
+# Capture modes
+# ---------------------------------------------------------------------------
+
+_CAPTURE_MODES = ("metadata", "sanitized", "full")
+_DEFAULT_CAPTURE_MODE = "sanitized"
+_warned_invalid_capture = False
+
+
+def _capture_mode() -> str:
+    """Resolve the content-capture mode: ``metadata | sanitized | full``.
+
+    Read per call (cheap env lookup) so tests and long-lived processes can
+    flip modes without a client reset. Invalid values warn once per process
+    and fall back to the default rather than silently capturing more than
+    the operator intended.
+    """
+    global _warned_invalid_capture
+    value = _env("HERMES_LANGFUSE_CAPTURE").lower()
+    if not value:
+        return _DEFAULT_CAPTURE_MODE
+    if value in _CAPTURE_MODES:
+        return value
+    if not _warned_invalid_capture:
+        _warned_invalid_capture = True
+        logger.warning(
+            "Langfuse plugin: invalid HERMES_LANGFUSE_CAPTURE=%r, falling back "
+            "to %r (valid: %s)",
+            value, _DEFAULT_CAPTURE_MODE, ", ".join(_CAPTURE_MODES),
+        )
+    return _DEFAULT_CAPTURE_MODE
+
+
+# Secret-shaped substrings redacted in ``sanitized`` mode. Ordered: specific
+# key formats first, generic assignment patterns last. Intentionally tight to
+# keep false positives low — this is defense in depth for accidental secret
+# passage through prompts/tool output, not a DLP system.
+_SECRET_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)", re.DOTALL), "[REDACTED:private-key]"),
+    (re.compile(r"\b(?:sk|pk)-lf-[A-Za-z0-9\-]{8,}"), "[REDACTED:langfuse-key]"),
+    (re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{8,}"), "[REDACTED:api-key]"),
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"), "[REDACTED:api-key]"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}"), "[REDACTED:github-token]"),
+    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "[REDACTED:github-token]"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "[REDACTED:aws-key]"),
+    (re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}"), "[REDACTED:slack-token]"),
+    (re.compile(r"\beyJ[A-Za-z0-9_\-]{20,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\b"), "[REDACTED:jwt]"),
+    (re.compile(r"(?i)\b(authorization\s*:\s*bearer)\s+[A-Za-z0-9_\-.~+/=]{8,}"), r"\1 [REDACTED:token]"),
+    (re.compile(r"(?i)\b((?:api[_-]?key|secret[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd)\s*[=:]\s*)(['\"]?)[^\s'\"]{6,}\2"), r"\1\2[REDACTED]\2"),
+]
+
+
+def _redact_secrets(value: str) -> str:
+    for pattern, replacement in _SECRET_PATTERNS:
+        value = pattern.sub(replacement, value)
+    return value
+
+
+def _describe_content(value: Any, *, depth: int = 0) -> Any:
+    """Metadata-mode stand-in for content: shape and size, never payload."""
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return {"omitted": True, "type": "number"}
+    if isinstance(value, bytes):
+        return {"omitted": True, "type": "bytes", "length": len(value)}
+    if isinstance(value, str):
+        return {"omitted": True, "type": "text", "chars": len(value)}
+    if isinstance(value, dict):
+        return {
+            "omitted": True,
+            "type": "object",
+            "keys": [str(k) for k in list(value.keys())[:20]],
+        }
+    if isinstance(value, (list, tuple, set)):
+        return {"omitted": True, "type": "array", "items": len(value)}
+    return {"omitted": True, "type": type(value).__name__}
+
+
+def _capture_content(value: Any, *, parse_json_strings: bool = False,
+                     tool_name: str = "", args: Any = None) -> Any:
+    """Apply the active capture mode to a CONTENT value.
+
+    Metadata fields (provider, model, IDs, counts) should NOT go through
+    this — they stay as-is in every mode. Only prompt/response text, tool
+    arguments, and tool results are content.
+    """
+    mode = _capture_mode()
+    if mode == "metadata":
+        return _describe_content(value)
+    if tool_name or args is not None:
+        value = _normalize_payload(value, tool_name=tool_name, args=args)
+    return _safe_value(value, parse_json_strings=parse_json_strings)
 
 
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
@@ -289,6 +388,10 @@ def _truncate_text(value: str, max_chars: int) -> Any:
     # reaches the SDK.
     if _is_base64_data_uri(value):
         return _redact_data_uri(value)
+    # Redact BEFORE truncating so a secret straddling the cut point cannot
+    # leak its prefix. Truncation is a size control, not redaction.
+    if _capture_mode() == "sanitized":
+        value = _redact_secrets(value)
     if len(value) <= max_chars:
         return value
     return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
@@ -462,7 +565,7 @@ def _extract_last_user_message(messages: Any) -> Any:
         if isinstance(message, dict) and message.get("role") == "user":
             return {
                 "role": "user",
-                "content": _safe_value(message.get("content")),
+                "content": _capture_content(message.get("content")),
             }
     return None
 
@@ -492,7 +595,7 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
         role = message.get("role")
         item = {
             "role": role,
-            "content": _safe_value(
+            "content": _capture_content(
                 message.get("content"),
                 parse_json_strings=(role == "tool"),
             ),
@@ -503,7 +606,7 @@ def _serialize_messages(messages: Any) -> list[dict[str, Any]]:
             if message.get("name"):
                 item["name"] = _safe_value(message.get("name"))
         if message.get("tool_calls"):
-            item["tool_calls"] = _safe_value(message.get("tool_calls"), parse_json_strings=True)
+            item["tool_calls"] = _capture_content(message.get("tool_calls"), parse_json_strings=True)
         serialized.append(item)
     return serialized
 
@@ -516,7 +619,7 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
         fn = getattr(tool_call, "function", None)
         name = getattr(fn, "name", None) if fn else None
         arguments = getattr(fn, "arguments", None) if fn else None
-        safe_arguments = _safe_value(arguments, parse_json_strings=False)
+        safe_arguments = _capture_content(arguments, parse_json_strings=False)
         serialized.append({
             "id": getattr(tool_call, "id", None),
             "type": getattr(tool_call, "type", None) or "function",
@@ -532,8 +635,8 @@ def _serialize_tool_calls(tool_calls: Any) -> list[dict[str, Any]]:
 
 def _serialize_assistant_message(message: Any) -> dict[str, Any]:
     return {
-        "content": _safe_value(getattr(message, "content", None)),
-        "reasoning": _safe_value(getattr(message, "reasoning", None)),
+        "content": _capture_content(getattr(message, "content", None)),
+        "reasoning": _capture_content(getattr(message, "reasoning", None)),
         "tool_calls": _serialize_tool_calls(getattr(message, "tool_calls", None)),
     }
 
@@ -620,6 +723,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "provider": provider,
         "model": model,
         "api_mode": api_mode,
+        "capture_mode": _capture_mode(),
     }
 
     # session_id must be passed in trace_context for Langfuse session grouping.
@@ -963,7 +1067,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         output = _serialize_assistant_message(assistant_message)
     elif assistant_response is not None:
         # post_llm_call passes assistant_response as a plain string
-        output = {"content": _safe_value(assistant_response), "reasoning": None, "tool_calls": []}
+        output = {"content": _capture_content(assistant_response), "reasoning": None, "tool_calls": []}
     else:
         # post_api_request path — reconstruct from summary kwargs
         output = {
@@ -1091,7 +1195,7 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             client=client,
             name=f"Tool: {tool_name}",
             as_type="tool",
-            input_value=_safe_value(args),
+            input_value=_capture_content(args),
             metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
         )
         if tool_call_id:
@@ -1127,12 +1231,15 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     if observation is None:
         return
 
-    if isinstance(result, str):
-        result_value = _maybe_parse_json_string(result)
+    if _capture_mode() == "metadata":
+        safe_result_value = _describe_content(result)
     else:
-        result_value = result
-    result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
-    safe_result_value = _safe_value(result_value, parse_json_strings=True)
+        if isinstance(result, str):
+            result_value = _maybe_parse_json_string(result)
+        else:
+            result_value = result
+        result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
+        safe_result_value = _safe_value(result_value, parse_json_strings=True)
 
     # Backfill so the generation's tool_call record carries the result alongside arguments.
     if tool_call_id:
@@ -1150,8 +1257,123 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     _end_observation(
         observation,
         output=safe_result_value,
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata={"tool_name": tool_name, "args": _capture_content(args, parse_json_strings=True)},
     )
+
+
+def on_api_request_error(*, task_id: str = "", session_id: str = "", provider: str = "",
+                         model: str = "", api_mode: str = "", api_call_count: int = 0,
+                         api_duration: float = 0.0, status_code: Any = None,
+                         retry_count: Any = None, max_retries: Any = None,
+                         retryable: Any = None, reason: Any = None, error: Any = None,
+                         turn_id: str = "", api_request_id: str = "",
+                         **_: Any) -> None:
+    """Close the open generation for a failed API request.
+
+    Without this, a failed request leaves its generation open until trace
+    eviction — the failure is invisible in Langfuse and the turn appears
+    to hang. Marks the generation with ERROR level and the error summary.
+    If the request was not retryable (or retries are exhausted), the turn
+    is finished too, since the agent loop is about to unwind.
+    """
+    client = _get_langfuse()
+    if client is None:
+        return
+
+    task_key = _trace_key(
+        task_id,
+        session_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+    )
+    req_key = _request_key(api_call_count)
+
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        generation = state.generations.pop(req_key, None) if state else None
+    if state is None:
+        return
+
+    error_type = ""
+    error_message = ""
+    if isinstance(error, dict):
+        error_type = str(error.get("type") or "")
+        error_message = str(error.get("message") or "")
+
+    error_metadata: Dict[str, Any] = {
+        "error": True,
+        "error_type": error_type,
+        # Error messages can embed request fragments (URLs w/ keys, prompt
+        # echoes) — run them through the capture pipeline like content.
+        "error_message": _capture_content(error_message),
+    }
+    if status_code is not None:
+        error_metadata["status_code"] = status_code
+    if retry_count is not None:
+        error_metadata["retry_count"] = retry_count
+    if max_retries is not None:
+        error_metadata["max_retries"] = max_retries
+    if retryable is not None:
+        error_metadata["retryable"] = retryable
+    if reason:
+        error_metadata["reason"] = str(reason)
+    if api_duration and api_duration > 0:
+        error_metadata["api_duration_s"] = round(api_duration, 3)
+
+    if generation is not None:
+        try:
+            generation.update(
+                level="ERROR",
+                status_message=(error_type or "api_request_error")[:200],
+            )
+        except Exception as exc:  # pragma: no cover - fail-open
+            _debug(f"error-level update failed: {exc}")
+        _end_observation(generation, metadata=error_metadata)
+
+    # A retryable failure will be followed by another pre_api_request on the
+    # same trace; keep the turn open. A terminal failure ends the turn.
+    if retryable is False:
+        _finish_trace(task_key, output={"error": error_metadata})
+    else:
+        state.last_updated_at = time.time()
+
+
+def on_session_finalize(*, session_id: str = "", **_: Any) -> None:
+    """True session-end boundary: close any traces still open and flush.
+
+    A turn that ended on a tool-only or empty final response never reaches
+    ``_finish_trace``; without this hook its root span dangles until state
+    eviction and queued events can be lost on process exit.
+    """
+    # Only act on an already-constructed client — do NOT lazily initialize
+    # one at finalize time; if init never happened there are no traces.
+    client = _LANGFUSE_CLIENT
+    if client is None or client is _INIT_FAILED or not isinstance(client, object) or not hasattr(client, "flush"):
+        return
+
+    # Close every trace belonging to this session (or all, when no
+    # session_id is provided — process-level finalization). Trace keys carry
+    # the session as either "session:<id>" (no task) or "task:<id>" (gateway
+    # sets task_id == session_id), plus the legacy bare-task_id shape — match
+    # on the id in any segment.
+    if session_id:
+        fragments = (f"session:{session_id}", f"task:{session_id}")
+        with _STATE_LOCK:
+            keys = [
+                k for k in _TRACE_STATE
+                if k == session_id or any(f in k for f in fragments)
+            ]
+    else:
+        with _STATE_LOCK:
+            keys = list(_TRACE_STATE)
+
+    for key in keys:
+        _finish_trace(key)
+
+    try:
+        client.flush()
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"finalize flush failed: {exc}")
 
 
 def register(ctx) -> None:
@@ -1160,7 +1382,10 @@ def register(ctx) -> None:
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
     ctx.register_hook("pre_api_request", on_pre_llm_request)
     ctx.register_hook("post_api_request", on_post_llm_call)
+    ctx.register_hook("api_request_error", on_api_request_error)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
     ctx.register_hook("post_tool_call", on_post_tool_call)
+    ctx.register_hook("on_session_finalize", on_session_finalize)
+    ctx.register_hook("on_session_end", on_session_finalize)
