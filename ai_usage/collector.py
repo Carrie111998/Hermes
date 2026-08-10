@@ -18,6 +18,13 @@ from ai_usage.spend import spend_provider
 from ai_usage.tokensum import tokensum_provider
 
 
+def _default_source(key: str) -> str:
+    for provider_key, _label, mode in PROVIDERS:
+        if provider_key == key:
+            return "official" if mode in ("budget", "balance") else "hermes"
+    return "hermes"
+
+
 def _carry_forward(prev: Optional[dict], key: str) -> Optional[dict]:
     if not prev:
         return None
@@ -27,7 +34,7 @@ def _carry_forward(prev: Optional[dict], key: str) -> Optional[dict]:
                 return None
             carried = dict(p)
             carried["state"] = "stale"
-            carried.setdefault("source", "hermes")
+            carried.setdefault("source", _default_source(key))
             return carried
     return None
 
@@ -96,8 +103,8 @@ def collect(
     _monotonic: Callable[[], float] = time.monotonic,
 ) -> dict:
     now = now or datetime.now(timezone.utc)
-    manual = read_manual_snapshot(manual_store_path, now) if manual_store_path else {}
     started = _monotonic()
+    manual = read_manual_snapshot(manual_store_path, now) if manual_store_path else {}
     deadline_seconds = max(0.0, float(deadline_seconds))
     deadline = started + deadline_seconds
     accepts_budget = _supports_budget(fetch_usage)
@@ -167,8 +174,16 @@ def collect(
                 attempts.append(_diagnostic(key, outcome, finished - attempt_started, remaining))
                 continue
 
-            providers.append(_state_db_row(key, label, mode, conn, now, prev))
-            attempts.append(_diagnostic(key, "ok", _monotonic() - attempt_started, remaining))
+            row = _state_db_row(key, label, mode, conn, now, prev)
+            providers.append(row)
+            outcome = "ok"
+            if row.get("state") == "stale":
+                outcome = "stale"
+            elif row.get("state") == "error":
+                outcome = "exception"
+            attempts.append(
+                _diagnostic(key, outcome, _monotonic() - attempt_started, remaining)
+            )
     finally:
         if conn is not None:
             conn.close()

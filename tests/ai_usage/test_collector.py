@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import ai_usage.collector as collector_module
 from ai_usage.collector import collect, write_atomic
 
 NOW = datetime(2026, 8, 4, 15, 0, tzinfo=timezone.utc)
@@ -378,6 +379,72 @@ def test_collect_stops_starting_providers_after_deadline_and_carries_stale(tmp_p
     assert outcomes["gemini"] == "deadline_exhausted"
     assert outcomes["xai"] == "deadline_exhausted"
     assert outcomes["opencode-go"] == "deadline_exhausted"
+
+
+def test_manual_snapshot_read_consumes_collection_deadline(tmp_path, monkeypatch):
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    calls = []
+    ticks = itertools.chain((10.0, 12.0), itertools.repeat(12.0))
+
+    def slow_manual(path, now):
+        del path, now
+        return {}
+
+    monkeypatch.setattr(collector_module, "read_manual_snapshot", slow_manual)
+
+    data = collect(
+        db_path=str(db), prev=None,
+        fetch_usage=lambda provider, **kwargs: calls.append((provider, kwargs)),
+        now=NOW, manual_store_path=str(tmp_path / "manual.json"),
+        deadline_seconds=1.0, _monotonic=lambda: next(ticks),
+    )
+
+    assert calls == []
+    assert all(
+        item["outcome"] == "deadline_exhausted"
+        for item in data["diagnostics"]["providers"]
+    )
+
+
+def test_state_db_diagnostics_report_error_and_stale_outcomes(tmp_path):
+    prev = {
+        "providers": [{
+            "key": "gemini", "label": "Gemini", "mode": "spend",
+            "state": "ok", "windows": [], "detail": "last known",
+        }],
+    }
+
+    data = collect(
+        db_path=str(tmp_path / "missing-state.db"), prev=prev,
+        fetch_usage=lambda _: None, now=NOW,
+    )
+
+    outcomes = {item["key"]: item["outcome"] for item in data["diagnostics"]["providers"]}
+    assert outcomes["gemini"] == "stale"
+    assert outcomes["xai"] == "exception"
+    assert outcomes["opencode-go"] == "exception"
+    assert "missing-state.db" not in json.dumps(data["diagnostics"])
+
+
+def test_pre_provenance_carry_forward_infers_provider_source(tmp_path):
+    prev = {
+        "providers": [
+            {"key": "anthropic", "label": "Claude", "mode": "budget", "state": "ok", "windows": []},
+            {"key": "openai-codex", "label": "Codex", "mode": "budget", "state": "ok", "windows": []},
+            {"key": "gemini", "label": "Gemini", "mode": "spend", "state": "ok", "windows": []},
+        ],
+    }
+
+    data = collect(
+        db_path=str(tmp_path / "missing-state.db"), prev=prev,
+        fetch_usage=lambda _: None, now=NOW,
+    )
+
+    by = {row["key"]: row for row in data["providers"]}
+    assert by["anthropic"]["source"] == "official"
+    assert by["openai-codex"]["source"] == "official"
+    assert by["gemini"]["source"] == "hermes"
 
 
 def test_collect_keeps_one_argument_fetcher_compatibility(tmp_path):
