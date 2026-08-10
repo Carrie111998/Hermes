@@ -122,3 +122,26 @@ def test_scriptless_job_still_reaches_the_session(hermes_env, session_db_calls, 
     run_job(job)
 
     assert session_db_calls == [1]
+
+
+def test_silent_script_output_skips_the_model_call(hermes_env, session_db_calls):
+    """Interim contract for a hybrid job whose script went silent.
+
+    Empty stdout is NOT a wakeAgent:false gate, so the gate lets the run
+    proceed -- but _build_job_prompt then returns None and the tick ends
+    silently with no model call and no delivery. This is the behavior that
+    ships before the (separately gated) no_agent conversion.
+    """
+    from unittest.mock import patch
+
+    from cron.scheduler import SILENT_MARKER, run_job
+
+    job = _gated_job(hermes_env, "# prints nothing")
+
+    with patch("run_agent.AIAgent") as agent_cls:
+        ok, _doc, final, error = run_job(job)
+
+    assert ok is True and error is None
+    assert final == SILENT_MARKER, "a silent script must not deliver"
+    # A silent script must not cost a model call.
+    agent_cls.assert_not_called()
