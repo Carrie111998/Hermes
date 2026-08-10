@@ -19401,6 +19401,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         We use the adapter's pending-message / FIFO machinery so any real
         user message that arrives simultaneously is handled by the same
         queue and takes priority naturally.
+
+        The judge call is a synchronous auxiliary LLM request. Running it
+        inline on the gateway event loop wedges liveness probes whenever the
+        model is slow or times out (common with local GGUF endpoints), and
+        the loop-liveness watchdog then hard-exits with code 75. Keep the
+        cheap active-check on-loop; offload gather + evaluate to a worker
+        thread so messaging stays responsive.
         """
         try:
             from hermes_cli.goals import GoalManager
@@ -19418,17 +19425,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not mgr.is_active():
             return
 
-        try:
-            from hermes_cli.goals import gather_background_processes as _gather_bg
-            _bg_procs = _gather_bg()
-        except Exception:
-            _bg_procs = None
+        final_text = final_response or ""
 
-        decision = mgr.evaluate_after_turn(
-            final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
-        )
+        def _evaluate_goal_off_loop() -> dict:
+            try:
+                from hermes_cli.goals import gather_background_processes as _gather_bg
+                _bg_procs = _gather_bg()
+            except Exception:
+                _bg_procs = None
+            return mgr.evaluate_after_turn(
+                final_text,
+                user_initiated=True,
+                background_processes=_bg_procs,
+            )
+
+        decision = await asyncio.to_thread(_evaluate_goal_off_loop)
         msg = decision.get("message") or ""
 
         # Defer the status line until after the adapter has delivered the
