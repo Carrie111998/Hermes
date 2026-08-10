@@ -4176,6 +4176,20 @@ def generate_launchd_plist() -> str:
     <key>ExitTimeOut</key>
     <integer>25</integer>
 
+    <!-- The gateway maintains Discord sockets and several SQLite-backed subsystems.
+         The macOS per-job default of 256 FDs is too small for long-lived gateway
+         workloads and can prevent new database or network connections. -->
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>4096</integer>
+    </dict>
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>{log_dir}/gateway.log</string>
     
