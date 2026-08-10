@@ -3,6 +3,7 @@ import logging
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -143,6 +144,37 @@ def _secondary_recovery_runner(*, running=True):
     runner._adapter_disconnect_timeout_secs = lambda: 0
     runner._sync_voice_mode_state_to_adapter = lambda adapter: None
     return runner
+
+
+@pytest.mark.asyncio
+async def test_secondary_busy_handler_stamps_profile_before_authorization(monkeypatch):
+    runner = _secondary_recovery_runner()
+    adapter = _SecondaryRecoveryAdapter()
+    seen = {}
+    scoped_homes = []
+
+    @contextmanager
+    def fake_scope(profile_home):
+        scoped_homes.append(Path(profile_home))
+        yield
+
+    async def handle_busy(event, session_key):
+        seen["profile"] = event.source.profile
+        seen["session_key"] = session_key
+        return True
+
+    monkeypatch.setattr(gateway_run, "_profile_runtime_scope", fake_scope)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir", lambda name: Path("/profiles") / name
+    )
+    runner._handle_active_session_busy_message = handle_busy
+
+    runner._configure_profile_adapter(adapter, "reviewer", Platform.DISCORD)
+    event = SimpleNamespace(source=SimpleNamespace(profile=None))
+
+    assert await adapter.busy_session_handler(event, "session-1") is True
+    assert seen == {"profile": "reviewer", "session_key": "session-1"}
+    assert scoped_homes == [Path("/profiles/reviewer")]
 
 
 def _install_secondary_reconnect_context(monkeypatch, runner, adapter, scoped_homes=None):
