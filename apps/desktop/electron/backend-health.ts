@@ -175,6 +175,7 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
   }
 
   const detail = lastError instanceof Error ? lastError.message : 'timeout'
+
   const error = new Error(`Hermes backend did not become ready: ${detail}`, { cause: lastError }) as Error & {
     kind: 'timeout'
   }

@@ -94,6 +94,7 @@ function isRetryableRemoteConnectionError(error: unknown, seen = new Set<object>
 
 function retryDeadlineError(lastError: unknown, maxElapsedMs: number): Error & { kind: 'timeout' } {
   const detail = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error')
+
   const error = new Error(`Remote connection retry deadline exceeded after ${maxElapsedMs}ms: ${detail}`, {
     cause: lastError
   }) as Error & { kind: 'timeout' }
