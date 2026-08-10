@@ -6587,6 +6587,167 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=_profile,
         )
 
+    # ------------------------------------------------------------------
+    # Public injection API — exposed to plugins via gateway:startup hook
+    # ------------------------------------------------------------------
+
+    async def inject_internal_message(
+        self,
+        profile: str,
+        platform: Platform,
+        chat_id: str,
+        text: str,
+        notice_text: Optional[str] = None,
+    ) -> Optional[str]:
+        """Route an internal message through a platform adapter to the agent.
+
+        Used by plugins (e.g., the ATM graft bridge) to inject synthetic
+        host-originated messages that enter the agent loop via the normal
+        adapter→gateway dispatch path, but with ``internal=True`` so they
+        bypass user authorization, startup restore, and other user-facing
+        guards.
+
+        The adapter is selected from ``self._profile_adapters[profile]``
+        when ``profile`` names a secondary profile; otherwise
+        ``self.adapters`` (the running profile's map) is used.
+
+        .. note::
+
+           This method is **fire-and-forget** — it awaits
+           ``adapter.handle_message(event)`` which spawns a background
+           task and returns quickly. The agent response, if any, is
+           delivered through the normal gateway delivery path.
+
+        Args:
+            profile:    Profile name to route through (looked up in
+                        ``_profile_adapters``; falls back to
+                        ``self.adapters``).
+            platform:   Platform enum (e.g. ``Platform.TELEGRAM``).
+            chat_id:    Target chat ID for the platform.
+            text:       Message text to inject.
+            notice_text: Optional visible notice to send to the chat
+                         before routing the event (observability surface).
+
+        Returns:
+            ``None`` — the method returns after queuing the event for
+            dispatch.
+        """
+        # Resolve the adapter for the requested profile.
+        adapter = None
+        if profile and self._profile_adapters:
+            profile_map = self._profile_adapters.get(profile)
+            if profile_map:
+                adapter = profile_map.get(platform)
+        if adapter is None:
+            adapter = self.adapters.get(platform)
+
+        if adapter is None:
+            logger.warning(
+                "inject_internal_message: no adapter for profile=%s platform=%s",
+                profile, platform,
+            )
+            return None
+
+        # Construct SessionSource — deliberately NOT a synthetic Telegram
+        # user message; the platform and chat_id reflect the real delivery
+        # channel so session resolution keys on the right identity.
+        source = SessionSource(
+            platform=platform,
+            chat_id=chat_id,
+            chat_type="dm",
+            profile=profile or None,
+        )
+
+        # Construct MessageEvent with internal=True so the gateway skips
+        # authorization, startup-restore queueing, and scale-to-zero
+        # clocks — this is a host-originated event, not user traffic.
+        event = MessageEvent(
+            text=text,
+            source=source,
+            internal=True,
+        )
+
+        # Optional visible notice (observability, not a duplicate message).
+        if notice_text:
+            try:
+                await adapter.send(chat_id, notice_text)
+            except Exception as exc:
+                logger.warning(
+                    "inject_internal_message: failed to send notice to %s: %s",
+                    chat_id, exc,
+                )
+
+        # Route through the adapter's handle_message. This spawns a
+        # background task that calls _handle_message → the full agent
+        # pipeline. We await so the caller knows the event was accepted
+        # for dispatch; the response is delivered asynchronously.
+        await adapter.handle_message(event)
+        return None
+
+    def resolve_session_id(self, chat_id: str) -> Optional[str]:
+        """Resolve a Telegram chat ID to the runtime session key.
+
+        Returns the opaque session key string used internally by
+        ``_handle_message`` for session routing, or ``None`` if a session
+        cannot be resolved (no session store configured).
+
+        This is the public lookup that plugins use to map a configured
+        ``ATM_CHAT_ID`` to the live runtime session. The returned value
+        is an opaque identifier — callers must not parse or interpret it.
+        """
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id=chat_id,
+            chat_type="dm",
+        )
+        try:
+            return self._session_key_for_source(source)
+        except Exception as exc:
+            logger.debug("resolve_session_id failed for chat_id=%s: %s", chat_id, exc)
+            return None
+
+    async def steer_session(
+        self,
+        session_id_or_chat_id: str,
+        text: str,
+    ) -> bool:
+        """Steer a running agent session without interrupting it.
+
+        If the identified session has an active ``AIAgent`` turn with a
+        pending tool-result boundary, the text is delivered at that
+        boundary (non-interrupting steer). If the session is idle or has
+        no running agent, returns ``False``.
+
+        The argument may be a chat_id (resolved via
+        ``resolve_session_id()``) or an opaque session key returned by a
+        prior ``resolve_session_id()`` call — the method tries the
+        argument as-is first, then falls back to resolving it as a chat
+        ID.
+
+        Returns ``True`` when steer was accepted and will be delivered
+        at the next safe boundary; ``False`` when no active agent exists
+        for this session.
+        """
+        # Try the argument directly as a session key first.
+        state = self._peek_session_state(session_id_or_chat_id)
+        if state is None or state.turn.agent is None:
+            # Fall back: treat it as a chat_id and resolve.
+            session_key = self.resolve_session_id(session_id_or_chat_id)
+            if session_key is None:
+                return False
+            state = self._peek_session_state(session_key)
+
+        if state is None or state.turn.agent is None:
+            return False
+
+        agent = state.turn.agent
+        try:
+            agent.steer(text)
+            return True
+        except Exception as exc:
+            logger.warning("steer_session failed for %s: %s", session_id_or_chat_id, exc)
+            return False
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -11258,6 +11419,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info("%s hook(s) loaded", hook_count)
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
+            "runner": self,  # public injection API (inject_internal_message, …)
         })
         
         if connected_count > 0:
