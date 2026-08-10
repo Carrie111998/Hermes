@@ -147,7 +147,7 @@ from agent.tool_guardrails import LoopCapConfig  # noqa: E402
 def test_loop_cap_zero_disables_and_junk_falls_back():
     # 0 is a legitimate "unlimited" value; negatives / junk fall back to default.
     assert LoopCapConfig.from_mapping({"max_web_searches": 0}).max_web_searches == 0
-    assert LoopCapConfig.from_mapping({"max_web_searches": -5}).max_web_searches == 50
+    assert LoopCapConfig.from_mapping({"max_web_searches": -5}).max_web_searches == 12
     assert LoopCapConfig.from_mapping({"max_subagents": "nope"}).max_subagents == 50
 
 
@@ -165,10 +165,27 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
         assert controller.before_call("web_search", {"query": f"q{i}"}).action == "allow"
     decision = controller.before_call("web_search", {"query": "q4"})
     assert decision.action == "block"
-    assert decision.code == "loop_web_search_cap"
+    assert decision.code == "loop_web_research_cap"
     assert decision.should_halt is True
 
 
+def test_web_search_and_extract_share_one_research_budget():
+    controller = ToolCallGuardrailController(
+        ToolCallGuardrailConfig(loop_caps=LoopCapConfig(max_web_searches=3))
+    )
+
+    assert controller.before_call("web_search", {"query": "a"}).action == "allow"
+    assert controller.before_call(
+        "web_extract", {"urls": ["https://example.com/a"]}
+    ).action == "allow"
+    assert controller.before_call("web_search", {"query": "b"}).action == "allow"
+
+    decision = controller.before_call(
+        "web_extract", {"urls": ["https://example.com/b"]}
+    )
+    assert decision.action == "block"
+    assert decision.code == "loop_web_research_cap"
+    assert decision.count == 3
 
 
 

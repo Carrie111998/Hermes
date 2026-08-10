@@ -420,3 +420,21 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def test_web_budget_halt_response_is_actionable_and_not_an_internal_loop_dump():
+    from agent.tool_guardrails import ToolGuardrailDecision
+
+    agent = _make_agent("web_search")
+    response = agent._toolguard_controlled_halt_response(
+        ToolGuardrailDecision(
+            action="block",
+            code="loop_web_research_cap",
+            tool_name="web_search",
+            count=12,
+        )
+    )
+
+    assert "12 search/extract requests" in response
+    assert "direct/official data source" in response
+    assert "loop_web_research_cap" not in response
