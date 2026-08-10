@@ -305,6 +305,21 @@ export interface Translations {
       notifications: string
       plugins: string
     }
+    customEndpoints: {
+      apiMode: string
+      modes: {
+        auto: string
+        chatCompletions: string
+        responses: string
+        anthropicMessages: string
+      }
+      descriptions: {
+        auto: string
+        chatCompletions: string
+        responses: string
+        anthropicMessages: string
+      }
+    }
     plugins: {
       title: string
       blurb: string

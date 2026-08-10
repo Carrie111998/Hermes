@@ -344,6 +344,21 @@ export const zh: Translations = {
       notifications: '通知',
       plugins: '插件'
     },
+    customEndpoints: {
+      apiMode: 'API 模式',
+      modes: {
+        auto: '自动检测',
+        chatCompletions: 'Chat Completions',
+        responses: 'Responses / Codex',
+        anthropicMessages: 'Anthropic Messages'
+      },
+      descriptions: {
+        auto: '让 Hermes 根据端点 URL 推断协议。',
+        chatCompletions: '使用 /chat/completions；端点 URL 通常以 /v1 结尾。',
+        responses: '使用 /responses；端点 URL 通常以 /v1 结尾。测试会发送一个单 token 请求。',
+        anthropicMessages: '使用 /v1/messages；请填写不带末尾 /v1 的 API 根地址。测试会发送一个单 token 请求。'
+      }
+    },
     plugins: {
       title: '桌面插件',
       blurb:

@@ -355,6 +355,22 @@ export const en: Translations = {
       notifications: 'Notifications',
       plugins: 'Plugins'
     },
+    customEndpoints: {
+      apiMode: 'API Mode',
+      modes: {
+        auto: 'Auto-detect',
+        chatCompletions: 'Chat Completions',
+        responses: 'Responses / Codex',
+        anthropicMessages: 'Anthropic Messages'
+      },
+      descriptions: {
+        auto: 'Let Hermes infer the protocol from the endpoint URL.',
+        chatCompletions: 'Uses /chat/completions; the endpoint URL normally ends in /v1.',
+        responses: 'Uses /responses; the endpoint URL normally ends in /v1. Test sends a one-token request.',
+        anthropicMessages:
+          'Uses /v1/messages; enter the API root without a trailing /v1. Test sends a one-token request.'
+      }
+    },
     plugins: {
       title: 'Desktop plugins',
       blurb: 'Bundled or dropped into the desktop-plugins folder. Disable to unload live.',

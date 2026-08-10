@@ -239,6 +239,23 @@ export const ja = defineLocale({
       billing: '請求',
       notifications: '通知'
     },
+    customEndpoints: {
+      apiMode: 'API モード',
+      modes: {
+        auto: '自動検出',
+        chatCompletions: 'Chat Completions',
+        responses: 'Responses / Codex',
+        anthropicMessages: 'Anthropic Messages'
+      },
+      descriptions: {
+        auto: 'エンドポイント URL から Hermes がプロトコルを推測します。',
+        chatCompletions: '/chat/completions を使用します。通常、エンドポイント URL は /v1 で終わります。',
+        responses:
+          '/responses を使用します。通常、エンドポイント URL は /v1 で終わります。テストでは 1 トークンのリクエストを送信します。',
+        anthropicMessages:
+          '/v1/messages を使用します。末尾に /v1 を付けず、API のルート URL を入力してください。テストでは 1 トークンのリクエストを送信します。'
+      }
+    },
     notifications: {
       title: '通知',
       intro: 'アプリ内トーストとは別の、ネイティブのデスクトップ通知です。設定は端末ごとに保存されます。',
