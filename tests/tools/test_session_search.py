@@ -108,6 +108,49 @@ class TestBrowseShape:
         assert "s_newest" not in sids
 
 
+class TestSessionDbOwnership:
+    class FakeSessionDB:
+        def __init__(self):
+            self.closed = False
+
+        def list_sessions_rich(self, **_kwargs):
+            return []
+
+        def close(self):
+            self.closed = True
+
+    def test_lazy_opened_default_db_is_closed(self, monkeypatch):
+        owned = self.FakeSessionDB()
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: owned)
+
+        result = json.loads(session_search())
+
+        assert result["success"] is True
+        assert owned.closed is True
+
+    def test_caller_supplied_db_is_not_closed(self):
+        supplied = self.FakeSessionDB()
+
+        result = json.loads(session_search(db=supplied))
+
+        assert result["success"] is True
+        assert supplied.closed is False
+
+    def test_profile_db_owned_by_call_is_closed_but_supplied_db_is_not(self, monkeypatch):
+        supplied = self.FakeSessionDB()
+        profile_db = self.FakeSessionDB()
+        monkeypatch.setattr(
+            "tools.session_search_tool._resolve_profile_db",
+            lambda _profile: profile_db,
+        )
+
+        result = json.loads(session_search(db=supplied, profile="work"))
+
+        assert result["success"] is True
+        assert supplied.closed is False
+        assert profile_db.closed is True
+
+
 # =========================================================================
 # Discovery shape (with query)
 # =========================================================================
