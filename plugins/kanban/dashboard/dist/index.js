@@ -1531,6 +1531,159 @@
     );
   }
 
+  // -------------------------------------------------------------------------
+  // Skill recovery control — operator fix for blocked/crashed tasks
+  // (issue #22925 dashboard slice). Lets the operator replace or clear the
+  // task's force-loaded skills, reset the consecutive-failure streak, or
+  // clear a stale claim, then retry — backed by POST /tasks/:id/recovery,
+  // which maps 1:1 to kanban_db.edit_task_recovery (never direct UI SQLite).
+  //
+  // The control is disabled while the task is claimed by a live worker
+  // (status === "running"): mutating a running task's payload is refused by
+  // the kernel (409), so the UI shows why instead of letting the operator
+  // click into a guaranteed rejection.
+  // -------------------------------------------------------------------------
+
+  function SkillRecoveryControl(props) {
+    const { t } = useI18n();
+    const task = props.task;
+    const running = task.status === "running";
+    const [skillsText, setSkillsText] = useState((task.skills || []).join(", "));
+    const [busy, setBusy] = useState(false);
+    const [msg, setMsg] = useState(null);
+
+    // Only render when there's actually something to recover: a stopped
+    // task (blocked/scheduled), a failure streak, force-loaded skills, or
+    // a claim to clear. Terminal/done cards and clean ready cards stay
+    // visually clean — matching the DiagnosticsSection's collapse rule.
+    const failures = task.consecutive_failures || 0;
+    const hasSkills = !!(task.skills && task.skills.length);
+    const hasClaim = !!task.claim_lock;
+    const recoverable = task.status !== "done" && task.status !== "archived" && (
+      task.status === "blocked" || task.status === "scheduled" ||
+      failures > 0 || hasSkills || hasClaim
+    );
+    if (!recoverable) return null;
+
+    const parseSkills = function () {
+      return skillsText
+        .split(",")
+        .map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length > 0; });
+    };
+
+    const runRecovery = function (body, retry) {
+      if (busy) return;
+      setBusy(true); setMsg(null);
+      const url = withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/recovery`, props.boardSlug);
+      SDK.fetchJSON(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }).then(function (res) {
+        if (retry && task.status === "blocked") {
+          // Safe save-and-retry: recovery edit applied, then unblock to
+          // ready so the dispatcher picks the task up again on the next
+          // tick. Unblocking is the existing PATCH status=ready path.
+          return SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}`, props.boardSlug), {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ status: "ready" }),
+          }).then(function () {
+            setMsg({ ok: true, text: tx(t, "recoverySavedRetried",
+              "Skills saved and task unblocked — ready for the next dispatch tick.") });
+            if (props.onRefresh) props.onRefresh();
+          });
+        }
+        setMsg({ ok: true, text: tx(t, "recoverySaved",
+          "Recovery edit saved.") });
+        if (props.onRefresh) props.onRefresh();
+      }).catch(function (err) {
+        setMsg({ ok: false, text: tx(t, "recoveryFailed",
+          "Recovery failed: ") + parseApiErrorMessage(err) });
+      }).then(function () { setBusy(false); });
+    };
+
+    const saveSkills = function (retry) {
+      const skills = parseSkills();
+      if (!skills.length && !retry) {
+        setMsg({ ok: false, text: tx(t, "recoveryNoSkills",
+          "Enter at least one skill name, or use Clear skills.") });
+        return;
+      }
+      const body = skills.length ? { skills: skills } : { clear_skills: true };
+      runRecovery(body, retry);
+    };
+
+    const actionBtn = function (label, onClick, opts) {
+      return h("button", {
+        type: "button",
+        className: cn(
+          "hermes-kanban-recovery-btn",
+          opts && opts.suggested ? "hermes-kanban-recovery-btn--suggested" : "",
+        ),
+        disabled: busy || running,
+        onClick: onClick,
+      }, label);
+    };
+
+    return h("div", { className: "hermes-kanban-section" },
+      h("div", { className: "hermes-kanban-section-head-row" },
+        h("span", { className: "hermes-kanban-section-head" },
+          tx(t, "recoveryTitle", "Recovery")),
+      ),
+      h("div", { className: "hermes-kanban-recovery" },
+        h("div", { className: "hermes-kanban-recovery-hint" },
+          tx(t, "recoveryHint",
+            "Fix the task's force-loaded skills, reset its failure streak, or clear a stale claim, then retry.")),
+        running
+          ? h("div", { className: "hermes-kanban-recovery-hint hermes-kanban-recovery-running" },
+              tx(t, "recoveryRunningHint",
+                "Task is claimed by a live worker. Stop or reclaim the worker before editing its payload."))
+          : h("div", { className: "hermes-kanban-recovery-section" },
+              h("label", { className: "hermes-kanban-recovery-label" },
+                tx(t, "skillsLabel", "Skills (comma-separated)")),
+              h("input", {
+                className: "hermes-kanban-recovery-input",
+                value: skillsText,
+                disabled: busy,
+                placeholder: tx(t, "skillsPlaceholder", "skill-a, skill-b"),
+                onChange: function (e) { setSkillsText(e.target.value); },
+              }),
+              h("div", { className: "hermes-kanban-recovery-action-row" },
+                actionBtn(
+                  tx(t, "saveAndRetry", "Save & retry"),
+                  function () { saveSkills(true); },
+                  { suggested: true },
+                ),
+                actionBtn(tx(t, "saveSkills", "Save skills"),
+                  function () { saveSkills(false); }),
+                hasSkills
+                  ? actionBtn(tx(t, "clearSkills", "Clear skills"),
+                      function () { runRecovery({ clear_skills: true }); })
+                  : null,
+                failures > 0
+                  ? actionBtn(tx(t, "resetFailures", "Reset failures"),
+                      function () { runRecovery({ reset_failures: true }); })
+                  : null,
+                hasClaim && !running
+                  ? actionBtn(tx(t, "clearClaim", "Clear stale claim"),
+                      function () { runRecovery({ clear_claim: true }); })
+                  : null,
+              ),
+            ),
+        msg
+          ? h("div", {
+              className: cn(
+                "hermes-kanban-recovery-msg",
+                msg.ok ? "hermes-kanban-recovery-msg--ok" : "hermes-kanban-recovery-msg--err",
+              ),
+            }, msg.text)
+          : null,
+      ),
+    );
+  }
+
     // -------------------------------------------------------------------------
   // Board switcher (multi-project)
   // -------------------------------------------------------------------------
@@ -3608,6 +3761,11 @@
         boardSlug: props.boardSlug,
         assignees: props.assignees,
         diagnostics: t.diagnostics || [],
+        onRefresh: props.onRefresh,
+      }),
+      h(SkillRecoveryControl, {
+        task: t,
+        boardSlug: props.boardSlug,
         onRefresh: props.onRefresh,
       }),
       h(HomeSubsSection, {

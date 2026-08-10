@@ -457,6 +457,52 @@ hermes kanban create "audit auth flow" \
 
 The dispatcher emits one `--skills <name>` flag per skill listed, so the worker spawns with all of them loaded on top of the auto-injected kanban guidance. The skill names must match skills that are actually installed on the assignee's profile (run `hermes skills list` to see what's available); there's no runtime install.
 
+### Recovering a task after a dispatch failure (skills / failures / stale claim)
+
+Sometimes a task is created with the wrong force-loaded skills — a typo, a
+renamed skill, a skill that only lives on another profile — and the worker
+spawn fails. The dispatcher blocks the task and trips the per-task circuit
+breaker (`consecutive_failures` + `last_failure_error`). Before the recovery
+surface, the only way out was editing `~/.hermes/kanban.db` by hand. Now the
+operator repairs it through the same surface that created it:
+
+```bash
+# Replace the wrong skill and zero the failure streak, then release the task
+hermes kanban edit t_abcd --skills translation --reset-failures
+hermes kanban unblock t_abcd
+```
+
+`hermes kanban edit` (and `/kanban edit`) accepts any combination of:
+
+| Flag | Effect |
+|------|--------|
+| `--skills NAME...` | Replace the task's force-loaded skills (the "Unknown skill(s)" dispatch-failure class). Skill names only — path-like names (`./`, `../`, `/`, `~/`, backslashes), toolset names, and comma-joined strings are rejected with a usage error. Namespaced hub ids like `official/category/name` are preserved. |
+| `--clear-skills` | Store an explicit empty skill list (no extra skills — distinct from unset = profile defaults). `--skills []` is an alias. |
+| `--reset-failures` | Zero `consecutive_failures` and clear `last_failure_error`, so the dispatcher's circuit breaker stops tripping. |
+| `--clear-claim` | Clear a **stale** claim lock (TTL expired) and return the task to `ready`, closing the dangling run as `reclaimed`. Refuses a **live** claim — a genuinely running worker is aborted with `hermes kanban reclaim`, never silently mutated underneath. |
+| `--result` / `--summary` / `--metadata` | Existing backfill for a *done* task's result (unchanged). |
+
+Safety invariants (kernel `kanban_db.edit_task_recovery`, shared by the CLI,
+`/kanban`, and the dashboard API):
+
+- **Live-worker mutation refused.** Skills/failure edits raise an error
+  while a task is actively claimed/running — a mid-flight worker's payload
+  is never mutated underneath it.
+- **Stale-claim only.** `--clear-claim` refuses a claim whose TTL has not
+  expired.
+- **Audit trail.** Every applied edit records an `edited` event with the
+  changed fields plus a `RECOVERY EDIT: …` comment under the operator's
+  name. No recovery path touches the SQLite DB directly.
+- **Default and named boards.** `--board <slug>` resolves exactly as it does
+  for every other verb; the recovery edit operates on whichever board the
+  flag (or current-board resolution) selects.
+
+The dashboard exposes the same flow in the task drawer: the **Skill
+recovery** control replaces/clears skills, resets failures, and clears a
+stale claim, with a **Save & retry** action (recovery edit, then unblock to
+`ready`). It is disabled while a live worker is claimed. Backed by
+`POST /api/plugins/kanban/tasks/:id/recovery`.
+
 ### Per-task model override
 
 Pin a task's worker to a specific model (and optionally provider), independent of the assignee profile's default:
@@ -630,6 +676,7 @@ All routes are mounted under `/api/plugins/kanban/` and protected by the dashboa
 | `PATCH` | `/tasks/:id` | Status / assignee / priority / title / body / result |
 | `POST` | `/tasks/bulk` | Apply the same patch (status / archive / assignee / priority) to every id in `ids`. Per-id failures reported without aborting siblings |
 | `POST` | `/tasks/:id/comments` | Append a comment |
+| `POST` | `/tasks/:id/recovery` | Operator recovery edit on a stopped/blocked/crashed task — replace/clear force-loaded skills, reset `consecutive_failures`, clear a stale claim. 400 (bad input/no-op) / 404 (unknown/archived) / 409 (live worker or live claim). Maps 1:1 to `kanban_db.edit_task_recovery`, never direct SQL |
 | `POST` | `/tasks/:id/specify` | Run the triage specifier — auxiliary LLM fleshes out the task body and promotes it from `triage` to `todo`. Returns `{ok, task_id, reason, new_title}`; `ok=false` with a human-readable reason on "not in triage" / no aux client / LLM error is a 200, not a 4xx |
 | `POST` | `/tasks/:id/decompose` | Run the kanban decomposer — auxiliary LLM produces a task graph and the helper atomically creates the children + links the root + flips `triage → todo`. Returns `{ok, task_id, reason, fanout, child_ids, new_title}`. Same 200-on-LLM-error convention as `/specify`. |
 | `GET` | `/profiles` | List installed profiles with their descriptions (consumed by the dashboard's profile-description editor and the orchestrator picker). |
@@ -707,8 +754,8 @@ hermes kanban list [--mine] [--assignee P] [--status S] [--tenant T] [--archived
 hermes kanban show <id> [--json]
 hermes kanban assign <id> <profile>                    # or 'none' to unassign
 hermes kanban reassign <id>... <profile>               # bulk re-assign tasks to a profile
-hermes kanban edit <id> [--title ...] [--body ...]     # edit task title / body / priority in place
-        [--priority N]
+hermes kanban edit <id> [--result ...] [--summary ...] [--metadata JSON]   # recovery edit: skills / failures / claim / result
+        [--skills NAME ...] [--clear-skills] [--reset-failures] [--clear-claim]
 hermes kanban promote <id>...                          # move todo/blocked tasks to ready (recovery)
 hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's scheduled_at start time
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)

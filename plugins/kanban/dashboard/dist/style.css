@@ -1282,6 +1282,19 @@
 .hermes-kanban-recovery-btn:hover:not(:disabled) {
   background: rgba(255, 158, 59, 0.25);
 }
+.hermes-kanban-recovery-btn--suggested {
+  background: rgba(255, 158, 59, 0.18);
+  border-color: rgba(255, 158, 59, 0.5);
+  font-weight: 600;
+}
+.hermes-kanban-recovery-btn--suggested:hover:not(:disabled) {
+  background: rgba(255, 158, 59, 0.28);
+}
+.hermes-kanban-recovery-running {
+  color: #ff8b6b;
+  border-left: 2px solid rgba(255, 107, 61, 0.5);
+  padding-left: 0.5rem;
+}
 .hermes-kanban-recovery-btn:disabled {
   opacity: 0.4;
   cursor: not-allowed;

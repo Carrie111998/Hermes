@@ -2878,6 +2878,88 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _looks_like_skill_path(name: str) -> bool:
+    """True when ``name`` looks like a filesystem path, not a skill name.
+
+    ``hermes --skills`` (and the dispatcher's ``--skills`` passthrough) take
+    skill *names* — e.g. ``blogwatcher``, ``github-code-review``. Namespaced
+    hub ids like ``official/category/name`` are legitimate and preserved;
+    the forms below are almost always an agent dumping a filesystem path
+    into the skills field, which then fails worker startup with
+    "Unknown skill(s)". Path signals:
+      * leading ``./``, ``../``, ``/``, ``~/`` or a Windows backslash
+      * any backslash (Windows path separator)
+      * a ``/``-namespaced name whose leaf carries a file extension
+        (``sub/dir/skill.md``, ``skills/foo.yaml``)
+    """
+    if name.startswith(("./", "../", "/", "~/", "\\")):
+        return True
+    if "\\" in name:
+        return True
+    if "/" in name:
+        leaf = name.rsplit("/", 1)[-1]
+        if leaf.casefold().endswith(
+            (".md", ".yaml", ".yml", ".skill", ".json", ".txt", ".toml")
+        ):
+            return True
+    return False
+
+
+def _normalize_skill_names(skills: Iterable[str]) -> list[str]:
+    """Normalise + validate a skill-name iterable (shared by create/edit).
+
+    Strips whitespace, drops empties, dedupes (preserving order). Refuses
+    commas inside a single name so we don't invisibly splatter a
+    comma-joined string into one argv slot — the ``hermes --skills X,Y``
+    comma syntax is handled in the dispatcher, not here. Refuses
+    toolset-name confusions (agents that confuse skills with toolsets
+    usually pass several at once and serial-correcting one per failure
+    round-trips wastes tokens, so all hits are collected and reported
+    together). Refuses path-like names via :func:`_looks_like_skill_path`.
+
+    Raises :class:`ValueError` on invalid input; returns the cleaned list.
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    # Collect all toolset-name confusions up front so the user sees the
+    # whole list at once.
+    toolset_typos: list[str] = []
+    for s in skills:
+        if not s:
+            continue
+        name = str(s).strip()
+        if not name:
+            continue
+        if "," in name:
+            raise ValueError(
+                f"skill name cannot contain comma: {name!r} "
+                f"(pass a list of separate names instead of a comma-joined string)"
+            )
+        if name.casefold() in KNOWN_TOOLSET_NAMES:
+            toolset_typos.append(name)
+            continue
+        if _looks_like_skill_path(name):
+            raise ValueError(
+                f"skill name cannot be a path: {name!r} "
+                f"(pass skill names, e.g. `blogwatcher`, not filesystem paths)"
+            )
+        if name in seen:
+            continue
+        seen.add(name)
+        cleaned.append(name)
+    if toolset_typos:
+        quoted = ", ".join(repr(n) for n in toolset_typos)
+        noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
+        raise ValueError(
+            f"{quoted} {noun}, not skill name(s). "
+            "Put toolsets in the assignee profile's `toolsets:` config "
+            "instead of per-task skills. Skills are named skill bundles "
+            "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
+            "capabilities (e.g. `web`, `browser`, `terminal`)."
+        )
+    return cleaned
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3071,50 +3153,15 @@ def create_task(
 
     parents = tuple(p for p in parents if p)
 
-    # Normalise + validate skills: strip whitespace, drop empties, dedupe
-    # (preserving order). Refuse commas inside a single name so we don't
-    # invisibly splatter a comma-joined string into one argv slot — the
-    # `hermes --skills X,Y` comma syntax is handled in the dispatcher,
-    # not here.
+    # Normalise + validate skills (shared with edit_task_recovery): strip
+    # whitespace, drop empties, dedupe (preserving order), refuse commas
+    # inside a single name (so we don't invisibly splatter a comma-joined
+    # string into one argv slot), refuse toolset-name confusions, and
+    # refuse path-like names (``hermes --skills`` takes skill names, not
+    # filesystem paths).
     skills_list: Optional[list[str]] = None
     if skills is not None:
-        cleaned: list[str] = []
-        seen: set[str] = set()
-        # Collect all toolset-name confusions up front so the user sees the
-        # whole list at once. Raising on the first hit is friendly when the
-        # input has one mistake, but agents that confuse skills with toolsets
-        # usually pass several at once (`skills=["web", "browser", "terminal"]`)
-        # and serial-correcting one per failure round-trips wastes tokens.
-        toolset_typos: list[str] = []
-        for s in skills:
-            if not s:
-                continue
-            name = str(s).strip()
-            if not name:
-                continue
-            if "," in name:
-                raise ValueError(
-                    f"skill name cannot contain comma: {name!r} "
-                    f"(pass a list of separate names instead of a comma-joined string)"
-                )
-            if name.casefold() in KNOWN_TOOLSET_NAMES:
-                toolset_typos.append(name)
-                continue
-            if name in seen:
-                continue
-            seen.add(name)
-            cleaned.append(name)
-        if toolset_typos:
-            quoted = ", ".join(repr(n) for n in toolset_typos)
-            noun = "is a toolset name" if len(toolset_typos) == 1 else "are toolset names"
-            raise ValueError(
-                f"{quoted} {noun}, not skill name(s). "
-                "Put toolsets in the assignee profile's `toolsets:` config "
-                "instead of per-task skills. Skills are named skill bundles "
-                "(e.g. `blogwatcher`, `github-code-review`); toolsets are runtime "
-                "capabilities (e.g. `web`, `browser`, `terminal`)."
-            )
-        skills_list = cleaned
+        skills_list = _normalize_skill_names(skills)
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -5611,6 +5658,153 @@ def edit_completed_task_result(
                 "summary": ev_summary or None,
             },
             run_id=run_id,
+        )
+    return True
+
+
+def edit_task_recovery(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    skills: Optional[Iterable[str]] = None,
+    clear_skills: bool = False,
+    reset_failures: bool = False,
+    clear_claim: bool = False,
+    author: str = "operator",
+) -> bool:
+    """Operator recovery edits on a task (upstream issue #22925).
+
+    Covers the post-dispatch recovery slice that previously required raw
+    SQLite: replacing/clearing the task's force-loaded skills (the
+    "Unknown skill(s)" dispatch-failure class), resetting the
+    consecutive-failure counter + last failure error, and clearing a stale
+    claim lock so a stuck task becomes dispatchable again. Unlike
+    :func:`edit_completed_task_result` (which is restricted to ``done``
+    tasks), recovery edits apply to any non-archived task.
+
+    ``skills`` replaces the stored skills list (``[]`` or ``clear_skills``
+    stores an explicit empty list = no extra skills, distinct from NULL =
+    defaults). Skill names are validated via
+    :func:`_normalize_skill_names` — commas, toolset names, and path-like
+    names are rejected with :class:`ValueError`.
+
+    Safety invariants:
+
+    * **Active-claim guard** — skills/failure edits are refused with
+      :class:`RuntimeError` while the task is actively claimed/running
+      (``status = 'running'`` and ``claim_lock`` set), mirroring
+      :func:`assign_task`. A mid-flight worker must not have its payload
+      mutated underneath it.
+    * **Live-claim guard** — ``clear_claim`` refuses to clear a *live*
+      claim (``claim_expires`` still in the future). A genuinely running
+      worker is aborted via :func:`reclaim_task` (``hermes kanban
+      reclaim``); ``clear_claim`` is only for stale/expired locks.
+      Clearing a stale claim returns the task to ``ready`` and closes the
+      dangling run as ``reclaimed`` so the runs invariant holds.
+    * **Audit trail** — every applied edit records a ``edited`` event
+      (with the changed fields) and a human-readable comment under
+      ``author``.
+
+    Returns True when the task exists (and is not archived) and at least
+    one operation was applied; False for unknown/archived ids. Raises
+    ValueError when no operation is requested or a skill name is invalid.
+    """
+    if skills is not None and clear_skills:
+        raise ValueError("pass either skills= or clear_skills=True, not both")
+    if not (skills is not None or clear_skills or reset_failures or clear_claim):
+        raise ValueError(
+            "no recovery operation requested "
+            "(pass skills=, clear_skills=True, reset_failures=True, "
+            "and/or clear_claim=True)"
+        )
+
+    skills_list: Optional[list[str]] = None
+    if clear_skills:
+        skills_list = []
+    elif skills is not None:
+        skills_list = _normalize_skill_names(skills)
+
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row or row["status"] == "archived":
+            return False
+
+        active_claim = row["claim_lock"] is not None and row["status"] == "running"
+        if active_claim and (skills_list is not None or reset_failures):
+            raise RuntimeError(
+                f"cannot edit {task_id}: currently running (claimed). "
+                "Wait for completion or reclaim the stale lock first "
+                "(`hermes kanban reclaim`)."
+            )
+        live_claim = (
+            active_claim
+            and row["claim_expires"] is not None
+            and int(row["claim_expires"]) >= now
+        )
+        if clear_claim and live_claim:
+            raise RuntimeError(
+                f"cannot clear claim on {task_id}: claim is live (worker still "
+                "within its TTL). Use `hermes kanban reclaim` to abort a "
+                "running worker instead."
+            )
+
+        fields: list[str] = []
+        if skills_list is not None:
+            conn.execute(
+                "UPDATE tasks SET skills = ? WHERE id = ?",
+                (json.dumps(skills_list, ensure_ascii=False), task_id),
+            )
+            fields.append("skills")
+        if reset_failures:
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures = 0, "
+                "last_failure_error = NULL WHERE id = ?",
+                (task_id,),
+            )
+            fields.append("failures")
+        run_id = None
+        if clear_claim:
+            if row["claim_lock"] is not None:
+                if row["status"] == "running":
+                    conn.execute(
+                        "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                        "claim_expires = NULL, worker_pid = NULL WHERE id = ?",
+                        (task_id,),
+                    )
+                    run_id = _end_run(
+                        conn, task_id,
+                        outcome="reclaimed", status="reclaimed",
+                        error=f"stale_claim_cleared lock={row['claim_lock']}",
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+                        "worker_pid = NULL WHERE id = ?",
+                        (task_id,),
+                    )
+                fields.append("claim")
+            else:
+                # Idempotent no-op — record it so the audit trail shows the
+                # operator asked, and nothing was there to clear.
+                fields.append("claim(noop)")
+
+        _append_event(
+            conn, task_id, "edited",
+            {
+                "fields": fields,
+                "skills": skills_list,
+                "author": author,
+            },
+            run_id=run_id,
+        )
+    if fields:
+        add_comment(
+            conn, task_id, author,
+            f"RECOVERY EDIT: {', '.join(fields)}",
         )
     return True
 

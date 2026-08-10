@@ -603,12 +603,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     p_edit = sub.add_parser(
         "edit",
-        help="Edit recovery fields on an already-completed task",
+        help="Edit recovery fields on a task (skills, failures, claim, result)",
     )
     p_edit.add_argument("task_id")
     p_edit.add_argument(
         "--result",
-        required=True,
+        default=None,
         help="Backfilled task result text for a done task",
     )
     p_edit.add_argument(
@@ -620,6 +620,32 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--metadata",
         default=None,
         help="JSON dict of structured facts to store on the latest completed run.",
+    )
+    p_edit.add_argument(
+        "--skills",
+        nargs="*",
+        default=None,
+        help="Replace the task's force-loaded skills with these names "
+             "(recovery for unknown-skill dispatch failures). "
+             "`--skills []` or `--clear-skills` clears them. "
+             "Skill names only — paths are rejected.",
+    )
+    p_edit.add_argument(
+        "--clear-skills",
+        action="store_true",
+        help="Clear the task's force-loaded skills (set to an empty list).",
+    )
+    p_edit.add_argument(
+        "--reset-failures",
+        action="store_true",
+        help="Reset the consecutive-failure counter and last failure error "
+             "so the task becomes dispatchable again.",
+    )
+    p_edit.add_argument(
+        "--clear-claim",
+        action="store_true",
+        help="Clear a stale claim lock so a stuck task can be re-dispatched. "
+             "Refuses to clear a live claim (use `reclaim` for a running worker).",
     )
 
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
@@ -2238,20 +2264,72 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         except (ValueError, json.JSONDecodeError) as exc:
             print(f"kanban: --metadata: {exc}", file=sys.stderr)
             return 2
+
+    skills_raw = getattr(args, "skills", None)
+    clear_skills = bool(getattr(args, "clear_skills", False))
+    reset_failures = bool(getattr(args, "reset_failures", False))
+    clear_claim = bool(getattr(args, "clear_claim", False))
+    # The issue's `--skills []` convenience form behaves like --clear-skills.
+    if skills_raw == ["[]"]:
+        skills_raw = None
+        clear_skills = True
+    has_backfill = args.result is not None
+    has_recovery = (
+        skills_raw is not None or clear_skills or reset_failures or clear_claim
+    )
+    if not has_backfill and not has_recovery:
+        print(
+            "kanban: edit requires at least one operation "
+            "(--result, --skills, --clear-skills, --reset-failures, "
+            "or --clear-claim)",
+            file=sys.stderr,
+        )
+        return 2
+
+    changed: list[str] = []
     with kb.connect_closing() as conn:
-        if not kb.edit_completed_task_result(
-            conn,
-            args.task_id,
-            result=args.result,
-            summary=getattr(args, "summary", None),
-            metadata=metadata,
-        ):
-            print(
-                f"cannot edit {args.task_id} (unknown id or task is not done)",
-                file=sys.stderr,
-            )
-            return 1
-    print(f"Edited {args.task_id}")
+        if has_backfill:
+            if not kb.edit_completed_task_result(
+                conn,
+                args.task_id,
+                result=args.result,
+                summary=getattr(args, "summary", None),
+                metadata=metadata,
+            ):
+                print(
+                    f"cannot edit {args.task_id} (unknown id or task is not done)",
+                    file=sys.stderr,
+                )
+                return 1
+            changed.append("result")
+        if has_recovery:
+            try:
+                ok = kb.edit_task_recovery(
+                    conn,
+                    args.task_id,
+                    skills=skills_raw,
+                    clear_skills=clear_skills,
+                    reset_failures=reset_failures,
+                    clear_claim=clear_claim,
+                    author=_profile_author(),
+                )
+            except ValueError as exc:
+                # Bad input (invalid skill name, no-op) — usage error.
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 2
+            except RuntimeError as exc:
+                # Operational conflict (running task / live claim).
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
+            if not ok:
+                print(
+                    f"cannot edit {args.task_id} (unknown or archived id)",
+                    file=sys.stderr,
+                )
+                return 1
+            changed.append("recovery")
+    suffix = f" ({', '.join(changed)})" if changed else ""
+    print(f"Edited {args.task_id}{suffix}")
     return 0
 
 
@@ -3145,6 +3223,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `edit <id> …`         Recovery edit: `--skills`/`--clear-skills`, `--reset-failures`, `--clear-claim`, `--result` backfill
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
