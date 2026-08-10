@@ -886,10 +886,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         )
         root_span = root_ctx.__enter__()
 
+    # SDK v3 uses update_trace() (not set_trace_io). Failures must never block
+    # the rest of the turn — the observation still carries input from start.
     try:
-        root_span.set_trace_io(input=trace_input)
-    except Exception:
-        pass
+        root_span.update_trace(input=trace_input)
+    except Exception as exc:
+        _debug(f"update_trace(input) failed: {exc}")
 
     _debug(f"started trace {trace_id} for {task_key}")
     return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
@@ -1038,9 +1040,23 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
                 _end_observation(observation)
         final_output = _merge_trace_output(output, state)
         if final_output is not None:
-            state.root_span.set_trace_io(output=final_output)
-            state.root_span.update(output=final_output)
-        state.root_span.end()
+            # update_trace sets TRACE-level Input/Output columns in the UI
+            # (SDK v3; set_trace_io was the pre-v3 spelling). Root observation
+            # I/O is set via update(); never let either call prevent end() —
+            # otherwise generations/tools export without a CHAIN root and the
+            # list view looks half-empty.
+            try:
+                state.root_span.update_trace(output=final_output)
+            except Exception as exc:
+                _debug(f"update_trace(output) failed: {exc}")
+            try:
+                state.root_span.update(output=final_output)
+            except Exception as exc:
+                _debug(f"root update(output) failed: {exc}")
+        try:
+            state.root_span.end()
+        except Exception as exc:
+            _debug(f"root end() failed: {exc}")
         # Properly exit the root context manager so the generator unwinds
         # now, while opentelemetry.trace.Span is still a real type.  Without
         # this the generator is left suspended; at interpreter teardown the
@@ -1054,6 +1070,11 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
                 pass
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"finish trace failed: {exc}")
+        # Last-chance end so an earlier unexpected error still exports the root.
+        try:
+            state.root_span.end()
+        except Exception:
+            pass
     finally:
         try:
             client.flush()
