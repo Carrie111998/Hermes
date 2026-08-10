@@ -422,6 +422,91 @@ async def test_explicit_alias_switches_profile_in_bound_thread(tmp_path):
     assert persisted["profile"] == "chopper"
 
 
+@pytest.mark.asyncio
+async def test_explicit_luffy_korean_particle_releases_specialist_thread_binding(tmp_path):
+    """Regression for the Design Flip incident: ``루피가 직접해`` is Luffy."""
+    store = tmp_path / "routes.json"
+    adapter, _ = _adapter(store)
+    adapter.config.extra["profile_invocations"] = [
+        {
+            "profile": "luffy",
+            "slash": "luffy",
+            "aliases": ["luffy", "루피"],
+            "display_name": "Luffy",
+            "icon_emoji": ":hermes_luffy:",
+        },
+        {
+            "profile": "chopper",
+            "slash": "chopper",
+            "aliases": ["chopper", "쵸파", "초파"],
+            "display_name": "Chopper",
+            "icon_emoji": ":hermes_chopper:",
+        },
+    ]
+    adapter._bot_user_id = "U_BOT"
+    adapter._team_bot_user_ids = {"T1": "U_BOT"}
+    adapter._running = True
+    adapter.handle_message = AsyncMock()
+    adapter._fetch_thread_context = AsyncMock(return_value="")
+    adapter._fetch_thread_parent_text = AsyncMock(return_value="root")
+    adapter._has_active_session_for_thread = MagicMock(return_value=False)
+    adapter._bind_profile_thread(
+        "T1", "C1", "100.001",
+        {
+            "profile": "chopper",
+            "display_name": "Chopper",
+            "icon_emoji": ":hermes_chopper:",
+        },
+    )
+
+    with (
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        await adapter._handle_slack_message(
+            {
+                "type": "message",
+                "channel": "C1",
+                "channel_type": "channel",
+                "team": "T1",
+                "user": "U1",
+                "client_msg_id": "m-luffy",
+                "text": "<@U_BOT> 루피가 직접해 그럼",
+                "ts": "101.001",
+                "thread_ts": "100.001",
+            }
+        )
+
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.profile == "luffy"
+    assert event.text == "직접해 그럼"
+    assert event.metadata["_slack_profile_persona"]["display_name"] == "Luffy"
+    persisted = json.loads(store.read_text())["routes"]["T1\u001fC1\u001f100.001"]
+    assert persisted["profile"] == "luffy"
+
+
+def test_korean_particle_requires_explicit_app_mention(tmp_path):
+    adapter, _ = _adapter(tmp_path / "routes.json")
+    adapter.config.extra["profile_invocations"] = [
+        {
+            "profile": "luffy",
+            "aliases": ["luffy", "루피"],
+            "display_name": "Luffy",
+            "icon_emoji": ":hermes_luffy:",
+        },
+    ]
+    with (
+        patch("agent.secret_scope.is_multiplex_active", return_value=True),
+        patch("hermes_cli.profiles.profile_exists", return_value=True),
+    ):
+        assert adapter._match_profile_alias("루피가 직접해")[0] is None
+        spec, text = adapter._match_profile_alias(
+            "루피가 직접해", allow_korean_particle=True
+        )
+    assert spec["profile"] == "luffy"
+    assert text == "직접해"
+
+
 def test_manifest_pins_profile_slashes_and_customize_scope(monkeypatch):
     monkeypatch.setattr(
         slack_cli,

@@ -22,9 +22,12 @@ import pytest
 from hermes_cli import _subprocess_compat
 from hermes_cli._subprocess_compat import _kill_git_process_tree, bounded_git_probe
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX process-group semantics"
-)
+pytestmark = [
+    pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics"),
+    # These are deliberate real child-process containment tests.  The fixture
+    # only creates descendants of this test process and cleans them on failure.
+    pytest.mark.live_system_guard_bypass,
+]
 
 
 def _write_forking_script(tmp_path, marker_name="child.pid"):
@@ -83,8 +86,12 @@ def test_timeout_kills_descendants(tmp_path):
 
 def test_posix_spawn_uses_own_process_group(tmp_path):
     """The probe child must lead its own process group (killpg precondition)."""
-    script = tmp_path / "pgid.sh"
-    script.write_text("#!/bin/bash\necho \"$$ $(ps -o pgid= -p $$ | tr -d ' ')\"\n")
+    # Do not shell out to ``ps`` here: macOS sandbox profiles may forbid the
+    # process-table read even though getpgrp() is safe and sufficient.
+    script = tmp_path / "pgid.py"
+    script.write_text(
+        f"#!{sys.executable}\nimport os\nprint(f'{{os.getpid()}} {{os.getpgrp()}}')\n"
+    )
     script.chmod(0o755)
 
     out = bounded_git_probe([str(script)], timeout=5.0)

@@ -961,6 +961,14 @@ class SlackAdapter(BasePlatformAdapter):
         # be workspace-scoped markers (team_id, ts) in multi-workspace mode.
         self._approval_resolved: Dict[Any, bool] = {}
         self._APPROVAL_RESOLVED_MAX = 1000
+        # Approval buttons are capabilities for the user whose already-
+        # authorized Slack message caused the prompt.  Keep the binding in
+        # memory beside the double-click guard: gateway approvals themselves
+        # are process-local, so persisting this would only create stale,
+        # replayable authority after a restart.
+        #
+        # key -> {"requester_user_id": str, "session_key": str}
+        self._approval_requesters: Dict[Any, Dict[str, str]] = {}
         # Same guard for clarify prompts (interactive multiple-choice
         # buttons); mirrors _approval_resolved.
         self._clarify_resolved: Dict[Any, bool] = {}
@@ -1684,8 +1692,18 @@ class SlackAdapter(BasePlatformAdapter):
         return configured.get(str(stored.get("profile") or ""))
 
     def _match_profile_alias(
-        self, text: str
+        self, text: str, *, allow_korean_particle: bool = False
     ) -> Tuple[Optional[Dict[str, Any]], str]:
+        """Match an explicit crew invocation at the start of *text*.
+
+        A bare Korean name remains boundary-safe: ``나미야`` is not treated as
+        a profile command in ordinary text.  When the Slack app itself was
+        explicitly mentioned, however, Korean subject/object particles make
+        the operator's intent unambiguous (for example ``<@app> 루피가 직접해``).
+        Accept those particles only on that already-authorized direct-address
+        path, so a persisted specialist thread cannot swallow an explicit
+        return-to-Luffy instruction.
+        """
         stripped = str(text or "").lstrip()
         folded = stripped.casefold()
         for spec in self._profile_invocation_specs().values():
@@ -1693,9 +1711,23 @@ class SlackAdapter(BasePlatformAdapter):
                 if folded == alias:
                     return spec, ""
                 if folded.startswith(alias) and len(stripped) > len(alias):
-                    boundary = stripped[len(alias)]
+                    suffix = stripped[len(alias) :]
+                    boundary = suffix[0]
                     if boundary.isspace() or boundary in ":：,-":
-                        return spec, stripped[len(alias) :].lstrip(" \t:：,-")
+                        return spec, suffix.lstrip(" \t:：,-")
+                    if allow_korean_particle:
+                        # Korean particles are only accepted when followed by
+                        # a normal command boundary.  This avoids turning a
+                        # longer unspaced word into a profile invocation.
+                        for particle in (
+                            "에게는", "에게", "으로", "에서", "은", "는", "이",
+                            "가", "을", "를", "와", "과", "로", "아", "야",
+                        ):
+                            if not suffix.startswith(particle):
+                                continue
+                            remainder = suffix[len(particle) :]
+                            if not remainder or remainder[0].isspace() or remainder[0] in ":：,-":
+                                return spec, remainder.lstrip(" \t:：,-")
         return None, text
 
     def _profile_slash_source_allowed(self, source: Any) -> bool:
@@ -6556,7 +6588,12 @@ class SlackAdapter(BasePlatformAdapter):
         if not is_command_text and (
             is_mentioned or is_one_to_one_dm or continued_profile_spec is not None
         ):
-            profile_spec, routed_text = self._match_profile_alias(msg_event.text)
+            profile_spec, routed_text = self._match_profile_alias(
+                msg_event.text,
+                # See _match_profile_alias: profile names with Korean
+                # particles are explicit only after the app has been named.
+                allow_korean_particle=bool(is_mentioned),
+            )
             if profile_spec:
                 msg_event.text = routed_text or "/profile"
         if profile_spec is None:
@@ -6638,6 +6675,21 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        # An approval is a capability issued to the requester that already
+        # passed GatewayRunner's inbound authorization gate.  Do not render a
+        # button whose click cannot be verified later; returning an error here
+        # lets the caller use its existing typed-command fallback instead.
+        requester_user_id = str((metadata or {}).get("approval_requester_user_id") or "")
+        if not requester_user_id:
+            logger.warning(
+                "[Slack] Refusing unbound approval buttons for session %s",
+                session_key,
+            )
+            return SendResult(
+                success=False,
+                error="missing approval requester binding",
+            )
+
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
@@ -6713,12 +6765,21 @@ class SlackAdapter(BasePlatformAdapter):
             msg_ts = result.get("ts", "")
             if msg_ts:
                 team_id = self._metadata_team_id(metadata)
-                self._approval_resolved[
-                    self._workspace_message_marker(team_id, msg_ts)
-                ] = False
+                approval_key = self._workspace_message_marker(team_id, msg_ts)
+                self._approval_resolved[approval_key] = False
+                self._approval_requesters[approval_key] = {
+                    "requester_user_id": requester_user_id,
+                    "session_key": str(session_key),
+                }
                 self._trim_oldest_dict_entries(
                     self._approval_resolved, self._APPROVAL_RESOLVED_MAX
                 )
+                # Keep both maps in lockstep.  The resolved map is the
+                # authoritative cap because it has existed since the first
+                # approval-buttons release; remove any orphaned binding too.
+                for key in tuple(self._approval_requesters):
+                    if key not in self._approval_resolved:
+                        self._approval_requesters.pop(key, None)
 
             return SendResult(success=True, message_id=msg_ts, raw_response=result)
         except Exception as e:
@@ -7132,32 +7193,6 @@ class SlackAdapter(BasePlatformAdapter):
         user_name = body.get("user", {}).get("name", "unknown")
         user_id = body.get("user", {}).get("id", "")
 
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=channel_id,
-            user_name=user_name,
-            team_id=team_id,
-        ):
-            logger.warning(
-                "[Slack] Unauthorized approval click by %s (%s) - ignoring",
-                user_name, user_id,
-            )
-            return
-
-        # Only authorized users may click approval buttons.  Button clicks
-        # bypass the normal message auth flow in gateway/run.py, so we must
-        # check here as well.
-        allowed_csv = ""  # Interactive auth already ran above.
-        if allowed_csv:
-            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-            if "*" not in allowed_ids and user_id not in allowed_ids:
-                logger.warning(
-                    "[Slack] Unauthorized approval click by %s (%s) — ignoring",
-                    user_name,
-                    user_id,
-                )
-                return
-
         # Map action_id to approval choice
         choice_map = {
             "hermes_approve_once": "once",
@@ -7175,8 +7210,32 @@ class SlackAdapter(BasePlatformAdapter):
         approval_key = self._workspace_message_marker(team_id, msg_ts)
         if msg_ts in self._approval_resolved:
             approval_key = msg_ts
+        binding = self._approval_requesters.get(approval_key)
+        if not binding:
+            # Never fall back to an ambient/global allowlist.  The button
+            # must be bound to the original requester or it is unusable.
+            logger.warning(
+                "[Slack] Ignoring approval click without requester binding "
+                "for message %s",
+                msg_ts,
+            )
+            return
+        if binding.get("session_key") != str(session_key):
+            logger.warning(
+                "[Slack] Ignoring approval click with mismatched session for message %s",
+                msg_ts,
+            )
+            return
+        if binding.get("requester_user_id") != str(user_id):
+            logger.warning(
+                "[Slack] Non-requester approval click by %s (%s) - ignoring",
+                user_name,
+                user_id,
+            )
+            return
         if self._approval_resolved.pop(approval_key, True):
             return
+        self._approval_requesters.pop(approval_key, None)
 
         # Resolve the approval FIRST — this unblocks the agent thread. Render
         # after, so a click that lands past the approval timeout (count == 0)

@@ -3004,6 +3004,7 @@ class TestAssistantThreadLifecycle:
         runner = object.__new__(GatewayRunner)
         assert runner._thread_metadata_for_source(msg_event.source) == {
             "thread_id": "171.111",
+            "approval_requester_user_id": "U_USER",
             "slack_team_id": "T_OTHER",
         }
 
@@ -4558,4 +4559,3 @@ class TestSlackUserAgent:
         """Module constant matches the HermesAgent/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-
