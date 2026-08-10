@@ -502,3 +502,62 @@ def test_unloadable_registry_behaves_as_unmapped(hermes_env, monkeypatch, caplog
     assert success is True and error is None and "hi" in final_response
     assert not (hermes_env / "telemetry" / "activity.db").exists()
     assert "must-not-appear" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Requested-route attribution
+# ---------------------------------------------------------------------------
+
+
+class TestRequestedRoute:
+    """The requested route must be the route the scheduler would actually ask for.
+
+    Most cron jobs pin neither provider nor model; they inherit the platform
+    default. Recording None for those makes requested-vs-served drift — the
+    whole reason the two are stored separately — undetectable.
+    """
+
+    def test_explicit_pin_wins(self, monkeypatch):
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_MODEL", "env/default")
+        job = {"provider": "openai-codex", "model": "gpt-5.6-sol",
+               "provider_snapshot": "deepseek", "model_snapshot": "deepseek-v4-pro"}
+        assert scheduler._requested_route(job) == ("openai-codex", "gpt-5.6-sol")
+
+    def test_snapshot_used_when_unpinned(self, monkeypatch):
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_MODEL", "env/default")
+        job = {"provider_snapshot": "deepseek", "model_snapshot": "deepseek-v4-pro"}
+        assert scheduler._requested_route(job) == ("deepseek", "deepseek-v4-pro")
+
+    def test_env_default_used_when_no_pin_or_snapshot(self, monkeypatch):
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_MODEL", "deepseek/deepseek-v4-pro")
+        assert scheduler._requested_route({}) == (None, "deepseek/deepseek-v4-pro")
+
+    def test_axes_resolve_independently(self, monkeypatch):
+        """A job may pin the model but not the provider."""
+        from cron import scheduler
+
+        monkeypatch.setenv("HERMES_MODEL", "env/default")
+        job = {"model": "gpt-5.6-sol", "provider_snapshot": "deepseek"}
+        assert scheduler._requested_route(job) == ("deepseek", "gpt-5.6-sol")
+
+    def test_nothing_available_is_none(self, monkeypatch):
+        from cron import scheduler
+
+        monkeypatch.delenv("HERMES_MODEL", raising=False)
+        assert scheduler._requested_route({}) == (None, None)
+
+    def test_recorded_run_carries_the_effective_route(self, hermes_env, registry, monkeypatch):
+        """End-to-end: an unpinned job must not record a null requested model."""
+        from cron.scheduler import run_job
+
+        monkeypatch.setenv("HERMES_MODEL", "deepseek/deepseek-v4-pro")
+        run_job(_script_job(hermes_env, "route", "echo hi", name="mapped-script-job"))
+
+        row = _only_run(hermes_env)
+        assert row["requested_model"] == "deepseek/deepseek-v4-pro"

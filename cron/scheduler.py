@@ -3967,6 +3967,28 @@ def _resolve_cron_activity_policy(job: dict):
         return None
 
 
+def _requested_route(job: dict) -> tuple[Optional[str], Optional[str]]:
+    """The route the scheduler will actually ask for, per axis.
+
+    Mirrors execution precedence: an explicit per-job pin wins, else the
+    creation-time snapshot (what resolution picked when the job was made),
+    else the platform default. Recording only the explicit pin would leave
+    ``requested_*`` null for every unpinned job — which is most of them —
+    and make requested-vs-served drift undetectable, defeating the reason
+    the two routes are stored separately.
+    """
+    def _pick(*candidates: Any) -> Optional[str]:
+        for value in candidates:
+            text = str(value or "").strip()
+            if text:
+                return text
+        return None
+
+    provider = _pick(job.get("provider"), job.get("provider_snapshot"))
+    model = _pick(job.get("model"), job.get("model_snapshot"), os.getenv("HERMES_MODEL"))
+    return provider, model
+
+
 def _open_cron_activity(
     *,
     job: dict,
@@ -3981,6 +4003,8 @@ def _open_cron_activity(
         from activity_telemetry.recorder import ActivityRecorder
         from hermes_constants import get_default_hermes_root
 
+        requested_provider, requested_model = _requested_route(job)
+
         db_path = Path(get_default_hermes_root()) / "telemetry" / "activity.db"
         # Requested route is the job's declared pre-agent configuration. The
         # SERVED route is recorded only from real responses in
@@ -3994,8 +4018,8 @@ def _open_cron_activity(
             trigger_source="cron",
             profile=profile,
             effective_hermes_home=effective_hermes_home,
-            requested_provider=(str(job.get("provider") or "").strip() or None),
-            requested_model=(str(job.get("model") or "").strip() or None),
+            requested_provider=requested_provider,
+            requested_model=requested_model,
         )
     except Exception as exc:
         logger.warning(
