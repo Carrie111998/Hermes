@@ -165,7 +165,11 @@ import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRoutePr
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
-import { remoteHttpStatusError, resolveReadyRemoteConnectionWithRetry } from './remote-connection-retry'
+import {
+  DEFAULT_REMOTE_READY_ATTEMPT_TIMEOUT_MS,
+  remoteHttpStatusError,
+  resolveReadyRemoteConnectionWithRetry
+} from './remote-connection-retry'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -5238,7 +5242,7 @@ async function buildReadinessHealthProbe(baseUrl, authMode, token) {
   return { probeHealth: fetchPublicJson, probeIsCredentialed: false }
 }
 
-async function waitForHermes(baseUrl, token, signal?, authMode?) {
+async function waitForHermes(baseUrl, token, signal?, authMode?, timeoutMs?) {
   const { probeHealth, probeIsCredentialed } = await buildReadinessHealthProbe(baseUrl, authMode, token)
 
   return waitForHermesReady(baseUrl, {
@@ -5247,7 +5251,8 @@ async function waitForHermes(baseUrl, token, signal?, authMode?) {
     fetchPublicJson,
     fetchJson: probeIsCredentialed ? (url, _token, options) => probeHealth(url, options) : fetchJson,
     probeHealth,
-    probeIsCredentialed
+    probeIsCredentialed,
+    timeoutMs
   })
 }
 
@@ -7702,6 +7707,34 @@ async function resolveRemoteBackend(profile) {
   )
 }
 
+// Resolve and prove a remote connection inside one bounded policy. Re-running
+// the resolver is required for OAuth because every attempt must mint a fresh
+// single-use WebSocket ticket. The same seam is used by primary and pooled
+// profile backends so controlled restart behavior cannot drift between them.
+async function resolveReadyRemoteBackendWithRetry(
+  profile,
+  { beforeResolve, beforeReady, onRetry }: any = {}
+) {
+  return resolveReadyRemoteConnectionWithRetry(
+    () => {
+      beforeResolve?.()
+
+      return resolveRemoteBackend(profile)
+    },
+    async (remote, context) => {
+      await beforeReady?.(remote)
+      await waitForHermes(
+        remote.baseUrl,
+        remote.token,
+        undefined,
+        remote.authMode,
+        Math.max(1, Math.min(DEFAULT_REMOTE_READY_ATTEMPT_TIMEOUT_MS, context.remainingMs))
+      )
+    },
+    { onRetry }
+  )
+}
+
 // A remote profile's sessions live on its remote host's state.db, not on a local
 // file the primary can open — so reads for it must route to the remote backend,
 // not the local-disk fast path. These three helpers drive that (see
@@ -8214,8 +8247,8 @@ function startPoolIdleReaper() {
 }
 
 // Spawn an additional dashboard backend pinned to a named profile. Mirrors the
-// local-spawn portion of startHermes() but without the boot-progress UI,
-// bootstrap, or remote handling (those belong to the primary backend only).
+// local-spawn portion of startHermes() but without the boot-progress UI or
+// first-run bootstrap.
 async function spawnPoolBackend(profile, entry) {
   // A profile may point at its OWN remote backend (connection.json
   // `profiles[name]`), or inherit the app-wide remote (env / global settings).
@@ -8223,11 +8256,15 @@ async function spawnPoolBackend(profile, entry) {
   // remote is reachable and hand back its connection descriptor. The pool
   // entry keeps `entry.process === null`, which stopPoolBackend/evict already
   // tolerate.
-  const remote = await resolveRemoteBackend(profile)
+  const remote = await resolveReadyRemoteBackendWithRetry(profile, {
+    onRetry: (_error, attempt, delayMs) => {
+      rememberLog(
+        `Remote Hermes backend for profile "${profile}" unavailable; retrying after ${delayMs}ms (attempt ${attempt}).`
+      )
+    }
+  })
 
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
-
     // Recorded on the entry so revalidation can probe this descriptor without
     // awaiting connectionPromise, which may still be pending for a sibling.
     entry.remoteBaseUrl = remote.baseUrl
@@ -8486,8 +8523,6 @@ async function startHermes() {
 
   const connectionPromise = (async () => {
     const connectRemote = async remote => {
-      await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token, undefined, remote.authMode)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
@@ -8536,13 +8571,21 @@ async function startHermes() {
 
         return resolveHermesBackend(backendArgs)
       },
-      resolveRemote: () => {
-        // Classify immediately before each throwing resolve. This callback runs
-        // both for an already-saved remote and after first-run remote Apply.
-        attemptedRemote = primaryBackendIsRemote()
-
-        return resolveRemoteBackend(primaryProfileKey())
-      },
+      resolveRemote: () =>
+        resolveReadyRemoteBackendWithRetry(primaryProfileKey(), {
+          // Classify immediately before every throwing resolve. This callback
+          // runs for an already-saved remote and after first-run remote Apply.
+          beforeResolve: () => {
+            attemptedRemote = primaryBackendIsRemote()
+          },
+          beforeReady: remote =>
+            advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24),
+          onRetry: (_error, attempt, delayMs) => {
+            rememberLog(
+              `Remote Hermes backend unavailable; retrying connection after ${delayMs}ms (attempt ${attempt}).`
+            )
+          }
+        }),
       waitForDecision: waitForFirstRunSetupChoice,
       // Mutual exclusion with an in-app update (#50238). Remote connections
       // return before this waiter; local starts park until the updater exits.

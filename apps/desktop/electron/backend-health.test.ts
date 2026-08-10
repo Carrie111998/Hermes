@@ -3,7 +3,6 @@ import assert from 'node:assert/strict'
 import { test } from 'vitest'
 
 import {
-  DEFAULT_HEALTH_PROBE_TIMEOUT_MS,
   isAuthRejectionError,
   isGatedMissingHealthError,
   isMissingHealthEndpointError,
@@ -90,7 +89,7 @@ test('does not fall back to heavyweight /api/status for transient health failure
   assert.ok(calls.every(call => call[0] === 'public' && call[1].endsWith('/api/health')))
 })
 
-test('probes health on a short timeout but leaves the legacy fallback its own', async () => {
+test('caps health and legacy fallback probes to the readiness deadline', async () => {
   const timeouts: (number | undefined)[] = []
 
   await waitForHermesReady('http://127.0.0.1:9000', {
@@ -104,12 +103,13 @@ test('probes health on a short timeout but leaves the legacy fallback its own', 
 
       return { version: 'old' }
     },
+    now: () => 0,
     sleep: async () => {},
     timeoutMs: 100,
     pollMs: 1
   })
 
-  assert.deepEqual(timeouts, [DEFAULT_HEALTH_PROBE_TIMEOUT_MS, undefined])
+  assert.deepEqual(timeouts, [100, 100])
 })
 
 test('aborts as superseded when the bootstrap signal fires', async () => {

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
+import { isReauthRequiredError, waitForHermesReady } from './backend-health'
 import {
   isRetryableRemoteConnectionError,
   remoteHttpStatusError,
@@ -136,6 +137,7 @@ test('default retry window survives a 23-second controlled backend restart', asy
       return 'connected'
     },
     {
+      now: () => elapsedMs,
       sleep: async delayMs => {
         elapsedMs += delayMs
       }
@@ -145,6 +147,131 @@ test('default retry window survives a 23-second controlled backend restart', asy
   assert.equal(result, 'connected')
   assert.equal(elapsedMs, 23_500)
   assert.equal(attempts, 9)
+})
+
+test('retry deadline caps cumulative backoff', async () => {
+  let elapsedMs = 0
+  let attempts = 0
+  const unavailable = remoteHttpStatusError(503, 'upstream unavailable')
+
+  await assert.rejects(
+    () =>
+      resolveRemoteConnectionWithRetry(
+        async () => {
+          attempts += 1
+          throw unavailable
+        },
+        {
+          initialDelayMs: 700,
+          maxAttempts: 9,
+          maxDelayMs: 700,
+          maxElapsedMs: 1_000,
+          now: () => elapsedMs,
+          sleep: async delayMs => {
+            elapsedMs += delayMs
+          }
+        }
+      ),
+    error =>
+      (error as { kind?: unknown; message?: unknown }).kind === 'timeout' &&
+      String((error as { message?: unknown }).message).includes('1000ms')
+  )
+
+  assert.equal(elapsedMs, 1_000)
+  assert.equal(attempts, 2)
+})
+
+test('current readiness polling shares one end-to-end retry deadline', async () => {
+  let elapsedMs = 0
+  let readinessAttempts = 0
+  let resolverAttempts = 0
+  const unavailable = remoteHttpStatusError(503, 'upstream unavailable')
+
+  await assert.rejects(
+    () =>
+      resolveReadyRemoteConnectionWithRetry(
+        async () => {
+          resolverAttempts += 1
+
+          return { baseUrl: 'https://remote.example', token: 'static-token' }
+        },
+        async (connection, context) => {
+          readinessAttempts += 1
+          await waitForHermesReady(connection.baseUrl, {
+            token: connection.token,
+            fetchJson: async () => {
+              throw unavailable
+            },
+            fetchPublicJson: async () => {
+              throw unavailable
+            },
+            healthProbeTimeoutMs: 100,
+            now: () => elapsedMs,
+            pollMs: 250,
+            sleep: async delayMs => {
+              elapsedMs += delayMs
+            },
+            timeoutMs: Math.min(1_000, context.remainingMs)
+          })
+        },
+        {
+          initialDelayMs: 100,
+          maxAttempts: 9,
+          maxDelayMs: 100,
+          maxElapsedMs: 2_500,
+          now: () => elapsedMs,
+          sleep: async delayMs => {
+            elapsedMs += delayMs
+          }
+        }
+      ),
+    error => (error as { kind?: unknown }).kind === 'timeout'
+  )
+
+  assert.equal(elapsedMs, 2_500)
+  assert.equal(resolverAttempts, 3)
+  assert.equal(readinessAttempts, 3)
+})
+
+test('current credentialed readiness probe fails 401/403 without retrying', async () => {
+  for (const statusCode of [401, 403]) {
+    let readinessAttempts = 0
+    let resolverAttempts = 0
+    const rejected = remoteHttpStatusError(statusCode, 'session rejected')
+
+    await assert.rejects(
+      () =>
+        resolveReadyRemoteConnectionWithRetry(
+          async () => {
+            resolverAttempts += 1
+
+            return { baseUrl: 'https://remote.example', token: 'expired-token' }
+          },
+          async (connection, context) => {
+            readinessAttempts += 1
+            await waitForHermesReady(connection.baseUrl, {
+              token: connection.token,
+              fetchJson: async () => {
+                throw rejected
+              },
+              fetchPublicJson: async () => {
+                throw rejected
+              },
+              probeHealth: async () => {
+                throw rejected
+              },
+              probeIsCredentialed: true,
+              timeoutMs: context.remainingMs
+            })
+          },
+          { maxAttempts: 9, sleep: async () => undefined }
+        ),
+      error => isReauthRequiredError(error)
+    )
+
+    assert.equal(resolverAttempts, 1)
+    assert.equal(readinessAttempts, 1)
+  }
 })
 
 test('token readiness failures retry the complete connection attempt', async () => {

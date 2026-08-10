@@ -1,9 +1,20 @@
 import { isGatewayAuthRejection } from './connection-config'
 
+const DEFAULT_REMOTE_CONNECTION_RETRY_TIMEOUT_MS = 45_000
+const DEFAULT_REMOTE_READY_ATTEMPT_TIMEOUT_MS = 8_000
+
+interface RemoteConnectionAttemptContext {
+  readonly attempt: number
+  readonly elapsedMs: number
+  readonly remainingMs: number
+}
+
 interface RemoteConnectionRetryOptions {
   initialDelayMs?: number
   maxAttempts?: number
   maxDelayMs?: number
+  maxElapsedMs?: number
+  now?: () => number
   onRetry?: (error: unknown, attempt: number, delayMs: number) => void
   sleep?: (delayMs: number) => Promise<void>
 }
@@ -81,6 +92,17 @@ function isRetryableRemoteConnectionError(error: unknown, seen = new Set<object>
   return typeof candidate.message === 'string' && /(?:timed? out|timeout)/i.test(candidate.message)
 }
 
+function retryDeadlineError(lastError: unknown, maxElapsedMs: number): Error & { kind: 'timeout' } {
+  const detail = lastError instanceof Error ? lastError.message : String(lastError || 'unknown error')
+  const error = new Error(`Remote connection retry deadline exceeded after ${maxElapsedMs}ms: ${detail}`, {
+    cause: lastError
+  }) as Error & { kind: 'timeout' }
+
+  error.kind = 'timeout'
+
+  return error
+}
+
 /**
  * A controlled backend restart can leave the public route unavailable for
  * more than 20 seconds. Retry only ordinary transport/server failures; a
@@ -92,28 +114,57 @@ function isRetryableRemoteConnectionError(error: unknown, seen = new Set<object>
  * captured by an earlier attempt.
  */
 async function resolveRemoteConnectionWithRetry<T>(
-  resolve: () => Promise<T>,
+  resolve: (context: RemoteConnectionAttemptContext) => Promise<T>,
   {
     initialDelayMs = 500,
     maxAttempts = 9,
     maxDelayMs = 4_000,
+    maxElapsedMs = DEFAULT_REMOTE_CONNECTION_RETRY_TIMEOUT_MS,
+    now = Date.now,
     onRetry,
     sleep = delayMs => new Promise<void>(done => setTimeout(done, delayMs))
   }: RemoteConnectionRetryOptions = {}
 ): Promise<T> {
   const attempts = Math.max(1, Math.floor(maxAttempts))
+  const budgetMs = Math.max(1, Math.floor(maxElapsedMs))
+  const startedAt = now()
+  const deadline = startedAt + budgetMs
   let delayMs = Math.max(0, initialDelayMs)
+  let lastError: unknown = null
 
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const context: RemoteConnectionAttemptContext = {
+      attempt,
+      get elapsedMs() {
+        return Math.max(0, now() - startedAt)
+      },
+      get remainingMs() {
+        return Math.max(0, deadline - now())
+      }
+    }
+
     try {
-      return await resolve()
+      return await resolve(context)
     } catch (error) {
+      lastError = error
+
       if (attempt >= attempts || !isRetryableRemoteConnectionError(error)) {
         throw error
       }
 
-      onRetry?.(error, attempt, delayMs)
-      await sleep(delayMs)
+      if (context.remainingMs <= 0) {
+        throw retryDeadlineError(lastError, budgetMs)
+      }
+
+      const boundedDelayMs = Math.min(delayMs, context.remainingMs)
+
+      onRetry?.(error, attempt, boundedDelayMs)
+      await sleep(boundedDelayMs)
+
+      if (now() >= deadline) {
+        throw retryDeadlineError(lastError, budgetMs)
+      }
+
       delayMs = Math.min(Math.max(delayMs * 2, initialDelayMs), maxDelayMs)
     }
   }
@@ -122,15 +173,15 @@ async function resolveRemoteConnectionWithRetry<T>(
 }
 
 async function resolveReadyRemoteConnectionWithRetry<T>(
-  resolve: () => Promise<null | T>,
-  waitForReady: (connection: T) => Promise<void>,
+  resolve: (context: RemoteConnectionAttemptContext) => Promise<null | T>,
+  waitForReady: (connection: T, context: RemoteConnectionAttemptContext) => Promise<void>,
   options: RemoteConnectionRetryOptions = {}
 ): Promise<null | T> {
-  return resolveRemoteConnectionWithRetry(async () => {
-    const connection = await resolve()
+  return resolveRemoteConnectionWithRetry(async context => {
+    const connection = await resolve(context)
 
     if (connection) {
-      await waitForReady(connection)
+      await waitForReady(connection, context)
     }
 
     return connection
@@ -138,10 +189,12 @@ async function resolveReadyRemoteConnectionWithRetry<T>(
 }
 
 export {
+  DEFAULT_REMOTE_CONNECTION_RETRY_TIMEOUT_MS,
+  DEFAULT_REMOTE_READY_ATTEMPT_TIMEOUT_MS,
   isRetryableRemoteConnectionError,
   remoteHttpStatusError,
   requiresOauthLogin,
   resolveReadyRemoteConnectionWithRetry,
   resolveRemoteConnectionWithRetry
 }
-export type { RemoteConnectionRetryOptions }
+export type { RemoteConnectionAttemptContext, RemoteConnectionRetryOptions }

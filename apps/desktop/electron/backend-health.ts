@@ -129,9 +129,13 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
 
     try {
       if (useStatusFallback) {
-        await options.fetchJson(`${base}/api/status`, options.token)
+        await options.fetchJson(`${base}/api/status`, options.token, {
+          timeoutMs: Math.max(1, deadline - now())
+        })
       } else {
-        await probeHealth(`${base}/api/health`, { timeoutMs: healthProbeTimeoutMs })
+        await probeHealth(`${base}/api/health`, {
+          timeoutMs: Math.max(1, Math.min(healthProbeTimeoutMs, deadline - now()))
+        })
       }
 
       return
@@ -160,10 +164,21 @@ export async function waitForHermesReady(baseUrl: string, options: HermesReadyOp
         continue
       }
 
-      await sleep(pollMs)
+      const remainingMs = deadline - now()
+
+      if (remainingMs <= 0) {
+        break
+      }
+
+      await sleep(Math.min(pollMs, remainingMs))
     }
   }
 
   const detail = lastError instanceof Error ? lastError.message : 'timeout'
-  throw new Error(`Hermes backend did not become ready: ${detail}`)
+  const error = new Error(`Hermes backend did not become ready: ${detail}`, { cause: lastError }) as Error & {
+    kind: 'timeout'
+  }
+
+  error.kind = 'timeout'
+  throw error
 }
