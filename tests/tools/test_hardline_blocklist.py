@@ -713,6 +713,42 @@ _ABS_PATH_BLOCK = [
     "`/sbin/reboot`",
     "{ /sbin/reboot; }",
     "env -u FOO /sbin/reboot",
+    # leading redirections are POSIX prefix words, not the command (egilewski,
+    # PR #82830): the executable that follows must still reach the floor
+    "</dev/null /sbin/shutdown -h now",
+    "2>/dev/null /usr/sbin/reboot",
+    "< /dev/null /sbin/shutdown -h now",
+    "2>&1 /sbin/shutdown -h now",
+    "&>/dev/null /sbin/reboot",
+    "<<EOF /sbin/shutdown -h now",
+    "<<<word /sbin/reboot",
+    # prefix repetition must not exhaust the walk before the command word
+    "2>/dev/null </dev/null 1>/tmp/a 2>>/tmp/b <>/tmp/c >|/tmp/d /sbin/reboot",
+    # a redirection prefix in front of a bare-name command (main-era gap,
+    # closed here by the same normalization)
+    "</dev/null shutdown -h now",
+    "2>/dev/null reboot",
+    # an assignment prefix in front of a bare-name command (same gap)
+    "FOO=1 shutdown -h now",
+    # process substitution as a redirection operand still resumes at the cmd
+    "> >(cat) /sbin/shutdown -h now",
+    # gluing must not hide the command: no separator before the redirection
+    "shutdown&>out -h now",
+    # an escaped > is a literal, so & stays a background operator and the
+    # following command starts fresh and must block
+    "printf x \\>& shutdown -h now",
+    # a sudo option that takes an argument must not shift the command word
+    "sudo -D /tmp /sbin/shutdown -h now",
+    # >&file redirects both streams to a filename (not an fd), so the file is
+    # the operand and the command still follows (Grok round 1)
+    ">&/dev/null /sbin/shutdown -h now",
+    # a quoted ) inside a process substitution must not end the balance early
+    '> >(echo "x)y") /sbin/shutdown -h now',
+    # a digit run glued to non-digits after >&/2>& is a filename operand, not
+    # a bare fd number, so the whole token is consumed and the command follows
+    # (Grok round 2)
+    ">&2x /sbin/shutdown -h now",
+    "2>&1x /sbin/reboot",
 ]
 
 _ABS_PATH_ALLOW = [
@@ -737,6 +773,16 @@ _ABS_PATH_ALLOW = [
     "env --argv0 /tmp/reboot /bin/echo ok",
     # `}` is not a shell metacharacter: it can end a legitimate word
     "/tmp/reboot}",
+    # benign leading redirections in front of a benign command stay allowed
+    ">out.txt make build",
+    "2>/dev/null ls /tmp",
+    "< /dev/null cat file",
+    # process substitution feeding a benign command is not the floor's concern
+    "diff <(sort a) <(sort b)",
+    # `env -C dir cmd` operand is data; the benign command is not blocked
+    "env -C /tmp /bin/ls",
+    # background operator between two benign commands keeps its meaning
+    "echo hi & echo bye",
 ]
 
 
