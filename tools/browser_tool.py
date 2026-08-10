@@ -293,6 +293,8 @@ _SANDBOX_BYPASS_FLAGS = frozenset({
     "--disable-namespace-sandbox",
     "--disable-seccomp-filter-sandbox",
     "--disable-setuid-sandbox",
+    "--single-process",
+    "--in-process-gpu",
 })
 _SANDBOX_CONTROL_FLAGS = frozenset({
     "--remote-debugging-address",
@@ -300,6 +302,12 @@ _SANDBOX_CONTROL_FLAGS = frozenset({
     "--remote-debugging-port",
     "--user-data-dir",
 })
+_SANDBOX_LAUNCHER_ENV_VARS = (
+    "CHROMIUM_FLAGS",
+    "CHROME_FLAGS",
+    "CHROME_USER_FLAGS",
+    "CHROMIUM_USER_FLAGS",
+)
 
 _cached_command_timeout: Optional[int] = None
 _command_timeout_resolved = False
@@ -417,6 +425,14 @@ def _sandbox_chromium_args(env: dict[str, str]) -> list[str]:
     return flags
 
 
+def _sandbox_chromium_env(env: dict[str, str]) -> dict[str, str]:
+    """Remove inherited launcher flags from the sandboxed Chromium child."""
+    child_env = dict(env)
+    for key in _SANDBOX_LAUNCHER_ENV_VARS:
+        child_env.pop(key, None)
+    return child_env
+
+
 def _build_sandboxed_chromium_command(
     executable: str,
     profile_dir: str,
@@ -500,11 +516,12 @@ def _launch_sandboxed_chromium(
         os.unlink(os.path.join(profile_dir, "DevToolsActivePort"))
     except FileNotFoundError:
         pass
+    chromium_env = _sandbox_chromium_env(browser_env)
     command = _build_sandboxed_chromium_command(
         executable,
         profile_dir,
         headed=headed,
-        extra_args=_sandbox_chromium_args(browser_env),
+        extra_args=_sandbox_chromium_args(chromium_env),
     )
     popen_extra: dict[str, Any] = {}
     if os.name == "nt":
@@ -517,7 +534,7 @@ def _launch_sandboxed_chromium(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env=browser_env,
+            env=chromium_env,
             **popen_extra,
         )
     except OSError as exc:

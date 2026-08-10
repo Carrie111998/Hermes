@@ -1,6 +1,7 @@
 # PR infographic — Preserve Chromium sandbox in containers
 
-![Preserve Chromium sandbox in containers](./infographic.png)
+> A imagem permanece incorporada na descrição do PR; o binário não é rastreado
+> neste repositório.
 
 ## Arquitetura, em linguagem simples
 

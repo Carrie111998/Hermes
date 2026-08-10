@@ -31,6 +31,13 @@ class TestSandboxOptIn:
         with pytest.raises(ValueError, match="AGENT_BROWSER_FORCE_SANDBOX"):
             bt._sandbox_chromium_args(os.environ)
 
+    @pytest.mark.parametrize("flag", ["--single-process", "--in-process-gpu"])
+    def test_force_sandbox_rejects_process_isolation_flags(self, monkeypatch, flag):
+        monkeypatch.setenv("AGENT_BROWSER_ARGS", flag)
+
+        with pytest.raises(ValueError, match="AGENT_BROWSER_FORCE_SANDBOX"):
+            bt._sandbox_chromium_args(os.environ)
+
     def test_sandbox_command_keeps_control_flags_owned_by_hermes(self):
         command = bt._build_sandboxed_chromium_command(
             "/usr/bin/chromium",
@@ -47,6 +54,35 @@ class TestSandboxOptIn:
 
 
 class TestSandboxBrowserRouting:
+    def test_sandbox_chromium_env_strips_inherited_launcher_flags(self, monkeypatch):
+        captured = {}
+        env = {
+            key: "--single-process"
+            for key in bt._SANDBOX_LAUNCHER_ENV_VARS
+        }
+        monkeypatch.setattr(bt.os, "makedirs", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            bt,
+            "_read_sandbox_cdp_url",
+            lambda _: "ws://127.0.0.1:4321/devtools/browser/test",
+        )
+
+        def fake_popen(_command, **kwargs):
+            captured["env"] = kwargs["env"]
+            return _FakeChromiumProcess()
+
+        monkeypatch.setattr(bt.subprocess, "Popen", fake_popen)
+
+        bt._launch_sandboxed_chromium(
+            "/usr/bin/chromium",
+            os.path.join(os.getcwd(), ".sandbox-chromium-profile"),
+            env,
+            headed=False,
+        )
+
+        assert all(key not in captured["env"] for key in bt._SANDBOX_LAUNCHER_ENV_VARS)
+        assert all(key in env for key in bt._SANDBOX_LAUNCHER_ENV_VARS)
+
     def test_force_sandbox_connects_agent_browser_over_cdp(self, monkeypatch):
         captured = {}
         runtime_dir = os.path.join(os.getcwd(), ".sandbox-browser-runtime")
