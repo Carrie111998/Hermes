@@ -35,6 +35,13 @@
     "codex_rereview": "WAIVED by user 2026-08-10 (以后无需 Codex 复验)"
   },
   "not_claimed": "不宣称 release ready: 发布门禁 (回滚包 MANIFEST/恢复演练/双向兼容 smoke/上游 merge) 仍未执行, 维持文档记录的发布前阻塞条件",
+  "release_promotion": {
+    "status": "PENDING_ONE_RESTART",
+    "new_build": "apps/desktop/release-new/win-unpacked (electron-builder --dir, 含 hide-unused/relative-time/threshold 全部改动)",
+    "user_confirmed": "2026-08-10 用户在新包上确认无误",
+    "watcher": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\usage-bar-release-promote.ps1 — 用户退出后自动 release→release-old, release-new→release, 并从 release\\ 重启",
+    "rollback": "release-old\\win-unpacked\\Hermes.exe 或 cache\\release-backups\\release-backup-usage-20260810-114009"
+  },
   "ux_compaction": {
     "commit": "bacaa4e07",
     "changes": "上下文用量分类默认折叠(disclosure); 提供商按使用排序(当前会话置顶+当前徽标→有真实额度→需注意); unsupported 合并为单行折叠组(note 仅一次); 健康状态图标化(CheckCircle2/Clock/AlertCircle); 额度行内联(label+bar+% left)",
