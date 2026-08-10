@@ -11593,6 +11593,7 @@ async def get_logs(
     level: Optional[str] = None,
     component: Optional[str] = None,
     search: Optional[str] = None,
+    session: Optional[str] = None,
 ):
     from hermes_cli.logs import _read_tail, LOG_FILES
 
@@ -11623,12 +11624,19 @@ async def get_logs(
     else:
         comp_prefixes = None
 
-    has_filters = bool(min_level or comp_prefixes or search)
+    # Session ids are stamped as a delimited ``[session_id]`` field. Search
+    # that exact marker so an id cannot match a longer id or message text that
+    # merely mentions it.
+    session_id = session.strip() if session and session.strip() else None
+    session_filter = f"[{session_id}]" if session_id else None
+
+    has_filters = bool(min_level or comp_prefixes or search or session_filter)
     result = _read_tail(
         log_path, min(lines, 500) if not search else 2000,
         has_filters=has_filters,
         min_level=min_level,
         component_prefixes=comp_prefixes,
+        session_filter=session_filter,
     )
     # Post-filter by search term (case-insensitive substring match).
     # _read_tail doesn't support free-text search, so we filter here and

@@ -11,6 +11,7 @@
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
+import { useMemo, useState } from 'react'
 
 import { RightSidebarPane } from '@/app/right-sidebar'
 import { ReviewPane } from '@/app/right-sidebar/review'
@@ -18,27 +19,111 @@ import type { GroupSetter } from '@/app/shell/group-setter'
 import type { StatusbarItem } from '@/app/shell/statusbar-controls'
 import type { TitlebarTool } from '@/app/shell/titlebar-controls'
 import { DecodeText } from '@/components/ui/decode-text'
+import { ResponsiveTabs } from '@/components/ui/tab-dropdown'
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { getLogs } from '@/hermes'
+import { sessionTitle } from '@/lib/chat-runtime'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
 import { openPreview } from '@/store/preview'
-import { $currentCwd } from '@/store/session'
+import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
+import { $activeSessionId, $currentCwd, $selectedStoredSessionId, $sessions } from '@/store/session'
+import type { SessionInfo } from '@/types/hermes'
 
 // ---------------------------------------------------------------------------
-// Logs — live agent-log tail. ⌘K-only chrome: the pane contribution exists
-// only while the "Toggle logs" palette command has it summoned ($logsOpen in
-// the controller) — never in a default layout, never a standing tab.
+// Logs — live agent-log tail. OPTIONAL chrome: not in any default layout,
+// hidden until the ⌘K "Toggle logs" command opens it ($logsOpen).
+//
+// Session filter: log lines are already stamped with " [session_id]" by
+// hermes_logging's record factory (set_session_context()), so filtering here
+// is just passing that id through to GET /api/logs?session=... — no new
+// backend plumbing beyond exposing the CLI's existing `--session` filter on
+// the endpoint (#70828).
 // ---------------------------------------------------------------------------
+
+const LOGS_SESSION_FILTER_ALL = 'all'
+const LOGS_SESSION_FILTER_CURRENT = 'current'
+
+export function resolveLogsSessionQueryValue({
+  activeSessionId,
+  selectedStoredSessionId,
+  resolvedFilter
+}: {
+  activeSessionId: null | string
+  selectedStoredSessionId: null | string
+  resolvedFilter: string
+}): string | undefined {
+  if (resolvedFilter === LOGS_SESSION_FILTER_ALL) {
+    return undefined
+  }
+
+  if (resolvedFilter === LOGS_SESSION_FILTER_CURRENT) {
+    return selectedStoredSessionId ?? activeSessionId ?? undefined
+  }
+
+  return resolvedFilter
+}
+
+export function logsSessionsForProfile(sessions: SessionInfo[], activeGatewayProfile: string): SessionInfo[] {
+  const profile = normalizeProfileKey(activeGatewayProfile)
+
+  return sessions.filter(session => normalizeProfileKey(session.profile) === profile)
+}
 
 export function LogsPane() {
+  const activeSessionId = useStore($activeSessionId)
+  const activeGatewayProfile = useStore($activeGatewayProfile)
+  const selectedStoredSessionId = useStore($selectedStoredSessionId)
+  const sessions = useStore($sessions)
+  const [sessionFilter, setSessionFilter] = useState<string>(LOGS_SESSION_FILTER_ALL)
+
+  const profileSessions = useMemo(
+    () => logsSessionsForProfile(sessions, activeGatewayProfile),
+    [activeGatewayProfile, sessions]
+  )
+
+  // A specific picked session id can go stale (session closed/deleted) —
+  // fall back to "all" rather than silently filtering on a dead id forever.
+  const resolvedFilter = useMemo(() => {
+    if (sessionFilter === LOGS_SESSION_FILTER_ALL || sessionFilter === LOGS_SESSION_FILTER_CURRENT) {
+      return sessionFilter
+    }
+
+    return profileSessions.some(session => session.id === sessionFilter)
+      ? sessionFilter
+      : LOGS_SESSION_FILTER_ALL
+  }, [profileSessions, sessionFilter])
+
+  const sessionQueryValue = resolveLogsSessionQueryValue({
+    activeSessionId,
+    selectedStoredSessionId,
+    resolvedFilter
+  })
+
   const { data, error } = useQuery({
-    queryKey: ['contrib-logs-tail'],
-    queryFn: () => getLogs({ lines: 300 }),
+    queryKey: ['contrib-logs-tail', sessionQueryValue],
+    queryFn: () => getLogs({ lines: 300, session: sessionQueryValue }),
     refetchInterval: 5000
   })
+
+  const tabs = useMemo(() => {
+    const base = [
+      { id: LOGS_SESSION_FILTER_ALL, label: 'All' },
+      { id: LOGS_SESSION_FILTER_CURRENT, label: 'Current' }
+    ]
+
+    // Recent sessions beyond "current", most-recently-active first, capped
+    // so the picker stays usable rather than listing every stored session.
+    const recents = [...profileSessions]
+      .sort((a, b) => (b.last_active || b.started_at || 0) - (a.last_active || a.started_at || 0))
+      .filter(session => session.id !== (selectedStoredSessionId ?? activeSessionId))
+      .slice(0, 8)
+      .map(session => ({ id: session.id, label: sessionTitle(session) }))
+
+    return [...base, ...recents]
+  }, [activeSessionId, profileSessions, selectedStoredSessionId])
 
   if (error) {
     return <div className="p-3 text-xs text-(--ui-text-quaternary)">log unavailable: {String(error)}</div>
@@ -52,12 +137,17 @@ export function LogsPane() {
     )
   }
 
-  // No chrome of its own — the zone header (when the user summons it) is the
-  // pane's only label. Just the tail.
   return (
-    <pre className="h-full min-h-0 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)">
-      {data.lines.join('\n')}
-    </pre>
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center border-b border-(--ui-border-primary) px-2.5 py-1">
+        <ResponsiveTabs align="end" onChange={setSessionFilter} tabs={tabs} value={resolvedFilter} />
+      </div>
+      {/* No further chrome of its own — the zone header (when the user
+         summons it) is the pane's only other label. Just the tail. */}
+      <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words p-2.5 font-mono text-[0.66rem] leading-relaxed text-(--ui-text-secondary)">
+        {data.lines.length ? data.lines.join('\n') : 'no matching log lines'}
+      </pre>
+    </div>
   )
 }
 
