@@ -2033,7 +2033,7 @@ Supported `fields` (order is preserved; omit any field to hide it):
 
 Notes:
 
-- Default fields are `["model", "reasoning", "context_pct", "cwd"]` when `fields` is unset. `reasoning` is skipped silently when the active effort is unavailable.
+- Default fields remain `["model", "context_pct", "cwd"]` when `fields` is unset.
 - `latency` is opt-in; fields whose data is unavailable are skipped silently.
 - `underline: true` prepends a short separator line before the footer.
 - `quota` only renders windows a provider actually returns; providers without usage APIs stay silent for that field.
