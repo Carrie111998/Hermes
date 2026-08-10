@@ -3635,7 +3635,7 @@ class MCPServerTask:
             finally:
                 self.session = None
 
-    async def start(self, config: dict):
+    async def start(self, config: dict, *, shutdown_on_error: bool = True):
         """Create the background Task and wait until ready (or failed)."""
         self._task = asyncio.ensure_future(self.run(config))
         try:
@@ -3645,14 +3645,52 @@ class MCPServerTask:
             # in asyncio.wait_for) cancels *this* coroutine, but the
             # ensure_future'd run() task is independent and would otherwise
             # keep running detached — parked on a hung transport with no
-            # owner to reap it (#59349). Propagate the cancellation so the
+            # owner to reap it (#59349). Cancel and await the owner task so
             # transport context managers unwind and their finally blocks
-            # release the child process / FDs.
+            # release the child process / FDs before propagating cancellation.
             if self._task and not self._task.done():
                 self._task.cancel()
+                try:
+                    await self._task
+                except asyncio.CancelledError:
+                    pass
+                except BaseException:
+                    # Cleanup failures must not replace the caller's original
+                    # cancellation. Preserve the cancellation and retain the
+                    # cleanup traceback in debug logs for diagnosis.
+                    logger.debug(
+                        "MCP server '%s' owner cleanup failed after start cancellation",
+                        self.name,
+                        exc_info=True,
+                    )
             raise
         if self._error:
-            raise self._error
+            if not shutdown_on_error:
+                raise self._error
+            # Initial connection failures park run() for a later self-probe.
+            # The server is not registered until start() succeeds, so returning
+            # the error without reaping that parked owner task leaves it
+            # unreachable. At process exit the MCP loop then closes underneath
+            # the task and its cancellation cleanup raises "Event loop is
+            # closed". Shut the unregistered owner down while its loop is alive.
+            error = self._error
+            error_traceback = error.__traceback__
+            try:
+                await self.shutdown()
+            except asyncio.CancelledError:
+                # A caller cancellation during cleanup supersedes the stored
+                # connection failure and must retain normal cancellation flow.
+                raise
+            except BaseException:
+                # Preserve the original connection error. Shutdown is
+                # best-effort here and must not turn a useful startup failure
+                # into an unrelated cleanup exception.
+                logger.debug(
+                    "MCP server '%s' cleanup failed after startup error",
+                    self.name,
+                    exc_info=True,
+                )
+            raise error.with_traceback(error_traceback)
 
     async def shutdown(self):
         """Signal the Task to exit and wait for clean resource teardown."""
@@ -5061,7 +5099,7 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         # retain its discovery closure for the server's lifetime.
         claim_token = _connect_server_claim.set(None)
     try:
-        await server.start(config)
+        await server.start(config, shutdown_on_error=claim is None)
     except asyncio.CancelledError:
         # start() already cancels/reaps server._task on external cancellation
         # (see the comment there) -- awaiting a redundant shutdown() inside a
