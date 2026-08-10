@@ -359,10 +359,26 @@ def _local_delivery_notice(job: Dict[str, Any], user_deliver: Optional[str]) -> 
     if (user_deliver or "").strip().lower() == "local":
         return None
     try:
-        from cron.scheduler import _resolve_delivery_targets
+        from cron.scheduler import _is_known_delivery_platform, _resolve_delivery_targets
 
         if _resolve_delivery_targets(job):
             return None  # Will actually deliver somewhere — nothing to flag.
+        # Non-push origin (api_server HTTP request/response, webhook, …): the
+        # job has an origin stamp but that platform can never receive push
+        # delivery. Surface a specific notice so the agent does not promise
+        # "I'll report back here" and then ERROR-loop forever (#83484).
+        origin = job.get("origin") if isinstance(job.get("origin"), dict) else None
+        origin_platform = str((origin or {}).get("platform") or "").strip()
+        if origin_platform and not _is_known_delivery_platform(origin_platform):
+            return (
+                f"This cron job's origin platform '{origin_platform}' cannot "
+                f"receive push deliveries (stateless request/response). Output "
+                f"is saved (view it with cronjob(action='list')) but will NOT "
+                f"be delivered back into this session. To be notified when it "
+                f"runs, recreate or update the job with deliver set to a "
+                f"gateway-connected platform, e.g. deliver='telegram' or "
+                f"deliver='all'."
+            )
     except Exception:
         # If resolution can't be evaluated, fall back to the origin signal.
         if job.get("origin"):
