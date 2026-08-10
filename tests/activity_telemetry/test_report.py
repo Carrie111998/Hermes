@@ -246,6 +246,61 @@ def test_read_only_connection_rejects_writes(seed_activity_db, monkeypatch):
         )
 
 
+def test_report_reads_one_consistent_snapshot(tmp_path, monkeypatch):
+    """Counters and exact costs must describe the same instant.
+
+    Reporting runs against the live, actively-written database. If the
+    aggregate query and the exact-cost query see different snapshots, a row can
+    report counters from before a write and costs from after it — an
+    internally impossible result that silently corrupts cost-per-outcome.
+    """
+    from activity_telemetry import report as report_module
+
+    path = tmp_path / "activity.db"
+    store = ActivityStore(path, clock=lambda: BASE)
+    store.start(LogicalActivityStart(
+        run_id="r", correlation_id="r", activity_id="live", policy_version=1,
+        trigger_source="cron", profile="main", effective_hermes_home="H",
+    ))
+    route = ServedRoute("p", "m")
+    store.record_usage("r", route, RouteUsageDelta(
+        turns=1, model_calls=1, recorded_provider_cost_usd=Decimal("0.10"),
+    ))
+
+    real_connection = report_module._read_only_connection
+
+    class InterleavingConnection:
+        """Commits a concurrent write just before the exact-cost query runs."""
+
+        def __init__(self, inner):
+            self._inner = inner
+            self._wrote = False
+
+        def execute(self, sql, *args, **kwargs):
+            if "recorded_provider_cost_usd, u.api_equivalent_cost_usd" in sql and not self._wrote:
+                self._wrote = True
+                store.record_usage("r", route, RouteUsageDelta(
+                    turns=5, model_calls=5, recorded_provider_cost_usd=Decimal("0.50"),
+                ))
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def close(self):
+            self._inner.close()
+
+    monkeypatch.setattr(
+        report_module, "_read_only_connection",
+        lambda db: InterleavingConnection(real_connection(db)),
+    )
+
+    row = summarize(path, since=SINCE)[0]
+
+    # Either both halves see the pre-write state or both see the post-write
+    # state. A mix is the bug.
+    assert (row["model_calls"], row["recorded_provider_cost_usd"]) in {
+        (1, "0.10"), (6, "0.60"),
+    }, f"torn read: model_calls={row['model_calls']} cost={row['recorded_provider_cost_usd']}"
+
+
 def test_rows_expose_exactly_the_documented_columns(seed_activity_db):
     expected = {
         "activity_id", "policy_version", "requested_provider", "requested_model",

@@ -62,8 +62,6 @@ SELECT
     COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
     COALESCE(SUM(u.output_tokens), 0)      AS output_tokens,
     COALESCE(SUM(u.reasoning_tokens), 0)   AS reasoning_tokens,
-    SUM(CAST(u.recorded_provider_cost_usd AS REAL)) AS recorded_cost_present,
-    SUM(CAST(u.api_equivalent_cost_usd AS REAL))    AS equivalent_cost_present,
     AVG(r.wall_time_ms)                    AS average_wall_time_ms
 FROM logical_activity_runs AS r
 LEFT JOIN logical_activity_route_usage AS u ON u.run_id = r.run_id
@@ -110,7 +108,11 @@ def _read_only_connection(db_path: Path) -> sqlite3.Connection:
         raise FileNotFoundError(f"activity telemetry database not found: {resolved}")
     # as_uri() percent-encodes spaces and '#', which a hand-built
     # "file:{path}" string would not.
-    conn = sqlite3.connect(f"{resolved.as_uri()}?mode=ro", uri=True)
+    # isolation_level=None hands transaction control to us; summarize() opens an
+    # explicit read transaction so all of its queries share one snapshot.
+    conn = sqlite3.connect(
+        f"{resolved.as_uri()}?mode=ro", uri=True, isolation_level=None
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -130,6 +132,11 @@ def summarize(db_path: Path, since: str) -> list[dict[str, Any]]:
     lower_bound = _normalized_since(since)
     conn = _read_only_connection(db_path)
     try:
+        # The database is written live by the cron adapter. Without one read
+        # transaction the aggregate and the exact-cost requeries would see
+        # different snapshots, and a row could report counters from before a
+        # write alongside costs from after it.
+        conn.execute("BEGIN")
         rows = conn.execute(_SUMMARY_SQL, (lower_bound,)).fetchall()
         summaries = []
         for row in rows:
@@ -149,4 +156,8 @@ def summarize(db_path: Path, since: str) -> list[dict[str, Any]]:
             summaries.append({name: summary[name] for name in COLUMNS})
         return summaries
     finally:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
         conn.close()
