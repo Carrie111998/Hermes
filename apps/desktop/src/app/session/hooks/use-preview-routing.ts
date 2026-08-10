@@ -84,7 +84,11 @@ export function usePreviewRouting({ baseHandleGatewayEvent, currentCwd, requestG
           void normalizeOrLocalPreviewTarget(target, $currentCwd.get() || currentCwd || undefined).then(resolved => {
             if (resolved) {
               const trimmedLabel = typeof label === 'string' ? label.trim() : ''
-              openPreview(trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved, 'tool-result')
+              openPreview(
+                trimmedLabel ? { ...resolved, label: trimmedLabel } : resolved,
+                'tool-result',
+                event.session_id || undefined
+              )
             }
           })
         }

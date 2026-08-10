@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { $rightRailActiveTabId } from './layout'
+import { $activeSessionId } from './session'
 import {
   $previewServerRestart,
   $previewServerRestartStatus,
   $previewTabs,
   $previewTarget,
+  $visiblePreviewTabs,
   beginPreviewServerRestart,
   closePreviewForSource,
   closeRightRail,
@@ -32,13 +34,55 @@ describe('preview store', () => {
   beforeEach(() => {
     $previewServerRestart.set(null)
     closeRightRail()
+    $activeSessionId.set(null)
     window.localStorage.clear()
   })
 
   afterEach(() => {
     $previewServerRestart.set(null)
     closeRightRail()
+    $activeSessionId.set(null)
     window.localStorage.clear()
+  })
+
+  it('scopes tool-result tabs to the session that handed them over', () => {
+    $activeSessionId.set('session-a')
+    openPreview(fileTarget('/work/demo.html'), 'tool-result')
+
+    // Visible (and only visible) while its owning session is active.
+    expect($visiblePreviewTabs.get()).toHaveLength(1)
+    $activeSessionId.set('session-b')
+    expect($visiblePreviewTabs.get()).toHaveLength(0)
+    // The tab itself is not destroyed by a chat switch, just hidden.
+    expect($previewTabs.get()).toHaveLength(1)
+    $activeSessionId.set('session-a')
+    expect($visiblePreviewTabs.get()).toHaveLength(1)
+  })
+
+  it('keeps file-browser and manual tabs global across sessions', () => {
+    $activeSessionId.set('session-a')
+    openPreview(fileTarget('/work/browsed.html'), 'file-browser')
+    openPreview(fileTarget('/work/pasted.png'), 'manual')
+
+    $activeSessionId.set('session-b')
+    expect($visiblePreviewTabs.get()).toHaveLength(2)
+  })
+
+  it('prefers an explicit sessionId over the active session', () => {
+    $activeSessionId.set('session-a')
+    openPreview(urlTarget('https://example.com'), 'tool-result', 'session-c')
+
+    $activeSessionId.set('session-c')
+    expect($visiblePreviewTabs.get()).toHaveLength(1)
+    $activeSessionId.set('session-a')
+    expect($visiblePreviewTabs.get()).toHaveLength(0)
+  })
+
+  it('shows all tabs when no session is active (boot / non-chat views)', () => {
+    openPreview(fileTarget('/work/demo.html'), 'tool-result')
+    $activeSessionId.set(null)
+
+    expect($visiblePreviewTabs.get()).toHaveLength(1)
   })
 
   it('does not notify status subscribers for restart progress text', () => {

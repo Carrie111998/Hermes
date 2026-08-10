@@ -12,8 +12,11 @@ import { $previewTabSources, closePreviewForSource, openPreview, type PreviewRec
 export function PreviewAttachment({ source = 'manual', target }: { source?: PreviewRecordSource; target: string }) {
   const { t } = useI18n()
   // This link lives in one session's transcript; resolve it against THAT
-  // session's cwd, not the primary chat's.
-  const cwd = useStore(useSessionView().$cwd)
+  // session's cwd, not the primary chat's, and scope the preview tab it opens
+  // to that session so it doesn't follow the user into other chats.
+  const sessionView = useSessionView()
+  const cwd = useStore(sessionView.$cwd)
+  const sessionId = useStore(sessionView.$runtimeId)
   const openSources = useStore($previewTabSources)
   const [opening, setOpening] = useState(false)
   const cwdRef = useRef(cwd)
@@ -75,7 +78,7 @@ export function PreviewAttachment({ source = 'manual', target }: { source?: Prev
         throw new Error(`Could not open preview target: ${requestTarget}`)
       }
 
-      openPreview(preview, source)
+      openPreview(preview, source, sessionId ?? undefined)
     } catch (error) {
       if (
         !mountedRef.current ||

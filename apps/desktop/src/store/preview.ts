@@ -4,6 +4,7 @@ import { persistentAtom } from '@/lib/persisted'
 import { normalize } from '@/lib/text'
 
 import { $rightRailActiveTabId, type RightRailTabId, selectRightRailTab } from './layout'
+import { $activeSessionId } from './session'
 
 /**
  * PREVIEW RAIL — one list of tabs, one way in.
@@ -58,6 +59,10 @@ export type PreviewRecordSource = 'explicit-link' | 'file-browser' | 'manual' | 
 export interface PreviewTab {
   id: RightRailTabId
   target: PreviewTarget
+  /** Chat session that handed this tab over. When set, the tab only shows
+   *  while that session is the active chat; tabs without one stay global,
+   *  exactly as before. */
+  sessionId?: string
 }
 
 const TABS_STORAGE_KEY = 'hermes.desktop.previewTabs.v2'
@@ -158,6 +163,14 @@ if (typeof window !== 'undefined') {
   }
 }
 
+/** Tabs visible in the CURRENT chat. Session-tagged tabs only surface while
+ *  their owning session is the active one; untagged (global) tabs always
+ *  show. With no session active (boot, non-chat views) everything shows, so
+ *  restored tabs never silently vanish. */
+export const $visiblePreviewTabs = computed([$previewTabs, $activeSessionId], (tabs, activeSessionId) =>
+  activeSessionId ? tabs.filter(tab => !tab.sessionId || tab.sessionId === activeSessionId) : tabs
+)
+
 /** The tab the rail actually shows. A stale or missing selection falls back to
  *  the first tab, so the strip, `⌘W`, and the pane never disagree about which
  *  tab is on screen. */
@@ -166,7 +179,7 @@ function resolveActiveTab(tabs: PreviewTab[], activeTabId: RightRailTabId | null
 }
 
 function activePreviewTab(): PreviewTab | null {
-  return resolveActiveTab($previewTabs.get(), $rightRailActiveTabId.get())
+  return resolveActiveTab($visiblePreviewTabs.get(), $rightRailActiveTabId.get())
 }
 
 // A restored active id whose tab didn't survive validation would leave the rail
@@ -175,13 +188,14 @@ selectRightRailTab(activePreviewTab()?.id ?? null)
 
 /** The target the rail is currently showing, or null when it has no tabs. */
 export const $previewTarget = computed(
-  [$previewTabs, $rightRailActiveTabId],
+  [$visiblePreviewTabs, $rightRailActiveTabId],
   (tabs, activeTabId) => resolveActiveTab(tabs, activeTabId)?.target ?? null
 )
 
-/** Raw `source` strings of every open tab, for the composer rows that toggle a
- *  preview open and closed by the target they were handed. */
-export const $previewTabSources = computed($previewTabs, tabs => tabs.map(tab => tab.target.source))
+/** Raw `source` strings of every tab VISIBLE in the current chat, for the
+ *  composer rows that toggle a preview open and closed by the target they
+ *  were handed. */
+export const $previewTabSources = computed($visiblePreviewTabs, tabs => tabs.map(tab => tab.target.source))
 
 export const $previewReloadRequest = atom(0)
 export const $previewServerRestart = atom<PreviewServerRestart | null>(null)
@@ -214,13 +228,20 @@ function previewTargetForSource(target: PreviewTarget, source: PreviewRecordSour
 
 /** Open (or re-front) the tab for `target`. Re-opening an existing tab refreshes
  *  its target so a stale label/path can't outlive the thing it points at. The
- *  only way anything reaches a preview. */
-export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual') {
+ *  only way anything reaches a preview.
+ *
+ *  `sessionId` scopes the tab to one chat. When omitted, chat-produced opens
+ *  (tool results, links inside a transcript) are stamped with the active
+ *  session so they follow the chat that handed them over; browser and manual
+ *  opens stay global. */
+export function openPreview(target: PreviewTarget, source: PreviewRecordSource = 'manual', sessionId?: string) {
   const resolved = previewTargetForSource(target, source)
   const id = previewTabId(resolved)
   const current = $previewTabs.get()
   const index = current.findIndex(tab => tab.id === id)
-  const tab: PreviewTab = { id, target: resolved }
+  const owner =
+    sessionId ?? (source === 'file-browser' || source === 'manual' ? undefined : $activeSessionId.get() ?? undefined)
+  const tab: PreviewTab = { id, target: resolved, sessionId: owner }
 
   $previewTabs.set(index === -1 ? [...current, tab] : current.map((item, i) => (i === index ? tab : item)))
   selectRightRailTab(id)
