@@ -70,6 +70,22 @@ def _ra():
     return run_agent
 
 
+def _resolve_skills_index_injection(
+    skills_config: object,
+    override: Optional[bool] = None,
+) -> bool:
+    """Resolve the session-static skill-index setting without truthy coercion."""
+    if override is not None:
+        return override
+    if not isinstance(skills_config, dict):
+        return True
+    configured = skills_config.get("inject_index", True)
+    if not isinstance(configured, bool):
+        logger.warning("skills.inject_index must be a boolean; defaulting to true")
+        return True
+    return configured
+
+
 def _moa_reference_output_allowed(agent: Any) -> bool:
     """Keep MoA display events off only the machine-readable ``-Q`` surface."""
     return not (
@@ -532,6 +548,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    inject_skills_index: Optional[bool] = None,
 ):
     """
     Initialize the AI Agent.
@@ -1794,10 +1811,19 @@ def init_agent(
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
 
-    # Skills config: nudge interval for skill creation reminders
+    # Skills config: prompt-index injection and skill-creation reminders.
+    # ``inject_index`` is session-static because the rendered system prompt is
+    # cached for the conversation lifetime.
+    agent._inject_skills_index = True
     agent._skill_nudge_interval = 10
     try:
         skills_config = _agent_cfg.get("skills", {})
+        if not isinstance(skills_config, dict):
+            skills_config = {}
+        agent._inject_skills_index = _resolve_skills_index_injection(
+            skills_config,
+            inject_skills_index,
+        )
         agent._skill_nudge_interval = int(skills_config.get("creation_nudge_interval", 10))
     except Exception:
         pass

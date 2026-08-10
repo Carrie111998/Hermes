@@ -180,6 +180,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    no_skills_index: bool = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +191,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            inject_skills_index=False if no_skills_index else None,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -2294,6 +2296,7 @@ def _launch_tui(
     pass_session_id: bool = False,
     max_turns: Optional[int] = None,
     accept_hooks: bool = False,
+    no_skills_index: bool = False,
 ):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
@@ -2378,6 +2381,8 @@ def _launch_tui(
         env["HERMES_TUI_TOOL_PROGRESS"] = "off"
     if accept_hooks:
         env["HERMES_ACCEPT_HOOKS"] = "1"
+    if no_skills_index:
+        env["HERMES_TUI_NO_SKILLS_INDEX"] = "1"
     # Guarantee a generous V8 heap for the TUI. Default node cap is ~1.5–4GB
     # depending on version and can fatal-OOM on long sessions with large
     # transcripts / reasoning blobs. We target 8GB on an unconstrained host,
@@ -2741,6 +2746,7 @@ def cmd_chat(args):
             pass_session_id=getattr(args, "pass_session_id", False),
             max_turns=getattr(args, "max_turns", None),
             accept_hooks=getattr(args, "accept_hooks", False),
+            no_skills_index=getattr(args, "no_skills_index", False),
         )
 
     # Import and run the CLI
@@ -2765,6 +2771,9 @@ def cmd_chat(args):
         "ignore_rules": getattr(args, "ignore_rules", False) or getattr(args, "safe_mode", False),
         "ignore_user_config": getattr(args, "ignore_user_config", False) or getattr(args, "safe_mode", False),
         "compact": getattr(args, "compact", False),
+        "inject_skills_index": (
+            False if getattr(args, "no_skills_index", False) else None
+        ),
     }
     # Filter out None values
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
@@ -10967,6 +10976,7 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            no_skills_index=getattr(args, "no_skills_index", False),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -12638,6 +12648,7 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            no_skills_index=getattr(args, "no_skills_index", False),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat
