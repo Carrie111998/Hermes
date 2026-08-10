@@ -5053,9 +5053,10 @@ def reopen_task(
 
     Only a terminal ``done`` task with no active claim or worker may be
     reopened.  The task returns to ``ready`` when all of its parents are
-    terminal, otherwise to ``todo``.  Direct children that were made ready by
-    the premature completion are demoted to ``todo`` so they cannot run against
-    an invalid prerequisite.
+    terminal, otherwise to ``todo``.  Reopening is rejected after any
+    descendant has entered review or a terminal state, or while a descendant
+    is active.  Every ready descendant is demoted to ``todo`` so no downstream
+    task can run against the invalidated prerequisite.
     """
     if os.environ.get("HERMES_KANBAN_TASK"):
         raise PermissionError("reopen is operator-only and unavailable to Kanban workers")
@@ -5078,18 +5079,24 @@ def reopen_task(
         ):
             raise RuntimeError(f"cannot reopen task {task_id} with an active run or worker")
 
-        active_child = conn.execute(
-            "SELECT c.id FROM tasks c "
-            "JOIN task_links l ON l.child_id = c.id "
-            "WHERE l.parent_id = ? AND (c.status = 'running' "
+        unsafe_descendant = conn.execute(
+            "WITH RECURSIVE descendants(id) AS ("
+            "  SELECT child_id FROM task_links WHERE parent_id = ? "
+            "  UNION "
+            "  SELECT l.child_id FROM task_links l "
+            "  JOIN descendants d ON l.parent_id = d.id"
+            ") "
+            "SELECT c.id, c.status FROM tasks c "
+            "JOIN descendants d ON d.id = c.id "
+            "WHERE c.status IN ('running', 'review', 'done', 'archived') "
             "OR c.claim_lock IS NOT NULL OR c.worker_pid IS NOT NULL "
-            "OR c.current_run_id IS NOT NULL) LIMIT 1",
+            "OR c.current_run_id IS NOT NULL LIMIT 1",
             (task_id,),
         ).fetchone()
-        if active_child is not None:
+        if unsafe_descendant is not None:
             raise RuntimeError(
-                f"cannot reopen task {task_id} while active child "
-                f"{active_child['id']} is running or claimed"
+                f"cannot reopen task {task_id} while descendant "
+                f"{unsafe_descendant['id']} is {unsafe_descendant['status']} or active"
             )
 
         parents = conn.execute(
@@ -5115,8 +5122,14 @@ def reopen_task(
             return False
 
         invalidated = conn.execute(
-            "UPDATE tasks SET status = 'todo' WHERE status = 'ready' AND id IN "
-            "(SELECT child_id FROM task_links WHERE parent_id = ?)",
+            "WITH RECURSIVE descendants(id) AS ("
+            "  SELECT child_id FROM task_links WHERE parent_id = ? "
+            "  UNION "
+            "  SELECT l.child_id FROM task_links l "
+            "  JOIN descendants d ON l.parent_id = d.id"
+            ") "
+            "UPDATE tasks SET status = 'todo' "
+            "WHERE status = 'ready' AND id IN (SELECT id FROM descendants)",
             (task_id,),
         ).rowcount
         _append_event(

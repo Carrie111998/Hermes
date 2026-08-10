@@ -259,11 +259,43 @@ def test_reopen_rejects_running_child_dependency_race(kanban_home):
         assert kb.complete_task(conn, parent) is True
         assert kb.claim_task(conn, child) is not None
 
-        with pytest.raises(RuntimeError, match="active child"):
+        with pytest.raises(RuntimeError, match="descendant"):
             kb.reopen_task(conn, parent, reason="premature completion")
 
         assert kb.get_task(conn, parent).status == "done"
         assert kb.get_task(conn, child).status == "running"
+
+
+def test_reopen_rejects_child_waiting_for_review(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        assert kb.complete_task(conn, parent) is True
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (child,))
+        conn.commit()
+
+        with pytest.raises(RuntimeError, match="descendant.*review"):
+            kb.reopen_task(conn, parent, reason="premature completion")
+
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "review"
+
+
+def test_reopen_rejects_completed_descendant_chain(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent")
+        child = kb.create_task(conn, title="child", parents=[parent])
+        grandchild = kb.create_task(conn, title="grandchild", parents=[child])
+        assert kb.complete_task(conn, parent) is True
+        assert kb.complete_task(conn, child) is True
+        assert kb.get_task(conn, grandchild).status == "ready"
+
+        with pytest.raises(RuntimeError, match="descendant.*done"):
+            kb.reopen_task(conn, parent, reason="premature completion")
+
+        assert kb.get_task(conn, parent).status == "done"
+        assert kb.get_task(conn, child).status == "done"
+        assert kb.get_task(conn, grandchild).status == "ready"
 
 
 def test_reopen_bypasses_recent_success_respawn_guard(kanban_home):
