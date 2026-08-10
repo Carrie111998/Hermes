@@ -9385,7 +9385,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
 
     lines: list[str] = []
-    lines.append(f"# Kanban task {task.id}: {task.title}")
+    lines.append(f"# Kanban task {task.id}: {_cap(task.title)}")
     lines.append("")
     lines.append(f"Assignee: {task.assignee or '(unassigned)'}")
     lines.append(f"Status:   {task.status}")

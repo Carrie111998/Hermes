@@ -86,6 +86,28 @@ def test_worker_query_caps_many_parent_handoffs_without_losing_task_body(kanban_
     assert query.endswith(" chars omitted]\n")
 
 
+def test_worker_query_caps_title_before_authoritative_task_body(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="T" * (kb._CTX_MAX_WORKER_QUERY_CHARS + 100),
+            body="BEGIN-TASK-BODY\nworker requirement\nEND-TASK-BODY",
+            assignee="worker-a",
+        )
+        query = kb.build_worker_query(
+            conn,
+            task_id,
+            f"work kanban task {task_id}",
+        )
+    finally:
+        conn.close()
+
+    assert len(query) < kb._CTX_MAX_WORKER_QUERY_CHARS
+    assert "[truncated," in query.splitlines()[2]
+    assert "BEGIN-TASK-BODY\nworker requirement\nEND-TASK-BODY" in query
+
+
 def test_worker_guidance_consumes_injected_context_before_refresh_tool():
     assert "includes an authoritative `# Kanban task …` context block" in KANBAN_GUIDANCE
     assert "Call `kanban_show()` only if the block is absent" in KANBAN_GUIDANCE
