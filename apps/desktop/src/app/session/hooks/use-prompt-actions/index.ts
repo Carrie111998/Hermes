@@ -700,6 +700,7 @@ export function usePromptActions({
           }
         }
       )
+
       if (!stopContextDrifted()) {
         releaseBusy()
       }
@@ -707,6 +708,7 @@ export function usePromptActions({
       if (stopContextDrifted()) {
         return
       }
+
       releaseBusy()
       notifyError(err, copy.stopFailed)
     }

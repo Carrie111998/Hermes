@@ -692,6 +692,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           // From this point onward the recovered runtime owns all success/error
           // cleanup. A failed retry must not strand busy state or attach its
           // error to the stale runtime session.
+
           sessionId = usedSessionId
         } catch (firstErr) {
           if (firstErr instanceof SessionRecoveryAborted) {
