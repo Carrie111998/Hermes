@@ -68,6 +68,25 @@ from gateway.response_filters import is_autonomous_silence_response
 logger = logging.getLogger(__name__)
 
 
+def _payload_delivery_id(route_name: str, payload: Any) -> Optional[str]:
+    """Return a route-scoped delivery ID for a safe top-level payload ID.
+
+    Some providers do not send a delivery header but do retry the same object
+    with a stable top-level ``id``.  Only scalar string/integer IDs are safe to
+    use here; otherwise the caller retains the timestamp fallback.
+    """
+    if not isinstance(payload, dict):
+        return None
+    payload_id = payload.get("id")
+    if isinstance(payload_id, bool) or not isinstance(payload_id, (str, int)):
+        return None
+    if isinstance(payload_id, str) and not payload_id:
+        return None
+    return "payload-id:" + json.dumps(
+        [route_name, payload_id], separators=(",", ":"), ensure_ascii=True
+    )
+
+
 def _is_webhook_silence_response(content: Any) -> bool:
     """Whether an agent response means "deliberately say nothing".
 
@@ -288,6 +307,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_get("/webhooks/{route_name}", self._handle_webhook_readiness)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -296,6 +316,9 @@ class WebhookAdapter(BasePlatformAdapter):
         # when gateway.multiplex_profiles is on (the handler validates).
         app.router.add_post(
             "/p/{profile}/webhooks/{route_name}", self._handle_webhook
+        )
+        app.router.add_get(
+            "/p/{profile}/webhooks/{route_name}", self._handle_webhook_readiness
         )
 
         self._runner = web.AppRunner(app)
@@ -500,6 +523,28 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_webhook_readiness(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Confirm that a webhook route is registered without processing an event."""
+        # Keep readiness entirely separate from the POST pipeline: do not read a
+        # body, authenticate, rate-limit, deduplicate, or invoke the agent.
+        self._reload_dynamic_routes()
+
+        profile = self._resolve_request_profile(request)
+        if profile is _PROFILE_REJECTED:
+            return web.json_response(
+                {"error": "Unknown or unconfigured profile"}, status=404
+            )
+
+        route_name = request.match_info.get("route_name", "")
+        if route_name not in self._routes:
+            return web.json_response({"error": "Unknown webhook route"}, status=404)
+
+        # Intentionally omit the route name and all route configuration. This
+        # endpoint proves only that the URL is ready to receive webhook POSTs.
+        return web.json_response({"status": "ready"})
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
@@ -734,6 +779,10 @@ class WebhookAdapter(BasePlatformAdapter):
                     {"error": "Cannot parse body"}, status=400
                 )
 
+        # Capture the provider's signed top-level ID before any route script
+        # can transform the payload used for prompting.
+        payload_delivery_id = _payload_delivery_id(route_name, payload)
+
         # Check event type filter
         event_type = (
             request.headers.get("Linear-Event", "")
@@ -830,12 +879,17 @@ class WebhookAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("[webhook] Skill loading failed: %s", e)
 
-        # Build a unique delivery ID
+        # Build a unique delivery ID.  Trusted provider delivery headers keep
+        # their existing priority; a stable top-level payload ID is only a
+        # fallback for providers (such as Circleback) that omit them.
         delivery_id = request.headers.get(
             "X-GitHub-Delivery",
             request.headers.get(
                 "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                request.headers.get(
+                    "X-Request-ID",
+                    payload_delivery_id or str(int(time.time() * 1000)),
+                ),
             ),
         )
 
