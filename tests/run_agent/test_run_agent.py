@@ -2770,6 +2770,22 @@ class TestHandleMaxIterations:
         combined = "\n".join(printed) + capsys.readouterr().out
         assert "Reached maximum iterations" in combined
 
+    def test_summary_retries_router_timeout_shim(self, agent):
+        shim = _mock_response(content="Connect timeout, please try again later.")
+        shim.usage = SimpleNamespace(completion_tokens=0)
+        agent.client.chat.completions.create.side_effect = [
+            shim,
+            _mock_response(content="Recovered summary"),
+        ]
+        agent._cached_system_prompt = "You are helpful."
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "do stuff"}], 60,
+        )
+
+        assert result == "Recovered summary"
+        assert agent.client.chat.completions.create.call_count == 2
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
