@@ -703,6 +703,16 @@ def _discard_staged(staged) -> None:
             logger.warning("could not remove staging path %s: %s", staging, exc)
 
 
+# Paths (repo-relative) that live INSIDE a swapped top-level entry and must
+# survive it. The ZIP has no build output, so a wholesale ``apps/`` swap would
+# otherwise delete the packaged desktop app and dependencies that the updater
+# intentionally never rebuilds (see the desktop-skip note below).
+NESTED_PRESERVE = (
+    os.path.join("apps", "desktop", "node_modules"),
+    os.path.join("apps", "desktop", "release"),
+)
+
+
 def _commit_staged_replacements(staged) -> None:
     """Phase 2: swap every staged entry into place, rolling back all on failure.
 
@@ -752,6 +762,29 @@ def _commit_staged_replacements(staged) -> None:
                 # so say so rather than swallowing it.
                 logger.warning("rollback failed for %s: %s", dst, exc)
         raise
+    # Only after every swap succeeds may nested artifacts leave the untouched
+    # backups. Each restore is best-effort: these trees are rebuildable, while
+    # turning a successful source update into a failed update is worse.
+    for dst, backup in swapped:
+        if not backup:
+            continue
+        for relative in NESTED_PRESERVE:
+            parts = relative.split(os.sep)
+            if os.path.basename(dst) != parts[0]:
+                continue
+            source = os.path.join(backup, *parts[1:])
+            destination = os.path.join(dst, *parts[1:])
+            if not os.path.exists(source) or os.path.exists(destination):
+                continue
+            try:
+                os.makedirs(os.path.dirname(destination), exist_ok=True)
+                os.rename(source, destination)
+            except OSError as exc:
+                logger.warning(
+                    "could not preserve nested build artifact %s: %s",
+                    relative,
+                    exc,
+                )
     # All swaps succeeded — drop the backups (best-effort, never fatal).
     for _dst, backup in swapped:
         if backup and os.path.isdir(backup):
@@ -849,7 +882,9 @@ def _update_via_zip(args):
                     extracted = candidate
                     break
 
-        # Copy updated files over existing installation, preserving venv/node_modules/.git
+        # Copy updated files over existing installation, preserving top-level
+        # venv/node_modules/.git. Nested build output is restored separately by
+        # _commit_staged_replacements after all swaps succeed.
         preserve = {"venv", "node_modules", ".git", ".env"}
         entries = [i for i in os.listdir(extracted) if i not in preserve]
 

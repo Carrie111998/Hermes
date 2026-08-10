@@ -67,6 +67,55 @@ def test_commit_swaps_every_entry(tmp_path):
     assert not [p for p in os.listdir(live) if "hermes-update" in p]
 
 
+def test_commit_preserves_nested_desktop_build_artifacts(tmp_path):
+    live, new = tmp_path / "live", tmp_path / "new"
+    _live_tree(live, {"apps": "old"})
+    _live_tree(new, {"apps": "new"})
+    release = live / "apps" / "desktop" / "release"
+    node_modules = live / "apps" / "desktop" / "node_modules"
+    release.mkdir(parents=True)
+    node_modules.mkdir(parents=True)
+    (release / "marker.txt").write_text("original packaged desktop")
+    (node_modules / "x").write_text("original desktop dependencies")
+
+    update_cmd._commit_staged_replacements(_stage_all(live, new, ["apps"]))
+
+    assert (live / "apps" / "version.txt").read_text() == "new"
+    assert (release / "marker.txt").read_text() == "original packaged desktop"
+    assert (node_modules / "x").read_text() == "original desktop dependencies"
+
+
+def test_commit_failure_rolls_back_apps_before_nested_restore(tmp_path, monkeypatch):
+    live, new = tmp_path / "live", tmp_path / "new"
+    _live_tree(live, {"apps": "old", "tools": "old"})
+    _live_tree(new, {"apps": "new", "tools": "new"})
+    release = live / "apps" / "desktop" / "release"
+    node_modules = live / "apps" / "desktop" / "node_modules"
+    release.mkdir(parents=True)
+    node_modules.mkdir(parents=True)
+    (release / "marker.txt").write_text("original packaged desktop")
+    (node_modules / "x").write_text("original desktop dependencies")
+    staged = _stage_all(live, new, ["apps", "tools"])
+
+    real_rename = os.rename
+    calls = {"n": 0}
+
+    def flaky_rename(src, dst):
+        calls["n"] += 1
+        if calls["n"] == 4:
+            raise OSError("simulated AV interference")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(update_cmd.os, "rename", flaky_rename)
+    with pytest.raises(OSError):
+        update_cmd._commit_staged_replacements(staged)
+    monkeypatch.undo()
+
+    assert (live / "apps" / "version.txt").read_text() == "old"
+    assert (release / "marker.txt").read_text() == "original packaged desktop"
+    assert (node_modules / "x").read_text() == "original desktop dependencies"
+
+
 def test_failed_swap_rolls_back_every_earlier_swap(tmp_path, monkeypatch):
     """The regression: a mid-loop failure must not leave a mixed-version tree.
 
