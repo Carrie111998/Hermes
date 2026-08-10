@@ -264,6 +264,8 @@ Specific leak guards:
 - Closed-loop entries in the auxiliary async-client cache run the real async
   transport close. Clients owned by a live foreign loop are only neutered;
   hard cross-thread close can corrupt TLS/SQLite FD reuse (see #70773).
+  Shutdown snapshots and clears the cache under its lock, then closes transports
+  outside the lock so slow async teardown cannot stall unrelated callers.
 - RetainDB allows one prefetch batch at a time. Its queue tracks connections
   and closes writer/owner handles on their owning threads; handles left by an
   exited memory worker are closed deterministically at shutdown.
