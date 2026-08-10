@@ -2148,6 +2148,18 @@ class TestTruncateToolCallArgsJson:
         assert "context-pruned" in parsed["note"]
         assert parsed["note"].endswith("z" * 100)
 
+    def test_medium_string_leaves_do_not_expand_compact_json(self):
+        import json as _json
+
+        shrink = self._helper()
+        original = _json.dumps(
+            {"first": "x" * 300, "second": "y" * 300},
+            separators=(",", ":"),
+        )
+
+        assert len(original) > 500
+        assert shrink(original) == original
+
 
 
     def test_pass3_emits_valid_json_for_downstream_provider(self):
