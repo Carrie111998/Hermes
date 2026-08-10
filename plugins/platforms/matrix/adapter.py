@@ -54,6 +54,7 @@ from __future__ import annotations
 import asyncio
 import array
 import inspect
+import json
 import logging
 import mimetypes
 import os
@@ -1440,6 +1441,156 @@ class MatrixAdapter(BasePlatformAdapter):
         except Exception:
             return False
 
+    @staticmethod
+    def _is_unknown_token_error(exc: Exception) -> bool:
+        return getattr(exc, "errcode", "") == "M_UNKNOWN_TOKEN" or "Unknown access token" in str(exc)
+
+    async def _delete_server_device(self, client: Any) -> bool:
+        """Delete this device's server record, completing password UIA if asked.
+
+        Homeservers commonly require user-interactive authentication to remove
+        a device, so an access token alone can be insufficient even though it
+        was enough to identify the device. The challenge is completed only
+        with the configured MATRIX_PASSWORD.
+        """
+        try:
+            await client.api.request(
+                client.api.Method.DELETE if hasattr(client.api, "Method") else "DELETE",
+                f"/_matrix/client/v3/devices/{client.device_id}",
+            )
+            return True
+        except Exception as exc:
+            session = ""
+            if getattr(exc, "http_status", None) == 401:
+                try:
+                    session = str(json.loads(getattr(exc, "text", "{}") or "{}").get("session") or "")
+                except (TypeError, ValueError):
+                    pass
+            if not session:
+                logger.error(
+                    "Matrix: could not delete server device %s: %s",
+                    client.device_id, exc, exc_info=True,
+                )
+                return False
+            if not self._password:
+                logger.error(
+                    "Matrix: deleting server device %s requires password UIA, "
+                    "but no MATRIX_PASSWORD is configured",
+                    client.device_id,
+                )
+                return False
+            try:
+                await client.api.request(
+                    client.api.Method.DELETE if hasattr(client.api, "Method") else "DELETE",
+                    f"/_matrix/client/v3/devices/{client.device_id}",
+                    {
+                        "auth": {
+                            "type": "m.login.password",
+                            "session": session,
+                            "identifier": {"type": "m.id.user", "user": str(client.mxid)},
+                            "password": self._password,
+                        }
+                    },
+                    sensitive=True,
+                )
+                return True
+            except Exception as uia_exc:
+                logger.error(
+                    "Matrix: password UIA could not delete server device %s: %s",
+                    client.device_id, uia_exc, exc_info=True,
+                )
+                return False
+
+    async def _reauthenticate_after_device_delete(self, client: Any) -> bool:
+        """Obtain a replacement token bound to the same configured device ID.
+
+        Deleting a device invalidates that device's access token, and the
+        homeserver may also have deleted the device while the local crypto
+        store survived (M_UNKNOWN_TOKEN on the next request). Re-login with
+        the configured password re-binds a fresh token to the same device ID,
+        so the local Olm identity stays valid for it. Without a password the
+        caller must fail closed.
+        """
+        expected_device_id = str(self._device_id or client.device_id or "")
+        if not expected_device_id or not self._password:
+            logger.error(
+                "Matrix: cannot reauthenticate device %s without a configured Matrix password",
+                expected_device_id or "(unknown)",
+            )
+            return False
+        try:
+            # Do not send the known-invalid bearer token to /login.
+            client.api.token = ""
+            await client.login(
+                identifier=self._user_id or client.mxid,
+                password=self._password,
+                device_name="Hermes Agent",
+                device_id=expected_device_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "Matrix: could not reauthenticate device %s: %s",
+                expected_device_id, exc, exc_info=True,
+            )
+            return False
+        if str(client.device_id or "") != expected_device_id or not getattr(client.api, "token", ""):
+            logger.error(
+                "Matrix: reauthentication did not restore configured device %s",
+                expected_device_id,
+            )
+            return False
+        self._access_token = str(client.api.token)
+        return True
+
+    async def _repair_server_device_keys(
+        self,
+        client: Any,
+        olm: Any,
+        local_ed25519: str,
+        local_curve25519: str,
+    ) -> bool:
+        """Rebind the server device record to this installation's local identity.
+
+        A Matrix device ID and the private keys in its crypto store are a
+        pair. If the homeserver carries a different public key for the same
+        device ID, deleting that server record and re-uploading the local
+        identity is the least disruptive deterministic repair. Every step is
+        verified; any failure remains fail-closed.
+        """
+        logger.warning(
+            "Matrix: repairing server device record for %s from the local crypto store",
+            client.device_id,
+        )
+        if not await self._delete_server_device(client):
+            return False
+        # Deleting our own device may have invalidated the token in use.
+        # Re-authenticate deterministically when a password is configured;
+        # otherwise the token is either still valid (upload proceeds) or the
+        # upload fails below with a precise error.
+        if self._password and not await self._reauthenticate_after_device_delete(client):
+            return False
+        try:
+            # share_keys() only uploads an account identity when this flag is
+            # false. This is a deliberate repair, not an accidental
+            # rebootstrap caused by an empty store.
+            olm.account.shared = False
+            await olm.share_keys()
+        except Exception as exc:
+            logger.error(
+                "Matrix: could not re-upload local keys for repaired device %s: %s",
+                client.device_id, exc, exc_info=True,
+            )
+            return False
+        if not await self._reverify_keys_after_upload(
+            client, local_ed25519, local_curve25519
+        ):
+            return False
+        logger.warning(
+            "Matrix: repaired device %s and verified its local identity on the server",
+            client.device_id,
+        )
+        return True
+
     async def _reverify_keys_after_upload(
         self, client: Any, local_ed25519: str, local_curve25519: str
     ) -> bool:
@@ -1673,8 +1824,22 @@ class MatrixAdapter(BasePlatformAdapter):
             try:
                 await olm.share_keys()
             except Exception as exc:
-                logger.error("Matrix: failed to re-upload device keys: %s", exc, exc_info=True)
-                return False
+                # The homeserver may have deleted this device while the local
+                # crypto store survived; its token is then invalid
+                # (M_UNKNOWN_TOKEN). Re-authenticate the same device ID and
+                # retry the upload once before giving up.
+                if self._is_unknown_token_error(exc) and await self._reauthenticate_after_device_delete(client):
+                    try:
+                        await olm.share_keys()
+                    except Exception as retry_exc:
+                        logger.error(
+                            "Matrix: failed to re-upload device keys after reauthentication: %s",
+                            retry_exc, exc_info=True,
+                        )
+                        return False
+                else:
+                    logger.error("Matrix: failed to re-upload device keys: %s", exc, exc_info=True)
+                    return False
             return await self._reverify_keys_after_upload(
                 client, local_ed25519, local_curve25519
             )
@@ -1699,47 +1864,25 @@ class MatrixAdapter(BasePlatformAdapter):
                     else "invalid device self-signature"
                 )
             )
-            if olm.account.shared:
+            if olm.account.shared and not self._password:
+                # Automatic repair re-binds the server record to this
+                # installation's identity, which requires the account
+                # password (UIA completion + same-device re-authentication
+                # after the deletion invalidates the token). An account that
+                # already shared its keys without a configured password stays
+                # fail-closed.
                 logger.error(
                     "Matrix: server device record for %s failed verification (%s) — "
-                    "local crypto state is stale. Delete %s and restart.",
+                    "local crypto state is stale. Configure MATRIX_PASSWORD to enable "
+                    "automatic repair, or delete %s and restart.",
                     client.device_id,
                     invalid_reason,
                     _CRYPTO_DB_PATH,
                 )
                 return False
 
-            logger.warning(
-                "Matrix: server device record for %s failed verification (%s) — "
-                "attempting re-upload",
-                client.device_id,
-                invalid_reason,
-            )
-            try:
-                await client.api.request(
-                    client.api.Method.DELETE
-                    if hasattr(client.api, "Method")
-                    else "DELETE",
-                    f"/_matrix/client/v3/devices/{client.device_id}",
-                )
-                logger.info(
-                    "Matrix: deleted stale device %s from server", client.device_id
-                )
-            except Exception:
-                pass
-            try:
-                await olm.share_keys()
-            except Exception as exc:
-                logger.error(
-                    "Matrix: cannot upload device keys for %s: %s. "
-                    "Try generating a new access token to get a fresh device.",
-                    client.device_id,
-                    exc,
-                    exc_info=True,
-                )
-                return False
-            return await self._reverify_keys_after_upload(
-                client, local_ed25519, local_curve25519
+            return await self._repair_server_device_keys(
+                client, olm, local_ed25519, local_curve25519
             )
 
         return True
