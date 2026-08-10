@@ -86,6 +86,12 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
     def get_tool_schemas(self):
         return [MEMORY_DUO_SCHEMA]
 
+    def get_config_schema(self):
+        return [
+            {"key": "vault_path", "description": "Obsidian vault path", "required": True},
+            {"key": "managed_folder", "description": "Managed memory folder", "default": "Hermes Memory"},
+        ]
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._broker or not query or query.strip().lower() in {"thanks", "thank you", "ok", "okay"}:
             return ""
