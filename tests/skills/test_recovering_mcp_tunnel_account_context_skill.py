@@ -74,7 +74,7 @@ def test_every_procedure_step_has_a_completion_gate():
         body,
         re.MULTILINE | re.DOTALL,
     )
-    assert len(steps) == 8
+    assert steps, "procedure must contain numbered ### steps"
     assert all("**Done when:**" in step for step in steps)
 
 

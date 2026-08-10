@@ -963,6 +963,11 @@ class TestToolRegistration:
         server, _ = mcp_server_read_only_e2e
         tool_names = {tool.name for tool in server._tool_manager.list_tools()}
 
+        # Security allowlist — intentionally an exact set, not a relation to
+        # the default surface. "default minus the two mutating tools" would
+        # silently pass a future mutating tool that was wrongly registered
+        # unconditionally; the exact set fails closed and forces every new
+        # tool to make an explicit read-only membership decision here.
         assert tool_names == {
             "conversations_list", "conversation_get", "messages_read",
             "attachments_fetch", "events_poll", "events_wait",
