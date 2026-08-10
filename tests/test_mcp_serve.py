@@ -407,4 +407,994 @@ class TestEventBridge:
         b._enqueue(QueueEvent(cursor=0, type="message", session_key="a"))
         b._enqueue(QueueEvent(cursor=0, type="message", session_key="b"))
         b._enqueue(QueueEvent(cursor=0, type="message", session_key="a"))
-        r = b.poll_events(after_cursoóÏ8¶‰ËkºwµçM•Ìè4(€€€‘•˜Ñ•ÍÑ}•µÁÑå}Í•ÍÍ¥½¹Í}©Í½¸¡Í•±˜°Í•ÍÍ¥½¹Í}‘¥È°µ½¹­•åÁ…Ñ ¤è4(€€€€€€€€¡Í•ÍÍ¥½¹Í}‘¥È€¼€‰Í•ÍÍ¥½¹Ì¹©Í½¸ˆ¤¹İÉ¥Ñ•}Ñ•áĞ ‰íôˆ¤4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹Í}‘¥Èˆ°±…µ‰‘„èÍ•ÍÍ¥½¹Í}‘¥È¤4(€€€€€€€…ÍÍ•ÉĞµÁ}Í•ÉÙ”¹}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤€ôôíô4(4(€€€‘•˜Ñ•ÍÑ}Í•ÍÍ¥½¹Í}İ¥Ñ¡½ÕÑ}½É¥¥¸¡Í•±˜°Í•ÍÍ¥½¹Í}‘¥È°µ½¹­•åÁ…Ñ ¤è4(€€€€€€€‘…Ñ„€ôì‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´èÄÄÄˆèì4(€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆè€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´èÄÄÄˆ°4(€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆè€ˆÈÀÈØÀÌÈå|ÄÈÀÀÀÁ}áåèˆ°4(€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€‰ÕÁ‘…Ñ•‘}…Ğˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÈèÀÀèÀÀˆ°4(€€€€€€€õô4(€€€€€€€€¡Í•ÍÍ¥½¹Í}‘¥È€¼€‰Í•ÍÍ¥½¹Ì¹©Í½¸ˆ¤¹İÉ¥Ñ•}Ñ•áĞ¡©Í½¸¹‘ÕµÁÌ¡‘…Ñ„¤¤4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹Í}‘¥Èˆ°±…µ‰‘„èÍ•ÍÍ¥½¹Í}‘¥È¤4(€€€€€€€•¹ÑÉ¥•Ì€ôµÁ}Í•ÉÙ”¹}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤4(€€€€€€€…ÍÍ•ÉĞ•¹ÑÉ¥•Íl‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´èÄÄÄ‰ul‰Á±…Ñ™½É´‰t€ôô€‰Ñ•±•É…´ˆ4(4(€€€‘•˜Ñ•ÍÑ}‰É¥‘•}ÍÑ…ÉÑ}ÍÑ½À¡Í•±˜¤è4(€€€€€€€™É½´µÁ}Í•ÉÙ”¥µÁ½ÉĞÙ•¹Ñ	É¥‘”4(€€€€€€€ˆ€ôÙ•¹Ñ	É¥‘” ¤4(€€€€€€€…ÍÍ•ÉĞ¹½Ğˆ¹}ÉÕ¹¹¥¹œ4(€€€€€€€ˆ¹}ÉÕ¹¹¥¹œ€ôQÉÕ”4(€€€€€€€ˆ¹ÍÑ½À ¤4(€€€€€€€…ÍÍ•ÉĞ¹½Ğˆ¹}ÉÕ¹¹¥¹œ4(4(€€€‘•˜Ñ•ÍÑ}ÑÉÕ¹…Ñ¥½¸¡Í•±˜¤è4(€€€€€€€…ÍÍ•ÉĞ±•¸  ‰àˆ€¨€ÔÀÀÀ¥lèÈÀÀÁt¤€ôô€ÈÀÀÀ4(4(4(Œ€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(Œ€Ü¸Y9P	I%A=101==@ÉƒŠPÉ•…°ME1¥Ñ”°µÑ¥µ”½ÁÑ¥µ¥é…Ñ¥½¸4(Œ€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4)±…ÍÌQ•ÍÑÙ•¹Ñ	É¥‘•A½±±Éè4(€€€€ˆˆ‰¹µÑ¼µ•¹Ñ•ÍÑÌ™½ÈÑ¡”Ù•¹Ñ	É¥‘”Á½±±¥¹œ±½½Àİ¥Ñ É•…°™¥±•Ì¸ˆˆˆ4(4(€€€‘•˜Ñ•ÍÑ}Á½±±}‘•Ñ•ÑÍ}¹•İ}µ•ÍÍ…•Ì¡Í•±˜°ÑµÁ}Á…Ñ °µ½¹­•åÁ…Ñ ¤è4(€€€€€€€€ˆˆ‰]É¥Ñ”Ñ¼ME1¥Ñ”€¬Í•ÍÍ¥½¹Ì¹©Í½¸°Ù•É¥™äÙ•¹Ñ	É¥‘”Á¥­Ì¥ĞÕÀ¸ˆˆˆ4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È€ôÑµÁ}Á…Ñ €¼€‰Í•ÍÍ¥½¹Ìˆ4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È¹µ­‘¥È ¤4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹Í}‘¥Èˆ°±…µ‰‘„èÍ•ÍÍ¥½¹Í}‘¥È¤4(4(€€€€€€€Í•ÍÍ¥½¹}¥€ô€ˆÈÀÈØÀÌÈå|ÄÔÀÀÀÁ}Á½±±}Ñ•ÍĞˆ4(€€€€€€€‘‰}Á…Ñ €ôÑµÁ}Á…Ñ €¼€‰ÍÑ…Ñ”¹‘ˆˆ4(4(€€€€€€€€Œ]É¥Ñ”Í•ÍÍ¥½¹Ì¹©Í½¸4(€€€€€€€Í•ÍÍ¥½¹Í}‘…Ñ„€ôì4(€€€€€€€€€€€€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´éÁ½±±}Ñ•ÍĞˆèì4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆè€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´éÁ½±±}Ñ•ÍĞˆ°4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆèÍ•ÍÍ¥½¹}¥°4(€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€€€€€‰¡…Ñ}ÑåÁ”ˆè€‰‘´ˆ°4(€€€€€€€€€€€€€€€€‰‘¥ÍÁ±…å}¹…µ”ˆè€‰A½±±Q•ÍĞˆ°4(€€€€€€€€€€€€€€€€‰ÕÁ‘…Ñ•‘}…Ğˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÔˆ°4(€€€€€€€€€€€€€€€€‰½É¥¥¸ˆèì‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°€‰¡…Ñ}¥ˆè€‰Á½±±}Ñ•ÍĞ‰ô°4(€€€€€€€€€€€ô4(€€€€€€€ô4(€€€€€€€€¡Í•ÍÍ¥½¹Í}‘¥È€¼€‰Í•ÍÍ¥½¹Ì¹©Í½¸ˆ¤¹İÉ¥Ñ•}Ñ•áĞ¡©Í½¸¹‘ÕµÁÌ¡Í•ÍÍ¥½¹Í}‘…Ñ„¤¤4(4(€€€€€€€€Œ]É¥Ñ”µ•ÍÍ…•ÌÑ¼ME1¥Ñ”4(€€€€€€€µ•ÍÍ…•Ì€ôl4(€€€€€€€€€€€ì‰É½±”ˆè€‰ÕÍ•Èˆ°€‰½¹Ñ•¹Ğˆè€‰¥ÉÍĞµ•ÍÍ…”ˆ°4(€€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÄ‰ô°4(€€€€€€€€€€€ì‰É½±”ˆè€‰…ÍÍ¥ÍÑ…¹Ğˆ°€‰½¹Ñ•¹Ğˆè€‰I•Á±äˆ°4(€€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÌ‰ô°4(€€€€€€€t4(€€€€€€€}É•…Ñ•}Ñ•ÍÑ}‘ˆ¡‘‰}Á…Ñ °Í•ÍÍ¥½¹}¥°µ•ÍÍ…•Ì¤4(4(€€€€€€€€ŒÉ•…Ñ”„µ½¬M•ÍÍ¥½¹Ñ¡…ĞÉ•…‘Ì½ÕÈÑ•ÍĞ4(€€€€€€€±…ÍÌQ•ÍÑè4(€€€€€€€€€€€‘•˜•Ñ}µ•ÍÍ…•Ì¡Í•±˜°Í¥¤è4(€€€€€€€€€€€€€€€½¹¸€ôÍÅ±¥Ñ”Ì¹½¹¹•Ğ¡ÍÑÈ¡‘‰}Á…Ñ ¤¤4(€€€€€€€€€€€€€€€½¹¸¹É½İ}™…Ñ½Éä€ôÍÅ±¥Ñ”Ì¹I½Ü4(€€€€€€€€€€€€€€€É½İÌ€ô½¹¸¹•á•ÕÑ” 4(€€€€€€€€€€€€€€€€€€€€‰M1P€¨I=4µ•ÍÍ…•Ì]!IÍ•ÍÍ¥½¹}¥€ô€ü=IH	d¥ˆ°4(€€€€€€€€€€€€€€€€€€€€¡Í¥°¤°4(€€€€€€€€€€€€€€€€¤¹™•Ñ¡…±° ¤4(€€€€€€€€€€€€€€€½¹¸¹±½Í” ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸m‘¥Ğ¡È¤™½ÈÈ¥¸É½İÍt4(4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹}‘ˆˆ°±…µ‰‘„èQ•ÍÑ ¤¤4(4(€€€€€€€‰É¥‘”€ôµÁ}Í•ÉÙ”¹Ù•¹Ñ	É¥‘” ¤4(€€€€€€€€ŒIÕ¸½¹”Á½±°å±”µ…¹Õ…±±ä4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡Q•ÍÑ ¤¤4(4(€€€€€€€€ŒM¡½Õ±¡…Ù”™½Õ¹Ñ¡”µ•ÍÍ…•Ì4(€€€€€€€É•ÍÕ±Ğ€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈôÀ¤4(€€€€€€€…ÍÍ•ÉĞ±•¸¡É•ÍÕ±Ñl‰•Ù•¹ÑÌ‰t¤€ôô€È4(€€€€€€€…ÍÍ•ÉĞÉ•ÍÕ±Ñl‰•Ù•¹ÑÌ‰ulÁul‰É½±”‰t€ôô€‰ÕÍ•Èˆ4(€€€€€€€…ÍÍ•ÉĞÉ•ÍÕ±Ñl‰•Ù•¹ÑÌ‰ulÁul‰½¹Ñ•¹Ğ‰t€ôô€‰¥ÉÍĞµ•ÍÍ…”ˆ4(€€€€€€€…ÍÍ•ÉĞÉ•ÍÕ±Ñl‰•Ù•¹ÑÌ‰ulÅul‰É½±”‰t€ôô€‰…ÍÍ¥ÍÑ…¹Ğˆ4(4(€€€‘•˜Ñ•ÍÑ}Á½±±}Í­¥ÁÍ}İ¡•¹}Õ¹¡…¹•¡Í•±˜°ÑµÁ}Á…Ñ °µ½¹­•åÁ…Ñ ¤è4(€€€€€€€€ˆˆ‰M•½¹Á½±°İ¥Ñ ¹¼™¥±”¡…¹•ÌÍ¡½Õ±‰”„¹¼µ½À¸ˆˆˆ4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È€ôÑµÁ}Á…Ñ €¼€‰Í•ÍÍ¥½¹Ìˆ4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È¹µ­‘¥È ¤4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹Í}‘¥Èˆ°±…µ‰‘„èÍ•ÍÍ¥½¹Í}‘¥È¤4(4(€€€€€€€Í•ÍÍ¥½¹}¥€ô€ˆÈÀÈØÀÌÈå|ÄÔÀÀÀÁ}Í­¥Á}Ñ•ÍĞˆ4(€€€€€€€‘‰}Á…Ñ €ôÑµÁ}Á…Ñ €¼€‰ÍÑ…Ñ”¹‘ˆˆ4(4(€€€€€€€Í•ÍÍ¥½¹Í}‘…Ñ„€ôì4(€€€€€€€€€€€€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´éÍ­¥Àˆèì4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆè€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´éÍ­¥Àˆ°4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆèÍ•ÍÍ¥½¹}¥°4(€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€€€€€‰ÕÁ‘…Ñ•‘}…Ğˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÔˆ°4(€€€€€€€€€€€€€€€€‰½É¥¥¸ˆèì‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°€‰¡…Ñ}¥ˆè€‰Í­¥À‰ô°4(€€€€€€€€€€€ô4(€€€€€€€ô4(€€€€€€€€¡Í•ÍÍ¥½¹Í}‘¥È€¼€‰Í•ÍÍ¥½¹Ì¹©Í½¸ˆ¤¹İÉ¥Ñ•}Ñ•áĞ¡©Í½¸¹‘ÕµÁÌ¡Í•ÍÍ¥½¹Í}‘…Ñ„¤¤4(€€€€€€€}É•…Ñ•}Ñ•ÍÑ}‘ˆ¡‘‰}Á…Ñ °Í•ÍÍ¥½¹}¥°l4(€€€€€€€€€€€ì‰É½±”ˆè€‰ÕÍ•Èˆ°€‰½¹Ñ•¹Ğˆè€‰!•±±¼ˆ°€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÄ‰ô°4(€€€€€€€t¤4(4(€€€€€€€±…ÍÌQ•ÍÑè4(€€€€€€€€€€€‘•˜}}¥¹¥Ñ}|¡Í•±˜¤è4(€€€€€€€€€€€€€€€Í•±˜¹…±±}½Õ¹Ğ€ô€À4(4(€€€€€€€€€€€‘•˜•Ñ}µ•ÍÍ…•Ì¡Í•±˜°Í¥¤è4(€€€€€€€€€€€€€€€Í•±˜¹…±±}½Õ¹Ğ€¬ô€Ä4(€€€€€€€€€€€€€€€½¹¸€ôÍÅ±¥Ñ”Ì¹½¹¹•Ğ¡ÍÑÈ¡‘‰}Á…Ñ ¤¤4(€€€€€€€€€€€€€€€½¹¸¹É½İ}™…Ñ½Éä€ôÍÅ±¥Ñ”Ì¹I½Ü4(€€€€€€€€€€€€€€€É½İÌ€ô½¹¸¹•á•ÕÑ” 4(€€€€€€€€€€€€€€€€€€€€‰M1P€¨I=4µ•ÍÍ…•Ì]!IÍ•ÍÍ¥½¹}¥€ô€ü=IH	d¥ˆ°4(€€€€€€€€€€€€€€€€€€€€¡Í¥°¤°4(€€€€€€€€€€€€€€€€¤¹™•Ñ¡…±° ¤4(€€€€€€€€€€€€€€€½¹¸¹±½Í” ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸m‘¥Ğ¡È¤™½ÈÈ¥¸É½İÍt4(4(€€€€€€€‘ˆ€ôQ•ÍÑ ¤4(€€€€€€€‰É¥‘”€ôµÁ}Í•ÉÙ”¹Ù•¹Ñ	É¥‘” ¤4(4(€€€€€€€€Œ¥ÉÍĞÁ½±°ƒŠPÍ¡½Õ±ÁÉ½•ÍÌ4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡‘ˆ¤4(€€€€€€€™¥ÉÍÑ}…±±Ì€ô‘ˆ¹…±±}½Õ¹Ğ4(€€€€€€€…ÍÍ•ÉĞ™¥ÉÍÑ}…±±Ì€øô€Ä4(4(€€€€€€€€ŒM•½¹Á½±°ƒŠP™¥±•ÌÕ¹¡…¹•°Í¡½Õ±Í­¥À•¹Ñ¥É•±ä4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡‘ˆ¤4(€€€€€€€…ÍÍ•ÉĞ‘ˆ¹…±±}½Õ¹Ğ€ôô™¥ÉÍÑ}…±±Ì°p4(€€€€€€€€€€€€‰M•½¹Á½±°Í¡½Õ±Í­¥ÀÅÕ•É¥•Ìİ¡•¸™¥±•ÌÕ¹¡…¹•ˆ4(4(€€€‘•˜Ñ•ÍÑ}Á½±±}‘•Ñ•ÑÍ}¹•İ}µ•ÍÍ…•}…™Ñ•É}‘‰}İÉ¥Ñ”¡Í•±˜°ÑµÁ}Á…Ñ °µ½¹­•åÁ…Ñ ¤è4(€€€€€€€€ˆˆ‰]É¥Ñ”„¹•Üµ•ÍÍ…”Ñ¼Ñ¡”…™Ñ•È™¥ÉÍĞÁ½±°°Ù•É¥™ä¥ĞÌ‘•Ñ•Ñ•¸ˆˆˆ4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È€ôÑµÁ}Á…Ñ €¼€‰Í•ÍÍ¥½¹Ìˆ4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È¹µ­‘¥È ¤4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹Í}‘¥Èˆ°±…µ‰‘„èÍ•ÍÍ¥½¹Í}‘¥È¤4(4(€€€€€€€Í•ÍÍ¥½¹}¥€ô€ˆÈÀÈØÀÌÈå|ÄÔÀÀÀÁ}¹•İ}µÍœˆ4(€€€€€€€‘‰}Á…Ñ €ôÑµÁ}Á…Ñ €¼€‰ÍÑ…Ñ”¹‘ˆˆ4(4(€€€€€€€Í•ÍÍ¥½¹Í}‘…Ñ„€ôì4(€€€€€€€€€€€€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é¹•Üˆèì4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆè€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é¹•Üˆ°4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆèÍ•ÍÍ¥½¹}¥°4(€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€€€€€‰ÕÁ‘…Ñ•‘}…Ğˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÔˆ°4(€€€€€€€€€€€€€€€€‰½É¥¥¸ˆèì‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°€‰¡…Ñ}¥ˆè€‰¹•Ü‰ô°4(€€€€€€€€€€€ô4(€€€€€€€ô4(€€€€€€€€¡Í•ÍÍ¥½¹Í}‘¥È€¼€‰Í•ÍÍ¥½¹Ì¹©Í½¸ˆ¤¹İÉ¥Ñ•}Ñ•áĞ¡©Í½¸¹‘ÕµÁÌ¡Í•ÍÍ¥½¹Í}‘…Ñ„¤¤4(€€€€€€€}É•…Ñ•}Ñ•ÍÑ}‘ˆ¡‘‰}Á…Ñ °Í•ÍÍ¥½¹}¥°l4(€€€€€€€€€€€ì‰É½±”ˆè€‰ÕÍ•Èˆ°€‰½¹Ñ•¹Ğˆè€‰¥ÉÍĞˆ°€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÄ‰ô°4(€€€€€€€t¤4(4(€€€€€€€±…ÍÌQ•ÍÑè4(€€€€€€€€€€€‘•˜•Ñ}µ•ÍÍ…•Ì¡Í•±˜°Í¥¤è4(€€€€€€€€€€€€€€€½¹¸€ôÍÅ±¥Ñ”Ì¹½¹¹•Ğ¡ÍÑÈ¡‘‰}Á…Ñ ¤¤4(€€€€€€€€€€€€€€€½¹¸¹É½İ}™…Ñ½Éä€ôÍÅ±¥Ñ”Ì¹I½Ü4(€€€€€€€€€€€€€€€É½İÌ€ô½¹¸¹•á•ÕÑ” 4(€€€€€€€€€€€€€€€€€€€€‰M1P€¨I=4µ•ÍÍ…•Ì]!IÍ•ÍÍ¥½¹}¥€ô€ü=IH	d¥ˆ°4(€€€€€€€€€€€€€€€€€€€€¡Í¥°¤°4(€€€€€€€€€€€€€€€€¤¹™•Ñ¡…±° ¤4(€€€€€€€€€€€€€€€½¹¸¹±½Í” ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸m‘¥Ğ¡È¤™½ÈÈ¥¸É½İÍt4(4(€€€€€€€‘ˆ€ôQ•ÍÑ ¤4(€€€€€€€‰É¥‘”€ôµÁ}Í•ÉÙ”¹Ù•¹Ñ	É¥‘” ¤4(4(€€€€€€€€Œ¥ÉÍĞÁ½±°4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡‘ˆ¤4(€€€€€€€ÈÄ€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈôÀ¤4(€€€€€€€…ÍÍ•ÉĞ±•¸¡ÈÅl‰•Ù•¹ÑÌ‰t¤€ôô€Ä4(4(€€€€€€€€Œ‘„¹•Üµ•ÍÍ…”Ñ¼Ñ¡”4(€€€€€€€½¹¸€ôÍÅ±¥Ñ”Ì¹½¹¹•Ğ¡ÍÑÈ¡‘‰}Á…Ñ ¤¤4(€€€€€€€½¹¸¹•á•ÕÑ” 4(€€€€€€€€€€€€‰%9MIP%9Q<µ•ÍÍ…•Ì€¡Í•ÍÍ¥½¹}¥°É½±”°½¹Ñ•¹Ğ°Ñ¥µ•ÍÑ…µÀ¤Y1UL€ ü°€ü°€ü°€ü¤ˆ°4(€€€€€€€€€€€€¡Í•ÍÍ¥½¹}¥°€‰…ÍÍ¥ÍÑ…¹Ğˆ°€‰9•ÜÉ•Á±ä„ˆ°€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÄÀˆ¤°4(€€€€€€€€¤4(€€€€€€€½¹¸¹½µµ¥Ğ ¤4(€€€€€€€½¹¸¹±½Í” ¤4(€€€€€€€€ŒQ½Õ Ñ¡”™¥±”Ñ¼ÕÁ‘…Ñ”µÑ¥µ”€¡]0µ½‘”µ…ä¹½ĞÕÁ‘…Ñ”µÑ¥µ”½¸Íµ…±°İÉ¥Ñ•Ì¤4(€€€€€€€½Ì¹ÕÑ¥µ”¡‘‰}Á…Ñ °9½¹”¤4(4(€€€€€€€€ŒUÁ‘…Ñ”Í•ÍÍ¥½¹Ì¹©Í½¸ÕÁ‘…Ñ•‘}…ĞÑ¼ÑÉ¥•ÈÉ”µ¡•¬4(€€€€€€€Í•ÍÍ¥½¹Í}‘…Ñ…l‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é¹•Ü‰ul‰ÕÁ‘…Ñ•‘}…Ğ‰t€ô€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÄÀˆ4(€€€€€€€€¡Í•ÍÍ¥½¹Í}‘¥È€¼€‰Í•ÍÍ¥½¹Ì¹©Í½¸ˆ¤¹İÉ¥Ñ•}Ñ•áĞ¡©Í½¸¹‘ÕµÁÌ¡Í•ÍÍ¥½¹Í}‘…Ñ„¤¤4(4(€€€€€€€€ŒM•½¹Á½±°ƒŠPÍ¡½Õ±‘•Ñ•ĞÑ¡”¹•Üµ•ÍÍ…”4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡‘ˆ¤4(€€€€€€€ÈÈ€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈõÈÅl‰¹•áÑ}ÕÉÍ½È‰t¤4(€€€€€€€…ÍÍ•ÉĞ±•¸¡ÈÉl‰•Ù•¹ÑÌ‰t¤€ôô€Ä4(€€€€€€€…ÍÍ•ÉĞÈÉl‰•Ù•¹ÑÌ‰ulÁul‰½¹Ñ•¹Ğ‰t€ôô€‰9•ÜÉ•Á±ä„ˆ4(4(€€€‘•˜Ñ•ÍÑ}Á½±±}Á¥­Í}ÕÁ}¹•İ}½¹Ù•ÉÍ…Ñ¥½¹}½¹}‘‰}¡…¹” 4(€€€€€€€Í•±˜°ÑµÁ}Á…Ñ °µ½¹­•åÁ…Ñ 4(€€€€¤è4(€€€€€€€€ˆˆ‰‰É…¹µ¹•Ü½¹Ù•ÉÍ…Ñ¥½¸µÕÍĞ‰”Á¥­•ÕÀ½¸Ñ¡”Ñ¥¬İ¡•É”4(€€€€€€€ÍÑ…Ñ”¹‘ˆ¡…¹•Ì¸4(4(€€€€€€€M¥¹”€ŒäÀÀØÑ¡”É½ÕÑ¥¹œ¥¹‘•à±¥Ù•Ì%8ÍÑ…Ñ”¹‘ˆ€¡Í•ÍÍ¥½¸É½İÌ…ÉÉä4(€€€€€€€Í•ÍÍ¥½¹}­•ä½½É¥¥¸µ•Ñ…‘…Ñ„¤°Í¼„¹•Ü½¹Ù•ÉÍ…Ñ¥½¸ÌÉ•¥ÍÑÉ…Ñ¥½¸…¹4(€€€€€€€¥ÑÌ™¥ÉÍĞµ•ÍÍ…”±…¹¥¸Ñ¡”Í…µ”™¥±”ƒŠP„Í¥¹±”µÑ¥µ”¡•¬½Ù•ÉÌ4(€€€€€€€‰½Ñ …¹Ñ¡”½±‘Õ…°µ™¥±”€¡Í•ÍÍ¥½¹Ì¹©Í½¸€¬ÍÑ…Ñ”¹‘ˆ¤É…”€ ŒàäÈÔ¤¥Ì4(€€€€€€€ÍÑÉÕÑÕÉ…±±ä¥µÁ½ÍÍ¥‰±”¸Q¡¥ÌÑ•ÍĞ…ÍÍ•ÉÑÌÑ¡”¥¹‘•à¥ÌÉ•™É•Í¡•½¸„4(€€€€€€€‘ˆµµÑ¥µ”‰ÕµÀ°Í¼„½¹Ù•ÉÍ…Ñ¥½¸Ñ¡”‰É¥‘”¡…Ì¹•Ù•ÈÍ••¸‰•™½É”¥Ì4(€€€€€€€•µ¥ÑÑ•½¸Ñ¡”Í…µ”Ñ¥¬¸4(€€€€€€€€ˆˆˆ4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È€ôÑµÁ}Á…Ñ €¼€‰Í•ÍÍ¥½¹Ìˆ4(€€€€€€€Í•ÍÍ¥½¹Í}‘¥È¹µ­‘¥È ¤4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹Í}‘¥Èˆ°±…µ‰‘„èÍ•ÍÍ¥½¹Í}‘¥È¤4(4(€€€€€€€€Œ}Á½±±}½¹”É•…‘Ì€ñ!I5M}!=5ø½ÍÑ…Ñ”¹‘ˆ™½È¥ÑÌµÑ¥µ”…Ñ”ìÑ¡”…ÕÑ½ÕÍ”4(€€€€€€€€Œ™¥áÑÕÉ”Á½¥¹ÑÌ!I5M}!=5…ĞÑµÁ}Á…Ñ ¸4(€€€€€€€‘‰}Á…Ñ €ôÑµÁ}Á…Ñ €¼€‰ÍÑ…Ñ”¹‘ˆˆ4(€€€€€€€‘‰}Á…Ñ ¹İÉ¥Ñ•}Ñ•áĞ ‰Á±…•¡½±‘•Èˆ¤4(4(€€€€€€€Í•ÍÍ¥½¹}¥€ô€ˆÈÀÈØÀÌÈå|ÄÔÀÀÀÁ}±…Ñ•}É•¥ÍÑ•Èˆ4(€€€€€€€€ŒQ¡”É½ÕÑ¥¹œ¥¹‘•à¹½Ü½µ•Ì™É½´}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤€¡ÍÑ…Ñ”¹‘ˆ4(€€€€€€€€ŒÁÉ¥µ…Éä°Í•ÍÍ¥½¹Ì¹©Í½¸™…±±‰…¬¤¸MÑÕˆ¥ĞÑ¼É•ÑÕÉ¸Ñ¡”¹•Ü4(€€€€€€€€Œ½¹Ù•ÉÍ…Ñ¥½¸°Í¥µÕ±…Ñ¥¹œÑ¡”…Ñ•İ…ä¡…Ù¥¹œ©ÕÍĞİÉ¥ÑÑ•¸Ñ¡”4(€€€€€€€€ŒÍ•ÍÍ¥½¸É½Ü€¬™¥ÉÍĞµ•ÍÍ…”¥¸½¹”ÍÑ…Ñ”¹‘ˆÑÉ…¹Í…Ñ¥½¸¸4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ 4(€€€€€€€€€€€µÁ}Í•ÉÙ”°€‰}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•àˆ°4(€€€€€€€€€€€±…µ‰‘„èì4(€€€€€€€€€€€€€€€€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é±…Ñ”ˆèì4(€€€€€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆèÍ•ÍÍ¥½¹}¥°4(€€€€€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€€€€€€€€€‰½É¥¥¸ˆèì‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°€‰¡…Ñ}¥ˆè€‰±…Ñ”‰ô°4(€€€€€€€€€€€€€€€ô4(€€€€€€€€€€€ô°4(€€€€€€€€¤4(4(€€€€€€€±…ÍÌè4(€€€€€€€€€€€‘•˜•Ñ}µ•ÍÍ…•Ì¡Í•±˜°Í¥¤è4(€€€€€€€€€€€€€€€É•ÑÕÉ¸mì4(€€€€€€€€€€€€€€€€€€€€‰¥ˆè€Ä°€‰É½±”ˆè€‰ÕÍ•Èˆ°4(€€€€€€€€€€€€€€€€€€€€‰½¹Ñ•¹Ğˆè€‰!•±±¼™É½´„™É•Í¡±äµÉ•¥ÍÑ•É•½¹Ù•ÉÍ…Ñ¥½¸ˆ°4(€€€€€€€€€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÀˆ°4(€€€€€€€€€€€€€€€õt4(4(€€€€€€€‰É¥‘”€ôµÁ}Í•ÉÙ”¹Ù•¹Ñ	É¥‘” ¤4(€€€€€€€€Œ	É¥‘”¡…Ì¹•Ù•ÈÍ••¸Ñ¡¥Ì‘ˆÍÑ…Ñ”€¡µÑ¥µ”‘¥™™•ÉÌ¤…¹¡…Ì…¸4(€€€€€€€€Œ•µÁÑä…¡•¥¹‘•àƒŠP•á…Ñ±äÑ¡”ÍÑ…Ñ”…™Ñ•È„¹•Ü½¹Ù•ÉÍ…Ñ¥½¸Ì4(€€€€€€€€Œ™¥ÉÍĞİÉ¥Ñ”¸4(€€€€€€€‰É¥‘”¹}ÍÑ…Ñ•}‘‰}µÑ¥µ”€ô€À¸À4(€€€€€€€…ÍÍ•ÉĞ‰É¥‘”¹}…¡•‘}Í•ÍÍ¥½¹Í}¥¹‘•à€ôôíô4(4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡ ¤¤4(4(€€€€€€€É•ÍÕ±Ğ€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈôÀ¤4(€€€€€€€…ÍÍ•ÉĞ±•¸¡É•ÍÕ±Ñl‰•Ù•¹ÑÌ‰t¤€ôô€Ä4(€€€€€€€…ÍÍ•ÉĞÉ•ÍÕ±Ñl‰•Ù•¹ÑÌ‰ulÁul‰Í•ÍÍ¥½¹}­•ä‰t€ôô€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é±…Ñ”ˆ4(€€€€€€€…ÍÍ•ÉĞÉ•ÍÕ±Ñl‰•Ù•¹ÑÌ‰ulÁul‰½¹Ñ•¹Ğ‰t¹ÍÑ…ÉÑÍİ¥Ñ  ‰!•±±¼™É½´„™É•Í¡±äˆ¤4(4(€€€‘•˜Ñ•ÍÑ}ÍÑ…ÉÑÕÁ}‰…Í•±¥¹•}ÍÕÁÁÉ•ÍÍ•Í}¡¥ÍÑ½É¥…±}É•Á±…ä¡Í•±˜°ÑµÁ}Á…Ñ °µ½¹­•åÁ…Ñ ¤è4(€€€€€€€€ˆˆ‰ÍÑ…ÉĞ ¤Ì‰…Í•±¥¹”É•½É‘Ì•á¥ÍÑ¥¹œ¡¥ÍÑ½Éäİ¥Ñ¡½ÕĞ•µ¥ÑÑ¥¹œ¥Ğ°Í¼„4(€€€€€€€™É•Í Ù•¹Ñ	É¥‘”‘½•Ì¹½ĞÉ•Á±…äÍÑ½É•µ•ÍÍ…•Ì½¸ÍÑ…ÉÑÕÀì½¹±ä4(€€€€€€€µ•ÍÍ…•ÌİÉ¥ÑÑ•¸…™Ñ•ÈÑ¡”‰…Í•±¥¹”…É”‘•±¥Ù•É•¸ˆˆˆ4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(4(€€€€€€€‘‰}Á…Ñ €ôÑµÁ}Á…Ñ €¼€‰ÍÑ…Ñ”¹‘ˆˆ4(€€€€€€€‘‰}Á…Ñ ¹İÉ¥Ñ•}Ñ•áĞ ‰Á±…•¡½±‘•Èˆ¤4(€€€€€€€Í•ÍÍ¥½¹}¥€ô€ˆÈÀÈØÀÌÈå|ÄÔÀÀÀÁ}¡¥ÍÑ½Éäˆ4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ 4(€€€€€€€€€€€µÁ}Í•ÉÙ”°€‰}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•àˆ°4(€€€€€€€€€€€±…µ‰‘„èì4(€€€€€€€€€€€€€€€€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é¡¥ÍĞˆèì4(€€€€€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆèÍ•ÍÍ¥½¹}¥°4(€€€€€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€€€€€€€€€‰½É¥¥¸ˆèì‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°€‰¡…Ñ}¥ˆè€‰¡¥ÍĞ‰ô°4(€€€€€€€€€€€€€€€ô4(€€€€€€€€€€€ô°4(€€€€€€€€¤4(€€€€€€€ÍÑ½É”€ômì4(€€€€€€€€€€€€‰¥ˆè€Ä°€‰É½±”ˆè€‰ÕÍ•Èˆ°€‰½¹Ñ•¹Ğˆè€‰ÁÉ”µ•á¥ÍÑ¥¹œ¡¥ÍÑ½Éäˆ°4(€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÀèÀÀˆ°4(€€€€€€€õt4(4(€€€€€€€±…ÍÌè4(€€€€€€€€€€€‘•˜•Ñ}µ•ÍÍ…•Ì¡Í•±˜°Í¥¤è4(€€€€€€€€€€€€€€€É•ÑÕÉ¸±¥ÍĞ¡ÍÑ½É”¤4(4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹}‘ˆˆ°±…µ‰‘„è ¤¤4(4(€€€€€€€‰É¥‘”€ôµÁ}Í•ÉÙ”¹Ù•¹Ñ	É¥‘” ¤4(€€€€€€€‰É¥‘”¹}•ÍÑ…‰±¥Í¡}‰…Í•±¥¹” ¤4(€€€€€€€€Œ5•ÍÍ…•ÌÑ¡…Ğ•á¥ÍÑ•‰•™½É”ÍÑ…ÉĞ ¤…É”¹½ĞÉ•Á±…å•¸4(€€€€€€€…ÍÍ•ÉĞ‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈôÀ¥l‰•Ù•¹ÑÌ‰t€ôômt4(4(€€€€€€€€Œµ•ÍÍ…”İÉ¥ÑÑ•¸…™Ñ•ÈÑ¡”‰…Í•±¥¹”%L‘•±¥Ù•É•½¸Ñ¡”¹•áĞÑ¥¬¸4(€€€€€€€ÍÑ½É”¹…ÁÁ•¹¡ì4(€€€€€€€€€€€€‰¥ˆè€È°€‰É½±”ˆè€‰…ÍÍ¥ÍÑ…¹Ğˆ°€‰½¹Ñ•¹Ğˆè€‰…ÉÉ¥Ù•…™Ñ•ÈÍÑ…ÉĞˆ°4(€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÀÔèÀÀˆ°4(€€€€€€€ô¤4(€€€€€€€½Ì¹ÕÑ¥µ”¡‘‰}Á…Ñ °9½¹”¤€€Œ‰ÕµÀµÑ¥µ”Í¼Ñ¡”Á½±°…Ñ”½Á•¹Ì4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡ ¤¤4(€€€€€€€•Ù•¹ÑÌ€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈôÀ¥l‰•Ù•¹ÑÌ‰t4(€€€€€€€…ÍÍ•ÉĞ±•¸¡•Ù•¹ÑÌ¤€ôô€Ä4(€€€€€€€…ÍÍ•ÉĞ•Ù•¹ÑÍlÁul‰½¹Ñ•¹Ğ‰t€ôô€‰…ÉÉ¥Ù•…™Ñ•ÈÍÑ…ÉĞˆ4(4(€€€‘•˜Ñ•ÍÑ}¹•İ}½¹Ù•ÉÍ…Ñ¥½¹}…™Ñ•É}‰…Í•±¥¹•}¥Í}‘•±¥Ù•É•¡Í•±˜°ÑµÁ}Á…Ñ °µ½¹­•åÁ…Ñ ¤è4(€€€€€€€€ˆˆ‰½¹Ù•ÉÍ…Ñ¥½¸Ñ¡…Ğ™¥ÉÍĞ…ÁÁ•…ÉÌQHÑ¡”ÍÑ…ÉÑÕÀ‰…Í•±¥¹”¥ÌÍÑ¥±°4(€€€€€€€‘•±¥Ù•É•½¸¥ÑÌÍÑ…Ñ”¹‘ˆµ¡…¹”Ñ¥¬ƒŠPÍ•ÍÍ¥½¹Ì…‰Í•¹Ğ™É½´Ñ¡”4(€€€€€€€‰…Í•±¥¹”‘•™…Õ±ĞÑ¼±…ÍÑ}Í••¸ôÀ¸À¸ˆˆˆ4(€€€€€€€¥µÁ½ÉĞµÁ}Í•ÉÙ”4(4(€€€€€€€‘‰}Á…Ñ €ôÑµÁ}Á…Ñ €¼€‰ÍÑ…Ñ”¹‘ˆˆ4(€€€€€€€‘‰}Á…Ñ ¹İÉ¥Ñ•}Ñ•áĞ ‰Á±…•¡½±‘•Èˆ¤4(€€€€€€€¥¹‘•àè‘¥Ğ€ôíô4(€€€€€€€µ•ÍÍ…•Ìè‘¥Ğ€ôíô4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•àˆ°±…µ‰‘„è‘¥Ğ¡¥¹‘•à¤¤4(4(€€€€€€€±…ÍÌè4(€€€€€€€€€€€‘•˜•Ñ}µ•ÍÍ…•Ì¡Í•±˜°Í¥¤è4(€€€€€€€€€€€€€€€É•ÑÕÉ¸±¥ÍĞ¡µ•ÍÍ…•Ì¹•Ğ¡Í¥°mt¤¤4(4(€€€€€€€µ½¹­•åÁ…Ñ ¹Í•Ñ…ÑÑÈ¡µÁ}Í•ÉÙ”°€‰}•Ñ}Í•ÍÍ¥½¹}‘ˆˆ°±…µ‰‘„è ¤¤4(4(€€€€€€€‰É¥‘”€ôµÁ}Í•ÉÙ”¹Ù•¹Ñ	É¥‘” ¤4(€€€€€€€‰É¥‘”¹}•ÍÑ…‰±¥Í¡}‰…Í•±¥¹” ¤€€Œ¹¼½¹Ù•ÉÍ…Ñ¥½¹Ì•á¥ÍĞå•Ğ4(4(€€€€€€€€ŒQ¡”…Ñ•İ…äÉ•¥ÍÑ•ÉÌ„‰É…¹µ¹•Ü½¹Ù•ÉÍ…Ñ¥½¸€¬¥ÑÌ™¥ÉÍĞµ•ÍÍ…”¸4(€€€€€€€Í¥€ô€ˆÈÀÈØÀÌÈå|ÄÔÀÀÀÁ}™É•Í ˆ4(€€€€€€€¥¹‘•ál‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é™É•Í ‰t€ôì4(€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆèÍ¥°4(€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°4(€€€€€€€€€€€€‰½É¥¥¸ˆèì‰Á±…Ñ™½É´ˆè€‰Ñ•±•É…´ˆ°€‰¡…Ñ}¥ˆè€‰™É•Í ‰ô°4(€€€€€€€ô4(€€€€€€€µ•ÍÍ…•ÍmÍ¥‘t€ômì4(€€€€€€€€€€€€‰¥ˆè€Ä°€‰É½±”ˆè€‰ÕÍ•Èˆ°€‰½¹Ñ•¹Ğˆè€‰¡•±±¼…™Ñ•È‰…Í•±¥¹”ˆ°4(€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆè€ˆÈÀÈØ´ÀÌ´ÈåPÄÔèÄÀèÀÀˆ°4(€€€€€€€õt4(€€€€€€€½Ì¹ÕÑ¥µ”¡‘‰}Á…Ñ °9½¹”¤4(€€€€€€€‰É¥‘”¹}Á½±±}½¹”¡ ¤¤4(4(€€€€€€€•Ù•¹ÑÌ€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ¡…™Ñ•É}ÕÉÍ½ÈôÀ¥l‰•Ù•¹ÑÌ‰t4(€€€€€€€…ÍÍ•ÉĞ±•¸¡•Ù•¹ÑÌ¤€ôô€Ä4(€€€€€€€…ÍÍ•ÉĞ•Ù•¹ÑÍlÁul‰Í•ÍÍ¥½¹}­•ä‰t€ôô€‰…•¹Ğéµ…¥¸éÑ•±•É…´é‘´é™É•Í ˆ4(€€€€€€€…ÍÍ•ÉĞ•Ù•¹ÑÍlÁul‰½¹Ñ•¹Ğ‰t€ôô€‰¡•±±¼…™Ñ•È‰…Í•±¥¹”ˆ4(4(€€€‘•˜Ñ•ÍÑ}Á½±±}¥¹Ñ•ÉÙ…±}¥Í|ÈÀÁµÌ¡Í•±˜¤è4(€€€€€€€€ˆˆ‰Y•É¥™äÑ¡”Á½±°¥¹Ñ•ÉÙ…°½¹ÍÑ…¹Ğ¸ˆˆˆ4(€€€€€€€™É½´µÁ}Í•ÉÙ”¥µÁ½ÉĞA=11}%9QIY04(€€€€€€€…ÍÍ•ÉĞA=11}%9QIY0€ôô€À¸È4(
+        r = b.poll_events(after_cursor=0, session_key="a")
+        assert len(r["events"]) == 2
+
+    def test_poll_empty(self):
+        from mcp_serve import EventBridge
+        r = EventBridge().poll_events(after_cursor=0)
+        assert r["events"] == []
+        assert r["next_cursor"] == 0
+
+    def test_poll_limit(self):
+        from mcp_serve import EventBridge, QueueEvent
+        b = EventBridge()
+        for i in range(10):
+            b._enqueue(QueueEvent(cursor=0, type="message", session_key=f"s{i}"))
+        r = b.poll_events(after_cursor=0, limit=3)
+        assert len(r["events"]) == 3
+
+    def test_wait_immediate(self):
+        from mcp_serve import EventBridge, QueueEvent
+        b = EventBridge()
+        b._enqueue(QueueEvent(cursor=0, type="message", session_key="t",
+                              data={"content": "hi"}))
+        event = b.wait_for_event(after_cursor=0, timeout_ms=100)
+        assert event is not None
+        assert event["type"] == "message"
+
+    def test_wait_timeout(self):
+        from mcp_serve import EventBridge
+        start = time.monotonic()
+        event = EventBridge().wait_for_event(after_cursor=0, timeout_ms=150)
+        assert event is None
+        assert time.monotonic() - start >= 0.1
+
+    def test_wait_wakes_on_enqueue(self):
+        from mcp_serve import EventBridge, QueueEvent
+        b = EventBridge()
+        result = [None]
+
+        def waiter():
+            result[0] = b.wait_for_event(after_cursor=0, timeout_ms=5000)
+
+        t = threading.Thread(target=waiter)
+        t.start()
+        time.sleep(0.05)
+        b._enqueue(QueueEvent(cursor=0, type="message", session_key="wake"))
+        t.join(timeout=2)
+        assert result[0] is not None
+        assert result[0]["session_key"] == "wake"
+
+    def test_queue_limit(self):
+        from mcp_serve import EventBridge, QueueEvent, QUEUE_LIMIT
+        b = EventBridge()
+        for i in range(QUEUE_LIMIT + 50):
+            b._enqueue(QueueEvent(cursor=0, type="message", session_key=f"s{i}"))
+        assert len(b._queue) == QUEUE_LIMIT
+
+    def test_concurrent_enqueue(self):
+        from mcp_serve import EventBridge, QueueEvent
+        b = EventBridge()
+        errors = []
+
+        def batch(start):
+            try:
+                for i in range(100):
+                    b._enqueue(QueueEvent(cursor=0, type="message",
+                                          session_key=f"s{start}_{i}"))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=batch, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert not errors
+        assert len(b._queue) == 500
+        assert b._cursor == 500
+
+    def test_approvals_lifecycle(self):
+        from mcp_serve import EventBridge
+        b = EventBridge()
+        b._pending_approvals["a1"] = {
+            "id": "a1", "kind": "exec",
+            "description": "rm -rf /tmp",
+            "session_key": "test", "created_at": "2026-03-29T12:00:00",
+        }
+        assert len(b.list_pending_approvals()) == 1
+        result = b.respond_to_approval("a1", "deny")
+        assert result["resolved"] is True
+        assert len(b.list_pending_approvals()) == 0
+
+    def test_respond_nonexistent(self):
+        from mcp_serve import EventBridge
+        r = EventBridge().respond_to_approval("nope", "deny")
+        assert "error" in r
+
+
+# ---------------------------------------------------------------------------
+# 3. END-TO-END TESTS â€” call MCP tools through FastMCP server
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def mcp_server_e2e(populated_sessions_dir, mock_session_db, monkeypatch):
+    """Create a fully wired MCP server for E2E testing."""
+    mcp = pytest.importorskip("mcp", reason="MCP SDK not installed")
+    import mcp_serve
+    monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+    monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: mock_session_db)
+    monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {})
+
+    bridge = mcp_serve.EventBridge()
+    server = mcp_serve.create_mcp_server(event_bridge=bridge)
+    return server, bridge
+
+
+def _run_tool(server, name, args=None):
+    """Call an MCP tool through FastMCP's tool manager and return parsed JSON."""
+    result = asyncio.get_event_loop().run_until_complete(
+        server._tool_manager.call_tool(name, args or {})
+    )
+    return json.loads(result) if isinstance(result, str) else result
+
+
+@pytest.fixture
+def _event_loop():
+    """Ensure an event loop exists for sync tests calling async tools."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    yield loop
+    loop.close()
+
+
+class TestE2EConversationsList:
+    def test_list_all(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list")
+        assert result["count"] == 3
+        platforms = {c["platform"] for c in result["conversations"]}
+        assert platforms == {"telegram", "discord", "slack"}
+
+    def test_list_sorted_by_updated(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list")
+        keys = [c["session_key"] for c in result["conversations"]]
+        # Telegram (14:30) > Discord (13:00) > Slack (11:00)
+        assert keys[0] == "agent:main:telegram:dm:123456"
+        assert keys[1] == "agent:main:discord:group:789:456"
+        assert keys[2] == "agent:main:slack:group:C1234:U5678"
+
+    def test_filter_by_platform(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list", {"platform": "discord"})
+        assert result["count"] == 1
+        assert result["conversations"][0]["platform"] == "discord"
+
+    def test_filter_by_platform_case_insensitive(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list", {"platform": "TELEGRAM"})
+        assert result["count"] == 1
+
+    def test_search_by_name(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list", {"search": "Alice"})
+        assert result["count"] == 1
+        assert result["conversations"][0]["display_name"] == "Alice"
+
+    def test_search_no_match(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list", {"search": "nobody"})
+        assert result["count"] == 0
+
+    def test_limit(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversations_list", {"limit": 2})
+        assert result["count"] == 2
+
+
+class TestE2EConversationGet:
+    def test_get_existing(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversation_get",
+                          {"session_key": "agent:main:telegram:dm:123456"})
+        assert result["platform"] == "telegram"
+        assert result["display_name"] == "Alice"
+        assert result["chat_id"] == "123456"
+        assert result["input_tokens"] == 50000
+
+    def test_get_nonexistent(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "conversation_get",
+                          {"session_key": "nonexistent:key"})
+        assert "error" in result
+
+
+class TestE2EMessagesRead:
+    def test_read_messages(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "messages_read",
+                          {"session_key": "agent:main:telegram:dm:123456"})
+        assert result["count"] > 0
+        # Should filter out tool messages â€” only user/assistant
+        roles = {m["role"] for m in result["messages"]}
+        assert "tool" not in roles
+        assert "user" in roles
+        assert "assistant" in roles
+
+    def test_read_messages_content(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "messages_read",
+                          {"session_key": "agent:main:telegram:dm:123456"})
+        contents = [m["content"] for m in result["messages"]]
+        assert "Hello Alice!" in contents
+        assert "Hi! How can I help?" in contents
+
+    def test_read_messages_have_ids(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "messages_read",
+                          {"session_key": "agent:main:telegram:dm:123456"})
+        for msg in result["messages"]:
+            assert "id" in msg
+            assert msg["id"]  # non-empty
+
+    def test_read_with_limit(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "messages_read",
+                          {"session_key": "agent:main:telegram:dm:123456",
+                           "limit": 2})
+        assert result["count"] == 2
+
+    def test_read_nonexistent_session(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "messages_read",
+                          {"session_key": "nonexistent:key"})
+        assert "error" in result
+
+
+class TestE2EAttachmentsFetch:
+    def test_fetch_media_from_message(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        # First get message IDs
+        msgs = _run_tool(server, "messages_read",
+                        {"session_key": "agent:main:telegram:dm:123456"})
+        # Find the message with MEDIA: tag
+        media_msg = None
+        for m in msgs["messages"]:
+            if "MEDIA:" in m["content"]:
+                media_msg = m
+                break
+        assert media_msg is not None, "Should have a message with MEDIA: tag"
+
+        result = _run_tool(server, "attachments_fetch", {
+            "session_key": "agent:main:telegram:dm:123456",
+            "message_id": media_msg["id"],
+        })
+        assert result["count"] >= 1
+        assert result["attachments"][0]["type"] == "media"
+        assert result["attachments"][0]["path"] == "/tmp/screenshot.png"
+
+    def test_fetch_from_nonexistent_message(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "attachments_fetch", {
+            "session_key": "agent:main:telegram:dm:123456",
+            "message_id": "99999",
+        })
+        assert "error" in result
+
+    def test_fetch_from_nonexistent_session(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "attachments_fetch", {
+            "session_key": "nonexistent:key",
+            "message_id": "1",
+        })
+        assert "error" in result
+
+
+class TestE2EEventsPoll:
+    def test_poll_empty(self, mcp_server_e2e, _event_loop):
+        server, bridge = mcp_server_e2e
+        result = _run_tool(server, "events_poll")
+        assert result["events"] == []
+        assert result["next_cursor"] == 0
+
+    def test_poll_with_events(self, mcp_server_e2e, _event_loop):
+        from mcp_serve import QueueEvent
+        server, bridge = mcp_server_e2e
+        bridge._enqueue(QueueEvent(cursor=0, type="message",
+                                   session_key="agent:main:telegram:dm:123456",
+                                   data={"role": "user", "content": "Hello"}))
+        bridge._enqueue(QueueEvent(cursor=0, type="message",
+                                   session_key="agent:main:telegram:dm:123456",
+                                   data={"role": "assistant", "content": "Hi"}))
+
+        result = _run_tool(server, "events_poll")
+        assert len(result["events"]) == 2
+        assert result["events"][0]["content"] == "Hello"
+        assert result["events"][1]["content"] == "Hi"
+        assert result["next_cursor"] == 2
+
+    def test_poll_cursor_pagination(self, mcp_server_e2e, _event_loop):
+        from mcp_serve import QueueEvent
+        server, bridge = mcp_server_e2e
+        for i in range(5):
+            bridge._enqueue(QueueEvent(cursor=0, type="message",
+                                       session_key=f"s{i}"))
+
+        page1 = _run_tool(server, "events_poll", {"limit": 2})
+        assert len(page1["events"]) == 2
+        assert page1["next_cursor"] == 2
+
+        page2 = _run_tool(server, "events_poll",
+                         {"after_cursor": page1["next_cursor"], "limit": 2})
+        assert len(page2["events"]) == 2
+        assert page2["next_cursor"] == 4
+
+    def test_poll_session_filter(self, mcp_server_e2e, _event_loop):
+        from mcp_serve import QueueEvent
+        server, bridge = mcp_server_e2e
+        bridge._enqueue(QueueEvent(cursor=0, type="message", session_key="a"))
+        bridge._enqueue(QueueEvent(cursor=0, type="message", session_key="b"))
+        bridge._enqueue(QueueEvent(cursor=0, type="message", session_key="a"))
+
+        result = _run_tool(server, "events_poll",
+                          {"session_key": "b"})
+        assert len(result["events"]) == 1
+
+
+class TestE2EEventsWait:
+    def test_wait_timeout(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "events_wait", {"timeout_ms": 100})
+        assert result["event"] is None
+        assert result["reason"] == "timeout"
+
+    def test_wait_with_existing_event(self, mcp_server_e2e, _event_loop):
+        from mcp_serve import QueueEvent
+        server, bridge = mcp_server_e2e
+        bridge._enqueue(QueueEvent(cursor=0, type="message",
+                                   session_key="test",
+                                   data={"content": "waiting for this"}))
+        result = _run_tool(server, "events_wait", {"timeout_ms": 100})
+        assert result["event"] is not None
+        assert result["event"]["content"] == "waiting for this"
+
+    def test_wait_caps_timeout(self, mcp_server_e2e, _event_loop):
+        """Timeout should be capped at 300000ms (5 min)."""
+        from mcp_serve import QueueEvent
+        server, bridge = mcp_server_e2e
+        bridge._enqueue(QueueEvent(cursor=0, type="message", session_key="t"))
+        # Even with huge timeout, should return immediately since event exists
+        result = _run_tool(server, "events_wait", {"timeout_ms": 999999})
+        assert result["event"] is not None
+
+class TestMCPToolParameterCoercion:
+    def test_conversations_list_coerces_string_limit(self, fake_mcp_server, _event_loop):
+        server, _ = fake_mcp_server
+        result = _run_tool(server, "conversations_list", {"limit": "2"})
+        assert result["count"] == 2
+
+    def test_messages_read_coerces_string_limit(self, fake_mcp_server, _event_loop):
+        server, _ = fake_mcp_server
+        result = _run_tool(
+            server,
+            "messages_read",
+            {"session_key": "agent:main:telegram:dm:123456", "limit": "2"},
+        )
+        assert result["count"] == 2
+
+    def test_events_poll_coerces_string_cursor_and_limit(self, fake_mcp_server, _event_loop):
+        from mcp_serve import QueueEvent
+
+        server, bridge = fake_mcp_server
+        bridge._enqueue(QueueEvent(cursor=0, type="message", session_key="a"))
+        bridge._enqueue(QueueEvent(cursor=0, type="message", session_key="b"))
+
+        result = _run_tool(server, "events_poll", {"after_cursor": "0", "limit": "1"})
+        assert len(result["events"]) == 1
+        assert result["next_cursor"] == 1
+
+    def test_events_wait_coerces_invalid_timeout(self, fake_mcp_server, _event_loop):
+        from mcp_serve import QueueEvent
+
+        server, bridge = fake_mcp_server
+        bridge._enqueue(
+            QueueEvent(
+                cursor=0,
+                type="message",
+                session_key="test",
+                data={"content": "waiting for this"},
+            )
+        )
+
+        result = _run_tool(server, "events_wait", {"after_cursor": "0", "timeout_ms": "bad"})
+        assert result["event"] is not None
+        assert result["event"]["content"] == "waiting for this"
+
+
+class TestE2EMessagesSend:
+    def test_send_missing_args(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "messages_send", {"target": "", "message": "hi"})
+        assert "error" in result
+
+    def test_send_delegates_to_tool(self, mcp_server_e2e, _event_loop, monkeypatch):
+        server, _ = mcp_server_e2e
+        mock = MagicMock(return_value=json.dumps({"success": True, "platform": "telegram"}))
+        monkeypatch.setattr("tools.send_message_tool.send_message_tool", mock)
+
+        result = _run_tool(server, "messages_send",
+                          {"target": "telegram:123456", "message": "Hello!"})
+        assert result["success"] is True
+        mock.assert_called_once()
+        call_args = mock.call_args[0][0]
+        assert call_args["action"] == "send"
+        assert call_args["target"] == "telegram:123456"
+
+
+class TestE2EChannelsList:
+    def test_channels_from_sessions(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "channels_list")
+        assert result["count"] == 3
+        targets = {c["target"] for c in result["channels"]}
+        assert "telegram:123456" in targets
+        assert "discord:789" in targets
+        assert "slack:C1234" in targets
+
+    def test_channels_platform_filter(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "channels_list", {"platform": "slack"})
+        assert result["count"] == 1
+        assert result["channels"][0]["target"] == "slack:C1234"
+
+    def test_channels_with_directory(self, mcp_server_e2e, _event_loop, monkeypatch):
+        """Populated channel_directory.json should be unwrapped via the 'platforms' key.
+
+        Regression test for issue #21474: the writer wraps platforms under
+        {"updated_at": ..., "platforms": {...}} but the reader was iterating
+        directory.items() directly, so channels_list always returned 0.
+        """
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {
+            "updated_at": "2026-05-07T12:00:00",
+            "platforms": {
+                "telegram": [
+                    {"id": "123456", "name": "Alice", "type": "dm"},
+                    {"id": "-100999", "name": "Dev Group", "type": "group"},
+                ],
+                "discord": [
+                    {"id": "789", "name": "general", "type": "text"},
+                ],
+            },
+        })
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "channels_list")
+        assert result["count"] == 3
+        targets = {c["target"] for c in result["channels"]}
+        assert targets == {"telegram:123456", "telegram:-100999", "discord:789"}
+
+    def test_channels_with_directory_platform_filter(self, mcp_server_e2e, _event_loop, monkeypatch):
+        """Platform filter should work against the wrapped 'platforms' payload."""
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_load_channel_directory", lambda: {
+            "updated_at": "2026-05-07T12:00:00",
+            "platforms": {
+                "telegram": [{"id": "123456", "name": "Alice", "type": "dm"}],
+                "discord": [{"id": "789", "name": "general", "type": "text"}],
+            },
+        })
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "channels_list", {"platform": "discord"})
+        assert result["count"] == 1
+        assert result["channels"][0]["target"] == "discord:789"
+
+
+class TestE2EPermissions:
+    def test_list_empty(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "permissions_list_open")
+        assert result["count"] == 0
+        assert result["approvals"] == []
+
+    def test_list_with_approvals(self, mcp_server_e2e, _event_loop):
+        server, bridge = mcp_server_e2e
+        bridge._pending_approvals["a1"] = {
+            "id": "a1", "kind": "exec",
+            "description": "sudo rm -rf /",
+            "session_key": "test",
+            "created_at": "2026-03-29T12:00:00",
+        }
+        result = _run_tool(server, "permissions_list_open")
+        assert result["count"] == 1
+        assert result["approvals"][0]["id"] == "a1"
+
+    def test_respond_allow(self, mcp_server_e2e, _event_loop):
+        server, bridge = mcp_server_e2e
+        bridge._pending_approvals["a1"] = {"id": "a1", "kind": "exec"}
+        result = _run_tool(server, "permissions_respond",
+                          {"id": "a1", "decision": "allow-once"})
+        assert result["resolved"] is True
+        assert result["decision"] == "allow-once"
+        # Should be gone now
+        check = _run_tool(server, "permissions_list_open")
+        assert check["count"] == 0
+
+    def test_respond_deny(self, mcp_server_e2e, _event_loop):
+        server, bridge = mcp_server_e2e
+        bridge._pending_approvals["a2"] = {"id": "a2", "kind": "plugin"}
+        result = _run_tool(server, "permissions_respond",
+                          {"id": "a2", "decision": "deny"})
+        assert result["resolved"] is True
+
+    def test_respond_invalid_decision(self, mcp_server_e2e, _event_loop):
+        server, bridge = mcp_server_e2e
+        bridge._pending_approvals["a3"] = {"id": "a3", "kind": "exec"}
+        result = _run_tool(server, "permissions_respond",
+                          {"id": "a3", "decision": "maybe"})
+        assert "error" in result
+
+    def test_respond_nonexistent(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        result = _run_tool(server, "permissions_respond",
+                          {"id": "nope", "decision": "deny"})
+        assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# 4. TOOL LISTING â€” verify all 10 tools are registered
+# ---------------------------------------------------------------------------
+
+class TestToolRegistration:
+    def test_all_tools_registered(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        tools = server._tool_manager.list_tools()
+        tool_names = {t.name for t in tools}
+
+        expected = {
+            "conversations_list", "conversation_get", "messages_read",
+            "attachments_fetch", "events_poll", "events_wait",
+            "messages_send", "channels_list",
+            "permissions_list_open", "permissions_respond",
+        }
+        assert expected == tool_names, f"Missing: {expected - tool_names}, Extra: {tool_names - expected}"
+
+    def test_tools_have_descriptions(self, mcp_server_e2e, _event_loop):
+        server, _ = mcp_server_e2e
+        for tool in server._tool_manager.list_tools():
+            assert tool.description, f"Tool {tool.name} has no description"
+
+
+# ---------------------------------------------------------------------------
+# 5. SERVER LIFECYCLE / CLI INTEGRATION
+# ---------------------------------------------------------------------------
+
+class TestServerCreation:
+    def test_create_server(self, populated_sessions_dir, monkeypatch):
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        assert mcp_serve.create_mcp_server() is not None
+
+    def test_create_with_bridge(self, populated_sessions_dir, monkeypatch):
+        pytest.importorskip("mcp", reason="MCP SDK not installed")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: populated_sessions_dir)
+        bridge = mcp_serve.EventBridge()
+        assert mcp_serve.create_mcp_server(event_bridge=bridge) is not None
+
+    def test_create_without_mcp_sdk(self, monkeypatch):
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", False)
+        with pytest.raises(ImportError, match="MCP server requires"):
+            mcp_serve.create_mcp_server()
+
+
+class TestRunMcpServer:
+    def test_run_without_mcp_exits(self, monkeypatch):
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", False)
+        with pytest.raises(SystemExit) as exc_info:
+            mcp_serve.run_mcp_server()
+        assert exc_info.value.code == 1
+
+
+class TestCliIntegration:
+    def test_parse_serve(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        subs = parser.add_subparsers(dest="command")
+        mcp_p = subs.add_parser("mcp")
+        mcp_sub = mcp_p.add_subparsers(dest="mcp_action")
+        serve_p = mcp_sub.add_parser("serve")
+        serve_p.add_argument("-v", "--verbose", action="store_true")
+
+        args = parser.parse_args(["mcp", "serve"])
+        assert args.mcp_action == "serve"
+        assert args.verbose is False
+
+    def test_parse_serve_verbose(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        subs = parser.add_subparsers(dest="command")
+        mcp_p = subs.add_parser("mcp")
+        mcp_sub = mcp_p.add_subparsers(dest="mcp_action")
+        serve_p = mcp_sub.add_parser("serve")
+        serve_p.add_argument("-v", "--verbose", action="store_true")
+
+        args = parser.parse_args(["mcp", "serve", "--verbose"])
+        assert args.verbose is True
+
+    def test_dispatcher_routes_serve(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_run = MagicMock()
+        monkeypatch.setattr("mcp_serve.run_mcp_server", mock_run)
+
+        import argparse
+        args = argparse.Namespace(mcp_action="serve", verbose=True)
+        from hermes_cli.mcp_config import mcp_command
+        mcp_command(args)
+        mock_run.assert_called_once_with(verbose=True)
+
+
+# ---------------------------------------------------------------------------
+# 6. EDGE CASES
+# ---------------------------------------------------------------------------
+
+class TestEdgeCases:
+    def test_empty_sessions_json(self, sessions_dir, monkeypatch):
+        (sessions_dir / "sessions.json").write_text("{}")
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+        assert mcp_serve._load_sessions_index() == {}
+
+    def test_sessions_without_origin(self, sessions_dir, monkeypatch):
+        data = {"agent:main:telegram:dm:111": {
+            "session_key": "agent:main:telegram:dm:111",
+            "session_id": "20260329_120000_xyz",
+            "platform": "telegram",
+            "updated_at": "2026-03-29T12:00:00",
+        }}
+        (sessions_dir / "sessions.json").write_text(json.dumps(data))
+        import mcp_serve
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+        entries = mcp_serve._load_sessions_index()
+        assert entries["agent:main:telegram:dm:111"]["platform"] == "telegram"
+
+    def test_bridge_start_stop(self):
+        from mcp_serve import EventBridge
+        b = EventBridge()
+        assert not b._running
+        b._running = True
+        b.stop()
+        assert not b._running
+
+    def test_truncation(self):
+        assert len(("x" * 5000)[:2000]) == 2000
+
+
+# ---------------------------------------------------------------------------
+# 7. EVENT BRIDGE POLL LOOP E2E â€” real SQLite DB, mtime optimization
+# ---------------------------------------------------------------------------
+
+class TestEventBridgePollE2E:
+    """End-to-end tests for the EventBridge polling loop with real files."""
+
+    def test_poll_detects_new_messages(self, tmp_path, monkeypatch):
+        """Write to SQLite + sessions.json, verify EventBridge picks it up."""
+        import mcp_serve
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+
+        session_id = "20260329_150000_poll_test"
+        db_path = tmp_path / "state.db"
+
+        # Write sessions.json
+        sessions_data = {
+            "agent:main:telegram:dm:poll_test": {
+                "session_key": "agent:main:telegram:dm:poll_test",
+                "session_id": session_id,
+                "platform": "telegram",
+                "chat_type": "dm",
+                "display_name": "PollTest",
+                "updated_at": "2026-03-29T15:00:05",
+                "origin": {"platform": "telegram", "chat_id": "poll_test"},
+            }
+        }
+        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+
+        # Write messages to SQLite
+        messages = [
+            {"role": "user", "content": "First message",
+             "timestamp": "2026-03-29T15:00:01"},
+            {"role": "assistant", "content": "Reply",
+             "timestamp": "2026-03-29T15:00:03"},
+        ]
+        _create_test_db(db_path, session_id, messages)
+
+        # Create a mock SessionDB that reads our test DB
+        class TestDB:
+            def get_messages(self, sid):
+                conn = sqlite3.connect(str(db_path))
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                    (sid,),
+                ).fetchall()
+                conn.close()
+                return [dict(r) for r in rows]
+
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: TestDB())
+
+        bridge = mcp_serve.EventBridge()
+        # Run one poll cycle manually
+        bridge._poll_once(TestDB())
+
+        # Should have found the messages
+        result = bridge.poll_events(after_cursor=0)
+        assert len(result["events"]) == 2
+        assert result["events"][0]["role"] == "user"
+        assert result["events"][0]["content"] == "First message"
+        assert result["events"][1]["role"] == "assistant"
+
+    def test_poll_skips_when_unchanged(self, tmp_path, monkeypatch):
+        """Second poll with no file changes should be a no-op."""
+        import mcp_serve
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+
+        session_id = "20260329_150000_skip_test"
+        db_path = tmp_path / "state.db"
+
+        sessions_data = {
+            "agent:main:telegram:dm:skip": {
+                "session_key": "agent:main:telegram:dm:skip",
+                "session_id": session_id,
+                "platform": "telegram",
+                "updated_at": "2026-03-29T15:00:05",
+                "origin": {"platform": "telegram", "chat_id": "skip"},
+            }
+        }
+        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        _create_test_db(db_path, session_id, [
+            {"role": "user", "content": "Hello", "timestamp": "2026-03-29T15:00:01"},
+        ])
+
+        class TestDB:
+            def __init__(self):
+                self.call_count = 0
+
+            def get_messages(self, sid):
+                self.call_count += 1
+                conn = sqlite3.connect(str(db_path))
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                    (sid,),
+                ).fetchall()
+                conn.close()
+                return [dict(r) for r in rows]
+
+        db = TestDB()
+        bridge = mcp_serve.EventBridge()
+
+        # First poll â€” should process
+        bridge._poll_once(db)
+        first_calls = db.call_count
+        assert first_calls >= 1
+
+        # Second poll â€” files unchanged, should skip entirely
+        bridge._poll_once(db)
+        assert db.call_count == first_calls, \
+            "Second poll should skip DB queries when files unchanged"
+
+    def test_poll_detects_new_message_after_db_write(self, tmp_path, monkeypatch):
+        """Write a new message to the DB after first poll, verify it's detected."""
+        import mcp_serve
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+
+        session_id = "20260329_150000_new_msg"
+        db_path = tmp_path / "state.db"
+
+        sessions_data = {
+            "agent:main:telegram:dm:new": {
+                "session_key": "agent:main:telegram:dm:new",
+                "session_id": session_id,
+                "platform": "telegram",
+                "updated_at": "2026-03-29T15:00:05",
+                "origin": {"platform": "telegram", "chat_id": "new"},
+            }
+        }
+        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+        _create_test_db(db_path, session_id, [
+            {"role": "user", "content": "First", "timestamp": "2026-03-29T15:00:01"},
+        ])
+
+        class TestDB:
+            def get_messages(self, sid):
+                conn = sqlite3.connect(str(db_path))
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? ORDER BY id",
+                    (sid,),
+                ).fetchall()
+                conn.close()
+                return [dict(r) for r in rows]
+
+        db = TestDB()
+        bridge = mcp_serve.EventBridge()
+
+        # First poll
+        bridge._poll_once(db)
+        r1 = bridge.poll_events(after_cursor=0)
+        assert len(r1["events"]) == 1
+
+        # Add a new message to the DB
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            (session_id, "assistant", "New reply!", "2026-03-29T15:00:10"),
+        )
+        conn.commit()
+        conn.close()
+        # Touch the DB file to update mtime (WAL mode may not update mtime on small writes)
+        os.utime(db_path, None)
+
+        # Update sessions.json updated_at to trigger re-check
+        sessions_data["agent:main:telegram:dm:new"]["updated_at"] = "2026-03-29T15:00:10"
+        (sessions_dir / "sessions.json").write_text(json.dumps(sessions_data))
+
+        # Second poll â€” should detect the new message
+        bridge._poll_once(db)
+        r2 = bridge.poll_events(after_cursor=r1["next_cursor"])
+        assert len(r2["events"]) == 1
+        assert r2["events"][0]["content"] == "New reply!"
+
+    def test_poll_picks_up_new_conversation_on_db_change(
+        self, tmp_path, monkeypatch
+    ):
+        """A brand-new conversation must be picked up on the tick where
+        state.db changes.
+
+        Since #9006 the routing index lives IN state.db (session rows carry
+        session_key/origin metadata), so a new conversation's registration and
+        its first message land in the same file â€” a single mtime check covers
+        both and the old dual-file (sessions.json + state.db) race (#8925) is
+        structurally impossible. This test asserts the index is refreshed on a
+        db-mtime bump, so a conversation the bridge has never seen before is
+        emitted on the same tick.
+        """
+        import mcp_serve
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        monkeypatch.setattr(mcp_serve, "_get_sessions_dir", lambda: sessions_dir)
+
+        # _poll_once reads <HERMES_HOME>/state.db for its mtime gate; the autouse
+        # fixture points HERMES_HOME at tmp_path.
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+
+        session_id = "20260329_150000_late_register"
+        # The routing index now comes from _load_sessions_index() (state.db
+        # primary, sessions.json fallback). Stub it to return the new
+        # conversation, simulating the gateway having just written the
+        # session row + first message in one state.db transaction.
+        monkeypatch.setattr(
+            mcp_serve, "_load_sessions_index",
+            lambda: {
+                "agent:main:telegram:dm:late": {
+                    "session_id": session_id,
+                    "platform": "telegram",
+                    "origin": {"platform": "telegram", "chat_id": "late"},
+                }
+            },
+        )
+
+        class DB:
+            def get_messages(self, sid):
+                return [{
+                    "id": 1, "role": "user",
+                    "content": "Hello from a freshly-registered conversation",
+                    "timestamp": "2026-03-29T15:00:00",
+                }]
+
+        bridge = mcp_serve.EventBridge()
+        # Bridge has never seen this db state (mtime differs) and has an
+        # empty cached index â€” exactly the state after a new conversation's
+        # first write.
+        bridge._state_db_mtime = 0.0
+        assert bridge._cached_sessions_index == {}
+
+        bridge._poll_once(DB())
+
+        result = bridge.poll_events(after_cursor=0)
+        assert len(result["events"]) == 1
+        assert result["events"][0]["session_key"] == "agent:main:telegram:dm:late"
+        assert result["events"][0]["content"].startswith("Hello from a freshly")
+
+    def test_startup_baseline_suppresses_historical_replay(self, tmp_path, monkeypatch):
+        """start()'s baseline records existing history without emitting it, so a
+        fresh EventBridge does not replay stored messages on startup; only
+        messages written after the baseline are delivered."""
+        import mcp_serve
+
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+        session_id = "20260329_150000_history"
+        monkeypatch.setattr(
+            mcp_serve, "_load_sessions_index",
+            lambda: {
+                "agent:main:telegram:dm:hist": {
+                    "session_id": session_id,
+                    "platform": "telegram",
+                    "origin": {"platform": "telegram", "chat_id": "hist"},
+                }
+            },
+        )
+        store = [{
+            "id": 1, "role": "user", "content": "pre-existing history",
+            "timestamp": "2026-03-29T15:00:00",
+        }]
+
+        class DB:
+            def get_messages(self, sid):
+                return list(store)
+
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+
+        bridge = mcp_serve.EventBridge()
+        bridge._establish_baseline()
+        # Messages that existed before start() are not replayed.
+        assert bridge.poll_events(after_cursor=0)["events"] == []
+
+        # A message written after the baseline IS delivered on the next tick.
+        store.append({
+            "id": 2, "role": "assistant", "content": "arrived after start",
+            "timestamp": "2026-03-29T15:05:00",
+        })
+        os.utime(db_path, None)  # bump mtime so the poll gate opens
+        bridge._poll_once(DB())
+        events = bridge.poll_events(after_cursor=0)["events"]
+        assert len(events) == 1
+        assert events[0]["content"] == "arrived after start"
+
+    def test_new_conversation_after_baseline_is_delivered(self, tmp_path, monkeypatch):
+        """A conversation that first appears AFTER the startup baseline is still
+        delivered on its state.db-change tick â€” sessions absent from the
+        baseline default to last_seen=0.0."""
+        import mcp_serve
+
+        db_path = tmp_path / "state.db"
+        db_path.write_text("placeholder")
+        index: dict = {}
+        messages: dict = {}
+        monkeypatch.setattr(mcp_serve, "_load_sessions_index", lambda: dict(index))
+
+        class DB:
+            def get_messages(self, sid):
+                return list(messages.get(sid, []))
+
+        monkeypatch.setattr(mcp_serve, "_get_session_db", lambda: DB())
+
+        bridge = mcp_serve.EventBridge()
+        bridge._establish_baseline()  # no conversations exist yet
+
+        # The gateway registers a brand-new conversation + its first message.
+        sid = "20260329_150000_fresh"
+        index["agent:main:telegram:dm:fresh"] = {
+            "session_id": sid,
+            "platform": "telegram",
+            "origin": {"platform": "telegram", "chat_id": "fresh"},
+        }
+        messages[sid] = [{
+            "id": 1, "role": "user", "content": "hello after baseline",
+            "timestamp": "2026-03-29T15:10:00",
+        }]
+        os.utime(db_path, None)
+        bridge._poll_once(DB())
+
+        events = bridge.poll_events(after_cursor=0)["events"]
+        assert len(events) == 1
+        assert events[0]["session_key"] == "agent:main:telegram:dm:fresh"
+        assert events[0]["content"] == "hello after baseline"
+
+    def test_poll_interval_is_200ms(self):
+        """Verify the poll interval constant."""
+        from mcp_serve import POLL_INTERVAL
+        assert POLL_INTERVAL == 0.2

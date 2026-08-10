@@ -361,4 +361,868 @@ def cmd_sessions(args, sessions_parser=None):
             if filters:
                 candidates = db.list_prune_candidates(**filters)
                 if args.dry_run:
-                  ïm{¶‰žËkºwµçhðÄÝô€ˆ4(€€€€€€€€€€€€€€€€€€€˜‰íÍlÍ½ÕÉ”tèðÄÁôíµ½‘•°èðÈÑô€ˆ4(€€€€€€€€€€€€€€€€€€€˜‰íÍlµ•ÍÍ…•}½Õ¹ÐtèøÑôµÍÌ€íÑ¥Ñ±•ôˆ4(€€€€€€€€€€€€€€€€¤4(€€€€€€€€€€€¥˜±•¸¡…¹‘¥‘…Ñ•Ì¤€ø±•¸¡Í¡½Ý¸¤è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€ƒŠ˜…¹í±•¸¡…¹‘¥‘…Ñ•Ì¤€´±•¸¡Í¡½Ý¸¥ôµ½É”ˆ¤4(€€€€€€€€€€€¥˜…ÉÌ¹‘Éå}ÉÕ¸è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰ÉäÉÕ¸ƒŠP¹½Ñ¡¥¹œì‘•±•Ñ•œ¥˜…Ñ¥½¸€ôô€ÁÉÕ¹”œ•±Í”€…É¡¥Ù•ô¸ˆ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€¥˜¹½Ð…ÉÌ¹å•Ìè4(€€€€€€€€€€€¥˜¹½Ð}½¹™¥Éµ}ÁÉ½µÁÐ 4(€€€€€€€€€€€€€€€˜‰íÙ•É‰ôÑ¡•Í”í±•¸¡…¹‘¥‘…Ñ•Ì¥ôÍ•ÍÍ¥½¸¡Ì¤€¡í}ÍÁ…¹ô¤ümä½9t€ˆ4(€€€€€€€€€€€€¤è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð ‰…¹•±±•¸ˆ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€¥˜…Ñ¥½¸€ôô€‰ÁÉÕ¹”ˆè4(€€€€€€€€€€€Í•ÍÍ¥½¹Í}‘¥È€ô•Ñ}¡•Éµ•Í}¡½µ” ¤€¼€‰Í•ÍÍ¥½¹Ìˆ4(€€€€€€€€€€€½Õ¹Ð€ô‘ˆ¹ÁÉÕ¹•}Í•ÍÍ¥½¹Ì¡Í•ÍÍ¥½¹Í}‘¥ÈõÍ•ÍÍ¥½¹Í}‘¥È°€¨©™¥±Ñ•ÉÌ¤4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰AÉÕ¹•í½Õ¹ÑôÍ•ÍÍ¥½¸¡Ì¤¸ˆ¤4(€€€€€€€•±Í”è4(€€€€€€€€€€€½Õ¹Ð€ô‘ˆ¹…É¡¥Ù•}Í•ÍÍ¥½¹Ì ¨©™¥±Ñ•ÉÌ¤4(€€€€€€€€€€€ÁÉ¥¹Ð 4(€€€€€€€€€€€€€€€˜‰É¡¥Ù•í½Õ¹ÑôÍ•ÍÍ¥½¸¡Ì¤¸Q¡•äÉ”¡¥‘‘•¸™É½´±¥ÍÑ¥¹Ì€ˆ4(€€€€€€€€€€€€€€€€‰‰ÕÐ™Õ±±äÉ•½Ù•É…‰±”€¡¹½Ñ¡¥¹œÝ…Ì‘•±•Ñ•¤¸ˆ4(€€€€€€€€€€€€¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰É•¹…µ”ˆè4(€€€€€€€É•Í½±Ù•‘}Í•ÍÍ¥½¹}¥€ô‘ˆ¹É•Í½±Ù•}Í•ÍÍ¥½¹}¥¡…ÉÌ¹Í•ÍÍ¥½¹}¥¤4(€€€€€€€¥˜¹½ÐÉ•Í½±Ù•‘}Í•ÍÍ¥½¹}¥è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰M•ÍÍ¥½¸€í…ÉÌ¹Í•ÍÍ¥½¹}¥‘ôœ¹½Ð™½Õ¹¸ˆ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(€€€€€€€Ñ¥Ñ±”€ô€ˆ€ˆ¹©½¥¸¡…ÉÌ¹Ñ¥Ñ±”¤4(€€€€€€€ÑÉäè4(€€€€€€€€€€€¥˜‘ˆ¹Í•Ñ}Í•ÍÍ¥½¹}Ñ¥Ñ±”¡É•Í½±Ù•‘}Í•ÍÍ¥½¹}¥°Ñ¥Ñ±”¤è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰M•ÍÍ¥½¸€íÉ•Í½±Ù•‘}Í•ÍÍ¥½¹}¥‘ôœÉ•¹…µ•Ñ¼èíÑ¥Ñ±•ôˆ¤4(€€€€€€€€€€€•±Í”è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰M•ÍÍ¥½¸€í…ÉÌ¹Í•ÍÍ¥½¹}¥‘ôœ¹½Ð™½Õ¹¸ˆ¤4(€€€€€€€•á•ÁÐY…±Õ•ÉÉ½È…Ì”è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰ÉÉ½Èèí•ôˆ¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰É•Ñ¥Ñ±”µÍ­¥±±Ìˆè4(€€€€€€€™É½´…•¹Ð¹Í­¥±±}½µµ…¹‘Ì¥µÁ½ÉÐ‘•ÍÉ¥‰•}Í­¥±±}¥¹Ù½…Ñ¥½¸4(€€€€€€€™É½´…•¹Ð¹Ñ¥Ñ±•}•¹•É…Ñ½È¥µÁ½ÉÐ•¹•É…Ñ•}Ñ¥Ñ±”4(4(€€€€€€€±¥µ¥Ð€ôµ…à Ä°¥¹Ð¡•Ñ…ÑÑÈ¡…ÉÌ°€‰±¥µ¥Ðˆ°€ÈÀÀ¤½È€ÈÀÀ¤¤4(€€€€€€€…ÁÁ±å}¡…¹•Ì€ô‰½½°¡•Ñ…ÑÑÈ¡…ÉÌ°€‰…ÁÁ±äˆ°…±Í”¤¤4(4(€€€€€€€‘•˜}¥Í}Ñ¥Ñ±•±¥­”¡…¹‘¥‘…Ñ”èÍÑÈ¤€´ø‰½½°è4(€€€€€€€€€€€€ˆˆ‰I•©•Ð„…¹‘¥‘…Ñ”Ñ¡…Ð¥Í¸Ð„Ñ¥Ñ±”…Ð…±°¸4(4(€€€€€€€€€€€¸…Õá¥±¥…Éäµ½‘•°½…Í¥½¹…±±ä…¹ÍÝ•ÉÌÑ¡”ÁÉ½µÁÐ¥¹ÍÑ•…½˜4(€€€€€€€€€€€Ñ¥Ñ±¥¹œ¥Ð…¹•¡½•ÌÑ¡”…ÍÍ¥ÍÑ…¹ÐÌ½ÕÑÁÕÐ€ œ‘˜€µ €¼œ¤¸Q¡”4(€€€€€€€€€€€±¥Ù”Á…Ñ ¡…Ì¹¼…±Ñ•É¹…Ñ¥Ù”…¹Ñ…­•ÌÝ¡…Ð¥Ð•ÑÌ°‰ÕÐÑ¡¥Ì¥Ì4(€€€€€€€€€€€„IA%HƒŠPÉ•Á±…¥¹œ„Í•ÉÙ¥•…‰±”Ñ¥Ñ±”Ý¥Ñ ½µµ…¹½ÕÑÁÕÐ4(€€€€€€€€€€€Ý½Õ±µ…­”Ñ¡¥¹ÌÝ½ÉÍ”°Í¼­••ÀÑ¡”½±½¹”¸4(€€€€€€€€€€€€ˆˆˆ4(€€€€€€€€€€€É•ÑÕÉ¸‰½½°¡…¹‘¥‘…Ñ”¤…¹…¹‘¥‘…Ñ•lÁt¹¥Í…±¹Õ´ ¤4(4(€€€€€€€…¹‘¥‘…Ñ•Ì€ô‘ˆ¹±¥ÍÑ}Í­¥±±}Í…™™½±‘•‘}Í•ÍÍ¥½¹Ì¡±¥µ¥Ðõ±¥µ¥Ð¤4(€€€€€€€¥˜¹½Ð…¹‘¥‘…Ñ•Ìè4(€€€€€€€€€€€ÁÉ¥¹Ð ‰9¼Í•ÍÍ¥½¹ÌÝ•É”Ñ¥Ñ±•™É½´„€½Í­¥±°¥¹Ù½…Ñ¥½¸¸ˆ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€ÁÉ¥¹Ð 4(€€€€€€€€€€€˜‰í±•¸¡…¹‘¥‘…Ñ•Ì¥ôÍ•ÍÍ¥½¸¡Ì¤½Á•¹•Ý¥Ñ „€½Í­¥±°ˆ4(€€€€€€€€€€€˜‰ìœœ¥˜…ÁÁ±å}¡…¹•Ì•±Í”€œ€¡‘ÉäÉÕ¸ƒŠPÁ…ÍÌ€´µ…ÁÁ±äÑ¼ÝÉ¥Ñ”¤ôèˆ4(€€€€€€€€¤4(€€€€€€€¡…¹•€ô€À4(€€€€€€€™½ÈÉ½Ü¥¸…¹‘¥‘…Ñ•Ìè4(€€€€€€€€€€€Í•ÍÍ¥½¹}¥€ôÉ½Ýl‰¥‰t4(€€€€€€€€€€€ÑåÁ•€ô‘•ÍÉ¥‰•}Í­¥±±}¥¹Ù½…Ñ¥½¸¡É½Ýl‰½¹Ñ•¹Ð‰t¤½È€ˆˆ4(€€€€€€€€€€€¹•Ý}Ñ¥Ñ±”€ô•¹•É…Ñ•}Ñ¥Ñ±”¡ÑåÁ•¤4(€€€€€€€€€€€¥˜¹½Ð¹•Ý}Ñ¥Ñ±”½È¹•Ý}Ñ¥Ñ±”€ôôÉ½Ýl‰Ñ¥Ñ±”‰tè4(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€¥˜¹½Ð}¥Í}Ñ¥Ñ±•±¥­”¡¹•Ý}Ñ¥Ñ±”¤è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€íÍ•ÍÍ¥½¹}¥‘õq¸€€€­•ÁÐíÉ½ÝlÑ¥Ñ±”t…ÉôƒŠP½Ðí¹•Ý}Ñ¥Ñ±”…Éôˆ¤4(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€íÍ•ÍÍ¥½¹}¥‘õq¸€€€íÉ½ÝlÑ¥Ñ±”t…Éõq¸€€€ƒŠHí¹•Ý}Ñ¥Ñ±”…Éôˆ¤4(€€€€€€€€€€€¡…¹•€¬ô€Ä4(€€€€€€€€€€€¥˜¹½Ð…ÁÁ±å}¡…¹•Ìè4(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€ÑÉäè4(€€€€€€€€€€€€€€€‘ˆ¹Í•Ñ}Í•ÍÍ¥½¹}Ñ¥Ñ±”¡Í•ÍÍ¥½¹}¥°¹•Ý}Ñ¥Ñ±”¤4(€€€€€€€€€€€•á•ÁÐY…±Õ•ÉÉ½Èè4(€€€€€€€€€€€€€€€€ŒU¹¥ÅÕ”µÑ¥Ñ±”½±±¥Í¥½¸¸•‘ÕÁ”Ñ¡”Í…µ”Ý…äÑ¡”±¥Ù”4(€€€€€€€€€€€€€€€€Œ…ÕÑ¼µÑ¥Ñ±•È‘½•Ì€¡‰…Í”€ŒÈ°‰…Í”€ŒÌ°€¸¸¸¤É…Ñ¡•ÈÑ¡…¸4(€€€€€€€€€€€€€€€€Œ±•…Ù¥¹œÑ¡”±•…­•Ñ¥Ñ±”¥¸Á±…”¸4(€€€€€€€€€€€€€€€‘•‘ÕÁ•€ô‘ˆ¹•Ñ}¹•áÑ}Ñ¥Ñ±•}¥¹}±¥¹•…”¡¹•Ý}Ñ¥Ñ±”¤4(€€€€€€€€€€€€€€€ÑÉäè4(€€€€€€€€€€€€€€€€€€€‘ˆ¹Í•Ñ}Í•ÍÍ¥½¹}Ñ¥Ñ±”¡Í•ÍÍ¥½¹}¥°‘•‘ÕÁ•¤4(€€€€€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€€€€¡É•¹…µ•Ñ¼í‘•‘ÕÁ•…ÉôƒŠPÑ¥Ñ±”Ý…ÌÑ…­•¸¤ˆ¤4(€€€€€€€€€€€€€€€•á•ÁÐY…±Õ•ÉÉ½È…Ì”è4(€€€€€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€€€Í­¥ÁÁ•èí•ôˆ¤4(€€€€€€€€€€€€€€€€€€€¡…¹•€´ô€Ä4(4(€€€€€€€¥˜¹½Ð¡…¹•è4(€€€€€€€€€€€ÁÉ¥¹Ð ˆ€•Ù•ÉäÑ¥Ñ±”…±É•…‘äÉ•™±•ÑÌÑ¡”ÕÍ•ÈÌÉ•ÅÕ•ÍÐ¸ˆ¤4(€€€€€€€•±¥˜…ÁÁ±å}¡…¹•Ìè4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‹ŠrLI”µÑ¥Ñ±•í¡…¹•‘ôÍ•ÍÍ¥½¸¡Ì¤¸ˆ¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰‰É½ÝÍ”ˆè4(€€€€€€€±¥µ¥Ð€ô•Ñ…ÑÑÈ¡…ÉÌ°€‰±¥µ¥Ðˆ°€ÔÀÀ¤½È€ÔÀÀ4(€€€€€€€Í½ÕÉ”€ô•Ñ…ÑÑÈ¡…ÉÌ°€‰Í½ÕÉ”ˆ°9½¹”¤4(€€€€€€€}‰É½ÝÍ•}•á±Õ‘”€ô9½¹”¥˜Í½ÕÉ”•±Í”l‰Ñ½½°‰t4(€€€€€€€Í•ÍÍ¥½¹Ì€ô‘ˆ¹±¥ÍÑ}Í•ÍÍ¥½¹Í}É¥  4(€€€€€€€€€€€Í½ÕÉ”õÍ½ÕÉ”°•á±Õ‘•}Í½ÕÉ•Ìõ}‰É½ÝÍ•}•á±Õ‘”°±¥µ¥Ðõ±¥µ¥Ð4(€€€€€€€€¤4(€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€¥˜¹½ÐÍ•ÍÍ¥½¹Ìè4(€€€€€€€€€€€ÁÉ¥¹Ð ‰9¼Í•ÍÍ¥½¹Ì™½Õ¹¸ˆ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€Í•±•Ñ•‘}¥€ô}Í•ÍÍ¥½¹}‰É½ÝÍ•}Á¥­•È¡Í•ÍÍ¥½¹Ì¤4(€€€€€€€¥˜¹½ÐÍ•±•Ñ•‘}¥è4(€€€€€€€€€€€ÁÉ¥¹Ð ‰…¹•±±•¸ˆ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€€Œ1…Õ¹ ¡•Éµ•Ì€´µÉ•ÍÕµ”€ñ¥ø‰äÉ•Á±…¥¹œÑ¡”ÕÉÉ•¹ÐÁÉ½•ÍÌ4(€€€€€€€ÁÉ¥¹Ð¡˜‰I•ÍÕµ¥¹œÍ•ÍÍ¥½¸èíÍ•±•Ñ•‘}¥‘ôˆ¤4(€€€€€€€™É½´¡•Éµ•Í}±¤¹É•±…Õ¹ ¥µÁ½ÉÐÉ•±…Õ¹ 4(4(€€€€€€€É•±…Õ¹ ¡lˆ´µÉ•ÍÕµ”ˆ°Í•±•Ñ•‘}¥‘t¤4(€€€€€€€É•ÑÕÉ¸€€ŒÝ½¸ÐÉ•… ¡•É”…™Ñ•È•á•ÙÀ4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰½ÁÑ¥µ¥é”ˆè4(€€€€€€€‘‰}Á…Ñ €ô‘ˆ¹‘‰}Á…Ñ 4(€€€€€€€‰•™½É•}µˆ€ô€ 4(€€€€€€€€€€€½Ì¹Á…Ñ ¹•ÑÍ¥é”¡‘‰}Á…Ñ ¤€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤4(€€€€€€€€€€€¥˜‘‰}Á…Ñ ¹•á¥ÍÑÌ ¤4(€€€€€€€€€€€•±Í”€À¸À4(€€€€€€€€¤4(€€€€€€€ÁÉ¥¹Ð ‰=ÁÑ¥µ¥é¥¹œÍ•ÍÍ¥½¸ÍÑ½É”€¡QLµ•É”€¬YUU4§Š˜ˆ¤4(€€€€€€€ÑÉäè4(€€€€€€€€€€€€ŒÙ…ÕÕ´ ¤µ•É•ÌQLÔÍ•µ•¹ÑÌ€¡½ÁÑ¥µ¥é•}™ÑÌ¤Ñ¡•¸YUU5Ì°4(€€€€€€€€€€€€Œ…¹É•ÑÕÉ¹ÌÑ¡”¹Õµ‰•È½˜¥¹‘•á•Ì¥Ðµ•É•¸4(€€€€€€€€€€€¸€ô‘ˆ¹Ù…ÕÕ´ ¤4(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì”è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰ÉÉ½Èè½ÁÑ¥µ¥é…Ñ¥½¸™…¥±•èí•ôˆ¤4(€€€€€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(€€€€€€€…™Ñ•É}µˆ€ô€ 4(€€€€€€€€€€€½Ì¹Á…Ñ ¹•ÑÍ¥é”¡‘‰}Á…Ñ ¤€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤4(€€€€€€€€€€€¥˜‘‰}Á…Ñ ¹•á¥ÍÑÌ ¤4(€€€€€€€€€€€•±Í”€À¸À4(€€€€€€€€¤4(€€€€€€€€ŒM…µ”]0…Ù•…Ð…Ì½ÁÑ¥µ¥é”µÍÑ½É…”è…™Ñ•È„YUU4Ñ¡”µ…¥¸™¥±”4(€€€€€€€€Œ½¸‘¥Í¬±…ÌÕ¹Ñ¥°Ñ¡”]0¥Ì¡•­Á½¥¹Ñ•‰…¬€¡É•™ÕÍ•Ý¡¥±”„4(€€€€€€€€Œ±¥Ù”…Ñ•Ý…ä¡½±‘Ì„É•…µµ…É¬¤°Í¼ÍÑ…Ð ¤Õ¹‘•ÉÍÑ…Ñ•ÌÑ¡”Ý¥¸…¹4(€€€€€€€€Œ…¸¼¹•…Ñ¥Ù”¸ME1¥Ñ”ÌÁ…”…½Õ¹Ñ¥¹œ¥Ì½ÉÉ•Ð¥µµ•‘¥…Ñ•±ä¸4(€€€€€€€±½¥…±}…™Ñ•È€ô‘ˆ¹±½¥…±}Í¥é•}‰åÑ•Ì ¤4(€€€€€€€¥˜±½¥…±}…™Ñ•È¥Ì¹½Ð9½¹”è4(€€€€€€€€€€€…™Ñ•É}µˆ€ô±½¥…±}…™Ñ•È€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤4(€€€€€€€Í…Ù•€ô‰•™½É•}µˆ€´…™Ñ•É}µˆ4(€€€€€€€ÁÉ¥¹Ð¡˜‰=ÁÑ¥µ¥é•í¹ôQL¥¹‘•à¡•Ì¤¸ˆ¤4(€€€€€€€ÁÉ¥¹Ð 4(€€€€€€€€€€€˜‰…Ñ…‰…Í”Í¥é”èí‰•™½É•}µˆè¸Å™ô5€´øí…™Ñ•É}µˆè¸Å™ô5€ˆ4(€€€€€€€€€€€˜ˆ¡í}Í¥é•}‘•±Ñ…}±…‰•°¡Í…Ù•¥ô¤ˆ4(€€€€€€€€¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰±•…¸µµ…É­•ÉÌˆè4(€€€€€€€¥˜…ÉÌ¹‘Éå}ÉÕ¸è4(€€€€€€€€€€€ÁÉ¥¹Ð ‰ÉäÉÕ¸ƒŠPÍ…¹¹¥¹œ™½ÈÍÑ…±”Ñ½½°µ…±°µ…É­•ÈÉ½ÝÌ€ ŒÜàÄÐà§Š˜ˆ¤4(€€€€€€€•±Í”è4(€€€€€€€€€€€ÁÉ¥¹Ð ‰M…¹¹¥¹œ™½ÈÍÑ…±”Ñ½½°µ…±°µ…É­•ÈÉ½ÝÌ€ ŒÜàÄÐà§Š˜ˆ¤4(€€€€€€€É•Á½ÉÐ€ô‘ˆ¹ÁÕÉ•}ÍÑ…±•}Ñ½½±}…±±}µ…É­•ÉÌ 4(€€€€€€€€€€€‘Éå}ÉÕ¸õ…ÉÌ¹‘Éå}ÉÕ¸°‰…­ÕÀõ¹½Ð…ÉÌ¹¹½}‰…­ÕÀ4(€€€€€€€€¤4(€€€€€€€¥˜É•Á½ÉÑl‰É½ÝÍ}…™™•Ñ•‰t€ôô€Àè4(€€€€€€€€€€€ÁÉ¥¹Ð ‹ŠrL9¼…™™•Ñ•É½ÝÌ™½Õ¹ƒŠP¹½Ñ¡¥¹œÑ¼±•…¸¸ˆ¤4(€€€€€€€•±¥˜…ÉÌ¹‘Éå}ÉÕ¸è4(€€€€€€€€€€€ÁÉ¥¹Ð 4(€€€€€€€€€€€€€€€˜‰]½Õ±±•…ÈíÉ•Á½ÉÑlÉ½ÝÍ}…™™•Ñ•uôÉ½Ü¡Ì¤è€ˆ4(€€€€€€€€€€€€€€€˜‰¥‘ÌíÉ•Á½ÉÑlÉ½Ý}¥‘Ìuôˆ4(€€€€€€€€€€€€¤4(€€€€€€€•±Í”è4(€€€€€€€€€€€¥˜É•Á½ÉÑl‰‰…­ÕÁ}Á…Ñ ‰tè4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€‰…­ÕÀèíÉ•Á½ÉÑl‰…­ÕÁ}Á…Ñ uôˆ¤4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‹ŠrL±•…É•íÉ•Á½ÉÑlÉ½ÝÍ}…™™•Ñ•uôÉ½Ü¡Ì¤¸ˆ¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰½ÁÑ¥µ¥é”µÍÑ½É…”ˆè4(€€€€€€€‘‰}Á…Ñ €ô‘ˆ¹‘‰}Á…Ñ 4(€€€€€€€¥˜¹½Ð‘ˆ¹™ÑÍ}½ÁÑ¥µ¥é•}…Ù…¥±…‰±” ¤è4(€€€€€€€€€€€ÁÉ¥¹Ð ‰M•…É ¥¹‘•à¥Ì…±É•…‘ä½¸Ñ¡”½µÁ…Ð±…å½ÕÐƒŠP¹½Ñ¡¥¹œÑ¼‘¼¸ˆ¤4(€€€€€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€‰•™½É•}‰åÑ•Ì€ô½Ì¹Á…Ñ ¹•ÑÍ¥é”¡‘‰}Á…Ñ ¤¥˜‘‰}Á…Ñ ¹•á¥ÍÑÌ ¤•±Í”€À4(€€€€€€€‰•™½É•}µˆ€ô‰•™½É•}‰åÑ•Ì€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤4(4(€€€€€€€€Œ¥Í¬ÁÉ•™±¥¡ÐèÑ¡”É•‰Õ¥±…‘‘ÌÑ¡”¹•Ü¥¹‘•à‰•™½É”Ñ¡”½±¥Ì4(€€€€€€€€ŒÑ½É¸‘½Ý¸°…¹Ñ¡”™¥¹…°YUU4¹••‘Ì„™Õ±°Í•½¹½Áä½˜Ñ¡”4(€€€€€€€€Œ™¥±”¸I•ÅÕ¥É”¡•…‘É½½´ƒŠ& ÕÉÉ•¹Ð™¥±”Í¥é”Ñ¼™¥¹¥Í ±•…¹±ä¸4(€€€€€€€‘½}Ù…ÕÕ´€ô¹½Ð•Ñ…ÑÑÈ¡…ÉÌ°€‰¹½}Ù…ÕÕ´ˆ°…±Í”¤4(€€€€€€€ÑÉäè4(€€€€€€€€€€€¥µÁ½ÉÐÍ¡ÕÑ¥°…Ì}Í¡ÕÑ¥°4(€€€€€€€€€€€™É••}‰åÑ•Ì€ô}Í¡ÕÑ¥°¹‘¥Í­}ÕÍ…”¡‘‰}Á…Ñ ¹Á…É•¹Ð¤¹™É•”4(€€€€€€€•á•ÁÐá•ÁÑ¥½¸è4(€€€€€€€€€€€™É••}‰åÑ•Ì€ô9½¹”4(€€€€€€€¹••‘}‰åÑ•Ì€ô‰•™½É•}‰åÑ•Ì¥˜‘½}Ù…ÕÕ´•±Í”¥¹Ð¡‰•™½É•}‰åÑ•Ì€¨€À¸Ì¤4(€€€€€€€ÁÉ¥¹Ð¡˜‰M•…É µ¥¹‘•à½ÁÑ¥µ¥é…Ñ¥½¸™½Èí‘‰}Á…Ñ¡ôˆ¤4(€€€€€€€ÁÉ¥¹Ð¡˜ˆ€ÕÉÉ•¹Ð‘…Ñ…‰…Í”Í¥é”èí‰•™½É•}µˆè¸Å™ô5ˆ¤4(€€€€€€€¥˜™É••}‰åÑ•Ì¥Ì¹½Ð9½¹”è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€É•”‘¥Í¬èí™É••}‰åÑ•Ì€¼€ ÄÀÈÐ¨ÄÀÈÐ¤è¸Á™ô5€ˆ4(€€€€€€€€€€€€€€€€€˜ˆ¡¹••ùí¹••‘}‰åÑ•Ì€¼€ ÄÀÈÐ¨ÄÀÈÐ¤è¸Á™ô5Ñ¼½µÁ±•Ñ”ˆ4(€€€€€€€€€€€€€€€€€˜‰ìœ¥¹°¸YUU4œ¥˜‘½}Ù…ÕÕ´•±Í”€œô¤ˆ¤4(€€€€€€€€€€€¥˜™É••}‰åÑ•Ì€ð¹••‘}‰åÑ•Ìè4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð ¤4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð ‹Šj€9½Ð•¹½Õ ™É•”‘¥Í¬Ñ¼½µÁ±•Ñ”Í…™•±ä¸É•”ÕÀ€ˆ4(€€€€€€€€€€€€€€€€€€€€€€‰ÍÁ…”°½ÈÉÕ¸Ý¥Ñ €´µ¹¼µÙ…ÕÕ´€¡É•‰Õ¥±‘ÌÑ¡”¥¹‘•à€ˆ4(€€€€€€€€€€€€€€€€€€€€€€‰‰ÕÐ‘½•Í¸ÐÉ•±…¥´ÍÁ…”Õ¹Ñ¥°„±…Ñ•ÈYUU4¤¸ˆ¤4(€€€€€€€€€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸4(€€€€€€€¥˜‰•™½É•}µˆ€ø€ÔÀÀè4(€€€€€€€€€€€ÁÉ¥¹Ð ˆ€Q¡¥Ìµ…äÑ…­”„Ý¡¥±”½¸„±…É”‘…Ñ…‰…Í”¸%ÐÉÕ¹Ì¥¸€ˆ4(€€€€€€€€€€€€€€€€€€‰Ñ¡”™½É•É½Õ¹Ý¥Ñ ÁÉ½É•ÍÌ‰•±½ÜìÍ…™”Ñ¼ÑÉ°µ…¹€ˆ4(€€€€€€€€€€€€€€€€€€‰É”µÉÕ¸€¡¥ÐÉ•ÍÕµ•Ì¤¸ˆ¤4(€€€€€€€¥˜¹½Ð•Ñ…ÑÑÈ¡…ÉÌ°€‰å•Ìˆ°…±Í”¤è4(€€€€€€€€€€€ÑÉäè4(€€€€€€€€€€€€€€€É•ÍÀ€ô¥¹ÁÕÐ ‰AÉ½••ümä½9t€ˆ¤¹ÍÑÉ¥À ¤¹±½Ý•È ¤4(€€€€€€€€€€€•á•ÁÐ=ÉÉ½Èè4(€€€€€€€€€€€€€€€É•ÍÀ€ô€ˆˆ4(€€€€€€€€€€€¥˜É•ÍÀ¹½Ð¥¸€ ‰äˆ°€‰å•Ìˆ¤è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð ‰…¹•±±•¸ˆ¤4(€€€€€€€€€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€€€€€€€€€É•ÑÕÉ¸4(4(€€€€€€€}±…ÍÐ€ôì‰Á¡…Í”ˆè9½¹•ô4(4(€€€€€€€‘•˜}ÁÉ½É•ÍÌ¡¥¹™¼¤è4(€€€€€€€€€€€Á¡…Í”€ô¥¹™¼¹•Ð ‰Á¡…Í”ˆ¤4(€€€€€€€€€€€ÁÐ€ô¥¹™¼¹•Ð ‰Á•É•¹Ðˆ°€À¤4(€€€€€€€€€€€¥˜Á¡…Í”€ôô€‰‰…­™¥±°ˆè4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰qÈ€I•‰Õ¥±‘¥¹œ¥¹‘•àèíÁÐèÍ‘ô”€ˆ4(€€€€€€€€€€€€€€€€€€€€€˜ˆ¡í¥¹™¼¹•Ð ¥¹‘•á•œ°À¤è±ô½í¥¹™¼¹•Ð Ñ½Ñ…°œ°À¤è±ô¤ˆ°4(€€€€€€€€€€€€€€€€€€€€€•¹ôˆˆ°™±ÕÍ õQÉÕ”¤4(€€€€€€€€€€€•±¥˜Á¡…Í”€„ô}±…ÍÑl‰Á¡…Í”‰tè4(€€€€€€€€€€€€€€€±…‰•°€ôì‰Ñ•…É‘½Ý¸ˆè€‰I•±…¥µ¥¹œ½±¥¹‘•àˆ°4(€€€€€€€€€€€€€€€€€€€€€€€€€‰Ù…ÕÕ´ˆè€‰½µÁ…Ñ¥¹œ‘…Ñ…‰…Í”€¡YUU4¤ˆ°4(€€€€€€€€€€€€€€€€€€€€€€€€€‰‘½¹”ˆè€‰½¹”‰ô¹•Ð¡Á¡…Í”°Á¡…Í”¤4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰q¸€í±…‰•±÷Š˜ˆ°™±ÕÍ õQÉÕ”¤4(€€€€€€€€€€€}±…ÍÑl‰Á¡…Í”‰t€ôÁ¡…Í”4(4(€€€€€€€ÁÉ¥¹Ð ‰=ÁÑ¥µ¥é¥¹œÍ•…É µ¥¹‘•àÍÑ½É…—Š˜ˆ¤4(€€€€€€€ÑÉäè4(€€€€€€€€€€€É•ÍÕ±Ð€ô‘ˆ¹½ÁÑ¥µ¥é•}™ÑÍ}ÍÑ½É…” 4(€€€€€€€€€€€€€€€ÁÉ½É•ÍÍ}ˆõ}ÁÉ½É•ÍÌ°Ù…ÕÕ´õ‘½}Ù…ÕÕ´4(€€€€€€€€€€€€¤4(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì”è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰q¹ÉÉ½Èè½ÁÑ¥µ¥é…Ñ¥½¸™…¥±•èí•ôˆ¤4(€€€€€€€€€€€ÁÉ¥¹Ð ‰9¼‘…Ñ„Ý…Ì±½ÍÐ¸I”µÉÕ¸Ñ¼É•ÍÕµ”¸ˆ¤4(€€€€€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(€€€€€€€¥˜¹½ÐÉ•ÍÕ±Ð¹•Ð ‰½¬ˆ¤è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰q¹½Õ±¹½Ð½ÁÑ¥µ¥é”èíÉ•ÍÕ±Ð¹•Ð É•…Í½¸œ°€Õ¹­¹½Ý¸œ¥ôˆ¤4(€€€€€€€€€€€‘ˆ¹±½Í” ¤4(€€€€€€€€€€€É•ÑÕÉ¸4(€€€€€€€…™Ñ•É}µˆ€ô€ 4(€€€€€€€€€€€½Ì¹Á…Ñ ¹•ÑÍ¥é”¡‘‰}Á…Ñ ¤€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤¥˜‘‰}Á…Ñ ¹•á¥ÍÑÌ ¤•±Í”€À¸À4(€€€€€€€€¤4(€€€€€€€€ŒAÉ•™•ÈME1¥Ñ”Ì½Ý¸Á…”…½Õ¹Ñ¥¹œ½Ù•ÈÍÑ…Ð ¤¸%¸]0µ½‘”„4(€€€€€€€€ŒYUU4ÌÉ•ÝÉ¥Ñ”Í¥ÑÌ¥¸Ñ¡”€µÝ…°™¥±”Õ¹Ñ¥°„¡•­Á½¥¹Ð™½±‘Ì¥Ð4(€€€€€€€€Œ‰…¬°…¹Ñ¡…Ð¡•­Á½¥¹Ð¥ÌÉ•™ÕÍ•Ý¡¥±”…¹½Ñ¡•È½¹¹•Ñ¥½¸€¡„4(€€€€€€€€Œ±¥Ù”…Ñ•Ý…ä¤¡½±‘Ì„É•…µµ…É¬ƒŠPÍ¼Ñ¡”µ…¥¸™¥±”½¸‘¥Í¬ÍÑ¥±°4(€€€€€€€€ŒÉ•…‘Ì…Ð¥ÑÌÁÉ”µYUU4Í¥é”…¹­••ÁÌÉ½Ý¥¹œ¸ÍÑ…Ð ¥¥¹œ¥Ð¡•É”4(€€€€€€€€ŒÉ•Á½ÉÑ•€‰É•±…¥µ•€´ÌàÈÀ¸Ä5ˆ½¸„Ñ¡…Ð¡……ÑÕ…±±äÍ¡ÉÕ¹¬4(€€€€€€€€Œ€ØÀ”¸Á…•}½Õ¹Ð€¨Á…•}Í¥é”¥Ì½ÉÉ•Ð¥µµ•‘¥…Ñ•±ä¸4(€€€€€€€±½¥…±}…™Ñ•È€ô‘ˆ¹±½¥…±}Í¥é•}‰åÑ•Ì ¤4(€€€€€€€¥˜±½¥…±}…™Ñ•È¥Ì¹½Ð9½¹”è4(€€€€€€€€€€€…™Ñ•É}µˆ€ô±½¥…±}…™Ñ•È€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤4(€€€€€€€Í…Ù•€ô‰•™½É•}µˆ€´…™Ñ•É}µˆ4(€€€€€€€ÁÉ¥¹Ð¡˜‰q»ŠrLM•…É ¥¹‘•à½ÁÑ¥µ¥é•¸ˆ¤4(€€€€€€€ÁÉ¥¹Ð 4(€€€€€€€€€€€˜ˆ€…Ñ…‰…Í”Í¥é”èí‰•™½É•}µˆè¸Å™ô5€´øí…™Ñ•É}µˆè¸Å™ô5€ˆ4(€€€€€€€€€€€˜ˆ¡í}Í¥é•}‘•±Ñ…}±…‰•°¡Í…Ù•¥ô¤ˆ4(€€€€€€€€¤4(€€€€€€€¥˜É•ÍÕ±Ð¹•Ð ‰Ù…ÕÕµ•ˆ¤¥Ì…±Í”è4(€€€€€€€€€€€ÁÉ¥¹Ð ˆ€€¡YUU4Ý…ÌÍ­¥ÁÁ•½È™…¥±•ƒŠPÉÕ¸€ˆ4(€€€€€€€€€€€€€€€€€€‰¡•Éµ•ÌÍ•ÍÍ¥½¹Ì½ÁÑ¥µ¥é•€±…Ñ•ÈÑ¼É•±…¥´™É••ÍÁ…”¸¤ˆ¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰É•Á…¥ÈµÉ½ÕÑ¥¹œˆè4(€€€€€€€É•½É‘Ì€ô‘ˆ¹™¥¹‘}½ÉÁ¡…¹•‘}…Ñ•Ý…å}Í•ÍÍ¥½¹Ì 4(€€€€€€€€€€€µ…á}…Á}Ìõ•Ñ…ÑÑÈ¡…ÉÌ°€‰µ…á}…Á}Í•½¹‘Ìˆ°9½¹”¤4(€€€€€€€€¤4(€€€€€€€…‘½ÁÑ…‰±”€ômÈ™½ÈÈ¥¸É•½É‘Ì¥˜Él‰…‘½ÁÑ…‰±”‰ut4(€€€€€€€™½ÈÉ•½É¥¸É•½É‘Ìè4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰íÉ•½É‘l½ÉÁ¡…¹}¥uô€€¡íÉ•½É‘lÍ½ÕÉ”uô°€ˆ4(€€€€€€€€€€€€€€€€€˜‰íÉ•½É‘lµ•ÍÍ…•}½Õ¹Ðuôµ•ÍÍ…•Ì¤ˆ¤4(€€€€€€€€€€€¥˜É•½É‘l‰…‘½ÁÑ…‰±”‰tè4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€ƒŠH…‘½ÁÐ¥¹Ñ¼íÉ•½É‘lÍ•ÍÍ¥½¹}­•äuô€ˆ4(€€€€€€€€€€€€€€€€€€€€€˜ˆ¡™É½´íÉ•½É‘l‘½¹½É}¥uô°€ˆ4(€€€€€€€€€€€€€€€€€€€€€˜‰•Ù¥‘•¹”èíÉ•½É‘l•Ù¥‘•¹”uô¤ˆ¤4(€€€€€€€€€€€•±Í”è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€ƒŠr\¹½ÐÉ•Á…¥É…‰±”ƒŠPíÉ•½É‘lÉ•…Í½¸uôˆ¤4(4(€€€€€€€¥˜¹½ÐÉ•½É‘Ìè4(€€€€€€€€€€€ÁÉ¥¹Ð ‹ŠrL9¼…Ñ•Ý…äÍ•ÍÍ¥½¹Ì…É”µ¥ÍÍ¥¹œÑ¡•¥ÈÉ½ÕÑ¥¹œ¥‘•¹Ñ¥Ñä¸ˆ¤4(€€€€€€€•±¥˜¹½Ð…‘½ÁÑ…‰±”è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰q¹í±•¸¡É•½É‘Ì¥ô½ÉÁ¡…¹•Í•ÍÍ¥½¸¡Ì¤™½Õ¹°¹½¹”€ˆ4(€€€€€€€€€€€€€€€€€€‰Õ¹…µ‰¥Õ½ÕÍ±äÉ•Á…¥É…‰±”¸9½Ñ¡¥¹œÑ¼‘¼¸ˆ¤4(€€€€€€€•±¥˜¹½Ð•Ñ…ÑÑÈ¡…ÉÌ°€‰…ÁÁ±äˆ°…±Í”¤è4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰q¹í±•¸¡…‘½ÁÑ…‰±”¥ô½˜í±•¸¡É•½É‘Ì¥ô½ÉÁ¡…¹•Í•ÍÍ¥½¸¡Ì¤€ˆ4(€€€€€€€€€€€€€€€€€€‰…¸‰”É•Á…¥É•¸I”µÉÕ¸Ý¥Ñ €´µ…ÁÁ±äÑ¼Á•É™½É´Ñ¡•´¸ˆ¤4(€€€€€€€•±Í”è4(€€€€€€€€€€€€ŒÉÕ¹¹¥¹œ…Ñ•Ý…ä¡½±‘ÌÑ¡”½±É½ÕÑ¥¹œµ…ÁÁ¥¹œ¥¸µ•µ½Éä…¹4(€€€€€€€€€€€€ŒÝ½Õ±ÝÉ¥Ñ”¥Ð‰…¬½Ù•ÈÑ¡”É•Á…¥È½¸¥ÑÌ¹•áÐÍ…Ù”¸4(€€€€€€€€€€€ÁÉ¥¹Ð ‰q¹MÑ½ÀÑ¡”…Ñ•Ý…ä‰•™½É”…ÁÁ±å¥¹œƒŠP„ÉÕ¹¹¥¹œ…Ñ•Ý…ä€ˆ4(€€€€€€€€€€€€€€€€€€‰ÍÑ¥±°¡½±‘ÌÑ¡”½±É½ÕÑ¥¹œµ…ÁÁ¥¹œ¥¸µ•µ½Éä¸ˆ¤4(€€€€€€€€€€€¥˜}½¹™¥Éµ}ÁÉ½µÁÐ 4(€€€€€€€€€€€€€€€˜‰‘½ÁÐí±•¸¡…‘½ÁÑ…‰±”¥ô½ÉÁ¡…¹•Í•ÍÍ¥½¸¡Ì¤ümä½9t€ˆ4(€€€€€€€€€€€€¤è4(€€€€€€€€€€€€€€€É•Á…¥É•€ô€À4(€€€€€€€€€€€€€€€™½ÈÉ•½É¥¸…‘½ÁÑ…‰±”è4(€€€€€€€€€€€€€€€€€€€¥˜‘ˆ¹…‘½ÁÑ}½ÉÁ¡…¹•‘}…Ñ•Ý…å}Í•ÍÍ¥½¸ 4(€€€€€€€€€€€€€€€€€€€€€€€É•½É‘l‰½ÉÁ¡…¹}¥‰t°É•½É‘l‰‘½¹½É}¥‰t4(€€€€€€€€€€€€€€€€€€€€¤è4(€€€€€€€€€€€€€€€€€€€€€€€É•Á…¥É•€¬ô€Ä4(€€€€€€€€€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‹ŠrLíÉ•½É‘l½ÉÁ¡…¹}¥uô¹½Ü½Ý¹Ì€ˆ4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€˜‰íÉ•½É‘lÍ•ÍÍ¥½¹}­•äuôˆ¤4(€€€€€€€€€€€€€€€€€€€•±Í”è4(€€€€€€€€€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‹Šr\íÉ•½É‘l½ÉÁ¡…¹}¥uôÝ…Ì¹½Ð…‘½ÁÑ•€ˆ4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€ˆ¡Ñ¡”É½Ü¡…¹•Í¥¹”¥ÐÝ…ÌÉ•Á½ÉÑ•¤ˆ¤4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰q¹I•Á…¥É•íÉ•Á…¥É•‘ô½˜í±•¸¡…‘½ÁÑ…‰±”¥ôÍ•ÍÍ¥½¸¡Ì¤¸ˆ¤4(€€€€€€€€€€€•±Í”è4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð ‰‰½ÉÑ•ƒŠP¹½Ñ¡¥¹œÝ…Ì¡…¹•¸ˆ¤4(4(€€€•±¥˜…Ñ¥½¸€ôô€‰ÍÑ…ÑÌˆè4(€€€€€€€Ñ½Ñ…°€ô‘ˆ¹Í•ÍÍ¥½¹}½Õ¹Ð ¤4(€€€€€€€µÍÌ€ô‘ˆ¹µ•ÍÍ…•}½Õ¹Ð ¤4(€€€€€€€ÁÉ¥¹Ð¡˜‰Q½Ñ…°Í•ÍÍ¥½¹ÌèíÑ½Ñ…±ôˆ¤4(€€€€€€€ÁÉ¥¹Ð¡˜‰Q½Ñ…°µ•ÍÍ…•ÌèíµÍÍôˆ¤4(€€€€€€€™½ÈÍÉŒ¥¸l‰±¤ˆ°€‰Ñ•±•É…´ˆ°€‰‘¥Í½Éˆ°€‰Ý¡…ÑÍ…ÁÀˆ°€‰Í±…¬‰tè4(€€€€€€€€€€€Œ€ô‘ˆ¹Í•ÍÍ¥½¹}½Õ¹Ð¡Í½ÕÉ”õÍÉŒ¤4(€€€€€€€€€€€¥˜Œ€ø€Àè4(€€€€€€€€€€€€€€€ÁÉ¥¹Ð¡˜ˆ€íÍÉôèíôÍ•ÍÍ¥½¹Ìˆ¤4(€€€€€€€‘‰}Á…Ñ €ô‘ˆ¹‘‰}Á…Ñ 4(€€€€€€€¥˜‘‰}Á…Ñ ¹•á¥ÍÑÌ ¤è4(€€€€€€€€€€€Í¥é•}µˆ€ô½Ì¹Á…Ñ ¹•ÑÍ¥é”¡‘‰}Á…Ñ ¤€¼€ ÄÀÈÐ€¨€ÄÀÈÐ¤4(€€€€€€€€€€€ÁÉ¥¹Ð¡˜‰…Ñ…‰…Í”Í¥é”èíÍ¥é•}µˆè¸Å™ô5ˆ¤4(4(€€€•±Í”è4(€€€€€€€Í•ÍÍ¥½¹Í}Á…ÉÍ•È¹ÁÉ¥¹Ñ}¡•±À ¤4(4(€€€‘ˆ¹±½Í” ¤4(
+                    print(
+                        f"Would export {len(candidates)} session(s) "
+                        f"({describe_filters(filters)})."
+                    )
+                    for row in candidates[:100]:
+                        print(f"  {row.get('id')}  {row.get('source', '')}")
+                    if len(candidates) > 100:
+                        print(f"  ... {len(candidates) - 100} more")
+                    return None
+                return [
+                    s
+                    for s in (
+                        _redact(db.export_session(row["id"])) for row in candidates
+                    )
+                    if s
+                ]
+            if args.dry_run:
+                print("--dry-run requires at least one filter.")
+                return None
+            return [_redact(s) for s in db.export_all(source=None)]
+
+        # Prompt-only export (--only user-prompts): one prompt record per
+        # line (jsonl) or headed sections (md). Delegates rendering to
+        # hermes_cli.session_export.
+        if getattr(args, "only", None):
+            if args.format not in ("jsonl", "md"):
+                print("--only user-prompts supports --format jsonl or md.")
+                return
+            from hermes_cli.session_export import (
+                export_record_count,
+                render_sessions_export,
+            )
+
+            sessions = _collect_sessions()
+            if sessions is None:
+                db.close()
+                return
+            rendered = render_sessions_export(
+                sessions,
+                fmt="markdown" if args.format == "md" else "jsonl",
+                only=args.only,
+            )
+            if not args.output or args.output == "-":
+                sys.stdout.write(rendered)
+                db.close()
+                return
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(rendered)
+            count, noun = export_record_count(sessions, only=args.only)
+            suffix = "" if count == 1 else "s"
+            print(f"Exported {count} {noun}{suffix} to {args.output}")
+            db.close()
+            return
+
+        # Standalone HTML export: one self-contained file (single session
+        # or multi-session with sidebar navigation).
+        if args.format == "html":
+            if not args.output or args.output == "-":
+                print("HTML export requires an output file path.")
+                return
+            from hermes_cli.session_export_html import (
+                generate_html_export,
+                generate_multi_session_html_export,
+            )
+
+            sessions = _collect_sessions()
+            if sessions is None:
+                db.close()
+                return
+            if len(sessions) == 1:
+                content = generate_html_export(sessions[0])
+            else:
+                content = generate_multi_session_html_export(sessions)
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(content)
+            suffix = "" if len(sessions) == 1 else "s"
+            print(f"Exported {len(sessions)} session{suffix} to {args.output} (HTML)")
+            db.close()
+            return
+
+        # Claude Code JSONL trace export â€” local file or HF upload.
+        # Redaction is ON by default for traces (they leave the machine
+        # when --upload is used); --no-redact opts out after review.
+        if args.format == "trace":
+            if getattr(args, "only", None):
+                print("--only user-prompts supports --format jsonl or md.")
+                db.close()
+                return
+            session_id = args.session_id
+            if not session_id and not filters:
+                # Match the shell's common intent: "the last thing I did".
+                rows = db.list_sessions_rich(limit=1, order_by_last_active=True)
+                session_id = rows[0].get("id") if rows else None
+                if not session_id:
+                    print("No session found to export. Pass --session-id.")
+                    db.close()
+                    return
+            if session_id and not db.resolve_session_id(session_id):
+                print(f"Session '{session_id}' not found.")
+                db.close()
+                return
+
+            from agent.trace_upload import (
+                TraceRedactionError,
+                build_trace_jsonl,
+                upload_session_trace,
+            )
+
+            redact_trace = not getattr(args, "no_redact", False)
+
+            if getattr(args, "upload", False):
+                if not session_id:
+                    print("--upload exports one session: pass --session-id (or drop filters to use the most recent).")
+                    db.close()
+                    return
+                resolved = db.resolve_session_id(session_id)
+                db.close()
+                status = upload_session_trace(
+                    resolved,
+                    cwd="",
+                    redact=redact_trace,
+                    private=not getattr(args, "public", False),
+                )
+                print(status)
+                return
+
+            # Local trace file(s)
+            def _trace_ids():
+                if session_id:
+                    return [db.resolve_session_id(session_id)]
+                candidates = db.list_prune_candidates(**filters)
+                if args.dry_run:
+                    print(
+                        f"Would export {len(candidates)} session(s) "
+                        f"({describe_filters(filters)})."
+                    )
+                    for row in candidates[:100]:
+                        print(f"  {row.get('id')}  {row.get('source', '')}")
+                    if len(candidates) > 100:
+                        print(f"  ... {len(candidates) - 100} more")
+                    return None
+                return [row["id"] for row in candidates]
+
+            ids = _trace_ids()
+            if ids is None:
+                db.close()
+                return
+
+            def _render_trace(sid):
+                meta = db.get_session(sid) or {}
+                messages = db.get_messages_as_conversation(sid)
+                if not messages:
+                    return None
+                return build_trace_jsonl(
+                    messages,
+                    session_id=sid,
+                    model=meta.get("model") or "",
+                    cwd="",
+                    redact=redact_trace,
+                )
+
+            try:
+                if len(ids) == 1:
+                    jsonl = _render_trace(ids[0])
+                    if not jsonl:
+                        print(f"No transcript to export for session '{ids[0]}'.")
+                        db.close()
+                        return
+                    if not args.output or args.output == "-":
+                        sys.stdout.write(jsonl)
+                    else:
+                        with open(args.output, "w", encoding="utf-8") as f:
+                            f.write(jsonl)
+                        print(f"Exported 1 session trace to {args.output}")
+                else:
+                    out_dir = (
+                        Path(args.output).expanduser()
+                        if args.output and args.output != "-"
+                        else get_hermes_home() / "session-exports"
+                    )
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    exported = 0
+                    for sid in ids:
+                        jsonl = _render_trace(sid)
+                        if not jsonl:
+                            continue
+                        (out_dir / f"{sid}.trace.jsonl").write_text(
+                            jsonl, encoding="utf-8"
+                        )
+                        exported += 1
+                    print(f"Exported {exported} session trace(s) to {out_dir}")
+            except TraceRedactionError:
+                print("Redaction failed; refusing to export unredacted trace content.")
+            db.close()
+            return
+
+        if args.format == "jsonl":
+            if not args.output:
+                print("JSONL export requires an output path (use - for stdout).")
+                return
+            if args.session_id:
+                resolved_session_id = db.resolve_session_id(args.session_id)
+                if not resolved_session_id:
+                    print(f"Session '{args.session_id}' not found.")
+                    return
+                data = _redact(db.export_session(resolved_session_id))
+                if not data:
+                    print(f"Session '{args.session_id}' not found.")
+                    return
+                line = _json.dumps(data, ensure_ascii=False) + "\n"
+                if args.output == "-":
+
+                    sys.stdout.write(line)
+                else:
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        f.write(line)
+                    print(f"Exported 1 session to {args.output}")
+            else:
+                if filters:
+                    candidates = db.list_prune_candidates(**filters)
+                    if args.dry_run:
+                        print(
+                            f"Would export {len(candidates)} session(s) "
+                            f"({describe_filters(filters)})."
+                        )
+                        for row in candidates[:100]:
+                            print(f"  {row.get('id')}  {row.get('source', '')}")
+                        if len(candidates) > 100:
+                            print(f"  ... {len(candidates) - 100} more")
+                        return
+                    sessions = [
+                        s
+                        for s in (
+                            db.export_session(row["id"]) for row in candidates
+                        )
+                        if s
+                    ]
+                else:
+                    if args.dry_run:
+                        print("--dry-run requires at least one filter.")
+                        return
+                    sessions = db.export_all(source=None)
+                if args.output == "-":
+
+                    for s in sessions:
+                        sys.stdout.write(
+                            _json.dumps(_redact(s), ensure_ascii=False) + "\n"
+                        )
+                else:
+                    with open(args.output, "w", encoding="utf-8") as f:
+                        for s in sessions:
+                            f.write(
+                                _json.dumps(_redact(s), ensure_ascii=False) + "\n"
+                            )
+                    print(f"Exported {len(sessions)} sessions to {args.output}")
+            return
+
+        # Markdown / QMD export
+        from hermes_cli.session_export_md import (
+            append_manifest_entry,
+            verify_export_file,
+            write_session_markdown,
+        )
+
+        if args.output == "-":
+            print("Markdown/QMD export writes files; stdout (-) is only supported with --format jsonl.")
+            db.close()
+            return
+        output_dir = Path(args.output).expanduser() if args.output else get_hermes_home() / "session-exports"
+
+        def _export_one(session_id: str, *, include_lineage: bool = False):
+            data = (
+                db.export_session_lineage(session_id)
+                if include_lineage
+                else db.export_session(session_id)
+            )
+            if not data:
+                return None, None
+            data = _redact(data)
+            path = write_session_markdown(
+                data,
+                output_dir,
+                fmt=args.format,
+                force=args.force,
+            )
+            append_manifest_entry(output_dir, data, path, fmt=args.format)
+            return data, path
+
+        if args.delete_after_verified and not args.yes:
+            print("--delete-after-verified requires --yes.")
+            db.close()
+            return
+        if args.delete_after_verified and not args.session_id:
+            print("--delete-after-verified is only supported with --session-id.")
+            db.close()
+            return
+
+        lineage_is_logical = getattr(args, "lineage", "single") == "logical"
+
+        if args.session_id:
+            resolved_session_id = db.resolve_session_id(args.session_id)
+            if not resolved_session_id:
+                print(f"Session '{args.session_id}' not found.")
+                db.close()
+                return
+            delete_target_ids = [resolved_session_id]
+            if args.delete_after_verified:
+                delete_target_ids = db.get_session_delete_targets(
+                    resolved_session_id
+                )
+
+            exported_items = []
+            for target_id in delete_target_ids:
+                try:
+                    data, exported_path = _export_one(
+                        target_id,
+                        include_lineage=(
+                            target_id == resolved_session_id
+                            and lineage_is_logical
+                        ),
+                    )
+                except FileExistsError as e:
+                    print(
+                        f"Export already exists: {e}. "
+                        "Pass --force to overwrite."
+                    )
+                    db.close()
+                    return
+                if not data or not exported_path:
+                    print(
+                        f"Session '{target_id}' disappeared during export; "
+                        "nothing was deleted."
+                    )
+                    db.close()
+                    return
+                exported_items.append((data, exported_path))
+
+            message_count = sum(
+                len(data.get("messages") or [])
+                for data, _path in exported_items
+            )
+            suffix = "" if message_count == 1 else "s"
+            if len(exported_items) == 1:
+                print(
+                    f"Exported 1 session ({message_count} message{suffix}) "
+                    f"to {exported_items[0][1]}"
+                )
+            else:
+                print(
+                    f"Exported {len(exported_items)} sessions "
+                    f"({message_count} message{suffix}) to {output_dir}"
+                )
+            if args.delete_after_verified:
+                for data, exported_path in exported_items:
+                    ok, reason = verify_export_file(exported_path, data)
+                    if not ok:
+                        print(
+                            "Export verification failed; not deleting "
+                            f"session '{data.get('id')}': {reason}"
+                        )
+                        db.close()
+                        return
+                sessions_dir = get_hermes_home() / "sessions"
+                if db.delete_session(
+                    resolved_session_id,
+                    sessions_dir=sessions_dir,
+                    expected_delete_ids=delete_target_ids,
+                ):
+                    delegate_count = len(delete_target_ids) - 1
+                    delegate_suffix = (
+                        ""
+                        if not delegate_count
+                        else f" and {delegate_count} delegate session"
+                        f"{'' if delegate_count == 1 else 's'}"
+                    )
+                    print(
+                        f"Deleted exported session '{resolved_session_id}'"
+                        f"{delegate_suffix}."
+                    )
+                else:
+                    print(
+                        f"Exported, but session '{resolved_session_id}' was "
+                        "not deleted because its delegate set changed."
+                    )
+            db.close()
+            return
+
+        if not filters:
+            print(
+                "Refusing bulk export without a filter. Pass --session-id or "
+                "at least one filter (e.g. --older-than 90, --source telegram)."
+            )
+            db.close()
+            return
+        candidates = db.list_prune_candidates(**filters)
+        if args.dry_run:
+            print(
+                f"Would export {len(candidates)} session(s) "
+                f"({describe_filters(filters)})."
+            )
+            for row in candidates[:100]:
+                print(f"  {row.get('id')}  {row.get('source', '')}")
+            if len(candidates) > 100:
+                print(f"  ... {len(candidates) - 100} more")
+            db.close()
+            return
+        exported = 0
+        for row in candidates:
+            try:
+                data, exported_path = _export_one(
+                    row["id"],
+                    include_lineage=lineage_is_logical,
+                )
+            except FileExistsError as e:
+                print(f"Skipping existing export: {e}. Pass --force to overwrite.")
+                continue
+            if data and exported_path:
+                exported += 1
+        print(f"Exported {exported} session(s) to {output_dir}")
+
+    elif action == "delete":
+        resolved_session_id = db.resolve_session_id(args.session_id)
+        if not resolved_session_id:
+            print(f"Session '{args.session_id}' not found.")
+            return
+        if not args.yes:
+            if not _confirm_prompt(
+                f"Delete session '{resolved_session_id}' and all its messages? [y/N] "
+            ):
+                print("Cancelled.")
+                return
+        sessions_dir = get_hermes_home() / "sessions"
+        if db.delete_session(resolved_session_id, sessions_dir=sessions_dir):
+            print(f"Deleted session '{resolved_session_id}'.")
+        else:
+            print(f"Session '{args.session_id}' not found.")
+
+    elif action in ("prune", "archive"):
+        from hermes_cli.session_filters import (
+            build_prune_filters,
+            describe_filters,
+            format_epoch,
+        )
+
+        # Preserve the historical default ONLY for a truly bare
+        # `hermes sessions prune`: no time window and no filters at all
+        # means "older than 90 days". ANY filter â€” including --source â€”
+        # suppresses the implicit cutoff, so `prune --source cron`
+        # matches ALL cron sessions regardless of age. The preview +
+        # confirmation below (count, oldest/newest) is the safety net.
+        _non_time_filters = any(
+            getattr(args, a, None) is not None
+            for a in (
+                "source", "title", "end_reason", "cwd",
+                "min_messages", "max_messages", "model", "provider",
+                "user", "chat_id", "chat_type", "branch",
+                "min_tokens", "max_tokens", "min_cost", "max_cost",
+                "min_tool_calls", "max_tool_calls",
+            )
+        )
+        if (
+            action == "prune"
+            and args.older_than is None
+            and args.newer_than is None
+            and args.before is None
+            and args.after is None
+            and not _non_time_filters
+        ):
+            args.older_than = "90"
+
+        try:
+            filters = build_prune_filters(args)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return
+
+        if action == "archive" and not any(
+            v for k, v in filters.items() if k != "older_than_days"
+        ):
+            print(
+                "Refusing to archive every ended session: pass at least one "
+                "filter (e.g. --newer-than 5h, --source cli, --title codex)."
+            )
+            return
+
+        # Prune skips archived sessions unless --include-archived;
+        # archive only targets not-yet-archived rows (idempotent).
+        if action == "prune":
+            filters["archived"] = (
+                None if getattr(args, "include_archived", False) else False
+            )
+        else:
+            filters["archived"] = False
+
+        candidates = db.list_prune_candidates(**filters)
+        verb = "Delete" if action == "prune" else "Archive"
+        if not candidates:
+            print(f"No sessions match ({describe_filters(filters)}).")
+            return
+
+        # Candidates are ordered by activity oldest-first. Surface that
+        # span so a long-lived but recently used conversation cannot look
+        # old merely because of its creation date.
+        _oldest = candidates[0].get("last_active")
+        _newest = candidates[-1].get("last_active")
+        _span = (
+            f"oldest activity {format_epoch(_oldest)}, "
+            f"newest activity {format_epoch(_newest)}"
+        )
+
+        if args.dry_run or not args.yes:
+            shown = candidates if args.dry_run else candidates[:15]
+            print(
+                f"{len(candidates)} session(s) match "
+                f"({describe_filters(filters)}; {_span}):"
+            )
+            for s in shown:
+                title = (s.get("title") or "")[:36]
+                model = (s.get("model") or "-").split("/")[-1][:24]
+                print(
+                    f"  {s['id']}  {format_epoch(s.get('last_active')):<17} "
+                    f"{s['source']:<10} {model:<24} "
+                    f"{s['message_count']:>4} msgs  {title}"
+                )
+            if len(candidates) > len(shown):
+                print(f"  â€¦ and {len(candidates) - len(shown)} more")
+            if args.dry_run:
+                print(f"Dry run â€” nothing {'deleted' if action == 'prune' else 'archived'}.")
+                return
+
+        if not args.yes:
+            if not _confirm_prompt(
+                f"{verb} these {len(candidates)} session(s) ({_span})? [y/N] "
+            ):
+                print("Cancelled.")
+                return
+
+        if action == "prune":
+            sessions_dir = get_hermes_home() / "sessions"
+            count = db.prune_sessions(sessions_dir=sessions_dir, **filters)
+            print(f"Pruned {count} session(s).")
+        else:
+            count = db.archive_sessions(**filters)
+            print(
+                f"Archived {count} session(s). They're hidden from listings "
+                "but fully recoverable (nothing was deleted)."
+            )
+
+    elif action == "rename":
+        resolved_session_id = db.resolve_session_id(args.session_id)
+        if not resolved_session_id:
+            print(f"Session '{args.session_id}' not found.")
+            return
+        title = " ".join(args.title)
+        try:
+            if db.set_session_title(resolved_session_id, title):
+                print(f"Session '{resolved_session_id}' renamed to: {title}")
+            else:
+                print(f"Session '{args.session_id}' not found.")
+        except ValueError as e:
+            print(f"Error: {e}")
+
+    elif action == "retitle-skills":
+        from agent.skill_commands import describe_skill_invocation
+        from agent.title_generator import generate_title
+
+        limit = max(1, int(getattr(args, "limit", 200) or 200))
+        apply_changes = bool(getattr(args, "apply", False))
+
+        def _is_titlelike(candidate: str) -> bool:
+            """Reject a candidate that isn't a title at all.
+
+            An auxiliary model occasionally answers the prompt instead of
+            titling it and echoes the assistant's output ('$ df -h /'). The
+            live path has no alternative and takes what it gets, but this is
+            a REPAIR â€” replacing a serviceable title with command output
+            would make things worse, so keep the old one.
+            """
+            return bool(candidate) and candidate[0].isalnum()
+
+        candidates = db.list_skill_scaffolded_sessions(limit=limit)
+        if not candidates:
+            print("No sessions were titled from a /skill invocation.")
+            return
+
+        print(
+            f"{len(candidates)} session(s) opened with a /skill"
+            f"{'' if apply_changes else ' (dry run â€” pass --apply to write)'}:"
+        )
+        changed = 0
+        for row in candidates:
+            session_id = row["id"]
+            typed = describe_skill_invocation(row["content"]) or ""
+            new_title = generate_title(typed)
+            if not new_title or new_title == row["title"]:
+                continue
+            if not _is_titlelike(new_title):
+                print(f"  {session_id}\n    kept {row['title']!r} â€” got {new_title!r}")
+                continue
+            print(f"  {session_id}\n    {row['title']!r}\n    â†’ {new_title!r}")
+            changed += 1
+            if not apply_changes:
+                continue
+            try:
+                db.set_session_title(session_id, new_title)
+            except ValueError:
+                # Unique-title collision. Dedupe the same way the live
+                # auto-titler does (base #2, base #3, ...) rather than
+                # leaving the leaked title in place.
+                deduped = db.get_next_title_in_lineage(new_title)
+                try:
+                    db.set_session_title(session_id, deduped)
+                    print(f"    (renamed to {deduped!r} â€” title was taken)")
+                except ValueError as e:
+                    print(f"    skipped: {e}")
+                    changed -= 1
+
+        if not changed:
+            print("  every title already reflects the user's request.")
+        elif apply_changes:
+            print(f"âœ“ Re-titled {changed} session(s).")
+
+    elif action == "browse":
+        limit = getattr(args, "limit", 500) or 500
+        source = getattr(args, "source", None)
+        _browse_exclude = None if source else ["tool"]
+        sessions = db.list_sessions_rich(
+            source=source, exclude_sources=_browse_exclude, limit=limit
+        )
+        db.close()
+        if not sessions:
+            print("No sessions found.")
+            return
+
+        selected_id = _session_browse_picker(sessions)
+        if not selected_id:
+            print("Cancelled.")
+            return
+
+        # Launch hermes --resume <id> by replacing the current process
+        print(f"Resuming session: {selected_id}")
+        from hermes_cli.relaunch import relaunch
+
+        relaunch(["--resume", selected_id])
+        return  # won't reach here after execvp
+
+    elif action == "optimize":
+        db_path = db.db_path
+        before_mb = (
+            os.path.getsize(db_path) / (1024 * 1024)
+            if db_path.exists()
+            else 0.0
+        )
+        print("Optimizing session store (FTS merge + VACUUM)â€¦")
+        try:
+            # vacuum() merges FTS5 segments (optimize_fts) then VACUUMs,
+            # and returns the number of indexes it merged.
+            n = db.vacuum()
+        except Exception as e:
+            print(f"Error: optimization failed: {e}")
+            db.close()
+            return
+        after_mb = (
+            os.path.getsize(db_path) / (1024 * 1024)
+            if db_path.exists()
+            else 0.0
+        )
+        # Same WAL caveat as optimize-storage: after a VACUUM the main file
+        # on disk lags until the WAL is checkpointed back (refused while a
+        # live gateway holds a read-mark), so stat() understates the win and
+        # can go negative. SQLite's page accounting is correct immediately.
+        logical_after = db.logical_size_bytes()
+        if logical_after is not None:
+            after_mb = logical_after / (1024 * 1024)
+        saved = before_mb - after_mb
+        print(f"Optimized {n} FTS index(es).")
+        print(
+            f"Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
+            f"({_size_delta_label(saved)})"
+        )
+
+    elif action == "clean-markers":
+        if args.dry_run:
+            print("Dry run â€” scanning for stale tool-call marker rows (#78148)â€¦")
+        else:
+            print("Scanning for stale tool-call marker rows (#78148)â€¦")
+        report = db.purge_stale_tool_call_markers(
+            dry_run=args.dry_run, backup=not args.no_backup
+        )
+        if report["rows_affected"] == 0:
+            print("âœ“ No affected rows found â€” nothing to clean.")
+        elif args.dry_run:
+            print(
+                f"Would clear {report['rows_affected']} row(s): "
+                f"ids {report['row_ids']}"
+            )
+        else:
+            if report["backup_path"]:
+                print(f"  backup: {report['backup_path']}")
+            print(f"âœ“ Cleared {report['rows_affected']} row(s).")
+
+    elif action == "optimize-storage":
+        db_path = db.db_path
+        if not db.fts_optimize_available():
+            print("Search index is already on the compact layout â€” nothing to do.")
+            db.close()
+            return
+
+        before_bytes = os.path.getsize(db_path) if db_path.exists() else 0
+        before_mb = before_bytes / (1024 * 1024)
+
+        # Disk preflight: the rebuild adds the new index before the old is
+        # torn down, and the final VACUUM needs a full second copy of the
+        # file. Require headroom â‰ˆ current file size to finish cleanly.
+        do_vacuum = not getattr(args, "no_vacuum", False)
+        try:
+            import shutil as _shutil
+            free_bytes = _shutil.disk_usage(db_path.parent).free
+        except Exception:
+            free_bytes = None
+        need_bytes = before_bytes if do_vacuum else int(before_bytes * 0.3)
+        print(f"Search-index optimization for {db_path}")
+        print(f"  Current database size: {before_mb:.1f} MB")
+        if free_bytes is not None:
+            print(f"  Free disk: {free_bytes / (1024*1024):.0f} MB "
+                  f"(need ~{need_bytes / (1024*1024):.0f} MB to complete"
+                  f"{' incl. VACUUM' if do_vacuum else ''})")
+            if free_bytes < need_bytes:
+                print()
+                print("âš  Not enough free disk to complete safely. Free up "
+                      "space, or run with --no-vacuum (rebuilds the index "
+                      "but doesn't reclaim space until a later VACUUM).")
+                db.close()
+                return
+        if before_mb > 500:
+            print("  This may take a while on a large database. It runs in "
+                  "the foreground with progress below; safe to Ctrl-C and "
+                  "re-run (it resumes).")
+        if not getattr(args, "yes", False):
+            try:
+                resp = input("Proceed? [y/N] ").strip().lower()
+            except EOFError:
+                resp = ""
+            if resp not in ("y", "yes"):
+                print("Cancelled.")
+                db.close()
+                return
+
+        _last = {"phase": None}
+
+        def _progress(info):
+            phase = info.get("phase")
+            pct = info.get("percent", 0)
+            if phase == "backfill":
+                print(f"\r  Rebuilding index: {pct:3d}% "
+                      f"({info.get('indexed',0):,}/{info.get('total',0):,})",
+                      end="", flush=True)
+            elif phase != _last["phase"]:
+                label = {"teardown": "Reclaiming old index",
+                         "vacuum": "Compacting database (VACUUM)",
+                         "done": "Done"}.get(phase, phase)
+                print(f"\n  {label}â€¦", flush=True)
+            _last["phase"] = phase
+
+        print("Optimizing search-index storageâ€¦")
+        try:
+            result = db.optimize_fts_storage(
+                progress_cb=_progress, vacuum=do_vacuum
+            )
+        except Exception as e:
+            print(f"\nError: optimization failed: {e}")
+            print("No data was lost. Re-run to resume.")
+            db.close()
+            return
+        if not result.get("ok"):
+            print(f"\nCould not optimize: {result.get('reason', 'unknown')}")
+            db.close()
+            return
+        after_mb = (
+            os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
+        )
+        # Prefer SQLite's own page accounting over stat(). In WAL mode a
+        # VACUUM's rewrite sits in the -wal file until a checkpoint folds it
+        # back, and that checkpoint is refused while another connection (a
+        # live gateway) holds a read-mark â€” so the main file on disk still
+        # reads at its pre-VACUUM size and keeps growing. stat()ing it here
+        # reported "reclaimed -3820.1 MB" on a DB that had actually shrunk
+        # 60%. page_count * page_size is correct immediately.
+        logical_after = db.logical_size_bytes()
+        if logical_after is not None:
+            after_mb = logical_after / (1024 * 1024)
+        saved = before_mb - after_mb
+        print(f"\nâœ“ Search index optimized.")
+        print(
+            f"  Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
+            f"({_size_delta_label(saved)})"
+        )
+        if result.get("vacuumed") is False:
+            print("  (VACUUM was skipped or failed â€” run "
+                  "`hermes sessions optimize` later to reclaim freed space.)")
+
+    elif action == "repair-routing":
+        records = db.find_orphaned_gateway_sessions(
+            max_gap_s=getattr(args, "max_gap_seconds", None)
+        )
+        adoptable = [r for r in records if r["adoptable"]]
+        for record in records:
+            print(f"{record['orphan_id']}  ({record['source']}, "
+                  f"{record['message_count']} messages)")
+            if record["adoptable"]:
+                print(f"  â†’ adopt into {record['session_key']} "
+                      f"(from {record['donor_id']}, "
+                      f"evidence: {record['evidence']})")
+            else:
+                print(f"  âœ— not repairable â€” {record['reason']}")
+
+        if not records:
+            print("âœ“ No gateway sessions are missing their routing identity.")
+        elif not adoptable:
+            print(f"\n{len(records)} orphaned session(s) found, none "
+                  "unambiguously repairable. Nothing to do.")
+        elif not getattr(args, "apply", False):
+            print(f"\n{len(adoptable)} of {len(records)} orphaned session(s) "
+                  "can be repaired. Re-run with --apply to perform them.")
+        else:
+            # A running gateway holds the old routing mapping in memory and
+            # would write it back over the repair on its next save.
+            print("\nStop the gateway before applying â€” a running gateway "
+                  "still holds the old routing mapping in memory.")
+            if _confirm_prompt(
+                f"Adopt {len(adoptable)} orphaned session(s)? [y/N] "
+            ):
+                repaired = 0
+                for record in adoptable:
+                    if db.adopt_orphaned_gateway_session(
+                        record["orphan_id"], record["donor_id"]
+                    ):
+                        repaired += 1
+                        print(f"âœ“ {record['orphan_id']} now owns "
+                              f"{record['session_key']}")
+                    else:
+                        print(f"âœ— {record['orphan_id']} was not adopted "
+                              "(the row changed since it was reported)")
+                print(f"\nRepaired {repaired} of {len(adoptable)} session(s).")
+            else:
+                print("Aborted â€” nothing was changed.")
+
+    elif action == "stats":
+        total = db.session_count()
+        msgs = db.message_count()
+        print(f"Total sessions: {total}")
+        print(f"Total messages: {msgs}")
+        for src in ["cli", "telegram", "discord", "whatsapp", "slack"]:
+            c = db.session_count(source=src)
+            if c > 0:
+                print(f"  {src}: {c} sessions")
+        db_path = db.db_path
+        if db_path.exists():
+            size_mb = os.path.getsize(db_path) / (1024 * 1024)
+            print(f"Database size: {size_mb:.1f} MB")
+
+    else:
+        sessions_parser.print_help()
+
+    db.close()

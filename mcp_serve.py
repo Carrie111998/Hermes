@@ -427,4 +427,631 @@ class EventBridge:
 
         return None
 
-    def list_pending_approvals(self) -> List[dict]Ûßw¶‰žËkºwµçqÑ•È½¹Ù•ÉÍ…Ñ¥½¹Ì‰ä¹…µ”4(€€€€€€€€ˆˆˆ4(€€€€€€€±¥µ¥Ð€ô}½•É•}¥¹Ð¡±¥µ¥Ð°‘•™…Õ±ÐôÔÀ°µ¥¹¥µÕ´ôÄ°µ…á¥µÕ´ôÈÀÀ¤4(€€€€€€€•¹ÑÉ¥•Ì€ô}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤4(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¹Ì€ômt4(4(€€€€€€€™½È­•ä°•¹ÑÉä¥¸•¹ÑÉ¥•Ì¹¥Ñ•µÌ ¤è4(€€€€€€€€€€€½É¥¥¸€ô•¹ÑÉä¹•Ð ‰½É¥¥¸ˆ°íô¤4(€€€€€€€€€€€•¹ÑÉå}Á±…Ñ™½É´€ô•¹ÑÉä¹•Ð ‰Á±…Ñ™½É´ˆ¤½È½É¥¥¸¹•Ð ‰Á±…Ñ™½É´ˆ°€ˆˆ¤4(4(€€€€€€€€€€€¥˜Á±…Ñ™½É´…¹•¹ÑÉå}Á±…Ñ™½É´¹±½Ý•È ¤€„ôÁ±…Ñ™½É´¹±½Ý•È ¤è4(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(4(€€€€€€€€€€€‘¥ÍÁ±…å}¹…µ”€ô•¹ÑÉä¹•Ð ‰‘¥ÍÁ±…å}¹…µ”ˆ°€ˆˆ¤4(€€€€€€€€€€€¡…Ñ}¹…µ”€ô½É¥¥¸¹•Ð ‰¡…Ñ}¹…µ”ˆ°€ˆˆ¤4(€€€€€€€€€€€¥˜Í•…É è4(€€€€€€€€€€€€€€€Í•…É¡}±½Ý•È€ôÍ•…É ¹±½Ý•È ¤4(€€€€€€€€€€€€€€€¥˜€¡Í•…É¡}±½Ý•È¹½Ð¥¸‘¥ÍÁ±…å}¹…µ”¹±½Ý•È ¤4(€€€€€€€€€€€€€€€€€€€€€€€…¹Í•…É¡}±½Ý•È¹½Ð¥¸¡…Ñ}¹…µ”¹±½Ý•È ¤4(€€€€€€€€€€€€€€€€€€€€€€€…¹Í•…É¡}±½Ý•È¹½Ð¥¸­•ä¹±½Ý•È ¤¤è4(€€€€€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(4(€€€€€€€€€€€½¹Ù•ÉÍ…Ñ¥½¹Ì¹…ÁÁ•¹¡ì4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆè­•ä°4(€€€€€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆè•¹ÑÉä¹•Ð ‰Í•ÍÍ¥½¹}¥ˆ°€ˆˆ¤°4(€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè•¹ÑÉå}Á±…Ñ™½É´°4(€€€€€€€€€€€€€€€€‰¡…Ñ}ÑåÁ”ˆè•¹ÑÉä¹•Ð ‰¡…Ñ}ÑåÁ”ˆ°½É¥¥¸¹•Ð ‰¡…Ñ}ÑåÁ”ˆ°€ˆˆ¤¤°4(€€€€€€€€€€€€€€€€‰‘¥ÍÁ±…å}¹…µ”ˆè‘¥ÍÁ±…å}¹…µ”°4(€€€€€€€€€€€€€€€€‰¡…Ñ}¹…µ”ˆè¡…Ñ}¹…µ”°4(€€€€€€€€€€€€€€€€‰ÕÍ•É}¹…µ”ˆè½É¥¥¸¹•Ð ‰ÕÍ•É}¹…µ”ˆ°€ˆˆ¤°4(€€€€€€€€€€€€€€€€‰ÕÁ‘…Ñ•‘}…Ðˆè•¹ÑÉä¹•Ð ‰ÕÁ‘…Ñ•‘}…Ðˆ°€ˆˆ¤°4(€€€€€€€€€€€ô¤4(4(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¹Ì¹Í½ÉÐ¡­•äõ±…µ‰‘„ŒèŒ¹•Ð ‰ÕÁ‘…Ñ•‘}…Ðˆ°€ˆˆ¤°É•Ù•ÉÍ”õQÉÕ”¤4(€€€€€€€½¹Ù•ÉÍ…Ñ¥½¹Ì€ô½¹Ù•ÉÍ…Ñ¥½¹Ílé±¥µ¥Ñt4(4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì4(€€€€€€€€€€€€‰½Õ¹Ðˆè±•¸¡½¹Ù•ÉÍ…Ñ¥½¹Ì¤°4(€€€€€€€€€€€€‰½¹Ù•ÉÍ…Ñ¥½¹Ìˆè½¹Ù•ÉÍ…Ñ¥½¹Ì°4(€€€€€€€ô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´½¹Ù•ÉÍ…Ñ¥½¹}•Ð€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜½¹Ù•ÉÍ…Ñ¥½¹}•Ð¡Í•ÍÍ¥½¹}­•äèÍÑÈ¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰•Ð‘•Ñ…¥±•¥¹™¼…‰½ÕÐ½¹”½¹Ù•ÉÍ…Ñ¥½¸‰ä¥ÑÌÍ•ÍÍ¥½¸­•ä¸4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äèQ¡”Í•ÍÍ¥½¸­•ä™É½´½¹Ù•ÉÍ…Ñ¥½¹Í}±¥ÍÐ4(€€€€€€€€ˆˆˆ4(€€€€€€€•¹ÑÉ¥•Ì€ô}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤4(€€€€€€€•¹ÑÉä€ô•¹ÑÉ¥•Ì¹•Ð¡Í•ÍÍ¥½¹}­•ä¤4(4(€€€€€€€¥˜¹½Ð•¹ÑÉäè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè˜‰½¹Ù•ÉÍ…Ñ¥½¸¹½Ð™½Õ¹èíÍ•ÍÍ¥½¹}­•åô‰ô¤4(4(€€€€€€€½É¥¥¸€ô•¹ÑÉä¹•Ð ‰½É¥¥¸ˆ°íô¤4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì4(€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆèÍ•ÍÍ¥½¹}­•ä°4(€€€€€€€€€€€€‰Í•ÍÍ¥½¹}¥ˆè•¹ÑÉä¹•Ð ‰Í•ÍÍ¥½¹}¥ˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰Á±…Ñ™½É´ˆè•¹ÑÉä¹•Ð ‰Á±…Ñ™½É´ˆ¤½È½É¥¥¸¹•Ð ‰Á±…Ñ™½É´ˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰¡…Ñ}ÑåÁ”ˆè•¹ÑÉä¹•Ð ‰¡…Ñ}ÑåÁ”ˆ°½É¥¥¸¹•Ð ‰¡…Ñ}ÑåÁ”ˆ°€ˆˆ¤¤°4(€€€€€€€€€€€€‰‘¥ÍÁ±…å}¹…µ”ˆè•¹ÑÉä¹•Ð ‰‘¥ÍÁ±…å}¹…µ”ˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰ÕÍ•É}¹…µ”ˆè½É¥¥¸¹•Ð ‰ÕÍ•É}¹…µ”ˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰¡…Ñ}¹…µ”ˆè½É¥¥¸¹•Ð ‰¡…Ñ}¹…µ”ˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰¡…Ñ}¥ˆè½É¥¥¸¹•Ð ‰¡…Ñ}¥ˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰Ñ¡É•…‘}¥ˆè½É¥¥¸¹•Ð ‰Ñ¡É•…‘}¥ˆ¤°4(€€€€€€€€€€€€‰ÕÁ‘…Ñ•‘}…Ðˆè•¹ÑÉä¹•Ð ‰ÕÁ‘…Ñ•‘}…Ðˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰É•…Ñ•‘}…Ðˆè•¹ÑÉä¹•Ð ‰É•…Ñ•‘}…Ðˆ°€ˆˆ¤°4(€€€€€€€€€€€€‰¥¹ÁÕÑ}Ñ½­•¹Ìˆè•¹ÑÉä¹•Ð ‰¥¹ÁÕÑ}Ñ½­•¹Ìˆ°€À¤°4(€€€€€€€€€€€€‰½ÕÑÁÕÑ}Ñ½­•¹Ìˆè•¹ÑÉä¹•Ð ‰½ÕÑÁÕÑ}Ñ½­•¹Ìˆ°€À¤°4(€€€€€€€€€€€€‰Ñ½Ñ…±}Ñ½­•¹Ìˆè•¹ÑÉä¹•Ð ‰Ñ½Ñ…±}Ñ½­•¹Ìˆ°€À¤°4(€€€€€€€ô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´µ•ÍÍ…•Í}É•…€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜µ•ÍÍ…•Í}É•… 4(€€€€€€€Í•ÍÍ¥½¹}­•äèÍÑÈ°4(€€€€€€€±¥µ¥Ðè¥¹Ð€ô€ÔÀ°4(€€€€¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰I•…É••¹Ðµ•ÍÍ…•Ì™É½´„½¹Ù•ÉÍ…Ñ¥½¸¸4(4(€€€€€€€I•ÑÕÉ¹ÌÑ¡”µ•ÍÍ…”¡¥ÍÑ½Éä¥¸¡É½¹½±½¥…°½É‘•ÈÝ¥Ñ É½±”°½¹Ñ•¹Ð°4(€€€€€€€…¹Ñ¥µ•ÍÑ…µÀ™½È•… µ•ÍÍ…”¸4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äèQ¡”Í•ÍÍ¥½¸­•ä™É½´½¹Ù•ÉÍ…Ñ¥½¹Í}±¥ÍÐ4(€€€€€€€€€€€±¥µ¥Ðè5…á¥µÕ´¹Õµ‰•È½˜µ•ÍÍ…•ÌÑ¼É•ÑÕÉ¸€¡‘•™…Õ±Ð€ÔÀ°µ½ÍÐÉ••¹Ð¤4(€€€€€€€€ˆˆˆ4(€€€€€€€±¥µ¥Ð€ô}½•É•}¥¹Ð¡±¥µ¥Ð°‘•™…Õ±ÐôÔÀ°µ¥¹¥µÕ´ôÄ°µ…á¥µÕ´ôÈÀÀ¤4(€€€€€€€•¹ÑÉ¥•Ì€ô}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤4(€€€€€€€•¹ÑÉä€ô•¹ÑÉ¥•Ì¹•Ð¡Í•ÍÍ¥½¹}­•ä¤4(€€€€€€€¥˜¹½Ð•¹ÑÉäè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè˜‰½¹Ù•ÉÍ…Ñ¥½¸¹½Ð™½Õ¹èíÍ•ÍÍ¥½¹}­•åô‰ô¤4(4(€€€€€€€Í•ÍÍ¥½¹}¥€ô•¹ÑÉä¹•Ð ‰Í•ÍÍ¥½¹}¥ˆ°€ˆˆ¤4(€€€€€€€¥˜¹½ÐÍ•ÍÍ¥½¹}¥è4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè€‰9¼Í•ÍÍ¥½¸%™½ÈÑ¡¥Ì½¹Ù•ÉÍ…Ñ¥½¸‰ô¤4(4(€€€€€€€…±±}µ•ÍÍ…•Ì°•ÉÉ½È€ô}±½…‘}Í•ÍÍ¥½¹}µ•ÍÍ…•Ì¡Í•ÍÍ¥½¹}¥¤(€€€€€€€¥˜•ÉÉ½Èè(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè•ÉÉ½Éô¤(4(€€€€€€€™¥±Ñ•É•€ômt4(€€€€€€€™½ÈµÍœ¥¸…±±}µ•ÍÍ…•Ìè4(€€€€€€€€€€€É½±”€ôµÍœ¹•Ð ‰É½±”ˆ°€ˆˆ¤4(€€€€€€€€€€€¥˜É½±”¥¸ì‰ÕÍ•Èˆ°€‰…ÍÍ¥ÍÑ…¹Ð‰ôè4(€€€€€€€€€€€€€€€½¹Ñ•¹Ð€ô}•áÑÉ…Ñ}µ•ÍÍ…•}½¹Ñ•¹Ð¡µÍœ¤4(€€€€€€€€€€€€€€€¥˜½¹Ñ•¹Ðè4(€€€€€€€€€€€€€€€€€€€™¥±Ñ•É•¹…ÁÁ•¹¡ì4(€€€€€€€€€€€€€€€€€€€€€€€€‰¥ˆèÍÑÈ¡µÍœ¹•Ð ‰¥ˆ°€ˆˆ¤¤°4(€€€€€€€€€€€€€€€€€€€€€€€€‰É½±”ˆèÉ½±”°4(€€€€€€€€€€€€€€€€€€€€€€€€‰½¹Ñ•¹Ðˆè½¹Ñ•¹ÑlèÈÀÀÁt°4(€€€€€€€€€€€€€€€€€€€€€€€€‰Ñ¥µ•ÍÑ…µÀˆèµÍœ¹•Ð ‰Ñ¥µ•ÍÑ…µÀˆ°€ˆˆ¤°4(€€€€€€€€€€€€€€€€€€€ô¤4(4(€€€€€€€µ•ÍÍ…•Ì€ô™¥±Ñ•É•‘lµ±¥µ¥Ðét4(4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì4(€€€€€€€€€€€€‰Í•ÍÍ¥½¹}­•äˆèÍ•ÍÍ¥½¹}­•ä°4(€€€€€€€€€€€€‰½Õ¹Ðˆè±•¸¡µ•ÍÍ…•Ì¤°4(€€€€€€€€€€€€‰Ñ½Ñ…±}¥¹}Í•ÍÍ¥½¸ˆè±•¸¡™¥±Ñ•É•¤°4(€€€€€€€€€€€€‰µ•ÍÍ…•Ìˆèµ•ÍÍ…•Ì°4(€€€€€€€ô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´…ÑÑ…¡µ•¹ÑÍ}™•Ñ €´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜…ÑÑ…¡µ•¹ÑÍ}™•Ñ  4(€€€€€€€Í•ÍÍ¥½¹}­•äèÍÑÈ°4(€€€€€€€µ•ÍÍ…•}¥èÍÑÈ°4(€€€€¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰1¥ÍÐ¹½¸µÑ•áÐ…ÑÑ…¡µ•¹ÑÌ™½È„µ•ÍÍ…”¥¸„½¹Ù•ÉÍ…Ñ¥½¸¸4(4(€€€€€€€áÑÉ…ÑÌ¥µ…•Ì°µ•‘¥„™¥±•Ì°…¹½Ñ¡•È¹½¸µÑ•áÐ½¹Ñ•¹Ð‰±½­Ì4(€€€€€€€™É½´Ñ¡”ÍÁ•¥™¥•µ•ÍÍ…”¸4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äèQ¡”Í•ÍÍ¥½¸­•ä™É½´½¹Ù•ÉÍ…Ñ¥½¹Í}±¥ÍÐ4(€€€€€€€€€€€µ•ÍÍ…•}¥èQ¡”µ•ÍÍ…”%™É½´µ•ÍÍ…•Í}É•…4(€€€€€€€€ˆˆˆ4(€€€€€€€•¹ÑÉ¥•Ì€ô}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤4(€€€€€€€•¹ÑÉä€ô•¹ÑÉ¥•Ì¹•Ð¡Í•ÍÍ¥½¹}­•ä¤4(€€€€€€€¥˜¹½Ð•¹ÑÉäè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè˜‰½¹Ù•ÉÍ…Ñ¥½¸¹½Ð™½Õ¹èíÍ•ÍÍ¥½¹}­•åô‰ô¤4(4(€€€€€€€Í•ÍÍ¥½¹}¥€ô•¹ÑÉä¹•Ð ‰Í•ÍÍ¥½¹}¥ˆ°€ˆˆ¤4(€€€€€€€¥˜¹½ÐÍ•ÍÍ¥½¹}¥è4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè€‰9¼Í•ÍÍ¥½¸%™½ÈÑ¡¥Ì½¹Ù•ÉÍ…Ñ¥½¸‰ô¤4(4(€€€€€€€…±±}µ•ÍÍ…•Ì°•ÉÉ½È€ô}±½…‘}Í•ÍÍ¥½¹}µ•ÍÍ…•Ì¡Í•ÍÍ¥½¹}¥¤(€€€€€€€¥˜•ÉÉ½Èè(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè•ÉÉ½Éô¤(4(€€€€€€€€Œ¥¹Ñ¡”Ñ…É•Ðµ•ÍÍ…”4(€€€€€€€Ñ…É•Ñ}µÍœ€ô9½¹”4(€€€€€€€™½ÈµÍœ¥¸…±±}µ•ÍÍ…•Ìè4(€€€€€€€€€€€¥˜ÍÑÈ¡µÍœ¹•Ð ‰¥ˆ°€ˆˆ¤¤€ôôµ•ÍÍ…•}¥è4(€€€€€€€€€€€€€€€Ñ…É•Ñ}µÍœ€ôµÍœ4(€€€€€€€€€€€€€€€‰É•…¬4(4(€€€€€€€¥˜¹½ÐÑ…É•Ñ}µÍœè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè˜‰5•ÍÍ…”¹½Ð™½Õ¹èíµ•ÍÍ…•}¥‘ô‰ô¤4(4(€€€€€€€…ÑÑ…¡µ•¹ÑÌ€ô}•áÑÉ…Ñ}…ÑÑ…¡µ•¹ÑÌ¡Ñ…É•Ñ}µÍœ¤4(4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì4(€€€€€€€€€€€€‰µ•ÍÍ…•}¥ˆèµ•ÍÍ…•}¥°4(€€€€€€€€€€€€‰½Õ¹Ðˆè±•¸¡…ÑÑ…¡µ•¹ÑÌ¤°4(€€€€€€€€€€€€‰…ÑÑ…¡µ•¹ÑÌˆè…ÑÑ…¡µ•¹ÑÌ°4(€€€€€€€ô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´•Ù•¹ÑÍ}Á½±°€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜•Ù•¹ÑÍ}Á½±° 4(€€€€€€€…™Ñ•É}ÕÉÍ½Èè¥¹Ð€ô€À°4(€€€€€€€Í•ÍÍ¥½¹}­•äè=ÁÑ¥½¹…±mÍÑÉt€ô9½¹”°4(€€€€€€€±¥µ¥Ðè¥¹Ð€ô€ÈÀ°4(€€€€¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰A½±°™½È¹•Ü½¹Ù•ÉÍ…Ñ¥½¸•Ù•¹ÑÌÍ¥¹”„ÕÉÍ½ÈÁ½Í¥Ñ¥½¸¸4(4(€€€€€€€I•ÑÕÉ¹Ì•Ù•¹ÑÌÑ¡…Ð¡…Ù”½ÕÉÉ•Í¥¹”Ñ¡”¥Ù•¸ÕÉÍ½È¸UÍ”Ñ¡”4(€€€€€€€É•ÑÕÉ¹•¹•áÑ}ÕÉÍ½ÈÙ…±Õ”™½ÈÍÕ‰Í•ÅÕ•¹ÐÁ½±±Ì¸4(4(€€€€€€€Ù•¹ÐÑåÁ•Ìèµ•ÍÍ…”°…ÁÁÉ½Ù…±}É•ÅÕ•ÍÑ•°…ÁÁÉ½Ù…±}É•Í½±Ù•4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€…™Ñ•É}ÕÉÍ½ÈèI•ÑÕÉ¸•Ù•¹ÑÌ…™Ñ•ÈÑ¡¥ÌÕÉÍ½È€ À™½È…±°¤4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äè=ÁÑ¥½¹…°™¥±Ñ•ÈÑ¼½¹”½¹Ù•ÉÍ…Ñ¥½¸4(€€€€€€€€€€€±¥µ¥Ðè5…á¥µÕ´•Ù•¹ÑÌÑ¼É•ÑÕÉ¸€¡‘•™…Õ±Ð€ÈÀ¤4(€€€€€€€€ˆˆˆ4(€€€€€€€…™Ñ•É}ÕÉÍ½È€ô}½•É•}¥¹Ð¡…™Ñ•É}ÕÉÍ½È°‘•™…Õ±ÐôÀ°µ¥¹¥µÕ´ôÀ°µ…á¥µÕ´ôÄÀ¨¨Äà¤4(€€€€€€€±¥µ¥Ð€ô}½•É•}¥¹Ð¡±¥µ¥Ð°‘•™…Õ±ÐôÈÀ°µ¥¹¥µÕ´ôÄ°µ…á¥µÕ´ôÈÀÀ¤4(€€€€€€€É•ÍÕ±Ð€ô‰É¥‘”¹Á½±±}•Ù•¹ÑÌ 4(€€€€€€€€€€€…™Ñ•É}ÕÉÍ½Èõ…™Ñ•É}ÕÉÍ½È°4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äõÍ•ÍÍ¥½¹}­•ä°4(€€€€€€€€€€€±¥µ¥Ðõ±¥µ¥Ð°4(€€€€€€€€¤4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡É•ÍÕ±Ð°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´•Ù•¹ÑÍ}Ý…¥Ð€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜•Ù•¹ÑÍ}Ý…¥Ð 4(€€€€€€€…™Ñ•É}ÕÉÍ½Èè¥¹Ð€ô€À°4(€€€€€€€Í•ÍÍ¥½¹}­•äè=ÁÑ¥½¹…±mÍÑÉt€ô9½¹”°4(€€€€€€€Ñ¥µ•½ÕÑ}µÌè¥¹Ð€ô€ÌÀÀÀÀ°4(€€€€¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰]…¥Ð™½ÈÑ¡”¹•áÐ½¹Ù•ÉÍ…Ñ¥½¸•Ù•¹Ð€¡±½¹œµÁ½±°¤¸4(4(€€€€€€€	±½­ÌÕ¹Ñ¥°„µ…Ñ¡¥¹œ•Ù•¹Ð…ÉÉ¥Ù•Ì½ÈÑ¡”Ñ¥µ•½ÕÐ•áÁ¥É•Ì¸4(€€€€€€€UÍ”Ñ¡¥Ì™½È¹•…ÈµÉ•…°µÑ¥µ”•Ù•¹Ð‘•±¥Ù•ÉäÝ¥Ñ¡½ÕÐÁ½±±¥¹œ¸4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€…™Ñ•É}ÕÉÍ½Èè]…¥Ð™½È•Ù•¹ÑÌ…™Ñ•ÈÑ¡¥ÌÕÉÍ½È4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äè=ÁÑ¥½¹…°™¥±Ñ•ÈÑ¼½¹”½¹Ù•ÉÍ…Ñ¥½¸4(€€€€€€€€€€€Ñ¥µ•½ÕÑ}µÌè5…á¥µÕ´Ý…¥ÐÑ¥µ”¥¸µ¥±±¥Í•½¹‘Ì€¡‘•™…Õ±Ð€ÌÀÀÀÀ¤4(€€€€€€€€ˆˆˆ4(€€€€€€€…™Ñ•É}ÕÉÍ½È€ô}½•É•}¥¹Ð¡…™Ñ•É}ÕÉÍ½È°‘•™…Õ±ÐôÀ°µ¥¹¥µÕ´ôÀ°µ…á¥µÕ´ôÄÀ¨¨Äà¤4(€€€€€€€Ñ¥µ•½ÕÑ}µÌ€ô}½•É•}¥¹Ð 4(€€€€€€€€€€€Ñ¥µ•½ÕÑ}µÌ°4(€€€€€€€€€€€‘•™…Õ±ÐôÌÀÀÀÀ°4(€€€€€€€€€€€µ¥¹¥µÕ´ôÀ°4(€€€€€€€€€€€µ…á¥µÕ´ôÌÀÀÀÀÀ°4(€€€€€€€€¤€€Œ…À…Ð€Ôµ¥¹ÕÑ•Ì4(€€€€€€€•Ù•¹Ð€ô‰É¥‘”¹Ý…¥Ñ}™½É}•Ù•¹Ð 4(€€€€€€€€€€€…™Ñ•É}ÕÉÍ½Èõ…™Ñ•É}ÕÉÍ½È°4(€€€€€€€€€€€Í•ÍÍ¥½¹}­•äõÍ•ÍÍ¥½¹}­•ä°4(€€€€€€€€€€€Ñ¥µ•½ÕÑ}µÌõÑ¥µ•½ÕÑ}µÌ°4(€€€€€€€€¤4(€€€€€€€¥˜•Ù•¹Ðè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•Ù•¹Ðˆè•Ù•¹Ñô°¥¹‘•¹ÐôÈ¤4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•Ù•¹Ðˆè9½¹”°€‰É•…Í½¸ˆè€‰Ñ¥µ•½ÕÐ‰ô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´µ•ÍÍ…•Í}Í•¹€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜µ•ÍÍ…•Í}Í•¹ 4(€€€€€€€Ñ…É•ÐèÍÑÈ°4(€€€€€€€µ•ÍÍ…”èÍÑÈ°4(€€€€¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰M•¹„µ•ÍÍ…”Ñ¼„Á±…Ñ™½É´½¹Ù•ÉÍ…Ñ¥½¸¸4(4(€€€€€€€Q¡”Ñ…É•Ð™½Éµ…Ð¥Ì€‰Á±…Ñ™½É´é¡…Ñ}¥ˆƒŠPÍ…µ”™½Éµ…ÐÕÍ•‰äÑ¡”4(€€€€€€€¡…¹¹•±Í}±¥ÍÐÑ½½°¸e½Ô…¸…±Í¼ÕÍ”¡Õµ…¸µ™É¥•¹‘±ä¡…¹¹•°¹…µ•Ì4(€€€€€€€Ñ¡…ÐÝ¥±°‰”É•Í½±Ù•…ÕÑ½µ…Ñ¥…±±ä¸4(4(€€€€€€€á…µÁ±•Ìè4(€€€€€€€€€€€Ñ…É•Ðô‰Ñ•±•É…´èØÌÀàäàÄàØÔˆ4(€€€€€€€€€€€Ñ…É•Ðô‰‘¥Í½Éè•¹•É…°ˆ4(€€€€€€€€€€€Ñ…É•Ðô‰Í±…¬è•¹¥¹••É¥¹œˆ4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€Ñ…É•ÐèA±…Ñ™½É´Ñ…É•Ð¥¸€‰Á±…Ñ™½É´é¥‘•¹Ñ¥™¥•Èˆ™½Éµ…Ð4(€€€€€€€€€€€µ•ÍÍ…”èQ¡”µ•ÍÍ…”Ñ•áÐÑ¼Í•¹4(€€€€€€€€ˆˆˆ4(€€€€€€€¥˜¹½ÐÑ…É•Ð½È¹½Ðµ•ÍÍ…”è4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè€‰	½Ñ Ñ…É•Ð…¹µ•ÍÍ…”…É”É•ÅÕ¥É•‰ô¤4(4(€€€€€€€ÑÉäè4(€€€€€€€€€€€™É½´Ñ½½±Ì¹Í•¹‘}µ•ÍÍ…•}Ñ½½°¥µÁ½ÉÐÍ•¹‘}µ•ÍÍ…•}Ñ½½°4(€€€€€€€€€€€É•ÍÕ±Ñ}ÍÑÈ€ôÍ•¹‘}µ•ÍÍ…•}Ñ½½° 4(€€€€€€€€€€€€€€€ì‰…Ñ¥½¸ˆè€‰Í•¹ˆ°€‰Ñ…É•ÐˆèÑ…É•Ð°€‰µ•ÍÍ…”ˆèµ•ÍÍ…•ô4(€€€€€€€€€€€€¤4(€€€€€€€€€€€É•ÑÕÉ¸É•ÍÕ±Ñ}ÍÑÈ4(€€€€€€€•á•ÁÐ%µÁ½ÉÑÉÉ½Èè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè€‰M•¹µ•ÍÍ…”Ñ½½°¹½Ð…Ù…¥±…‰±”‰ô¤4(€€€€€€€•á•ÁÐá•ÁÑ¥½¸…Ì”è4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰•ÉÉ½Èˆè˜‰M•¹™…¥±•èí•ô‰ô¤4(4(€€€€Œ€´´¡…¹¹•±Í}±¥ÍÐ€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜¡…¹¹•±Í}±¥ÍÐ¡Á±…Ñ™½É´è=ÁÑ¥½¹…±mÍÑÉt€ô9½¹”¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰1¥ÍÐ…Ù…¥±…‰±”µ•ÍÍ…¥¹œ¡…¹¹•±Ì…¹Ñ…É•ÑÌ…É½ÍÌÁ±…Ñ™½ÉµÌ¸4(4(€€€€€€€I•ÑÕÉ¹Ì¡…¹¹•±ÌÑ¡…Ðå½Ô…¸Í•¹µ•ÍÍ…•ÌÑ¼¸Q¡”Ñ…É•ÐÍÑÉ¥¹Ì4(€€€€€€€É•ÑÕÉ¹•¡•É”…¸‰”ÕÍ•‘¥É•Ñ±äÝ¥Ñ Ñ¡”µ•ÍÍ…•Í}Í•¹Ñ½½°¸4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€Á±…Ñ™½É´è¥±Ñ•È‰äÁ±…Ñ™½É´¹…µ”€¡Ñ•±•É…´°‘¥Í½É°Í±…¬°•ÑŒ¸¤4(€€€€€€€€ˆˆˆ4(€€€€€€€‘¥É•Ñ½Éä€ô}±½…‘}¡…¹¹•±}‘¥É•Ñ½Éä ¤4(€€€€€€€¥˜¹½Ð‘¥É•Ñ½Éäè4(€€€€€€€€€€€•¹ÑÉ¥•Ì€ô}±½…‘}Í•ÍÍ¥½¹Í}¥¹‘•à ¤4(€€€€€€€€€€€Ñ…É•ÑÌ€ômt4(€€€€€€€€€€€Í••¸€ôÍ•Ð ¤4(€€€€€€€€€€€™½È­•ä°•¹ÑÉä¥¸•¹ÑÉ¥•Ì¹¥Ñ•µÌ ¤è4(€€€€€€€€€€€€€€€½É¥¥¸€ô•¹ÑÉä¹•Ð ‰½É¥¥¸ˆ°íô¤4(€€€€€€€€€€€€€€€À€ô•¹ÑÉä¹•Ð ‰Á±…Ñ™½É´ˆ¤½È½É¥¥¸¹•Ð ‰Á±…Ñ™½É´ˆ°€ˆˆ¤4(€€€€€€€€€€€€€€€¡…Ñ}¥€ô½É¥¥¸¹•Ð ‰¡…Ñ}¥ˆ°€ˆˆ¤4(€€€€€€€€€€€€€€€¥˜¹½ÐÀ½È¹½Ð¡…Ñ}¥è4(€€€€€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€€€€€¥˜Á±…Ñ™½É´…¹À¹±½Ý•È ¤€„ôÁ±…Ñ™½É´¹±½Ý•È ¤è4(€€€€€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€€€€€Ñ…É•Ñ}ÍÑÈ€ô˜‰íÁôéí¡…Ñ}¥‘ôˆ4(€€€€€€€€€€€€€€€¥˜Ñ…É•Ñ}ÍÑÈ¥¸Í••¸è4(€€€€€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€€€€€Í••¸¹…‘¡Ñ…É•Ñ}ÍÑÈ¤4(€€€€€€€€€€€€€€€Ñ…É•ÑÌ¹…ÁÁ•¹¡ì4(€€€€€€€€€€€€€€€€€€€€‰Ñ…É•ÐˆèÑ…É•Ñ}ÍÑÈ°4(€€€€€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆèÀ°4(€€€€€€€€€€€€€€€€€€€€‰¹…µ”ˆè•¹ÑÉä¹•Ð ‰‘¥ÍÁ±…å}¹…µ”ˆ¤½È½É¥¥¸¹•Ð ‰¡…Ñ}¹…µ”ˆ°€ˆˆ¤°4(€€€€€€€€€€€€€€€€€€€€‰¡…Ñ}ÑåÁ”ˆè•¹ÑÉä¹•Ð ‰¡…Ñ}ÑåÁ”ˆ°½É¥¥¸¹•Ð ‰¡…Ñ}ÑåÁ”ˆ°€ˆˆ¤¤°4(€€€€€€€€€€€€€€€ô¤4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰½Õ¹Ðˆè±•¸¡Ñ…É•ÑÌ¤°€‰¡…¹¹•±ÌˆèÑ…É•ÑÍô°¥¹‘•¹ÐôÈ¤4(4(€€€€€€€¡…¹¹•±Ì€ômt4(€€€€€€€™½ÈÁ±…Ð°•¹ÑÉ¥•Í}±¥ÍÐ¥¸‘¥É•Ñ½Éä¹•Ð ‰Á±…Ñ™½ÉµÌˆ°íô¤¹¥Ñ•µÌ ¤è4(€€€€€€€€€€€¥˜Á±…Ñ™½É´…¹Á±…Ð¹±½Ý•È ¤€„ôÁ±…Ñ™½É´¹±½Ý•È ¤è4(€€€€€€€€€€€€€€€½¹Ñ¥¹Õ”4(€€€€€€€€€€€¥˜¥Í¥¹ÍÑ…¹”¡•¹ÑÉ¥•Í}±¥ÍÐ°±¥ÍÐ¤è4(€€€€€€€€€€€€€€€™½È ¥¸•¹ÑÉ¥•Í}±¥ÍÐè4(€€€€€€€€€€€€€€€€€€€¥˜¥Í¥¹ÍÑ…¹”¡ °‘¥Ð¤è4(€€€€€€€€€€€€€€€€€€€€€€€¡…Ñ}¥€ô ¹•Ð ‰¥ˆ° ¹•Ð ‰¡…Ñ}¥ˆ°€ˆˆ¤¤4(€€€€€€€€€€€€€€€€€€€€€€€¡…¹¹•±Ì¹…ÁÁ•¹¡ì4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Ñ…É•Ðˆè˜‰íÁ±…Ñôéí¡…Ñ}¥‘ôˆ¥˜¡…Ñ}¥•±Í”Á±…Ð°4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰Á±…Ñ™½É´ˆèÁ±…Ð°4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰¹…µ”ˆè ¹•Ð ‰¹…µ”ˆ° ¹•Ð ‰‘¥ÍÁ±…å}¹…µ”ˆ°€ˆˆ¤¤°4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€‰¡…Ñ}ÑåÁ”ˆè ¹•Ð ‰ÑåÁ”ˆ°€ˆˆ¤°4(€€€€€€€€€€€€€€€€€€€€€€€ô¤4(4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì‰½Õ¹Ðˆè±•¸¡¡…¹¹•±Ì¤°€‰¡…¹¹•±Ìˆè¡…¹¹•±Íô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´Á•Éµ¥ÍÍ¥½¹Í}±¥ÍÑ}½Á•¸€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜Á•Éµ¥ÍÍ¥½¹Í}±¥ÍÑ}½Á•¸ ¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰1¥ÍÐÁ•¹‘¥¹œ…ÁÁÉ½Ù…°É•ÅÕ•ÍÑÌ½‰Í•ÉÙ•‘ÕÉ¥¹œÑ¡¥Ì‰É¥‘”Í•ÍÍ¥½¸¸4(4(€€€€€€€I•ÑÕÉ¹Ì•á•Œ…¹Á±Õ¥¸…ÁÁÉ½Ù…°É•ÅÕ•ÍÑÌÑ¡…ÐÑ¡”‰É¥‘”¡…ÌÍ••¸4(€€€€€€€Í¥¹”¥ÐÍÑ…ÉÑ•¸ÁÁÉ½Ù…±Ì…É”±¥Ù”µÍ•ÍÍ¥½¸½¹±äƒŠP½±‘•È…ÁÁÉ½Ù…±Ì4(€€€€€€€™É½´‰•™½É”Ñ¡”‰É¥‘”½¹¹•Ñ•…É”¹½Ð¥¹±Õ‘•¸4(€€€€€€€€ˆˆˆ4(€€€€€€€…ÁÁÉ½Ù…±Ì€ô‰É¥‘”¹±¥ÍÑ}Á•¹‘¥¹}…ÁÁÉ½Ù…±Ì ¤4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì4(€€€€€€€€€€€€‰½Õ¹Ðˆè±•¸¡…ÁÁÉ½Ù…±Ì¤°4(€€€€€€€€€€€€‰…ÁÁÉ½Ù…±Ìˆè…ÁÁÉ½Ù…±Ì°4(€€€€€€€ô°¥¹‘•¹ÐôÈ¤4(4(€€€€Œ€´´Á•Éµ¥ÍÍ¥½¹Í}É•ÍÁ½¹€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4(€€€µÀ¹Ñ½½° ¤4(€€€‘•˜Á•Éµ¥ÍÍ¥½¹Í}É•ÍÁ½¹ 4(€€€€€€€¥èÍÑÈ°4(€€€€€€€‘•¥Í¥½¸èÍÑÈ°4(€€€€¤€´øÍÑÈè4(€€€€€€€€ˆˆ‰I•ÍÁ½¹Ñ¼„Á•¹‘¥¹œ…ÁÁÉ½Ù…°É•ÅÕ•ÍÐ¸4(4(€€€€€€€ÉÌè4(€€€€€€€€€€€¥èQ¡”…ÁÁÉ½Ù…°%™É½´Á•Éµ¥ÍÍ¥½¹Í}±¥ÍÑ}½Á•¸4(€€€€€€€€€€€‘•¥Í¥½¸è=¹”½˜€‰…±±½Üµ½¹”ˆ°€‰…±±½Üµ…±Ý…åÌˆ°½È€‰‘•¹äˆ4(€€€€€€€€ˆˆˆ4(€€€€€€€¥˜‘•¥Í¥½¸¹½Ð¥¸ì‰…±±½Üµ½¹”ˆ°€‰…±±½Üµ…±Ý…åÌˆ°€‰‘•¹ä‰ôè4(€€€€€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡ì4(€€€€€€€€€€€€€€€€‰•ÉÉ½Èˆè˜‰%¹Ù…±¥‘•¥Í¥½¸èí‘•¥Í¥½¹ô¸€ˆ4(€€€€€€€€€€€€€€€€€€€€€€€€˜‰5ÕÍÐ‰”…±±½Üµ½¹”°…±±½Üµ…±Ý…åÌ°½È‘•¹äˆ4(€€€€€€€€€€€ô¤4(4(€€€€€€€É•ÍÕ±Ð€ô‰É¥‘”¹É•ÍÁ½¹‘}Ñ½}…ÁÁÉ½Ù…°¡¥°‘•¥Í¥½¸¤4(€€€€€€€É•ÑÕÉ¸©Í½¸¹‘ÕµÁÌ¡É•ÍÕ±Ð°¥¹‘•¹ÐôÈ¤4(4(€€€É•ÑÕÉ¸µÀ4(4(4(Œ€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(Œ¹ÑÉäÁ½¥¹Ð4(Œ€´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´´4(4)‘•˜ÉÕ¹}µÁ}Í•ÉÙ•È¡Ù•É‰½Í”è‰½½°€ô…±Í”¤€´ø9½¹”è4(€€€€ˆˆ‰MÑ…ÉÐÑ¡”!•Éµ•Ì5@Í•ÉÙ•È½¸ÍÑ‘¥¼¸ˆˆˆ4(€€€¥˜¹½Ð}5A}MIYI}Y%1	1è4(€€€€€€€ÁÉ¥¹Ð 4(€€€€€€€€€€€€‰ÉÉ½Èè5@Í•ÉÙ•ÈÉ•ÅÕ¥É•ÌÑ¡”€µÀœÁ…­…”¹q¸ˆ4(€€€€€€€€€€€˜‰%¹ÍÑ…±°Ý¥Ñ èíÍåÌ¹•á•ÕÑ…‰±•ô€µ´Á¥À¥¹ÍÑ…±°€µÀœˆ°4(€€€€€€€€€€€™¥±”õÍåÌ¹ÍÑ‘•ÉÈ°4(€€€€€€€€¤4(€€€€€€€ÍåÌ¹•á¥Ð Ä¤4(4(€€€¥˜Ù•É‰½Í”è4(€€€€€€€±½¥¹œ¹‰…Í¥½¹™¥œ¡±•Ù•°õ±½¥¹œ¹	U°ÍÑÉ•…´õÍåÌ¹ÍÑ‘•ÉÈ¤4(€€€•±Í”è4(€€€€€€€±½¥¹œ¹‰…Í¥½¹™¥œ¡±•Ù•°õ±½¥¹œ¹]I9%9°ÍÑÉ•…´õÍåÌ¹ÍÑ‘•ÉÈ¤4(4(€€€‰É¥‘”€ôÙ•¹Ñ	É¥‘” ¤4(€€€‰É¥‘”¹ÍÑ…ÉÐ ¤4(4(€€€Í•ÉÙ•È€ôÉ•…Ñ•}µÁ}Í•ÉÙ•È¡•Ù•¹Ñ}‰É¥‘”õ‰É¥‘”¤4(4(€€€¥µÁ½ÉÐ…Íå¹¥¼4(4(€€€…Íå¹Œ‘•˜}ÉÕ¸ ¤è4(€€€€€€€ÑÉäè4(€€€€€€€€€€€…Ý…¥ÐÍ•ÉÙ•È¹ÉÕ¹}ÍÑ‘¥½}…Íå¹Œ ¤4(€€€€€€€™¥¹…±±äè4(€€€€€€€€€€€‰É¥‘”¹ÍÑ½À ¤4(4(€€€ÑÉäè4(€€€€€€€…Íå¹¥¼¹ÉÕ¸¡}ÉÕ¸ ¤¤4(€€€•á•ÁÐ-•å‰½…É‘%¹Ñ•ÉÉÕÁÐè4(€€€€€€€‰É¥‘”¹ÍÑ½À ¤4(
+    def list_pending_approvals(self) -> List[dict]:
+        """List approval requests observed during this bridge session."""
+        with self._lock:
+            return sorted(
+                self._pending_approvals.values(),
+                key=lambda a: a.get("created_at", ""),
+            )
+
+    def respond_to_approval(self, approval_id: str, decision: str) -> dict:
+        """Resolve a pending approval (best-effort without gateway IPC)."""
+        with self._lock:
+            approval = self._pending_approvals.pop(approval_id, None)
+
+        if not approval:
+            return {"error": f"Approval not found: {approval_id}"}
+
+        self._enqueue(QueueEvent(
+            cursor=0,  # Will be set by _enqueue
+            type="approval_resolved",
+            session_key=approval.get("session_key", ""),
+            data={"approval_id": approval_id, "decision": decision},
+        ))
+
+        return {"resolved": True, "approval_id": approval_id, "decision": decision}
+
+    def _enqueue(self, event: QueueEvent) -> None:
+        """Add an event to the queue and wake any waiters."""
+        with self._lock:
+            self._cursor += 1
+            event.cursor = self._cursor
+            self._queue.append(event)
+            # Trim queue to limit
+            while len(self._queue) > QUEUE_LIMIT:
+                self._queue.pop(0)
+        self._new_event.set()
+
+    def _establish_baseline(self) -> None:
+        db = _get_session_db()
+        if not db:
+            return
+        try:
+            self._establish_baseline_with_db(db)
+        finally:
+            try:
+                db.close()
+            except Exception:
+                logger.debug("Failed to close MCP baseline SessionDB", exc_info=True)
+
+    def _establish_baseline_with_db(self, db) -> None:
+        """Record the latest per-session message timestamp and the current
+        state.db mtime WITHOUT emitting events, so startup does not replay
+        history (#13414).
+
+        Only sessions that already exist at startup are baselined; a session
+        that first appears afterwards is absent here and defaults to
+        last_seen=0.0 in _poll_once, so a brand-new conversation's first
+        message is still delivered on its state.db-change tick.
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            db_file = get_hermes_home() / "state.db"
+        except ImportError:
+            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+        try:
+            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+        except OSError:
+            self._state_db_mtime = 0.0
+        try:
+            self._cached_sessions_index = _load_sessions_index()
+        except Exception:
+            self._cached_sessions_index = {}
+        for session_key, entry in self._cached_sessions_index.items():
+            session_id = entry.get("session_id", "")
+            if not session_id:
+                continue
+            try:
+                messages = db.get_messages(session_id)
+            except Exception:
+                continue
+            all_ts = [_ts_float(m.get("timestamp", 0)) for m in (messages or ())]
+            if all_ts:
+                latest = max(all_ts)
+                if latest > 0.0:
+                    self._last_poll_timestamps[session_key] = latest
+    def _poll_loop(self):
+        """Background loop: poll SessionDB for new messages."""
+        db = _get_session_db()
+        if not db:
+            logger.warning("EventBridge: SessionDB unavailable, event polling disabled")
+            return
+
+        try:
+            while self._running:
+                try:
+                    self._poll_once(db)
+                except Exception as e:
+                    logger.debug("EventBridge poll error: %s", e)
+                time.sleep(POLL_INTERVAL)
+        finally:
+            try:
+                db.close()
+            except Exception:
+                logger.debug("Failed to close MCP polling SessionDB", exc_info=True)
+
+    def _poll_once(self, db):
+        """Check for new messages across all sessions.
+
+        Uses a single mtime check on state.db to skip work when nothing
+        has changed â€” makes 200ms polling essentially free.  Since #9006
+        the routing index itself lives in state.db (session rows carry
+        session_key/origin metadata), so a new conversation and its first
+        message land in the SAME file and one mtime check covers both â€”
+        eliminating the old dual-file (sessions.json + state.db) race that
+        could drop brand-new conversations (#8925).
+        """
+        try:
+            from hermes_constants import get_hermes_home
+            db_file = get_hermes_home() / "state.db"
+        except ImportError:
+            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+
+        try:
+            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+        except OSError:
+            db_mtime = 0.0
+
+        if db_mtime == self._state_db_mtime:
+            return  # Nothing changed since last poll â€” skip entirely
+
+        self._state_db_mtime = db_mtime
+        # Refresh the routing index from state.db on every change tick â€”
+        # it's a single indexed query and it can never lag the messages
+        # table (both live in the same database file).
+        self._cached_sessions_index = _load_sessions_index()
+        entries = self._cached_sessions_index
+
+        for session_key, entry in entries.items():
+            session_id = entry.get("session_id", "")
+            if not session_id:
+                continue
+
+            last_seen = self._last_poll_timestamps.get(session_key, 0.0)
+
+            try:
+                messages = db.get_messages(session_id)
+            except Exception:
+                continue
+
+            if not messages:
+                continue
+
+            # Find messages newer than our last seen timestamp (see the
+            # module-level _ts_float helper for timestamp normalization).
+            new_messages = []
+            for msg in messages:
+                ts = _ts_float(msg.get("timestamp", 0))
+                role = msg.get("role", "")
+                if role not in {"user", "assistant"}:
+                    continue
+                if ts > last_seen:
+                    new_messages.append(msg)
+
+            for msg in new_messages:
+                content = _extract_message_content(msg)
+                if not content:
+                    continue
+                self._enqueue(QueueEvent(
+                    cursor=0,
+                    type="message",
+                    session_key=session_key,
+                    data={
+                        "role": msg.get("role", ""),
+                        "content": content[:500],
+                        "timestamp": str(msg.get("timestamp", "")),
+                        "message_id": str(msg.get("id", "")),
+                    },
+                ))
+
+            # Update last seen to the most recent message timestamp
+            all_ts = [_ts_float(m.get("timestamp", 0)) for m in messages]
+            if all_ts:
+                latest = max(all_ts)
+                if latest > last_seen:
+                    self._last_poll_timestamps[session_key] = latest
+
+
+# ---------------------------------------------------------------------------
+# MCP Server
+# ---------------------------------------------------------------------------
+
+def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
+    """Create and return the Hermes MCP server with all tools registered."""
+    if not _MCP_SERVER_AVAILABLE:
+        raise ImportError(
+            "MCP server requires the 'mcp' package. "
+            f"Install with: {sys.executable} -m pip install 'mcp'"
+        )
+
+    mcp = FastMCP(
+        "hermes",
+        instructions=(
+            "Hermes Agent messaging bridge. Use these tools to interact with "
+            "conversations across Telegram, Discord, Slack, WhatsApp, Signal, "
+            "Matrix, and other connected platforms."
+        ),
+    )
+
+    bridge = event_bridge or EventBridge()
+
+    # -- conversations_list ------------------------------------------------
+
+    @mcp.tool()
+    def conversations_list(
+        platform: Optional[str] = None,
+        limit: int = 50,
+        search: Optional[str] = None,
+    ) -> str:
+        """List active messaging conversations across connected platforms.
+
+        Returns conversations with their session keys (needed for messages_read),
+        platform, chat type, display name, and last activity time.
+
+        Args:
+            platform: Filter by platform name (telegram, discord, slack, etc.)
+            limit: Maximum number of conversations to return (default 50)
+            search: Optional text to filter conversations by name
+        """
+        limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
+        entries = _load_sessions_index()
+        conversations = []
+
+        for key, entry in entries.items():
+            origin = entry.get("origin", {})
+            entry_platform = entry.get("platform") or origin.get("platform", "")
+
+            if platform and entry_platform.lower() != platform.lower():
+                continue
+
+            display_name = entry.get("display_name", "")
+            chat_name = origin.get("chat_name", "")
+            if search:
+                search_lower = search.lower()
+                if (search_lower not in display_name.lower()
+                        and search_lower not in chat_name.lower()
+                        and search_lower not in key.lower()):
+                    continue
+
+            conversations.append({
+                "session_key": key,
+                "session_id": entry.get("session_id", ""),
+                "platform": entry_platform,
+                "chat_type": entry.get("chat_type", origin.get("chat_type", "")),
+                "display_name": display_name,
+                "chat_name": chat_name,
+                "user_name": origin.get("user_name", ""),
+                "updated_at": entry.get("updated_at", ""),
+            })
+
+        conversations.sort(key=lambda c: c.get("updated_at", ""), reverse=True)
+        conversations = conversations[:limit]
+
+        return json.dumps({
+            "count": len(conversations),
+            "conversations": conversations,
+        }, indent=2)
+
+    # -- conversation_get --------------------------------------------------
+
+    @mcp.tool()
+    def conversation_get(session_key: str) -> str:
+        """Get detailed info about one conversation by its session key.
+
+        Args:
+            session_key: The session key from conversations_list
+        """
+        entries = _load_sessions_index()
+        entry = entries.get(session_key)
+
+        if not entry:
+            return json.dumps({"error": f"Conversation not found: {session_key}"})
+
+        origin = entry.get("origin", {})
+        return json.dumps({
+            "session_key": session_key,
+            "session_id": entry.get("session_id", ""),
+            "platform": entry.get("platform") or origin.get("platform", ""),
+            "chat_type": entry.get("chat_type", origin.get("chat_type", "")),
+            "display_name": entry.get("display_name", ""),
+            "user_name": origin.get("user_name", ""),
+            "chat_name": origin.get("chat_name", ""),
+            "chat_id": origin.get("chat_id", ""),
+            "thread_id": origin.get("thread_id"),
+            "updated_at": entry.get("updated_at", ""),
+            "created_at": entry.get("created_at", ""),
+            "input_tokens": entry.get("input_tokens", 0),
+            "output_tokens": entry.get("output_tokens", 0),
+            "total_tokens": entry.get("total_tokens", 0),
+        }, indent=2)
+
+    # -- messages_read -----------------------------------------------------
+
+    @mcp.tool()
+    def messages_read(
+        session_key: str,
+        limit: int = 50,
+    ) -> str:
+        """Read recent messages from a conversation.
+
+        Returns the message history in chronological order with role, content,
+        and timestamp for each message.
+
+        Args:
+            session_key: The session key from conversations_list
+            limit: Maximum number of messages to return (default 50, most recent)
+        """
+        limit = _coerce_int(limit, default=50, minimum=1, maximum=200)
+        entries = _load_sessions_index()
+        entry = entries.get(session_key)
+        if not entry:
+            return json.dumps({"error": f"Conversation not found: {session_key}"})
+
+        session_id = entry.get("session_id", "")
+        if not session_id:
+            return json.dumps({"error": "No session ID for this conversation"})
+
+        all_messages, error = _load_session_messages(session_id)
+        if error:
+            return json.dumps({"error": error})
+
+        filtered = []
+        for msg in all_messages:
+            role = msg.get("role", "")
+            if role in {"user", "assistant"}:
+                content = _extract_message_content(msg)
+                if content:
+                    filtered.append({
+                        "id": str(msg.get("id", "")),
+                        "role": role,
+                        "content": content[:2000],
+                        "timestamp": msg.get("timestamp", ""),
+                    })
+
+        messages = filtered[-limit:]
+
+        return json.dumps({
+            "session_key": session_key,
+            "count": len(messages),
+            "total_in_session": len(filtered),
+            "messages": messages,
+        }, indent=2)
+
+    # -- attachments_fetch -------------------------------------------------
+
+    @mcp.tool()
+    def attachments_fetch(
+        session_key: str,
+        message_id: str,
+    ) -> str:
+        """List non-text attachments for a message in a conversation.
+
+        Extracts images, media files, and other non-text content blocks
+        from the specified message.
+
+        Args:
+            session_key: The session key from conversations_list
+            message_id: The message ID from messages_read
+        """
+        entries = _load_sessions_index()
+        entry = entries.get(session_key)
+        if not entry:
+            return json.dumps({"error": f"Conversation not found: {session_key}"})
+
+        session_id = entry.get("session_id", "")
+        if not session_id:
+            return json.dumps({"error": "No session ID for this conversation"})
+
+        all_messages, error = _load_session_messages(session_id)
+        if error:
+            return json.dumps({"error": error})
+
+        # Find the target message
+        target_msg = None
+        for msg in all_messages:
+            if str(msg.get("id", "")) == message_id:
+                target_msg = msg
+                break
+
+        if not target_msg:
+            return json.dumps({"error": f"Message not found: {message_id}"})
+
+        attachments = _extract_attachments(target_msg)
+
+        return json.dumps({
+            "message_id": message_id,
+            "count": len(attachments),
+            "attachments": attachments,
+        }, indent=2)
+
+    # -- events_poll -------------------------------------------------------
+
+    @mcp.tool()
+    def events_poll(
+        after_cursor: int = 0,
+        session_key: Optional[str] = None,
+        limit: int = 20,
+    ) -> str:
+        """Poll for new conversation events since a cursor position.
+
+        Returns events that have occurred since the given cursor. Use the
+        returned next_cursor value for subsequent polls.
+
+        Event types: message, approval_requested, approval_resolved
+
+        Args:
+            after_cursor: Return events after this cursor (0 for all)
+            session_key: Optional filter to one conversation
+            limit: Maximum events to return (default 20)
+        """
+        after_cursor = _coerce_int(after_cursor, default=0, minimum=0, maximum=10**18)
+        limit = _coerce_int(limit, default=20, minimum=1, maximum=200)
+        result = bridge.poll_events(
+            after_cursor=after_cursor,
+            session_key=session_key,
+            limit=limit,
+        )
+        return json.dumps(result, indent=2)
+
+    # -- events_wait -------------------------------------------------------
+
+    @mcp.tool()
+    def events_wait(
+        after_cursor: int = 0,
+        session_key: Optional[str] = None,
+        timeout_ms: int = 30000,
+    ) -> str:
+        """Wait for the next conversation event (long-poll).
+
+        Blocks until a matching event arrives or the timeout expires.
+        Use this for near-real-time event delivery without polling.
+
+        Args:
+            after_cursor: Wait for events after this cursor
+            session_key: Optional filter to one conversation
+            timeout_ms: Maximum wait time in milliseconds (default 30000)
+        """
+        after_cursor = _coerce_int(after_cursor, default=0, minimum=0, maximum=10**18)
+        timeout_ms = _coerce_int(
+            timeout_ms,
+            default=30000,
+            minimum=0,
+            maximum=300000,
+        )  # Cap at 5 minutes
+        event = bridge.wait_for_event(
+            after_cursor=after_cursor,
+            session_key=session_key,
+            timeout_ms=timeout_ms,
+        )
+        if event:
+            return json.dumps({"event": event}, indent=2)
+        return json.dumps({"event": None, "reason": "timeout"}, indent=2)
+
+    # -- messages_send -----------------------------------------------------
+
+    @mcp.tool()
+    def messages_send(
+        target: str,
+        message: str,
+    ) -> str:
+        """Send a message to a platform conversation.
+
+        The target format is "platform:chat_id" â€” same format used by the
+        channels_list tool. You can also use human-friendly channel names
+        that will be resolved automatically.
+
+        Examples:
+            target="telegram:6308981865"
+            target="discord:#general"
+            target="slack:#engineering"
+
+        Args:
+            target: Platform target in "platform:identifier" format
+            message: The message text to send
+        """
+        if not target or not message:
+            return json.dumps({"error": "Both target and message are required"})
+
+        try:
+            from tools.send_message_tool import send_message_tool
+            result_str = send_message_tool(
+                {"action": "send", "target": target, "message": message}
+            )
+            return result_str
+        except ImportError:
+            return json.dumps({"error": "Send message tool not available"})
+        except Exception as e:
+            return json.dumps({"error": f"Send failed: {e}"})
+
+    # -- channels_list -----------------------------------------------------
+
+    @mcp.tool()
+    def channels_list(platform: Optional[str] = None) -> str:
+        """List available messaging channels and targets across platforms.
+
+        Returns channels that you can send messages to. The target strings
+        returned here can be used directly with the messages_send tool.
+
+        Args:
+            platform: Filter by platform name (telegram, discord, slack, etc.)
+        """
+        directory = _load_channel_directory()
+        if not directory:
+            entries = _load_sessions_index()
+            targets = []
+            seen = set()
+            for key, entry in entries.items():
+                origin = entry.get("origin", {})
+                p = entry.get("platform") or origin.get("platform", "")
+                chat_id = origin.get("chat_id", "")
+                if not p or not chat_id:
+                    continue
+                if platform and p.lower() != platform.lower():
+                    continue
+                target_str = f"{p}:{chat_id}"
+                if target_str in seen:
+                    continue
+                seen.add(target_str)
+                targets.append({
+                    "target": target_str,
+                    "platform": p,
+                    "name": entry.get("display_name") or origin.get("chat_name", ""),
+                    "chat_type": entry.get("chat_type", origin.get("chat_type", "")),
+                })
+            return json.dumps({"count": len(targets), "channels": targets}, indent=2)
+
+        channels = []
+        for plat, entries_list in directory.get("platforms", {}).items():
+            if platform and plat.lower() != platform.lower():
+                continue
+            if isinstance(entries_list, list):
+                for ch in entries_list:
+                    if isinstance(ch, dict):
+                        chat_id = ch.get("id", ch.get("chat_id", ""))
+                        channels.append({
+                            "target": f"{plat}:{chat_id}" if chat_id else plat,
+                            "platform": plat,
+                            "name": ch.get("name", ch.get("display_name", "")),
+                            "chat_type": ch.get("type", ""),
+                        })
+
+        return json.dumps({"count": len(channels), "channels": channels}, indent=2)
+
+    # -- permissions_list_open ---------------------------------------------
+
+    @mcp.tool()
+    def permissions_list_open() -> str:
+        """List pending approval requests observed during this bridge session.
+
+        Returns exec and plugin approval requests that the bridge has seen
+        since it started. Approvals are live-session only â€” older approvals
+        from before the bridge connected are not included.
+        """
+        approvals = bridge.list_pending_approvals()
+        return json.dumps({
+            "count": len(approvals),
+            "approvals": approvals,
+        }, indent=2)
+
+    # -- permissions_respond -----------------------------------------------
+
+    @mcp.tool()
+    def permissions_respond(
+        id: str,
+        decision: str,
+    ) -> str:
+        """Respond to a pending approval request.
+
+        Args:
+            id: The approval ID from permissions_list_open
+            decision: One of "allow-once", "allow-always", or "deny"
+        """
+        if decision not in {"allow-once", "allow-always", "deny"}:
+            return json.dumps({
+                "error": f"Invalid decision: {decision}. "
+                         f"Must be allow-once, allow-always, or deny"
+            })
+
+        result = bridge.respond_to_approval(id, decision)
+        return json.dumps(result, indent=2)
+
+    return mcp
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def run_mcp_server(verbose: bool = False) -> None:
+    """Start the Hermes MCP server on stdio."""
+    if not _MCP_SERVER_AVAILABLE:
+        print(
+            "Error: MCP server requires the 'mcp' package.\n"
+            f"Install with: {sys.executable} -m pip install 'mcp'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr)
+    else:
+        logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+
+    bridge = EventBridge()
+    bridge.start()
+
+    server = create_mcp_server(event_bridge=bridge)
+
+    import asyncio
+
+    async def _run():
+        try:
+            await server.run_stdio_async()
+        finally:
+            bridge.stop()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        bridge.stop()
