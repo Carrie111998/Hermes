@@ -316,8 +316,9 @@ class TestGetProcessStartTime:
 
     def test_live_process_is_stable_int(self):
         import subprocess
+        import sys
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -888,6 +889,7 @@ class TestReadProcessCmdlinePsFallback:
     """Tests for _read_process_cmdline falling back to ps on non-Linux."""
 
     def test_ps_fallback_when_proc_unavailable(self, monkeypatch):
+        monkeypatch.setattr(status, "_IS_WINDOWS", False)
         monkeypatch.setattr(status.Path, "read_bytes", lambda self: (_ for _ in ()).throw(FileNotFoundError))
         monkeypatch.setattr(
             status.subprocess, "run",
@@ -1237,4 +1239,3 @@ class TestResolveGatewayLiveness:
         # expected_home is what stops a recycled PID belonging to another
         # profile's live gateway from being reported as this profile's.
         assert seen["expected_home"] == profile_dir
-
