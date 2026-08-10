@@ -12,16 +12,15 @@ metadata:
 
 # File Watcher
 
-Monitor filesystem events in real time during development. Use `hermes watch`
-to track file changes, run commands on change, and debug file-system issues.
+`hermes watch` reports filesystem changes as they happen, and can re-run a
+command each time something changes.
 
 ## When to Use
 
-- Watching log files in real time
-- Monitoring test output files during test-driven development
-- Detecting when external processes write files
-- Triggering builds or linters on file save
-- Debugging file-system race conditions
+- Re-running tests or a linter on every save
+- Watching log or output files while another process writes them
+- Detecting when an external process writes or deletes files
+- Confirming that a build step actually touched what you expected
 
 ## Usage
 
@@ -29,72 +28,77 @@ to track file changes, run commands on change, and debug file-system issues.
 # Watch current directory
 hermes watch .
 
-# Watch specific paths
+# Watch several trees at once
 hermes watch src/ tests/
 
-# Filter by file pattern
+# Only report matching files
 hermes watch . --pattern "*.py,*.js"
 
-# Ignore build artifacts
+# Skip build artifacts (matches at any depth)
 hermes watch . --ignore "*.pyc,__pycache__/*,node_modules/*"
 
-# Run a command after changes
+# Re-run a command after each batch of changes
 hermes watch . --pattern "*.py" --command "pytest tests/ -x"
 
-# Use polling fallback (no watchdog dependency)
-# The polling mode activates automatically when watchdog is not installed.
-# Adjust the interval:
+# Top level only
+hermes watch . --no-recursive
+
+# Sweep interval, in seconds (default: 1.0)
 hermes watch . --interval 2.0
 ```
 
-## Installation
+Paths are reported relative to the watched root. When several roots are
+given, each path is prefixed with its root's name so `src/main.py` and
+`tests/main.py` stay distinguishable.
 
-The `watch` subcommand prefers the `watchdog` package for efficient
-filesystem monitoring. Install it for best results:
+`--pattern` and `--ignore` take comma-separated globs. A glob is matched
+against the filename, the root-relative path, and that path at any depth —
+so `__pycache__/*` skips the directory wherever it appears. `--ignore` wins
+over `--pattern`.
+
+## `--command`
+
+The command runs through the shell after any sweep that produced events, not
+once per file — a burst of saves triggers one run. Runs are sequential, so a
+slow command delays the next sweep rather than overlapping with itself. The
+exit status of the last run becomes the exit status of `hermes watch`.
+
+## Backends
+
+By default the watcher polls, which needs no extra packages and works
+everywhere. If the optional `watchdog` package is importable, OS-level
+notifications are used instead — cheaper on large trees, and `--interval`
+stops applying. `watchdog` is not a Hermes dependency; install it into the
+same environment if you want it:
 
 ```bash
 uv pip install watchdog
 ```
 
-Without `watchdog`, the command falls back to a polling watcher that
-checks for changes at a configurable interval (default: 1 second).
+| Platform | Backend with watchdog | Without |
+|----------|-----------------------|---------|
+| Linux | inotify | polling |
+| macOS | FSEvents | polling |
+| Windows | ReadDirectoryChangesW | polling |
 
-## Platform Support
+## Notes
 
-| Platform | Backend | Notes |
-|----------|---------|-------|
-| macOS | FSEvents (via watchdog) or polling | FSEvents is preferred |
-| Linux | inotify (via watchdog) or polling | inotify is preferred |
-| Windows | ReadDirectoryChangesW (via watchdog) or polling | |
-
-## Tips
-
-- Use `--pattern` to filter noisy directories (`.git/`, `node_modules/`)
-- The polling fallback works everywhere but is less efficient for large trees
-- Combine with `--command` to create a simple CI-like feedback loop
-- Press Ctrl+C to stop watching
+- Polling compares each file's modification time and size, so an edit that
+  changes neither (rare, and only within one filesystem clock tick) is missed.
+- Large trees cost one directory walk per interval; narrow the paths or raise
+  `--interval` rather than watching a whole home directory.
+- Ctrl+C (or SIGTERM) stops the watcher and prints the event count.
 
 ## Agent Guidance
 
-When a user asks you to watch files for changes, use:
+Prefer `hermes watch` over hand-rolled `while true; do ... sleep; done` loops
+in the terminal: it is consistent across platforms, filters noise with
+`--pattern`/`--ignore`, and exits cleanly.
 
 ```bash
-hermes watch <paths> [--pattern <glob>] [--command <cmd>]
+hermes watch <paths> [--pattern <glob>] [--ignore <glob>] [--command <cmd>]
 ```
 
-This is preferred over polling loops in bash/terminal because:
-1. It uses efficient OS-level notifications (when watchdog is available)
-2. It handles cross-platform differences consistently
-3. Output is structured and easy to parse
-4. Signal handling (Ctrl+C) is clean
-
-If `hermes watch` is not available (older Hermes versions), fall back to:
-```bash
-# Polling fallback example
-while true; do
-  inotifywait -e modify,create,delete -r src/ 2>/dev/null || \
-  fswatch -1 src/ 2>/dev/null || \
-  sleep 2
-  echo "Change detected"
-done
-```
+`hermes watch` runs until stopped, so start it in the background (or in its
+own terminal) when you still need the shell — a foreground call blocks until
+the user interrupts it.
