@@ -2688,7 +2688,7 @@ class ShellFileOperations(FileOperations):
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{self._escape_pattern_arg(pattern)} {self._escape_native_exe_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2710,7 +2710,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{self._escape_pattern_arg(pattern)} {self._escape_native_exe_arg(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2730,7 +2730,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+                f"{self._escape_pattern_arg(pattern)} {self._escape_native_exe_arg(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
