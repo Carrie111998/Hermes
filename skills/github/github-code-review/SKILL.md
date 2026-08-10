@@ -23,8 +23,9 @@ Perform code reviews on local changes before pushing, or review open PRs on GitH
 ### Setup (for PR interactions)
 
 ```bash
-# Source the shared auth/repo detection helper (sets GH_AUTH_METHOD, GITHUB_TOKEN,
-# GH_USER, GH_OWNER, GH_REPO, GH_OWNER_REPO). See github-auth skill for details.
+# Source the shared auth/repo detection helper (sets GH_AUTH_METHOD, GH_USER,
+# GH_OWNER, GH_REPO, GH_OWNER_REPO; GITHUB_TOKEN only when available on the
+# curl path or pre-set). See github-auth skill for details.
 source "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/gh-env.sh"
 # Legacy alias used elsewhere in this skill: gh-env.sh uses "curl" where older
 # skills used "git" for the non-gh fallback path.

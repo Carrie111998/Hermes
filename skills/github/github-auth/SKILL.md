@@ -212,7 +212,7 @@ uv run python3 "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/
 
 ### Helper: Detect Auth Method
 
-Use the shared helper script at the start of any GitHub workflow. It exports `GH_AUTH_METHOD` (`"gh"`, `"curl"`, or `"none"`), `GITHUB_TOKEN`, `GH_USER`, and — when inside a repo — `GH_OWNER` / `GH_REPO` / `GH_OWNER_REPO`:
+Use the shared helper script at the start of any GitHub workflow. It always exports `GH_AUTH_METHOD` (`"gh"`, `"curl"`, or `"none"`) and `GH_USER`, and — when inside a repo — `GH_OWNER` / `GH_REPO` / `GH_OWNER_REPO`. It exports `GITHUB_TOKEN` only when one is actually available (i.e. on the `curl` path or when already set in the environment); the `gh`-authenticated branch sets `GH_AUTH_METHOD="gh"` but does not populate a token.
 
 ```bash
 source "${HERMES_HOME:-$HOME/.hermes}/skills/github/github-auth/scripts/gh-env.sh"
