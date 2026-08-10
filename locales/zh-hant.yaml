@@ -328,6 +328,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "否"
     queued:                "**排隊中的後續：** {count}"
     platforms:             "**已連線平台：** {platforms}"
+    activity:              "**活動：** {detail}"
+    iteration:             "迭代 {used}/{max}"
+    running:               "執行中: {action}"
+    idle:                  "閒置 {seconds}秒"
 
   stop:
     stopped_pending:       "⚡ 已停止。代理尚未啟動 — 你可以繼續此工作階段。"

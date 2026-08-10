@@ -332,6 +332,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Níl"
     queued:                "**Tascanna i scuaine:** {count}"
     platforms:             "**Ardáin Cheangailte:** {platforms}"
+    activity:              "**Gníomhaíocht:** {detail}"
+    iteration:             "atriall {used}/{max}"
+    running:               "ag rith: {action}"
+    idle:                  "díomhaoin {seconds}s"
 
   stop:
     stopped_pending:       "⚡ Stoptha. Ní raibh an gníomhaire tosaithe fós — is féidir leat leanúint leis an seisiún seo."

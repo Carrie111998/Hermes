@@ -328,6 +328,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Não"
     queued:                "**Seguimentos em fila:** {count}"
     platforms:             "**Plataformas ligadas:** {platforms}"
+    activity:              "**Atividade:** {detail}"
+    iteration:             "iteração {used}/{max}"
+    running:               "executando: {action}"
+    idle:                  "inativo {seconds}s"
 
   stop:
     stopped_pending:       "⚡ Parado. O agente ainda não tinha começado — podes continuar esta sessão."

@@ -328,6 +328,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "Nee"
     queued:                "**Opgehoopte opvolge:** {count}"
     platforms:             "**Verbinde Platforms:** {platforms}"
+    activity:              "**Aktiwiteit:** {detail}"
+    iteration:             "iterasie {used}/{max}"
+    running:               "besig: {action}"
+    idle:                  "onaktief {seconds}s"
 
   stop:
     stopped_pending:       "⚡ Gestop. Die agent het nog nie begin nie — jy kan met hierdie sessie voortgaan."

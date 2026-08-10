@@ -687,6 +687,36 @@ class GatewaySlashCommandsMixin:
             t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
             t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
         ])
+        # Live activity block (#83077): reuse the shared activity observation
+        # contract AIAgent.get_activity_summary() — the same source the 3-min
+        # "still working" heartbeat (gateway/run.py:25804-25818) and the
+        # busy-ack detail (gateway/run.py:9273-9298) already format. The idle
+        # threshold of 5s exists because /status can be polled at any time and
+        # "idle 0s" right after an activity would be noise; the heartbeat only
+        # fires every 3 min, so it never had this concern.
+        if is_running and hasattr(agent, "get_activity_summary"):
+            try:
+                _activity = agent.get_activity_summary()
+                activity_parts = []
+                if _activity.get("api_call_count") is not None and _activity.get("max_iterations"):
+                    activity_parts.append(
+                        t(
+                            "gateway.status.iteration",
+                            used=_activity["api_call_count"],
+                            max=_activity["max_iterations"],
+                        )
+                    )
+                _action = _activity.get("current_tool") or _activity.get("last_activity_desc")
+                if _action:
+                    activity_parts.append(t("gateway.status.running", action=_action))
+                _idle_seconds = _activity.get("seconds_since_activity")
+                if _idle_seconds is not None and float(_idle_seconds) >= 5:
+                    activity_parts.append(t("gateway.status.idle", seconds=int(_idle_seconds)))
+                if activity_parts:
+                    lines.append(t("gateway.status.activity", detail=" · ".join(activity_parts)))
+            except Exception:
+                # Observation-only: never let an activity-read failure break /status.
+                pass
         if queue_depth:
             lines.append(t("gateway.status.queued", count=queue_depth))
         if source.platform == Platform.MATRIX:
