@@ -32,15 +32,25 @@ _SENSITIVE_QUERY_PARAMS = frozenset({
     "token",
     "api_key",
     "apikey",
+    "auth_token",
+    "authorization",
+    "awsaccesskeyid",
     "client_secret",
+    "credential",
+    "credentials",
     "password",
+    "passwd",
     "auth",
     "jwt",
     "session",
+    "session_id",
     "secret",
     "key",
     "code",           # OAuth authorization codes
     "signature",      # pre-signed URL signatures
+    "x_amz_security_token",
+    "x_amz_signature",
+    "x-amz-security-token",
     "x-amz-signature",
 })
 

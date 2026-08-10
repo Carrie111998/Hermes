@@ -375,6 +375,29 @@ def test_hash_is_exact_bytes(hermes_env):
     assert hash_monitor_output("a\nb") != hash_monitor_output("a\nb ")
 
 
+def _opaque_credential_url() -> tuple[str, tuple[str, ...]]:
+    values = tuple(f"opaque-{index:02d}" for index in range(1, 11))
+    query = "&".join(
+        f"{name}={value}"
+        for name, value in zip(
+            (
+                "credential",
+                "credentials",
+                "author%69zation",
+                "session_id",
+                "passwd",
+                "auth_token",
+                "awsaccesskeyid",
+                "x-amz-security-token",
+                "x-amz-signature",
+                "public",
+            ),
+            values,
+        )
+    )
+    return f"https://alice:secret@example.com/path?{query}", values
+
+
 def test_monitor_display_and_snapshot_force_strict_url_credential_redaction(
     hermes_env, monkeypatch
 ):
@@ -383,10 +406,11 @@ def test_monitor_display_and_snapshot_force_strict_url_credential_redaction(
     from cron.monitor import _snapshot_path, check_monitor
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    credential_url, values = _opaque_credential_url()
     _write_script(
         hermes_env,
         "credentials.sh",
-        "printf '%s' 'https://alice:secret@example.com/path?token=opaque&public=visible'",
+        f"printf '%s' '{credential_url}'",
     )
     job = create_job(
         prompt="React",
@@ -400,10 +424,22 @@ def test_monitor_display_and_snapshot_force_strict_url_credential_redaction(
 
     for surfaced in (output, snapshot):
         assert "secret" not in surfaced
-        assert "opaque" not in surfaced
+        for value in values[:-1]:
+            assert value not in surfaced
         assert "alice:***@example.com" in surfaced
-        assert "token=***" in surfaced
-        assert "public=visible" in surfaced
+        for name in (
+            "credential",
+            "credentials",
+            "author%69zation",
+            "session_id",
+            "passwd",
+            "auth_token",
+            "awsaccesskeyid",
+            "x-amz-security-token",
+            "x-amz-signature",
+        ):
+            assert f"{name}=***" in surfaced
+        assert f"public={values[-1]}" in surfaced
 
 
 def test_monitor_failure_forces_strict_url_credential_redaction(
@@ -413,12 +449,13 @@ def test_monitor_failure_forces_strict_url_credential_redaction(
     import cron.monitor as monitor
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+    credential_url, values = _opaque_credential_url()
     monkeypatch.setattr(
         monitor,
         "_fetch_monitor_url_bytes",
         lambda _url: (
             False,
-            "fetch failed for https://alice:secret@example.com/?token=opaque",
+            f"fetch failed for {credential_url}",
         ),
     )
 
@@ -429,9 +466,22 @@ def test_monitor_failure_forces_strict_url_credential_redaction(
     assert ok is False
     assert raw_output == b""
     assert "secret" not in error
-    assert "opaque" not in error
+    for value in values[:-1]:
+        assert value not in error
     assert "alice:***@example.com" in error
-    assert "token=***" in error
+    for name in (
+        "credential",
+        "credentials",
+        "author%69zation",
+        "session_id",
+        "passwd",
+        "auth_token",
+        "awsaccesskeyid",
+        "x-amz-security-token",
+        "x-amz-signature",
+    ):
+        assert f"{name}=***" in error
+    assert f"public={values[-1]}" in error
 
 
 def test_legacy_monitor_snapshot_is_redacted_before_diff(hermes_env, monkeypatch):
