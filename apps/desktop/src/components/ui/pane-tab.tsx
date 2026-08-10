@@ -4,7 +4,7 @@ import { type MenuKit, renderActionItem } from '@/components/ui/actions-menu'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
-import { translateNow } from '@/i18n'
+import { translateNow, useI18n } from '@/i18n'
 import { isMetaClose, middleClickHandlers } from '@/lib/middle-click'
 import { cn } from '@/lib/utils'
 
@@ -101,6 +101,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
   const [closeHovered, setCloseHovered] = React.useState(false)
   const [closeFocused, setCloseFocused] = React.useState(false)
   const closeVisible = closeHovered || closeFocused
+  const { t } = useI18n()
 
   return (
     <div
@@ -187,7 +188,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
       </div>
       {canShowClose && (
         <Button
-          aria-label={translateNow('zones.closeTab')}
+          aria-label={t.zones.closeTab}
           className="group/close relative mr-0.5 self-center text-(--ui-text-tertiary)"
           onAuxClick={event => {
             if (event.button === 1) {
@@ -197,6 +198,16 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
           }}
           onBlur={() => setCloseFocused(false)}
           onClick={event => {
+            // A meta-close is claimed on pointerdown so the shell cannot start
+            // a drag. Suppress the synthetic follow-up click to avoid closing
+            // a second tab after this one unmounts.
+            if (isMetaClose(event)) {
+              event.preventDefault()
+              event.stopPropagation()
+
+              return
+            }
+
             if (event.button === 1) {
               event.preventDefault()
               event.stopPropagation()
@@ -222,6 +233,14 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
           }}
           onPointerDown={event => {
             closeMiddle.onPointerDown(event)
+
+            if (isMetaClose(event)) {
+              event.preventDefault()
+              event.stopPropagation()
+              onClose?.()
+
+              return
+            }
 
             // Primary and middle presses belong to this leaf action. A right
             // press is deliberately left alone so the tab context menu still

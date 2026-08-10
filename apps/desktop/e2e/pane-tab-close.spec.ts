@@ -61,6 +61,7 @@ test('reveals a close control and closes an identified inactive tab without chan
 
   const tabList = closeButtons.first().locator('xpath=ancestor::*[@role="tablist"][1]')
   const tabItems = tabList.locator('[data-tree-tab]')
+  const initialTabCount = await tabItems.count()
   const selectedTab = tabList.locator('[data-tree-tab] > [role="tab"][aria-selected="true"]')
 
   const inactiveTab = tabList
@@ -96,6 +97,7 @@ test('reveals a close control and closes an identified inactive tab without chan
   await expect
     .poll(() => tabItems.evaluateAll(items => items.map(item => item.getAttribute('data-tree-tab'))))
     .not.toContain(inactiveTabId)
+  await expect(tabItems).toHaveCount(initialTabCount - 1)
 
   const remainingSelectedTab = tabList.locator('[data-tree-tab] > [role="tab"][aria-selected="true"]')
   await expect(remainingSelectedTab).toHaveCount(1)
