@@ -10,20 +10,15 @@
   "git": {
     "branch": "codex/hermes-custom-migrate-v020",
     "head_at_start": "299d5d7d9",
-    "head_now": "2ab1a7e00",
+    "head_now": "ba45dc8a5",
     "commits_this_round": [
       "c64d5af1f feat(agent): harden usage.accounts contract with cache identity and concurrent fetch",
       "05b6a1de4 fix(desktop): keep account usage reachable in the statusbar by default",
-      "2ab1a7e00 docs: usage bar core hardening M0 control plane + M1/M2 mockup"
+      "0db51dea5 docs: usage bar core hardening M0 control plane + M1/M2 mockup (on-branch; 2ab1a7e00 为其 amend 前版本)",
+      "eee304619 fix(agent): close cache-identity and stale-semantics gaps from plan review",
+      "ba45dc8a5 fix(desktop): narrow statusbar migration to the untouched legacy default"
     ],
-    "uncommitted_not_mine": [
-      "agent/account_usage.py (并行写者 R1 修复进行中)",
-      "agent/usage_contract.py (同上)",
-      "apps/desktop/src/store/statusbar-prefs.ts (同上)",
-      "tests/agent/test_account_usage.py (同上)",
-      "tests/agent/test_usage_contract.py (同上)",
-      "apps/desktop/src/store/statusbar-prefs.test.ts (新增, 同上)"
-    ],
+    "uncommitted_not_mine_resolved": "两个写者会话交错提交已核实：历史线性、双方工作完整保留；原 uncommitted_not_mine 清单即本会话 R4 修复，已提交为 eee304619/ba45dc8a5",
     "backup_branch": "backup/usage-bar-hardening-pre-m0-20260810",
     "dirty_snapshot": "history/pre-m0-dirty.patch",
     "noise_reverted": [
@@ -44,7 +39,7 @@
     "M2": "PLANNED_AWAITING_MOCKUP_APPROVAL",
     "M3": "PLANNED"
   },
-  "codex_plan_review": "APPROVE (R1:5 -> R2:3 -> R3:2 -> R4:0; history/codex-review-round*.md)",
+  "codex_plan_review": "APPROVE (计划轮 R1:5 -> R2:3 -> R3:2 -> R4:0, history/codex-review-round*.md; 另有 R4-REVISE 修复复核轮 R5: 6/6 VERIFIED -> APPROVE, history/codex-review-round5-verify.md)",
   "blockers": [
     "上游 merge 推迟: live-checkout guard (merge-tree 零冲突已证实, 需停 Hermes 后外部执行)",
     "package/release smoke 未执行 (非发布机; 回滚包已归档 cache/release-backups/)",

@@ -88,3 +88,18 @@
 - 分文件计数（独立复跑）：test_usage_contract 10 passed /
   test_usage_accounts 1 passed / test_account_usage 6 passed / vitest 13 passed。
 - `git diff 299d5d7d9..HEAD` ≡ pre-m0-dirty.patch − package-lock 噪声，零凭证材料。
+
+## 收尾更新（2026-08-10 12:5x）
+
+- **双写者事件**：本会话与另一会话（父会话侧）交错提交同一分支。已核实
+  `git log`：历史线性（c64d5af1f → 05b6a1de4 → 0db51dea5(docs) →
+  eee304619 → ba45dc8a5），双方工作完整保留，无丢改、无 rebase 冲突。
+  对方 STATE 中的 "uncommitted_not_mine" 清单即本会话 R4 修复，已闭环提交。
+- **Codex 复核轮 R5：APPROVE**（R4 REVISE 的 6 项最小修改全部 VERIFIED，
+  行级依据见 `history/codex-review-round5-verify.md`）。
+- 最终测试矩阵：后端 24 passed（usage_contract 16 + account_usage 7 +
+  tui_gateway 1... 按文件：test_usage_contract.py+test_usage_accounts.py
+  合并 17、test_account_usage.py 7）、Desktop 19 passed、typecheck 三 config
+  exit 0、build exit 0、git diff --check clean。
+- STATE.json 已修正 commit 清单与 head（ba45dc8a5），状态维持
+  `AWAITING_MOCKUP_APPROVAL`。

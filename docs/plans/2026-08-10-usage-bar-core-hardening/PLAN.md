@@ -64,12 +64,11 @@
 
 ### 数据面（后端，contract v1 additive）
 
-- **P0（Codex R1#1/R2#3）cache identity 的 credential 分量**：实现已改为忽略
-  持久化 `secret_fingerprint`、直接 `sha256(runtime_token)`（`del entry` 注释
-  说明轮换漂移风险）。剩余任务：**补域分隔前缀**
-  `sha256("usage.accounts/v1|" + runtime_token)`（防跨用途哈希混淆），并补
+- **P0（Codex R1#1/R2#3）cache identity 的 credential 分量**——✅ M0 已闭环：
+  忽略持久化 `secret_fingerprint`，直接域分隔哈希
+  `sha256("usage.accounts/v1|" + runtime_token)`（防跨用途哈希混淆）；
   "同一 env 引用 + 旧 fingerprint + token 轮换 → 两次 identity 不同、旧缓存
-  不可见"的隔离测试。
+  不可见"回归测试在库。
 - `AccountUsageQuota` 已有 additive 字段：`plan`、`source`、`fetched_at`、
   `stale`、`reason`、`details[]`；windows 带 `label/used_percent/reset_at/detail`。
 - 补齐 per-account 稳定展示名：新增可选 `display_name`（由
@@ -83,17 +82,17 @@
 
 ### 可靠性面
 
-- 已实现：6.5s 全局 deadline + ≤4 worker 并发 + fresh/stale 二级缓存 +
-  Codex 单请求 timeout 6s。
-- 待补（**1–4 为 M1 发布前阻塞条件**，Codex R1#2/#3）：
-  1. Kimi fetch timeout 10s → ≤6s；并审计全部 provider 的
-     connect/read/write/pool timeout 均严格 < 全局 deadline（deadline 是返回
-     上限，不是 worker 生命周期上限，单请求必须先收敛）。
-  2. 错误分类器（当前仅 `httpx.TimeoutException` 回退 stale，connect/5xx 错落
-     通用分支）：timeout/connect/5xx → stale 回退；401/403 → unavailable
-     （认证失效，绝不 stale）；429 → 尊重 Retry-After 设置负缓存（封顶 120s）。
-     有缓存/无缓存两种场景分别覆盖。
-  3. in-flight dedupe（singleflight，R2#1 状态机明确如下）：in-flight registry
+- 已实现（M0，Codex R4 修订后）：6.5s 全局 deadline + ≤4 worker 并发 +
+  fresh/stale 二级缓存 + **全部 provider 单请求预算 ≤ deadline**（统一
+  `USAGE_FETCH_TIMEOUT_SECONDS=6s`，OpenRouter 双请求各 3s；逐 provider
+  断言测试在库）+ 错误分类器（timeout/connect/5xx → stale 回退；
+  401/403/429 → error，绝不 stale；有/无缓存场景均锁定）+ late worker
+  不污染缓存/contract 回归测试 + >4 jobs 并发上限测试。
+  注意：`future.cancel()` 不能终止已运行的 HTTP 请求，deadline 是"面板响应
+  上限"而非"请求生命周期上限"——detached daemon worker 会自然消亡，但在
+  singleflight 落地前，高频重复构建仍可能累积少量 in-flight 请求。
+- 待补（**1–3 为 M1 发布前阻塞条件**，Codex R1#2/#3）：
+  1. in-flight dedupe（singleflight，R2#1 状态机明确如下）：in-flight registry
      每个 cache_key 至多一个 entry `(future, deadline)`——
      - 无 entry → 发起 fetch，登记 entry（deadline = now + 6.5s 全局预算）；
      - entry 在飞且 now < deadline → **join 同一 future**（并发构建共享结果，
@@ -107,30 +106,32 @@
        不写缓存、不删除/不修改 registry 中的替代 entry（R3#1 竞态闭合）。
      进程级 semaphore 封顶并发 fetch 数，连续刷新不再每次新建独立 executor
      累积 late workers。测试按四态分别锁定行为。
-  4. negative cache / circuit breaker：连续失败的 cache_key 短窗口负缓存
-     （如 30s），避免每次 statusbar 刷新重打挂掉的端点。
-  5. 线程生命周期：`shutdown(wait=False)` 不终止运行中线程是已知事实，
+  2. negative cache / circuit breaker：连续失败的 cache_key 短窗口负缓存
+     （如 30s）；429 尊重 Retry-After 设置负缓存时长（封顶 120s）；
+     401/403 语义细化为 `status=unavailable` + auth reason（M0 为 error，
+     已满足"不被 stale 掩盖"底线）。
+  3. 线程生命周期压测：`shutdown(wait=False)` 不终止运行中线程是已知事实，
      "worker 纯化"仅是缓解不是上限；补连续多轮 deadline 压测：活跃 worker 数
      有界、旧 future 不被新请求复用且最终释放。
 
 ### 测试矩阵（M1）
 
-- cache identity：同一 env 引用 + 旧 fingerprint + token 轮换 → identity 变化
-  且旧缓存不可见（R1#1）。
+M0 已在库：cache identity 轮换隔离（含旧 persisted fingerprint）、profile
+隔离、endpoint 等价类、late worker 不污染、>4 jobs 并发上限、错误分类
+（timeout/connect/5xx→stale 带 `fetched_at`；401/403/429→error 不读 stale）、
+逐 provider timeout 预算、statusbar 迁移 6 项（精确匹配旧默认才剥离 /
+自定义集合保留 / 幂等 / 损坏 JSON）。
+
+M1 待补：
+
 - 稳定 display_name / is_current 的确定性（打乱输入顺序、cooldown 状态不变名）。
-- 错误分类：timeout/connect/5xx 产生 stale 且带 `fetched_at`；401/403 产生
-  unavailable 且不读 stale；429 在 Retry-After 窗口内不再发请求（R1#3）。
+- 401/403 → `unavailable` + auth reason 的语义细化（M0 为 error）。
 - in-flight dedupe：N 次并发 build 只触发 1 次 provider 调用。
 - singleflight 竞态（R3#1）：旧 future 在替代 entry 登记后才完成 → 旧结果
   被丢弃、替代 entry 仍可被 join、registry 不被误删（generation 比对）。
-- negative cache：失败后 30s 内不再发起请求。
+- negative cache：失败后 30s 内不再发起请求；429 Retry-After 窗口被尊重。
 - worker 有界性：连续 K 轮 deadline 超时后活跃 worker 数 ≤ 进程上限，旧
   future 最终释放（R1#2）。
-- deadline 后完成的 worker 不写缓存、不改已返回 contract。
-- profile 隔离：两个 HERMES_HOME 下同一凭证的 cache identity 不同
-  （**发布前阻塞**，R1 附注）。
-- statusbar 迁移（R1#4）：存储值 == 已知旧默认集合 → 迁移删 context-usage；
-  用户自定义集合（增删过任何项）→ 原样保留。
 
 ## M2 — Command Center 整合 + 维度恢复（下下轮）
 
@@ -154,14 +155,14 @@
 
 ### 发布门禁清单（唯一权威，R3#2；全部为阻塞条件，无例外）
 
-1. M1 可靠性面 1–4（provider timeout 收敛、错误分类器、singleflight、
-   negative cache）实现完成。
-2. credential 域分隔前缀 + env 轮换隔离测试通过（R1#1/R2#3 剩余项）。
-3. profile 隔离测试通过（两个 HERMES_HOME 下同凭证 identity 不同）。
-4. worker 有界性压测 + late-worker 不写缓存/不误删 registry 测试通过
-   （R1#2/R3#1）。
-5. 错误分类测试全绿（timeout/connect/5xx→stale；401/403→unavailable；
-   429→Retry-After；有/无缓存两场景）。
+1. M1 可靠性面 1–3（singleflight、negative cache/Retry-After、worker 有界性
+   压测）实现完成。~~provider timeout 收敛、基础错误分类器~~（M0 已闭环）。
+2. ~~credential 域分隔前缀 + env 轮换隔离测试~~（M0 已闭环，R1#1/R2#3）。
+3. ~~profile 隔离测试~~（M0 已闭环）。
+4. worker 有界性压测通过（R1#2）；~~late-worker 不写缓存~~（M0 已闭环）；
+   不误删 registry（随 singleflight 落地）。
+5. M1 错误分类增量：401/403→unavailable 细化、429→Retry-After 负缓存
+   （M0 已锁定 stale/非 stale 边界）。
 6. 双向兼容测试通过：新客户端连旧后端（缺字段降级 M0 展示）、旧客户端连
    新后端（忽略未知字段）。
 7. 回滚包制品校验完成：SHA-256 清单、构建 commit、版本号、配置兼容范围
@@ -180,17 +181,17 @@
   ③ 手动打开 statusbar popover 确认渲染。
 - 后端/前端 commit 可独立 revert（后端缓存/并发层失败时 revert 回串行无缓存
   版）。
-- statusbar 迁移修正（R1#4）：现行一次性迁移无法区分旧默认集合与用户主动
-  隐藏——M1 收窄迁移条件为"存储值与已知旧默认集合精确匹配才迁移"；用户
-  自定义集合原样保留。旧声明"revert 后重刷无害"对误迁移用户不成立，已删除；
-  回滚不尝试恢复被误删的隐藏偏好（不可区分），改为收窄后不再产生新误迁移。
+- statusbar 迁移修正（R1#4，✅ M0 已落地）：一次性迁移收窄为"存储值与已知
+  旧默认集合精确匹配才剥离 context-usage"；用户自定义集合原样保留；6 项迁移
+  单测在库。已知残余风险：恰好逐条复现旧默认集合的显式隐藏会被覆盖一次
+  （无法区分，已如实记录）。回滚不尝试恢复被剥离的隐藏偏好（不可区分）。
 
 ## 风险登记
 
 | 风险 | 缓解 |
 |---|---|
 | behind 29 的上游同步冲突跨模块 | merge-tree 探测零冲突；实际 merge 因 live-checkout guard 推迟 |
-| cache identity 泄漏凭证 | identity 只含 sha256 指纹与 entry 元数据，永不含 secret |
+| cache identity 泄漏凭证 | 无明文 secret；含 secret 派生的域分隔哈希——禁止日志化/外传 cache key |
 | cache identity 漂移（env 轮换） | R1#1：identity 改用 runtime_token 域分隔哈希 + 轮换隔离测试 |
 | late worker 污染状态/累积 | worker 纯化 + singleflight + 进程级并发上限 + 有界性压测 |
 | stale 掩盖认证失效 | 错误分类器：401/403 永不回退 stale（R1#3 测试锁定） |
