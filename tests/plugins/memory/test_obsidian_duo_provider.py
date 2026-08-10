@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from agent.plugin_llm import PluginLlm
 from plugins.memory.obsidian_duo import ObsidianDuoMemoryProvider
@@ -11,11 +12,12 @@ def test_provider_captures_host_owned_llm():
 
     assert provider.name == "obsidian_duo"
     assert provider._llm is llm
-    assert provider.get_tool_schemas() == []
+    assert provider.get_tool_schemas()[0]["name"] == "memory_duo"
 
 
 def test_provider_initializes_profile_scoped_home(tmp_path):
     provider = ObsidianDuoMemoryProvider()
+    ObsidianDuoConfig(vault_path=str(tmp_path / "Vault")).save(tmp_path)
 
     provider.initialize("session-1", hermes_home=str(tmp_path))
 
@@ -36,3 +38,19 @@ def test_bundled_provider_discovery_registers_host_owned_llm(monkeypatch):
     assert provider is not None
     assert provider.name == "obsidian_duo"
     assert isinstance(provider._llm, PluginLlm)
+
+
+def test_provider_lifecycle_uses_profile_scoped_broker(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    ObsidianDuoConfig(vault_path=str(tmp_path / "Vault")).save(home)
+    monkeypatch.setattr("plugins.memory.obsidian_duo.get_hermes_home", lambda: home, raising=False)
+    provider = ObsidianDuoMemoryProvider()
+
+    provider.initialize("session-1", hermes_home=str(home))
+
+    assert provider._broker is not None
+    assert provider.prefetch("thanks") == ""
+    assert provider.get_tool_schemas()[0]["name"] == "memory_duo"
+    assert '"commit"' not in json.dumps(provider.get_tool_schemas())
+    provider.shutdown()
