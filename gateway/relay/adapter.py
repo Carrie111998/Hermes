@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
@@ -841,6 +842,17 @@ class RelayAdapter(BasePlatformAdapter):
         return parts
 
     async def disconnect(self) -> None:
+        # Budget accounting: the runner wraps this whole call in
+        # asyncio.wait_for(_adapter_disconnect_timeout_secs()). Everything we
+        # spend on monitor teardown and go_idle below eats into what the
+        # transport can spend on its outbound drain, so measure from the top
+        # and thread the REMAINDER down — otherwise worst-case
+        # monitor(1s) + go_idle(2s) + drain + 3×teardown(1s) can blow the 5s
+        # budget, cancelling teardown mid-drain and skipping the transport's
+        # fail-pending loop (callers then block on _OUTBOUND_TIMEOUT_S).
+        from gateway.relay.ws_transport import _env_disconnect_budget_s
+        _started = time.monotonic()
+        _budget = _env_disconnect_budget_s()
         # Phase 7 Unit 7d-B: stop the revocation monitor first so it can't fire a
         # spurious fatal during/after a deliberate teardown.
         if self._revocation_monitor is not None:
@@ -884,7 +896,16 @@ class RelayAdapter(BasePlatformAdapter):
                         )
             finally:
                 try:
-                    await asyncio.shield(self._transport.disconnect())
+                    _remaining = max(0.0, _budget - (time.monotonic() - _started))
+                    try:
+                        _td = cast(Any, self._transport).disconnect(
+                            budget_s=_remaining
+                        )
+                    except TypeError:
+                        # Transports without the budget_s keyword (stubs,
+                        # older implementations) keep the legacy signature.
+                        _td = self._transport.disconnect()
+                    await asyncio.shield(_td)
                 except Exception:  # noqa: BLE001 - teardown must not block outer cancel propagation
                     logger.debug(
                         "relay transport disconnect failed during drain",

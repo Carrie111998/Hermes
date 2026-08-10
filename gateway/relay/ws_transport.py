@@ -68,14 +68,27 @@ _TEARDOWN_AWAIT_TIMEOUT_S = 1.0
 _DISCONNECT_DRAIN_GRACE_S = 5.0
 
 
-def _disconnect_drain_grace_s() -> float:
+def _disconnect_drain_grace_s(budget_s: Optional[float] = None) -> float:
     """Effective drain grace: clamped to the caller's disconnect budget.
 
-    Mirrors gateway/run.py:_adapter_disconnect_timeout_secs (env override with
-    the same variable, same default) rather than importing it — the transport
-    must stay importable without the gateway runner. Reserves the three
-    sequential teardown awaits plus a small margin.
+    ``budget_s`` is the REMAINING budget threaded down by the caller
+    (RelayAdapter.disconnect measures what go_idle and monitor teardown
+    already consumed). When None, mirrors
+    gateway/run.py:_adapter_disconnect_timeout_secs (env override with
+    the same variable, same default) rather than importing it — the
+    transport must stay importable without the gateway runner. Reserves
+    the three sequential teardown awaits plus a small margin.
     """
+    budget = _env_disconnect_budget_s() if budget_s is None else max(0.0, budget_s)
+    reserved = 3 * _TEARDOWN_AWAIT_TIMEOUT_S + 0.5
+    return max(0.0, min(_DISCONNECT_DRAIN_GRACE_S, budget - reserved))
+
+
+def _env_disconnect_budget_s() -> float:
+    """The runner's adapter-disconnect budget, read the same way
+    gateway/run.py:_adapter_disconnect_timeout_secs reads it (same env
+    variable, same default). Callers above the transport use this to
+    apportion the budget across go_idle / monitor teardown / drain."""
     budget = 5.0  # _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT in gateway/run.py
     raw = os.getenv("HERMES_GATEWAY_ADAPTER_DISCONNECT_TIMEOUT", "").strip()
     if raw:
@@ -83,8 +96,7 @@ def _disconnect_drain_grace_s() -> float:
             budget = max(0.0, float(raw))
         except ValueError:
             pass
-    reserved = 3 * _TEARDOWN_AWAIT_TIMEOUT_S + 0.5
-    return max(0.0, min(_DISCONNECT_DRAIN_GRACE_S, budget - reserved))
+    return budget
 
 # Phase 7 Unit 7d-B: the application close code the connector sends when it
 # rejects/revokes a gateway's WS upgrade auth (mirrors the connector's
@@ -528,7 +540,13 @@ class WebSocketRelayTransport:
         token = make_upgrade_token(self._gateway_id, self._upgrade_secret)
         return {"Authorization": f"Bearer {token}"}
 
-    async def disconnect(self) -> None:
+    async def disconnect(self, *, budget_s: Optional[float] = None) -> None:
+        """Tear down the socket, draining in-flight outbound frames first.
+
+        ``budget_s`` is the REMAINING wall-clock budget the caller can spend
+        here (RelayAdapter.disconnect threads it down after go_idle / monitor
+        teardown). When None, the env-mirrored runner default applies.
+        """
         self._closing = True
         # Drain grace: a trailing outbound frame (typically the turn's
         # finalize edit) may still be awaiting its outbound_result. Failing
@@ -538,7 +556,7 @@ class WebSocketRelayTransport:
         # window to resolve before tearing the socket down.
         pending = [f for f in self._pending.values() if not f.done()]
         if pending:
-            _grace = _disconnect_drain_grace_s()
+            _grace = _disconnect_drain_grace_s(budget_s)
             if _grace > 0:
                 try:
                     # asyncio.wait (not wait_for+gather): on timeout it must NOT
@@ -741,6 +759,12 @@ class WebSocketRelayTransport:
         *,
         platform: Optional[str] = None,
     ) -> Dict[str, Any]:
+        if self._closing:
+            # Teardown in progress: the disconnect() fail-pending loop may
+            # already have run, so a future registered now would never be
+            # resolved or failed — the caller would block the full
+            # _OUTBOUND_TIMEOUT_S for a socket that is going away. Fail fast.
+            return {"success": False, "error": "relay transport closed"}
         if self._ws is None:
             return {"success": False, "error": "relay transport not connected"}
         request_id = uuid.uuid4().hex
