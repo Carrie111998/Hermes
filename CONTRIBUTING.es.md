@@ -314,8 +314,8 @@ Todavía debes añadir el nombre de la herramienta a la lista apropiada en `tool
 (por ejemplo `_HERMES_CORE_TOOLS` o un toolset dedicado); de lo contrario la herramienta
 se registra pero nunca se expone al agente.
 
-Consulta `AGENTS.md` (sección **Adding New Tools**) para rutas conscientes del perfil y
-orientación sobre plugins vs. núcleo.
+Consulta la [guía de extensiones y configuración](docs/agents/extensions-and-configuration.md#adding-new-tools)
+para rutas conscientes del perfil y orientación sobre plugins vs. núcleo.
 
 ---
 
