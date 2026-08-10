@@ -100,6 +100,63 @@ def _import_projection(
     )
 
 
+def test_hermes_visibility_sources_dedupe_across_profiles(db, monkeypatch) -> None:
+    """The same Hermes session in two databases must not kill the whole lane.
+
+    The root/profile split writes some sessions to both this store's own db and
+    a profile db. Raising on that made 7 duplicated identities out of 20,846
+    surface as a generic `provider_degraded`, disabling Claude visibility
+    entirely. The primary copy (yielded first) wins.
+    """
+    from contextlib import contextmanager
+
+    class _Projection:
+        def __init__(self, last_active: float) -> None:
+            self.last_active = last_active
+
+    class _Source:
+        def __init__(self, session_id: str, last_active: float) -> None:
+            self.source_session_id = session_id
+            self.projection = _Projection(last_active)
+
+    shared = "20260806_175034_62c1bb"
+    primary = [_Source(shared, 30.0), _Source("only-primary", 20.0)]
+    profile = [_Source(shared, 10.0), _Source("only-profile", 25.0)]
+    batches = iter([primary, profile])
+
+    @contextmanager
+    def _fake_databases(self):
+        yield [("default", object(), False), ("main", object(), True)]
+
+    monkeypatch.setattr(
+        SessionBridgeStore, "_native_hermes_databases", _fake_databases
+    )
+    monkeypatch.setattr(
+        SessionBridgeStore, "_profile_catalog_compatible", lambda self, database: True
+    )
+    monkeypatch.setattr(
+        SessionBridgeStore,
+        "_list_claude_visibility_hermes_sources_from_db",
+        lambda self, database, *, after, limit: next(batches),
+    )
+    monkeypatch.setattr(
+        SessionBridgeStore, "_recorded_worktree_snapshots", lambda self, identities: {}
+    )
+    monkeypatch.setattr(
+        SessionBridgeStore,
+        "_with_recorded_worktree_snapshot",
+        lambda self, source, snapshot: source,
+    )
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+
+    result = store.list_claude_visibility_hermes_sources(0.0, None)
+
+    ids = [source.source_session_id for source in result]
+    assert ids == [shared, "only-profile", "only-primary"]
+    # the PRIMARY copy survived, not the profile one
+    assert next(s for s in result if s.source_session_id == shared).projection.last_active == 30.0
+
+
 def test_upsert_rejects_canonical_id_owned_by_a_different_source(db) -> None:
     """A genuine collision -- another provider's session holds the canonical id."""
     store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)

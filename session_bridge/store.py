@@ -3999,9 +3999,25 @@ class SessionBridgeStore:
                         database, after=cutoff, limit=limit
                     )
                 )
+        # One Hermes session can legitimately appear in more than one database:
+        # the root/profile split writes some sessions to both this store's own
+        # database and a profile database. Keep the first occurrence --
+        # _native_hermes_databases() yields this store's own database first, so
+        # the primary copy wins, and that is also the copy
+        # _recorded_worktree_snapshots() resolves against. Raising here instead
+        # let 7 duplicated identities out of 20,846 sources disable the entire
+        # Claude visibility lane, because the caller reports any exception from
+        # this path as a generic provider_degraded.
+        deduped: list[SidebarSource] = []
+        seen_identities: set[str] = set()
+        for source in sources:
+            identity = source.source_session_id
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            deduped.append(source)
+        sources = deduped
         identities = [source.source_session_id for source in sources]
-        if len(identities) != len(set(identities)):
-            raise ValueError("duplicate native Hermes session identity across profiles")
         snapshots = self._recorded_worktree_snapshots(identities)
         sources = [
             self._with_recorded_worktree_snapshot(
