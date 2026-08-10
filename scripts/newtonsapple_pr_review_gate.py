@@ -76,13 +76,15 @@ class ReviewTuple:
     pr_number: int
     base_sha: str
     head_sha: str
+    request_id: int = 1
     contract_version: str = CONTRACT_VERSION
 
 
 def tuple_key(review_tuple: ReviewTuple) -> str:
     return (
         f"{review_tuple.contract_version}:{review_tuple.repository}:"
-        f"{review_tuple.pr_number}:{review_tuple.base_sha}:{review_tuple.head_sha}"
+        f"{review_tuple.pr_number}:{review_tuple.base_sha}:{review_tuple.head_sha}:"
+        f"{review_tuple.request_id}"
     )
 
 
@@ -652,12 +654,15 @@ def review_marker(review_tuple: ReviewTuple) -> str:
     return (
         f"<!-- newtonsapple-pr-review:{review_tuple.contract_version} "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
-        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} -->"
     )
 
 
-def _latest_request_is_current(timeline: list[dict], *, reviewer_login: str) -> bool:
-    """Prove the live tuple still belongs to the latest reviewer request."""
+def _latest_current_request_id(
+    timeline: list[dict], *, reviewer_login: str
+) -> Optional[int]:
+    """Return the current review-request event ID, or fail closed."""
     request_index = next(
         (
             index
@@ -670,7 +675,14 @@ def _latest_request_is_current(timeline: list[dict], *, reviewer_login: str) -> 
         None,
     )
     if request_index is None:
-        return False
+        return None
+    request_id = timeline[request_index].get("id")
+    if (
+        isinstance(request_id, bool)
+        or not isinstance(request_id, int)
+        or request_id <= 0
+    ):
+        return None
     invalidating_events = {
         "base_ref_changed",
         "base_ref_force_pushed",
@@ -683,15 +695,15 @@ def _latest_request_is_current(timeline: list[dict], *, reviewer_login: str) -> 
     }
     for event in timeline[request_index + 1 :]:
         if not isinstance(event, dict) or event.get("event") in invalidating_events:
-            return False
+            return None
         later_reviewer = event.get("requested_reviewer")
         if (
             event.get("event") in {"review_request_removed", "review_requested"}
             and isinstance(later_reviewer, dict)
             and later_reviewer.get("login") == reviewer_login
         ):
-            return False
-    return True
+            return None
+    return request_id
 
 
 def select_authorized_tuple(
@@ -733,16 +745,20 @@ def select_authorized_tuple(
         timeline = load_timeline(pr_number)
     except (RuntimeError, TypeError, ValueError):
         return None
+    if not isinstance(timeline, list):
+        return None
+    request_id = _latest_current_request_id(
+        timeline, reviewer_login=reviewer_login
+    )
+    if request_id is None:
+        return None
     candidate = ReviewTuple(
         repository=REPOSITORY,
         pr_number=pr_number,
         base_sha=str(base["sha"]),
         head_sha=str(head["sha"]),
+        request_id=request_id,
     )
-    if not isinstance(timeline, list) or not _latest_request_is_current(
-        timeline, reviewer_login=reviewer_login
-    ):
-        return None
     marker = review_marker(candidate)
     if any(marker in body for body in bot_bodies if isinstance(body, str)):
         return None
@@ -797,6 +813,7 @@ def _execution_tuple(payload: dict) -> ReviewTuple:
             pr_number=int(payload["pr_number"]),
             base_sha=str(payload["base_sha"]),
             head_sha=str(payload["head_sha"]),
+            request_id=int(payload["review_request_id"]),
             contract_version=str(payload["contract_version"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -805,6 +822,7 @@ def _execution_tuple(payload: dict) -> ReviewTuple:
         review_tuple.repository != REPOSITORY
         or review_tuple.contract_version != CONTRACT_VERSION
         or review_tuple.pr_number <= 0
+        or review_tuple.request_id <= 0
         or SHA_PATTERN.fullmatch(review_tuple.base_sha) is None
         or SHA_PATTERN.fullmatch(review_tuple.head_sha) is None
     ):
@@ -1305,7 +1323,8 @@ def _summary_marker(review_tuple: ReviewTuple) -> str:
     return (
         "<!-- newtonsapple-pr-review-summary:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
-        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} -->"
     )
 
 
@@ -1313,7 +1332,8 @@ def _requested_marker(review_tuple: ReviewTuple) -> str:
     return (
         "<!-- newtonsapple-pr-review-requested:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
-        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} -->"
     )
 
 
@@ -1321,7 +1341,8 @@ def _started_marker(review_tuple: ReviewTuple) -> str:
     return (
         "<!-- newtonsapple-pr-review-started:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
-        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} -->"
     )
 
 
@@ -1329,7 +1350,8 @@ def _blocker_marker(review_tuple: ReviewTuple) -> str:
     return (
         "<!-- newtonsapple-pr-review-blocker:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
-        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} -->"
     )
 
 
@@ -1337,7 +1359,8 @@ def _dead_letter_marker(review_tuple: ReviewTuple) -> str:
     return (
         "<!-- newtonsapple-pr-review-dead-letter:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
-        f"base={review_tuple.base_sha} head={review_tuple.head_sha} -->"
+        f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} -->"
     )
 
 
@@ -1346,6 +1369,7 @@ def _retry_marker(review_tuple: ReviewTuple, attempt: int) -> str:
         "<!-- newtonsapple-pr-review-retry:v2 "
         f"repo={review_tuple.repository} pr={review_tuple.pr_number} "
         f"base={review_tuple.base_sha} head={review_tuple.head_sha} "
+        f"request={review_tuple.request_id} "
         f"attempt={attempt} -->"
     )
 
@@ -1641,6 +1665,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                     pr_number=number,
                     base_sha=base["sha"],
                     head_sha=head["sha"],
+                    request_id=0,
                 )
                 _ensure_requested_message(
                     store, blocked_tuple, str(listed.get("html_url", ""))
@@ -1680,7 +1705,8 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                 {
                     "delivery_id": (
                         f"recovery-v2-pr{number}-"
-                        f"{selected.base_sha[:12]}-{selected.head_sha[:12]}"
+                        f"{selected.base_sha[:12]}-{selected.head_sha[:12]}-"
+                        f"req{selected.request_id}"
                     ),
                     "event_type": "pull_request",
                     "payload": {
@@ -1704,6 +1730,7 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                 pr_number=number,
                 base_sha=str(base["sha"]),
                 head_sha=str(head["sha"]),
+                request_id=0,
             )
         except KeyError:
             continue
@@ -1745,6 +1772,7 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
             pr_number=int(payload["pr_number"]),
             base_sha=str(payload["base_sha"]),
             head_sha=str(payload["head_sha"]),
+            request_id=int(payload["review_request_id"]),
             contract_version=str(payload["contract_version"]),
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -1753,6 +1781,7 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         review_tuple.repository != REPOSITORY
         or review_tuple.contract_version != CONTRACT_VERSION
         or review_tuple.pr_number <= 0
+        or review_tuple.request_id <= 0
         or SHA_PATTERN.fullmatch(review_tuple.base_sha) is None
         or SHA_PATTERN.fullmatch(review_tuple.head_sha) is None
     ):
@@ -1777,6 +1806,11 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         _ensure_started_message(store, review_tuple, pr_url)
         return {"settled": "started"}
     if operation == "claim_publish":
+        _, selected, _ = _recoverable_live_tuple(
+            review_tuple.pr_number, expected_login
+        )
+        if selected != review_tuple:
+            raise RuntimeError("review request generation changed before publication")
         store.claim_publication(
             review_tuple,
             lease_token=lease_token,
@@ -1811,7 +1845,11 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
     if operation != "complete":
         raise RuntimeError("invalid settlement operation")
 
-    live_pr, _, bodies = _authorized_live_tuple(review_tuple.pr_number, expected_login)
+    live_pr, selected, bodies = _recoverable_live_tuple(
+        review_tuple.pr_number, expected_login
+    )
+    if selected != review_tuple:
+        raise RuntimeError("review request generation changed before settlement")
     marker = review_marker(review_tuple)
     matching_body = next((body for body in bodies if marker in body), None)
     if matching_body is None:
@@ -1878,17 +1916,18 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
         or payload_head.get("sha") != live_head.get("sha")
     ):
         raise RuntimeError("live pull request tuple changed after review request")
-    review_tuple = ReviewTuple(
-        repository=REPOSITORY,
-        pr_number=number,
-        base_sha=str(live_base.get("sha", "")),
-        head_sha=str(live_head.get("sha", "")),
+    review_tuple = select_authorized_tuple(
+        live_pr,
+        reviewer_login=expected_login,
+        bot_bodies=bodies,
+        load_timeline=_load_timeline,
     )
     if (
         live_pr.get("state") != "open"
         or live_pr.get("draft") is not False
-        or SHA_PATTERN.fullmatch(review_tuple.base_sha) is None
-        or SHA_PATTERN.fullmatch(review_tuple.head_sha) is None
+        or review_tuple is None
+        or review_tuple.base_sha != live_base.get("sha")
+        or review_tuple.head_sha != live_head.get("sha")
         or not isinstance(requested_reviewers, list)
         or expected_login
         not in {
@@ -1896,11 +1935,6 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
             for reviewer in requested_reviewers
             if isinstance(reviewer, dict)
         }
-        or any(
-            review_marker(review_tuple) in body
-            for body in bodies
-            if isinstance(body, str)
-        )
     ):
         raise RuntimeError("webhook pull request is no longer eligible")
     lease_token = store.reserve(
@@ -1922,6 +1956,7 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
         "expected_base_sha": review_tuple.base_sha,
         "expected_base_ref": BASE_BRANCH,
         "expected_head_sha": review_tuple.head_sha,
+        "review_request_id": review_tuple.request_id,
         "action": "review_requested",
         "pr_url": str(live_pr.get("html_url", "")),
         "review_marker": review_marker(review_tuple),
@@ -1945,7 +1980,7 @@ def main() -> None:
             output = resolve_execution_gates(payload)
         elif operation == "execution_evidence":
             output = execution_evidence(payload)
-        elif operation in {"complete", "release", "started"}:
+        elif operation in {"claim_publish", "complete", "release", "started"}:
             output = _settle(payload, expected_login, store)
         elif operation is not None:
             raise RuntimeError("unsupported control-plane operation")

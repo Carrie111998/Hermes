@@ -21,6 +21,7 @@ from scripts.newtonsapple_pr_review_gate import (
 
 BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
+REVIEW_REQUEST_ID = 123456
 
 
 def _execution_request(operation):
@@ -31,6 +32,7 @@ def _execution_request(operation):
         "pr_number": "185",
         "base_sha": BASE_SHA,
         "head_sha": HEAD_SHA,
+        "review_request_id": REVIEW_REQUEST_ID,
     }
 
 
@@ -130,6 +132,52 @@ def test_review_state_store_uses_wal_and_reclaims_only_expired_leases(tmp_path):
     assert store.reserve(review_tuple, now=10_000, lease_seconds=30) is None
 
 
+def test_new_request_generation_bypasses_prior_completion_and_dead_letter(tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    completed = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        request_id=1,
+    )
+    dead_lettered = ReviewTuple(
+        repository=completed.repository,
+        pr_number=completed.pr_number,
+        base_sha=completed.base_sha,
+        head_sha=completed.head_sha,
+        request_id=2,
+    )
+    current = ReviewTuple(
+        repository=completed.repository,
+        pr_number=completed.pr_number,
+        base_sha=completed.base_sha,
+        head_sha=completed.head_sha,
+        request_id=3,
+    )
+
+    completed_lease = store.reserve(completed, now=100, lease_seconds=30)
+    assert isinstance(completed_lease, str)
+    store.complete(completed, lease_token=completed_lease, now=101)
+
+    dead_lettered_lease = store.reserve(dead_lettered, now=102, lease_seconds=30)
+    assert isinstance(dead_lettered_lease, str)
+    failure = store.record_failure(
+        dead_lettered,
+        lease_token=dead_lettered_lease,
+        now=103,
+        retry_delay=60,
+        max_attempts=1,
+        dead_letter_marker="dead-letter-marker",
+        dead_letter_content="dead-letter-content",
+    )
+    assert failure["dead_lettered"] is True
+
+    assert store.reserve(completed, now=104, lease_seconds=30) is None
+    assert store.reserve(dead_lettered, now=104, lease_seconds=30) is None
+    assert isinstance(store.reserve(current, now=104, lease_seconds=30), str)
+
+
 def test_publication_claim_is_single_use_token_fenced_and_extends_lease(tmp_path):
     first_store = ReviewStateStore(tmp_path / "review.sqlite3")
     second_store = ReviewStateStore(tmp_path / "review.sqlite3")
@@ -172,6 +220,11 @@ def test_settlement_control_plane_claims_publication_before_side_effect(monkeypa
     lease_token = store.reserve(review_tuple, now=100, lease_seconds=60)
     assert isinstance(lease_token, str)
     monkeypatch.setattr(gate.time, "time", lambda: 120)
+    monkeypatch.setattr(
+        gate,
+        "_recoverable_live_tuple",
+        lambda *args: (_live_pr(), review_tuple, []),
+    )
     payload = {
         "operation": "claim_publish",
         "contract_version": "v2",
@@ -179,6 +232,7 @@ def test_settlement_control_plane_claims_publication_before_side_effect(monkeypa
         "pr_number": review_tuple.pr_number,
         "base_sha": review_tuple.base_sha,
         "head_sha": review_tuple.head_sha,
+        "review_request_id": review_tuple.request_id,
         "lease_token": lease_token,
     }
 
@@ -187,6 +241,50 @@ def test_settlement_control_plane_claims_publication_before_side_effect(monkeypa
     }
     with pytest.raises(ValueError, match="review publication claim not found"):
         gate._settle(payload, "newtonsapple-bot", store)
+
+
+def test_publication_claim_rejects_a_superseded_request_generation(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    stale = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        request_id=1,
+    )
+    current = ReviewTuple(
+        repository=stale.repository,
+        pr_number=stale.pr_number,
+        base_sha=stale.base_sha,
+        head_sha=stale.head_sha,
+        request_id=2,
+    )
+    lease_token = store.reserve(stale, now=100, lease_seconds=60)
+    assert isinstance(lease_token, str)
+    monkeypatch.setattr(gate.time, "time", lambda: 120)
+    monkeypatch.setattr(
+        gate,
+        "_recoverable_live_tuple",
+        lambda *args: (_live_pr(), current, []),
+    )
+
+    with pytest.raises(RuntimeError, match="generation changed before publication"):
+        gate._settle(
+            {
+                "operation": "claim_publish",
+                "contract_version": "v2",
+                "repository": stale.repository,
+                "pr_number": stale.pr_number,
+                "base_sha": stale.base_sha,
+                "head_sha": stale.head_sha,
+                "review_request_id": stale.request_id,
+                "lease_token": lease_token,
+            },
+            "newtonsapple-bot",
+            store,
+        )
+
+    assert store.active_lease(stale, lease_token=lease_token, now=120) is True
 
 
 def test_complete_settlement_records_review_without_commit_status(monkeypatch, tmp_path):
@@ -212,8 +310,8 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
     )
     monkeypatch.setattr(
         gate,
-        "_authorized_live_tuple",
-        lambda *args: (live_pr, None, [marker_body]),
+        "_recoverable_live_tuple",
+        lambda *args: (live_pr, review_tuple, [marker_body]),
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     delivered = []
@@ -235,6 +333,7 @@ def test_complete_settlement_records_review_without_commit_status(monkeypatch, t
             "pr_number": review_tuple.pr_number,
             "base_sha": review_tuple.base_sha,
             "head_sha": review_tuple.head_sha,
+            "review_request_id": review_tuple.request_id,
             "lease_token": lease_token,
         },
         "newtonsapple-bot",
@@ -351,6 +450,7 @@ def test_release_settlement_never_publishes_a_github_status(monkeypatch, tmp_pat
                 "pr_number": review_tuple.pr_number,
                 "base_sha": review_tuple.base_sha,
                 "head_sha": review_tuple.head_sha,
+                "review_request_id": review_tuple.request_id,
                 "lease_token": lease_token,
                 "failure_code": "review_evidence_incomplete",
             },
@@ -377,6 +477,17 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
         "scripts.newtonsapple_pr_review_gate._live_review_state",
         lambda number, login: (live_pr, []),
     )
+    monkeypatch.setattr(
+        gate,
+        "_load_timeline",
+        lambda number: [
+            {
+                "id": REVIEW_REQUEST_ID,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            }
+        ],
+    )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
         gate, "_buzz_send", lambda content, reply_to=None: "buzz-request"
@@ -396,6 +507,7 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
 
     assert result["contract_version"] == "v2"
     assert result["expected_base_ref"] == "dev"
+    assert result["review_request_id"] == REVIEW_REQUEST_ID
     assert isinstance(result["lease_token"], str)
     assert len(result["lease_token"]) >= 32
     assert store.requested_event_id(
@@ -404,6 +516,7 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
             pr_number=185,
             base_sha=BASE_SHA,
             head_sha=HEAD_SHA,
+            request_id=REVIEW_REQUEST_ID,
         )
     ) == "buzz-request"
 
@@ -435,6 +548,7 @@ def test_started_control_plane_replies_once_under_requested_thread(monkeypatch, 
         "pr_number": review_tuple.pr_number,
         "base_sha": review_tuple.base_sha,
         "head_sha": review_tuple.head_sha,
+        "review_request_id": review_tuple.request_id,
         "lease_token": lease_token,
         "pr_url": "https://github.com/NewtonsAppleAI/newtonsapple-web/pull/185",
     }
@@ -468,7 +582,8 @@ def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tm
     )
     marker = (
         "<!-- newtonsapple-pr-review-summary:v2 "
-        f"repo=NewtonsAppleAI/newtonsapple-web pr=185 base={BASE_SHA} head={HEAD_SHA} -->"
+        f"repo=NewtonsAppleAI/newtonsapple-web pr=185 base={BASE_SHA} "
+        f"head={HEAD_SHA} request={review_tuple.request_id} -->"
     )
 
     first_id = store.enqueue_summary(review_tuple, marker=marker, content="review summary")
@@ -479,7 +594,8 @@ def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tm
         {
             "id": first_id,
             "key": (
-                f"v2:NewtonsAppleAI/newtonsapple-web:185:{BASE_SHA}:{HEAD_SHA}"
+                f"v2:NewtonsAppleAI/newtonsapple-web:185:{BASE_SHA}:{HEAD_SHA}:"
+                f"{review_tuple.request_id}"
             ),
             "marker": marker,
             "content": "review summary",
@@ -873,6 +989,7 @@ def test_reconciliation_accepts_latest_current_timeline_request():
         pr_number=185,
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
+        request_id=2,
     )
 
 
@@ -943,6 +1060,66 @@ def test_reconciliation_accepts_the_latest_rerequest():
         pr_number=185,
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
+        request_id=4,
+    )
+
+
+@pytest.mark.parametrize("request_id", [None, True, "4", 0, -1])
+def test_reconciliation_rejects_a_request_without_a_positive_timeline_id(request_id):
+    selected = select_authorized_tuple(
+        _live_pr(),
+        reviewer_login="newtonsapple-bot",
+        bot_bodies=[],
+        load_timeline=lambda pr_number: [
+            {
+                "id": request_id,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            }
+        ],
+    )
+
+    assert selected is None
+
+
+def test_prior_generation_marker_does_not_block_the_latest_rerequest():
+    prior = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        request_id=2,
+    )
+
+    selected = select_authorized_tuple(
+        _live_pr(),
+        reviewer_login="newtonsapple-bot",
+        bot_bodies=[f"prior review\n\n{gate.review_marker(prior)}"],
+        load_timeline=lambda pr_number: [
+            {
+                "id": 2,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            },
+            {
+                "id": 3,
+                "event": "review_request_removed",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            },
+            {
+                "id": 4,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            },
+        ],
+    )
+
+    assert selected == ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        request_id=4,
     )
 
 
@@ -953,6 +1130,17 @@ def test_webhook_accepts_verified_payload_tuple(monkeypatch, tmp_path):
         gate,
         "_live_review_state",
         lambda number, login: (live_pr, []),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_load_timeline",
+        lambda number: [
+            {
+                "id": REVIEW_REQUEST_ID,
+                "event": "review_requested",
+                "requested_reviewer": {"login": "newtonsapple-bot"},
+            }
+        ],
     )
     monkeypatch.setattr(gate, "_buzz_find", lambda marker, reply_to=None: None)
     monkeypatch.setattr(
@@ -973,6 +1161,7 @@ def test_webhook_accepts_verified_payload_tuple(monkeypatch, tmp_path):
 
     assert result["expected_base_sha"] == BASE_SHA
     assert result["expected_head_sha"] == HEAD_SHA
+    assert result["review_request_id"] == REVIEW_REQUEST_ID
 
 
 def test_webhook_rejects_head_mutation_between_payload_and_live_state(monkeypatch, tmp_path):
@@ -1278,7 +1467,7 @@ def test_reconciliation_rechecks_request_event_and_later_invalidation():
         ({"base": {"ref": "feature", "sha": BASE_SHA}}, []),
         ({"requested_reviewers": []}, []),
         ({}, ["prefix <!-- newtonsapple-pr-review:v2 repo=NewtonsAppleAI/newtonsapple-web "
-              f"pr=185 base={BASE_SHA} head={HEAD_SHA} --> suffix"]),
+              f"pr=185 base={BASE_SHA} head={HEAD_SHA} request=1 --> suffix"]),
     ],
 )
 def test_reconciliation_rejects_stale_ineligible_or_completed_tuple(

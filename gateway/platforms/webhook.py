@@ -447,6 +447,12 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         if deliver_type == "github_review":
+            if not await self._claim_review_publication(delivery):
+                delivery["_github_review_failure_code"] = "publication_failed"
+                return SendResult(
+                    success=False,
+                    error="Review publication claim unavailable",
+                )
             result = await self._deliver_github_review(content, delivery)
             if result.success:
                 self._successful_github_reviews.add(chat_id)
@@ -1024,6 +1030,7 @@ class WebhookAdapter(BasePlatformAdapter):
             deliver_config["_trusted_evidence_route"] = route_name
             deliver_config["_evidence_tuple"] = evidence.tuple_dict
             deliver_config["_settlement_lease_token"] = settlement_lease_token
+            deliver_config["_review_request_id"] = payload.get("review_request_id")
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
@@ -1053,6 +1060,7 @@ class WebhookAdapter(BasePlatformAdapter):
             evidence.tuple_dict,
             settlement_lease_token,
             payload.get("pr_url"),
+            payload.get("review_request_id"),
         ):
             await self._release_review_reservation(
                 route_name, payload, settlement_lease_token
@@ -1188,6 +1196,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "pr_number": str(payload.get("pr_number", "")),
             "base_sha": payload.get("expected_base_sha"),
             "head_sha": payload.get("expected_head_sha"),
+            "review_request_id": payload.get("review_request_id"),
             "lease_token": lease_token,
         }
         keep, _ = await asyncio.to_thread(
@@ -1205,6 +1214,7 @@ class WebhookAdapter(BasePlatformAdapter):
         review_tuple: dict,
         lease_token: Optional[str],
         pr_url: Any,
+        review_request_id: Any,
     ) -> bool:
         """Record the active-review reply before the model run is dispatched."""
         if not route_config.get("buzz_thread_lifecycle"):
@@ -1217,6 +1227,9 @@ class WebhookAdapter(BasePlatformAdapter):
             or not isinstance(lease_token, str)
             or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", lease_token) is None
             or not isinstance(pr_url, str)
+            or isinstance(review_request_id, bool)
+            or not isinstance(review_request_id, int)
+            or review_request_id <= 0
         ):
             return False
         control = {
@@ -1226,6 +1239,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "pr_number": str(review_tuple.get("pr_number", "")),
             "base_sha": review_tuple.get("base_sha"),
             "head_sha": review_tuple.get("head_sha"),
+            "review_request_id": review_request_id,
             "lease_token": lease_token,
             "pr_url": pr_url,
         }
@@ -1250,6 +1264,7 @@ class WebhookAdapter(BasePlatformAdapter):
         route_name = delivery.get("_trusted_evidence_route")
         lease_token = delivery.get("_settlement_lease_token")
         review_tuple = delivery.get("_evidence_tuple")
+        review_request_id = delivery.get("_review_request_id")
         static_route = (
             self._static_routes.get(route_name)
             if isinstance(route_name, str)
@@ -1264,6 +1279,9 @@ class WebhookAdapter(BasePlatformAdapter):
             or not isinstance(lease_token, str)
             or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", lease_token) is None
             or not isinstance(review_tuple, dict)
+            or isinstance(review_request_id, bool)
+            or not isinstance(review_request_id, int)
+            or review_request_id <= 0
             or not isinstance(extra, dict)
             or str(extra.get("repo")) != str(review_tuple.get("repository"))
             or str(extra.get("pr_number")) != str(review_tuple.get("pr_number"))
@@ -1278,6 +1296,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "pr_number": str(review_tuple.get("pr_number", "")),
             "base_sha": review_tuple.get("base_sha"),
             "head_sha": review_tuple.get("head_sha"),
+            "review_request_id": review_request_id,
             "lease_token": lease_token,
         }
         try:
@@ -1401,6 +1420,7 @@ class WebhookAdapter(BasePlatformAdapter):
             evidence.tuple_dict,
             settlement_lease_token,
             payload.get("pr_url"),
+            payload.get("review_request_id"),
         ):
             await self._release_review_reservation(
                 route_name, payload, settlement_lease_token
@@ -1420,6 +1440,7 @@ class WebhookAdapter(BasePlatformAdapter):
             deliver_config["_trusted_evidence_route"] = route_name
             deliver_config["_evidence_tuple"] = evidence.tuple_dict
             deliver_config["_settlement_lease_token"] = settlement_lease_token
+            deliver_config["_review_request_id"] = payload.get("review_request_id")
         self._delivery_info[session_chat_id] = deliver_config
         self._delivery_info_created[session_chat_id] = now
         self._delivery_info_order.append((now, session_chat_id))
@@ -1471,6 +1492,13 @@ class WebhookAdapter(BasePlatformAdapter):
         ):
             return None
         if not isinstance(payload, dict):
+            return None
+        review_request_id = payload.get("review_request_id")
+        if (
+            isinstance(review_request_id, bool)
+            or not isinstance(review_request_id, int)
+            or review_request_id <= 0
+        ):
             return None
         public_key_value = static_route.get("execution_attestation_public_key")
         baseline_gates = static_route.get("baseline_execution_gates")
@@ -1531,6 +1559,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 "pr_number": str(scope.pr_number),
                 "base_sha": scope.base_sha,
                 "head_sha": scope.head_sha,
+                "review_request_id": review_request_id,
             }
             script_kwargs = (
                 {
@@ -1607,6 +1636,7 @@ class WebhookAdapter(BasePlatformAdapter):
         route_name = delivery.get("_trusted_evidence_route")
         tuple_data = delivery.get("_evidence_tuple")
         lease_token = delivery.get("_settlement_lease_token")
+        review_request_id = delivery.get("_review_request_id")
         if not isinstance(route_name, str):
             return
         static_route = self._static_routes.get(route_name)
@@ -1614,6 +1644,9 @@ class WebhookAdapter(BasePlatformAdapter):
             not isinstance(tuple_data, dict)
             or not isinstance(lease_token, str)
             or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", lease_token) is None
+            or isinstance(review_request_id, bool)
+            or not isinstance(review_request_id, int)
+            or review_request_id <= 0
             or not isinstance(static_route, dict)
             or static_route.get("evidence") != "github_pr"
             or not isinstance(static_route.get("script"), str)
@@ -1645,6 +1678,7 @@ class WebhookAdapter(BasePlatformAdapter):
             "pr_number": str(trusted_tuple.pr_number),
             "base_sha": trusted_tuple.base_sha,
             "head_sha": trusted_tuple.head_sha,
+            "review_request_id": review_request_id,
             "lease_token": lease_token,
         }
         if operation == "release":
@@ -2003,6 +2037,7 @@ class WebhookAdapter(BasePlatformAdapter):
         head_sha = extra.get("head_sha", "")
         publisher_login = extra.get("publisher_login", "")
         requested_reviewer = extra.get("requested_reviewer", "")
+        review_request_id = delivery.get("_review_request_id")
 
         try:
             pr_int = int(pr_number)
@@ -2022,6 +2057,12 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Invalid publisher_login")
         if requested_reviewer != publisher_login:
             return SendResult(success=False, error="Reviewer/publisher mismatch")
+        if (
+            isinstance(review_request_id, bool)
+            or not isinstance(review_request_id, int)
+            or review_request_id <= 0
+        ):
+            return SendResult(success=False, error="Invalid review_request_id")
         if not review_evidence_complete_for(
             "v2", repo, pr_int, str(base_sha), str(head_sha)
         ):
@@ -2038,7 +2079,8 @@ class WebhookAdapter(BasePlatformAdapter):
             )
         review_marker = (
             "<!-- newtonsapple-pr-review:v2 "
-            f"repo={repo} pr={pr_int} base={base_sha} head={head_sha} -->"
+            f"repo={repo} pr={pr_int} base={base_sha} head={head_sha} "
+            f"request={review_request_id} -->"
         )
         if review_marker not in content:
             return SendResult(

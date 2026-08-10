@@ -269,12 +269,14 @@ class TestGitHubPRWebhook:
 
 
 class TestGitHubPREvidenceScope:
+    review_request_id = 123456
     payload = {
         "repository": "org/repo",
         "pr_number": 42,
         "expected_base_sha": "a" * 40,
         "expected_head_sha": "b" * 40,
         "contract_version": "v2",
+        "review_request_id": review_request_id,
     }
 
     @pytest.mark.asyncio
@@ -301,6 +303,7 @@ class TestGitHubPREvidenceScope:
             },
             "l" * 43,
             "https://github.com/org/repo/pull/42",
+            self.review_request_id,
         )
 
         assert started is True
@@ -313,6 +316,7 @@ class TestGitHubPREvidenceScope:
                 "pr_number": "42",
                 "base_sha": "a" * 40,
                 "head_sha": "b" * 40,
+                "review_request_id": self.review_request_id,
                 "lease_token": "l" * 43,
                 "pr_url": "https://github.com/org/repo/pull/42",
             },
@@ -404,6 +408,31 @@ class TestGitHubPREvidenceScope:
         assert scope.gate_resolution_loader is not None
         assert scope.execution_attestation_loader is not None
 
+    @pytest.mark.parametrize("review_request_id", [None, True, "123456", 0, -1])
+    def test_static_opted_in_route_rejects_invalid_review_request_generation(
+        self, review_request_id
+    ):
+        adapter = _make_adapter(
+            {
+                "github-pr": {
+                    "evidence": "github_pr",
+                    "review_evidence_mode": "concise",
+                    "secret": "secret",
+                    "script": "trusted-gate.py",
+                    "deliver_extra": {"contract_version": "v2"},
+                    "execution_attestation_public_key": base64.b64encode(
+                        b"k" * 32
+                    ).decode(),
+                    "baseline_execution_gates": ["quality", "integration", "e2e"],
+                    "execution_gate_policy_version": "newtonsapple-v1",
+                    "execution_gate_policy_sha256": "f" * 64,
+                }
+            }
+        )
+        payload = {**self.payload, "review_request_id": review_request_id}
+
+        assert adapter._evidence_scope_for_route("github-pr", payload) is None
+
     @pytest.mark.asyncio
     async def test_opted_in_route_does_not_start_agent_without_valid_evidence_scope(self):
         secret = "secret"
@@ -448,6 +477,7 @@ class TestGitHubPREvidenceScope:
                 "pr_number": "42",
                 "base_sha": "a" * 40,
                 "head_sha": "b" * 40,
+                "review_request_id": self.review_request_id,
                 "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
             },
         )
@@ -536,6 +566,7 @@ class TestGitHubPREvidenceScope:
                 "pr_number": "42",
                 "base_sha": "a" * 40,
                 "head_sha": "b" * 40,
+                "review_request_id": self.review_request_id,
             },
             timeout_seconds=4 * 60 * 60,
             trusted_github_pr_environment=True,
@@ -579,6 +610,7 @@ class TestGitHubPREvidenceScope:
                 "pr_number": "42",
                 "base_sha": "a" * 40,
                 "head_sha": "b" * 40,
+                "review_request_id": self.review_request_id,
             },
             trusted_github_pr_environment=True,
         )
@@ -805,6 +837,7 @@ class TestStaticRouteRecovery:
             "pr_number": 42,
             "expected_base_sha": "a" * 40,
             "expected_head_sha": "b" * 40,
+            "review_request_id": 123456,
             "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
         }
         adapter._route_processor.run_route_script = MagicMock(
@@ -831,6 +864,7 @@ class TestStaticRouteRecovery:
                 "pr_number": "42",
                 "base_sha": "a" * 40,
                 "head_sha": "b" * 40,
+                "review_request_id": 123456,
                 "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
             },
         )
@@ -856,6 +890,7 @@ class TestStaticRouteRecovery:
             "pr_number": 42,
             "expected_base_sha": "a" * 40,
             "expected_head_sha": "b" * 40,
+            "review_request_id": 123456,
             "lease_token": "l" * 43,
         }
         adapter._route_processor.run_route_script = MagicMock(
@@ -900,6 +935,7 @@ class TestStaticRouteRecovery:
             "pr_number": 42,
             "expected_base_sha": "a" * 40,
             "expected_head_sha": "b" * 40,
+            "review_request_id": 123456,
             "lease_token": "l" * 43,
         }
         adapter._route_processor.run_route_script = MagicMock(
@@ -1127,6 +1163,7 @@ class TestGitHubReviewDelivery:
     base_sha = "a" * 40
     head_sha = "b" * 40
     publisher = "newtonsapple-bot"
+    review_request_id = 123456
 
     @pytest.fixture(autouse=True)
     def complete_evidence_scope(self):
@@ -1154,7 +1191,8 @@ class TestGitHubReviewDelivery:
     def _marker(self, *, head_sha=None):
         return (
             "<!-- newtonsapple-pr-review:v2 repo=org/repo pr=42 "
-            f"base={self.base_sha} head={head_sha or self.head_sha} -->"
+            f"base={self.base_sha} head={head_sha or self.head_sha} "
+            f"request={self.review_request_id} -->"
         )
 
     def _delivery(self, **overrides):
@@ -1168,7 +1206,10 @@ class TestGitHubReviewDelivery:
             "requested_reviewer": self.publisher,
         }
         extra.update(overrides)
-        return {"deliver_extra": extra}
+        return {
+            "deliver_extra": extra,
+            "_review_request_id": self.review_request_id,
+        }
 
     def _actor(self, login=None):
         return MagicMock(
@@ -1453,6 +1494,7 @@ class TestGitHubReviewDelivery:
             "deliver_extra": self._delivery()["deliver_extra"],
             "_trusted_evidence_route": "pr-review",
             "_settlement_lease_token": "l" * 43,
+            "_review_request_id": self.review_request_id,
             "_evidence_tuple": {
                 "contract_version": "v2",
                 "repository": "org/repo",
@@ -1465,13 +1507,66 @@ class TestGitHubReviewDelivery:
 
         with patch.object(
             adapter,
+            "_claim_review_publication",
+            new=AsyncMock(return_value=True),
+        ) as claim, patch.object(
+            adapter,
             "_deliver_github_review",
             new=AsyncMock(return_value=SendResult(success=True)),
         ) as publish:
             result = await adapter.send(chat_id, self._marker())
 
         assert result.success is True
+        claim.assert_awaited_once_with(delivery)
         publish.assert_awaited_once_with(self._marker(), delivery)
+
+    @pytest.mark.asyncio
+    async def test_github_review_send_does_not_publish_when_generation_claim_is_rejected(self):
+        adapter = _make_adapter(
+            {
+                "pr-review": {
+                    "evidence": "github_pr",
+                    "script": "newtonsapple-pr-review-gate.py",
+                }
+            }
+        )
+        chat_id = "webhook:pr-review:delivery-1"
+        delivery = {
+            "deliver": "github_review",
+            "deliver_extra": self._delivery()["deliver_extra"],
+            "_trusted_evidence_route": "pr-review",
+            "_settlement_lease_token": "l" * 43,
+            "_review_request_id": self.review_request_id,
+            "_evidence_tuple": {
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": 42,
+                "base_sha": self.base_sha,
+                "head_sha": self.head_sha,
+            },
+        }
+        adapter._delivery_info[chat_id] = delivery
+
+        with patch.object(
+            adapter,
+            "_claim_review_publication",
+            new=AsyncMock(return_value=False),
+        ) as claim, patch.object(
+            adapter,
+            "_deliver_github_review",
+            new=AsyncMock(),
+        ) as publish:
+            result = await adapter.send(chat_id, self._marker())
+
+        assert result.success is False
+        assert result.error == "Review publication claim unavailable"
+        claim.assert_awaited_once_with(delivery)
+        publish.assert_not_awaited()
+        assert chat_id not in adapter._successful_github_reviews
+        assert (
+            adapter._delivery_info[chat_id]["_github_review_failure_code"]
+            == "publication_failed"
+        )
 
     @pytest.mark.asyncio
     async def test_github_review_send_propagates_publication_failure(self):
@@ -1489,6 +1584,7 @@ class TestGitHubReviewDelivery:
             "deliver_extra": self._delivery()["deliver_extra"],
             "_trusted_evidence_route": "pr-review",
             "_settlement_lease_token": "l" * 43,
+            "_review_request_id": self.review_request_id,
             "_evidence_tuple": {
                 "contract_version": "v2",
                 "repository": "org/repo",
@@ -1499,6 +1595,10 @@ class TestGitHubReviewDelivery:
         }
 
         with patch.object(
+            adapter,
+            "_claim_review_publication",
+            new=AsyncMock(return_value=True),
+        ), patch.object(
             adapter,
             "_deliver_github_review",
             new=AsyncMock(return_value=SendResult(success=False, error="publish failed")),
@@ -1577,6 +1677,7 @@ class TestGitHubReviewDelivery:
             "deliver_extra": self._delivery(contract_version="v2")["deliver_extra"],
             "_trusted_evidence_route": "pr-review",
             "_settlement_lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
+            "_review_request_id": self.review_request_id,
             "_evidence_tuple": {
                 "contract_version": "v2",
                 "repository": "org/repo",
@@ -1625,6 +1726,7 @@ class TestGitHubReviewDelivery:
             "pr_number": "42",
             "base_sha": self.base_sha,
             "head_sha": self.head_sha,
+            "review_request_id": self.review_request_id,
             "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
         }
         if expected_failure_code is not None:
