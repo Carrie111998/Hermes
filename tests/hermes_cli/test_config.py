@@ -1488,6 +1488,29 @@ class TestLoadConfigFlatMoa:
             assert preset["reference_models"][0]["model"] == "named-ref"
             assert preset["aggregator"]["model"] == "named-agg"
 
+    def test_flat_moa_with_enabled_false_keeps_inherited_presets(self, tmp_path):
+        """``enabled: false`` opts out of flat legacy detection — presets stay."""
+        from hermes_cli.moa_config import (
+            DEFAULT_MOA_AGGREGATOR,
+            DEFAULT_MOA_REFERENCE_MODELS,
+            resolve_moa_preset,
+        )
+
+        yaml_text = """moa:
+  enabled: false
+  reference_models:
+    - provider: myprov
+      model: my-reference-a
+  aggregator:
+    provider: myprov
+    model: my-aggregator
+"""
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            (tmp_path / "config.yaml").write_text(yaml_text, encoding="utf-8")
+            preset = resolve_moa_preset(load_config().get("moa") or {})
+            assert preset["reference_models"][0]["model"] == DEFAULT_MOA_REFERENCE_MODELS[0]["model"]
+            assert preset["aggregator"]["model"] == DEFAULT_MOA_AGGREGATOR["model"]
+
 
 # ---------------------------------------------------------------------------
 # DEFAULT_CONFIG must not carry a duplicate "kanban" key
