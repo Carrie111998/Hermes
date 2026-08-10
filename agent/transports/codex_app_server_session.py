@@ -679,7 +679,14 @@ class CodexAppServerSession:
                                 result.error
                                 or "codex reported turn_aborted"
                             )
-                self._handle_server_request(sreq)
+                try:
+                    self._handle_server_request(sreq)
+                except CodexAppServerTransportError as exc:
+                    result.error = self._format_error_with_stderr(
+                        "server request response transport failed", exc
+                    )
+                    result.should_retire = True
+                    break
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
                 last_tool_completion_at = None
@@ -892,7 +899,14 @@ class CodexAppServerSession:
 
             sreq = self._client.take_server_request(timeout=0)
             if sreq is not None:
-                self._handle_server_request(sreq)
+                try:
+                    self._handle_server_request(sreq)
+                except CodexAppServerTransportError as exc:
+                    result.error = self._format_error_with_stderr(
+                        "server request response transport failed", exc
+                    )
+                    result.should_retire = True
+                    break
                 continue
 
             note = self._client.take_notification(

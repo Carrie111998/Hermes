@@ -406,6 +406,27 @@ class TestRunTurn:
         with pytest.raises(RuntimeError, match="unexpected adapter defect"):
             make_session(client).run_turn("hi", turn_timeout=2.0)
 
+    def test_approval_response_transport_failure_returns_retiring_result(self):
+        from agent.transports.codex_app_server import CodexAppServerTransportError
+
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            command="pwd",
+            cwd="/tmp",
+        )
+
+        def fail_write(_request_id, _result):
+            raise CodexAppServerTransportError("stdin closed")
+
+        client.respond = fail_write
+
+        result = make_session(client).run_turn("hi", turn_timeout=2.0)
+
+        assert result.error and "response transport failed" in result.error
+        assert "stdin closed" in result.error
+        assert result.should_retire is True
+
 
 
 
@@ -513,6 +534,27 @@ class TestCompactThread:
 
         assert result.thread_id == "thread-fake-001"
         assert result.error and "thread/compact/start transport failed" in result.error
+        assert result.should_retire is True
+
+    def test_compact_approval_response_transport_failure_retires(self):
+        from agent.transports.codex_app_server import CodexAppServerTransportError
+
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval",
+            command="pwd",
+            cwd="/tmp",
+        )
+
+        def fail_write(_request_id, _result):
+            raise CodexAppServerTransportError("stdin closed")
+
+        client.respond = fail_write
+
+        result = make_session(client).compact_thread(turn_timeout=2.0)
+
+        assert result.error and "response transport failed" in result.error
+        assert "stdin closed" in result.error
         assert result.should_retire is True
 
     def test_compact_thread_ignores_foreign_child_completion(self):
