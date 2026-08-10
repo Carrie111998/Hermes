@@ -4,6 +4,9 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 const CLIPBOARD_MAX_BUFFER = 4 * 1024 * 1024
 const CLIPBOARD_IMAGE_MAX_BUFFER = 36 * 1024 * 1024
+/** Bound stalled clipboard owners (xclip/wl-paste) so paste cannot hang the composer. */
+const CLIPBOARD_IMAGE_TIMEOUT_MS = 3_000
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
 
 // PowerShell read: base64-encode the clipboard content to avoid ANSI codepage
 // corruption (same problem as the write path — see comment at line 94).
@@ -64,6 +67,15 @@ function readClipboardImageCommands(platform: NodeJS.Platform, env: NodeJS.Proce
   return attempts
 }
 
+function isPngBase64(contentBase64: string): boolean {
+  if (!contentBase64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(contentBase64)) {
+    return false
+  }
+
+  const bytes = Buffer.from(contentBase64, 'base64')
+  return bytes.length >= PNG_SIGNATURE.length && bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)
+}
+
 /** Read a clipboard image on the TUI host and normalize it to base64 PNG. */
 export async function readClipboardImage(
   platform: NodeJS.Platform = process.platform,
@@ -75,11 +87,12 @@ export async function readClipboardImage(
       const result = await run(attempt.cmd, [...attempt.args], {
         encoding: attempt.output === 'base64' ? 'utf8' : 'base64',
         maxBuffer: CLIPBOARD_IMAGE_MAX_BUFFER,
+        timeout: CLIPBOARD_IMAGE_TIMEOUT_MS,
         windowsHide: true
       })
       const contentBase64 = typeof result.stdout === 'string' ? result.stdout.replace(/\s/g, '') : ''
 
-      if (contentBase64 && /^[A-Za-z0-9+/]+={0,2}$/.test(contentBase64)) {
+      if (isPngBase64(contentBase64)) {
         return { contentBase64, filename: 'clipboard.png' }
       }
     } catch {
