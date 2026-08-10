@@ -190,6 +190,38 @@ _CHECKPOINT_EVERY_N_WRITES = 50
 ```
 
 
+## Connection Ownership and Failure Cleanup
+
+`SessionDB` owns every SQLite connection it opens. A constructor that fails
+after opening SQLite closes the partial writer before re-raising, including
+schema, pragma, FTS, repair, and lock-retry failures. WAL read connections are
+also closed when setup fails before registration, and can be drained by
+`SessionDB.close()` from a different worker thread.
+
+Callers that open a temporary or dedicated handle must close it in a
+`finally` block. A caller-supplied shared handle remains owned by its caller;
+agent teardown must not close it. This distinction matters for session search,
+cross-profile reads, trace export, CLI probes, and cron startup.
+
+Timeouts need explicit ownership too. If cron stops waiting for a background
+`SessionDB()` construction, the late future result is closed by its completion
+callback. Otherwise a connection that arrives after the timeout has no owner
+and leaks its `state.db`, `-wal`, and `-shm` descriptors.
+
+```python
+db = SessionDB(db_path=path, read_only=True)
+try:
+    rows = db.list_sessions_rich(limit=20)
+finally:
+    db.close()
+```
+
+Do not rely on garbage collection for cleanup. Tracked connections unregister
+only after SQLite `close()` succeeds; an unclosed or cross-thread-invalid
+handle therefore remains visible to the live-connection guard and can turn a
+long-running gateway into an `EMFILE` failure.
+
+
 ## Common Operations
 
 ### Initialize

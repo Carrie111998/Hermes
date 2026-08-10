@@ -94,6 +94,50 @@ class TestFormatTimestamp:
 # =========================================================================
 
 class TestBrowseShape:
+    def test_lazy_database_is_closed_after_search(self, monkeypatch):
+        class _DB:
+            closed = 0
+
+            def list_sessions_rich(self, **_kwargs):
+                return []
+
+            def close(self):
+                self.closed += 1
+
+        db = _DB()
+        monkeypatch.setattr("hermes_state.SessionDB", lambda: db)
+
+        result = json.loads(session_search())
+
+        assert result["success"] is True
+        assert db.closed == 1
+
+    def test_cross_profile_database_is_closed_but_shared_database_is_not(
+        self, monkeypatch
+    ):
+        class _DB:
+            def __init__(self):
+                self.closed = 0
+
+            def list_sessions_rich(self, **_kwargs):
+                return []
+
+            def close(self):
+                self.closed += 1
+
+        shared_db = _DB()
+        profile_db = _DB()
+        monkeypatch.setattr(
+            "tools.session_search_tool._resolve_profile_db",
+            lambda _profile: profile_db,
+        )
+
+        result = json.loads(session_search(db=shared_db, profile="work"))
+
+        assert result["success"] is True
+        assert profile_db.closed == 1
+        assert shared_db.closed == 0
+
     def test_no_args_returns_recent_sessions(self, db):
         _seed_modpack_sessions(db)
         result = json.loads(session_search(db=db))
@@ -317,509 +361,4 @@ class TestReadShape:
         assert result["mode"] == "read"
         assert result["message_count"] == 50
         assert result["truncated"] is True
-        assert len(result["messages"]) == 30  # head 20 + tail 10
-
-
-# =========================================================================
-# Session links β€” the value the agent writes to point the user at a session
-# =========================================================================
-
-def _linked_session_id(link: str) -> str:
-    """Recover the session id from an `@session:[<profile>/]<id>` value."""
-    assert link.startswith("@session:"), link
-    value = link[len("@session:"):]
-
-    return value.rsplit("/", 1)[-1]
-
-
-class TestSessionLink:
-    def test_link_carries_the_named_profile(self):
-        assert _session_link("s_oldest", "work") == "@session:work/s_oldest"
-
-
-    def test_every_discovery_result_links_to_its_own_session(self, db):
-        _seed_modpack_sessions(db)
-        result = json.loads(session_search(query="modpack", limit=5, db=db))
-
-        assert result["results"]
-        for entry in result["results"]:
-            assert _linked_session_id(entry["link"]) == entry["session_id"]
-
-
-# =========================================================================
-# Cross-profile read β€” `profile` swaps in another profile's DB (read-only)
-# =========================================================================
-
-class TestCrossProfileRead:
-    def _patch_profiles(self, monkeypatch, home, exists=True):
-        from hermes_cli import profiles as profiles_mod
-        monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
-        monkeypatch.setattr(profiles_mod, "validate_profile_name", lambda n: None)
-        monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: exists)
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: home)
-
-    def test_bare_id_locates_across_profiles(self, db, tmp_path, monkeypatch):
-        # The real-world failure: model dropped the owning profile and passed a
-        # bare id. The tool must scan profiles and find it anyway.
-        other_home = tmp_path / "asdf_home"
-        other_home.mkdir()
-        other = SessionDB(other_home / "state.db")
-        other.create_session("s_far", source="cli")
-        other.append_message("s_far", role="user", content="hi")
-        other._conn.commit()
-
-        from collections import namedtuple
-        from hermes_cli import profiles as profiles_mod
-        Info = namedtuple("Info", "name path")
-        monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: tmp_path / "default_home")
-        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [Info("asdf", other_home)])
-
-        # `db` (current profile) lacks s_far; no profile passed β†’ scan finds it.
-        result = json.loads(session_search(session_id="s_far", db=db))
-        assert result["success"] is True
-        assert result["mode"] == "read"
-        assert result["profile"] == "asdf"
-
-
-    def test_combined_value_autosplits(self, db, tmp_path, monkeypatch):
-        # Agent passed the raw "@session:<profile>/<id>" value as session_id with
-        # no separate profile β€” the tool should recover both.
-        other_home = tmp_path / "other_home"
-        other_home.mkdir()
-        other = SessionDB(other_home / "state.db")
-        other.create_session("s_other", source="cli")
-        other.append_message("s_other", role="user", content="hi")
-        other._conn.commit()
-
-        self._patch_profiles(monkeypatch, other_home)
-
-        # Every permutation the model might send must resolve to (asdf, s_other).
-        for kwargs in (
-            {"session_id": "asdf/s_other"},                    # full value, no profile
-            {"session_id": "asdf/s_other", "profile": "asdf"},  # full value AND profile
-            {"session_id": "s_other", "profile": "asdf"},       # bare id + profile
-        ):
-            result = json.loads(session_search(db=db, **kwargs))
-            assert result["success"] is True, kwargs
-            assert result["mode"] == "read"
-            assert result["session_id"] == "s_other"
-
-
-# =========================================================================
-# Cron demotion in discover ranking (#19434)
-# =========================================================================
-
-class TestCronDemotion:
-    def _seed_cron_and_interactive(self, db):
-        """One interactive (telegram) session and several cron sessions, all
-        matching the same query. Cron rows accumulate repetitive vocabulary
-        and out-number the user's single interactive session β€” the live-data
-        symptom in #19434.
-        """
-        now = int(time.time())
-        # Interactive user session β€” older, so it loses on bare recency too.
-        db.create_session("s_user", source="telegram")
-        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?",
-                         (now - 90000, "s_user"))
-        db.append_message("s_user", role="user", content="how is the venom project going")
-        db.append_message("s_user", role="assistant", content="The venom project shipped its first milestone.")
-        # Several cron sessions, all newer and all stuffed with the same terms.
-        for i in range(8):
-            sid = f"cron_{i}"
-            db.create_session(sid, source="cron")
-            db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?",
-                             (now - 1000 - i, sid))
-            db.append_message(sid, role="user", content="venom project daily status")
-            db.append_message(sid, role="assistant", content="venom project venom project venom summary")
-        db._conn.commit()
-
-    def test_interactive_session_surfaces_above_cron(self, db):
-        self._seed_cron_and_interactive(db)
-        result = json.loads(session_search(query="venom project", limit=1, db=db))
-        assert result["success"] is True
-        assert result["count"] == 1
-        # With cron drowning FTS, bare BM25/recency would return a cron_* hit.
-        # Demotion must put the user's interactive session first.
-        assert result["results"][0]["source"] == "telegram"
-        assert result["results"][0]["session_id"] == "s_user"
-
-    def test_cron_still_reachable_when_only_match(self, db):
-        """Demotion must not exclude cron β€” when only cron matches, it still
-        comes back."""
-        now = int(time.time())
-        db.create_session("cron_only", source="cron")
-        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?",
-                         (now - 500, "cron_only"))
-        db.append_message("cron_only", role="user", content="quarterly archive sweep")
-        db.append_message("cron_only", role="assistant", content="Archive sweep complete.")
-        db._conn.commit()
-        result = json.loads(session_search(query="archive sweep", db=db))
-        assert result["success"] is True
-        assert result["count"] == 1
-        assert result["results"][0]["source"] == "cron"
-
-
-# =========================================================================
-# Compaction summary filtering (#43175)
-# =========================================================================
-
-class TestCompactionSummaryFiltering:
-    """session_search discovery must exclude compaction handoffs from bookends."""
-
-    def test_is_compaction_summary_detects_prefix(self):
-        from tools.session_search_tool import _is_compaction_summary
-        assert _is_compaction_summary("[CONTEXT COMPACTION β€” REFERENCE ONLY] foo")
-        assert _is_compaction_summary("[CONTEXT SUMMARY]: old summary")
-        assert not _is_compaction_summary("Hello, how can I help?")
-        assert not _is_compaction_summary("")
-        assert not _is_compaction_summary(None)
-
-    def test_compaction_summary_excluded_from_bookend_start(self, db):
-        """Compaction handoff in bookend_start position must be filtered out."""
-        db.create_session("s_compact", source="cli")
-        # First message: a compaction handoff (should be filtered)
-        db.append_message("s_compact", role="user",
-                          content="[CONTEXT COMPACTION β€” REFERENCE ONLY] "
-                                  "Earlier turns were compacted into the summary below. " + "x" * 50000)
-        # Second message: normal user message
-        db.append_message("s_compact", role="user", content="Fix the zorgblat rendering bug")
-        # Padding messages to push window away from session start (so bookend has room)
-        for i in range(10):
-            db.append_message("s_compact", role="user", content=f"setup step {i}")
-            db.append_message("s_compact", role="assistant", content=f"setup done {i}")
-        # Match target: uses a unique term so FTS5 anchors here, not at the start
-        db.append_message("s_compact", role="user", content="investigate the frobnitz mob spawning in KubeJS")
-        db.append_message("s_compact", role="assistant", content="I'll look into the frobnitz mob spawning issue.")
-        # Tail messages
-        for i in range(5):
-            db.append_message("s_compact", role="user", content=f"tail {i}")
-            db.append_message("s_compact", role="assistant", content=f"done tail {i}")
-        db._conn.commit()
-
-        result = json.loads(session_search(query="frobnitz mob spawning", db=db, limit=1))
-        assert result["success"] is True
-        assert len(result["results"]) >= 1
-        entry = result["results"][0]
-        # bookend_start must NOT contain the compaction handoff
-        for msg in entry.get("bookend_start", []):
-            assert "[CONTEXT COMPACTION" not in (msg.get("content") or "")
-        # The normal message should still be present in bookend_start
-        bookend_contents = [m.get("content", "") for m in entry.get("bookend_start", [])]
-        assert any("zorgblat" in c for c in bookend_contents)
-
-
-# =========================================================================
-# Compression-aware discovery (#6256)
-#
-# After compression (in-place compaction or legacy rotation), pre-compaction
-# content is no longer in the live context but MUST stay discoverable via
-# session_search. The old code skipped any FTS hit on the current session or
-# lineage, creating a "memory black hole". Delegation children must STAY
-# excluded β€” their content is still visible to the parent agent.
-# =========================================================================
-
-class TestResolveToParent:
-    """Unit tests for _resolve_to_parent's compression-aware tuple return."""
-
-    def test_legacy_rotation_detects_compression(self, db):
-        """Parent ended with end_reason='compression', child has parent_session_id."""
-        db.create_session("s_parent", source="cli")
-        db.end_session("s_parent", "compression")
-        db.create_session("s_child", source="cli", parent_session_id="s_parent")
-        root, has_compression = _resolve_to_parent(db, "s_child")
-        assert root == "s_parent"
-        assert has_compression is True
-
-
-    def test_chain_with_mixed_edges(self, db):
-        """Compression grandparent β†’ parent β†’ child (no end_reason on parent)."""
-        db.create_session("s_gp", source="cli")
-        db.end_session("s_gp", "compression")
-        db.create_session("s_p", source="cli", parent_session_id="s_gp")
-        # s_p does NOT end with compression β€” but ancestor s_gp does
-        db.create_session("s_c", source="cli", parent_session_id="s_p")
-        root, has_compression = _resolve_to_parent(db, "s_c")
-        assert root == "s_gp"
-        assert has_compression is True
-
-
-class TestIsCompactedMessage:
-    """Unit tests for the _is_compacted_message helper."""
-
-    def test_active_message_returns_false(self, db):
-        db.create_session("s1", source="cli")
-        mid = db.append_message("s1", role="user", content="hello")
-        assert _is_compacted_message(db, mid) is False
-
-    def test_compacted_message_returns_true(self, db):
-        db.create_session("s1", source="cli")
-        mid = db.append_message("s1", role="user", content="archived content")
-        db.archive_and_compact("s1", [
-            {"role": "assistant", "content": "compacted summary"},
-        ])
-        # mid is now active=0, compacted=1
-        assert _is_compacted_message(db, mid) is True
-
-
-class TestInPlaceCompactionDiscovery:
-    """In-place compaction: archived turns on the SAME session_id must be
-    discoverable from the current session."""
-
-    def test_archived_content_discoverable_after_compaction(self, db):
-        """The core regression: pre-compaction content on the current session
-        must surface in discovery even though raw_sid == current_session_id."""
-        db.create_session("s_compact", source="cli")
-        db.append_message("s_compact", role="user",
-                          content="The spectral phoenix only spawns during full moons")
-        db.append_message("s_compact", role="assistant",
-                          content="Spectral phoenix requires moonstone bait")
-        db.archive_and_compact("s_compact", [
-            {"role": "user", "content": "Summary: spectral phoenix discussed"},
-            {"role": "assistant", "content": "Acknowledged spectral phoenix info"},
-        ])
-
-        result = json.loads(session_search(
-            query="spectral phoenix", db=db, current_session_id="s_compact",
-        ))
-        assert result["success"] is True
-        assert result["count"] >= 1
-        # The hit should be from the same session (archived rows)
-        hit = result["results"][0]
-        assert hit["session_id"] == "s_compact"
-
-    def test_live_content_still_filtered_on_current_session(self, db):
-        """Non-compacted (active) content on the current session stays filtered."""
-        db.create_session("s_live", source="cli")
-        db.append_message("s_live", role="user", content="crystal golem farming route")
-        result = json.loads(session_search(
-            query="crystal golem", db=db, current_session_id="s_live",
-        ))
-        assert result["count"] == 0
-
-
-class TestLegacyRotationDiscovery:
-    """Legacy rotation: parent session ended with end_reason='compression',
-    child session created. Parent's pre-compaction content must be discoverable
-    from the child."""
-
-    def test_compression_parent_discoverable_from_child(self, db):
-        db.create_session("s_parent", source="cli")
-        db.append_message("s_parent", role="user",
-                          content="The void crystal mining requires diamond pickaxe")
-        db.append_message("s_parent", role="assistant",
-                          content="Void crystal found in the deep caverns")
-        db.end_session("s_parent", "compression")
-
-        db.create_session("s_child", source="cli", parent_session_id="s_parent")
-        db.append_message("s_child", role="user", content="Continue void crystal work")
-
-        result = json.loads(session_search(
-            query="void crystal", db=db, current_session_id="s_child",
-        ))
-        assert result["success"] is True
-        assert result["count"] >= 1
-        sids = [r["session_id"] for r in result["results"]]
-        assert "s_parent" in sids
-
-
-class TestDelegationExclusion:
-    """Delegation children (delegate_task) must STAY excluded β€” their content
-    is still visible to the parent agent. parent_session_id is set but the
-    parent does NOT have end_reason='compression'."""
-
-    def test_delegation_parent_excluded_from_child(self, db):
-        """Child can see its own content but parent's live content stays
-        excluded (it's in context via delegation)."""
-        db.create_session("s_parent", source="cli")
-        db.append_message("s_parent", role="user",
-                          content="nebula deployment infrastructure setup")
-        db.append_message("s_parent", role="assistant",
-                          content="Nebula deployment configured successfully")
-
-        db.create_session("s_child", source="cli", parent_session_id="s_parent")
-        db.append_message("s_child", role="user",
-                          content="delegated nebula deployment subtask")
-
-        result = json.loads(session_search(
-            query="nebula deployment", db=db, current_session_id="s_child",
-        ))
-        assert result["count"] == 0
-
-
-# =========================================================================
-# Both layers together: discovery scope (#63144) Γ— bookend bounding (#69334)
-#
-# Compaction touches two independent layers of session_search:
-#   1. Discovery scope β€” compaction-archived rows on the current session must
-#      surface in discovery (this PR).
-#   2. Content bounding β€” bookends must exclude generated compaction handoff
-#      summaries and cap message content length (#43175 / #69334).
-# A compacted session exercises both at once: its archived content is the FTS
-# hit, while the compaction summary row it produced sits at the session tail,
-# exactly where bookend_end is sampled.
-# =========================================================================
-
-class TestCompactionDiscoveryBothLayers:
-    """Compacted-session content is discoverable AND its bookends still
-    exclude compaction summaries / cap content length."""
-
-    def _seed_compacted_session(self, db):
-        db.create_session("s_both", source="cli")
-        # Long normal opening β€” exercises the 1200-char bookend cap.
-        db.append_message("s_both", role="user",
-                          content="Kick off the obsidian gateway migration. " + "o" * 5000)
-        db.append_message("s_both", role="assistant",
-                          content="Starting the obsidian gateway migration plan.")
-        # Padding so the anchored window doesn't swallow the bookends.
-        for i in range(10):
-            db.append_message("s_both", role="user", content=f"migration step {i}")
-            db.append_message("s_both", role="assistant", content=f"migration step {i} done")
-        # The FTS match target β€” will be archived by compaction below.
-        db.append_message("s_both", role="user",
-                          content="the obsidian gateway needs a quartz keystone to activate")
-        db.append_message("s_both", role="assistant",
-                          content="Noted: quartz keystone required for the obsidian gateway.")
-        for i in range(5):
-            db.append_message("s_both", role="user", content=f"wrap-up {i}")
-            db.append_message("s_both", role="assistant", content=f"wrapped {i}")
-        # Compact in place: everything above becomes active=0/compacted=1 and
-        # the handoff summary is inserted as the new live tail.
-        db.archive_and_compact("s_both", [
-            {"role": "user",
-             "content": "[CONTEXT COMPACTION β€” REFERENCE ONLY] "
-                        "Earlier turns were compacted into this summary. " + "s" * 50000},
-            {"role": "assistant", "content": "Continuing after compaction."},
-        ])
-        db._conn.commit()
-
-    def test_archived_hit_surfaces_with_bounded_summary_free_bookends(self, db):
-        self._seed_compacted_session(db)
-
-        result = json.loads(session_search(
-            query="quartz keystone", db=db, current_session_id="s_both",
-        ))
-
-        # Layer 1 β€” discovery scope: the archived (active=0, compacted=1)
-        # content on the CURRENT session must surface.
-        assert result["success"] is True
-        assert result["count"] >= 1
-        entry = result["results"][0]
-        assert entry["session_id"] == "s_both"
-
-        # Layer 2a β€” summary exclusion: the compaction handoff row sits at the
-        # session tail (freshly inserted by archive_and_compact), exactly where
-        # bookend_end samples β€” it must be filtered out.
-        for msg in entry.get("bookend_start", []) + entry.get("bookend_end", []):
-            assert "[CONTEXT COMPACTION" not in (msg.get("content") or "")
-
-        # Layer 2b β€” content caps: bookends β‰¤1200 chars, window β‰¤4000 chars.
-        for msg in entry.get("bookend_start", []) + entry.get("bookend_end", []):
-            assert len(msg.get("content") or "") <= 1210
-        for msg in entry.get("messages", []):
-            assert len(msg.get("content") or "") <= 4010
-
-        # The long-but-legitimate opening survives (capped, not dropped).
-        bookend_contents = [m.get("content") or "" for m in entry.get("bookend_start", [])]
-        assert any("obsidian gateway migration" in c for c in bookend_contents)
-
-
-# =========================================================================
-# Teknium review round 2: rewind exclusion + delegation-under-compression
-# =========================================================================
-
-class TestRewindExclusion:
-    """Rewind/undo rows (active=0, compacted=0) must STAY hidden β€” only
-    compaction archives (active=0, compacted=1) should surface."""
-
-    def test_compacted_messages_still_surface_alongside_rewind(self, db):
-        """On the same session: compacted rows surface, rewind rows don't."""
-        db.create_session("s_mixed", source="cli")
-        # Message that will be compacted
-        db.append_message("s_mixed", role="user",
-                          content="compaction archived content beta")
-        db.archive_and_compact("s_mixed", [
-            {"role": "assistant", "content": "Summary of beta"},
-        ])
-        # Now add a post-compaction message and rewind it
-        mid2 = db.append_message("s_mixed", role="user",
-                                 content="rewound content gamma")
-        db._conn.execute(
-            "UPDATE messages SET active = 0, compacted = 0 WHERE id = ?",
-            (mid2,),
-        )
-        db._conn.commit()
-
-        # Compacted content should be discoverable
-        result_compact = json.loads(session_search(
-            query="compaction archived content beta", db=db,
-            current_session_id="s_mixed",
-        ))
-        assert result_compact["count"] >= 1
-
-        # Rewound content should NOT be discoverable
-        result_rewind = json.loads(session_search(
-            query="rewound content gamma", db=db,
-            current_session_id="s_mixed",
-        ))
-        assert result_rewind["count"] == 0
-
-
-class TestCompressionEndedHelper:
-    """Unit tests for _is_compression_ended."""
-
-    def test_compression_ended_session(self, db):
-        db.create_session("s1", source="cli")
-        db.end_session("s1", "compression")
-        assert _is_compression_ended(db, "s1") is True
-
-    def test_delegation_child_not_ended(self, db):
-        """A delegation child under a compression continuation does NOT have
-        end_reason='compression' itself."""
-        db.create_session("s_parent", source="cli")
-        db.end_session("s_parent", "compression")
-        db.create_session("s_continuation", source="cli", parent_session_id="s_parent")
-        db.create_session("s_delegate_child", source="cli", parent_session_id="s_continuation")
-        assert _is_compression_ended(db, "s_delegate_child") is False
-
-
-class TestLegacyContinuationPlusDelegation:
-    """Regression: a delegation child created under a compression continuation
-    must stay excluded β€” its content is still live to the parent agent.
-    Only the compression-ended ancestor's content should surface."""
-
-    def test_compression_parent_surfaces_but_delegate_child_excluded(self, db):
-        """Setup: grandparent (compression) β†’ parent (compression) β†’ child
-        (active, current session). A delegation grandchild is created under
-        the parent. Searching from the child should find grandparent/parent
-        content but NOT the delegation grandchild's content."""
-        # Grandparent: compression-ended, has searchable content
-        db.create_session("s_gp", source="cli")
-        db.append_message("s_gp", role="user",
-                          content="grandparent cosmic anomaly research data")
-        db.end_session("s_gp", "compression")
-
-        # Parent: compression-ended continuation
-        db.create_session("s_p", source="cli", parent_session_id="s_gp")
-        db.append_message("s_p", role="user",
-                          content="parent cosmic anomaly follow-up notes")
-        db.end_session("s_p", "compression")
-
-        # Current session: active child
-        db.create_session("s_current", source="cli", parent_session_id="s_p")
-
-        # Delegation child under s_p (not compression-ended)
-        db.create_session("s_delegate", source="cli", parent_session_id="s_p")
-        db.append_message("s_delegate", role="assistant",
-                          content="delegated cosmic anomaly subtask results")
-
-        result = json.loads(session_search(
-            query="cosmic anomaly", db=db,
-            current_session_id="s_current",
-        ))
-
-        # Compression-ended ancestors should be discoverable
-        sids = [r["session_id"] for r in result["results"]]
-        assert "s_gp" in sids or "s_p" in sids
-
-        # Delegation child must NOT appear
-        assert "s_delegate" not in sids
+        assert len(result["messages"]) == 30  # head ίw¶‰ΛkΊwµηQΌΡ΅”Α…Ι•ΉΠ…•ΉΠΈ4(€τττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττ4(4)±…ΝΜQ•ΝΡI•Ν½±Ω•Q½A…Ι•ΉΠθ4(€€€€‰UΉ¥ΠΡ•ΝΡΜ™½Θ}Ι•Ν½±Ω•}Ρ½}Α…Ι•ΉΠΜ½µΑΙ•ΝΝ¥½Έµ…έ…Ι”ΡΥΑ±”Ι•ΡΥΙΈΈ4(4(€€€‘•Ρ•ΝΡ}±•…ε}Ι½Ρ…Ρ¥½Ή}‘•Ρ•ΡΝ}½µΑΙ•ΝΝ¥½Έ΅Ν•±°‘¤θ4(€€€€€€€€‰A…Ι•ΉΠ•Ή‘•έ¥Ρ •Ή‘}Ι•…Ν½Έτ½µΑΙ•ΝΝ¥½Έ°΅¥±΅…ΜΑ…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°€‰½µΑΙ•ΝΝ¥½Έ¤4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}΅¥±°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}Α…Ι•ΉΠ¤4(€€€€€€€Ι½½Π°΅…Ν}½µΑΙ•ΝΝ¥½Έ€τ}Ι•Ν½±Ω•}Ρ½}Α…Ι•ΉΠ΅‘°€‰Ν}΅¥±¤4(€€€€€€€…ΝΝ•ΙΠΙ½½Π€ττ€‰Ν}Α…Ι•ΉΠ4(€€€€€€€…ΝΝ•ΙΠ΅…Ν}½µΑΙ•ΝΝ¥½Έ¥ΜQΙΥ”4(4(4(€€€‘•Ρ•ΝΡ}΅…¥Ή}έ¥Ρ΅}µ¥α•‘}•‘•Μ΅Ν•±°‘¤θ4(€€€€€€€€‰½µΑΙ•ΝΝ¥½ΈΙ…Ή‘Α…Ι•ΉΠƒHΑ…Ι•ΉΠƒH΅¥±€΅ΉΌ•Ή‘}Ι•…Ν½Έ½ΈΑ…Ι•ΉΠ¤Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}ΐ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰Ν}ΐ°€‰½µΑΙ•ΝΝ¥½Έ¤4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}ΐ°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}ΐ¤4(€€€€€€€€Ν}ΐ‘½•Μ9=P•Ήέ¥Ρ ½µΑΙ•ΝΝ¥½ΈƒP‰ΥΠ…Ή•ΝΡ½ΘΝ}ΐ‘½•Μ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}ΐ¤4(€€€€€€€Ι½½Π°΅…Ν}½µΑΙ•ΝΝ¥½Έ€τ}Ι•Ν½±Ω•}Ρ½}Α…Ι•ΉΠ΅‘°€‰Ν}¤4(€€€€€€€…ΝΝ•ΙΠΙ½½Π€ττ€‰Ν}ΐ4(€€€€€€€…ΝΝ•ΙΠ΅…Ν}½µΑΙ•ΝΝ¥½Έ¥ΜQΙΥ”4(4(4)±…ΝΜQ•ΝΡ%Ν½µΑ…Ρ•‘5•ΝΝ…”θ4(€€€€‰UΉ¥ΠΡ•ΝΡΜ™½ΘΡ΅”}¥Ν}½µΑ…Ρ•‘}µ•ΝΝ…”΅•±Α•ΘΈ4(4(€€€‘•Ρ•ΝΡ}…Ρ¥Ω•}µ•ΝΝ…•}Ι•ΡΥΙΉΝ}™…±Ν”΅Ν•±°‘¤θ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰ΜΔ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€µ¥€τ‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰ΜΔ°Ι½±”τ‰ΥΝ•Θ°½ΉΡ•ΉΠτ‰΅•±±Ό¤4(€€€€€€€…ΝΝ•ΙΠ}¥Ν}½µΑ…Ρ•‘}µ•ΝΝ…”΅‘°µ¥¤¥Μ…±Ν”4(4(€€€‘•Ρ•ΝΡ}½µΑ…Ρ•‘}µ•ΝΝ…•}Ι•ΡΥΙΉΝ}ΡΙΥ”΅Ν•±°‘¤θ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰ΜΔ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€µ¥€τ‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰ΜΔ°Ι½±”τ‰ΥΝ•Θ°½ΉΡ•ΉΠτ‰…Ι΅¥Ω•½ΉΡ•ΉΠ¤4(€€€€€€€‘Ή…Ι΅¥Ω•}…Ή‘}½µΑ…Π ‰ΜΔ°l4(€€€€€€€€€€€μ‰Ι½±”θ€‰…ΝΝ¥ΝΡ…ΉΠ°€‰½ΉΡ•ΉΠθ€‰½µΑ…Ρ•ΝΥµµ…Ιδ‰τ°4(€€€€€€€t¤4(€€€€€€€€µ¥¥ΜΉ½ά…Ρ¥Ω”τΐ°½µΑ…Ρ•τΔ4(€€€€€€€…ΝΝ•ΙΠ}¥Ν}½µΑ…Ρ•‘}µ•ΝΝ…”΅‘°µ¥¤¥ΜQΙΥ”4(4(4)±…ΝΜQ•ΝΡ%ΉA±…•½µΑ…Ρ¥½Ή¥Ν½Ω•Ιδθ4(€€€€‰%ΈµΑ±…”½µΑ…Ρ¥½Έθ…Ι΅¥Ω•ΡΥΙΉΜ½ΈΡ΅”M5Ν•ΝΝ¥½Ή}¥µΥΝΠ‰”4(€€€‘¥Ν½Ω•Ι…‰±”™Ι½΄Ρ΅”ΥΙΙ•ΉΠΝ•ΝΝ¥½ΈΈ4(4(€€€‘•Ρ•ΝΡ}…Ι΅¥Ω•‘}½ΉΡ•ΉΡ}‘¥Ν½Ω•Ι…‰±•}…™Ρ•Ι}½µΑ…Ρ¥½Έ΅Ν•±°‘¤θ4(€€€€€€€€‰Q΅”½Ι”Ι•Ι•ΝΝ¥½ΈθΑΙ”µ½µΑ…Ρ¥½Έ½ΉΡ•ΉΠ½ΈΡ΅”ΥΙΙ•ΉΠΝ•ΝΝ¥½Έ4(€€€€€€€µΥΝΠΝΥΙ™…”¥Έ‘¥Ν½Ω•Ιδ•Ω•ΈΡ΅½Υ Ι…έ}Ν¥€ττΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}½µΑ…Π°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}½µΑ…Π°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Q΅”ΝΑ•ΡΙ…°Α΅½•Ή¥ΰ½Ή±δΝΑ…έΉΜ‘ΥΙ¥Ή™Υ±°µ½½ΉΜ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}½µΑ…Π°Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰MΑ•ΡΙ…°Α΅½•Ή¥ΰΙ•ΕΥ¥Ι•Μµ½½ΉΝΡ½Ή”‰…¥Π¤4(€€€€€€€‘Ή…Ι΅¥Ω•}…Ή‘}½µΑ…Π ‰Ν}½µΑ…Π°l4(€€€€€€€€€€€μ‰Ι½±”θ€‰ΥΝ•Θ°€‰½ΉΡ•ΉΠθ€‰MΥµµ…ΙδθΝΑ•ΡΙ…°Α΅½•Ή¥ΰ‘¥ΝΥΝΝ•‰τ°4(€€€€€€€€€€€μ‰Ι½±”θ€‰…ΝΝ¥ΝΡ…ΉΠ°€‰½ΉΡ•ΉΠθ€‰­Ή½έ±•‘•ΝΑ•ΡΙ…°Α΅½•Ή¥ΰ¥Ή™Ό‰τ°4(€€€€€€€t¤4(4(€€€€€€€Ι•ΝΥ±Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰ΝΑ•ΡΙ…°Α΅½•Ή¥ΰ°‘υ‘°ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}½µΑ…Π°4(€€€€€€€€¤¤4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰ΝΥ•ΝΜ‰t¥ΜQΙΥ”4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰½ΥΉΠ‰t€ψτ€Δ4(€€€€€€€€Q΅”΅¥ΠΝ΅½Υ±‰”™Ι½΄Ρ΅”Ν…µ”Ν•ΝΝ¥½Έ€΅…Ι΅¥Ω•Ι½έΜ¤4(€€€€€€€΅¥Π€τΙ•ΝΥ±Ρl‰Ι•ΝΥ±ΡΜ‰ulΑt4(€€€€€€€…ΝΝ•ΙΠ΅¥Ρl‰Ν•ΝΝ¥½Ή}¥‰t€ττ€‰Ν}½µΑ…Π4(4(€€€‘•Ρ•ΝΡ}±¥Ω•}½ΉΡ•ΉΡ}ΝΡ¥±±}™¥±Ρ•Ι•‘}½Ή}ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Έ΅Ν•±°‘¤θ4(€€€€€€€€‰9½Έµ½µΑ…Ρ•€΅…Ρ¥Ω”¤½ΉΡ•ΉΠ½ΈΡ΅”ΥΙΙ•ΉΠΝ•ΝΝ¥½ΈΝΡ…εΜ™¥±Ρ•Ι•Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}±¥Ω”°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}±¥Ω”°Ι½±”τ‰ΥΝ•Θ°½ΉΡ•ΉΠτ‰ΙεΝΡ…°½±•΄™…Ιµ¥ΉΙ½ΥΡ”¤4(€€€€€€€Ι•ΝΥ±Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰ΙεΝΡ…°½±•΄°‘υ‘°ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}±¥Ω”°4(€€€€€€€€¤¤4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰½ΥΉΠ‰t€ττ€ΐ4(4(4)±…ΝΜQ•ΝΡ1•…εI½Ρ…Ρ¥½Ή¥Ν½Ω•Ιδθ4(€€€€‰1•…δΙ½Ρ…Ρ¥½ΈθΑ…Ι•ΉΠΝ•ΝΝ¥½Έ•Ή‘•έ¥Ρ •Ή‘}Ι•…Ν½Έτ½µΑΙ•ΝΝ¥½Έ°4(€€€΅¥±Ν•ΝΝ¥½ΈΙ•…Ρ•ΈA…Ι•ΉΠΜΑΙ”µ½µΑ…Ρ¥½Έ½ΉΡ•ΉΠµΥΝΠ‰”‘¥Ν½Ω•Ι…‰±”4(€€€™Ι½΄Ρ΅”΅¥±Έ4(4(€€€‘•Ρ•ΝΡ}½µΑΙ•ΝΝ¥½Ή}Α…Ι•ΉΡ}‘¥Ν½Ω•Ι…‰±•}™Ι½µ}΅¥±΅Ν•±°‘¤θ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}Α…Ι•ΉΠ°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Q΅”Ω½¥ΙεΝΡ…°µ¥Ή¥ΉΙ•ΕΥ¥Ι•Μ‘¥…µ½ΉΑ¥­…α”¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}Α…Ι•ΉΠ°Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Y½¥ΙεΝΡ…°™½ΥΉ¥ΈΡ΅”‘••ΐ…Ω•ΙΉΜ¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°€‰½µΑΙ•ΝΝ¥½Έ¤4(4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}΅¥±°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}Α…Ι•ΉΠ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}΅¥±°Ι½±”τ‰ΥΝ•Θ°½ΉΡ•ΉΠτ‰½ΉΡ¥ΉΥ”Ω½¥ΙεΝΡ…°έ½Ι¬¤4(4(€€€€€€€Ι•ΝΥ±Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰Ω½¥ΙεΝΡ…°°‘υ‘°ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}΅¥±°4(€€€€€€€€¤¤4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰ΝΥ•ΝΜ‰t¥ΜQΙΥ”4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰½ΥΉΠ‰t€ψτ€Δ4(€€€€€€€Ν¥‘Μ€τmΙl‰Ν•ΝΝ¥½Ή}¥‰t™½ΘΘ¥ΈΙ•ΝΥ±Ρl‰Ι•ΝΥ±ΡΜ‰ut4(€€€€€€€…ΝΝ•ΙΠ€‰Ν}Α…Ι•ΉΠ¥ΈΝ¥‘Μ4(4(4)±…ΝΜQ•ΝΡ•±•…Ρ¥½Ήα±ΥΝ¥½Έθ4(€€€€‰•±•…Ρ¥½Έ΅¥±‘Ι•Έ€΅‘•±•…Ρ•}Ρ…Ν¬¤µΥΝΠMQd•α±Υ‘•ƒPΡ΅•¥Θ½ΉΡ•ΉΠ4(€€€¥ΜΝΡ¥±°Ω¥Ν¥‰±”ΡΌΡ΅”Α…Ι•ΉΠ…•ΉΠΈΑ…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥¥ΜΝ•Π‰ΥΠΡ΅”4(€€€Α…Ι•ΉΠ‘½•Μ9=P΅…Ω”•Ή‘}Ι•…Ν½Έτ½µΑΙ•ΝΝ¥½ΈΈ4(4(€€€‘•Ρ•ΝΡ}‘•±•…Ρ¥½Ή}Α…Ι•ΉΡ}•α±Υ‘•‘}™Ι½µ}΅¥±΅Ν•±°‘¤θ4(€€€€€€€€‰΅¥±…ΈΝ•”¥ΡΜ½έΈ½ΉΡ•ΉΠ‰ΥΠΑ…Ι•ΉΠΜ±¥Ω”½ΉΡ•ΉΠΝΡ…εΜ4(€€€€€€€•α±Υ‘•€΅¥ΠΜ¥Έ½ΉΡ•αΠΩ¥„‘•±•…Ρ¥½Έ¤Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}Α…Ι•ΉΠ°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Ή•‰Υ±„‘•Α±½εµ•ΉΠ¥Ή™Ι…ΝΡΙΥΡΥΙ”Ν•ΡΥΐ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}Α…Ι•ΉΠ°Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰9•‰Υ±„‘•Α±½εµ•ΉΠ½Ή™¥ΥΙ•ΝΥ•ΝΝ™Υ±±δ¤4(4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}΅¥±°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}Α…Ι•ΉΠ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}΅¥±°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰‘•±•…Ρ•Ή•‰Υ±„‘•Α±½εµ•ΉΠΝΥ‰Ρ…Ν¬¤4(4(€€€€€€€Ι•ΝΥ±Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰Ή•‰Υ±„‘•Α±½εµ•ΉΠ°‘υ‘°ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}΅¥±°4(€€€€€€€€¤¤4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰½ΥΉΠ‰t€ττ€ΐ4(4(4(€τττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττ4(	½Ρ ±…ε•ΙΜΡ½•Ρ΅•Θθ‘¥Ν½Ω•ΙδΝ½Α”€ ΨΜΔΠΠ¤ƒ\‰½½­•Ή‰½ΥΉ‘¥Ή€ ΨδΜΜΠ¤4(4(½µΑ…Ρ¥½ΈΡ½Υ΅•ΜΡέΌ¥Ή‘•Α•Ή‘•ΉΠ±…ε•ΙΜ½Ν•ΝΝ¥½Ή}Ν•…Ι θ4(€€€ΔΈ¥Ν½Ω•ΙδΝ½Α”ƒP½µΑ…Ρ¥½Έµ…Ι΅¥Ω•Ι½έΜ½ΈΡ΅”ΥΙΙ•ΉΠΝ•ΝΝ¥½ΈµΥΝΠ4(€€€€€ΝΥΙ™…”¥Έ‘¥Ν½Ω•Ιδ€΅Ρ΅¥ΜAH¤Έ4(€€€ΘΈ½ΉΡ•ΉΠ‰½ΥΉ‘¥ΉƒP‰½½­•Ή‘ΜµΥΝΠ•α±Υ‘”•Ή•Ι…Ρ•½µΑ…Ρ¥½Έ΅…Ή‘½™4(€€€€€ΝΥµµ…Ι¥•Μ…Ή…ΐµ•ΝΝ…”½ΉΡ•ΉΠ±•ΉΡ € ΠΜΔάΤ€Ό€ΨδΜΜΠ¤Έ4(½µΑ…Ρ•Ν•ΝΝ¥½Έ•α•Ι¥Ν•Μ‰½Ρ …Π½Ή”θ¥ΡΜ…Ι΅¥Ω•½ΉΡ•ΉΠ¥ΜΡ΅”QL4(΅¥Π°έ΅¥±”Ρ΅”½µΑ…Ρ¥½ΈΝΥµµ…ΙδΙ½ά¥ΠΑΙ½‘Υ•Ν¥ΡΜ…ΠΡ΅”Ν•ΝΝ¥½ΈΡ…¥°°4(•α…Ρ±δέ΅•Ι”‰½½­•Ή‘}•Ή¥ΜΝ…µΑ±•Έ4(€τττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττ4(4)±…ΝΜQ•ΝΡ½µΑ…Ρ¥½Ή¥Ν½Ω•Ιε	½Ρ΅1…ε•ΙΜθ4(€€€€‰½µΑ…Ρ•µΝ•ΝΝ¥½Έ½ΉΡ•ΉΠ¥Μ‘¥Ν½Ω•Ι…‰±”9¥ΡΜ‰½½­•Ή‘ΜΝΡ¥±°4(€€€•α±Υ‘”½µΑ…Ρ¥½ΈΝΥµµ…Ι¥•Μ€Ό…ΐ½ΉΡ•ΉΠ±•ΉΡ Έ4(4(€€€‘•}Ν••‘}½µΑ…Ρ•‘}Ν•ΝΝ¥½Έ΅Ν•±°‘¤θ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}‰½Ρ °Ν½ΥΙ”τ‰±¤¤4(€€€€€€€€1½ΉΉ½Ιµ…°½Α•Ή¥ΉƒP•α•Ι¥Ν•ΜΡ΅”€ΔΘΐΐµ΅…Θ‰½½­•Ή…ΐΈ4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰-¥¬½™Ρ΅”½‰Ν¥‘¥…Έ…Ρ•έ…δµ¥Ι…Ρ¥½ΈΈ€€¬€‰Ό€¨€Τΐΐΐ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰MΡ…ΙΡ¥ΉΡ΅”½‰Ν¥‘¥…Έ…Ρ•έ…δµ¥Ι…Ρ¥½ΈΑ±…ΈΈ¤4(€€€€€€€€A…‘‘¥ΉΝΌΡ΅”…Ή΅½Ι•έ¥Ή‘½ά‘½•ΝΈΠΝέ…±±½άΡ΅”‰½½­•Ή‘ΜΈ4(€€€€€€€™½Θ¤¥ΈΙ…Ή” Δΐ¤θ4(€€€€€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰ΥΝ•Θ°½ΉΡ•ΉΠυ‰µ¥Ι…Ρ¥½ΈΝΡ•ΐν¥τ¤4(€€€€€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°½ΉΡ•ΉΠυ‰µ¥Ι…Ρ¥½ΈΝΡ•ΐν¥τ‘½Ή”¤4(€€€€€€€€Q΅”QLµ…Ρ Ρ…Ι•ΠƒPέ¥±°‰”…Ι΅¥Ω•‰δ½µΑ…Ρ¥½Έ‰•±½άΈ4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Ρ΅”½‰Ν¥‘¥…Έ…Ρ•έ…δΉ••‘Μ„ΕΥ…ΙΡθ­•εΝΡ½Ή”ΡΌ…Ρ¥Ω…Ρ”¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰9½Ρ•θΕΥ…ΙΡθ­•εΝΡ½Ή”Ι•ΕΥ¥Ι•™½ΘΡ΅”½‰Ν¥‘¥…Έ…Ρ•έ…δΈ¤4(€€€€€€€™½Θ¤¥ΈΙ…Ή” Τ¤θ4(€€€€€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰ΥΝ•Θ°½ΉΡ•ΉΠυ‰έΙ…ΐµΥΐν¥τ¤4(€€€€€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‰½Ρ °Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°½ΉΡ•ΉΠυ‰έΙ…ΑΑ•ν¥τ¤4(€€€€€€€€½µΑ…Π¥ΈΑ±…”θ•Ω•ΙεΡ΅¥Ή…‰½Ω”‰•½µ•Μ…Ρ¥Ω”τΐ½½µΑ…Ρ•τΔ…Ή4(€€€€€€€€Ρ΅”΅…Ή‘½™ΝΥµµ…Ιδ¥Μ¥ΉΝ•ΙΡ•…ΜΡ΅”Ή•ά±¥Ω”Ρ…¥°Έ4(€€€€€€€‘Ή…Ι΅¥Ω•}…Ή‘}½µΑ…Π ‰Ν}‰½Ρ °l4(€€€€€€€€€€€μ‰Ι½±”θ€‰ΥΝ•Θ°4(€€€€€€€€€€€€€‰½ΉΡ•ΉΠθ€‰m=9QaP=5AQ%=8ƒPII9=91et€4(€€€€€€€€€€€€€€€€€€€€€€€€‰…Ι±¥•ΘΡΥΙΉΜέ•Ι”½µΑ…Ρ•¥ΉΡΌΡ΅¥ΜΝΥµµ…ΙδΈ€€¬€‰Μ€¨€ΤΐΐΐΑτ°4(€€€€€€€€€€€μ‰Ι½±”θ€‰…ΝΝ¥ΝΡ…ΉΠ°€‰½ΉΡ•ΉΠθ€‰½ΉΡ¥ΉΥ¥Ή…™Ρ•Θ½µΑ…Ρ¥½ΈΈ‰τ°4(€€€€€€€t¤4(€€€€€€€‘Ή}½ΉΈΉ½µµ¥Π ¤4(4(€€€‘•Ρ•ΝΡ}…Ι΅¥Ω•‘}΅¥Ρ}ΝΥΙ™…•Ν}έ¥Ρ΅}‰½ΥΉ‘•‘}ΝΥµµ…Ιε}™Ι••}‰½½­•Ή‘Μ΅Ν•±°‘¤θ4(€€€€€€€Ν•±Ή}Ν••‘}½µΑ…Ρ•‘}Ν•ΝΝ¥½Έ΅‘¤4(4(€€€€€€€Ι•ΝΥ±Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰ΕΥ…ΙΡθ­•εΝΡ½Ή”°‘υ‘°ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}‰½Ρ °4(€€€€€€€€¤¤4(4(€€€€€€€€1…ε•Θ€ΔƒP‘¥Ν½Ω•ΙδΝ½Α”θΡ΅”…Ι΅¥Ω•€΅…Ρ¥Ω”τΐ°½µΑ…Ρ•τΔ¤4(€€€€€€€€½ΉΡ•ΉΠ½ΈΡ΅”UII9PΝ•ΝΝ¥½ΈµΥΝΠΝΥΙ™…”Έ4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰ΝΥ•ΝΜ‰t¥ΜQΙΥ”4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρl‰½ΥΉΠ‰t€ψτ€Δ4(€€€€€€€•ΉΡΙδ€τΙ•ΝΥ±Ρl‰Ι•ΝΥ±ΡΜ‰ulΑt4(€€€€€€€…ΝΝ•ΙΠ•ΉΡΙεl‰Ν•ΝΝ¥½Ή}¥‰t€ττ€‰Ν}‰½Ρ 4(4(€€€€€€€€1…ε•Θ€Ι„ƒPΝΥµµ…Ιδ•α±ΥΝ¥½ΈθΡ΅”½µΑ…Ρ¥½Έ΅…Ή‘½™Ι½άΝ¥ΡΜ…ΠΡ΅”4(€€€€€€€€Ν•ΝΝ¥½ΈΡ…¥°€΅™Ι•Ν΅±δ¥ΉΝ•ΙΡ•‰δ…Ι΅¥Ω•}…Ή‘}½µΑ…Π¤°•α…Ρ±δέ΅•Ι”4(€€€€€€€€‰½½­•Ή‘}•ΉΝ…µΑ±•ΜƒP¥ΠµΥΝΠ‰”™¥±Ρ•Ι•½ΥΠΈ4(€€€€€€€™½ΘµΝ¥Έ•ΉΡΙδΉ•Π ‰‰½½­•Ή‘}ΝΡ…ΙΠ°mt¤€¬•ΉΡΙδΉ•Π ‰‰½½­•Ή‘}•Ή°mt¤θ4(€€€€€€€€€€€…ΝΝ•ΙΠ€‰m=9QaP=5AQ%=8Ή½Π¥Έ€΅µΝΉ•Π ‰½ΉΡ•ΉΠ¤½Θ€¤4(4(€€€€€€€€1…ε•Θ€ΙƒP½ΉΡ•ΉΠ…ΑΜθ‰½½­•Ή‘Μƒ&ΔΘΐΐ΅…ΙΜ°έ¥Ή‘½άƒ&Πΐΐΐ΅…ΙΜΈ4(€€€€€€€™½ΘµΝ¥Έ•ΉΡΙδΉ•Π ‰‰½½­•Ή‘}ΝΡ…ΙΠ°mt¤€¬•ΉΡΙδΉ•Π ‰‰½½­•Ή‘}•Ή°mt¤θ4(€€€€€€€€€€€…ΝΝ•ΙΠ±•Έ΅µΝΉ•Π ‰½ΉΡ•ΉΠ¤½Θ€¤€πτ€ΔΘΔΐ4(€€€€€€€™½ΘµΝ¥Έ•ΉΡΙδΉ•Π ‰µ•ΝΝ…•Μ°mt¤θ4(€€€€€€€€€€€…ΝΝ•ΙΠ±•Έ΅µΝΉ•Π ‰½ΉΡ•ΉΠ¤½Θ€¤€πτ€ΠΐΔΐ4(4(€€€€€€€€Q΅”±½Ήµ‰ΥΠµ±•¥Ρ¥µ…Ρ”½Α•Ή¥ΉΝΥΙΩ¥Ω•Μ€΅…ΑΑ•°Ή½Π‘Ι½ΑΑ•¤Έ4(€€€€€€€‰½½­•Ή‘}½ΉΡ•ΉΡΜ€τm΄Ή•Π ‰½ΉΡ•ΉΠ¤½Θ€™½Θ΄¥Έ•ΉΡΙδΉ•Π ‰‰½½­•Ή‘}ΝΡ…ΙΠ°mt¥t4(€€€€€€€…ΝΝ•ΙΠ…Ήδ ‰½‰Ν¥‘¥…Έ…Ρ•έ…δµ¥Ι…Ρ¥½Έ¥Έ™½Θ¥Έ‰½½­•Ή‘}½ΉΡ•ΉΡΜ¤4(4(4(€τττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττ4(Q•­Ή¥Υ΄Ι•Ω¥•άΙ½ΥΉ€ΘθΙ•έ¥Ή•α±ΥΝ¥½Έ€¬‘•±•…Ρ¥½ΈµΥΉ‘•Θµ½µΑΙ•ΝΝ¥½Έ4(€τττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττττ4(4)±…ΝΜQ•ΝΡI•έ¥Ή‘α±ΥΝ¥½Έθ4(€€€€‰I•έ¥Ή½ΥΉ‘ΌΙ½έΜ€΅…Ρ¥Ω”τΐ°½µΑ…Ρ•τΐ¤µΥΝΠMQd΅¥‘‘•ΈƒP½Ή±δ4(€€€½µΑ…Ρ¥½Έ…Ι΅¥Ω•Μ€΅…Ρ¥Ω”τΐ°½µΑ…Ρ•τΔ¤Ν΅½Υ±ΝΥΙ™…”Έ4(4(€€€‘•Ρ•ΝΡ}½µΑ…Ρ•‘}µ•ΝΝ…•Ν}ΝΡ¥±±}ΝΥΙ™…•}…±½ΉΝ¥‘•}Ι•έ¥Ή΅Ν•±°‘¤θ4(€€€€€€€€‰=ΈΡ΅”Ν…µ”Ν•ΝΝ¥½Έθ½µΑ…Ρ•Ι½έΜΝΥΙ™…”°Ι•έ¥ΉΙ½έΜ‘½ΈΠΈ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}µ¥α•°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€€5•ΝΝ…”Ρ΅…Πέ¥±°‰”½µΑ…Ρ•4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}µ¥α•°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰½µΑ…Ρ¥½Έ…Ι΅¥Ω•½ΉΡ•ΉΠ‰•Ρ„¤4(€€€€€€€‘Ή…Ι΅¥Ω•}…Ή‘}½µΑ…Π ‰Ν}µ¥α•°l4(€€€€€€€€€€€μ‰Ι½±”θ€‰…ΝΝ¥ΝΡ…ΉΠ°€‰½ΉΡ•ΉΠθ€‰MΥµµ…Ιδ½‰•Ρ„‰τ°4(€€€€€€€t¤4(€€€€€€€€9½ά…‘„Α½ΝΠµ½µΑ…Ρ¥½Έµ•ΝΝ…”…ΉΙ•έ¥Ή¥Π4(€€€€€€€µ¥Θ€τ‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}µ¥α•°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Ι•έ½ΥΉ½ΉΡ•ΉΠ…µµ„¤4(€€€€€€€‘Ή}½ΉΈΉ•α•ΥΡ” 4(€€€€€€€€€€€€‰UAQµ•ΝΝ…•ΜMP…Ρ¥Ω”€τ€ΐ°½µΑ…Ρ•€τ€ΐ]!I¥€τ€ό°4(€€€€€€€€€€€€΅µ¥Θ°¤°4(€€€€€€€€¤4(€€€€€€€‘Ή}½ΉΈΉ½µµ¥Π ¤4(4(€€€€€€€€½µΑ…Ρ•½ΉΡ•ΉΠΝ΅½Υ±‰”‘¥Ν½Ω•Ι…‰±”4(€€€€€€€Ι•ΝΥ±Ρ}½µΑ…Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰½µΑ…Ρ¥½Έ…Ι΅¥Ω•½ΉΡ•ΉΠ‰•Ρ„°‘υ‘°4(€€€€€€€€€€€ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}µ¥α•°4(€€€€€€€€¤¤4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρ}½µΑ…Ρl‰½ΥΉΠ‰t€ψτ€Δ4(4(€€€€€€€€I•έ½ΥΉ½ΉΡ•ΉΠΝ΅½Υ±9=P‰”‘¥Ν½Ω•Ι…‰±”4(€€€€€€€Ι•ΝΥ±Ρ}Ι•έ¥Ή€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰Ι•έ½ΥΉ½ΉΡ•ΉΠ…µµ„°‘υ‘°4(€€€€€€€€€€€ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}µ¥α•°4(€€€€€€€€¤¤4(€€€€€€€…ΝΝ•ΙΠΙ•ΝΥ±Ρ}Ι•έ¥Ή‘l‰½ΥΉΠ‰t€ττ€ΐ4(4(4)±…ΝΜQ•ΝΡ½µΑΙ•ΝΝ¥½ΉΉ‘•‘!•±Α•Θθ4(€€€€‰UΉ¥ΠΡ•ΝΡΜ™½Θ}¥Ν}½µΑΙ•ΝΝ¥½Ή}•Ή‘•Έ4(4(€€€‘•Ρ•ΝΡ}½µΑΙ•ΝΝ¥½Ή}•Ή‘•‘}Ν•ΝΝ¥½Έ΅Ν•±°‘¤θ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰ΜΔ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰ΜΔ°€‰½µΑΙ•ΝΝ¥½Έ¤4(€€€€€€€…ΝΝ•ΙΠ}¥Ν}½µΑΙ•ΝΝ¥½Ή}•Ή‘•΅‘°€‰ΜΔ¤¥ΜQΙΥ”4(4(€€€‘•Ρ•ΝΡ}‘•±•…Ρ¥½Ή}΅¥±‘}Ή½Ρ}•Ή‘•΅Ν•±°‘¤θ4(€€€€€€€€‰‘•±•…Ρ¥½Έ΅¥±ΥΉ‘•Θ„½µΑΙ•ΝΝ¥½Έ½ΉΡ¥ΉΥ…Ρ¥½Έ‘½•Μ9=P΅…Ω”4(€€€€€€€•Ή‘}Ι•…Ν½Έτ½µΑΙ•ΝΝ¥½Έ¥ΡΝ•±Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰Ν}Α…Ι•ΉΠ°€‰½µΑΙ•ΝΝ¥½Έ¤4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}½ΉΡ¥ΉΥ…Ρ¥½Έ°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}Α…Ι•ΉΠ¤4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}‘•±•…Ρ•}΅¥±°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}½ΉΡ¥ΉΥ…Ρ¥½Έ¤4(€€€€€€€…ΝΝ•ΙΠ}¥Ν}½µΑΙ•ΝΝ¥½Ή}•Ή‘•΅‘°€‰Ν}‘•±•…Ρ•}΅¥±¤¥Μ…±Ν”4(4(4)±…ΝΜQ•ΝΡ1•…ε½ΉΡ¥ΉΥ…Ρ¥½ΉA±ΥΝ•±•…Ρ¥½Έθ4(€€€€‰I•Ι•ΝΝ¥½Έθ„‘•±•…Ρ¥½Έ΅¥±Ι•…Ρ•ΥΉ‘•Θ„½µΑΙ•ΝΝ¥½Έ½ΉΡ¥ΉΥ…Ρ¥½Έ4(€€€µΥΝΠΝΡ…δ•α±Υ‘•ƒP¥ΡΜ½ΉΡ•ΉΠ¥ΜΝΡ¥±°±¥Ω”ΡΌΡ΅”Α…Ι•ΉΠ…•ΉΠΈ4(€€€=Ή±δΡ΅”½µΑΙ•ΝΝ¥½Έµ•Ή‘•…Ή•ΝΡ½ΘΜ½ΉΡ•ΉΠΝ΅½Υ±ΝΥΙ™…”Έ4(4(€€€‘•Ρ•ΝΡ}½µΑΙ•ΝΝ¥½Ή}Α…Ι•ΉΡ}ΝΥΙ™…•Ν}‰ΥΡ}‘•±•…Ρ•}΅¥±‘}•α±Υ‘•΅Ν•±°‘¤θ4(€€€€€€€€‰M•ΡΥΐθΙ…Ή‘Α…Ι•ΉΠ€΅½µΑΙ•ΝΝ¥½Έ¤ƒHΑ…Ι•ΉΠ€΅½µΑΙ•ΝΝ¥½Έ¤ƒH΅¥±4(€€€€€€€€΅…Ρ¥Ω”°ΥΙΙ•ΉΠΝ•ΝΝ¥½Έ¤Έ‘•±•…Ρ¥½ΈΙ…Ή‘΅¥±¥ΜΙ•…Ρ•ΥΉ‘•Θ4(€€€€€€€Ρ΅”Α…Ι•ΉΠΈM•…Ι΅¥Ή™Ι½΄Ρ΅”΅¥±Ν΅½Υ±™¥ΉΙ…Ή‘Α…Ι•ΉΠ½Α…Ι•ΉΠ4(€€€€€€€½ΉΡ•ΉΠ‰ΥΠ9=PΡ΅”‘•±•…Ρ¥½ΈΙ…Ή‘΅¥±Μ½ΉΡ•ΉΠΈ4(€€€€€€€€Ι…Ή‘Α…Ι•ΉΠθ½µΑΙ•ΝΝ¥½Έµ•Ή‘•°΅…ΜΝ•…Ι΅…‰±”½ΉΡ•ΉΠ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}ΐ°Ν½ΥΙ”τ‰±¤¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}ΐ°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Ι…Ή‘Α…Ι•ΉΠ½Νµ¥…Ή½µ…±δΙ•Ν•…Ι ‘…Ρ„¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰Ν}ΐ°€‰½µΑΙ•ΝΝ¥½Έ¤4(4(€€€€€€€€A…Ι•ΉΠθ½µΑΙ•ΝΝ¥½Έµ•Ή‘•½ΉΡ¥ΉΥ…Ρ¥½Έ4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}ΐ°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}ΐ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}ΐ°Ι½±”τ‰ΥΝ•Θ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰Α…Ι•ΉΠ½Νµ¥…Ή½µ…±δ™½±±½άµΥΐΉ½Ρ•Μ¤4(€€€€€€€‘Ή•Ή‘}Ν•ΝΝ¥½Έ ‰Ν}ΐ°€‰½µΑΙ•ΝΝ¥½Έ¤4(4(€€€€€€€€ΥΙΙ•ΉΠΝ•ΝΝ¥½Έθ…Ρ¥Ω”΅¥±4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}ΥΙΙ•ΉΠ°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}ΐ¤4(4(€€€€€€€€•±•…Ρ¥½Έ΅¥±ΥΉ‘•ΘΝ}ΐ€΅Ή½Π½µΑΙ•ΝΝ¥½Έµ•Ή‘•¤4(€€€€€€€‘ΉΙ•…Ρ•}Ν•ΝΝ¥½Έ ‰Ν}‘•±•…Ρ”°Ν½ΥΙ”τ‰±¤°Α…Ι•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}ΐ¤4(€€€€€€€‘Ή…ΑΑ•Ή‘}µ•ΝΝ…” ‰Ν}‘•±•…Ρ”°Ι½±”τ‰…ΝΝ¥ΝΡ…ΉΠ°4(€€€€€€€€€€€€€€€€€€€€€€€€€½ΉΡ•ΉΠτ‰‘•±•…Ρ•½Νµ¥…Ή½µ…±δΝΥ‰Ρ…Ν¬Ι•ΝΥ±ΡΜ¤4(4(€€€€€€€Ι•ΝΥ±Π€τ©Ν½ΈΉ±½…‘Μ΅Ν•ΝΝ¥½Ή}Ν•…Ι  4(€€€€€€€€€€€ΕΥ•Ιδτ‰½Νµ¥…Ή½µ…±δ°‘υ‘°4(€€€€€€€€€€€ΥΙΙ•ΉΡ}Ν•ΝΝ¥½Ή}¥τ‰Ν}ΥΙΙ•ΉΠ°4(€€€€€€€€¤¤4(4(€€€€€€€€½µΑΙ•ΝΝ¥½Έµ•Ή‘•…Ή•ΝΡ½ΙΜΝ΅½Υ±‰”‘¥Ν½Ω•Ι…‰±”4(€€€€€€€Ν¥‘Μ€τmΙl‰Ν•ΝΝ¥½Ή}¥‰t™½ΘΘ¥ΈΙ•ΝΥ±Ρl‰Ι•ΝΥ±ΡΜ‰ut4(€€€€€€€…ΝΝ•ΙΠ€‰Ν}ΐ¥ΈΝ¥‘Μ½Θ€‰Ν}ΐ¥ΈΝ¥‘Μ4(4(€€€€€€€€•±•…Ρ¥½Έ΅¥±µΥΝΠ9=P…ΑΑ•…Θ4(€€€€€€€…ΝΝ•ΙΠ€‰Ν}‘•±•…Ρ”Ή½Π¥ΈΝ¥‘Μ4(

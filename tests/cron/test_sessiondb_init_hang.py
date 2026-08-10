@@ -23,7 +23,7 @@ suite stays free of timing flakes under parallel load.
 import concurrent.futures
 from unittest.mock import MagicMock, patch
 
-from cron.scheduler import run_job
+from cron.scheduler import _close_late_session_db, run_job
 
 # Hold the real class: patching cron.scheduler.concurrent.futures.ThreadPoolExecutor
 # also replaces concurrent.futures.ThreadPoolExecutor (same module object).
@@ -73,6 +73,15 @@ def _session_db_executor(timeouts: list, *, instant_timeout: bool = True):
 
 
 class TestSessionDbInitTimeout:
+    def test_late_sessiondb_result_is_closed(self):
+        future = concurrent.futures.Future()
+        fake_db = MagicMock()
+
+        future.add_done_callback(_close_late_session_db)
+        future.set_result(fake_db)
+
+        fake_db.close.assert_called_once()
+
     def test_run_job_does_not_hang_when_sessiondb_init_wedges(self, tmp_path, monkeypatch):
         """run_job proceeds without a session store when SessionDB init times out."""
         monkeypatch.setenv("HERMES_CRON_SESSION_DB_TIMEOUT", "0.2")
