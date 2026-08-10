@@ -137,6 +137,10 @@ describe('watchSessionPins remote pull', () => {
     $pinnedSessionIds.set(['gone'])
     $sessions.set([row('gone', { pinned: true })])
     await flush()
+    // The first page arrived while the local write was still being issued. A
+    // later matching page confirms the ack and releases the post-write guard.
+    $sessions.set([row('gone', { pinned: true })])
+    await flush()
     patch.mockClear()
 
     // Another app unpinned it; our next refresh carries the new truth.
