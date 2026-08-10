@@ -17,6 +17,7 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 | D-010 | 2026-08-10 | Fluxo 1 sync: merge `origin/main` (3282 commits); patches reaplicados; patch-guard OK | LOG_EXECUCAO.md |
 | D-007 | 2026-08-10 | Versionar `harness/` em branch local `local/harness` (não upstream) | Resposta usuário: opção 1 |
 | D-011 | 2026-08-10 | Branch `local/harness` criada com patches Hermes One + harness/ | Esta sessão |
+| D-012 | 2026-08-10 | Skill `hermes-gateway-ops` implementada (status/logs/restart) | Esta sessão |
 
 ## Pendentes
 
@@ -32,6 +33,6 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 
 ## Próximo passo
 
-1. Skill **`hermes-gateway-ops`** — próxima na fila do catálogo
+1. Skill **`hermes-credential-audit`**
 2. **`hermes doctor --fix`** — migrar config v33→v34 (opcional)
 3. Pluginizar patches Hermes One (D-004 follow-up)

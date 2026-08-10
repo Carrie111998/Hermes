@@ -9,7 +9,7 @@
 | 1 — Descoberta | ✅ |
 | 2 — Proposta | ✅ |
 | 3 — Documentação | ✅ |
-| 4 — Skills | ✅ `hermes-patch-guard` + `hermes-test-slice` |
+| 4 — Skills | ✅ patch-guard + test-slice + gateway-ops |
 | 5 — Sync upstream | ✅ merge 3282 commits + patches reaplicados |
 | 6 — Deps dev | ✅ `.venv` + pytest |
 | 7 — Smoke pós-sync | ✅ `hermes doctor` exit 0 |
@@ -42,6 +42,7 @@ branch local/harness @ 052f52ab30
 |---|---|---|
 | patch-guard | `harness/scripts/hermes_patch_guard.py` | `~/.cursor/skills/hermes-patch-guard/` |
 | test-slice | `harness/scripts/hermes_test_slice.py` | `~/.cursor/skills/hermes-test-slice/` |
+| gateway-ops | `harness/scripts/hermes_gateway_ops.py` | `~/.cursor/skills/hermes-gateway-ops/` |
 
 ## Decisões confirmadas (D-001..D-006)
 
@@ -53,7 +54,7 @@ branch local/harness @ 052f52ab30
 
 ## Próximo passo
 
-1. Skill **`hermes-gateway-ops`** — próxima na fila do catálogo
+1. Skill **`hermes-credential-audit`** — próxima na fila do catálogo
 2. **`hermes doctor --fix`** — migrar config v33→v34 (opcional)
 3. Pluginizar patches Hermes One (D-004 follow-up)
 

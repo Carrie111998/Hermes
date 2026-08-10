@@ -48,7 +48,19 @@
 - gemini HTTP 400 na conectividade (1 de 31 checks)
 - Toolsets opcionais sem deps (discord, web, x_search, etc.)
 
-**Próximo passo:** branch `local/harness` ou skill `hermes-gateway-ops`
+**Próximo passo:** skill `hermes-credential-audit` ou `hermes doctor --fix`
+
+### 2026-08-10 — Skill hermes-gateway-ops
+
+| Passo | Resultado |
+|---|---|
+| Script `hermes_gateway_ops.py` | OK — status/logs/restart |
+| Skill Cursor | OK — `~/.cursor/skills/hermes-gateway-ops/` |
+| Teste status | OK — telegram+slack+api_server connected, PID 12076 |
+| Teste logs | OK — tail sanitizado |
+| Teste restart sem --confirm | OK — bloqueado (exit 1) |
+| Fix UTF-8 stdout Windows | OK |
+| Fix venv resolution | OK — prefere `.venv` sobre PATH |
 
 ### 2026-08-10 — Fim de sessão
 
