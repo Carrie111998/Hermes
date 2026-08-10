@@ -1,16 +1,15 @@
 {
   "task": "usage-bar-core-hardening",
-  "phase": "M0_COMPLETE_MOCKUP_REVISED",
-  "status": "AWAITING_PARENT_REVIEW",
+  "phase": "M1_BACKEND_DONE",
+  "status": "M1_BACKEND_AWAITING_PARENT_REVIEW",
   "session_id": "20260810_115223_1ade7f",
   "suggested_session_title": "Usage Bar 内建化 M0 固化 + M1/M2 mockup",
   "writer": "20260810_115223_1ade7f",
-  "parent_role": "read-only acceptance (实际观察: 存在并行写者, 详见 CHECKPOINT 遗留5)",
-  "updated_at": "2026-08-10T12:45:00Z",
+  "parent_role": "read-only acceptance; 历史上曾有 two-writer interleave, 当前无活跃并行 writer",
+  "updated_at": "2026-08-10T05:24:01Z",
   "git": {
     "branch": "codex/hermes-custom-migrate-v020",
     "head_at_start": "299d5d7d9",
-    "head_before_acceptance_fix": "83531309f",
     "head_resolution": "git rev-parse HEAD",
     "commits_this_round": [
       "c64d5af1f feat(agent): harden usage.accounts contract with cache identity and concurrent fetch",
@@ -19,9 +18,13 @@
       "eee304619 fix(agent): close cache-identity and stale-semantics gaps from plan review",
       "ba45dc8a5 fix(desktop): narrow statusbar migration to the untouched legacy default",
       "83531309f docs: usage bar plan R5 verify APPROVE + two-writer resolution",
-      "acceptance-round1 commits: fix(agent) stale classifier + docs/mockup (见 git log, 不自引用)"
+      "fae6eacb0 fix(agent): narrow stale fallback to transient upstream failures only",
+      "c1a2973b9 docs: parent acceptance round 1 revisions (control plane + mockup)",
+      "3b184b12b docs: emit mockup HTML with LF line endings",
+      "10d62c94e docs: refresh mockup DOM assertion evidence after LF regen",
+      "535cdeddd feat(agent): add bounded usage singleflight and account metadata"
     ],
-    "uncommitted_not_mine_resolved": "两个写者会话交错提交已核实：历史线性、双方工作完整保留；原 uncommitted_not_mine 清单即本会话 R4 修复，已提交为 eee304619/ba45dc8a5",
+    "uncommitted_not_mine_resolved": "两个写者会话交错提交已核实：历史线性、双方工作完整保留",
     "backup_branch": "backup/usage-bar-hardening-pre-m0-20260810",
     "dirty_snapshot": {
       "path": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\usage-bar-core-hardening\\pre-m0-dirty.patch",
@@ -29,41 +32,40 @@
       "bytes": 46471,
       "note": "moved out of repo per parent acceptance A3; hash verified 2026-08-10"
     },
-    "noise_reverted": [
-      "package-lock.json"
-    ],
+    "noise_reverted": ["package-lock.json"],
     "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree exit 0 零冲突; live-checkout guard 禁止运行中 merge)"
   },
   "tests_final": {
-    "backend": "25 passed (usage_contract 17 + usage_accounts 1 + account_usage 7)",
+    "backend": "36 passed (usage_contract 28 + usage_accounts 1 + account_usage 7)",
     "desktop": "19 passed (context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
-    "total": "44 passed",
-    "typecheck": "tsc x3 exit 0",
-    "git_diff_check": "git diff --check 299d5d7d9..HEAD -> clean (range, 验收轮复跑)",
-    "mockup_dom_assertions": "mockup/dom-assertions.json: 10/10 passed (360px overflow/focusables/bar-text consistency/Task/source copy/role=status/Esc path)"
+    "total": "55 passed",
+    "typecheck": "tsc x3 exit 0 (M0 轮; 本轮未动 production TS, types additive)",
+    "git_diff_check": "git diff --check 299d5d7d9..HEAD -> clean (range)",
+    "mockup_dom_assertions": "mockup/dom-assertions.json: 10/10 passed"
   },
   "parent_acceptance_round1": {
     "findings": "A1 stale classifier 过宽 / A2 wall-clock 口径 / A3 artifact gate / A4 控制面陈旧 / B mockup 7 项",
     "resolution": "全部修订完成, 详见 history/parent-acceptance-round1.md",
-    "code_review": "fix(agent) stale classifier 经本地 Codex read-only 复审 APPROVE (proc_545676d89b5c)"
+    "code_review": "fix(agent) stale classifier 经本地 Codex read-only 复审 APPROVE"
   },
   "milestones": {
-    "M0": "DONE (父验收 R1 修订后: stale 分类收窄+TDD、wall-clock 口径修正、artifact gate 达标)",
-    "M1": "PLAN_APPROVED; 生产实施待父会话批准 mockup; wall-clock/singleflight/negative-cache 为发布阻塞",
-    "M2": "PLANNED_AWAITING_MOCKUP_APPROVAL",
-    "M3": "PLANNED"
+    "M0": "DONE",
+    "M1_backend": "DONE (535cdeddd; Codex REVISE x2 -> APPROVE); display_name/401-403/429/negative/singleflight/process-bound 全部落地",
+    "M1_deferred": "is_current 省略: gateway/session 无权威 active entry id 只读信号, load_pool 有副作用被拒——登记为 M2 integration blocker",
+    "M2": "NOT_STARTED (下一短调用)",
+    "M3": "NOT_STARTED"
   },
-  "codex_plan_review": "APPROVE (计划轮 R1:5 -> R2:3 -> R3:2 -> R4:0, history/codex-review-round*.md; 另有 R4-REVISE 修复复核轮 R5: 6/6 VERIFIED -> APPROVE, history/codex-review-round5-verify.md)",
+  "codex_plan_review": "APPROVE (计划轮 R1-R4 + R5 verify; M1 backend 代码轮 REVISE x2 -> APPROVE)",
   "blockers": [
     "上游 merge 推迟: live-checkout guard (merge-tree 零冲突已证实, 需停 Hermes 后外部执行)",
     "package/release smoke 未执行 (非发布机; 回滚包已归档 cache/release-backups/)",
-    "Codex CLI 0.144.4 与用户主 config.toml [agents] 不兼容, 评审用专用 CODEX_HOME 绕行"
+    "Codex CLI 0.144.4 与用户主 config.toml [agents] 不兼容, 评审用专用 CODEX_HOME 绕行",
+    "is_current 无权威只读信号源, 待 M2 integration 决策"
   ],
   "artifacts": {
     "release_backup_archived_to": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\release-backups\\release-backup-usage-20260810-114009",
     "mockup_html": "docs/plans/2026-08-10-usage-bar-core-hardening/mockup/usage-bar-mockup.html",
-    "mockup_screenshots": 11,
-    "control_plane_commit": "2ab1a7e00"
+    "mockup_screenshots": 11
   },
-  "not_claimed": "M1/M2/M3 生产实现未宣称完成; 本轮仅 M0 固化 + 计划 APPROVE + mockup"
+  "not_claimed": "M2 UI 与 M3 provider/E2E 未开始; 不宣称 release ready"
 }
