@@ -4828,7 +4828,6 @@ class GatewaySlashCommandsMixin:
                 # consumers that read routing/presentation data from state.db
                 # (mcp_serve, mirror, channel directory) see the branch row
                 # fully formed with zero backfill gap.
-                user_id=source.user_id,
                 session_key=session_key,
                 chat_id=source.chat_id,
                 chat_type=source.chat_type,
