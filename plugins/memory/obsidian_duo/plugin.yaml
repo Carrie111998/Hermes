@@ -1,0 +1,3 @@
+name: obsidian_duo
+version: 1.0.0
+description: "Durable Obsidian-backed Memory Duo provider using deterministic retrieval first."
