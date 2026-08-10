@@ -631,16 +631,21 @@ def _format_exec_approval_fallback(
         heading = "⚠️ **Smart DENY — owner override for one operation:**"
 
     choices = [f"Reply `{command_prefix}approve` to execute this one operation"]
+    shortcuts = ["`1`/`y`"]
     if not smart_denied and allow_session:
         choices.append(
             f"`{command_prefix}approve session` to approve this pattern for the session"
         )
+        shortcuts.append("`2`/`s`")
         if allow_permanent:
             choices.append(f"`{command_prefix}approve always` to approve permanently")
+            shortcuts.append("`3`/`a`")
     choices.append(f"`{command_prefix}deny` to cancel")
+    shortcuts.append("`4`/`n`")
     return (
         f"{heading}\n```\n{cmd_preview}\n```\nReason: {description}\n\n"
-        + ", ".join(choices[:-1]) + f", or {choices[-1]}."
+        + ", ".join(choices[:-1]) + f", or {choices[-1]}.\n"
+        + "Shortcuts: " + " · ".join(shortcuts) + "."
     )
 
 
@@ -9009,18 +9014,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.approval import has_blocking_approval
             if has_blocking_approval(session_key):
                 _raw_text = (event.text or "").strip().lower()
-                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍"}
-                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎"}
+                _approve_words = {"approve", "yes", "ok", "okay", "confirm", "y", "👍", "1"}
+                _deny_words = {"deny", "no", "reject", "cancel", "n", "👎", "4"}
                 _approval_handler = None
                 _normalized_args = ""
                 if _raw_text in _approve_words:
                     _approval_handler = self._handle_approve_command
                 elif _raw_text in _deny_words:
                     _approval_handler = self._handle_deny_command
-                elif _raw_text in {"always", "approve always", "always approve"}:
+                elif _raw_text in {"always", "approve always", "always approve", "3", "a"}:
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "always"
-                elif _raw_text in {"session", "approve session", "session approve"}:
+                elif _raw_text in {"session", "approve session", "session approve", "2", "s"}:
                     _approval_handler = self._handle_approve_command
                     _normalized_args = "session"
                 if _approval_handler is not None:
