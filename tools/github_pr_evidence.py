@@ -909,21 +909,12 @@ def _is_canonical_gate_path(path: str) -> bool:
 
 def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
     merge_base_sha = _comparison_merge_base(scope)
-    base_tree_sha, base = _tree_map(
-        _run_gh_json([f"repos/{scope.repository}/git/trees/{scope.base_sha}?recursive=1"])
-    )
-    if merge_base_sha == scope.base_sha:
-        merge_base_tree_sha = base_tree_sha
-        merge_base = base
-    else:
-        merge_base_tree_sha, merge_base = _tree_map(
-            _run_gh_json(
-                [f"repos/{scope.repository}/git/trees/{merge_base_sha}?recursive=1"]
-            )
-        )
-    head_tree_sha, head = _tree_map(
-        _run_gh_json([f"repos/{scope.repository}/git/trees/{scope.head_sha}?recursive=1"])
-    )
+    base_tree_ref = scope.base_sha
+    merge_base_tree_ref = merge_base_sha
+    head_tree_ref = scope.head_sha
+    expected_base_tree = ""
+    expected_merge_base_tree = ""
+    expected_head_tree = ""
     if scope.concise_review:
         expected_base_tree = _commit_tree_identity(scope.repository, scope.base_sha)
         expected_merge_base_tree = expected_base_tree
@@ -932,6 +923,32 @@ def _tree_diff(scope: EvidenceScope) -> dict[str, Any]:
                 scope.repository, merge_base_sha
             )
         expected_head_tree = _commit_tree_identity(scope.repository, scope.head_sha)
+        # GitHub accepts a commit SHA for the trees endpoint but echoes that
+        # commit SHA as the response identity. Query the canonical tree objects
+        # instead so the returned identity can be verified byte-for-byte.
+        base_tree_ref = expected_base_tree
+        merge_base_tree_ref = expected_merge_base_tree
+        head_tree_ref = expected_head_tree
+    base_tree_sha, base = _tree_map(
+        _run_gh_json(
+            [f"repos/{scope.repository}/git/trees/{base_tree_ref}?recursive=1"]
+        )
+    )
+    if merge_base_sha == scope.base_sha:
+        merge_base_tree_sha = base_tree_sha
+        merge_base = base
+    else:
+        merge_base_tree_sha, merge_base = _tree_map(
+            _run_gh_json(
+                [f"repos/{scope.repository}/git/trees/{merge_base_tree_ref}?recursive=1"]
+            )
+        )
+    head_tree_sha, head = _tree_map(
+        _run_gh_json(
+            [f"repos/{scope.repository}/git/trees/{head_tree_ref}?recursive=1"]
+        )
+    )
+    if scope.concise_review:
         if (
             base_tree_sha != expected_base_tree
             or merge_base_tree_sha != expected_merge_base_tree

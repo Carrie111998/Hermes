@@ -571,10 +571,10 @@ def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
             "tools.github_pr_evidence._run_gh_json",
             side_effect=[
                 _comparison(),
-                base_tree,
-                head_tree,
                 base_commit,
                 head_commit,
+                base_tree,
+                head_tree,
             ],
         ) as run:
             result = json.loads(
@@ -586,9 +586,11 @@ def test_concise_tree_diff_validates_exact_trees_without_blob_fanout():
     assert not any(cursor.kind == "blob" for cursor in scope.cursors.values())
     assert result["items"]["base_tree_sha"] == "c" * 40
     assert result["items"]["head_tree_sha"] == "d" * 40
-    assert [call.args[0] for call in run.call_args_list[-2:]] == [
+    assert [call.args[0] for call in run.call_args_list[1:]] == [
         [f"repos/org/repo/git/commits/{BASE_SHA}"],
         [f"repos/org/repo/git/commits/{HEAD_SHA}"],
+        [f"repos/org/repo/git/trees/{'c' * 40}?recursive=1"],
+        [f"repos/org/repo/git/trees/{'d' * 40}?recursive=1"],
     ]
     assert result["coverage"]["complete"] is True
 
