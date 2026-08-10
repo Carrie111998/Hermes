@@ -507,6 +507,12 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
+# Advisory UI data: every provider read on the contract path must stay under
+# the usage contract's global deadline (usage_contract._FETCH_DEADLINE_SECONDS,
+# 6.5s) so a degraded provider edge cannot stall the panel.
+USAGE_FETCH_TIMEOUT_SECONDS = 6.0
+
+
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -519,9 +525,7 @@ def _fetch_codex_account_usage(
     }
     if account_id:
         headers["ChatGPT-Account-Id"] = account_id
-    # This endpoint is advisory UI data. Keep its latency below the contract's
-    # global 6.5s deadline so a degraded ChatGPT edge cannot stall the panel.
-    with httpx.Client(timeout=6.0) as client:
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get(_resolve_codex_usage_url(resolved_base_url), headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -770,7 +774,7 @@ def _fetch_anthropic_account_usage(
         "anthropic-beta": "oauth-2025-04-20",
         "User-Agent": "claude-code/2.1.0",
     }
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get("https://api.anthropic.com/api/oauth/usage", headers=headers)
         response.raise_for_status()
     payload = response.json() or {}
@@ -829,7 +833,9 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
     }
-    with httpx.Client(timeout=10.0) as client:
+    # Two sequential reads share one client; halve the per-request budget so
+    # the pair still fits the contract's global deadline.
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS / 2) as client:
         credits_resp = client.get(credits_url, headers=headers)
         credits_resp.raise_for_status()
         credits = (credits_resp.json() or {}).get("data") or {}
@@ -979,7 +985,7 @@ def _fetch_kimi_account_usage(
         # Kimi's coding edge expects the same UA family as the inference path.
         "User-Agent": "claude-code/0.1.0",
     }
-    with httpx.Client(timeout=10.0) as client:
+    with httpx.Client(timeout=USAGE_FETCH_TIMEOUT_SECONDS) as client:
         response = client.get(url, headers=headers)
         response.raise_for_status()
     payload = response.json() or {}

@@ -289,3 +289,55 @@ def test_kimi_usage_requires_api_key():
     assert (
         account_usage.fetch_account_usage_for_credential("kimi-coding", api_key="") is None
     )
+
+
+class _TimeoutRecordingClient:
+    def __init__(self, record, payload):
+        self.record = record
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url, headers=None):
+        self.record["gets"] += 1
+        return _FakeResponse(self.payload)
+
+
+def test_provider_fetch_timeout_budget_fits_contract_deadline(monkeypatch):
+    """Every provider read on the contract path must fit the 6.5s global
+    deadline — per-request and in total for multi-request fetchers."""
+    providers_payloads = {
+        "openai-codex": {"rate_limit": {}},
+        "anthropic": {},
+        "openrouter": {"data": {}},
+        "kimi-coding": {},
+    }
+    # Anthropic only queries its OAuth usage endpoint for OAuth-shaped tokens.
+    providers_tokens = {"anthropic": "eyJfixture-oauth-token"}
+    for provider, payload in providers_payloads.items():
+        record = {"timeouts": [], "gets": 0}
+
+        def factory(*args, **kwargs):
+            record["timeouts"].append(kwargs.get("timeout", args[0] if args else None))
+            return _TimeoutRecordingClient(record, payload)
+
+        monkeypatch.setattr(account_usage.httpx, "Client", factory)
+        monkeypatch.setattr(
+            account_usage,
+            "_resolve_codex_account_id",
+            lambda *args, **kwargs: None,
+            raising=False,
+        )
+        account_usage.fetch_account_usage_for_credential(
+            provider,
+            api_key=providers_tokens.get(provider, "fixture-token"),
+            base_url="https://fixture.example/v1",
+        )
+        assert record["gets"] >= 1, provider
+        assert all(0 < timeout <= 6.5 for timeout in record["timeouts"]), (provider, record)
+        # Multi-request fetchers (openrouter) must fit the deadline in total.
+        assert sum(record["timeouts"]) <= 6.5, (provider, record)

@@ -454,3 +454,156 @@ def test_usage_contract_cache_isolated_across_credential_rotation(tmp_path, monk
     quota = payload["providers"][0]["accounts"][0]["quota"]
     assert quota["status"] == "error"
     assert quota.get("stale") is not True
+
+
+def _status_error(status_code: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://provider.fixture/usage")
+    return httpx.HTTPStatusError(
+        f"fixture {status_code}",
+        request=request,
+        response=httpx.Response(status_code=status_code, request=request),
+    )
+
+
+def test_usage_contract_cache_identity_ignores_stale_persisted_fingerprint(tmp_path, monkeypatch):
+    """A persisted secret_fingerprint that lags a rotation must not anchor the
+    cache identity: the rotated credential must not inherit the old quota."""
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entry = {
+        "id": "same-id",
+        "source": "manual",
+        "access_token": "token-before",
+        "secret_fingerprint": "persisted-fingerprint-not-yet-rewritten",
+    }
+    _write_fixture(hermes_home, {"openrouter": [entry]})
+    usage_contract._clear_usage_cache_for_tests()
+    clock = [3000.0]
+    monkeypatch.setattr(usage_contract, "_monotonic", lambda: clock[0])
+    build_usage_contract(fetcher=lambda provider, **kwargs: _available_snapshot(provider))
+
+    clock[0] += 61  # fresh window elapsed; only the stale snapshot remains
+    entry["access_token"] = "token-after"  # rotated, fingerprint record stale
+    _write_fixture(hermes_home, {"openrouter": [entry]})
+
+    def timeout_fetch(provider, **kwargs):
+        raise httpx.ReadTimeout("fixture timeout")
+
+    payload = build_usage_contract(fetcher=timeout_fetch)
+    quota = payload["providers"][0]["accounts"][0]["quota"]
+    assert quota["status"] == "error"
+    assert quota.get("stale") is not True
+
+
+def test_canonical_endpoint_equivalence_classes():
+    canonical = usage_contract._canonical_endpoint
+    assert canonical("") == "<provider-default>"
+    assert canonical(None) == "<provider-default>"
+    # scheme/host case, trailing + duplicate slashes
+    assert canonical("HTTPS://API.Example.COM/v1/") == "https://api.example.com/v1"
+    assert canonical("https://api.example.com//v1//") == "https://api.example.com/v1"
+    # default ports collapse, explicit ports survive
+    assert canonical("https://api.example.com:443/v1") == "https://api.example.com/v1"
+    assert canonical("http://api.example.com:80/v1") == "https://api.example.com/v1".replace("https", "http")
+    assert canonical("https://api.example.com:8443/v1") == "https://api.example.com:8443/v1"
+    # query / fragment / userinfo never participate in identity
+    assert canonical("https://api.example.com/v1?sig=ephemeral") == "https://api.example.com/v1"
+    assert canonical("https://api.example.com/v1#frag") == "https://api.example.com/v1"
+    assert canonical("https://user:pw@api.example.com/v1") == "https://api.example.com/v1"
+    # IPv6 authorities keep brackets
+    assert canonical("http://[::1]:8080/v1") == "http://[::1]:8080/v1"
+
+
+def test_usage_contract_cache_identity_scoped_per_profile(tmp_path, monkeypatch):
+    entry = {"id": "e1", "source": "manual", "base_url": "https://api.example.com/v1"}
+    monkeypatch.setattr(usage_contract, "get_hermes_home", lambda: tmp_path / "profile-a")
+    identity_a = usage_contract._cache_identity("openrouter", entry, "token-x")
+    monkeypatch.setattr(usage_contract, "get_hermes_home", lambda: tmp_path / "profile-b")
+    identity_b = usage_contract._cache_identity("openrouter", entry, "token-x")
+    assert identity_a and identity_b and identity_a != identity_b
+
+
+def test_usage_contract_late_worker_does_not_pollute_cache(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entry = {"id": "slow", "source": "manual", "access_token": "token-slow"}
+    _write_fixture(hermes_home, {"openrouter": [entry]})
+    usage_contract._clear_usage_cache_for_tests()
+    monkeypatch.setattr(usage_contract, "_FETCH_DEADLINE_SECONDS", 0.05)
+
+    def blocked_fetch(provider, *, api_key, base_url=None):
+        time.sleep(0.3)
+        return _available_snapshot(provider)
+
+    payload = build_usage_contract(fetcher=blocked_fetch)
+    assert payload["providers"][0]["accounts"][0]["quota"]["status"] == "error"
+
+    time.sleep(0.5)  # let the detached worker finish
+    identity = usage_contract._cache_identity("openrouter", entry, "token-slow")
+    assert usage_contract._cache_read(identity) == (None, None)
+
+
+def test_usage_contract_caps_concurrency_with_more_jobs_than_workers(tmp_path, monkeypatch):
+    import threading
+
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    entries = [
+        {"id": f"acct-{index}", "source": "manual", "access_token": f"token-{index}", "priority": index}
+        for index in range(6)
+    ]
+    _write_fixture(hermes_home, {"openrouter": entries})
+    usage_contract._clear_usage_cache_for_tests()
+
+    lock = threading.Lock()
+    running = [0]
+    peak = [0]
+
+    def tracking_fetch(provider, *, api_key, base_url=None):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        try:
+            time.sleep(0.05)
+            return _available_snapshot(provider)
+        finally:
+            with lock:
+                running[0] -= 1
+
+    payload = build_usage_contract(fetcher=tracking_fetch)
+    quotas = [a["quota"]["status"] for a in payload["providers"][0]["accounts"]]
+    assert quotas == ["available"] * 6
+    assert 1 <= peak[0] <= 4
+
+
+def test_usage_contract_stale_masking_only_for_retryable_failures(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "fixture-home"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_fixture(
+        hermes_home,
+        {"openrouter": [{"id": "cached", "source": "manual", "access_token": "token-a"}]},
+    )
+    usage_contract._clear_usage_cache_for_tests()
+    clock = [4000.0]
+    monkeypatch.setattr(usage_contract, "_monotonic", lambda: clock[0])
+
+    first = build_usage_contract(fetcher=lambda provider, **kwargs: _available_snapshot(provider))
+    assert first["providers"][0]["accounts"][0]["quota"]["stale"] is False
+    clock[0] += 61  # demote the cached snapshot to stale
+
+    def quota_after(exc):
+        def failing(provider, **kwargs):
+            raise exc
+
+        payload = build_usage_contract(fetcher=failing)
+        return payload["providers"][0]["accounts"][0]["quota"]
+
+    # Retryable: 5xx and transport errors may be masked by the stale snapshot.
+    assert quota_after(_status_error(500))["stale"] is True
+    assert quota_after(httpx.ConnectError("fixture connect"))["stale"] is True
+
+    # Never masked: auth failures and rate limiting must surface as errors.
+    for status_code in (401, 403, 429):
+        quota = quota_after(_status_error(status_code))
+        assert quota["status"] == "error"
+        assert quota.get("stale") is not True

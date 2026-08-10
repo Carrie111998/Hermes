@@ -116,10 +116,21 @@ def _runtime_access_token(entry: Mapping[str, Any]) -> str:
 
 
 def _credential_fingerprint(entry: Mapping[str, Any], runtime_token: str) -> str:
-    persisted = str(entry.get("secret_fingerprint") or "").strip()
-    if persisted:
-        return persisted
-    return hashlib.sha256(runtime_token.encode()).hexdigest() if runtime_token else "missing"
+    """Bind the cache identity to the *current* runtime secret.
+
+    The persisted ``secret_fingerprint`` can lag a rotation (the env value was
+    swapped but the pool record was not rewritten yet), so it must never anchor
+    the cache identity — a stale fingerprint would let a rotated credential
+    inherit its predecessor's cached quota. The fingerprint is a secret-derived
+    identifier: it stays inside the in-memory hash seed and is never logged or
+    serialized into the contract.
+    """
+    del entry  # persisted fingerprints are intentionally not consulted
+    if not runtime_token:
+        return "missing"
+    # Domain-separated so the digest can never be confused with a hash of the
+    # same secret computed for another purpose.
+    return hashlib.sha256(f"usage.accounts/v1|{runtime_token}".encode()).hexdigest()
 
 
 def _canonical_endpoint(raw: Any) -> str:
@@ -130,13 +141,18 @@ def _canonical_endpoint(raw: Any) -> str:
         parsed = urlsplit(value)
         scheme = parsed.scheme.lower()
         host = (parsed.hostname or "").lower()
-        if not scheme or not host or parsed.username or parsed.password:
+        if not scheme or not host:
             return value.rstrip("/")
+        # userinfo, query, and fragment never identify the usage endpoint and
+        # may carry secrets or short-lived signatures — exclude them from the
+        # cache identity.
         explicit_port = parsed.port
-        effective_port = explicit_port or (443 if scheme == "https" else 80 if scheme == "http" else None)
-        authority = host if effective_port is None else f"{host}:{effective_port}"
+        default_port = 443 if scheme == "https" else 80 if scheme == "http" else None
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        authority = host if explicit_port is None or explicit_port == default_port else f"{host}:{explicit_port}"
         path = "/" + "/".join(part for part in parsed.path.split("/") if part)
-        return urlunsplit((scheme, authority, path.rstrip("/") or "/", parsed.query, ""))
+        return urlunsplit((scheme, authority, path.rstrip("/") or "/", "", ""))
     except (TypeError, ValueError):
         return value.rstrip("/")
 
@@ -198,6 +214,21 @@ def _cache_write(key: Optional[str], snapshot: AccountUsageSnapshot) -> None:
 def _clear_usage_cache_for_tests() -> None:
     with _CACHE_LOCK:
         _CACHE.clear()
+
+
+def _is_retryable_fetch_error(exc: BaseException) -> bool:
+    """Classify failures that may be masked by a stale cached snapshot.
+
+    Retryable: timeouts, transport-level failures (connect/read errors), and
+    upstream 5xx responses. Never retryable-maskable: 401/403 (auth failure
+    must surface, staleness would hide it) and 429 (rate limiting is a routing
+    signal, not usage data).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return isinstance(exc, httpx.TransportError)
 
 
 def _health(entry: Mapping[str, Any], now: datetime) -> dict[str, Any]:
@@ -427,19 +458,24 @@ def build_usage_contract(
                 job = future_jobs[future]
                 try:
                     snapshot = future.result()
-                except httpx.TimeoutException:
+                except Exception as exc:
                     cached = job["stale"]
-                    job["account"]["quota"] = (
-                        _quota_payload(cached, stale=True)
-                        if cached is not None
-                        else {"status": "error", "reason": "Provider usage request timed out", "windows": []}
-                    )
-                except Exception:
-                    job["account"]["quota"] = {
-                        "status": "error",
-                        "reason": "Provider usage request failed",
-                        "windows": [],
-                    }
+                    if cached is not None and _is_retryable_fetch_error(exc):
+                        # Stale data only ever masks retryable transport or
+                        # upstream (5xx) failures — never an auth rejection.
+                        job["account"]["quota"] = _quota_payload(cached, stale=True)
+                    elif isinstance(exc, httpx.TimeoutException):
+                        job["account"]["quota"] = {
+                            "status": "error",
+                            "reason": "Provider usage request timed out",
+                            "windows": [],
+                        }
+                    else:
+                        job["account"]["quota"] = {
+                            "status": "error",
+                            "reason": "Provider usage request failed",
+                            "windows": [],
+                        }
                 else:
                     if snapshot is None:
                         job["account"]["quota"] = {
