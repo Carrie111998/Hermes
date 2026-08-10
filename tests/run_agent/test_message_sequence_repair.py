@@ -356,6 +356,38 @@ def test_sanitize_drops_empty_tool_calls_array():
     assert assistant["content"] == "answer"
 
 
+def test_sanitize_dedup_does_not_create_empty_tool_calls_array():
+    """A later assistant call whose id is entirely duplicate must not leave
+    ``tool_calls: []`` after the de-duplication pass.
+
+    DeepSeek validates the final serialized request, so an empty array created
+    inside the sanitizer is just as invalid as one loaded from history.
+    """
+    from agent.agent_runtime_helpers import sanitize_api_messages
+
+    duplicate_call = {
+        "id": "call_duplicate",
+        "type": "function",
+        "function": {"name": "terminal", "arguments": "{}"},
+    }
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [duplicate_call]},
+        {"role": "tool", "tool_call_id": "call_duplicate", "content": "ok"},
+        {
+            "role": "assistant",
+            "content": "final answer",
+            "tool_calls": [duplicate_call],
+        },
+        {"role": "user", "content": "next"},
+    ]
+
+    out = sanitize_api_messages(messages)
+
+    final_answer = next(m for m in out if m.get("content") == "final answer")
+    assert "tool_calls" not in final_answer
+    assert all(m.get("tool_calls") != [] for m in out)
+
+
 
 
 
@@ -368,7 +400,6 @@ def test_sanitize_drops_empty_tool_calls_array():
 # "all messages must have non-empty content except for the optional final
 # assistant message" (INVALID_REQUEST_BODY). sanitize_api_messages now heals
 # such turns on the per-call copy so the session recovers itself in memory.
-
 
 
 

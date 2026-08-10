@@ -3476,6 +3476,34 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # De-duplication above can itself create ``tool_calls: []`` when every
+    # call on a later assistant message reuses an id seen earlier in the
+    # transcript.  The initial empty-array pass cannot catch a value created
+    # after it runs, and strict OpenAI-compatible providers reject the result.
+    # Normalize again at the final sanitizer boundary, then heal any
+    # tool-call-only assistant turn that became payload-empty after the key
+    # was removed.  This operates on the per-call copy only; durable history
+    # and its prompt-cache prefix remain untouched.
+    final_normalized: List[Dict[str, Any]] = []
+    dropped_post_dedup_tool_calls = 0
+    for msg in messages:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and "tool_calls" in msg
+            and not (isinstance(msg["tool_calls"], list) and msg["tool_calls"])
+        ):
+            msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+            dropped_post_dedup_tool_calls += 1
+        final_normalized.append(msg)
+    if dropped_post_dedup_tool_calls:
+        messages = repair_empty_non_final_messages(final_normalized)
+        _ra().logger.debug(
+            "Pre-call sanitizer: dropped %d empty/invalid tool_calls field(s) "
+            "created during de-duplication",
+            dropped_post_dedup_tool_calls,
+        )
     return messages
 
 

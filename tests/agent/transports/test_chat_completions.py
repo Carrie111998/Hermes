@@ -84,6 +84,22 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    @pytest.mark.parametrize("tool_calls", [[], None, "invalid"])
+    def test_convert_messages_strips_empty_or_malformed_tool_calls(
+        self, transport, tool_calls
+    ):
+        """The final chat-completions boundary never emits a tool_calls field
+        unless it is a non-empty list, even if an upstream pass regresses."""
+        msgs = [
+            {"role": "assistant", "content": "answer", "tool_calls": tool_calls},
+        ]
+
+        result = transport.convert_messages(msgs)
+
+        assert "tool_calls" not in result[0]
+        assert result[0]["content"] == "answer"
+        assert "tool_calls" in msgs[0]
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 
