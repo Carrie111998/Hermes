@@ -879,9 +879,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             or request.headers.get("x-bluebubbles-guid")
         )
         # Constant-time comparison so a mismatch can't be recovered from
-        # response-timing side channels. ``hmac.compare_digest`` requires both
-        # operands to be str; a missing token is coerced to "".
-        if not hmac.compare_digest(str(token or ""), str(self.password)):
+        # response-timing side channels. Compare UTF-8 bytes: ``hmac.compare_digest``
+        # on str raises TypeError for non-ASCII code points, which would turn
+        # hostile/Unicode credentials into HTTP 500 instead of 401 and break
+        # legitimately configured non-ASCII passwords.
+        token_b = str(token or "").encode("utf-8")
+        password_b = str(self.password).encode("utf-8")
+        if not hmac.compare_digest(token_b, password_b):
             return web.json_response({"error": "unauthorized"}, status=401)
         try:
             raw = await request.read()

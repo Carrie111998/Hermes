@@ -193,6 +193,54 @@ class TestBlueBubblesWebhookAuth:
         assert handled == []
 
     @pytest.mark.asyncio
+    async def test_webhook_rejects_wrong_unicode_password(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, password="s3cret")
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest({"type": "new-message"}, password="пароль-неверный")
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 401
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_webhook_accepts_configured_unicode_password(self, monkeypatch):
+        unicode_pw = "pässwörd-密钥"
+        adapter = _make_adapter(monkeypatch, password=unicode_pw)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                {
+                    "type": "new-message",
+                    "data": {
+                        "guid": "msg-unicode-auth",
+                        "text": "hello",
+                        "handle": {"address": "+15555550100"},
+                        "isFromMe": False,
+                        "isGroup": False,
+                        "chats": [{"guid": "iMessage;-;+15555550100"}],
+                    },
+                },
+                password=unicode_pw,
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert len(handled) == 1
+
+    @pytest.mark.asyncio
     async def test_connect_fails_closed_when_password_unconfigured(self, monkeypatch):
         # Lifecycle invariant: connect() returns early when password is falsy
         # (gateway/platforms/bluebubbles.py), so an unconfigured adapter never
