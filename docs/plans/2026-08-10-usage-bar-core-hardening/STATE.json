@@ -1,7 +1,7 @@
 {
   "task": "usage-bar-core-hardening",
-  "phase": "M1_BACKEND_DONE",
-  "status": "M1_BACKEND_AWAITING_PARENT_REVIEW",
+  "phase": "M2_IN_PROGRESS",
+  "status": "M2_IN_PROGRESS",
   "session_id": "20260810_115223_1ade7f",
   "suggested_session_title": "Usage Bar 内建化 M0 固化 + M1/M2 mockup",
   "writer": "20260810_115223_1ade7f",
@@ -54,8 +54,8 @@
     "M0": "DONE",
     "M1_backend": "DONE (535cdeddd + 484c008b7 父评审 R2 修复; 574b84b31 父评审 R3 竞态复核=无该竞态(test-only 锁定), Codex APPROVE)",
     "M1_deferred": "is_current 省略: gateway/session 无权威 active entry id 只读信号, load_pool 有副作用被拒——登记为 M2 integration blocker",
-    "M2": "NOT_STARTED (下一短调用)",
-    "M3": "NOT_STARTED"
+    "M2": "IN_PROGRESS (writer 切换: 2026-08-10 用户拍板由父会话(现同为 kimi-k3)直接实施, worker session 已终止; M1 父验收通过 @232532eb8, 40/40)",
+    "M3": "RESCOPED_E2E_ONLY (2026-08-10 用户拍板: 砍掉 Nous/xAI provider 估值——无官方 API 无真实数据源; 保留 E2E 验证)"
   },
   "codex_plan_review": "APPROVE (计划轮 R1-R4 + R5 verify; M1 backend 代码轮 REVISE x2 -> APPROVE)",
   "blockers": [
