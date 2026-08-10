@@ -240,6 +240,74 @@ class TestBlueBubblesWebhookParsing:
         assert len(handled) == 1
         assert handled[0].source.chat_id == "iMessage;-;+15550000001"
 
+    @pytest.mark.asyncio
+    async def test_required_participant_allows_only_direct_chat_with_bryan(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            required_participants=["+15550000001"],
+        )
+
+        assert await adapter._chat_has_required_participant("any;-;+15550000001")
+        assert not await adapter._chat_has_required_participant("any;-;+15550000002")
+
+    @pytest.mark.asyncio
+    async def test_required_participant_checks_group_membership(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            required_participants=["+15550000001"],
+        )
+
+        async def fake_get_chat_info(chat_id):
+            if chat_id.endswith("bryan-present"):
+                return {"participants": ["+15550000001", "+15550000002"]}
+            return {"participants": ["+15550000002", "+15550000003"]}
+
+        monkeypatch.setattr(adapter, "get_chat_info", fake_get_chat_info)
+
+        assert await adapter._chat_has_required_participant("any;+;bryan-present")
+        assert not await adapter._chat_has_required_participant("any;+;bryan-absent")
+
+    @pytest.mark.asyncio
+    async def test_webhook_silently_blocks_chat_without_required_participant(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            send_read_receipts=False,
+            required_participants=["+15550000001"],
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        async def missing_required_participant(chat_id):
+            return False
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        monkeypatch.setattr(
+            adapter,
+            "_chat_has_required_participant",
+            missing_required_participant,
+        )
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                {
+                    "type": "new-message",
+                    "data": {
+                        "guid": "group-without-bryan-message",
+                        "text": "Rico, can you help?",
+                        "handle": {"address": "+15550000002"},
+                        "isFromMe": False,
+                        "isGroup": True,
+                        "chats": [{"guid": "any;+;group-without-bryan"}],
+                    },
+                }
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
     def test_webhook_can_fall_back_to_sender_when_chat_fields_missing(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         payload = {

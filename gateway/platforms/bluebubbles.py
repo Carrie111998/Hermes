@@ -204,6 +204,17 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             for chat_id in self._parse_chat_allowlist(_allowed_chat_guids)
             if self._chat_scope_key(chat_id)
         }
+        _required_participants = extra.get("required_participants")
+        if _required_participants is None:
+            _required_participants = os.getenv(
+                "BLUEBUBBLES_REQUIRED_PARTICIPANTS",
+                "",
+            )
+        self._required_participant_keys = {
+            self._participant_key(participant)
+            for participant in self._parse_chat_allowlist(_required_participants)
+            if self._participant_key(participant)
+        }
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
@@ -972,6 +983,36 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return True
         return self._chat_scope_key(chat_id) in self._allowed_chat_keys
 
+    @staticmethod
+    def _participant_key(participant: Any) -> str:
+        value = str(participant or "").strip().casefold()
+        if "@" in value:
+            return value
+        digits = re.sub(r"\D", "", value)
+        return f"+{digits}" if digits else value
+
+    async def _chat_has_required_participant(self, chat_id: str) -> bool:
+        """Require at least one configured identity to be present in the chat."""
+        if not self._required_participant_keys:
+            return True
+
+        # A BlueBubbles direct-chat GUID embeds its sole remote participant.
+        parts = str(chat_id or "").split(";", 2)
+        if len(parts) == 3 and parts[1] == "-":
+            return self._participant_key(parts[2]) in self._required_participant_keys
+
+        # Group GUIDs do not encode membership. Query the local BlueBubbles
+        # server on each inbound message so a participant leaving takes effect
+        # immediately rather than being hidden by a stale authorization cache.
+        info = await self.get_chat_info(chat_id)
+        participants = info.get("participants") or []
+        participant_keys = {
+            self._participant_key(participant)
+            for participant in participants
+            if self._participant_key(participant)
+        }
+        return bool(participant_keys & self._required_participant_keys)
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -1131,6 +1172,12 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not self._chat_is_allowed(session_chat_id):
             logger.info(
                 "[bluebubbles] ignoring message from unapproved chat=%s",
+                _redact(str(session_chat_id)),
+            )
+            return web.Response(text="ok")
+        if not await self._chat_has_required_participant(session_chat_id):
+            logger.info(
+                "[bluebubbles] ignoring message because required participant is absent chat=%s",
                 _redact(str(session_chat_id)),
             )
             return web.Response(text="ok")

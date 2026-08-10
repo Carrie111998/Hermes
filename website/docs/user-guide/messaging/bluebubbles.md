@@ -162,6 +162,18 @@ platforms:
 
 When configured, messages from every unlisted group or direct chat are acknowledged by the webhook but ignored before the agent starts, so no working emoji or final answer is sent. Matching ignores only the BlueBubbles service prefix (`any` versus `iMessage`) while preserving the group/direct marker and conversation identifier. `BLUEBUBBLES_ALLOWED_CHAT_GUIDS` accepts a JSON or comma-separated list.
 
+To authorize conversations dynamically based on who is present, use `required_participants` instead:
+
+```yaml
+platforms:
+  bluebubbles:
+    extra:
+      required_participants:
+        - "+15550000001"
+```
+
+Hermes responds only when at least one configured identity is a current participant. Direct-chat identity is read from the chat GUID; group membership is fetched from the local BlueBubbles server on every inbound message so leaving a group takes effect immediately. If `allowed_chat_guids` is also configured, both checks must pass. `BLUEBUBBLES_REQUIRED_PARTICIPANTS` accepts a JSON or comma-separated list.
+
 ### Typing Indicators
 Shows "typing..." in the iMessage conversation while the agent is processing. Requires Private API.
 
