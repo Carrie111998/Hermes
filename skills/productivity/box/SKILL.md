@@ -1,6 +1,6 @@
 ---
 name: box
-description: Box stores, organizes, and shares files; extracts metadata.
+description: Box manages cloud files, sharing, search, and metadata.
 version: 1.0.0
 author: Chris Kim / @iskysun96
 license: MIT
@@ -47,14 +47,12 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
 
 ## Start each task
 
-1. Confirm the CLI and current actor. If `box` is on `PATH`, use it. If Hermes installed the CLI under its current home, use the shell-appropriate `npm exec --prefix` runner in [CLI guide](references/cli-guide.md) in place of every `box` command:
-   ```bash
-   command -v box
-   box users:get me --json --fields id,name,login
-   ```
+1. Confirm the CLI and current actor. Probe with `command -v box` on POSIX shells or `Get-Command box -ErrorAction SilentlyContinue` in PowerShell. If `box` is on `PATH`, use it. If Hermes installed the CLI under its current home, use the shell-appropriate verified runner in [CLI guide](references/cli-guide.md) in place of every leading `box`. Then run `box users:get me --json --fields id,name,login` with that runner.
    If this succeeds, record the actor and continue. Do not ask about authentication again. Treat `folders:items 0` only as a listing of the actor's root; it is not proof that a shared file, folder, or Hub is inaccessible. For a known file or folder, verify its ID directly; for a Hub, use the Hubs discovery path in [Box Hubs](references/hubs.md).
 2. If authentication is absent, ask to connect a Box account with OAuth, then ask whether Hermes and the authorization browser run on the same computer or on separate hosts. Read [OAuth setup](references/oauth-setup.md).
 3. Read the relevant reference before operating. Use documented commands first; only run subcommand help when the request needs an option not covered by the reference or the installed CLI rejects the documented form.
+
+Examples labeled `bash` use POSIX continuation syntax. In PowerShell, run the Box command on one line or replace each trailing `\` with PowerShell's backtick continuation. Do not paste POSIX variable assignments into PowerShell.
 
 ## Extend the CLI without pausing
 
@@ -87,9 +85,11 @@ Use existing Box metadata or metadata queries for deterministic lookups. Otherwi
 - `ai:extract` for flexible key-value extraction
 - `ai:text-gen` for writing grounded in one Box file
 
-For Q&A over more than 25 files, first narrow a one-off request with search or metadata. For recurring Q&A over a curated collection, discover and use an existing Box Hub; only propose creating or populating a Hub after the user approves. Do not use a Hub for metadata extraction or text generation. Read [Box Hubs](references/hubs.md).
+For Q&A over more than 25 files or a reusable curated knowledge base, prefer Box AI for Hubs. Discover an existing accessible Hub first; only create or populate one after the user approves the shared-resource change. If no Hub is available and the user does not want one created, narrow a one-off request with search or metadata. Do not use a Hub for metadata extraction or text generation. Read [Box Hubs](references/hubs.md).
 
-When the user asks to extract metadata from a Box file, treat it as a request to persist the result. First prove that one existing metadata template represents every requested field; then use structured extraction, attach the returned values to that same file, and read the metadata back. Do this without a separate confirmation only when the schema is fully compatible and the user did not ask for a preview. Never silently substitute a file description, attach a partial or unrelated template, truncate fields, or discard fields. Creating or changing an enterprise template additionally requires explicit approval and an Admin or authorized Co-Admin OAuth identity; do not elevate the connected account for it. Read [Search and AI](references/search-and-ai.md) for the required template-selection and writeback workflow.
+When the user asks to extract metadata from a Box file, treat it as a request to persist the result unless they ask for a preview. Use structured extraction with inline fields when the desired schema is known and freeform extraction when the fields are exploratory. Reuse a compatible existing enterprise template when one represents every requested field. Otherwise store flat scalar results in the built-in `global.properties` metadata instance, or upload a JSON sidecar beside the source file when the result contains nested objects, tables, or values that must retain their types. Read every write back and compare it with the intended result. Never silently substitute a file description, attach a partial or unrelated template, truncate fields, or discard fields.
+
+Do not create or change metadata templates. Box does not permit creation of global templates, and enterprise-template administration is outside Hermes' normal OAuth content workflow. If the user needs reusable typed enterprise metadata and no compatible template exists, explain that a Box Admin or authorized Co-Admin must create it separately, leave existing structured metadata unchanged, and report the persisted `global.properties` instance or JSON sidecar instead. Read [Search and AI](references/search-and-ai.md) for the complete extraction and writeback workflow.
 
 Before the first Box AI request, state that Box AI must be enabled, consumes AI units, and remains limited to the current actor's permissions; do not wait for acknowledgement. An AI response returned to Hermes can still contain sensitive information. Confirm only when a material batch's file scope or expected AI-unit use is ambiguous, or when the user has not explicitly requested that scale. See [Search and AI](references/search-and-ai.md).
 

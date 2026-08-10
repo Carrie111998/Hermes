@@ -2,9 +2,11 @@
 
 Use a Box Hub for recurring Q&A over a curated knowledge base. A direct Box AI Ask request handles up to 25 selected files; a Hub request sends one `hubs` item and searches the Hub's indexed content. Do not use a Hub for metadata extraction or text generation.
 
-## Check eligibility and discover an existing Hub
+## Check availability and discover an existing Hub
 
-Before the first Hub request, explain that Box AI for Hubs requires eligible plan access, administrator enablement, and AI units. Explain that answers only use indexed files the current actor can access. Hubs are not files or folders: never use `folders:items 0` to discover or reject a Hub invitation. Confirm the current actor, then list accessible Hubs before proposing a new one:
+The Box Free Developer Plan includes the Hubs API, Box AI APIs, and a monthly AI-unit allowance for building and testing. Do not apply Box web-app plan wording as a blanket API restriction. The CLI calls the same APIs and does not bypass account entitlements: production availability still depends on the organization's plan and Box configuration.
+
+Before the first Hub AI request, explain that Box AI must be enabled and consumes AI units; do not wait for acknowledgement. Explain that answers only use indexed files the current actor can access. Hubs are not files or folders: never use `folders:items 0` to discover or reject a Hub invitation. Confirm the current actor, then list accessible Hubs before proposing a new one:
 
 ```bash
 box users:get me --json --fields id,name,login
@@ -14,7 +16,7 @@ box hubs:get <HUB_ID> --json
 box hubs:items <HUB_ID> --max-items 100 --json
 ```
 
-For a known Hub URL or ID, run `box hubs:get <HUB_ID>` directly even if the list is empty. Report each Hub as `https://app.box.com/hubs/<HUB_ID>`. Check `is_ai_enabled` before asking a question. If Hub AI is unavailable, explain whether the account lacks access, Hub AI is disabled, or content may still be indexing; do not silently download source files into Hermes' model context.
+For a known Hub URL or ID, run `box hubs:get <HUB_ID>` directly even if the list is empty. Report each Hub as `https://app.box.com/hubs/<HUB_ID>`. Check `is_ai_enabled` before asking a question, then make one bounded Hub Ask request to verify actual API availability. Box AI for Hubs must have been enabled before the Hub was created so Box can index its content. If Hub AI is unavailable, distinguish a disabled feature, a Hub created before AI enablement, indexing delay, missing Hub collaboration, missing access to underlying files, and exhausted AI units; do not silently download source files into Hermes' model context.
 
 ## Ask questions across a Hub
 
@@ -30,7 +32,7 @@ State the Hub ID and navigation link with the answer. List cited file IDs, names
 
 ## Create and populate a Hub
 
-Do not create a Hub automatically. For a one-off request over 25 files, first narrow the scope with search or metadata. Offer a new Hub only for a reusable curated collection, then obtain explicit approval before creating it.
+Do not create a Hub automatically. For Q&A over more than 25 files or a reusable curated collection, discover an existing accessible Hub first. If none fits, offer to create a curated Hub and obtain explicit approval before creating or populating it. If the user declines, narrow the one-off scope with search or metadata instead.
 
 After approval, create it, report its link, and verify it:
 
@@ -68,6 +70,7 @@ Box AI for Hubs has a service limit per Hub and across the enterprise. Box's ded
 ## Sources
 
 - [Box Hubs API overview](https://developer.box.com/guides/hubs-api/)
+- [Box Free Developer Plan](https://developer.box.com/guides/getting-started/free-developer-plan/)
 - [Box AI Ask API](https://developer.box.com/reference/post-ai-ask/)
 - [Ask questions about a Hub](https://developer.box.com/guides/box-ai/ai-tutorials/ask-questions/)
 - [Box AI for Hubs](https://support.box.com/hc/en-us/articles/29347206309395-Box-AI-for-Hubs)

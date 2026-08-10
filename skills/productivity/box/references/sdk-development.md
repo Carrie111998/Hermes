@@ -17,10 +17,25 @@ OAuth follows the signed-in user's permissions and app scopes. For a shared or b
 ## Use an official SDK
 
 - [Python SDK Gen](https://github.com/box/box-python-sdk-gen)
-- [Node SDK](https://github.com/box/box-node-sdk)
+- [The `box` npm package](https://developer.box.com/guides/tooling/box-npm-package)
+- [Existing Node SDK projects](https://github.com/box/box-node-sdk)
 - [Other Box SDKs](https://developer.box.com/guides/tooling/sdks/)
 
-Use the SDK matching the project language. Store OAuth tokens and any custom Platform App client secret in the project's approved secret mechanism, not source control. When a custom Platform App needs additional scopes, use **User Authentication (OAuth 2.0)** and have the intended Box user grant access; do not add an impersonation path for normal application work. If an exceptional enterprise operation requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the account the application normally uses.
+Use the SDK matching the project language. For a new JavaScript or TypeScript application, use the project's existing package manager to install the unified `box` package; with npm, run:
+
+```bash
+npm install box
+```
+
+Import its Node SDK from the explicit SDK subpath:
+
+```typescript
+import BoxSDK from "box/sdk";
+```
+
+The package also exposes a project-local Box CLI through `npx box`. Use that runner for development inside the application when useful, but do not silently replace the separately resolved Hermes CLI runner or its authenticated environment. If the project already uses `box-node-sdk`, extend that integration instead of migrating it without a concrete reason. For Python or another language, install its current official Box SDK rather than the npm package.
+
+Store OAuth tokens and any custom Platform App client secret in the project's approved secret mechanism, not source control. When a custom Platform App needs additional scopes, use **User Authentication (OAuth 2.0)** and have the intended Box user grant access; do not add an impersonation path for normal application work. Keep exceptional enterprise administration outside the normal Hermes runtime and application identity; do not elevate the account the application normally uses.
 
 ## OAuth client
 
@@ -63,7 +78,7 @@ const answer = await client.ai.createAiAsk({
 });
 ```
 
-Querying a Hub uses its indexed content and only returns information from files the current actor can access. Newly added Hub content can take minutes, and occasionally up to an hour, to index; surface a retryable indexing state rather than treating an early answer as complete. Box AI for Hubs requires eligible plan access, administrator enablement, and AI units. Read [Box Hubs](hubs.md) for the CLI and operational workflow.
+Querying a Hub uses its indexed content and only returns information from files the current actor can access. Newly added Hub content can take minutes, and occasionally up to an hour, to index; surface a retryable indexing state rather than treating an early answer as complete. The Free Developer Plan includes the Hubs and Box AI APIs for building and testing, with a monthly AI-unit allowance. Production availability depends on the organization's plan and configuration. In every environment, verify that the Hub exists, has AI enabled, and was created after Hub AI was enabled so its content can be indexed. Read [Box Hubs](hubs.md) for the CLI and operational workflow.
 
 ## Webhooks and reliability
 

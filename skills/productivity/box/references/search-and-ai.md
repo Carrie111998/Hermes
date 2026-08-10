@@ -18,10 +18,11 @@ Search only returns content visible to the current actor. Resolve IDs and confir
 | --- | --- |
 | Answer, summarize, or compare 1 file | `ai:ask` with `single_item_qa` |
 | Answer, summarize, or compare 2–25 selected files | `ai:ask` with `multiple_item_qa` |
-| One-off Q&A over 25 files | narrow with search or metadata first |
+| Q&A over more than 25 files | [Box Hubs](hubs.md) |
 | Recurring Q&A over a curated knowledge base | [Box Hubs](hubs.md) |
-| Preview flexible key-value fields without storing them | `ai:extract` |
-| Extract metadata and store it on the file | `ai:extract-structured` |
+| Discover fields from an exploratory prompt | `ai:extract` |
+| Extract a known schema without creating a template | `ai:extract-structured --fields` |
+| Extract against an existing compatible template | `ai:extract-structured --metadata-template` |
 | Write or rewrite text grounded in one file | `ai:text-gen` |
 
 ```bash
@@ -39,9 +40,9 @@ box ai:text-gen --items=id=<FILE_ID>,type=file \
   --prompt "Draft a concise customer update based on this file." --json
 ```
 
-`ai:text-gen` supports exactly one item. Use structured extraction when the schema is known and must be repeatable. Use a metadata template with `--metadata-template` when the Box template is the source of truth.
+`ai:text-gen` supports exactly one item. Extraction endpoints return JSON; they do not automatically attach that result to the file. Use structured extraction with inline fields when the desired schema is known, freeform extraction when the fields are exploratory, and `--metadata-template` only when an existing Box template is the source of truth.
 
-Do not use a Hub for metadata extraction or text generation. For semantic Q&A across a reusable curated collection, read [Box Hubs](hubs.md). For a one-off request that names more than 25 files, narrow the candidate set before proposing a Hub.
+Do not use a Hub for metadata extraction or text generation. For semantic Q&A across more than 25 files or a reusable curated collection, read [Box Hubs](hubs.md), discover an existing Hub first, and obtain approval before creating or populating one. If the user does not want a Hub created, narrow the candidate set with search or metadata.
 
 ## Diagnose Box AI access
 
@@ -56,50 +57,72 @@ If the file permissions and actor are correct, verify that Box AI is enabled and
 
 ## Extract and persist file metadata
 
-Treat a request to extract metadata as a structured Box metadata workflow, not a request to merely show an AI response. Unless the user asks to preview only, persist values only when one template can represent every requested field with the correct types.
+Treat extraction and persistence as separate operations. Unless the user asks for a preview, the extraction request authorizes writing the result back to Box; do not stop for a redundant confirmation.
 
-1. Inspect the file's metadata instances, list the enterprise templates, and retrieve every candidate schema before extracting or writing.
+### Inspect schemas before extracting
+
+1. Retrieve the file, its parent, and every metadata instance already attached to it.
    ```bash
+   box files:get <FILE_ID> --json --fields id,name,parent
    box files:metadata <FILE_ID> --json
+   ```
+2. List the enterprise templates visible to the current OAuth identity and retrieve plausible schemas.
+   ```bash
    box metadata-templates --json --fields templateKey,displayName,scope
    box metadata-templates:get <TEMPLATE_KEY> --scope enterprise --json
    ```
-2. Compare every requested field to each candidate's field key and type. Select an existing template only when it supports **all** requested fields. Do not attach a semantically unrelated template or one that supports only some fields just to persist a subset.
-3. Extract against the selected template. Request only the target file IDs and keep the extraction output in the terminal result rather than downloading the source file.
-   ```bash
-   box ai:extract-structured --items=id=<FILE_ID>,type=file \
-     --metadata-template="type=metadata_template,scope=enterprise,template_key=<TEMPLATE_KEY>" \
-     --json
-   ```
-4. Convert returned values to the selected template's field keys and types. Add a metadata instance when the selected template has none on the file; otherwise replace its extracted fields. Do not write absent, null, incompatible, or truncated values.
-   ```bash
-   box files:metadata:create <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
-     --data "invoice_number=INV-001" --data "total=#1250.00" --json
+3. Compare every requested field with each candidate's meaning, field key, and type. Use an existing template only when one semantically appropriate template supports **all** requested fields. Do not attach a partial or unrelated template merely to fit some values.
 
-   box files:metadata:update <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
-     --replace "invoice_number=INV-001" --replace "total=#1250.00" --json
-   ```
-   Use the required `#` prefix for float values with `files:metadata:create` or `files:metadata:add`.
-5. Retrieve the specific instance and compare every returned field with the intended value. A successful response to the write is not verification. Report the template key, metadata instance ID, file link, and any missing, normalized, or rejected values.
-   ```bash
-   box files:metadata:get <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> --json
-   ```
+### Use a compatible existing template
 
-The extraction request authorizes matching per-file metadata writes, so do not ask again after finding a fully compatible existing template. Creating or changing a metadata template is an enterprise-wide schema change: require explicit user approval before doing it. It also requires an OAuth token for a Box Admin or a Co-Admin authorized to create and edit metadata templates. Do not elevate the account Hermes normally uses for this purpose. If the approved administrator OAuth session is unavailable, leave structured metadata unchanged and ask the administrator to create the template manually or select another supported outcome. If the approved administrator session is available, create a semantically appropriate template with stable field keys and correct field types, attach it to the target file, and verify every field. Use full ISO timestamps for date values, such as `2025-03-29T00:00:00Z`.
+Extract against the template, then add its metadata instance or update the existing instance. Do not write absent, null, incompatible, or truncated values.
 
 ```bash
-box metadata-templates:create --display-name "Invoice extraction" \
-  --template-key invoice_extraction \
-  --string "Client name" --field-key client_name \
-  --number "Invoice amount" --field-key invoice_amount \
-  --date "Invoice date" --field-key invoice_date --json
+box ai:extract-structured --items=id=<FILE_ID>,type=file \
+  --metadata-template="type=metadata_template,scope=enterprise,template_key=<TEMPLATE_KEY>" \
+  --json
+
+box files:metadata:create <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
+  --data "invoice_number=INV-001" --data "total=#1250.00" --json
+
+box files:metadata:update <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> \
+  --replace "invoice_number=INV-001" --replace "total=#1250.00" --json
+
+box files:metadata:get <FILE_ID> --scope enterprise --template-key <TEMPLATE_KEY> --json
 ```
 
-If no existing template supports every field and the user does not approve a new one, leave structured metadata unchanged. Explain that the schema is incomplete and ask whether they want a separate sidecar document, an explicitly requested description that fits, or another existing template. Never silently truncate or discard fields.
+Use the CLI's required `#` prefix for float values when creating or adding typed metadata. Use full ISO timestamps for Box date fields, such as `2025-03-29T00:00:00Z`. Compare every returned field with the intended typed value. Report the template key, metadata instance `$id`, file ID, and file link.
+
+### Work without a compatible template
+
+Do not create a metadata template. Box does not allow creation in the `global` scope. Enterprise templates can only be created by a Box Admin or a Co-Admin granted template-management permission, and custom templates may depend on the account plan. Template administration is outside Hermes' normal OAuth content workflow.
+
+Choose extraction based on the request, not on template availability:
+
+- For known fields, run `ai:extract-structured` with inline `--fields`; this preserves a predictable typed JSON result without creating a template.
+- For exploratory or variable fields, run `ai:extract` with a precise prompt.
+
+Persist a flat scalar result in Box's built-in `global.properties` instance. It accepts schema-free properties without creating a template. Convert each value to a lossless string representation, validate keys before writing, and preserve unrelated existing properties. If the instance does not exist, create it. If it exists, use `--replace` for existing keys and `--add` for new keys.
+
+```bash
+box files:metadata:get <FILE_ID> --scope global --template-key properties --json
+
+box files:metadata:create <FILE_ID> --scope global --template-key properties \
+  --data "invoice_number=INV-001" --data "total=1250.00" --json
+
+box files:metadata:update <FILE_ID> --scope global --template-key properties \
+  --replace "invoice_number=INV-001" --add "total=1250.00" --json
+
+box files:metadata:get <FILE_ID> --scope global --template-key properties --json
+```
+
+`global.properties` is untyped and cannot be queried with the Metadata Query API. For nested objects, tables, arrays, or any result whose JSON types must remain intact, write the complete extraction response to a UTF-8 JSON sidecar named `<SOURCE_NAME>.<FILE_ID>.metadata.json` and upload it to the source file's parent folder. If that exact sidecar already exists for the workflow, upload a new version rather than creating a duplicate. Fetch the uploaded file and compare its content or checksum with the local JSON, then report both the source and sidecar IDs and links.
+
+If the user explicitly requires reusable typed enterprise metadata, explain that an administrator must create a compatible enterprise template separately. Do not elevate the connected account or switch to an administrator identity. Preserve the extraction through `global.properties` or a JSON sidecar in the meantime, and never silently truncate or discard fields.
 
 ### File descriptions are not metadata fallback
 
-**Hard rule:** Never use a file description as an automatic substitute for structured metadata. Box file descriptions are limited to 256 characters. Use `box files:update --description` only when the user explicitly requests a description, first verify the complete intended text fits within 256 characters, then read it back and compare it with the intended value. Do not use a description for complete extracted metadata or as a fallback for fields that do not fit a template.
+**Hard rule:** Never use a file description as an automatic substitute for extracted metadata. Treat 255 characters as the safe limit because Box can truncate longer descriptions. Use `box files:update --description` only when the user explicitly requests a description, first verify the complete intended text fits, then read it back and compare it with the intended value.
 
 ## Confidentiality and AI units
 
@@ -117,6 +140,8 @@ Use `--bulk-file-path` where the command supports it. For hundreds of files, inv
 
 - [Box AI API](https://developer.box.com/ai/box-ai-api/)
 - [Structured metadata extraction](https://developer.box.com/guides/box-ai/ai-tutorials/extract-metadata-structured/)
+- [Metadata template scopes](https://developer.box.com/guides/metadata/scopes/)
+- [Global metadata query limitation](https://developer.box.com/guides/metadata/queries/limitations/)
 - [Box AI trust](https://www.box.com/ai/trust/)
 - [AI units and plan access](https://support.box.com/hc/en-us/articles/45612941554835-Expanded-AI-API-Access-and-AI-Units-for-Business-Business-Plus-and-Enterprise-Plans)
 - [Metadata template permissions](https://developer.box.com/guides/metadata/templates/create/)

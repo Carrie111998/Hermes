@@ -54,7 +54,7 @@ Read back the item or its parent after every write. Moving a folder moves its co
 
 ## File descriptions
 
-Box file descriptions are limited to 256 characters. Never use a description as a fallback for extracted structured metadata. Set one only when the user explicitly asks for a description, verify that the complete intended text fits the limit before writing, then fetch the file and compare the returned description with the intended value. Use [Search and AI](search-and-ai.md) to persist extracted fields through a compatible metadata template instead.
+Treat 255 characters as the safe file-description limit; Box can truncate longer values. Never use a description as a fallback for extracted metadata. Set one only when the user explicitly asks for a description, verify that the complete intended text fits before writing, then fetch the file and compare the returned description with the intended value. Use [Search and AI](search-and-ai.md) to persist extracted results as metadata or a JSON sidecar instead.
 
 ## Collaborate and share
 
@@ -78,9 +78,9 @@ Include the item ID with the link. If a human cannot open an item visible only t
 ## Read and write metadata
 
 ```bash
-box files:metadata:get <FILE_ID> --scope enterprise --template-key properties --json
-box files:metadata:create <FILE_ID> --scope enterprise --template-key properties \
+box files:metadata:get <FILE_ID> --scope global --template-key properties --json
+box files:metadata:create <FILE_ID> --scope global --template-key properties \
   --data invoice_id=INV-001 --json
 ```
 
-Read the template definition and all existing metadata instances before writing. Use [Search and AI](search-and-ai.md) when metadata must be extracted from document content; do not use a partial, unrelated, or incomplete template.
+`global.properties` is Box's built-in schema-free metadata instance; no template creation is required. Its values are not a reusable typed enterprise schema and cannot be used by the Metadata Query API. Read all existing metadata instances before writing so unrelated properties are preserved. Use [Search and AI](search-and-ai.md) when metadata must be extracted from document content; do not use a partial, unrelated, or incomplete enterprise template.
