@@ -284,6 +284,13 @@ def instrument_httpx_transport(
                 ),
             )
             response = transport.handle_request(request)
+            # A transport may return a response whose body is already fully
+            # materialized (for example HTTPX MockTransport with ``json=``).
+            # In that case there is no later stream EOF for a wrapper to
+            # observe, but completion is already an established fact.
+            if response.is_stream_consumed:
+                active.record_completed_response()
+                return response
             inner = response.stream
 
             class _ResponseStream(httpx.SyncByteStream):
@@ -295,15 +302,21 @@ def instrument_httpx_transport(
                     try:
                         for chunk in self._stream:
                             yield chunk
-                        self._eof = True
-                        active.record_completed_response()
+                        if not self._eof:
+                            self._eof = True
+                            active.record_completed_response()
                     except BaseException:
                         raise
 
                 def close(self):
                     return self._stream.close()
 
-            response.stream = _ResponseStream(inner)
+            wrapped_stream = _ResponseStream(inner)
+            response.stream = wrapped_stream
+            # httpx versions used by Hermes mirror the public stream on the
+            # private slot while eager reads; keep both references aligned.
+            if hasattr(response, "_stream"):
+                response._stream = wrapped_stream
             return response
 
         def close(self):
@@ -337,6 +350,9 @@ def instrument_async_httpx_transport(
                 ),
             )
             response = await transport.handle_async_request(request)
+            if response.is_stream_consumed:
+                active.record_completed_response()
+                return response
             inner = response.stream
 
             class _ResponseStream(httpx.AsyncByteStream):
@@ -348,15 +364,19 @@ def instrument_async_httpx_transport(
                     try:
                         async for chunk in self._stream:
                             yield chunk
-                        self._eof = True
-                        active.record_completed_response()
+                        if not self._eof:
+                            self._eof = True
+                            active.record_completed_response()
                     except BaseException:
                         raise
 
                 async def aclose(self):
                     return await self._stream.aclose()
 
-            response.stream = _ResponseStream(inner)
+            wrapped_stream = _ResponseStream(inner)
+            response.stream = wrapped_stream
+            if hasattr(response, "_stream"):
+                response._stream = wrapped_stream
             return response
 
         async def aclose(self):

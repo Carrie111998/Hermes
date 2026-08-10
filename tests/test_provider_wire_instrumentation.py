@@ -398,6 +398,8 @@ def test_lazy_stream_response_is_not_executed_outside_dispatch_and_loss_is_unkno
 def test_lazy_async_stream_counts_only_eof_and_marks_cancelled_body_unknown():
     class BrokenAsyncStream(httpx.AsyncByteStream):
         async def __aiter__(self):
+            if False:
+                yield b""
             raise asyncio.CancelledError()
 
         async def aclose(self):
