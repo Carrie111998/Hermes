@@ -139,6 +139,32 @@ class TestCleanupStaleAsyncClients:
                 _client_cache.pop(key, None)
 
 
+    def test_shutdown_closes_outside_cache_lock(self):
+        from agent.auxiliary_client import (
+            _client_cache,
+            _client_cache_lock,
+            shutdown_cached_clients,
+        )
+
+        lock_observations = []
+
+        class Client:
+            _client = None
+
+            def close(self):
+                acquired = _client_cache_lock.acquire(blocking=False)
+                lock_observations.append(acquired)
+                if acquired:
+                    _client_cache_lock.release()
+
+        key = ("test_shutdown_lock", False, "", "", "", (), False)
+        with _client_cache_lock:
+            _client_cache[key] = (Client(), "test-model", None)
+
+        shutdown_cached_clients()
+
+        assert lock_observations == [True]
+
     def test_keeps_live_entries(self):
         """Entries with an open loop should be preserved."""
         from agent.auxiliary_client import (
