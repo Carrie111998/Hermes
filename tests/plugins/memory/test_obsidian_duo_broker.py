@@ -75,8 +75,21 @@ def test_session_completion_consolidates_retained_events_without_turn_llm(tmp_pa
     broker.observe(MemoryEvent("task_complete", content="Decision: use SQLite", session_id="s1"))
 
     assert broker.flush("session_end", 5)
-    assert broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0] >= 1
+    candidates = broker.store.connection().execute("SELECT payload FROM candidates").fetchall()
+    assert any("SQLite" in row[0] for row in candidates)
     assert broker.store.connection().execute("SELECT COUNT(*) FROM metrics WHERE name='event.turn'").fetchone()[0] == 1
+    broker.shutdown(5)
+
+
+def test_session_end_consolidates_last_session_when_event_has_no_session_id(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    broker.observe(MemoryEvent("turn", content="The confirmed decision is SQLite", session_id="s1"))
+    broker.observe(MemoryEvent("session_end", session_id=""))
+
+    assert broker.flush("session_end", 5)
+    candidates = broker.store.connection().execute("SELECT payload FROM candidates").fetchall()
+    assert any("SQLite" in row[0] for row in candidates)
     broker.shutdown(5)
 
 

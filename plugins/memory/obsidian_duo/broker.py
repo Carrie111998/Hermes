@@ -80,13 +80,25 @@ class EmbeddedMemoryBroker:
                     self.store.metrics_increment(f"event.{event.event_type}")
                     self._retain_event(event)
                     if event.event_type in {"task_complete", "session_end", "delegation_result"}:
-                        session_key = event.session_id or "__default__"
-                        with self._event_buffer_lock:
-                            retained = list(self._event_buffers.get(session_key, ()))
-                        if retained:
-                            self.consolidate(event.event_type, retained)
+                        if event.event_type == "session_end" and not event.session_id:
                             with self._event_buffer_lock:
-                                self._event_buffers.pop(session_key, None)
+                                buffers = [
+                                    (session_key, list(retained))
+                                    for session_key, retained in self._event_buffers.items()
+                                ]
+                            for session_key, retained in buffers:
+                                if retained:
+                                    self.consolidate(event.event_type, retained)
+                                with self._event_buffer_lock:
+                                    self._event_buffers.pop(session_key, None)
+                        else:
+                            session_key = event.session_id or "__default__"
+                            with self._event_buffer_lock:
+                                retained = list(self._event_buffers.get(session_key, ()))
+                            if retained:
+                                self.consolidate(event.event_type, retained)
+                                with self._event_buffer_lock:
+                                    self._event_buffers.pop(session_key, None)
                 finally:
                     self._events.task_done()
         finally:
@@ -311,7 +323,10 @@ class EmbeddedMemoryBroker:
         return changed
 
     def consolidate(self, reason: str, events: list[MemoryEvent]) -> int:
-        retained = [event for event in events if event.event_type in {"task_complete", "session_end", "delegation_result"}][:32]
+        lifecycle_types = {"task_complete", "session_end", "delegation_result"}
+        if reason == "session_end":
+            lifecycle_types |= {"turn", "user_correction", "explicit_remember", "decision_confirmed"}
+        retained = [event for event in events if event.event_type in lifecycle_types][:32]
         if self.inference is not None and retained:
             result = self.inference.consolidate(retained, [])
             candidates = result.parsed.get("candidates", []) if result.parsed else []
