@@ -30,24 +30,24 @@ afterEach(() => {
   cleanup()
 })
 
-function userMessage(): ThreadMessage {
+function userMessage(messageCreatedAt = createdAt): ThreadMessage {
   return {
     id: 'user-1',
     role: 'user',
     content: [{ type: 'text', text: 'question one' }],
     attachments: [],
-    createdAt,
+    createdAt: messageCreatedAt,
     metadata: { custom: {} }
   } as ThreadMessage
 }
 
-function assistantMessage(): ThreadMessage {
+function assistantMessage(messageCreatedAt = createdAt): ThreadMessage {
   return {
     id: 'assistant-1',
     role: 'assistant',
     content: [{ type: 'text', text: 'done' }],
     status: { type: 'complete', reason: 'stop' },
-    createdAt,
+    createdAt: messageCreatedAt,
     metadata: {
       unstable_state: null,
       unstable_annotations: [],
@@ -58,9 +58,17 @@ function assistantMessage(): ThreadMessage {
   } as ThreadMessage
 }
 
-function Harness({ onBranchInNewChat }: { onBranchInNewChat?: (messageId: string) => void }) {
+function Harness({
+  assistantCreatedAt = createdAt,
+  onBranchInNewChat,
+  userCreatedAt = createdAt
+}: {
+  assistantCreatedAt?: Date
+  onBranchInNewChat?: (messageId: string) => void
+  userCreatedAt?: Date
+}) {
   const runtime = useExternalStoreRuntime<ThreadMessage>({
-    messages: [userMessage(), assistantMessage()],
+    messages: [userMessage(userCreatedAt), assistantMessage(assistantCreatedAt)],
     isRunning: false,
     onNew: async () => {}
   })
@@ -88,5 +96,18 @@ describe('AssistantMessage branch button visibility (bug #2 fix)', () => {
     await screen.findByText('done')
 
     expect(screen.queryByRole('button', { name: 'Branch in new chat' })).toBeNull()
+  })
+})
+
+describe('AssistantMessage completed turn duration', () => {
+  it('shows the elapsed time beside the message age', async () => {
+    render(
+      <Harness
+        assistantCreatedAt={new Date('2026-05-01T00:01:05.000Z')}
+        userCreatedAt={new Date('2026-05-01T00:00:00.000Z')}
+      />
+    )
+
+    expect(await screen.findByText('1:05')).toBeTruthy()
   })
 })

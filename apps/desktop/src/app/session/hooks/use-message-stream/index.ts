@@ -566,6 +566,7 @@ export function useMessageStream({
         // bubble failed, instead of stripping the text.
         const keepFailedPartialText = Boolean(failure?.partial && finalText)
         const interimBoundaryPending = state.interimBoundaryPending
+        const completedAt = Date.now() / 1000
 
         const replaceTextPart = (parts: ChatMessagePart[]) => {
           const visibleFinalText = stripGeneratedImageEchoes(finalText, generatedImageEchoSources(parts)).trim()
@@ -576,7 +577,7 @@ export function useMessageStream({
         // Settling the final response onto a bubble makes it the turn's real
         // reply — clear `interim` so it regains the action footer.
         const completeMessage = (message: ChatMessage): ChatMessage => {
-          const settled = { ...message, pending: false, interim: false }
+          const settled = { ...message, pending: false, interim: false, timestamp: completedAt }
 
           if (completionError && !keepFailedPartialText) {
             return { ...settled, error: completionError, parts: message.parts.filter(part => part.type !== 'text') }
@@ -594,6 +595,7 @@ export function useMessageStream({
           role: 'assistant',
           parts: completionError && !keepFailedPartialText ? [] : [assistantTextPart(finalText)],
           branchGroupId: state.pendingBranchGroup ?? undefined,
+          timestamp: completedAt,
           ...(completionError && { error: completionError })
         })
 
