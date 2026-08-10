@@ -483,12 +483,9 @@ export async function extractBridgeEvent({
     quotedText,
     hasQuotedMessage,
     botIds,
-    readReceiptKey: {
-      remoteJid: msg.key.remoteJid || chatId,
-      id: msg.key.id,
-      participant: msg.key.participant || senderId,
-      fromMe: Boolean(msg.key.fromMe),
-    },
+    // Preserve all Baileys addressing fields. This key is used for both read
+    // receipts and reactions, including LID/group variants.
+    readReceiptKey: { ...msg.key },
     timestamp: msg.messageTimestamp,
   };
 }

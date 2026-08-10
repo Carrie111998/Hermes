@@ -7,10 +7,10 @@ long-lived bridge process therefore survived gateway restarts AND
 ``hermes update``, serving pre-update bridge.js behavior forever (e.g.
 no inbound media download → images/voice notes arrive as placeholders).
 
-The fix: bridge.js reports a hash of its own source in ``/health``
-(``scriptHash``); the adapter compares it against the bridge.js on disk
-and restarts the bridge on mismatch.  Bridges that predate the handshake
-report no hash and are treated as stale by definition.
+The fix: bridge.js reports a hash of its runtime modules in ``/health``
+(``runtimeHash``); the adapter compares it against those modules on disk and
+restarts the bridge on mismatch. Bridges that predate the handshake report no
+hash and are treated as stale by definition. Runtime config is compared too.
 
 Also covers the npm dependency-refresh stamp: deps are reinstalled when
 package.json changes, not only when node_modules is missing.
@@ -85,6 +85,8 @@ def _setup_bridge_dir(tmp_path: Path) -> Path:
     bridge_dir = tmp_path / "whatsapp-bridge"
     bridge_dir.mkdir()
     (bridge_dir / "bridge.js").write_text("// current bridge code\n")
+    (bridge_dir / "message_consumers.js").write_text("// current queue code\n")
+    (bridge_dir / "reaction.js").write_text("// current reaction code\n")
     (bridge_dir / "package.json").write_text('{"name": "bridge"}\n')
     session_path = tmp_path / "session"
     session_path.mkdir()
@@ -113,8 +115,55 @@ class TestFileContentHash:
         assert len(h) == 16
         assert h == _file_content_hash(f)  # deterministic
 
+    def test_runtime_hash_includes_imported_bridge_helpers(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _bridge_runtime_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        before = _bridge_runtime_hash(bridge_dir / "bridge.js")
+        (bridge_dir / "reaction.js").write_text("// changed reaction code\n")
+        assert _bridge_runtime_hash(bridge_dir / "bridge.js") != before
+
 
 class TestStaleBridgeHandshake:
+
+    @pytest.mark.asyncio
+    async def test_restarts_bridge_when_consumer_routes_changed(self, tmp_path):
+        from plugins.platforms.whatsapp.adapter import _bridge_runtime_hash
+
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+        adapter.config.extra = {
+            "consumer_routes": [
+                {"consumer": "openjaw", "prefix": "/openjaw", "chat_ids": ["owner@lid"]}
+            ]
+        }
+        mock_client = _mock_health(
+            {
+                "status": "connected",
+                "runtimeHash": _bridge_runtime_hash(bridge_dir / "bridge.js"),
+                "consumerRoutesJson": "[]",
+                "sendReadReceipts": False,
+            }
+        )
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 1
+        mock_proc.returncode = 1
+
+        with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
+             patch("aiohttp.ClientSession", mock_client), \
+             patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
+             patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
+             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
+             patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
+             patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
+            await adapter.connect()
+
+        mock_popen.assert_called_once()
+        assert mock_popen.call_args.kwargs["env"]["WHATSAPP_CONSUMER_ROUTES_JSON"].startswith("[")
 
 
     @pytest.mark.asyncio

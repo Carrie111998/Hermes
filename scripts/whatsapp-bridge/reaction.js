@@ -7,10 +7,13 @@ function requiredString(value, field) {
 
 export function parseReactionRequest(body) {
   const input = body && typeof body === 'object' && !Array.isArray(body) ? body : {};
-  const chatId = requiredString(input.chatId, 'chatId');
+  if (!input.key || typeof input.key !== 'object' || Array.isArray(input.key)) {
+    return { ok: false, error: 'key is required' };
+  }
+  const chatId = requiredString(input.key.remoteJid, 'key.remoteJid');
   if (!chatId.ok) return chatId;
 
-  const messageId = requiredString(input.messageId, 'messageId');
+  const messageId = requiredString(input.key.id, 'key.id');
   if (!messageId.ok) return messageId;
 
   if (typeof input.emoji !== 'string') {
@@ -23,19 +26,16 @@ export function parseReactionRequest(body) {
     return { ok: false, error: 'emoji must be at most 32 characters' };
   }
 
-  const participant = typeof input.participant === 'string' ? input.participant.trim() : '';
   return {
     ok: true,
     chatId: chatId.value,
     payload: {
       react: {
         text: input.emoji,
-        key: {
-          remoteJid: chatId.value,
-          id: messageId.value,
-          fromMe: input.fromMe === true,
-          ...(participant ? { participant } : {}),
-        },
+        // Baileys message keys may carry addressing fields beyond the common
+        // four. Preserve the exact inbound key so LID/group reactions target
+        // the original message reliably.
+        key: input.key,
       },
     },
   };

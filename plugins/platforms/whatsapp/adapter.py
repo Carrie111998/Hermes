@@ -356,6 +356,35 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _bridge_runtime_hash(bridge_path: Path) -> str:
+    """Hash bridge.js plus feature modules loaded by the long-lived process."""
+    import hashlib
+
+    digest = hashlib.sha256()
+    try:
+        for filename in ("bridge.js", "message_consumers.js", "reaction.js"):
+            digest.update(filename.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update((bridge_path.parent / filename).read_bytes())
+    except OSError:
+        return ""
+    return digest.hexdigest()[:16]
+
+
+def _consumer_routes_json(config: Any) -> str:
+    """Return one deterministic representation for subprocess and reuse checks."""
+    extra = getattr(config, "extra", None)
+    if not isinstance(extra, dict):
+        return ""
+    routes = extra.get("consumer_routes")
+    if not routes:
+        return ""
+    try:
+        return json.dumps(routes, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return ""
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -571,6 +600,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # `hermes update` bumps the Baileys pin).  The stamp file records
             # the package.json hash of the last successful install.
             bridge_dir = bridge_path.parent
+            consumer_routes_json = _consumer_routes_json(self.config)
             _pkg_json = bridge_dir / "package.json"
             _dep_stamp = bridge_dir / "node_modules" / ".hermes-pkg-hash"
             _pkg_hash = _file_content_hash(_pkg_json)
@@ -628,18 +658,22 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             bridge_status = data.get("status", "unknown")
                             if bridge_status == "connected":
                                 # Staleness handshake: only reuse a running
-                                # bridge if it is serving the same bridge.js
-                                # that is on disk right now.  A long-lived
+                                # bridge if it is serving the same runtime
+                                # modules that are on disk right now. A long-lived
                                 # bridge survives gateway restarts AND
                                 # `hermes update`, so without this check it
                                 # keeps serving pre-update code forever
                                 # (e.g. no inbound media download).  Old
-                                # bridges that don't report scriptHash are
+                                # bridges that don't report runtimeHash are
                                 # treated as stale by definition.
-                                running_hash = data.get("scriptHash", "")
-                                disk_hash = _file_content_hash(bridge_path)
+                                running_hash = data.get("runtimeHash", "")
+                                disk_hash = _bridge_runtime_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                running_consumer_routes = data.get("consumerRoutesJson", "")
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and running_consumer_routes == consumer_routes_json
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -655,7 +689,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 stale_reason = (
                                     f"running={running_hash or 'unversioned'}, disk={disk_hash}"
                                     if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
+                                    else "WhatsApp bridge config changed"
                                 )
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
@@ -690,12 +724,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # only by the local Node bridge. This keeps the Python gateway on
             # its unchanged default queue while another local integration can
             # poll a named queue without racing it.
-            consumer_routes = self.config.extra.get("consumer_routes")
-            if consumer_routes:
-                try:
-                    bridge_env["WHATSAPP_CONSUMER_ROUTES_JSON"] = json.dumps(consumer_routes)
-                except (TypeError, ValueError):
-                    logger.warning("[%s] Ignoring non-serializable consumer_routes", self.name)
+            if consumer_routes_json:
+                bridge_env["WHATSAPP_CONSUMER_ROUTES_JSON"] = consumer_routes_json
             # Under multiplexing, the bridge subprocess runs with a copy of
             # os.environ that does NOT contain the secondary profile's .env
             # vars.  Inject the resolved WHATSAPP_* values so the Node bridge

@@ -11,7 +11,7 @@
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
- *   POST /react          - React to a message { chatId, messageId, emoji, fromMe?, participant? }
+ *   POST /react          - React to a message { key, emoji }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
  *   GET  /health         - Health check
@@ -104,17 +104,22 @@ const DOCUMENT_CACHE_DIR = process.env.HERMES_DOCUMENT_CACHE_DIR
 const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
   || path.join(process.env.HOME || '~', '.hermes', 'audio_cache');
 
-// Self-hash of this script file.  Reported in /health so the Python gateway
-// can detect a running bridge that predates the current bridge.js and
+// Runtime hash of the bridge and locally imported feature modules. Reported
+// in /health so the Python gateway can detect a running bridge that predates
+// any of the code currently on disk and
 // restart it instead of silently reusing stale code (stale-bridge trap:
 // `hermes update` updates bridge.js on disk but a long-lived bridge process
 // keeps serving the old behavior forever).
 let SCRIPT_HASH = '';
+let RUNTIME_HASH = '';
 try {
-  SCRIPT_HASH = createHash('sha256')
-    .update(readFileSync(fileURLToPath(import.meta.url)))
-    .digest('hex')
-    .slice(0, 16);
+  const bridgeFile = fileURLToPath(import.meta.url);
+  SCRIPT_HASH = createHash('sha256').update(readFileSync(bridgeFile)).digest('hex').slice(0, 16);
+  const runtimeHasher = createHash('sha256');
+  for (const fileName of ['bridge.js', 'message_consumers.js', 'reaction.js']) {
+    runtimeHasher.update(fileName).update('\0').update(readFileSync(path.join(path.dirname(bridgeFile), fileName)));
+  }
+  RUNTIME_HASH = runtimeHasher.digest('hex').slice(0, 16);
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
@@ -279,8 +284,12 @@ const logger = pino({ level: 'warn' });
 // command routes may instead target a named local consumer, allowing a second
 // local integration without a race to drain the one Baileys socket.
 const MAX_QUEUE_SIZE = 100;
-const messageConsumers = createMessageConsumerQueues(MAX_QUEUE_SIZE);
 const CONSUMER_ROUTES = parseConsumerRoutes(process.env.WHATSAPP_CONSUMER_ROUTES_JSON);
+const CONSUMER_ROUTES_JSON = process.env.WHATSAPP_CONSUMER_ROUTES_JSON || '';
+const messageConsumers = createMessageConsumerQueues(
+  MAX_QUEUE_SIZE,
+  CONSUMER_ROUTES.map(route => route.consumer),
+);
 
 function enqueueInboundEvent(event) {
   const consumer = selectConsumerForEvent(event, CONSUMER_ROUTES);
@@ -831,7 +840,11 @@ app.get('/messages', (req, res) => {
   if (!consumer) {
     return res.status(400).json({ error: 'Invalid consumer identifier' });
   }
-  return res.json(messageConsumers.drain(consumer));
+  const messages = messageConsumers.drain(consumer);
+  if (messages === null) {
+    return res.status(404).json({ error: 'Consumer is not configured' });
+  }
+  return res.json(messages);
 });
 
 // Send a message
@@ -1146,6 +1159,8 @@ app.get('/health', (req, res) => {
     consumerQueueLengths: messageConsumers.lengths(),
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
+    runtimeHash: RUNTIME_HASH,
+    consumerRoutesJson: CONSUMER_ROUTES_JSON,
     sendReadReceipts: SEND_READ_RECEIPTS,
   });
 });

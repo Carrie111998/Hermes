@@ -20,12 +20,14 @@ assert.equal(selectConsumerForEvent({ chatId: 'owner@lid', body: '/codex inspect
 assert.equal(selectConsumerForEvent({ chatId: 'owner@lid', body: '/CODEX\ninspect status' }, routes), 'codex');
 assert.equal(selectConsumerForEvent({ chatId: 'other@lid', body: '/codex inspect status' }, routes), 'default');
 assert.equal(selectConsumerForEvent({ chatId: 'owner@lid', body: '/codexical' }, routes), 'default');
+assert.equal(selectConsumerForEvent({ chatId: 'owner@lid', isGroup: true, body: '/codex inspect status' }, routes), 'default');
 
-const queues = createMessageConsumerQueues(2);
+const queues = createMessageConsumerQueues(2, ['codex']);
 queues.enqueue({ id: 'h1' });
 queues.enqueue({ id: 'c1' }, 'codex');
 queues.enqueue({ id: 'c2' }, 'codex');
 queues.enqueue({ id: 'c3' }, 'codex');
 assert.deepEqual(queues.drain(), [{ id: 'h1' }]);
 assert.deepEqual(queues.drain('codex'), [{ id: 'c2' }, { id: 'c3' }]);
+assert.equal(queues.drain('unconfigured'), null);
 console.log('✓ named consumer routing keeps default and Codex queues isolated');

@@ -46,6 +46,9 @@ export function parseConsumerRoutes(raw) {
 }
 
 export function selectConsumerForEvent(event, routes) {
+  // Named command routes are owner-DM only. A group conversation can be on
+  // the allowlist while still containing participants who are not the owner.
+  if (event?.isGroup === true) return DEFAULT_CONSUMER;
   const chatId = String(event?.chatId || '').trim();
   const body = String(event?.body || '').trimStart().toLowerCase();
   for (const route of routes || []) {
@@ -59,10 +62,15 @@ export function selectConsumerForEvent(event, routes) {
   return DEFAULT_CONSUMER;
 }
 
-export function createMessageConsumerQueues(limit = 100) {
+export function createMessageConsumerQueues(limit = 100, configuredConsumers = []) {
   const maxQueueSize = Number.isInteger(limit) && limit > 0 ? limit : 100;
   const defaultQueue = [];
-  const namedQueues = new Map();
+  const namedQueues = new Map(
+    configuredConsumers
+      .map(normalizeConsumerId)
+      .filter(consumer => consumer && consumer !== DEFAULT_CONSUMER)
+      .map(consumer => [consumer, []]),
+  );
 
   function pushBounded(queue, event) {
     queue.push(event);
@@ -71,20 +79,19 @@ export function createMessageConsumerQueues(limit = 100) {
 
   function queueFor(consumer) {
     if (consumer === DEFAULT_CONSUMER) return defaultQueue;
-    let queue = namedQueues.get(consumer);
-    if (!queue) {
-      queue = [];
-      namedQueues.set(consumer, queue);
-    }
-    return queue;
+    return namedQueues.get(consumer) || null;
   }
 
   function enqueue(event, consumer = DEFAULT_CONSUMER) {
-    pushBounded(queueFor(consumer), event);
+    const queue = queueFor(consumer);
+    if (!queue) return false;
+    pushBounded(queue, event);
+    return true;
   }
 
   function drain(consumer = DEFAULT_CONSUMER) {
     const queue = queueFor(consumer);
+    if (!queue) return null;
     return queue.splice(0, queue.length);
   }
 
