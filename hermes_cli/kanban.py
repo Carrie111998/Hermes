@@ -1206,12 +1206,19 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     return 2
 
 
+def _board_list_db_path(slug: str) -> Path:
+    """Return a board's physical DB path, ignoring worker handoff pins."""
+    if slug == kb.DEFAULT_BOARD:
+        return kb.kanban_home() / "kanban.db"
+    return kb.board_dir(slug) / "kanban.db"
+
+
 def _board_task_counts(
     slug: str, *, db_path: str | Path | None = None
 ) -> dict[str, int]:
     """Return ``{status: count}`` without entering the write/migration path."""
     try:
-        path = Path(db_path) if db_path is not None else kb.kanban_db_path(board=slug)
+        path = Path(db_path) if db_path is not None else _board_list_db_path(slug)
         if not path.exists():
             return {}
         uri = path.resolve().as_uri() + "?mode=ro"
@@ -1231,7 +1238,12 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"], db_path=b.get("db_path"))
+        path = _board_list_db_path(b["slug"])
+        # list_boards() metadata resolves through kanban_db_path(), whose
+        # worker handoff override intentionally pins one DB.  A registry list
+        # must instead expose and count each board's canonical physical path.
+        b["db_path"] = str(path)
+        b["counts"] = _board_task_counts(b["slug"], db_path=path)
         b["total"] = sum(b["counts"].values())
     if getattr(args, "json", False):
         print(json.dumps(boards, indent=2, ensure_ascii=False))

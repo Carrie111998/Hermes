@@ -315,6 +315,7 @@ class TestCLI:
         """Listing counts must not enter the schema migration/write path."""
         from hermes_cli import kanban as kanban_cli
 
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         path = tmp_path / "kanban.db"
         with sqlite3.connect(path) as conn:
             conn.execute("CREATE TABLE tasks (status TEXT NOT NULL)")
@@ -322,8 +323,6 @@ class TestCLI:
                 "INSERT INTO tasks(status) VALUES (?)",
                 [("running",), ("blocked",), ("blocked",)],
             )
-
-        monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: path)
 
         def reject_migration_path(*args, **kwargs):
             raise PermissionError("delegated contexts cannot mutate Kanban")
@@ -341,13 +340,19 @@ class TestCLI:
         """A worker's DB pin must not make every listed board show one DB."""
         from hermes_cli import kanban as kanban_cli
 
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         paths = []
         for slug, statuses in (
+            ("default", ["todo"]),
             ("alpha", ["running"]),
             ("beta", ["blocked", "blocked"]),
         ):
-            path = tmp_path / slug / "kanban.db"
-            path.parent.mkdir()
+            path = (
+                tmp_path / "kanban.db"
+                if slug == "default"
+                else tmp_path / "kanban" / "boards" / slug / "kanban.db"
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
             with sqlite3.connect(path) as conn:
                 conn.execute("CREATE TABLE tasks (status TEXT NOT NULL)")
                 conn.executemany(
@@ -357,21 +362,17 @@ class TestCLI:
             paths.append((slug, path))
 
         monkeypatch.setenv("HERMES_KANBAN_DB", str(paths[0][1]))
-        monkeypatch.setattr(
-            kb,
-            "list_boards",
-            lambda include_archived=False: [
-                {"slug": slug, "name": slug.title(), "db_path": str(path)}
-                for slug, path in paths
-            ],
-        )
         monkeypatch.setattr(kb, "get_current_board", lambda: "alpha")
 
         assert kanban_cli._cmd_boards_list(argparse.Namespace(all=False, json=True)) == 0
         data = json.loads(capsys.readouterr().out)
         by_slug = {board["slug"]: board for board in data}
+        assert by_slug["default"]["counts"] == {"todo": 1}
         assert by_slug["alpha"]["counts"] == {"running": 1}
         assert by_slug["beta"]["counts"] == {"blocked": 2}
+        assert {board["db_path"] for board in data} == {
+            str(path) for _, path in paths
+        }
 
     def test_boards_list_default_only(self, tmp_path):
         env = {"HERMES_HOME": str(tmp_path)}
