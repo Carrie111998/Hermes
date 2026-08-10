@@ -436,11 +436,14 @@ _RM_FLAG_PREFIX = _CMDPOS + r'rm\s+(-[^\s]*\s+)*'
 # narrow: ``cmd`` must be the -Command payload, so quoted prose stays data.
 _WINDOWS_CMD_PREFIX = _CMDPOS + r'cmd(?:\.exe)?\s+/(?:c|k)\s+'
 _WINDOWS_POWERSHELL_CMD_PREFIX = (
-    r'\b(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+'
+    _CMDPOS
+    + r'(?:powershell|pwsh)(?:\.exe)?\b(?:\s+-\S+)*\s+'
     r'-(?:command|c)\s+["\']?cmd(?:\.exe)?\s+/(?:c|k)\s+'
 )
-_WINDOWS_RECURSIVE_RD_PREFIX = (
+_WINDOWS_RD_PREFIX = (
     r'\\?["\']?(?:rd|rmdir)\b\s+'
+)
+_WINDOWS_RECURSIVE_FLAGS_PREFIX = (
     r'(?=(?:(?:/[sq])\s+)*/s(?:\s|$))'
     r'(?:(?:/[sq])\s+)+'
 )
@@ -448,15 +451,28 @@ _WINDOWS_ROOT_TARGET = (
     r'(?:["\'](?:[a-z]:)?[\\/]+["\']|'
     r'(?:[a-z]:)?[\\/]+(?=["\']?(?:[\s`;|&)]|$)))'
 )
+_WINDOWS_RECURSIVE_ROOT_ARGUMENTS = (
+    r'(?:'
+    # Flags-first spellings: rd /s /q C:\
+    + _WINDOWS_RECURSIVE_FLAGS_PREFIX + _WINDOWS_ROOT_TARGET
+    # Windows documents the path before /s [/q], and cmd also accepts /q
+    # before the path. Require /s in the post-target flag run so a root operand
+    # without recursive deletion remains outside the hardline floor.
+    + r'|(?:(?:/[sq])\s+)*' + _WINDOWS_ROOT_TARGET + r'\s+'
+    + r'(?=(?:(?:/[sq])\s+)*/s(?:\s|$))'
+    + r'(?:(?:/[sq])(?:\s+|$))+'
+    + r')'
+)
 _WINDOWS_ROOT_DELETE_PATTERN = (
     r'(?:'
     + r'(?:' + _WINDOWS_CMD_PREFIX + r'|' + _WINDOWS_POWERSHELL_CMD_PREFIX + r')'
-    + _WINDOWS_RECURSIVE_RD_PREFIX + _WINDOWS_ROOT_TARGET
+    + _WINDOWS_RD_PREFIX + _WINDOWS_RECURSIVE_ROOT_ARGUMENTS
     # PowerShell does not interpret \" as an escaped quote.  In #82842 this
     # leaves the preceding backslash as a standalone cmd root operand before
     # the intended drive path; direct cmd under Bash does interpret \" and is
     # deliberately excluded from this quote-collapse alternative.
-    + r'|' + _WINDOWS_POWERSHELL_CMD_PREFIX + _WINDOWS_RECURSIVE_RD_PREFIX
+    + r'|' + _WINDOWS_POWERSHELL_CMD_PREFIX + _WINDOWS_RD_PREFIX
+    + _WINDOWS_RECURSIVE_FLAGS_PREFIX
     + r'[\\/]+["\'][a-z]:[\\/]'
     + r')'
 )
@@ -563,7 +579,8 @@ def detect_hardline_command(command: str) -> tuple:
     # normalizer treats backslashes as POSIX shell escapes, which correctly
     # deobfuscates command words but turns a quoted drive root such as ``C:\``
     # into ``C:`` before the hardline regex can classify its target.
-    if _WINDOWS_ROOT_DELETE_RE.search(command):
+    windows_command = _mark_command_starts(_mask_quoted_newlines(command))
+    if _WINDOWS_ROOT_DELETE_RE.search(windows_command):
         return (True, "recursive delete of Windows filesystem root")
     normalized = _normalize_command_for_detection(command)
     _, malformed_grep = _grep_safe_detection_variant(normalized)

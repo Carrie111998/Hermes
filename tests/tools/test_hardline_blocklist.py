@@ -208,6 +208,9 @@ _WINDOWS_ROOT_DELETE_BLOCK = [
     "cmd.exe /c rmdir /q /s C:\\",
     "cmd /k rd /s D:/",
     "cmd /c rd /s /q \"E:\\\"",
+    "cmd /c rd F:\\ /s /q",
+    'cmd /c rmdir "G:\\" /s /q',
+    "cmd /c rd /q H:/ /s",
     (
         r'''powershell -NoProfile -Command 'cmd /c \"rd /s /q '''
         r'''\\\"C:\Users\Art\Documents\ChatGPT\Software\clipsift-release\\\"\"' '''
@@ -221,6 +224,8 @@ _WINDOWS_ROOT_DELETE_ALLOW = [
     "cmd /c rd /q C:\\",
     r'''cmd /c "rd /s /q \"C:\Users\Art\Documents\clipsift-release\""''',
     'echo "cmd /c rd /s /q C:\\"',
+    'echo "powershell -NoProfile -Command cmd /c rd /s /q C:\\"',
+    '''python -c "print('powershell -Command cmd /c rd /s /q C:\\')"''',
 ]
 
 
@@ -254,7 +259,11 @@ def test_windows_scoped_or_non_recursive_delete_is_not_hardline(command):
 
 @pytest.mark.parametrize(
     "command",
-    [_WINDOWS_ROOT_DELETE_BLOCK[2], _WINDOWS_ROOT_DELETE_BLOCK[-1]],
+    [
+        _WINDOWS_ROOT_DELETE_BLOCK[2],
+        _WINDOWS_ROOT_DELETE_BLOCK[5],
+        _WINDOWS_ROOT_DELETE_BLOCK[-1],
+    ],
 )
 def test_windows_root_delete_cannot_bypass_yolo(command, clean_session, monkeypatch):
     monkeypatch.setenv("HERMES_YOLO_MODE", "1")
