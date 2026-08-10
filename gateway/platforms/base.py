@@ -6608,6 +6608,37 @@ class BasePlatformAdapter(ABC):
                 _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
                 _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
+                # Collapse duplicates across explicit MEDIA paths and auto-detected
+                # bare local paths before dispatch. A file may appear in both
+                # lists when the assistant includes a raw path and a MEDIA tag,
+                # which should produce one upload only.
+                _deduped_media_files: list = []
+                _seen_media_paths: set[str] = set()
+                for media_path, is_voice in media_files:
+                    if media_path in _seen_media_paths:
+                        logger.info(
+                            "[%s] Skipping duplicate media attachment path from explicit MEDIA: after local merge: %s",
+                            self.name,
+                            media_path,
+                        )
+                        continue
+                    _seen_media_paths.add(media_path)
+                    _deduped_media_files.append((media_path, is_voice))
+                media_files = _deduped_media_files
+
+                _deduped_local_files: list = []
+                for file_path in local_files:
+                    if file_path in _seen_media_paths:
+                        logger.info(
+                            "[%s] Skipping duplicate media attachment path from local detection: %s",
+                            self.name,
+                            file_path,
+                        )
+                        continue
+                    _seen_media_paths.add(file_path)
+                    _deduped_local_files.append(file_path)
+                local_files = _deduped_local_files
+
                 # Partition images out of media_files + local_files so they
                 # can be sent as a single batch (Signal RPC). When
                 # ``[[as_document]]`` was set on the original response, image

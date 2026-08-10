@@ -276,6 +276,29 @@ async def test_explicit_media_response_does_not_load_transcript(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_media_tag_plus_bare_path_is_not_duplicated(tmp_path, monkeypatch):
+    """If a MEDIA path and the same bare path both appear in one reply,
+    only one attachment must be sent."""
+    plan = _allowed_file(tmp_path, monkeypatch, "duplicate-plan.md")
+    adapter = _DummyAdapter()
+    adapter._keep_typing = _hold_typing
+
+    async def handler(_event):
+        return (
+            f"Created plan.\nMEDIA:{plan}\n\n"
+            f"File saved at {plan} for later reference."
+        )
+
+    adapter.set_message_handler(handler)
+    event = _make_event()
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.documents == [str(plan)], (
+        "same path delivered twice when seen as MEDIA: and bare local path"
+    )
+
+
+@pytest.mark.asyncio
 async def test_bare_path_history_lookup_does_not_block_event_loop(tmp_path, monkeypatch):
     """A slow transcript read must run outside the platform event loop."""
     pdf = _allowed_file(tmp_path, monkeypatch, "slow-history.pdf")

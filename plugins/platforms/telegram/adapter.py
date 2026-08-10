@@ -1594,7 +1594,7 @@ class TelegramAdapter(BasePlatformAdapter):
     #
     # Final / new-message replies opportunistically use sendRichMessage with
     # the RAW agent markdown so richer constructs (tables, task lists,
-    # collapsible details, math, ...) render natively. The legacy MarkdownV2
+    # horizontal rules, collapsible details, math, ...) render natively. The legacy MarkdownV2
     # send() path stays as the fallback for unsupported/oversized content and
     # older PTB/clients. Streaming edits stay on Hermes' existing MarkdownV2
     # edit path for now; finalization can re-send as rich and delete the stale
@@ -1676,8 +1676,11 @@ class TelegramAdapter(BasePlatformAdapter):
         clients render a consistent font weight/spacing. The rich endpoint is
         reserved for constructs where raw markdown materially improves output:
         pipe tables (MarkdownV2 has no table syntax and rewrites them into
-        bullet lists), GFM task lists, collapsible ``<details>`` blocks, and
-        block math.  Adapted from #45995 (@YonganZhang).
+        bullet lists), GFM task lists, collapsible ``<details>`` blocks,
+        horizontal rules, and block math.  A horizontal rule is also the
+        standard separator between an agent response and its runtime footer,
+        so preserve it through Telegram's native rich renderer. Adapted from
+        #45995 (@YonganZhang).
         """
         if not content:
             return False
@@ -1686,6 +1689,8 @@ class TelegramAdapter(BasePlatformAdapter):
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):
             return True
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
+            return True
+        if re.search(r"(?m)^\s*-{3,}\s*$", content):
             return True
         if "$$" in content:
             return True
