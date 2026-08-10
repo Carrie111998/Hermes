@@ -380,6 +380,86 @@ async def test_etag_concurrency_and_revision_idempotency(create_api_client):
 
 
 @pytest.mark.asyncio
+async def test_stale_if_match_blocks_profile_skill_and_file_deletes(create_api_client):
+    """DELETE must enforce the same digest precondition as PUT before mutating resources."""
+    client, key = await create_api_client(admin_config_rw=True)
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        **OWNER_HEADERS,
+    }
+
+    profile_create = await client.put(
+        "/v1/admin/profiles/delete-etag-profile",
+        headers=headers,
+        json={"description": "v1"},
+    )
+    stale_profile_digest = (await profile_create.json())["digest"]
+    profile_update = await client.put(
+        "/v1/admin/profiles/delete-etag-profile",
+        headers={**headers, "If-Match": stale_profile_digest},
+        json={"description": "v2"},
+    )
+    assert profile_update.status == 200
+    profile_delete = await client.delete(
+        "/v1/admin/profiles/delete-etag-profile",
+        headers={**headers, "If-Match": stale_profile_digest},
+    )
+    assert profile_delete.status == 412
+    assert (await client.get("/v1/admin/profiles/delete-etag-profile", headers=headers)).status == 200
+
+    await client.put("/v1/admin/profiles/delete-etag-child", headers=headers, json={})
+    skill_v1 = "---\nname: guarded-skill\ndescription: v1\n---\nDo v1\n"
+    skill_create = await client.put(
+        "/v1/admin/profiles/delete-etag-child/skills/guarded-skill",
+        headers=headers,
+        json={"content": skill_v1},
+    )
+    stale_skill_digest = (await skill_create.json())["digest"]
+    skill_update = await client.put(
+        "/v1/admin/profiles/delete-etag-child/skills/guarded-skill",
+        headers={**headers, "If-Match": stale_skill_digest},
+        json={"content": skill_v1 + "updated\n"},
+    )
+    assert skill_update.status == 200
+    skill_delete = await client.delete(
+        "/v1/admin/profiles/delete-etag-child/skills/guarded-skill",
+        headers={**headers, "If-Match": stale_skill_digest},
+    )
+    assert skill_delete.status == 412
+    assert (
+        await client.get(
+            "/v1/admin/profiles/delete-etag-child/skills/guarded-skill",
+            headers=headers,
+        )
+    ).status == 200
+
+    file_create = await client.put(
+        "/v1/admin/profiles/delete-etag-child/files/context/guarded.md",
+        headers=headers,
+        json={"content": "v1"},
+    )
+    stale_file_digest = (await file_create.json())["digest"]
+    file_update = await client.put(
+        "/v1/admin/profiles/delete-etag-child/files/context/guarded.md",
+        headers={**headers, "If-Match": stale_file_digest},
+        json={"content": "v2"},
+    )
+    assert file_update.status == 200
+    file_delete = await client.delete(
+        "/v1/admin/profiles/delete-etag-child/files/context/guarded.md",
+        headers={**headers, "If-Match": stale_file_digest},
+    )
+    assert file_delete.status == 412
+    assert (
+        await client.get(
+            "/v1/admin/profiles/delete-etag-child/files/context/guarded.md",
+            headers=headers,
+        )
+    ).status == 200
+
+
+@pytest.mark.asyncio
 async def test_child_skill_and_file_metadata_persistence(create_api_client):
     """Verify skill and file revisions and digests are persisted and read back after restart."""
     client, key = await create_api_client(admin_config_rw=True)

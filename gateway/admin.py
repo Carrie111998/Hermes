@@ -796,6 +796,11 @@ async def handle_delete_profile(adapter: Any, request: Any) -> Any:
             code="ownership_mismatch" if err_code == "ownership_mismatch" else "unmanaged_profile",
         )
 
+    current_repr = _canonical_profile_repr(canon, profile_dir, manifest)
+    if_match_err = _check_if_match(request, current_repr["digest"])
+    if if_match_err:
+        return if_match_err
+
     # 1. Request scope active check
     current_scope = _api_request_profile.get()
     if current_scope and normalize_profile_name(current_scope) == canon:
@@ -1082,6 +1087,14 @@ async def handle_delete_skill(adapter: Any, request: Any) -> Any:
         return _admin_error(f"Skill '{skill_slug}' not found under profile '{profile_name}'", status=404, code="skill_not_found")
 
     skill_dir = profile_dir / "skills" / skill_slug
+    skill_md_path = skill_dir / "SKILL.md"
+    if not skill_md_path.is_file():
+        return _admin_error(f"Skill '{skill_slug}' not found under profile '{profile_name}'", status=404, code="skill_not_found")
+    current_digest = _sha256_digest(skill_md_path.read_text(encoding="utf-8"))
+    if_match_err = _check_if_match(request, current_digest)
+    if if_match_err:
+        return if_match_err
+
     if skill_dir.is_dir():
         try:
             shutil.rmtree(skill_dir)
@@ -1303,6 +1316,13 @@ async def handle_delete_file(adapter: Any, request: Any) -> Any:
 
     if rel_posix not in files_meta or not files_meta[rel_posix].get("managed"):
         return _admin_error(f"File '{rel_path_str}' not found", status=404, code="file_not_found")
+
+    if not target_path.is_file():
+        return _admin_error(f"File '{rel_path_str}' not found", status=404, code="file_not_found")
+    current_digest = _sha256_digest(target_path.read_text(encoding="utf-8"))
+    if_match_err = _check_if_match(request, current_digest)
+    if if_match_err:
+        return if_match_err
 
     if target_path.is_file():
         try:
