@@ -53,6 +53,39 @@ def test_unknown_task_prevents_contextless_worker_bootstrap(kanban_home):
         conn.close()
 
 
+def test_worker_query_caps_many_parent_handoffs_without_losing_task_body(kanban_home):
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="Fan-in worker",
+            body="BEGIN-TASK-BODY\nworker requirement\nEND-TASK-BODY",
+            assignee="worker-a",
+        )
+        for index in range(20):
+            parent_id = kb.create_task(
+                conn,
+                title=f"Parent {index}",
+                assignee="worker-a",
+            )
+            assert kb.complete_task(conn, parent_id, result="P" * 4096)
+            kb.link_tasks(conn, parent_id, task_id)
+
+        query = kb.build_worker_query(
+            conn,
+            task_id,
+            f"work kanban task {task_id}",
+        )
+    finally:
+        conn.close()
+
+    assert len(query) == kb._CTX_MAX_WORKER_QUERY_CHARS
+    assert query.startswith(f"work kanban task {task_id}\n\n# Kanban task {task_id}")
+    assert "BEGIN-TASK-BODY\nworker requirement\nEND-TASK-BODY" in query
+    assert "[worker context truncated," in query
+    assert query.endswith(" chars omitted]\n")
+
+
 def test_worker_guidance_consumes_injected_context_before_refresh_tool():
     assert "includes an authoritative `# Kanban task …` context block" in KANBAN_GUIDANCE
     assert "Call `kanban_show()` only if the block is absent" in KANBAN_GUIDANCE

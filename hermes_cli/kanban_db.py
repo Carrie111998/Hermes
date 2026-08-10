@@ -333,6 +333,7 @@ _CTX_MAX_COMMENTS       = 30      # most recent N comments shown in full
 _CTX_MAX_FIELD_BYTES    = 4 * 1024   # 4 KB per summary/error/metadata/result
 _CTX_MAX_BODY_BYTES     = 8 * 1024   # 8 KB per task.body (opening post)
 _CTX_MAX_COMMENT_BYTES  = 2 * 1024   # 2 KB per comment
+_CTX_MAX_WORKER_QUERY_CHARS = 64 * 1024  # total first-turn text incl. kickoff
 
 
 def _relative_age(ts: Optional[int], now: Optional[int] = None) -> str:
@@ -9606,9 +9607,23 @@ def build_worker_query(
     """
     context = build_worker_context(conn, task_id)
     prefix = str(kickoff or "").rstrip()
-    if not prefix:
-        return context
-    return f"{prefix}\n\n{context}"
+    query = context if not prefix else f"{prefix}\n\n{context}"
+    if len(query) <= _CTX_MAX_WORKER_QUERY_CHARS:
+        return query
+
+    # Individual fields are capped by build_worker_context(), but collection
+    # cardinality is intentionally flexible: fan-in tasks can have many parents
+    # and cards can have many attachments. Keep the authoritative task/body at
+    # the front while imposing a hard bound before this text becomes the latest
+    # actionable user turn (which conversation compression must preserve).
+    omitted = len(query) - _CTX_MAX_WORKER_QUERY_CHARS
+    while True:
+        marker = f"\n… [worker context truncated, {omitted} chars omitted]\n"
+        keep = max(0, _CTX_MAX_WORKER_QUERY_CHARS - len(marker))
+        actual_omitted = len(query) - keep
+        if actual_omitted == omitted:
+            return query[:keep] + marker
+        omitted = actual_omitted
 
 
 # ---------------------------------------------------------------------------
