@@ -399,6 +399,45 @@ def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | Pu
     return resolved.resolve()
 
 
+def _resolve_write_path_for_task(
+    filepath: str,
+    task_id: str = "default",
+    *,
+    follow_symlink: bool = False,
+) -> Path | PurePosixPath:
+    """Resolve a write path without dereferencing its final component by default."""
+    if follow_symlink:
+        return _resolve_path_for_task(filepath, task_id)
+
+    container_paths = _uses_container_paths(task_id)
+    if container_paths:
+        expanded = _expand_tilde(filepath)
+        if posixpath.isabs(expanded):
+            return _normalize_without_host_deref(expanded)
+        return _normalize_without_host_deref(
+            _resolve_base_dir(task_id, container_paths=True) / expanded
+        )
+
+    from tools.environments.local import _msys_to_windows_path
+
+    expanded = _expand_tilde(_msys_to_windows_path(filepath))
+    if sys.platform == "win32":
+        import ntpath
+
+        if ntpath.isabs(expanded):
+            candidate = Path(expanded)
+        else:
+            candidate = Path(
+                ntpath.join(str(_resolve_base_dir(task_id, container_paths=False)), expanded)
+            )
+        return candidate.parent.resolve() / candidate.name
+
+    candidate = Path(expanded)
+    if not candidate.is_absolute():
+        candidate = Path(_resolve_base_dir(task_id, container_paths=False)) / candidate
+    return candidate.parent.resolve() / candidate.name
+
+
 def _path_resolution_warning(filepath: str, resolved: Path, task_id: str = "default") -> str | None:
     """Warn when a relative path resolved OUTSIDE the task's workspace root.
 
@@ -2049,7 +2088,7 @@ def _mark_verification_stale(
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default",
-                    cross_profile: bool = False,
+                    cross_profile: bool = False, follow_symlink: bool = False,
                     session_id: str | None = None) -> str:
     """Write content to a file.
 
@@ -2080,14 +2119,18 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.
         try:
-            _resolved = str(_resolve_path_for_task(path, task_id))
+            _resolved = str(_resolve_write_path_for_task(
+                path, task_id, follow_symlink=follow_symlink,
+            ))
         except Exception:
             _resolved = None
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(path, content)
+            result = file_ops.write_file(
+                path, content, follow_symlink=follow_symlink,
+            )
             result_dict = result.to_dict()
             if stale_warning:
                 result_dict["_warning"] = stale_warning
@@ -2108,7 +2151,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             # terminal's cwd (the worktree-cwd bug). Lowest priority of the three.
             cwd_warning = _path_resolution_warning(path, Path(_resolved), task_id)
             file_ops = _get_file_ops(task_id)
-            result = file_ops.write_file(_resolved, content)
+            result = file_ops.write_file(
+                _resolved, content, follow_symlink=follow_symlink,
+            )
             result_dict = result.to_dict()
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
@@ -2474,12 +2519,17 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. Refuses destination symlinks by default; set follow_symlink=true only for an intentional write through a symlink. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
     "parameters": {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)"},
             "content": {"type": "string", "description": "Complete content to write to the file"},
+            "follow_symlink": {
+                "type": "boolean",
+                "description": "Allow writing through a destination symlink. Defaults to false; when false, the write is rejected before mutation and the resolved target is reported.",
+                "default": False,
+            },
             "cross_profile": {
                 "type": "boolean",
                 "description": "Opt out of the cross-profile soft guard. Defaults to false. Set true ONLY after explicit user direction to edit another Hermes profile's skills/plugins/cron/memories — by default these writes are blocked with a warning because they affect a different profile than the one this session is running under.",
@@ -2589,6 +2639,7 @@ def _handle_write_file(args, **kw):
     return write_file_tool(
         path=args["path"], content=args["content"], task_id=tid,
         cross_profile=bool(args.get("cross_profile", False)),
+        follow_symlink=bool(args.get("follow_symlink", False)),
         session_id=kw.get("session_id"),
     )
 

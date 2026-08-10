@@ -28,6 +28,7 @@ Usage:
 import base64
 import binascii
 import os
+import posixpath
 import re
 import difflib
 import hashlib
@@ -58,6 +59,7 @@ WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+_SYMLINK_PROBE_MARKER = "__HERMES_SYMLINK__\n"
 
 
 def _strip_terminal_fence_leaks(text: str) -> str:
@@ -196,6 +198,8 @@ class WriteResult:
     lsp_diagnostics: Optional[str] = None
     error: Optional[str] = None
     warning: Optional[str] = None
+    resolved_target: Optional[str] = None
+    code: Optional[str] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -472,8 +476,15 @@ class FileOperations(ABC):
 
     @abstractmethod
     def write_file(self, path: str, content: str,
-                   pre_content: Optional[str] = None) -> WriteResult:
-        """Write content to a file, creating directories as needed."""
+                   pre_content: Optional[str] = None,
+                   *, follow_symlink: bool = True) -> WriteResult:
+        """Write content to a file, creating directories as needed.
+
+        Destination-symlink refusal (``follow_symlink=False``) is scoped to
+        ``write_file`` only; ``patch``/``move_file`` keep the default
+        write-through semantics, and ``terminal``/``execute_code`` ``open()``
+        are out-of-band.
+        """
         ...
 
     @abstractmethod
@@ -1533,8 +1544,50 @@ class ShellFileOperations(FileOperations):
     # WRITE Implementation
     # =========================================================================
 
+    def _probe_destination_symlink(
+        self, path: str,
+    ) -> tuple[str, Optional[str], Optional[str]]:
+        """Return ``(status, resolved_target, error)`` for a guest-side probe.
+
+        ``status`` is one of ``"none"`` (not a symlink), ``"symlink"``, or
+        ``"error"`` (transport failure or malformed probe output).
+        """
+        link_result = self._exec(
+            f"if [ -L {self._escape_shell_arg(path)} ]; then "
+            f"printf '__HERMES_SYMLINK__\\n'; "
+            f"readlink -f {self._escape_shell_arg(path)} 2>/dev/null "
+            f"|| realpath {self._escape_shell_arg(path)} 2>/dev/null; "
+            f"fi"
+        )
+        if link_result.exit_code != 0:
+            return (
+                "error",
+                None,
+                (
+                    f"Could not probe symlink status for '{path}': "
+                    f"probe command failed (exit {link_result.exit_code})."
+                ),
+            )
+        if not link_result.stdout.startswith(_SYMLINK_PROBE_MARKER):
+            return "none", None, None
+        raw_target = link_result.stdout[len(_SYMLINK_PROBE_MARKER):].rstrip("\r\n")
+        if not raw_target:
+            return (
+                "error",
+                None,
+                f"Symlink probe for '{path}' returned no resolved target.",
+            )
+        if posixpath.isabs(raw_target):
+            resolved_target = posixpath.normpath(raw_target)
+        else:
+            resolved_target = posixpath.normpath(
+                posixpath.join(posixpath.dirname(path), raw_target)
+            )
+        return "symlink", resolved_target, None
+
     def write_file(self, path: str, content: str,
-                   pre_content: Optional[str] = None) -> WriteResult:
+                   pre_content: Optional[str] = None,
+                   *, follow_symlink: bool = True) -> WriteResult:
         """
         Write content to a file, creating parent directories as needed.
 
@@ -1576,6 +1629,25 @@ class ShellFileOperations(FileOperations):
         """
         # Expand ~ and other shell paths
         path = self._expand_path(path)
+
+        probe_status, resolved_target, probe_error = self._probe_destination_symlink(path)
+        if probe_status == "error":
+            return WriteResult(error=probe_error)
+
+        if probe_status == "symlink":
+            if not follow_symlink:
+                return WriteResult(
+                    error=(
+                        f"Refusing to write through destination symlink '{path}' "
+                        f"(resolved target: '{resolved_target}'). The target was NOT "
+                        "modified. Set follow_symlink=true only if this is intentional."
+                    ),
+                    resolved_target=resolved_target,
+                    code="symlink_destination_refused",
+                )
+            denied = get_write_denied_error(resolved_target)
+            if denied:
+                return WriteResult(error=denied)
 
         # Block writes to sensitive paths
         denied = get_write_denied_error(path)

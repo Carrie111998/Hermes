@@ -16,6 +16,7 @@ from tools.file_operations import (
     SearchMatch,
     LintResult,
     ShellFileOperations,
+    ExecuteResult,
     MAX_LINE_LENGTH,
     normalize_read_pagination,
     normalize_search_pagination,
@@ -656,6 +657,259 @@ class TestAtomicWriteThroughSymlink:
         assert result.error is None, f"write failed: {result.error}"
         assert target.exists()
         assert target.read_text() == "data\n"
+
+
+class TestDestinationSymlinkRefusal:
+    """Destination symlinks are refused by default before any write primitive."""
+
+    def test_refuses_symlink_before_write_command(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        real = tmp_path / "real.txt"
+        link = tmp_path / "link.txt"
+        real.write_text("original\n")
+        link.symlink_to(real)
+
+        exec_calls = []
+        original_exec = ops._exec
+
+        def tracking_exec(cmd, **kwargs):
+            exec_calls.append(cmd)
+            return original_exec(cmd, **kwargs)
+
+        ops._exec = tracking_exec
+
+        result = ops.write_file(str(link), "new\n", follow_symlink=False)
+
+        assert result.code == "symlink_destination_refused"
+        assert result.resolved_target == str(real.resolve())
+        assert real.read_text() == "original\n"
+        assert link.is_symlink()
+        assert any("[ -L " in c and "__HERMES_SYMLINK__" in c for c in exec_calls)
+        assert "[ -L " in exec_calls[0]
+        assert not any("mktemp" in c for c in exec_calls)
+
+    def test_follow_symlink_true_writes_through_allowed_symlink(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        real = tmp_path / "real.txt"
+        link = tmp_path / "link.txt"
+        real.write_text("original\n")
+        link.symlink_to(real)
+
+        exec_calls = []
+        original_exec = ops._exec
+
+        def tracking_exec(cmd, **kwargs):
+            exec_calls.append(cmd)
+            return original_exec(cmd, **kwargs)
+
+        ops._exec = tracking_exec
+
+        result = ops.write_file(str(link), "new\n", follow_symlink=True)
+
+        assert result.error is None, result.error
+        assert real.read_text() == "new\n"
+        probe_idxs = [i for i, c in enumerate(exec_calls) if "[ -L " in c and "__HERMES_SYMLINK__" in c]
+        write_idxs = [i for i, c in enumerate(exec_calls) if "mktemp" in c]
+        assert probe_idxs, "symlink probe must run before write"
+        assert write_idxs, "write must proceed when target is allowed"
+        assert min(probe_idxs) < min(write_idxs)
+
+    def test_symlink_probe_runs_before_write_on_regular_file(self, tmp_path):
+        """Every write probes destination; regular files proceed to atomic write."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        dest = tmp_path / "plain.txt"
+        dest.write_text("old\n")
+
+        exec_calls = []
+        original_exec = ops._exec
+
+        def tracking_exec(cmd, **kwargs):
+            exec_calls.append(cmd)
+            return original_exec(cmd, **kwargs)
+
+        ops._exec = tracking_exec
+
+        result = ops.write_file(str(dest), "new\n", follow_symlink=True)
+
+        assert result.error is None, result.error
+        probe_idxs = [i for i, c in enumerate(exec_calls) if "[ -L " in c and "__HERMES_SYMLINK__" in c]
+        write_idxs = [i for i, c in enumerate(exec_calls) if "mktemp" in c]
+        assert probe_idxs, "destination probe must run first"
+        assert write_idxs, "expected atomic write command"
+        assert min(probe_idxs) < min(write_idxs)
+
+    def test_refusal_probe_precedes_write_when_both_would_run(self, tmp_path):
+        """Deterministic ordering: symlink probe index < write index (if any)."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        real = tmp_path / "real.txt"
+        link = tmp_path / "link.txt"
+        real.write_text("x\n")
+        link.symlink_to(real)
+
+        exec_calls = []
+        original_exec = ops._exec
+
+        def tracking_exec(cmd, **kwargs):
+            exec_calls.append(cmd)
+            return original_exec(cmd, **kwargs)
+
+        ops._exec = tracking_exec
+
+        ops.write_file(str(link), "y\n", follow_symlink=False)
+
+        probe_idxs = [i for i, c in enumerate(exec_calls) if "[ -L " in c and "__HERMES_SYMLINK__" in c]
+        write_idxs = [i for i, c in enumerate(exec_calls) if "mktemp" in c]
+        assert probe_idxs, "symlink probe must run"
+        assert not write_idxs, "write must not run after refusal"
+        assert max(probe_idxs) < (min(write_idxs) if write_idxs else len(exec_calls))
+
+    def test_multi_hop_symlink_resolved_target_is_canonical(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        real = tmp_path / "real.txt"
+        mid = tmp_path / "mid.lnk"
+        link = tmp_path / "link.txt"
+        real.write_text("x\n")
+        mid.symlink_to(real)
+        link.symlink_to(mid)
+
+        result = ops.write_file(str(link), "y\n", follow_symlink=False)
+
+        assert result.code == "symlink_destination_refused"
+        assert result.resolved_target == str(real.resolve())
+
+    def test_follow_symlink_true_denies_guest_resolved_sensitive_target(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        link = tmp_path / "link_to_etc"
+        link.symlink_to("/etc/passwd")
+
+        exec_calls = []
+        original_exec = ops._exec
+
+        def tracking_exec(cmd, **kwargs):
+            exec_calls.append(cmd)
+            return original_exec(cmd, **kwargs)
+
+        ops._exec = tracking_exec
+
+        result = ops.write_file(str(link), "evil\n", follow_symlink=True)
+
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+        assert not any("mktemp" in c for c in exec_calls)
+
+    def test_probe_transport_failure_returns_error(self, mock_env):
+        mock_env.execute.return_value = {"output": "", "returncode": 1}
+        ops = ShellFileOperations(mock_env)
+
+        result = ops.write_file("/tmp/link.txt", "data\n", follow_symlink=False)
+
+        assert result.error is not None
+        assert "probe" in result.error.lower()
+        mock_env.execute.assert_called_once()
+
+    def test_probe_malformed_output_returns_error(self, mock_env):
+        mock_env.execute.return_value = {
+            "output": "__HERMES_SYMLINK__\n",
+            "returncode": 0,
+        }
+        ops = ShellFileOperations(mock_env)
+
+        result = ops.write_file("/tmp/link.txt", "data\n", follow_symlink=False)
+
+        assert result.error is not None
+        assert "no resolved target" in result.error.lower()
+        assert mock_env.execute.call_count == 1
+
+
+class TestRemoteBackendSymlinkProbeContract:
+    """Stubbed _exec contract: probe ordering, refusal, and guest deny checks."""
+
+    def _stub_ops(self, side_effect):
+        env = MagicMock()
+        env.cwd = "/workspace"
+        ops = ShellFileOperations(env)
+        ops._exec = MagicMock(side_effect=side_effect)
+        return ops, ops._exec
+
+    def test_probe_command_is_first_exec(self):
+        calls = []
+
+        def side_effect(cmd, **kwargs):
+            calls.append(cmd)
+            if "[ -L " in cmd:
+                return ExecuteResult(stdout="", exit_code=0)
+            return ExecuteResult(stdout="", exit_code=0)
+
+        ops, mock_exec = self._stub_ops(side_effect)
+        ops.write_file("/workspace/out.txt", "data\n", follow_symlink=False)
+
+        assert mock_exec.call_count >= 1
+        assert "[ -L " in calls[0]
+        assert "__HERMES_SYMLINK__" in calls[0]
+        assert "readlink -f" in calls[0]
+
+    def test_symlink_refusal_issues_no_write_commands(self):
+        write_markers = ("mktemp", "trap ", "cat >")
+
+        def side_effect(cmd, **kwargs):
+            if "[ -L " in cmd:
+                return ExecuteResult(
+                    stdout="__HERMES_SYMLINK__\n/workspace/secret.txt\n",
+                    exit_code=0,
+                )
+            raise AssertionError(f"unexpected write command: {cmd!r}")
+
+        ops, mock_exec = self._stub_ops(side_effect)
+        result = ops.write_file("/workspace/link.txt", "evil\n", follow_symlink=False)
+
+        assert result.code == "symlink_destination_refused"
+        assert result.resolved_target == "/workspace/secret.txt"
+        assert mock_exec.call_count == 1
+        assert not any(m in mock_exec.call_args.args[0] for m in write_markers)
+
+    def test_resolved_target_parses_absolute_readlink_output(self):
+        def side_effect(cmd, **kwargs):
+            if "[ -L " in cmd:
+                return ExecuteResult(
+                    stdout="__HERMES_SYMLINK__\n/etc/passwd\n",
+                    exit_code=0,
+                )
+            raise AssertionError(f"unexpected command: {cmd!r}")
+
+        ops, _ = self._stub_ops(side_effect)
+        result = ops.write_file("/workspace/link", "x\n", follow_symlink=False)
+
+        assert result.resolved_target == "/etc/passwd"
+
+    def test_resolved_target_parses_relative_readlink_output(self):
+        def side_effect(cmd, **kwargs):
+            if "[ -L " in cmd:
+                return ExecuteResult(
+                    stdout="__HERMES_SYMLINK__\n../real.txt\n",
+                    exit_code=0,
+                )
+            raise AssertionError(f"unexpected command: {cmd!r}")
+
+        ops, _ = self._stub_ops(side_effect)
+        result = ops.write_file("/workspace/sub/link.txt", "x\n", follow_symlink=False)
+
+        assert result.resolved_target == "/workspace/real.txt"
+
+    def test_follow_symlink_denies_guest_resolved_etc_target(self):
+        def side_effect(cmd, **kwargs):
+            if "[ -L " in cmd:
+                return ExecuteResult(
+                    stdout="__HERMES_SYMLINK__\n/etc/passwd\n",
+                    exit_code=0,
+                )
+            raise AssertionError(f"write must not run after deny: {cmd!r}")
+
+        ops, mock_exec = self._stub_ops(side_effect)
+        result = ops.write_file("/workspace/link", "evil\n", follow_symlink=True)
+
+        assert result.error is not None
+        assert "denied" in result.error.lower()
+        assert mock_exec.call_count == 1
 
 
 class TestReadNonUtf8IsBinary:

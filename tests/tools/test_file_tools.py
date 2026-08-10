@@ -12,6 +12,7 @@ import pytest
 
 from tools.file_tools import (
     PATCH_SCHEMA,
+    WRITE_FILE_SCHEMA,
 )
 
 
@@ -54,7 +55,137 @@ class TestWriteFileHandler:
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/tmp/out.txt", "hello world!\n"))
         assert result["status"] == "ok"
-        mock_ops.write_file.assert_called_once_with("/tmp/out.txt", "hello world!\n")
+        mock_ops.write_file.assert_called_once_with(
+            "/tmp/out.txt", "hello world!\n", follow_symlink=False,
+        )
+
+    def test_schema_exposes_safe_symlink_override(self):
+        follow = WRITE_FILE_SCHEMA["parameters"]["properties"]["follow_symlink"]
+        assert follow["type"] == "boolean"
+        assert follow["default"] is False
+
+    def test_destination_symlink_refused_without_mutating_target(self, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        target = tmp_path / "canonical.txt"
+        target.write_bytes(b"ORIGINAL\n")
+        link = tmp_path / "alias.txt"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        result = json.loads(write_file_tool(
+            str(link), "REPLACEMENT\n", task_id="symlink_refusal",
+        ))
+
+        assert result["code"] == "symlink_destination_refused"
+        assert result["resolved_target"] == str(target)
+        assert target.read_bytes() == b"ORIGINAL\n"
+        assert link.is_symlink()
+
+    def test_explicit_follow_symlink_preserves_previous_behavior(self, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        target = tmp_path / "canonical.txt"
+        target.write_text("old\n")
+        link = tmp_path / "alias.txt"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        result = json.loads(write_file_tool(
+            str(link), "new\n", task_id="symlink_override", follow_symlink=True,
+        ))
+
+        assert "error" not in result
+        assert target.read_text() == "new\n"
+        assert link.is_symlink()
+
+    def test_parent_directory_symlink_remains_allowed(self, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        real_dir = tmp_path / "real"
+        real_dir.mkdir()
+        linked_dir = tmp_path / "linked"
+        try:
+            linked_dir.symlink_to(real_dir, target_is_directory=True)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        result = json.loads(write_file_tool(
+            str(linked_dir / "new.txt"), "content\n",
+            task_id="symlink_parent",
+        ))
+
+        assert "error" not in result
+        assert (real_dir / "new.txt").read_text() == "content\n"
+
+    def test_dangling_symlink_destination_refused(self, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        target = tmp_path / "nonexistent.txt"
+        link = tmp_path / "dangling.lnk"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        result = json.loads(write_file_tool(
+            str(link), "data\n", task_id="dangling_symlink",
+        ))
+
+        assert result["code"] == "symlink_destination_refused"
+        assert not target.exists()
+        assert link.is_symlink()
+
+    def test_symlink_to_sensitive_target_blocked_when_following(self, tmp_path, monkeypatch):
+        from tools.file_tools import write_file_tool
+
+        fake_config = tmp_path / "config.yaml"
+        fake_config.write_text("original\n")
+        link = tmp_path / "link.yaml"
+        try:
+            link.symlink_to(fake_config)
+        except OSError:
+            pytest.skip("Symlinks not supported")
+
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
+        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+
+        result = json.loads(write_file_tool(
+            str(link), "evil\n", follow_symlink=True,
+        ))
+
+        assert "error" in result
+        assert "Hermes config" in result["error"]
+        assert fake_config.read_text() == "original\n"
+
+    def test_write_regular_existing_and_new_paths(self, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        existing = tmp_path / "existing.txt"
+        existing.write_text("old\n")
+        new_file = tmp_path / "new.txt"
+
+        r1 = json.loads(write_file_tool(str(existing), "new content\n", task_id="happy_path"))
+        assert "error" not in r1
+        assert existing.read_text() == "new content\n"
+
+        r2 = json.loads(write_file_tool(str(new_file), "created\n", task_id="happy_path"))
+        assert "error" not in r2
+        assert new_file.read_text() == "created\n"
+
+    def test_overwrite_replaces_entire_file(self, tmp_path):
+        from tools.file_tools import write_file_tool
+
+        existing = tmp_path / "multi.txt"
+        existing.write_text("line1\nline2\nline3\n")
+
+        result = json.loads(write_file_tool(str(existing), "only\n", task_id="overwrite"))
+        assert "error" not in result
+        assert existing.read_text() == "only\n"
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):
