@@ -11014,6 +11014,8 @@ def _try_fast_chat_launch() -> bool:
 
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
+    if getattr(args, "oneshot", None):
+        _configure_oneshot_policy_if_needed(args)
     _prepare_agent_startup(args)
 
     if getattr(args, "oneshot", None):
