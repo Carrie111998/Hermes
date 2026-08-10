@@ -167,6 +167,7 @@ describe('Ran Mode state transaction', () => {
       showArchived: layout.$sidebarShowArchived.get(),
       statusFilter: layout.$sidebarStatusFilter.get()
     })
+
     const upstreamView = {
       filtersActive: true,
       grouping: 'project',
