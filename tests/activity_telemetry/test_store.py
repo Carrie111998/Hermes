@@ -180,6 +180,9 @@ def test_escalation_and_evidence_are_validated(tmp_path):
         "session:user:password@example.test",
         "note:key=value",
         "note:" + "x" * 500,
+        "token:" + "sk-" + "opaque-test-value",
+        "authorization:" + "Bearer" + "OpaqueTestValue",
+        "evidence:" + "header" + ".payload.signature",
     ),
 )
 def test_evidence_rejects_payloads_urls_and_credential_shaped_values(tmp_path, reference):

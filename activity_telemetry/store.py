@@ -87,7 +87,10 @@ _COUNTER_FIELDS = (
     "output_tokens",
     "reasoning_tokens",
 )
-_EVIDENCE_REF = re.compile(r"^[a-z][a-z0-9_-]{0,31}:[A-Za-z0-9][A-Za-z0-9._/-]{0,254}$")
+_EVIDENCE_REF = re.compile(
+    r"^(?:artifact|event|run|session|trace|validation):"
+    r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+)
 
 
 def utc_now() -> datetime:
