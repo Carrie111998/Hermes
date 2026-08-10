@@ -74,6 +74,15 @@
 
 **Próximo passo:** `hermes doctor --fix` ou skill `hermes-cron-audit`
 
+### 2026-08-10 — Limpeza credenciais + handoff
+
+| Passo | Resultado |
+|---|---|
+| Remover openrouter/gemini (4 scopes) | OK — `.env` + pool podados |
+| Consolidar Codex | OK — 1 entry `device_code`, importado `~/.codex/auth.json` |
+| `model.provider=openai-codex` | OK — config.yaml atualizado |
+| Handoff | OK — `RETOMADA_SESSAO.md` atualizado |
+
 ### 2026-08-10 — Fim de sessão
 
-Handoff: `registros/RETOMADA_SESSAO.md`. Usuário reiniciará sessão Cursor.
+Handoff completo em `registros/RETOMADA_SESSAO.md`. Continuar em nova janela Cursor.
