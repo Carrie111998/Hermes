@@ -384,6 +384,8 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    trigger_on_complete: bool = False
+    trigger_status: str = "ok"
 
 
 class CronJobUpdate(BaseModel):

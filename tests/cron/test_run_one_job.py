@@ -66,6 +66,68 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_failure_fires_error_dependents(monkeypatch):
+    """A job that raises still kicks reactive children with parent_success=False.
+
+    Regression for reactive chaining (#15831): the success path fires children
+    with ``parent_success=True``; a hard failure must fire them with
+    ``parent_success=False`` so ``trigger_status='error'`` / ``'any'`` alert
+    children actually run on upstream failure instead of silently never firing.
+    """
+    fired = []
+
+    def boom(job, *, defer_agent_teardown=None, **kw):
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr(s, "run_job", boom)
+    monkeypatch.setattr(s, "save_job_output", lambda jid, out: f"/tmp/{jid}.txt")
+    monkeypatch.setattr(s, "_deliver_result", lambda *a, **k: None)
+    monkeypatch.setattr(s, "mark_job_run", lambda *a, **k: None)
+    monkeypatch.setattr(
+        s, "_fire_dependent_jobs",
+        lambda jid, parent_success: fired.append((jid, parent_success)),
+    )
+
+    ok = s.run_one_job({"id": "j-fail", "name": "t"})
+
+    assert ok is False
+    assert fired == [("j-fail", False)]
+
+
+def test_run_one_job_success_fires_ok_dependents(monkeypatch):
+    """Successful jobs fire reactive children with parent_success=True."""
+    fired = []
+    calls = _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(
+        s, "_fire_dependent_jobs",
+        lambda jid, parent_success: fired.append((jid, parent_success)),
+    )
+
+    ok = s.run_one_job({"id": "j3", "name": "t"})
+
+    assert ok is True
+    assert fired == [("j3", True)]
+
+
+def test_blocked_config_silent_retry_does_not_refire_dependents(monkeypatch):
+    """The once-only blocked-config alert policy also gates reactive fan-out."""
+    fired = []
+    _patch_pipeline(
+        monkeypatch,
+        success=False,
+        error=f"{s.BLOCKED_CONFIG_SILENT_MARKER} still blocked",
+    )
+    monkeypatch.setattr(
+        s, "_fire_dependent_jobs",
+        lambda jid, parent_success: fired.append((jid, parent_success)),
+    )
+
+    ok = s.run_one_job({"id": "j-blocked", "name": "t"})
+
+    assert ok is True
+    assert fired == []
+
+
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
     """Regression: under profile isolation (multiplex active), run_one_job must
     execute run_job inside a profile secret scope so credential reads
