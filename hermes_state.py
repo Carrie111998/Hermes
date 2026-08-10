@@ -2500,7 +2500,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
-    _SQLITE_BUSY_TIMEOUT_MS = 5000
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
@@ -2636,7 +2635,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
-                    timeout=self._SQLITE_BUSY_TIMEOUT_MS / 1000.0,
+                    timeout=1.0,
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
@@ -2724,7 +2723,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self._conn.execute(f"PRAGMA busy_timeout={self._SQLITE_BUSY_TIMEOUT_MS}")
                 # WAL activation and schema reconciliation can write the DB
                 # header/schema.  They share the same cross-process ownership
                 # gate as normal transactions.
@@ -3346,7 +3344,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 new_conn.row_factory = sqlite3.Row
-                new_conn.execute(f"PRAGMA busy_timeout={self._SQLITE_BUSY_TIMEOUT_MS}")
                 # Publish BEFORE schema init: _init_schema/_reconcile_columns
                 # operate on self._conn, not on the local variable.
                 self._conn = new_conn
