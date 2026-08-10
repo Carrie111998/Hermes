@@ -12,15 +12,9 @@ Choose a descriptive environment name, such as `hermes-box-oauth`. Do not overwr
 
 ## Same-host interactive path
 
-First ask whether Hermes runs on the same computer as the browser the user will use to authorize Box. Use this path only when they confirm that it does. This is normally a local computer setup. Do not infer this from the operating system alone. If `box` is not already on `PATH`, install the CLI under the current Hermes home at `tools/box-cli`; use the shell-specific setup in [CLI guide](cli-guide.md). On macOS/Linux, run:
+First resolve the Box command runner using [CLI guide](cli-guide.md). Then ask whether Hermes runs on the same computer as the browser the user will use to authorize Box. Use this path only when they confirm that it does. This is normally a local computer setup. Do not infer this from the operating system alone. Use the resolved runner; do not reconstruct a local npm prefix unless Hermes installed and verified that exact local copy.
 
-```bash
-BOX_CLI_HOME="${HERMES_HOME:-$HOME/.hermes}/tools/box-cli"
-npm install --prefix "$BOX_CLI_HOME" @box/cli
-npm exec --prefix "$BOX_CLI_HOME" -- box --version
-```
-
-Use the same runner for every later Box command in this setup. Start one official local login operation without `--code`, leave its terminal process running until it exits, then verify the actor:
+Start one official local login operation without `--code`, leave its terminal process running until it exits, then verify the actor. The examples below use `box`; replace it only with the previously verified local runner when applicable:
 
 ```bash
 npm exec --prefix "$BOX_CLI_HOME" -- \
@@ -29,11 +23,11 @@ npm exec --prefix "$BOX_CLI_HOME" -- \
   box users:get me --json --fields id,name,login
 ```
 
-If `box` already resolves on `PATH`, run the same `box login` and `box users:get me` commands without the `npm exec` prefix. The browser flow creates and selects the named environment. Announce the pending authorization, wait for the CLI process to finish, then continue with the actor check. Let the CLI open the authorization page and receive the local callback. Do not use browser tools, inspect browser tabs, request the resulting URL, navigate to Box, or ask the user to paste a code.
+The browser flow creates and selects the named environment. Run the action through Hermes's terminal rather than asking the user to copy a runner command. Announce the pending authorization, wait for the CLI process to finish, then continue with the actor check. Let the CLI open the authorization page and receive the local callback. Do not use browser tools, inspect browser tabs, request the resulting URL, navigate to Box, or ask the user to paste a code.
 
 ## Separate-host or headless path
 
-Use this path only after the user explicitly confirms that Hermes runs on a remote host—such as a VPS, container, or cloud VM—or that it is headless and the authorization browser is on a different computer. Run:
+Use this path only after the user explicitly confirms that Hermes runs on a remote host—such as a VPS, container, or cloud VM—or that it is headless and the authorization browser is on a different computer. Use the same previously resolved runner and run:
 
 ```bash
 box login --default-box-app --code --name <ENVIRONMENT_NAME>
@@ -55,13 +49,13 @@ Request approval before switching the current environment, especially on a share
 
 ## Custom OAuth Platform App
 
-Use this path only when the requested operation needs a scope unavailable through the official CLI app, such as **Manage webhooks**. Create a Platform App with **User Authentication (OAuth 2.0)**, select only the required scope, and use the CLI's interactive flow:
+Use this path only when the requested operation needs a scope unavailable through the official CLI app, such as **Manage webhooks**. Create a Platform App with **User Authentication (OAuth 2.0)**, select only the required scope, and use the already-resolved CLI runner for the interactive flow:
 
 ```bash
 box login --platform-app --name <ENVIRONMENT_NAME>
 ```
 
-Let the local CLI prompt for the Client ID and Client Secret. Do not ask the user to paste either value into chat, write either value to Hermes configuration, or reuse a broader administrator identity for normal work. Authenticate the intended user in the browser, then verify the resulting actor. If the operation also requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the account Hermes normally uses.
+Let the local CLI prompt for the Client ID and Client Secret. Do not ask the user to paste either value into chat, write either value to Hermes configuration, or give the user an unverified local-runner command to copy. Authenticate the intended user in the browser, then verify the resulting actor. If the operation also requires an administrator, use a separately approved administrator OAuth session only for that operation; do not elevate the account Hermes normally uses.
 
 ## Official links
 

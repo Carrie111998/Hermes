@@ -4,7 +4,13 @@ Run Box commands through Hermes' `terminal` tool. Prefer the documented command 
 
 ## Use one command runner
 
-If `box` is on `PATH`, run the examples in this guide as written. If it is missing, install the CLI once under the current Hermes home at `tools/box-cli`. `HERMES_HOME` is optional: Hermes uses its platform default when it is unset (`~/.hermes` on macOS/Linux and `%LOCALAPPDATA%\hermes` on Windows). Choose the command for the current shell.
+Resolve one command runner before any Box operation:
+
+1. Check whether `box` already resolves in the runtime shell (`command -v box` on macOS/Linux or `Get-Command box` in PowerShell). If it does, use that command as-is, regardless of where Hermes or Box CLI was installed.
+2. If it does not resolve, install and verify an isolated CLI under a writable, persistent Hermes runtime directory. Prefer the current Hermes home at `tools/box-cli`; `HERMES_HOME` is optional, and Hermes uses its platform default when it is unset (`~/.hermes` on macOS/Linux and `%LOCALAPPDATA%\hermes` on Windows).
+3. If that directory is not writable, ask for a writable persistent directory in the runtime. Do not assume Hermes's source checkout, a global npm prefix, or a user home is writable. If a nonstandard existing CLI is not on `PATH`, ask for its executable path instead of scanning the machine.
+
+Only use `npm exec --prefix` after Hermes installed and verified that exact local copy. Never calculate a prefix and then give the user an unverified `npm exec --prefix` command to run.
 
 Require Node.js and npm in the runtime where Hermes executes commands. If they are unavailable or the filesystem is not writable, ask for the runtime-appropriate installation or writable Hermes home; do not assume a system package manager, a desktop, or elevated privileges.
 
@@ -12,17 +18,21 @@ On macOS/Linux:
 
 ```bash
 BOX_CLI_HOME="${HERMES_HOME:-$HOME/.hermes}/tools/box-cli"
+mkdir -p "$BOX_CLI_HOME"
 npm install --prefix "$BOX_CLI_HOME" @box/cli
+npm exec --prefix "$BOX_CLI_HOME" -- box --version
 ```
 
 On Windows PowerShell:
 
 ```powershell
 $boxCliHome = Join-Path $(if ($env:HERMES_HOME) { $env:HERMES_HOME } else { Join-Path $env:LOCALAPPDATA "hermes" }) "tools\box-cli"
+New-Item -ItemType Directory -Force -Path $boxCliHome | Out-Null
 npm install --prefix $boxCliHome @box/cli
+npm exec --prefix $boxCliHome -- box --version
 ```
 
-Keep the resolved directory for the whole task. Then run every example by replacing its leading `box` with the runner for the current shell.
+Keep the resolved runner for the whole task. When Hermes installed the local copy, replace the leading `box` in every example with the applicable `npm exec --prefix` runner below. Otherwise run the examples with the already-resolved `box` command.
 
 On macOS/Linux:
 
