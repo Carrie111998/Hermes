@@ -41,7 +41,8 @@
   - Deployment record merged to main as
     `5fb3d5cd1ee8358570e86d9fbce95e8e73dd584b`.
 - **Active:** `CI-BASELINE-001` is implemented and pushed as `d20c48132`;
-  GitHub Actions, draft PR review, merge, and deployment gates remain.
+  draft PR [#3](https://github.com/cwliao/hermes-agent/pull/3) is open; GitHub
+  Actions, review, merge, and deployment gates remain.
 - **Deferred / not goals:** No DGX deploy or service restart for CI-BASELINE-001
   before remote CI and merge gates pass. Do not reset or edit Claude-owned
   dirty/diverged worktrees.
@@ -59,8 +60,8 @@
   - Ruff, compileall, and `git diff --check`: passed.
 - **Health:** Last DGX read-only check showed `hermes-gateway.service`
   `active/running` and no error entries in the checked recent journal window.
-  GitHub main had no open PRs at the last repository health check; the two
-  prior main CI runs were red before CI-BASELINE-001 implementation.
+  Draft PR #3 is the active repository review object; the two prior main CI
+  runs were red before CI-BASELINE-001 implementation.
 - **UI/runtime smoke:** No new UI smoke was run for CI-BASELINE-001. The DGX
   gateway process remains the existing runtime evidence boundary.
 - **Data/storage safety:** No DGX `.hermes` storage mutation was performed for
@@ -76,7 +77,7 @@
 ## 4. Next ticket
 
 - **Ticket:** `CI-BASELINE-001 - Restore the blocking Python CI baseline`
-- **Status:** `IMPLEMENTED_PENDING_CI` on pushed branch `d20c48132`.
+- **Status:** `IMPLEMENTED_PENDING_CI` on pushed branch `d20c48132`, draft PR #3.
 - **Scope:** `agent/codex_responses_adapter.py`, `gateway/run.py`,
   `hermes_cli/main.py`, affected tests, and the ticket/roadmap documents.
 - **Dependencies:** Clean Hermes `main`; preserve ARCH-001 runtime-state
