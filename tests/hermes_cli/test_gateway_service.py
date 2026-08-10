@@ -1649,6 +1649,21 @@ class TestServiceWorkingDirIsStable:
         assert Path(m.group(1)).resolve() == home.resolve()
         assert "/.worktrees/" not in m.group(1)
 
+    def test_launchd_plist_reserves_fd_headroom_for_long_lived_gateway(
+        self, tmp_path, monkeypatch
+    ):
+        """macOS's 256-FD launchd default is insufficient for gateway SQLite/socket use."""
+        import plistlib
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: home)
+
+        plist = plistlib.loads(gateway_cli.generate_launchd_plist().encode("utf-8"))
+
+        assert plist["SoftResourceLimits"]["NumberOfFiles"] == 4096
+        assert plist["HardResourceLimits"]["NumberOfFiles"] == 8192
+
 
 class TestLaunchctlBootstrapEioRetry:
     """`_launchctl_bootstrap` must recover from a stale already-loaded label.
