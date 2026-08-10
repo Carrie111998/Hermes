@@ -7934,8 +7934,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents_ts[_quick_key] = time.time()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        from agent.turn_attachments import begin_turn, end_turn, snapshot
+        _turn_attachment_token = begin_turn()
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            if _agent_result is not None and self._is_session_run_current(_quick_key, _run_generation):
+                _final_reply_metadata = snapshot()
+                if _final_reply_metadata:
+                    if not isinstance(getattr(event, "metadata", None), dict):
+                        event.metadata = {}
+                    event.metadata["_hermes_final_reply_metadata"] = _final_reply_metadata
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -7966,6 +7974,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            end_turn(_turn_attachment_token)
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which

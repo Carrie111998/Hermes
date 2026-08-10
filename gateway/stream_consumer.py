@@ -218,6 +218,8 @@ class GatewayStreamConsumer:
         if expect_edits:
             meta["expect_edits"] = True
         if final:
+            from agent.turn_attachments import snapshot as _turn_attachment_snapshot
+            meta.update(_turn_attachment_snapshot())
             meta["notify"] = True
         return meta or None
 
@@ -248,6 +250,7 @@ class GatewayStreamConsumer:
         message_id: str,
         content: str,
         finalize: bool = False,
+        metadata: Optional[dict] = None,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
         kwargs = {
@@ -259,14 +262,15 @@ class GatewayStreamConsumer:
         # must accept finalize= even when it is False (guarded by tests).
         kwargs["finalize"] = finalize
 
-        if self.metadata:
+        send_metadata = self.metadata if metadata is None else metadata
+        if send_metadata:
             try:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = send_metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -536,7 +540,7 @@ class GatewayStreamConsumer:
                         )
                         chunks_delivered = False
                         reply_to = self._message_id or self._initial_reply_to_id
-                        for chunk in chunks:
+                        for chunk_index, chunk in enumerate(chunks):
                             new_id = await self._send_new_chunk(
                                 chunk,
                                 reply_to,
@@ -885,6 +889,7 @@ class GatewayStreamConsumer:
                         result = await self._edit_message(
                             message_id=self._message_id,
                             content=clean_text,
+                            metadata=self._metadata_for_send(final=True),
                         )
                         if result.success:
                             self._last_sent_text = clean_text
@@ -915,7 +920,7 @@ class GatewayStreamConsumer:
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=self._metadata_for_send(final=chunk_index == len(chunks) - 1),
                 )
                 if result.success:
                     break
@@ -1397,8 +1402,10 @@ class GatewayStreamConsumer:
                     # finalize=True edit even when content is unchanged, so
                     # their streaming UI can transition out of the in-
                     # progress state.  Everyone else short-circuits.
+                    from agent.turn_attachments import snapshot as _turn_attachment_snapshot
+                    _has_final_attachments = bool(_turn_attachment_snapshot()) if finalize and is_turn_final else False
                     if text == self._last_sent_text and not (
-                        finalize and self._adapter_requires_finalize
+                        finalize and (self._adapter_requires_finalize or _has_final_attachments)
                     ):
                         return True
                     # Fresh-final for long-lived previews: when finalizing
@@ -1434,6 +1441,8 @@ class GatewayStreamConsumer:
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        metadata=(self._metadata_for_send(final=True)
+                                  if finalize and is_turn_final else self.metadata),
                     )
                     if result.success:
                         self._already_sent = True

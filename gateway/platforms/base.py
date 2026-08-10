@@ -77,6 +77,17 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     return metadata
 
 
+def _merge_final_reply_metadata(metadata: dict | None, event) -> dict | None:
+    """Merge host-owned, event-local attachments into final sends only."""
+    event_metadata = getattr(event, "metadata", None)
+    extra = event_metadata.get("_hermes_final_reply_metadata") if isinstance(event_metadata, dict) else None
+    if not isinstance(extra, dict) or not extra:
+        return metadata
+    merged = dict(metadata or {})
+    merged.update(extra)
+    return merged
+
+
 def _mark_notify_metadata(metadata: dict | None) -> dict:
     """Clone metadata and mark a user-visible reply as notify-worthy."""
     notify_metadata = dict(metadata) if metadata else {}
@@ -4279,7 +4290,8 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                _final_thread_metadata = _merge_final_reply_metadata(_thread_metadata, event)
+                _final_thread_metadata = _mark_notify_metadata(_final_thread_metadata)
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

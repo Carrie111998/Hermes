@@ -357,6 +357,15 @@ class PluginContext:
             self.manifest.name, name, " (override)" if override else "",
         )
 
+    def attach_final_reply_link_buttons(self, buttons: list[dict]) -> bool:
+        """Attach trusted link buttons to the current gateway turn's final reply.
+
+        This host capability is deliberately absent from the model tool schema.
+        Calls outside an active gateway turn are ignored.
+        """
+        from agent.turn_attachments import attach_final_reply_link_buttons
+        return attach_final_reply_link_buttons(buttons)
+
     # -- message injection --------------------------------------------------
 
     def inject_message(self, content: str, role: str = "user") -> bool:
