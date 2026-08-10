@@ -189,6 +189,7 @@ def _redact_monitor_text(text: object) -> str:
             str(text),
             force=True,
             redact_url_credentials=True,
+            extra_sensitive_url_params=frozenset({"session_id"}),
         )
     except Exception as exc:
         logger.warning("Monitor: failed to redact source data: %s", exc)
