@@ -2504,6 +2504,10 @@ def run_doctor(args):
                                        b=_base_env, s=_supports:
                                 _probe_apikey_provider(p, e, u, b, s)))
 
+    from hermes_cli.config import get_env_value
+
+    _github_token = get_env_value("GITHUB_TOKEN") or get_env_value("GH_TOKEN")
+    _github_validation_future = None
     _probes.append(("AWS Bedrock", _probe_bedrock))
     _probes.append(("Azure Foundry (Entra ID)", _probe_azure_entra))
 
@@ -2529,6 +2533,10 @@ def run_doctor(args):
         # noisy output if anything ever printed from inside a worker.
         with _futures.ThreadPoolExecutor(max_workers=8,
                                          thread_name_prefix="doctor-probe") as _ex:
+            if _github_token:
+                _github_validation_future = _ex.submit(
+                    _validate_github_token, _github_token
+                )
             _futures_in_order = [_ex.submit(_fn) for _, _fn in _probes]
             _results = [_f.result() for _f in _futures_in_order]
     finally:
@@ -2601,8 +2609,6 @@ def run_doctor(args):
     else:
         check_warn("Skills Hub directory not initialized", "(run: hermes skills list)")
 
-    from hermes_cli.config import get_env_value
-
     def _gh_authenticated() -> bool:
         """Check if gh CLI is authenticated via token file or device flow."""
         try:
@@ -2614,9 +2620,8 @@ def run_doctor(args):
         except (FileNotFoundError, subprocess.TimeoutExpired):
             return False
 
-    github_token = get_env_value("GITHUB_TOKEN") or get_env_value("GH_TOKEN")
-    if github_token:
-        github_token_status = _validate_github_token(github_token)
+    if _github_token:
+        github_token_status = _github_validation_future.result()
         if github_token_status == "valid":
             check_ok("GitHub token configured (authenticated API access)", "(validated)")
         elif github_token_status == "invalid":

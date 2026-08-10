@@ -5,6 +5,7 @@ import sys
 import types
 import io
 import contextlib
+import concurrent.futures
 import urllib.error
 from argparse import Namespace
 from types import SimpleNamespace
@@ -871,6 +872,36 @@ class TestGitHubTokenCheck:
         assert validated == ["github-token"]
         assert "GitHub token configured (authenticated API access)" in buf.getvalue()
         assert "(validated)" in buf.getvalue()
+
+    def test_run_doctor_submits_github_validation_to_connectivity_executor(self, monkeypatch, tmp_path):
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        self._isolate_home(monkeypatch, home)
+        monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+        submitted = []
+        monkeypatch.setattr(doctor, "_validate_github_token", lambda token: "valid")
+
+        class RecordingExecutor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+                return SimpleNamespace(result=lambda: fn(*args))
+
+        monkeypatch.setattr(concurrent.futures, "ThreadPoolExecutor", RecordingExecutor)
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            doctor.run_doctor(Namespace(fix=False))
+
+        assert any(fn is doctor._validate_github_token for fn, args in submitted)
+        assert any(args == ("github-token",) for fn, args in submitted)
 
     def test_run_doctor_reports_unavailable_token_validation(self, monkeypatch, tmp_path):
         home = tmp_path / ".hermes"
