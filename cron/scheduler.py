@@ -3483,7 +3483,13 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        _VAR_MAP,
+        bind_scheduler_service_origin,
+        clear_scheduler_service_origin,
+        clear_session_vars,
+        set_session_vars,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3589,6 +3595,7 @@ def run_job(
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
     _cron_session_token = None
+    _service_origin_token = None
     _non_dispatcher_token = None
     try:
         if not _cwd_lock_acquired:
@@ -3612,6 +3619,18 @@ def run_job(
         # which would suppress the legacy os.environ fallback used by standalone
         # cron entrypoints and tests.
         _cron_session_token = _cron_session_var.set("1")
+        # This is the sole writer of autonomous service authority.  It is
+        # task-local, freshly randomized per execution, and intentionally
+        # separate from stored delivery origin (which is not a human sender).
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            _service_profile_ref = get_active_profile_name()
+        except Exception:
+            _service_profile_ref = "default"
+        _service_origin_token = bind_scheduler_service_origin(
+            str(job_id), _service_profile_ref
+        )
 
         # Mark this job as NOT the dispatcher-owned kanban worker.
         #
@@ -4402,6 +4421,8 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
+        if _service_origin_token is not None:
+            clear_scheduler_service_origin(_service_origin_token)
         if _non_dispatcher_token is not None:
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:

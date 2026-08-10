@@ -2164,7 +2164,15 @@ def _is_verification_artifact_cleanup(command: str) -> bool:
     operand = argv[2]
     temp_dir = os.path.realpath(tempfile.gettempdir())
     basename = os.path.basename(operand)
-    if operand != os.path.join(temp_dir, basename):
+    allowed_literal_dirs = {temp_dir}
+    # macOS exposes /tmp as the stable public spelling of its canonical
+    # /private/tmp directory. Accept that single OS alias without broadly
+    # trusting arbitrary symlinked temp directories (which could be swapped).
+    if sys.platform == "darwin" and temp_dir == "/private/tmp":
+        allowed_literal_dirs.add("/tmp")
+    if operand not in {
+        os.path.join(literal_dir, basename) for literal_dir in allowed_literal_dirs
+    }:
         return False
 
     target = os.path.realpath(operand)
@@ -3638,7 +3646,8 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                             *, surface: str = "gateway",
-                            timeout_seconds: int | None = None) -> dict:
+                            timeout_seconds: int | None = None,
+                            human_wait_session_key: str | None = None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -3719,7 +3728,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     # tapping approve/deny on the gateway surface), bounded by the approval
     # timeout. Record it as human-wait time so the concurrent batch deadline
     # excludes it (#79719).
-    with human_wait_window(session_key):
+    wait_owner = session_key if human_wait_session_key is None else human_wait_session_key
+    with human_wait_window(wait_owner):
         while True:
             # Respect interrupt signals (e.g. /stop, /new, or an inactivity
             # timeout from the gateway) so a pending approval doesn't keep the
@@ -4503,6 +4513,64 @@ def check_execute_code_guard(code: str, env_type: str,
 # One-shot action approval and MCP elicitation entry points
 # =========================================================================
 
+def _service_action_approval_notify(
+    profile_ref: str,
+    destination: dict[str, str],
+    session_key: str,
+):
+    """Build a sync notifier over the live, profile-scoped gateway adapter."""
+    try:
+        from agent.async_utils import safe_schedule_threadsafe
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+        from hermes_cli.profiles import get_active_profile_name
+
+        runner = _gateway_runner_ref()
+        if runner is None:
+            return None
+        platform = Platform(destination["platform"])
+        active_profile = get_active_profile_name()
+        if profile_ref == active_profile:
+            adapters = getattr(runner, "adapters", {})
+        else:
+            adapters = getattr(runner, "_profile_adapters", {}).get(profile_ref, {})
+        adapter = adapters.get(platform) if isinstance(adapters, dict) else None
+        loop = getattr(runner, "_gateway_loop", None)
+        if (
+            adapter is None
+            or loop is None
+            or getattr(type(adapter), "send_action_approval", None) is None
+        ):
+            return None
+    except Exception:
+        return None
+
+    def notify(approval_data: dict) -> None:
+        future = safe_schedule_threadsafe(
+            adapter.send_action_approval(
+                chat_id=destination["channel_id"],
+                session_key=session_key,
+                approval_id=approval_data.get("approval_id", ""),
+                title=approval_data.get("action_title", "Approve action"),
+                summary=approval_data.get("action_summary", "Review this action."),
+                facts=approval_data.get("action_facts", []),
+                approve_label=approval_data.get("approve_label", "Approve"),
+                decline_label=approval_data.get("decline_label", "Decline"),
+                metadata=None,
+            ),
+            loop,
+            logger=logger,
+            log_message="background send_action_approval scheduling error",
+        )
+        if future is None:
+            raise RuntimeError("gateway loop unavailable")
+        result = future.result(timeout=15)
+        if not getattr(result, "success", False):
+            raise RuntimeError(getattr(result, "error", "approval delivery failed"))
+
+    return notify
+
+
 def request_action_approval(
     title: str,
     summary: str,
@@ -4512,6 +4580,7 @@ def request_action_approval(
     decline_label: str = "Decline",
     timeout_seconds: int | None = None,
     surface: str = "action-approval",
+    destination: Optional[dict[str, str]] = None,
 ) -> dict:
     """Request one exact, non-persistent human decision.
 
@@ -4546,6 +4615,17 @@ def request_action_approval(
             raise ValueError("action approval decline label is invalid")
         clean_facts = [item.strip() for item in clean_facts]
         session_key = get_current_session_key()
+        clean_destination = None
+        if destination is not None:
+            if not isinstance(destination, dict) or set(destination) != {
+                "platform", "channel_id"
+            }:
+                raise ValueError("action approval destination has an unknown shape")
+            platform = str(destination.get("platform") or "").strip().lower()
+            channel_id = str(destination.get("channel_id") or "").strip()
+            if not platform or len(platform) > 40 or not channel_id or len(channel_id) > 160:
+                raise ValueError("action approval destination is invalid")
+            clean_destination = {"platform": platform, "channel_id": channel_id}
     except Exception as exc:
         logger.warning("Action approval prompt rejected: %s", exc)
         return {"decision": "decline", "context": None}
@@ -4557,6 +4637,62 @@ def request_action_approval(
         logger.warning("Action approval prompt rejected: rendered prompt is too long")
         return {"decision": "decline", "context": None}
 
+    approval_data = {
+        "approval_kind": "action",
+        "approval_id": secrets.token_urlsafe(24),
+        "command": display,
+        "description": clean_title,
+        "pattern_key": "one_shot_action",
+        "pattern_keys": ["one_shot_action"],
+        "action_title": clean_title,
+        "action_summary": clean_summary,
+        "action_facts": clean_facts,
+        "approve_label": clean_approve,
+        "decline_label": clean_decline,
+        "allow_permanent": False,
+        "allow_session": False,
+    }
+
+    # Background action cards are permitted only inside a core-created
+    # scheduler service context. The destination is supplied by a trusted
+    # plugin's profile configuration, never borrowed from stored cron origin.
+    if clean_destination is not None:
+        try:
+            from gateway.session_context import get_scheduler_service_origin
+
+            origin = get_scheduler_service_origin()
+            if not isinstance(origin, dict):
+                raise RuntimeError("no trusted scheduler service origin")
+            profile_ref = str(origin.get("profile_ref") or "")
+            if not profile_ref or origin.get("runtime_attested") is not True:
+                raise RuntimeError("invalid scheduler service origin")
+            owner_session_key = session_key
+            session_key = "service-action:" + secrets.token_urlsafe(24)
+            notify_cb = _service_action_approval_notify(
+                profile_ref, clean_destination, session_key
+            )
+            if notify_cb is None:
+                raise RuntimeError("no live profile approval route")
+            decision = _await_gateway_decision(
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                timeout_seconds=timeout_seconds,
+                human_wait_session_key=owner_session_key,
+            )
+        except Exception as exc:
+            logger.error("Background action approval dispatch failed: %s", exc, exc_info=True)
+            return {"decision": "decline", "context": None}
+        if decision.get("notify_failed"):
+            return {"decision": "decline", "context": None}
+        if not decision.get("resolved"):
+            return {"decision": "timeout", "context": None}
+        return {
+            "decision": "approve" if decision.get("choice") == "once" else "decline",
+            "context": decision.get("context"),
+        }
+
     if _is_gateway_approval_context():
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
@@ -4566,21 +4702,6 @@ def request_action_approval(
                 session_key,
             )
             return {"decision": "decline", "context": None}
-        approval_data = {
-            "approval_kind": "action",
-            "approval_id": secrets.token_urlsafe(24),
-            "command": display,
-            "description": clean_title,
-            "pattern_key": "one_shot_action",
-            "pattern_keys": ["one_shot_action"],
-            "action_title": clean_title,
-            "action_summary": clean_summary,
-            "action_facts": clean_facts,
-            "approve_label": clean_approve,
-            "decline_label": clean_decline,
-            "allow_permanent": False,
-            "allow_session": False,
-        }
         try:
             decision = _await_gateway_decision(
                 session_key,

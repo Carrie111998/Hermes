@@ -434,6 +434,32 @@ class PluginContext:
         except Exception:
             return "default"
 
+    @property
+    def settings(self) -> dict[str, Any]:
+        """Return this plugin's profile-local, non-secret settings.
+
+        Plugins read only ``plugins.entries.<plugin_id>.settings`` from the
+        active profile's ``config.yaml``.  Returning a deep copy prevents a
+        plugin from mutating Hermes's cached configuration in place.  Secrets
+        remain outside this surface and continue to come from the secret
+        loader/environment boundary.
+        """
+        import copy
+
+        try:
+            from hermes_cli.config import load_config
+
+            cfg = load_config() or {}
+            plugin_id = self.manifest.key or self.manifest.name
+            entries = (cfg.get("plugins") or {}).get("entries") or {}
+            entry = entries.get(plugin_id) or {}
+            settings = entry.get("settings") or {}
+            if not isinstance(settings, dict):
+                return {}
+            return copy.deepcopy(settings)
+        except Exception:
+            return {}
+
     # -- tool registration --------------------------------------------------
 
     def register_tool(

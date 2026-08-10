@@ -171,6 +171,91 @@ class TestOneShotActionApproval:
         rendered = capsys.readouterr().out.lower()
         assert "[s]ession" not in rendered
 
+    def test_scheduler_action_routes_to_explicit_profile_destination(self, monkeypatch):
+        from gateway.session_context import (
+            bind_scheduler_service_origin,
+            clear_scheduler_service_origin,
+            clear_session_vars,
+            reset_session_vars,
+            set_session_vars,
+        )
+
+        owner_session_key = "cron-owner-session-123"
+        session_tokens = set_session_vars(
+            cron_session="1", session_key=owner_session_key,
+        )
+        service_token = bind_scheduler_service_origin("job-123", "cadence")
+        observed, resolvers = [], []
+
+        def route(profile_ref, destination, session_key):
+            assert profile_ref == "cadence"
+            assert destination == {"platform": "slack", "channel_id": "C_REVIEW"}
+
+            def notify(data):
+                observed.append((session_key, data))
+                def resolve():
+                    time.sleep(0.03)
+                    approval_module.resolve_gateway_approval(
+                        session_key,
+                        "once",
+                        decision_context={
+                            "platform": "slack", "user_id": "U_OPERATOR",
+                            "channel_id": "C_REVIEW", "observed_at": 123,
+                        },
+                        approval_id=data["approval_id"],
+                    )
+
+                thread = threading.Thread(target=resolve)
+                thread.start()
+                resolvers.append(thread)
+
+            return notify
+
+        monkeypatch.setattr(approval_module, "_service_action_approval_notify", route)
+        try:
+            result = request_action_approval(
+                "Cadence proposes a bounded action",
+                "*Proposal context*\nEvidence\n\n*AB4 exact action*\nExact plan",
+                destination={"platform": "slack", "channel_id": "C_REVIEW"},
+                timeout_seconds=2,
+            )
+        finally:
+            for thread in resolvers:
+                thread.join(timeout=1)
+            clear_scheduler_service_origin(service_token)
+            clear_session_vars(session_tokens)
+            reset_session_vars()
+
+        assert result == {
+            "decision": "approve",
+            "context": {
+                "platform": "slack", "user_id": "U_OPERATOR",
+                "channel_id": "C_REVIEW", "observed_at": 123,
+            },
+        }
+        assert observed[0][1]["allow_session"] is False
+        assert observed[0][1]["allow_permanent"] is False
+        approval_session_key = observed[0][0]
+        assert approval_session_key.startswith("service-action:")
+        assert approval_session_key != owner_session_key
+        assert approval_module.human_wait_seconds(owner_session_key) > 0
+        assert approval_module.human_wait_seconds(approval_session_key) == 0
+
+    def test_destination_without_core_scheduler_origin_fails_before_route(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        called = []
+        monkeypatch.setattr(
+            approval_module,
+            "_service_action_approval_notify",
+            lambda *_args: called.append(True),
+        )
+        assert request_action_approval(
+            "Cadence proposes a bounded action",
+            "Exact combined plan",
+            destination={"platform": "slack", "channel_id": "C_REVIEW"},
+        ) == {"decision": "decline", "context": None}
+        assert called == []
+
 
 class TestSmartApproval:
     def test_smart_approval_uses_call_llm(self):
