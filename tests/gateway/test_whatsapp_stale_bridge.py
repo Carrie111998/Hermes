@@ -17,12 +17,13 @@ package.json changes, not only when node_modules is missing.
 """
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
 
 
 class _AsyncCM:
@@ -85,8 +86,16 @@ def _setup_bridge_dir(tmp_path: Path) -> Path:
     bridge_dir = tmp_path / "whatsapp-bridge"
     bridge_dir.mkdir()
     (bridge_dir / "bridge.js").write_text("// current bridge code\n")
+    (bridge_dir / "allowlist.js").write_text("// current allowlist code\n")
+    (bridge_dir / "bridge_helpers.js").write_text("// current helper code\n")
     (bridge_dir / "message_consumers.js").write_text("// current queue code\n")
+    (bridge_dir / "outbound_ids.js").write_text("// current outbound code\n")
+    (bridge_dir / "owner_message_gate.js").write_text("// current owner gate code\n")
     (bridge_dir / "reaction.js").write_text("// current reaction code\n")
+    (bridge_dir / "runtime-files.json").write_text(
+        '["bridge.js","allowlist.js","bridge_helpers.js","message_consumers.js",'
+        '"outbound_ids.js","owner_message_gate.js","reaction.js"]'
+    )
     (bridge_dir / "package.json").write_text('{"name": "bridge"}\n')
     session_path = tmp_path / "session"
     session_path.mkdir()
@@ -120,27 +129,34 @@ class TestFileContentHash:
 
         bridge_dir = _setup_bridge_dir(tmp_path)
         before = _bridge_runtime_hash(bridge_dir / "bridge.js")
-        (bridge_dir / "reaction.js").write_text("// changed reaction code\n")
+        (bridge_dir / "bridge_helpers.js").write_text("// changed helper code\n")
         assert _bridge_runtime_hash(bridge_dir / "bridge.js") != before
 
 
 class TestStaleBridgeHandshake:
 
     @pytest.mark.asyncio
-    async def test_restarts_bridge_when_consumer_routes_changed(self, tmp_path):
+    async def test_restarts_bridge_when_consumer_routes_changed(self, tmp_path, monkeypatch):
         from plugins.platforms.whatsapp.adapter import _bridge_runtime_hash
+        from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
 
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
-        adapter = _make_adapter(
-            bridge_script=str(bridge_dir / "bridge.js"),
-            session_path=tmp_path / "session",
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+        routes = [
+            {"consumer": "openjaw", "prefix": "/openjaw", "chat_ids": ["owner@lid"]}
+        ]
+        adapter = WhatsAppAdapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "bridge_script": str(bridge_dir / "bridge.js"),
+                    "bridge_port": 19876,
+                    "session_path": str(tmp_path / "session"),
+                    "consumer_routes": routes,
+                },
+            )
         )
-        adapter.config.extra = {
-            "consumer_routes": [
-                {"consumer": "openjaw", "prefix": "/openjaw", "chat_ids": ["owner@lid"]}
-            ]
-        }
         mock_client = _mock_health(
             {
                 "status": "connected",
@@ -163,7 +179,9 @@ class TestStaleBridgeHandshake:
             await adapter.connect()
 
         mock_popen.assert_called_once()
-        assert mock_popen.call_args.kwargs["env"]["WHATSAPP_CONSUMER_ROUTES_JSON"].startswith("[")
+        assert json.loads(
+            mock_popen.call_args.kwargs["env"]["WHATSAPP_CONSUMER_ROUTES_JSON"]
+        ) == routes
 
 
     @pytest.mark.asyncio

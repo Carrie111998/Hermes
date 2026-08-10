@@ -1,0 +1,9 @@
+[
+  "bridge.js",
+  "allowlist.js",
+  "bridge_helpers.js",
+  "message_consumers.js",
+  "outbound_ids.js",
+  "owner_message_gate.js",
+  "reaction.js"
+]

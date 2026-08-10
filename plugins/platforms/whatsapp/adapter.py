@@ -362,11 +362,18 @@ def _bridge_runtime_hash(bridge_path: Path) -> str:
 
     digest = hashlib.sha256()
     try:
-        for filename in ("bridge.js", "message_consumers.js", "reaction.js"):
+        runtime_files = json.loads(
+            (bridge_path.parent / "runtime-files.json").read_text(encoding="utf-8")
+        )
+        if not isinstance(runtime_files, list) or not all(
+            isinstance(filename, str) and filename for filename in runtime_files
+        ):
+            return ""
+        for filename in runtime_files:
             digest.update(filename.encode("utf-8"))
             digest.update(b"\0")
             digest.update((bridge_path.parent / filename).read_bytes())
-    except OSError:
+    except (OSError, ValueError):
         return ""
     return digest.hexdigest()[:16]
 

@@ -116,7 +116,10 @@ try {
   const bridgeFile = fileURLToPath(import.meta.url);
   SCRIPT_HASH = createHash('sha256').update(readFileSync(bridgeFile)).digest('hex').slice(0, 16);
   const runtimeHasher = createHash('sha256');
-  for (const fileName of ['bridge.js', 'message_consumers.js', 'reaction.js']) {
+  const runtimeFiles = JSON.parse(
+    readFileSync(path.join(path.dirname(bridgeFile), 'runtime-files.json'), 'utf8'),
+  );
+  for (const fileName of runtimeFiles) {
     runtimeHasher.update(fileName).update('\0').update(readFileSync(path.join(path.dirname(bridgeFile), fileName)));
   }
   RUNTIME_HASH = runtimeHasher.digest('hex').slice(0, 16);
