@@ -206,3 +206,11 @@ class PtySessionRegistry:
     async def close_all(self) -> None:
         for key in list(self._sessions):
             await self._sessions.pop(key).close()
+        # Capacity evictions are removed from ``_sessions`` before their
+        # close is scheduled, so the loop above cannot reach one that is
+        # still in flight. Drain them here too, or shutdown returns while a
+        # PTY child is still unjoined. ``return_exceptions=True`` keeps one
+        # failing bridge from aborting the rest of the drain, matching the
+        # swallow-and-continue posture ``PtySession.close()`` already takes.
+        if self._closing:
+            await asyncio.gather(*list(self._closing), return_exceptions=True)
