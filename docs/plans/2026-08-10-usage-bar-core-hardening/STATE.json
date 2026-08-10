@@ -1,73 +1,38 @@
 {
   "task": "usage-bar-core-hardening",
-  "phase": "M2_IN_PROGRESS",
-  "status": "M2_IN_PROGRESS",
-  "session_id": "20260810_115223_1ade7f",
-  "suggested_session_title": "Usage Bar 内建化 M0 固化 + M1/M2 mockup",
-  "writer": "20260810_115223_1ade7f",
-  "parent_role": "read-only acceptance; 历史上曾有 two-writer interleave, 当前无活跃并行 writer",
-  "updated_at": "2026-08-10T05:51:28Z",
+  "phase": "CLOSEOUT",
+  "status": "M0_M1_M2_M3_E2E_DONE",
+  "writer_final": "parent session (kimi-k3, direct implementation per user decision 2026-08-10)",
+  "updated_at": "2026-08-10T06:05:00Z",
   "git": {
     "branch": "codex/hermes-custom-migrate-v020",
-    "head_at_start": "299d5d7d9",
-    "head_resolution": "git rev-parse HEAD",
-    "commits_this_round": [
-      "c64d5af1f feat(agent): harden usage.accounts contract with cache identity and concurrent fetch",
-      "05b6a1de4 fix(desktop): keep account usage reachable in the statusbar by default",
-      "0db51dea5 docs: usage bar core hardening M0 control plane + M1/M2 mockup",
-      "eee304619 fix(agent): close cache-identity and stale-semantics gaps from plan review",
-      "ba45dc8a5 fix(desktop): narrow statusbar migration to the untouched legacy default",
-      "83531309f docs: usage bar plan R5 verify APPROVE + two-writer resolution",
-      "fae6eacb0 fix(agent): narrow stale fallback to transient upstream failures only",
-      "c1a2973b9 docs: parent acceptance round 1 revisions (control plane + mockup)",
-      "3b184b12b docs: emit mockup HTML with LF line endings",
-      "10d62c94e docs: refresh mockup DOM assertion evidence after LF regen",
-      "535cdeddd feat(agent): add bounded usage singleflight and account metadata",
-      "484c008b7 fix(agent): preserve in-deadline usage results and admission safety",
-      "574b84b31 fix(agent): count completed usage futures before callbacks (test-only; race absent at HEAD per Codex verify)"
+    "commits_m2_closeout": [
+      "9ca0182c1 docs: M1 parent-accepted; writer switch; M3 rescoped to E2E-only",
+      "6ca605c80 feat(analytics): add real by_provider usage aggregation",
+      "0111f67a4 feat(desktop): shared account limits with refresh + command-center usage integration",
+      "654b4065e fix(usage): per-call provider attribution, focus-visible actions, alert roles, real race tests"
     ],
-    "uncommitted_not_mine_resolved": "两个写者会话交错提交已核实：历史线性、双方工作完整保留",
-    "backup_branch": "backup/usage-bar-hardening-pre-m0-20260810",
-    "dirty_snapshot": {
-      "path": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\usage-bar-core-hardening\\pre-m0-dirty.patch",
-      "sha256": "201485725060ed142de905d62d888713dd1420b43da641564564adb947d369c0",
-      "bytes": 46471,
-      "note": "moved out of repo per parent acceptance A3; hash verified 2026-08-10"
-    },
-    "noise_reverted": ["package-lock.json"],
-    "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree exit 0 零冲突; live-checkout guard 禁止运行中 merge)"
+    "worktree": "clean",
+    "upstream_sync": "PROBE_CLEAN_DEFERRED (merge-tree 零冲突已证实; live-checkout guard 需停 Hermes 后外部执行)"
   },
   "tests_final": {
-    "backend": "40 passed (usage_contract 32 + usage_accounts 1 + account_usage 7)",
-    "desktop": "19 passed (context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
-    "total": "59 passed",
-    "typecheck": "tsc x3 exit 0 (M0 轮; 本轮未动 production TS, types additive)",
-    "git_diff_check": "git diff --check 299d5d7d9..HEAD -> clean (range)",
-    "mockup_dom_assertions": "mockup/dom-assertions.json: 10/10 passed"
-  },
-  "parent_acceptance_round1": {
-    "findings": "A1 stale classifier 过宽 / A2 wall-clock 口径 / A3 artifact gate / A4 控制面陈旧 / B mockup 7 项",
-    "resolution": "全部修订完成, 详见 history/parent-acceptance-round1.md",
-    "code_review": "fix(agent) stale classifier 经本地 Codex read-only 复审 APPROVE"
+    "backend": "182 passed, 5 skipped (usage_contract 32 + usage_accounts 1 + account_usage 7 + web_server 含 by_provider 4 项; 唯一失败 test_serve_index_injects_bootstrap_for_user_theme 经 232532eb8 旧版复现证实为既有环境失败, 与本任务无关)",
+    "desktop": "32 passed (account-limits 8 + usage-panel 5 + context-usage-panel 5 + statusbar-visibility 8 + statusbar-prefs 6)",
+    "typecheck": "tsc x3 exit 0",
+    "build": "vite + electron main/preload + assert-dist-built exit 0",
+    "e2e_smoke": "真实凭证池 build_usage_contract: 7 providers / 8 accounts, 稳定 display_name (Codex 1, Kimi 1...), 状态诚实 (available/error/unsupported/cooldown), 无 secret 泄露",
+    "git_diff_check": "clean"
   },
   "milestones": {
     "M0": "DONE",
-    "M1_backend": "DONE (535cdeddd + 484c008b7 父评审 R2 修复; 574b84b31 父评审 R3 竞态复核=无该竞态(test-only 锁定), Codex APPROVE)",
-    "M1_deferred": "is_current 省略: gateway/session 无权威 active entry id 只读信号, load_pool 有副作用被拒——登记为 M2 integration blocker",
-    "M2": "IN_PROGRESS (writer 切换: 2026-08-10 用户拍板由父会话(现同为 kimi-k3)直接实施, worker session 已终止; M1 父验收通过 @232532eb8, 40/40)",
-    "M3": "RESCOPED_E2E_ONLY (2026-08-10 用户拍板: 砍掉 Nous/xAI provider 估值——无官方 API 无真实数据源; 保留 E2E 验证)"
+    "M1_backend": "DONE (singleflight/negative cache/Retry-After/display_name, 40/40)",
+    "M1_deferred": "is_current 无权威只读信号源, 未实现 (诚实省略, 非 blocker)",
+    "M2": "DONE (共享 AccountLimits + popover 修复 fill=remaining + Refresh/OpenCC + CC Provider/Model/Task + palette 关键词)",
+    "M3": "DONE_E2E_ONLY (provider 估值按用户拍板砍掉; E2E=jsdom 行为测试 + 真实 contract smoke + build)"
   },
-  "codex_plan_review": "APPROVE (计划轮 R1-R4 + R5 verify; M1 backend 代码轮 REVISE x2 -> APPROVE)",
-  "blockers": [
-    "上游 merge 推迟: live-checkout guard (merge-tree 零冲突已证实, 需停 Hermes 后外部执行)",
-    "package/release smoke 未执行 (非发布机; 回滚包已归档 cache/release-backups/)",
-    "Codex CLI 0.144.4 与用户主 config.toml [agents] 不兼容, 评审用专用 CODEX_HOME 绕行",
-    "is_current 无权威只读信号源, 待 M2 integration 决策"
-  ],
-  "artifacts": {
-    "release_backup_archived_to": "C:\\Users\\Admin\\AppData\\Local\\hermes\\cache\\release-backups\\release-backup-usage-20260810-114009",
-    "mockup_html": "docs/plans/2026-08-10-usage-bar-core-hardening/mockup/usage-bar-mockup.html",
-    "mockup_screenshots": 11
+  "review": {
+    "m2_codex_round1": "4 findings (provider 归因 blocker + focus/alert/假竞态) → 654b4065e 全部修复并补真竞态/切换/residual 回归测试",
+    "codex_rereview": "WAIVED by user 2026-08-10 (以后无需 Codex 复验)"
   },
-  "not_claimed": "M2 UI 与 M3 provider/E2E 未开始; 不宣称 release ready"
+  "not_claimed": "不宣称 release ready: 发布门禁 (回滚包 MANIFEST/恢复演练/双向兼容 smoke/上游 merge) 仍未执行, 维持文档记录的发布前阻塞条件"
 }
