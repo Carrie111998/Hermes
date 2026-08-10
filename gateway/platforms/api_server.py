@@ -5864,6 +5864,32 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _message_identity(message: Any) -> tuple:
+        """(role, content) projection for transcript prefix comparison.
+
+        Live ``result["messages"]`` rows accrete internal bookkeeping during
+        the turn (``_db_persisted``, ``finish_reason``, ``reasoning``), so raw
+        dict equality against the request's clean history never matches.
+        """
+        if not isinstance(message, dict):
+            return (None, message)
+        return (message.get("role"), message.get("content"))
+
+    @staticmethod
+    def _strip_response_store_markers(messages: List[Any]) -> List[Any]:
+        """Copy *messages* for the response store without ``_db_persisted``.
+
+        Copies are unconditional: the rows are live dicts that the SessionDB
+        flush stamps in place, possibly between this call and the store write.
+        """
+        return [
+            {k: v for k, v in msg.items() if k != "_db_persisted"}
+            if isinstance(msg, dict)
+            else msg
+            for msg in messages
+        ]
+
+    @staticmethod
     def _build_response_conversation_history(
         conversation_history: List[Dict[str, Any]],
         user_message: Any,
@@ -5880,6 +5906,7 @@ class APIServerAdapter(BasePlatformAdapter):
         concatenate the uncompressed history on front, bloating the stored
         context and re-triggering compression on every subsequent request.
         """
+        strip = APIServerAdapter._strip_response_store_markers
         prior = list(conversation_history)
         current_user = {"role": "user", "content": user_message}
         agent_messages = result.get("messages") if isinstance(result, dict) else None
@@ -5891,7 +5918,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 result,
             )
             if turn_start:
-                return list(agent_messages)
+                return strip(agent_messages)
 
             # turn_start == 0: agent_messages does not start with prior.
             # This can happen because compression rewrote the transcript
@@ -5901,17 +5928,17 @@ class APIServerAdapter(BasePlatformAdapter):
             # distinguishes — skip the concatenation and use the compressed
             # transcript directly.
             if result.get("_compressed"):
-                return list(agent_messages)
+                return strip(agent_messages)
 
             full_history = prior
             full_history.append(current_user)
             full_history.extend(agent_messages)
-            return full_history
+            return strip(full_history)
 
         full_history = prior
         full_history.append(current_user)
         full_history.append({"role": "assistant", "content": final_response})
-        return full_history
+        return strip(full_history)
 
     @staticmethod
     def _response_messages_turn_start_index(
@@ -5924,13 +5951,14 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(agent_messages, list) or not agent_messages:
             return 0
 
-        prior = list(conversation_history)
-        current_user = {"role": "user", "content": user_message}
-        expected_prefix = prior + [current_user]
-        if agent_messages[:len(expected_prefix)] == expected_prefix:
+        identity = APIServerAdapter._message_identity
+        prior_ids = [identity(m) for m in conversation_history]
+        agent_ids = [identity(m) for m in agent_messages]
+        expected_prefix = prior_ids + [("user", user_message)]
+        if agent_ids[:len(expected_prefix)] == expected_prefix:
             return len(expected_prefix)
-        if prior and agent_messages[:len(prior)] == prior:
-            return len(prior)
+        if prior_ids and agent_ids[:len(prior_ids)] == prior_ids:
+            return len(prior_ids)
         return 0
 
     @classmethod

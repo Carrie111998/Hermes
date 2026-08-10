@@ -1409,6 +1409,123 @@ class TestResponsesEndpoint:
 
 
     @pytest.mark.asyncio
+    async def test_stored_history_not_duplicated_by_db_persisted_marker(self, adapter):
+        """Internal markers on result["messages"] must not defeat turn-start detection."""
+        mock_result = {
+            "final_response": "Noted.",
+            "messages": [
+                {"role": "user", "content": "My favourite color is teal.", "_db_persisted": True},
+                {
+                    "role": "assistant",
+                    "content": "Noted.",
+                    "finish_reason": "stop",
+                    "_db_persisted": True,
+                },
+            ],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "My favourite color is teal.",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        stored_history = adapter._response_store.get(data["id"])["conversation_history"]
+        roles = [m.get("role") for m in stored_history]
+        assert roles == ["user", "assistant"], (
+            f"user turn duplicated in stored history: {roles}"
+        )
+        assert all("_db_persisted" not in m for m in stored_history)
+
+
+    @pytest.mark.asyncio
+    async def test_chained_turn_stored_history_not_duplicated_with_markers(self, adapter):
+        """A previous_response_id turn must not re-append the loaded prior history."""
+        prior_history = [
+            {"role": "user", "content": "My favourite color is teal."},
+            {"role": "assistant", "content": "Noted."},
+        ]
+        adapter._response_store.put(
+            "resp_prev_marker",
+            {
+                "response": {"id": "resp_prev_marker", "status": "completed"},
+                "conversation_history": list(prior_history),
+                "session_id": "api-test-session",
+            },
+        )
+
+        # The agent returns the full transcript; rows loaded from the store
+        # and this turn's rows all carry the mid-turn persistence marker.
+        mock_result = {
+            "final_response": "Teal.",
+            "messages": [
+                {**prior_history[0], "_db_persisted": True},
+                {**prior_history[1], "_db_persisted": True, "finish_reason": "stop"},
+                {"role": "user", "content": "What is my favourite color?", "_db_persisted": True},
+                {"role": "assistant", "content": "Teal.", "finish_reason": "stop"},
+            ],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/responses",
+                    json={
+                        "model": "hermes-agent",
+                        "input": "What is my favourite color?",
+                        "previous_response_id": "resp_prev_marker",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+
+        stored_history = adapter._response_store.get(data["id"])["conversation_history"]
+        roles = [m.get("role") for m in stored_history]
+        assert roles == ["user", "assistant", "user", "assistant"], (
+            f"prior transcript re-appended in stored history: {roles}"
+        )
+        assert all("_db_persisted" not in m for m in stored_history)
+
+
+    def test_turn_start_index_ignores_internal_markers(self):
+        """Prefix detection compares (role, content), not raw dicts."""
+        prior = [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+        ]
+        result = {
+            "messages": [
+                {"role": "user", "content": "a", "_db_persisted": True},
+                {"role": "assistant", "content": "b", "finish_reason": "stop"},
+                {"role": "user", "content": "c", "_db_persisted": True},
+                {"role": "assistant", "content": "d"},
+            ]
+        }
+        assert (
+            APIServerAdapter._response_messages_turn_start_index(prior, "c", result)
+            == 3
+        )
+        # Divergent content must still be treated as not-a-prefix.
+        result["messages"][0]["content"] = "different"
+        assert (
+            APIServerAdapter._response_messages_turn_start_index(prior, "c", result)
+            == 0
+        )
+
+
+    @pytest.mark.asyncio
     async def test_previous_response_id_outputs_only_current_turn_items(self, adapter):
         """Response output must not replay previous tool artifacts."""
         prior_history = [
