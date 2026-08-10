@@ -899,9 +899,11 @@ class CLICommandsMixin:
                 # just the number (`3`) on the next line instead of having to
                 # retype `/resume 3`. The list here must match the one shown by
                 # _show_recent_sessions and used for index resolution below —
-                # all three go through _list_recent_sessions(limit=10). See
-                # #34584.
-                self._pending_resume_sessions = self._list_recent_sessions(limit=10)
+                # all three go through _list_recent_sessions with the same limit.
+                # See #34584.
+                self._pending_resume_sessions = self._list_recent_sessions(
+                    limit=self._SESSIONS_LIST_LIMIT
+                )
                 return
             _cprint("  Tip:   Use /history or `hermes sessions list` to find sessions.")
             return
@@ -917,7 +919,7 @@ class CLICommandsMixin:
 
         # Resolve numbered selection, title, or ID
         if target.isdigit():
-            sessions = self._list_recent_sessions(limit=10)
+            sessions = self._list_recent_sessions(limit=self._SESSIONS_LIST_LIMIT)
             index = int(target)
             if index < 1 or index > len(sessions):
                 _cprint(f"  Resume index {index} is out of range.")
@@ -1128,7 +1130,7 @@ class CLICommandsMixin:
                 reason="sessions",
                 include_all_sources=True,
                 include_unnamed=True,
-                limit=20,
+                limit=self._SESSIONS_LIST_LIMIT,
             ):
                 _cprint("  (._.) No previous sessions yet.")
             return

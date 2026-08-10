@@ -7883,7 +7883,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         print(f"  Started:     {self.session_start.strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"  Config File: {config_path} {config_status}")
         print()
-    
+
+    # Maximum number of sessions shown by /sessions and /resume (bare), and
+    # the same limit used for numbered-index resolution in /resume <number>.
+    # All three paths must use the same limit so row N in the displayed table
+    # always resolves to the same session. See #80750.
+    _SESSIONS_LIST_LIMIT = 20
+
     def _list_recent_sessions(
         self,
         limit: int = 10,
@@ -7915,7 +7921,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self,
         *,
         reason: str = "history",
-        limit: int = 10,
+        limit: int | None = None,
         include_all_sources: bool = True,
         include_unnamed: bool = True,
         search_query: str | None = None,
@@ -7924,6 +7930,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         Returns True when something was shown, False if no session list was available.
         """
+        if limit is None:
+            limit = self._SESSIONS_LIST_LIMIT
         sessions = self._list_recent_sessions(
             limit=limit,
             include_all_sources=include_all_sources,
