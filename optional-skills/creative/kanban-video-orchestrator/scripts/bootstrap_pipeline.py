@@ -346,11 +346,10 @@ def render_team_md(plan: dict[str, Any]) -> str:
         "",
         "## Per-task workspace requirement",
         "",
-        "All `kanban_create` calls MUST pass:",
+        "All `hermes kanban create` calls MUST pass:",
         "```",
-        'workspace_kind="dir"',
-        f'workspace_path="$HOME/projects/video-pipeline/{plan["slug"]}"',
-        f'tenant="{plan["tenant"]}"',
+        f'--workspace "dir:$HOME/projects/video-pipeline/{plan["slug"]}"',
+        f'--tenant "{plan["tenant"]}"',
         "```",
     ])
     return "\n".join(lines)
@@ -405,7 +404,7 @@ def role_rules(member: dict[str, Any], plan: dict[str, Any]) -> str:
             "- For every concrete task, create a kanban task and assign it.",
             "- Read `brief.md`, `TEAM.md`, and `taste/` before decomposing.",
             "- Follow the task graph in `TEAM.md`; do not invent extra roles unless truly required.",
-            f"- On every `kanban_create`, pass `workspace_kind=\"dir\"`, `workspace_path=\"{workspace}\"`, and `tenant=\"{plan['tenant']}\"`.",
+            f"- On every `hermes kanban create`, pass `--workspace \"dir:{workspace}\" --tenant \"{plan['tenant']}\"`.",
             "- Carry runtime defaults forward: renderer 1800s, editor 600s, voice-talent 300s, image-to-video 900s.",
         ])
     if role == "cinematographer":
