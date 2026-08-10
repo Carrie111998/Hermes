@@ -155,6 +155,7 @@ _log = logging.getLogger(__name__)
 _SCHEDULER_ROLE: Optional[str] = None
 _DESKTOP_SCHEDULER_LEASE_NAME = "desktop-cron-fallback.lease"
 _desktop_scheduler_lease_fh = None  # process-lifetime exclusive lease handle
+_desktop_scheduler_lease_fallback_path: Optional[Path] = None
 
 
 def get_scheduler_role() -> Optional[str]:
@@ -189,43 +190,49 @@ def _try_acquire_desktop_scheduler_lease() -> bool:
     The file handle is retained for process lifetime so the lock is released
     only on exit (or explicit release).
     """
-    global _desktop_scheduler_lease_fh
+    global _desktop_scheduler_lease_fh, _desktop_scheduler_lease_fallback_path
     if _desktop_scheduler_lease_fh is not None:
         return True
 
     lease_path = _desktop_scheduler_lease_path()
     try:
         lease_path.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(lease_path, "a+", encoding="utf-8")
     except OSError:
-        _log.debug("desktop scheduler lease open failed", exc_info=True)
+        _log.debug("desktop scheduler lease directory creation failed", exc_info=True)
         return False
 
     try:
         import fcntl
-
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except ImportError:
+        # Windows/no-fcntl: do not pre-create the path with open("a+") before
+        # O_EXCL. O_TEMPORARY (when available) makes close/crash remove the
+        # lease; explicit release handles other no-fcntl hosts.
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        flags |= getattr(os, "O_TEMPORARY", 0)
         try:
-            fh.close()
-        except OSError:
-            pass
-        return False
-    except Exception:
-        # Platforms without fcntl: fall back to exclusive-create best effort.
-        try:
-            fh.close()
-        except OSError:
-            pass
-        try:
-            fd = os.open(str(lease_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            _desktop_scheduler_lease_fh = os.fdopen(fd, "w", encoding="utf-8")
-            _desktop_scheduler_lease_fh.write(f"{os.getpid()}\n")
-            _desktop_scheduler_lease_fh.flush()
-            return True
+            fd = os.open(str(lease_path), flags, 0o600)
         except FileExistsError:
             return False
         except OSError:
+            return False
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+        _desktop_scheduler_lease_fallback_path = lease_path
+    except Exception:
+        _log.debug("desktop scheduler lease backend failed", exc_info=True)
+        return False
+    else:
+        try:
+            fh = open(lease_path, "a+", encoding="utf-8")
+        except OSError:
+            _log.debug("desktop scheduler lease open failed", exc_info=True)
+            return False
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            try:
+                fh.close()
+            except OSError:
+                pass
             return False
 
     try:
@@ -240,9 +247,11 @@ def _try_acquire_desktop_scheduler_lease() -> bool:
 
 
 def _release_desktop_scheduler_lease() -> None:
-    global _desktop_scheduler_lease_fh
+    global _desktop_scheduler_lease_fh, _desktop_scheduler_lease_fallback_path
     fh = _desktop_scheduler_lease_fh
+    fallback_path = _desktop_scheduler_lease_fallback_path
     _desktop_scheduler_lease_fh = None
+    _desktop_scheduler_lease_fallback_path = None
     if fh is None:
         return
     try:
@@ -255,6 +264,11 @@ def _release_desktop_scheduler_lease() -> None:
         fh.close()
     except OSError:
         pass
+    if fallback_path is not None:
+        try:
+            fallback_path.unlink(missing_ok=True)
+        except OSError:
+            _log.debug("desktop scheduler fallback lease cleanup failed", exc_info=True)
 
 
 def admit_desktop_scheduler_fallback() -> bool:

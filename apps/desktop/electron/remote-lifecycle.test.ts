@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { exec as nodeExec } from 'node:child_process'
+import { promisify } from 'node:util'
 
 import { test } from 'vitest'
 
@@ -25,12 +27,15 @@ import {
   scrapeReadyPort,
   spawnLogPath,
   spawnRemoteDashboard,
+  terminateOwnedProcess,
   validateRemotePath,
+  withOwnershipMutex,
   writeLockfile
 } from './remote-lifecycle'
 
 const OWNERSHIP_ID = '0123456789abcdef0123456789abcdef'
 const SPAWN_NONCE = '0123456789abcdef'
+const execAsync = promisify(nodeExec)
 
 function ownedLock(over: any = {}) {
   return {
@@ -57,12 +62,14 @@ function ownedLock(over: any = {}) {
 function ownedIdentityOut(over: any = {}) {
   const start = over.startTime ?? 12345
   const fp = over.fingerprint ?? 'a'.repeat(32)
+
   return `OK\n${start}\n${fp}\npython\n/runtime/.venv/bin/hermes\nserve\n--isolated\n--ssh-owner-nonce\n${SPAWN_NONCE}\n`
 }
 
 function foreignIdentityOut(over: any = {}) {
   const start = over.startTime ?? 999
   const fp = over.fingerprint ?? 'b'.repeat(32)
+
   return `SHAPE\n${start}\n${fp}\nother\n`
 }
 
@@ -73,6 +80,7 @@ function goneIdentityOut() {
 function mutexRules() {
   return [
     [/stale_ms=/, 'ACQUIRED\n'],
+    [/print\("HELD"/, 'HELD\n'],
     [/data==holder/, '']
   ]
 }
@@ -92,6 +100,7 @@ function spawnConnectRules(over: any = {}) {
   const pid = over.pid ?? 777
   const port = over.port ?? 51999
   const ready = over.ready ?? `HERMES_DASHBOARD_READY port=${port}\n`
+
   return baseConnectRules([
     [/cat .*lock\.json/, over.lockJson ?? ''],
     [/grep -q ssh-session-token-file/, 'YES\n'],
@@ -347,16 +356,17 @@ test('cleanupStale kills ONLY a provably-ours pid; foreign alive is ownership-co
 
   const ours = fakeSsh([
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
-    [/kill 9\b/, ''],
+    [/terminate_result/, 'TERMINATED\n'],
     [/kill -0 9/, 'DEAD']
   ])
+
   await cleanupStale(ours, OWNERSHIP_ID, {
     pid: 9,
     spawnNonce: SPAWN_NONCE,
     hermesPath: '/x/hermes',
     logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE)
   })
-  assert.ok(ours.calls.some(c => /kill 9\b/.test(c)))
+  assert.ok(ours.calls.some(c => /terminate_result/.test(c)))
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
 })
 
@@ -566,15 +576,16 @@ test('connect() respawns when the requested remote profile differs from the lock
   const ssh = fakeSsh(baseConnectRules([
     [/cat .*lock\.json/, () => {
       lockReads += 1
+
       // First read sees owned lock; after cleanup the lock is gone.
       return lockReads === 1 ? JSON.stringify(lock) : ''
     }],
-    [/kill -0 333/, command => (ssh.calls.some(c => /kill 333\b/.test(c)) ? 'DEAD' : 'ALIVE')],
+    [/kill -0 333/, command => (ssh.calls.some(c => /terminate_result/.test(c)) ? 'DEAD' : 'ALIVE')],
     [/print\("OK" if ok else "SHAPE"\)/, command =>
       (command.includes('pid=890') || /pid=890/.test(command) ? ownedIdentityOut({ startTime: 890 }) : ownedIdentityOut())
     ],
     // broader identity match by nonce script — always owned shape for these pids
-    [/kill 333\b/, ''],
+    [/terminate_result/, 'TERMINATED\n'],
     [/--version/, 'Hermes Agent v0.18.2\n'],
     [/grep -q ssh-session-token-file/, 'YES\n'],
     [command => /python3 -c/.test(command) && /O_EXCL/.test(command), ''],
@@ -597,29 +608,42 @@ test('connect() respawns when the requested remote profile differs from the lock
   )
 })
 
-test('connect() reuses when lock launcherPath differs after exec-wrapper (identity-owned)', async () => {
+test('connect() replaces an owned backend when the configured launcher path changes', async () => {
   const reuseToken = 'stored-token'
-  // Lock records the wrapper launcher; live process is python + runtime entry.
-  // Ownership is by observed identity + nonce, not launcher path equality.
+
+  // Live argv may still be python + runtime entry after an exec wrapper, but a
+  // different configured launcher is explicit operator intent and must not be
+  // silently ignored.
   const lock = ownedLock({
     hermesPath: '/x/hermes-wrapper',
     launcherPath: '/x/hermes-wrapper',
     tokenFingerprint: fingerprintToken(reuseToken)
   })
 
+  let oldGone = false
+
   const ssh = fakeSsh(baseConnectRules([
-    [/cat .*lock\.json/, JSON.stringify(lock)],
-    [/kill -0/, 'ALIVE'],
+    [/cat .*lock\.json/, () => (oldGone ? '' : JSON.stringify(lock))],
+    [/kill -0 333/, () => (oldGone ? 'DEAD' : 'ALIVE')],
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
-    [/\[ -x .*\/new\/hermes/, 'OK']
+    [/terminate_result/, () => { oldGone = true;
+
+ return 'TERMINATED\n' }],
+    [/\[ -x .*\/new\/hermes/, 'OK'],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [command => /python3 -c/.test(command) && /O_EXCL/.test(command), ''],
+    [/setsid/, '902\n'],
+    [/kill -0 902/, 'ALIVE'],
+    [/cat .*\.log/, 'HERMES_DASHBOARD_READY port=44101\n']
   ]))
 
   const result = await connect(
     connectDeps(ssh, { reuseToken, remoteHermesPath: '/new/hermes', adoptServedToken: async (_b, t) => t })
   )
 
-  assert.equal(result.reused, true, 'exec-wrapper launcher mismatch must not block reuse of owned identity')
-  assert.ok(!ssh.calls.some(c => /setsid/.test(c)), 'must not spawn a replacement')
+  assert.equal(result.reused, false)
+  assert.equal(result.pid, 902)
+  assert.ok(ssh.calls.some(c => /setsid/.test(c)), 'configured launcher change must spawn a replacement')
 })
 
 test('connect() fails closed on alive foreign identity (no delete/signal/spawn)', async () => {
@@ -641,23 +665,28 @@ test('connect() fails closed on alive foreign identity (no delete/signal/spawn)'
   assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)), 'must preserve lock')
 })
 
-test('connect() respawns when the lockfile protocolVersion is incompatible', async () => {
+test('connect() fails closed on live malformed, incompatible-protocol, and incompatible-schema records', async () => {
   const reuseToken = 'stored-token'
 
-  const lock = {
-    schemaVersion: LOCKFILE_SCHEMA_VERSION,
-    protocolVersion: PROTOCOL_VERSION + 99,
-    pid: 333,
-    port: 40000,
-    tokenFingerprint: fingerprintToken(reuseToken)
+  const records = [
+    'not json',
+    JSON.stringify(ownedLock({ protocolVersion: PROTOCOL_VERSION + 99 })),
+    JSON.stringify(ownedLock({ schemaVersion: LOCKFILE_SCHEMA_VERSION + 99 }))
+  ]
+
+  for (const record of records) {
+    const ssh = fakeSsh(baseConnectRules([
+      [/cat .*lock\.json/, record],
+      [/kill -0 333/, 'ALIVE']
+    ]))
+
+    await assert.rejects(
+      () => connect(connectDeps(ssh, { reuseToken, adoptServedToken: async () => 'fresh' })),
+      (err: any) => err.kind === 'ownership-conflict'
+    )
+    assert.ok(!ssh.calls.some(c => /setsid|nohup/.test(c)), 'invalid existing ownership evidence must not be overlapped')
+    assert.ok(!ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)), 'invalid ownership evidence must be preserved')
   }
-
-  // Incompatible protocol => readLockfile returns null => fresh spawn path.
-  const ssh = fakeSsh(spawnConnectRules({ pid: 901, port: 44100, lockJson: JSON.stringify(lock) }))
-
-  const result = await connect(connectDeps(ssh, { reuseToken, adoptServedToken: async () => 'fresh' }))
-  assert.equal(result.reused, false, 'incompatible protocol must force a fresh spawn, not a reattach')
-  assert.equal(result.pid, 901)
 })
 
 test('connect() fresh spawn writes hermesHome + protocolVersion into the lockfile', async () => {
@@ -699,7 +728,10 @@ test('connect() respawns when the lockfile pid is dead (killed dashboard)', asyn
     [/cat .*lock\.json/, () => (sawDeadCleanup ? '' : JSON.stringify(lock))],
     [/kill -0 333/, 'DEAD'],
     [/rm -f/, c => {
-      if (/backend\.lock\.json/.test(c)) sawDeadCleanup = true
+      if (/backend\.lock\.json/.test(c)) {
+        sawDeadCleanup = true
+      }
+
       return ''
     }],
     [/grep -q ssh-session-token-file/, 'YES\n'],
@@ -1059,9 +1091,10 @@ test('readLockfile rejects a log path outside the exact ownership and spawn path
 test('cleanupStale never deletes a lock-supplied unexpected log path', async () => {
   const ssh = fakeSsh([
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
-    [/kill 333\b/, ''],
+    [/terminate_result/, 'TERMINATED\n'],
     [/kill -0 333/, 'DEAD']
   ])
+
   await cleanupStale(ssh, OWNERSHIP_ID, ownedLock({ logPath: '~/.hermes/unrelated.log' }))
   assert.ok(!ssh.calls.some(command => command.includes('unrelated.log')))
 })
@@ -1081,7 +1114,7 @@ test('connect removes the token file when a fresh backend fails after returning 
     [/setsid/, '999\n'],
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut({ startTime: 999 })],
     [/kill -0 999/, 'DEAD'],
-    [/kill 999\b/, '']
+    [/terminate_result/, 'GONE\n']
   ]))
 
   await assert.rejects(() => connect(connectDeps(ssh)), /exited before announcing/i)
@@ -1119,10 +1152,12 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
   const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
 
   let killed333 = false
+
   const ssh = fakeSsh(baseConnectRules([
     [/cat .*lock\.json/, () => (killed333 ? '' : JSON.stringify(lock))],
-    // Match terminate before the embedded `kill -0` probe inside the same command.
-    [/kill 333\b/, () => { killed333 = true; return '' }],
+    [/terminate_result/, () => { killed333 = true;
+
+ return 'TERMINATED\n' }],
     [/kill -0 333/, () => (killed333 ? 'DEAD' : 'ALIVE')],
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
     [/grep -q ssh-session-token-file/, 'YES\n'],
@@ -1146,7 +1181,7 @@ test('connect replaces an exact-owned backend only after authenticated stale pro
   )
 
   assert.equal(result.reused, false)
-  assert.ok(ssh.calls.some(command => /kill 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /terminate_result/.test(command)))
 })
 
 test('remote SSH ownership capability requires both secure bootstrap flags', async () => {
@@ -1180,22 +1215,26 @@ test('exec-wrapper ownership identity verifies as owned and can be reaped', asyn
     pidStartTime: 12345,
     processFingerprint: 'a'.repeat(32)
   })
+
   const ssh = fakeSsh([
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
-    [/kill 5\b/, ''],
+    [/terminate_result/, 'TERMINATED\n'],
     [/kill -0 5/, 'DEAD']
   ])
+
   assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes-wrapper', lock), true)
   await cleanupStale(ssh, OWNERSHIP_ID, lock)
-  assert.ok(ssh.calls.some(c => /kill 5\b/.test(c)))
+  assert.ok(ssh.calls.some(c => /terminate_result/.test(c)))
   assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
 })
 
 test('PID reuse start-time mismatch is foreign and never signaled', async () => {
   const lock = ownedLock({ pid: 5, pidStartTime: 111, processFingerprint: 'a'.repeat(32) })
+
   const ssh = fakeSsh([
     [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut({ startTime: 222 })]
   ])
+
   assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes', lock), false)
   await assert.rejects(
     () => cleanupStale(ssh, OWNERSHIP_ID, lock),
@@ -1204,10 +1243,113 @@ test('PID reuse start-time mismatch is foreign and never signaled', async () => 
   assert.ok(!ssh.calls.some(c => /kill 5\b/.test(c)))
 })
 
+test('post-proof PID reuse is rejected by the identity-checked termination command', async () => {
+  const lock = ownedLock({ pid: 5 })
+
+  const ssh = fakeSsh([
+    [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
+    [/terminate_result/, 'MISMATCH\n']
+  ])
+
+  await assert.rejects(
+    () => cleanupStale(ssh, OWNERSHIP_ID, lock),
+    (err: any) => err.kind === 'ownership-conflict'
+  )
+  const terminate = ssh.calls.find(c => /terminate_result/.test(c)) || ''
+  assert.match(terminate, /pidfd_open/, 'Linux termination must bind a pidfd before signaling')
+  assert.match(terminate, /pidStartTime|expected_start/, 'termination must recheck process start identity')
+  assert.ok(!ssh.calls.some(c => /^kill 5\b/.test(c)), 'must not issue a separate racy shell kill')
+})
+
+test('cleanup waits for asynchronous SIGTERM exit before removing evidence', async () => {
+  const lock = ownedLock({ pid: 5 })
+  let livenessChecks = 0
+
+  const ssh = fakeSsh([
+    [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
+    [/terminate_result/, 'TERMINATED\n'],
+    [/kill -0 5/, () => {
+      livenessChecks += 1
+
+      return livenessChecks === 1 ? 'ALIVE' : 'DEAD'
+    }]
+  ])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, lock)
+  assert.equal(livenessChecks, 2)
+  assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)))
+})
+
+test('identity-checked termination helper is executable and reports an absent pid as GONE', async () => {
+  const localSsh = {
+    async exec(command) {
+      const { stdout } = await execAsync(command)
+
+      return stdout
+    }
+  }
+
+  const result = await terminateOwnedProcess(localSsh, ownedLock({ pid: 4194304 }))
+
+  assert.equal(result, 'GONE')
+})
+
+test('GONE during failed-spawn cleanup preserves the original spawn error', async () => {
+  let identityReads = 0
+
+  const ssh = fakeSsh(baseConnectRules([
+    [/cat .*lock\.json/, ''],
+    [/grep -q ssh-session-token-file/, 'YES\n'],
+    [command => /python3 -c/.test(command) && /O_EXCL/.test(command), ''],
+    [/setsid/, '1001\n'],
+    [/print\("OK" if ok else "SHAPE"\)/, () => {
+      identityReads += 1
+
+      return identityReads === 1 ? ownedIdentityOut({ startTime: 1001 }) : goneIdentityOut()
+    }],
+    [/kill -0 1001/, 'DEAD']
+  ]))
+
+  await assert.rejects(
+    () => connect(connectDeps(ssh)),
+    (err: any) => err.kind === 'spawn-failed' && /exited before announcing/i.test(err.message)
+  )
+  assert.ok(ssh.calls.some(c => /rm -f .*backend\.lock\.json/.test(c)), 'gone spawn evidence should be cleaned')
+})
+
+test('ownership mutex heartbeats and fences a callback after lease loss', async () => {
+  let heldChecks = 0
+
+  const ssh = fakeSsh([
+    [/stale_ms=/, 'ACQUIRED\n'],
+    [/print\("HELD"/, () => {
+      heldChecks += 1
+
+      return heldChecks === 1 ? 'HELD\n' : 'LOST\n'
+    }],
+    [/data==holder/, '']
+  ])
+
+  await assert.rejects(
+    () => withOwnershipMutex(
+      ssh,
+      OWNERSHIP_ID,
+      async lease => {
+        await new Promise(resolve => setTimeout(resolve, 20))
+        await lease.assertHeld()
+      },
+      { heartbeatMs: 5 }
+    ),
+    (err: any) => err.kind === 'ownership-conflict'
+  )
+  assert.ok(heldChecks >= 2, 'heartbeat and explicit fence must both validate the holder token')
+})
+
 test('token-absent healthy lock still reuses when identity-owned', async () => {
   // Token files are read-and-unlinked by design; absence is not orphan proof.
   const reuseToken = 'stored-token'
   const lock = ownedLock({ tokenFingerprint: fingerprintToken(reuseToken) })
+
   const ssh = fakeSsh(baseConnectRules([
     [/cat .*lock\.json/, JSON.stringify(lock)],
     [/kill -0/, 'ALIVE'],
@@ -1215,8 +1357,8 @@ test('token-absent healthy lock still reuses when identity-owned', async () => {
     // no token file present on remote
     [/\.token/, '']
   ]))
+
   const result = await connect(connectDeps(ssh, { reuseToken, adoptServedToken: async (_b, t) => t }))
   assert.equal(result.reused, true)
   assert.ok(!ssh.calls.some(c => /setsid/.test(c)))
 })
-
