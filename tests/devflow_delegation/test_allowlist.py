@@ -32,6 +32,39 @@ SAMPLE = {
     },
 }
 
+CANARY_REAL = {
+    "version": "1",
+    "targets": {
+        "sandbox": {
+            "repo": "sandbox",
+            "checkout_path": "~/devflow-sandbox",
+            "default_branch": "main",
+            "remote": "origin",
+            "allowed_globs": ["src/**"],
+            "denied_globs": ["**/.env", "secrets/**"],
+            "worktree_base": "~/devflow-sandbox-worktrees",
+            "test_commands": [["python", "-c", "print('ok')"]],
+            "required_checks": ["test"],
+            "risk_ceiling": "low",
+            "max_autonomous_action": "create_pr",
+            "executor_enabled": True,
+            "canary_real": True,
+            "implementation_command": ["python", "tools/apply.py"],
+            "github_repo": "acme/sandbox",
+            "pr_budget": 1,
+            "live_gateway_imports": False,
+        }
+    },
+}
+
+
+def _canary_file(tmp_path, **target_overrides):
+    data = json.loads(json.dumps(CANARY_REAL))
+    data["targets"]["sandbox"].update(target_overrides)
+    p = tmp_path / "allowlist.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    return p
+
 
 @pytest.fixture
 def allowlist_file(tmp_path):
@@ -91,6 +124,54 @@ def test_enabled_executor_requires_all_synthetic_safety_gates(allowlist_file):
 
     with pytest.raises(AllowlistError):
         load_allowlist(allowlist_file)
+
+
+def test_canary_real_target_loads_with_full_bounded_set(tmp_path):
+    target = resolve_target(load_allowlist(_canary_file(tmp_path)), "sandbox")
+    assert target is not None
+    assert target.canary_real is True
+    assert target.synthetic_fixture is False
+    assert target.pr_budget == 1
+    assert target.pr_budget_window_hours == 24  # default
+    assert target.allowed_globs == ("src/**",)
+
+
+def test_canary_real_defaults_pr_budget_to_one(tmp_path):
+    data = json.loads(json.dumps(CANARY_REAL))
+    del data["targets"]["sandbox"]["pr_budget"]
+    p = tmp_path / "allowlist.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    assert resolve_target(load_allowlist(p), "sandbox").pr_budget == 1
+
+
+@pytest.mark.parametrize("mutation", [
+    {"implementation_command": None},
+    {"github_repo": ""},
+    {"max_autonomous_action": "none"},
+    {"worktree_base": ""},
+    {"allowed_globs": []},
+    {"risk_ceiling": "high"},
+    {"pr_budget": 0},
+    {"live_gateway_imports": True},
+    {"synthetic_fixture": True},                  # mutually exclusive with canary_real
+])
+def test_enabled_canary_real_requires_every_bound(tmp_path, mutation):
+    # Every bound is load-bearing on an ENABLED canary_real target: dropping any
+    # one fails closed with AllowlistError.
+    with pytest.raises(AllowlistError):
+        load_allowlist(_canary_file(tmp_path, **mutation))
+
+
+def test_disabled_canary_real_target_loads_without_running(tmp_path):
+    # A disabled target is not an error — it simply never runs — so the bounded-set
+    # checks (which gate only enabled executors) do not apply.
+    target = resolve_target(load_allowlist(_canary_file(tmp_path, executor_enabled=False)), "sandbox")
+    assert target is not None and target.executor_enabled is False
+
+
+def test_non_int_pr_budget_fails_closed(tmp_path):
+    with pytest.raises(AllowlistError):
+        load_allowlist(_canary_file(tmp_path, pr_budget="lots"))
 
 
 def test_path_allowed_enforces_allow_and_deny(allowlist_file):

@@ -42,6 +42,9 @@ class TargetConfig:
     # Stage-2 action requires all three explicit target-owned gates below.
     executor_enabled: bool = False
     synthetic_fixture: bool = False
+    canary_real: bool = False
+    pr_budget: int = 1
+    pr_budget_window_hours: int = 24
     implementation_command: Optional[Tuple[str, ...]] = None
     github_repo: str = ""
     deploy_command: Optional[str] = None
@@ -123,36 +126,71 @@ def load_allowlist(path: Path) -> Allowlist:
         command = _command_tuple(raw.get("implementation_command"), str(name))
         executor_enabled = bool(raw.get("executor_enabled", False))
         synthetic_fixture = bool(raw.get("synthetic_fixture", False))
+        canary_real = bool(raw.get("canary_real", False))
         github_repo = str(raw.get("github_repo", ""))
-        if executor_enabled and not (synthetic_fixture and command and github_repo and max_action == "create_pr"):
+        worktree_base = str(raw.get("worktree_base", ""))
+        allowed_globs = _tuple(raw.get("allowed_globs"))
+        risk_ceiling = str(raw.get("risk_ceiling", "medium"))
+        live_gateway_imports = bool(raw.get("live_gateway_imports", False))
+        try:
+            pr_budget = int(raw.get("pr_budget", 1))
+            pr_budget_window_hours = int(raw.get("pr_budget_window_hours", 24))
+        except (TypeError, ValueError) as exc:
             raise AllowlistError(
-                f"allowlist target '{name}' malformed: enabled executor requires synthetic_fixture, "
-                "implementation_command, github_repo, and max_autonomous_action='create_pr'"
-            )
+                f"allowlist target '{name}' malformed: pr_budget/pr_budget_window_hours must be int ({exc})"
+            ) from exc
+        if executor_enabled:
+            if not (command and github_repo and max_action == "create_pr"):
+                raise AllowlistError(
+                    f"allowlist target '{name}' malformed: enabled executor requires "
+                    "implementation_command, github_repo, and max_autonomous_action='create_pr'"
+                )
+            if synthetic_fixture and canary_real:
+                raise AllowlistError(
+                    f"allowlist target '{name}' malformed: synthetic_fixture and canary_real are mutually exclusive"
+                )
+            if not (synthetic_fixture or canary_real):
+                raise AllowlistError(
+                    f"allowlist target '{name}' malformed: enabled executor requires synthetic_fixture or canary_real"
+                )
+            if canary_real:
+                if live_gateway_imports:
+                    raise AllowlistError(f"allowlist target '{name}' malformed: canary_real must not import the live gateway")
+                if not worktree_base:
+                    raise AllowlistError(f"allowlist target '{name}' malformed: canary_real requires worktree_base")
+                if not allowed_globs:
+                    raise AllowlistError(f"allowlist target '{name}' malformed: canary_real requires non-empty allowed_globs")
+                if risk_ceiling not in {"low", "medium"}:
+                    raise AllowlistError(f"allowlist target '{name}' malformed: canary_real requires a low or medium risk_ceiling")
+                if pr_budget < 1:
+                    raise AllowlistError(f"allowlist target '{name}' malformed: canary_real requires pr_budget >= 1")
         targets[str(name)] = TargetConfig(
             repo=str(raw["repo"]),
             checkout_path=str(raw["checkout_path"]),
             default_branch=str(raw.get("default_branch", "main")),
             remote=str(raw.get("remote", "origin")),
-            allowed_globs=_tuple(raw.get("allowed_globs")),
+            allowed_globs=allowed_globs,
             denied_globs=_tuple(raw.get("denied_globs")),
-            worktree_base=str(raw.get("worktree_base", "")),
+            worktree_base=worktree_base,
             test_commands=_validation_commands(raw.get("test_commands")),
             lint_commands=_validation_commands(raw.get("lint_commands")),
             typecheck_commands=_validation_commands(raw.get("typecheck_commands")),
             build_commands=_validation_commands(raw.get("build_commands")),
             command_timeout_seconds=command_timeout_seconds,
             required_checks=_tuple(raw.get("required_checks")),
-            risk_ceiling=str(raw.get("risk_ceiling", "medium")),
+            risk_ceiling=risk_ceiling,
             max_autonomous_action=max_action,
             executor_enabled=executor_enabled,
             synthetic_fixture=synthetic_fixture,
+            canary_real=canary_real,
+            pr_budget=pr_budget,
+            pr_budget_window_hours=pr_budget_window_hours,
             implementation_command=command,
             github_repo=github_repo,
             deploy_command=raw.get("deploy_command"),
             rollback_command=raw.get("rollback_command"),
             health_checks=_tuple(raw.get("health_checks")),
-            live_gateway_imports=bool(raw.get("live_gateway_imports", False)),
+            live_gateway_imports=live_gateway_imports,
             owners=_tuple(raw.get("owners")),
             notify_route=str(raw.get("notify_route", "")),
         )
