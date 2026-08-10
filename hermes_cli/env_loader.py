@@ -579,21 +579,34 @@ def _apply_managed_env() -> None:
     v2 item (design §8.1). v1 relies on filesystem permissions only.
 
     Fail-open: a missing managed dir or .env is the common case and a no-op; any
-    error here is swallowed so managed scope can never block startup.
+    error here (including PermissionError/OSError on exists/stat/read of an
+    inaccessible managed path) is swallowed so managed scope can never block
+    startup. User/project dotenv errors are intentionally out of scope here.
     """
+    managed_env = None
     try:
         from hermes_cli import managed_scope
 
         managed_dir = managed_scope.get_managed_dir()
-    except Exception:  # noqa: BLE001 — managed scope must never block startup
-        return
-    if managed_dir is None:
-        return
-    managed_env = managed_dir / ".env"
-    if not managed_env.exists():
-        return
-    _sanitize_env_file_if_needed(managed_env)
-    _load_dotenv_with_fallback(managed_env, override=True)
+        if managed_dir is None:
+            return
+        managed_env = managed_dir / ".env"
+        # exists()/sanitize/load can raise when the managed dir is present but
+        # not traversable/readable to this uid (e.g. root-only /etc/hermes/.env).
+        if not managed_env.exists():
+            return
+        _sanitize_env_file_if_needed(managed_env)
+        _load_dotenv_with_fallback(managed_env, override=True)
+    except Exception as exc:  # noqa: BLE001 — managed scope must never block startup
+        import logging
+
+        # Path + exception only — never log managed file contents/secret values.
+        logging.getLogger(__name__).warning(
+            "managed scope: failed to apply managed .env (%s): %s — "
+            "IGNORING managed env. Admin policy from this file is NOT being applied.",
+            managed_env if managed_env is not None else "unresolved",
+            exc,
+        )
 
 
 def _apply_external_secret_sources(home_path: Path) -> None:
