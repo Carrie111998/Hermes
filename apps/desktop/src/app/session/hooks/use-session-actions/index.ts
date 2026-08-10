@@ -1995,7 +1995,8 @@ export function useSessionActions({
           normalizeProfileKey($activeGatewayProfile.get()) === resolvedUiIntent.profile &&
           $freshSessionRequest.get() === resolvedUiIntent.freshSessionRequest &&
           getRouteToken() === resolvedUiIntent.routeToken &&
-          selectedStoredSessionIdRef.current === resolvedUiIntent.selectedStoredSessionId
+          selectedStoredSessionIdRef.current === resolvedUiIntent.selectedStoredSessionId &&
+          focusedSessionTabAnchor() === resolvedUiIntent.anchor
 
         // Preserve main's foreground branch contract while routing tiled slash
         // commands back beside their invoking tile. A delayed branch may still
