@@ -13,6 +13,8 @@ Built-in TTS providers:
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
+- VoxCPM (local, free, no API key): OpenBMB VoxCPM2, 30 languages incl. 9 Chinese
+  dialects, voice design + reference cloning + continuation, 48 kHz output
 
 Custom command providers:
 - Users can declare any number of named providers with ``type: command``
@@ -203,6 +205,28 @@ def _import_piper():
     return PiperVoice
 
 
+def _import_voxcpm():
+    """Lazy import VoxCPM. Returns the VoxCPM class or raises ImportError.
+
+    VoxCPM is OpenBMB's tokenizer-free, diffusion-autoregressive TTS engine
+    (https://github.com/OpenBMB/VoxCPM). The package is optional and only
+    required when the user has selected ``provider: voxcpm`` in
+    ``~/.hermes/config.yaml``. Install with:
+
+        pip install voxcpm
+
+    VoxCPM2 (default) is a 2B-parameter model that supports 30 languages,
+    voice design from text prompts, and reference-audio voice cloning.
+    It runs locally on CUDA / MPS / CPU — no API key required.
+
+    The model weights (~5 GB total) are downloaded separately via ModelScope
+    (HF is blocked in some regions). See ``hermes setup tts`` and the VoxCPM
+    provider docs for the recommended layout.
+    """
+    from voxcpm import VoxCPM
+    return VoxCPM
+
+
 # ===========================================================================
 # Defaults
 # ===========================================================================
@@ -220,6 +244,10 @@ MANAGED_OPENAI_TTS_MODELS = frozenset({"gpt-4o-mini-tts"})
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
+DEFAULT_VOXCPM_MODEL = "openbmb/VoxCPM2"  # 2B, 30 languages, 48kHz
+DEFAULT_VOXCPM_DEVICE = "auto"  # voxcpm auto-selects CUDA → MPS → CPU
+DEFAULT_VOXCPM_CFG_VALUE = 2.0
+DEFAULT_VOXCPM_INFERENCE_TIMESTEPS = 10
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MINIMAX_MODEL = "speech-02-hd"
@@ -283,6 +311,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "voxcpm": 4000,       # VoxCPM2 2B local model — quality falls off past ~4k chars per chunk
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -780,6 +809,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "kittentts",
     "piper",
     "deepinfra",
+    "voxcpm",
 })
 
 DEFAULT_COMMAND_TTS_TIMEOUT_SECONDS = 120
@@ -3125,6 +3155,206 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: VoxCPM (OpenBMB — local, 30-language, voice-design + cloning)
+# ===========================================================================
+#
+# VoxCPM is OpenBMB's tokenizer-free, diffusion-autoregressive TTS engine
+# (https://github.com/OpenBMB/VoxCPM). The default VoxCPM2 weights are a 2B
+# parameter model trained on >2M hours of multilingual speech, supporting 30
+# languages (incl. Chinese dialects), 48 kHz studio-quality output, voice
+# design from text prompts, and reference-audio voice cloning.
+#
+# All synthesis is local — no API key required, no data leaves the host.
+# The engine runs on CUDA / MPS / CPU (VoxCPM auto-selects when ``device``
+# is ``None`` or ``"auto"``).
+#
+# Config keys (all under ``tts.voxcpm``):
+#
+#   model           Path or HF/ModelScope id (default "openbmb/VoxCPM2")
+#   device          "auto" | "cpu" | "mps" | "cuda" | "cuda:0"  (default "auto")
+#   local_files_only  Skip model download when True (default False)
+#   load_denoiser   Load acoustic denoiser (default False — ~1.5 GB extra,
+#                    not needed for typical TTS; enable if prompt audio is noisy)
+#   cfg_value       Guidance scale, recommended 1.0–3.0 (default 2.0)
+#   inference_timesteps   CFM denoising steps, 4–30 (default 10)
+#   normalize       Text normalization (default False — enable for digits/symbols)
+#   voice_design    Text description embedded in ``text`` for voice design
+#                   (e.g. "(A young woman, gentle voice) Hello!"). Applied only
+#                   when no reference_wav_path is provided.
+#   reference_wav_path   Voice cloning reference audio (16 kHz WAV preferred).
+#   prompt_wav_path      Continuation prompt audio (paired with prompt_text).
+#   prompt_text          Transcript of prompt_wav_path.
+#   max_text_length     Override PROVIDER_MAX_TEXT_LENGTH lookup.
+#
+# Module-level cache: VoxCPM model instances are heavy (~5 GB RAM on first
+# load) and load slowly (~10–30 s). Caching by (model, device, denoise) avoids
+# re-paying that cost on every call. The same LRU cap that bounds Piper and
+# KittenTTS caches applies — most sessions use a single model.
+
+# Module-level cache for VoxCPM model instances.
+_voxcpm_model_cache: Dict[str, Any] = {}
+
+
+def _check_voxcpm_available() -> bool:
+    """Return True when the optional ``voxcpm`` Python package is importable."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("voxcpm") is not None
+    except Exception:
+        return False
+
+
+def _resolve_voxcpm_model_path(model: str) -> str:
+    """Resolve a VoxCPM model id / HF repo / local path to a concrete directory.
+
+    VoxCPM's :meth:`from_pretrained` accepts both HF repo ids
+    (``"openbmb/VoxCPM2"``) and local filesystem paths. When a user supplies a
+    repo id we pass it through unchanged; when they supply a path we expand
+    ``~`` first and verify it exists so a typo raises a clear error here
+    rather than a stack trace inside voxcpm's weight loader.
+    """
+    expanded = os.path.expanduser(model)
+    if os.path.isdir(expanded):
+        return expanded
+    # Looks like a repo id (org/name) — defer to voxcpm.from_pretrained to
+    # resolve. An expanded-but-nonexistent path is left expanded so the
+    # voxcpm loader's own FileNotFoundError shows the post-expansion path.
+    if expanded != model:
+        return expanded
+    return model
+
+
+def _generate_voxcpm_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using the local VoxCPM engine.
+
+    VoxCPM2 supports three synthesis modes selected by which inputs the user
+    configured:
+
+      1. **Voice design** — text begins with ``"(description) "`` (or no
+         reference audio). The model synthesizes a brand-new voice from the
+         natural-language description.
+      2. **Reference cloning** — ``reference_wav_path`` set. VoxCPM2 clones
+         the timbre of the reference clip while keeping the user's text.
+      3. **Continuation / ultimate cloning** — both ``prompt_wav_path`` and
+         ``prompt_text`` set. VoxCPM2 continues from the reference audio,
+         preserving every vocal nuance (timbre, rhythm, emotion, style).
+
+    Writes WAV. Caller is responsible for ffmpeg conversion to MP3/Opus.
+    """
+    VoxCPM = _import_voxcpm()
+    import soundfile as sf  # voxcpm only requires numpy + torch; we add sf for writing
+
+    voxcpm_config = tts_config.get("voxcpm") or {}
+    model_id = voxcpm_config.get("model", DEFAULT_VOXCPM_MODEL)
+    device = voxcpm_config.get("device", DEFAULT_VOXCPM_DEVICE)
+    load_denoiser = bool(voxcpm_config.get("load_denoiser", False))
+    local_files_only = bool(voxcpm_config.get("local_files_only", False))
+    cfg_value = float(voxcpm_config.get("cfg_value", DEFAULT_VOXCPM_CFG_VALUE))
+    inference_timesteps = int(
+        voxcpm_config.get("inference_timesteps", DEFAULT_VOXCPM_INFERENCE_TIMESTEPS)
+    )
+    normalize = bool(voxcpm_config.get("normalize", False))
+
+    reference_wav_path = voxcpm_config.get("reference_wav_path") or None
+    prompt_wav_path = voxcpm_config.get("prompt_wav_path") or None
+    prompt_text = voxcpm_config.get("prompt_text") or None
+
+    # Validate reference / prompt audio paths up front — voxcpm would raise a
+    # less clear FileNotFoundError from inside the model if we didn't.
+    for label, path in (
+        ("reference_wav_path", reference_wav_path),
+        ("prompt_wav_path", prompt_wav_path),
+    ):
+        if path and not os.path.exists(path):
+            raise FileNotFoundError(
+                f"voxcpm {label} not found: {path}"
+            )
+
+    # VoxCPM contract: prompt_wav_path and prompt_text must both be provided
+    # together (or both omitted). Validate before spending model-load time.
+    if (prompt_wav_path is None) != (prompt_text is None):
+        raise ValueError(
+            "voxcpm: prompt_wav_path and prompt_text must both be provided or both omitted"
+        )
+
+    # Cache key: distinct (model, device, denoise, local-only) settings share a
+    # model load. local_files_only is part of the key because the from_pretrained
+    # path differs (network vs cache-only resolution).
+    cache_key = f"{model_id}::{device}::denoise={load_denoiser}::local={local_files_only}"
+
+    def _load_voxcpm_model():
+        resolved = _resolve_voxcpm_model_path(model_id)
+        logger.info(
+            "[VoxCPM] Loading model: id=%s resolved=%s device=%s denoise=%s local_only=%s",
+            model_id, resolved, device, load_denoiser, local_files_only,
+        )
+        m = VoxCPM.from_pretrained(
+            resolved,
+            load_denoiser=load_denoiser,
+            device=None if device == "auto" else device,
+            local_files_only=local_files_only,
+        )
+        logger.info("[VoxCPM] Model loaded successfully")
+        return m
+
+    model = _tts_cache_get_or_load(_voxcpm_model_cache, cache_key, _load_voxcpm_model)
+
+    # VoxCPM outputs a numpy float32 waveform on CPU at the model's native
+    # sample rate (48 kHz for VoxCPM2, 44.1 kHz for VoxCPM1.5, 16 kHz for
+    # VoxCPM-0.5B). The sample_rate lives on the underlying tts_model.
+    sample_rate = int(model.tts_model.sample_rate)
+
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    logger.info(
+        "[VoxCPM] Generating: text=%d chars cfg=%.2f steps=%d ref=%s prompt=%s",
+        len(text), cfg_value, inference_timesteps,
+        bool(reference_wav_path), bool(prompt_wav_path),
+    )
+
+    # VoxCPM's _generate signature uses *args/**kwargs (defensively forwarding
+    # both streaming and non-streaming modes). Build kwargs explicitly so
+    # callers see exactly what we passed and a future API rename surfaces as a
+    # TypeError rather than a silent kwargs mismatch.
+    generate_kwargs: Dict[str, Any] = {
+        "text": text,
+        "cfg_value": cfg_value,
+        "inference_timesteps": inference_timesteps,
+        "normalize": normalize,
+    }
+    if reference_wav_path is not None:
+        generate_kwargs["reference_wav_path"] = reference_wav_path
+    if prompt_wav_path is not None:
+        generate_kwargs["prompt_wav_path"] = prompt_wav_path
+        generate_kwargs["prompt_text"] = prompt_text
+
+    audio = model.generate(**generate_kwargs)
+
+    sf.write(wav_path, audio, sample_rate, subtype="PCM_16")
+
+    if wav_path != output_path:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(
+                conv_cmd, check=True, timeout=30,
+                stdin=subprocess.DEVNULL,
+                creationflags=windows_hide_flags(),
+            )
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+        else:
+            # No ffmpeg — keep the WAV and let the caller handle the rename.
+            os.rename(wav_path, output_path)
+
+    return output_path
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def _text_to_speech_single(
@@ -3364,6 +3594,19 @@ def _text_to_speech_single(
                 }, ensure_ascii=False)
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
+
+        elif provider == "voxcpm":
+            if not _check_voxcpm_available():
+                return json.dumps({
+                    "success": False,
+                    "error": "VoxCPM provider selected but the 'voxcpm' package is not installed. "
+                             "Install with: pip install voxcpm modelscope soundfile. "
+                             "Then download the ~5GB VoxCPM2 weights via ModelScope (HF is "
+                             "blocked in some regions); see the VoxCPM provider docs for the "
+                             "recommended cache layout under ~/.hermes/models/VoxCPM2.",
+                }, ensure_ascii=False)
+            logger.info("Generating speech with VoxCPM (local, OpenBMB)...")
+            _generate_voxcpm_tts(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback

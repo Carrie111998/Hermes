@@ -256,6 +256,65 @@ tts:
 
 **Advanced knobs** (`tts.piper.length_scale` / `noise_scale` / `noise_w_scale` / `volume` / `normalize_audio`, `use_cuda`) correspond 1:1 to Piper's `SynthesisConfig`. They're ignored on older `piper-tts` versions.
 
+### VoxCPM (local, 30 languages, voice design + cloning)
+
+[VoxCPM](https://github.com/OpenBMB/VoxCPM) is OpenBMB's tokenizer-free, diffusion-autoregressive TTS engine. VoxCPM2 (default) is a **2B-parameter** model trained on >2M hours of multilingual speech, supporting **30 languages** (incl. 9 Chinese dialects: 粤语 / 川话 / 吴语 / 东北话 / 河南话 / 陕西话 / 山东话 / 天津话 / 闽南话), **48 kHz** studio-quality output, **voice design** from text prompts (no reference audio needed), and **reference-audio voice cloning**.
+
+Everything runs locally — no API key, no data leaves the host. The engine runs on CUDA / MPS / CPU (VoxCPM auto-selects when `device: auto`).
+
+**Install via `hermes tools`** → Voice & TTS → VoxCPM — Hermes installs `voxcpm`, `modelscope`, and `soundfile` for you and walks you through downloading the ~5 GB weights.
+
+**Install manually:**
+
+```bash
+pip install voxcpm modelscope soundfile
+# ModelScope recommended (HF is blocked in some regions):
+python -c "from modelscope import snapshot_download; snapshot_download('OpenBMB/VoxCPM2', local_dir='~/.hermes/models/VoxCPM2')"
+```
+
+**Switch to VoxCPM:**
+
+```yaml
+tts:
+  provider: voxcpm
+  voxcpm:
+    model: /Users/pwndazhang/.hermes/models/VoxCPM2
+    device: auto              # auto | cpu | mps | cuda | cuda:0
+    local_files_only: true    # skip weight download when already on disk
+    cfg_value: 2.0            # guidance scale, recommended 1.0-3.0
+    inference_timesteps: 10   # CFM denoising steps, 4-30
+    normalize: false          # enable for digits / symbols / abbreviations
+```
+
+**Voice design — synthesize a brand-new voice from a description alone.** Prefix the text with a parenthesized description:
+
+```python
+# In chat:
+"Say (A young woman, gentle and sweet voice) Welcome to VoxCPM2!"
+```
+
+The model synthesizes the described voice with no reference audio required.
+
+**Reference cloning — clone any voice from a short clip (~10-30s recommended):**
+
+```yaml
+tts:
+  voxcpm:
+    reference_wav_path: /path/to/voice_sample.wav  # 16 kHz WAV preferred
+```
+
+**Continuation / ultimate cloning** — provide both a prompt audio AND its transcript for vocal-nuance-perfect reproduction (preserves timbre, rhythm, emotion, style):
+
+```yaml
+tts:
+  voxcpm:
+    prompt_wav_path: /path/to/prompt.wav
+    prompt_text: "The exact transcript of prompt.wav"
+    reference_wav_path: /path/to/prompt.wav   # optional, for max similarity
+```
+
+**Resource notes.** VoxCPM2 weights are ~5 GB total (`model.safetensors` 4.6 GB + `audiovae.pth` 377 MB). First-load takes 10–30 s (model is then cached in-process). Apple Silicon uses MPS by default — measured RTF is ~1.8× real-time on M-series at `inference_timesteps: 10`. RTX 4090 reaches RTF ~0.3 (Nano-vLLM accelerated: ~0.13).
+
 ### Custom command providers
 
 If a TTS engine you want isn't natively supported (VoxCPM, MLX-Kokoro, XTTS CLI, a voice-cloning script, anything else that exposes a CLI), you can wire it in as a **command-type provider** without writing any Python. Hermes writes the input text to a temp UTF-8 file, runs your shell command, and reads the audio file the command produced.

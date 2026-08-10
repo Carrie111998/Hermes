@@ -206,6 +206,65 @@ tts:
 
 **高级参数**（`tts.piper.length_scale` / `noise_scale` / `noise_w_scale` / `volume` / `normalize_audio`、`use_cuda`）与 Piper 的 `SynthesisConfig` 一一对应。在较旧的 `piper-tts` 版本上这些参数会被忽略。
 
+### VoxCPM（本地，30 种语言，支持声音设计与克隆）
+
+[VoxCPM](https://github.com/OpenBMB/VoxCPM) 是 OpenBMB 开源的 **tokenizer-free 扩散自回归 TTS 引擎**。VoxCPM2（默认）是 **2B 参数**模型，在超过 200 万小时多语言语音数据上训练而成，支持 **30 种语言**（含 9 种中文方言：粤语 / 川话 / 吴语 / 东北话 / 河南话 / 陕西话 / 山东话 / 天津话 / 闽南话）、**48 kHz** 录音棚级输出、通过**文字描述生成全新声音**（无需参考音频）、以及**参考音频声音克隆**。
+
+完全本地推理 — 无需 API 密钥，数据不出本机。支持 CUDA / MPS / CPU（`device: auto` 时 VoxCPM 自动选择）。
+
+**通过 `hermes tools` 安装** → Voice & TTS → VoxCPM — Hermes 会自动安装 `voxcpm`、`modelscope`、`soundfile`，并引导你下载 ~5 GB 权重。
+
+**手动安装：**
+
+```bash
+pip install voxcpm modelscope soundfile
+# 推荐 ModelScope（某些地区 HF 被墙）：
+python -c "from modelscope import snapshot_download; snapshot_download('OpenBMB/VoxCPM2', local_dir='~/.hermes/models/VoxCPM2')"
+```
+
+**切换至 VoxCPM：**
+
+```yaml
+tts:
+  provider: voxcpm
+  voxcpm:
+    model: /Users/pwndazhang/.hermes/models/VoxCPM2
+    device: auto              # auto | cpu | mps | cuda | cuda:0
+    local_files_only: true    # 权重已下载时跳过联网
+    cfg_value: 2.0            # 引导尺度，推荐 1.0-3.0
+    inference_timesteps: 10   # CFM 降噪步数，4-30
+    normalize: false          # 数字 / 符号 / 缩写场景开启
+```
+
+**声音设计 — 仅靠文字描述合成全新声音。** 在文本前加括号描述：
+
+```python
+# 对话中说：
+"用（年轻女性，温柔甜美）音色说：欢迎使用 VoxCPM2！"
+```
+
+模型即可合成符合描述的声音，无需参考音频。
+
+**参考音频克隆 — 用 10-30 秒短样本克隆任意声音：**
+
+```yaml
+tts:
+  voxcpm:
+    reference_wav_path: /path/to/voice_sample.wav  # 推荐 16 kHz WAV
+```
+
+**延续 / 极致克隆** — 同时提供参考音频及其转录文本，完美还原音色 / 节奏 / 情感 / 风格：
+
+```yaml
+tts:
+  voxcpm:
+    prompt_wav_path: /path/to/prompt.wav
+    prompt_text: "prompt.wav 的精确转录文本"
+    reference_wav_path: /path/to/prompt.wav   # 可选，最大相似度
+```
+
+**资源说明。** VoxCPM2 权重共 ~5 GB（`model.safetensors` 4.6 GB + `audiovae.pth` 377 MB）。首次加载需 10–30 秒（模型随后在进程内缓存）。Apple Silicon 默认使用 MPS，实测 M 系列在 `inference_timesteps: 10` 下 RTF ~1.8× 实时。RTX 4090 约 0.3（Nano-vLLM 加速后 0.13）。
+
 ### 自定义命令提供商
 
 如果你想使用的 TTS 引擎未被原生支持（VoxCPM、MLX-Kokoro、XTTS CLI、声音克隆脚本，或任何其他暴露 CLI 的引擎），你可以将其作为**命令类型提供商**接入，无需编写任何 Python 代码。Hermes 将输入文本写入临时 UTF-8 文件，运行你的 shell 命令，并读取命令生成的音频文件。

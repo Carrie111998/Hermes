@@ -142,13 +142,13 @@ class TestCommandTtsEnv:
 
 class TestGetNamedProviderConfig:
     def test_providers_block_wins(self):
-        cfg = {"providers": {"voxcpm": {"command": "new"}},
-               "voxcpm": {"command": "legacy"}}
-        assert _get_named_provider_config(cfg, "voxcpm") == {"command": "new"}
+        cfg = {"providers": {"kokoro": {"command": "new"}},
+               "kokoro": {"command": "legacy"}}
+        assert _get_named_provider_config(cfg, "kokoro") == {"command": "new"}
 
     def test_legacy_tts_name_block_still_resolves(self):
-        cfg = {"voxcpm": {"type": "command", "command": "legacy"}}
-        assert _get_named_provider_config(cfg, "voxcpm") == {
+        cfg = {"kokoro": {"type": "command", "command": "legacy"}}
+        assert _get_named_provider_config(cfg, "kokoro") == {
             "type": "command", "command": "legacy"
         }
 
@@ -177,12 +177,12 @@ class TestIterCommandProviders:
             "providers": {
                 "openai": {"type": "command", "command": "shouldnt show up"},
                 "piper-cli": {"type": "command", "command": "piper-cli"},
-                "voxcpm": {"type": "command", "command": "voxcpm"},
+                "kokoro-cli": {"type": "command", "command": "kokoro-cli"},
                 "broken": {"type": "command", "command": ""},
             },
         }
         names = sorted(name for name, _ in _iter_command_providers(cfg))
-        assert names == ["piper-cli", "voxcpm"]
+        assert names == ["kokoro-cli", "piper-cli"]
 
 
     def test_has_any_command_provider_when_none(self):
