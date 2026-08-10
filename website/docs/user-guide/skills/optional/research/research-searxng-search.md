@@ -33,19 +33,23 @@ The following is the complete skill definition that Hermes loads when this skill
 
 Free meta-search using [SearXNG](https://searxng.org/) — a privacy-respecting, self-hosted search aggregator that queries 70+ search engines simultaneously.
 
-**No API key required** when using a public instance. Can also be self-hosted for full control. Automatically appears as a fallback when the main web search toolset (`FIRECRAWL_API_KEY`) is not configured.
+**No API key required**, but it does require an instance whose **JSON API is enabled**. In practice this means self-hosting: most public instances serve `format=html` only and reject `format=json` (HTTP 403), or sit behind a bot-check/CAPTCHA wall. Automatically appears as a fallback when the main web search toolset (`FIRECRAWL_API_KEY`) is not configured.
 
 ## Configuration
 
 SearXNG requires a `SEARXNG_URL` environment variable pointing to your SearXNG instance:
 
 ```bash
-# Public instances (no setup required)
-SEARXNG_URL=https://searxng.example.com
-
-# Self-hosted SearXNG
-SEARXNG_URL=http://localhost:8888
+# Self-hosted SearXNG (recommended — see "Self-Hosting" below)
+SEARXNG_URL=http://127.0.0.1:8888
 ```
+
+:::warning
+The JSON API is opt-in. SearXNG's shipped `settings.yml` sets
+`search.formats: [html]`. Until `json` is added to that list, every
+`format=json` request returns HTTP 403 and Hermes reports the backend as
+unavailable. This is a server-side setting — it cannot be fixed from the client.
+:::
 
 If no instance is configured, this skill is unavailable and the agent falls back to other search options.
 
@@ -143,27 +147,70 @@ for r in data.get("results", []):
 
 ## Self-Hosting SearXNG
 
-To run your own SearXNG instance:
+Self-hosting is the reliable path, because you control whether the JSON API is enabled.
+
+### Option A: Docker
 
 ```bash
-# Using Docker
-docker run -d -p 8888:8080 \
-  -v $(pwd)/searxng:/etc/searxng \
+docker run -d --name searxng -p 8888:8080 \
+  -v "$(pwd)/searxng:/etc/searxng" \
   searxng/searxng:latest
-
-# Then set
-SEARXNG_URL=http://localhost:8888
 ```
 
-Or install via pip:
+Then add `json` to `search.formats` in `./searxng/settings.yml` and restart the
+container (`docker restart searxng`). The default config is HTML-only.
+
+### Option B: From source (no container runtime)
+
+Requires Python 3.10+. `uv` is a convenient way to get one without touching the
+system Python.
+
 ```bash
-pip install searxng
-# Edit /etc/searxng/settings.yml
-searxng-run
+git clone --depth 1 https://github.com/searxng/searxng.git ~/services/searxng
+cd ~/services/searxng
+
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-server.txt
 ```
 
-Public SearXNG instances are available at:
-- `https://searxng.example.com` (replace with any public instance)
+Create `~/services/searxng/settings.yml`:
+
+```yaml
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json      # REQUIRED — Hermes calls /search?format=json
+
+server:
+  port: 8888
+  bind_address: "127.0.0.1"
+  secret_key: "REPLACE_ME"   # openssl rand -hex 32
+  limiter: false             # must be false, or the JSON API gets bot-challenged
+  public_instance: false
+```
+
+Run it with the bundled `granian` WSGI server, then set
+`SEARXNG_URL=http://127.0.0.1:8888`:
+
+```bash
+cd ~/services/searxng
+SEARXNG_SETTINGS_PATH=$PWD/settings.yml \
+  .venv/bin/python -m granian --interface wsgi \
+  --host 127.0.0.1 --port 8888 searx.webapp:app
+```
+
+:::warning
+There is no `pip install searxng`. SearXNG is not distributed as a runnable
+PyPI package and provides no `searxng-run` entrypoint — the `searxng` name on
+PyPI is an unrelated third-party stub. Install from source or use the
+container image.
+:::
+
+Public instance lists live at [searx.space](https://searx.space/) — but verify
+`format=json` support before relying on one, since most instances serve HTML
+only or sit behind a bot-check wall.
 
 ## Workflow: Search then Extract
 

@@ -1,7 +1,7 @@
 ---
 name: searxng-search
 description: Free keyless meta-search aggregating 70+ engines.
-version: 1.0.1
+version: 1.1.0
 author: hermes-agent
 license: MIT
 platforms: [linux, macos]
@@ -16,19 +16,22 @@ metadata:
 
 Free meta-search using [SearXNG](https://searxng.org/) — a privacy-respecting, self-hosted search aggregator that queries 70+ search engines simultaneously.
 
-**No API key required** when using a public instance. Can also be self-hosted for full control. Automatically appears as a fallback when the main web search toolset (`FIRECRAWL_API_KEY`) is not configured.
+**No API key required**, but it does require an instance whose **JSON API is enabled**. In practice this means self-hosting: most public instances serve `format=html` only and reject `format=json` (HTTP 403), or sit behind a bot-check/CAPTCHA wall. Automatically appears as a fallback when the main web search toolset (`FIRECRAWL_API_KEY`) is not configured.
 
 ## Configuration
 
 SearXNG requires a `SEARXNG_URL` environment variable pointing to your SearXNG instance:
 
 ```bash
-# Public instances (no setup required)
-SEARXNG_URL=https://searxng.example.com
-
-# Self-hosted SearXNG
-SEARXNG_URL=http://localhost:8888
+# Self-hosted SearXNG (recommended — see "Self-Hosting" below)
+SEARXNG_URL=http://127.0.0.1:8888
 ```
+
+> **The JSON API is opt-in.** SearXNG's shipped `settings.yml` sets
+> `search.formats: [html]`. Until `json` is added to that list, every
+> `format=json` request returns HTTP 403 and Hermes reports the backend as
+> unavailable. Enabling it is a server-side change — it cannot be fixed from
+> the client.
 
 If no instance is configured, this skill is unavailable and the agent falls back to other search options.
 
@@ -126,27 +129,95 @@ for r in data.get("results", []):
 
 ## Self-Hosting SearXNG
 
-To run your own SearXNG instance:
+Self-hosting is the reliable path, because you control whether the JSON API is enabled.
+
+### Option A: Docker
 
 ```bash
-# Using Docker
-docker run -d -p 8888:8080 \
-  -v $(pwd)/searxng:/etc/searxng \
+docker run -d --name searxng -p 8888:8080 \
+  -v "$(pwd)/searxng:/etc/searxng" \
   searxng/searxng:latest
-
-# Then set
-SEARXNG_URL=http://localhost:8888
 ```
 
-Or install via pip:
+Then add `json` to `search.formats` in `./searxng/settings.yml` and restart the
+container (`docker restart searxng`). The default config is HTML-only.
+
+### Option B: From source (no container runtime)
+
+Use this when Docker/Podman/Colima are unavailable. Requires Python 3.10+;
+`uv` is a convenient way to get one without touching the system Python.
+
 ```bash
-pip install searxng
-# Edit /etc/searxng/settings.yml
-searxng-run
+git clone --depth 1 https://github.com/searxng/searxng.git ~/services/searxng
+cd ~/services/searxng
+
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-server.txt
 ```
 
-Public SearXNG instances are available at:
-- `https://searxng.example.com` (replace with any public instance)
+Create a settings file that inherits the defaults and overrides only what is
+needed (`~/services/searxng/settings.yml`):
+
+```yaml
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json      # REQUIRED — Hermes calls /search?format=json
+
+server:
+  port: 8888
+  bind_address: "127.0.0.1"
+  secret_key: "REPLACE_ME"   # openssl rand -hex 32
+  limiter: false             # must be false, or the JSON API gets bot-challenged
+  public_instance: false
+```
+
+Run it with the bundled `granian` WSGI server:
+
+```bash
+cd ~/services/searxng
+SEARXNG_SETTINGS_PATH=$PWD/settings.yml \
+  .venv/bin/python -m granian --interface wsgi \
+  --host 127.0.0.1 --port 8888 searx.webapp:app
+```
+
+Then set `SEARXNG_URL=http://127.0.0.1:8888`.
+
+> **There is no `pip install searxng`.** SearXNG is not distributed as a
+> runnable PyPI package and provides no `searxng-run` entrypoint. The
+> `searxng` name on PyPI is an unrelated third-party stub (an MCP server at
+> version `0.0.0.dev0`). Install from source or use the container image.
+
+### Keeping it running (macOS launchd)
+
+Run it as a user agent so it survives logout/reboot and restarts on crash.
+`~/Library/LaunchAgents/com.local.searxng.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.local.searxng</string>
+    <key>ProgramArguments</key>
+    <array><string>/Users/YOU/services/searxng/run-searxng.sh</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict>
+</plist>
+```
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.searxng.plist
+launchctl print gui/$(id -u)/com.local.searxng | grep -E "state|pid"
+```
+
+Use `launchctl bootout gui/$(id -u)/com.local.searxng` to stop it.
+
+Public instance lists live at https://searx.space/ — but check
+`format=json` support before relying on one.
 
 ## Workflow: Search then Extract
 
@@ -172,11 +243,15 @@ curl -s "${SEARXNG_URL}/search?q=fastapi+deployment&format=json&limit=3"
 
 | Problem | Likely Cause | What To Do |
 |---------|--------------|------------|
-| `SEARXNG_URL` not set | No instance configured | Use a public SearXNG instance or set up your own |
-| Connection refused | Instance not running or wrong URL | Check the URL is correct and the instance is running |
+| `SEARXNG_URL` not set | No instance configured | Set up your own instance (see Self-Hosting) |
+| HTTP 403 on `format=json` | Instance is HTML-only (`search.formats: [html]`) | Add `json` to `search.formats` and restart |
+| HTML captcha / "Verifying your browser" instead of JSON | Public instance behind a bot wall, or `limiter: true` | Self-host; set `limiter: false` and `public_instance: false` |
+| HTTP 429 | Public instance rate-limiting you | Self-host |
+| Connection refused | Instance not running or wrong URL | Check the URL and that the process is listening |
 | Empty results | Instance blocks the query | Try a different instance or self-host |
 | Slow responses | Public instance under load | Self-host or use a less-loaded public instance |
 | `json` format not supported | Old SearXNG version | Try `format=rss` or upgrade SearXNG |
+| Some engines missing from results | Upstream engine rate-limited/CAPTCHA'd | Normal for metasearch; check `unresponsive_engines` in the JSON |
 
 ## Pitfalls
 
@@ -188,8 +263,16 @@ curl -s "${SEARXNG_URL}/search?q=fastapi+deployment&format=json&limit=3"
 
 ## Instance Discovery
 
-If `SEARXNG_URL` is not set and the user asks about SearXNG, help them either:
-1. Find a public SearXNG instance (search for "public searxng instance")
-2. Set up their own with Docker or pip
+If `SEARXNG_URL` is not set and the user asks about SearXNG, guide them to
+**self-host** (see Self-Hosting above) — that is the only setup that reliably
+exposes the JSON API this skill depends on.
 
-Public instances are listed at: https://searxng.org/
+Before trusting any public instance, verify it actually serves JSON:
+
+```bash
+curl -s -m 10 "https://INSTANCE/search?q=test&format=json" | head -c 200
+# JSON starting with {"query": ... → usable
+# HTML (<!doctype html>) or HTTP 403/429 → not usable
+```
+
+Public instance lists: https://searx.space/

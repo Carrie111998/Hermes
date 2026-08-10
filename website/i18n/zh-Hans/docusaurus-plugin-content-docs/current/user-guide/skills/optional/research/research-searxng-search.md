@@ -33,19 +33,22 @@ description: "通过 SearXNG 免费元搜索 — 聚合 70+ 搜索引擎的结�
 
 使用 [SearXNG](https://searxng.org/) 进行免费元搜索——这是一个注重隐私的自托管搜索聚合器，可同时查询 70+ 搜索引擎。
 
-使用公共实例时**无需 API 密钥**。也可自托管以获得完全控制权。当主 web 搜索工具集（`FIRECRAWL_API_KEY`）未配置时，自动作为回退方案出现。
+**无需 API 密钥**，但需要一个**已启用 JSON API** 的实例。实际上这意味着需要自托管：大多数公共实例仅提供 `format=html`，会拒绝 `format=json`（HTTP 403），或设有机器人检测/验证码墙。当主 web 搜索工具集（`FIRECRAWL_API_KEY`）未配置时，自动作为回退方案出现。
 
 ## 配置
 
 SearXNG 需要一个 `SEARXNG_URL` 环境变量，指向你的 SearXNG 实例：
 
 ```bash
-# 公共实例（无需任何设置）
-SEARXNG_URL=https://searxng.example.com
-
-# 自托管 SearXNG
-SEARXNG_URL=http://localhost:8888
+# 自托管 SearXNG（推荐 —— 参见下方"自托管"）
+SEARXNG_URL=http://127.0.0.1:8888
 ```
+
+:::warning
+JSON API 需要手动启用。SearXNG 自带的 `settings.yml` 设置的是
+`search.formats: [html]`。在把 `json` 加入该列表之前，所有 `format=json` 请求都会
+返回 HTTP 403，Hermes 会报告该后端不可用。这是服务端设置——无法从客户端修复。
+:::
 
 如果未配置实例，此 skill 不可用，agent 将回退到其他搜索选项。
 
@@ -141,46 +144,69 @@ for r in data.get("results", []):
     print()
 ```
 
-## 方法三：searxng-data Python 包
-
-如需更结构化的访问，安装 `searxng-data` 包：
-
-```bash
-pip install searxng-data
-```
-
-```python
-from searxng_data import engines
-
-# 列出可用引擎
-print(engines.list_engines())
-```
-
-注意：此包仅提供引擎元数据，不提供搜索 API 本身。
-
 ## 自托管 SearXNG
 
-运行你自己的 SearXNG 实例：
+自托管是可靠的方案，因为你可以自行控制是否启用 JSON API。
+
+### 方案 A：Docker
 
 ```bash
-# 使用 Docker
-docker run -d -p 8888:8080 \
-  -v $(pwd)/searxng:/etc/searxng \
+docker run -d --name searxng -p 8888:8080 \
+  -v "$(pwd)/searxng:/etc/searxng" \
   searxng/searxng:latest
-
-# 然后设置
-SEARXNG_URL=http://localhost:8888
 ```
 
-或通过 pip 安装：
+然后在 `./searxng/settings.yml` 的 `search.formats` 中加入 `json`，并重启容器
+（`docker restart searxng`）。默认配置仅支持 HTML。
+
+### 方案 B：从源码安装（无需容器运行时）
+
+需要 Python 3.10+。`uv` 可以在不改动系统 Python 的情况下提供合适的版本。
+
 ```bash
-pip install searxng
-# 编辑 /etc/searxng/settings.yml
-searxng-run
+git clone --depth 1 https://github.com/searxng/searxng.git ~/services/searxng
+cd ~/services/searxng
+
+uv venv --python 3.11 .venv
+uv pip install --python .venv/bin/python -r requirements.txt -r requirements-server.txt
 ```
 
-公共 SearXNG 实例可在以下地址找到：
-- `https://searxng.example.com`（替换为任意公共实例）
+创建 `~/services/searxng/settings.yml`：
+
+```yaml
+use_default_settings: true
+
+search:
+  formats:
+    - html
+    - json      # 必需 —— Hermes 调用 /search?format=json
+
+server:
+  port: 8888
+  bind_address: "127.0.0.1"
+  secret_key: "REPLACE_ME"   # openssl rand -hex 32
+  limiter: false             # 必须为 false，否则 JSON API 会被机器人检测拦截
+  public_instance: false
+```
+
+使用自带的 `granian` WSGI 服务器运行，然后设置
+`SEARXNG_URL=http://127.0.0.1:8888`：
+
+```bash
+cd ~/services/searxng
+SEARXNG_SETTINGS_PATH=$PWD/settings.yml \
+  .venv/bin/python -m granian --interface wsgi \
+  --host 127.0.0.1 --port 8888 searx.webapp:app
+```
+
+:::warning
+不存在 `pip install searxng` 这种安装方式。SearXNG 并未作为可运行的 PyPI 包发布，
+也没有提供 `searxng-run` 入口点——PyPI 上的 `searxng` 是一个无关的第三方存根包。
+请从源码安装或使用容器镜像。
+:::
+
+公共实例列表见 [searx.space](https://searx.space/)——但在依赖某个实例之前，请先
+验证它是否支持 `format=json`，因为大多数实例仅提供 HTML 或设有机器人检测。
 
 ## 工作流：先搜索后提取
 
