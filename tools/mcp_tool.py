@@ -2718,10 +2718,24 @@ class MCPServerTask:
             # Capture old tool names for change diff
             old_tool_names = set(self._registered_tool_names)
 
-            # 1. Fetch current tool list from server (follow nextCursor)
+            # 1. Fetch current tool list from server (follow nextCursor).
+            # Dynamic list_changed refreshes are scheduled out-of-band from the
+            # MCP SDK notification handler.  By the time the background task
+            # reaches the RPC lock, the transport may already have recycled or
+            # torn down the session (self.session = None).  A missing session
+            # here is not a user-visible tool-call failure: keep the existing
+            # registered tools and let the normal reconnect/discovery path
+            # refresh the dynamic list on the next live session.
             async with self._rpc_lock:
+                session = self.session
+                if session is None:
+                    logger.info(
+                        "MCP server '%s': skipping dynamic tool refresh; session is not connected",
+                        self.name,
+                    )
+                    return
                 new_mcp_tools = await _paginate_full_list(
-                    self.session.list_tools, "tools", self.name
+                    session.list_tools, "tools", self.name
                 )
 
             # 2. Re-register with fresh tool list. Avoid nuke-and-repave for

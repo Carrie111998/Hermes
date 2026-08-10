@@ -1,6 +1,7 @@
 """Tests for MCP dynamic tool discovery (notifications/tools/list_changed)."""
 
 import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -74,6 +75,50 @@ class TestRefreshTools:
             assert "mcp__live_srv__new_tool" in mock_registry.get_all_tool_names()
             assert "mcp__live_srv__new_tool" in resolve_toolset("live_srv")
             assert server._registered_tool_names == ["mcp__live_srv__new_tool"]
+
+    @pytest.mark.asyncio
+    async def test_refresh_skips_when_session_disappears_before_list_tools(self, mock_registry, caplog):
+        """A dynamic refresh must not crash if teardown clears session first."""
+        caplog.set_level(logging.INFO, logger="tools.mcp_tool")
+
+        class OldSession:
+            async def list_tools(self, *args, **kwargs):  # pragma: no cover - should not run
+                raise AssertionError("stale session should not be queried")
+
+        class RaceRpcLock:
+            def __init__(self, server):
+                self.server = server
+
+            async def __aenter__(self):
+                self.server.session = None
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def locked(self):
+                return False
+
+        server = MCPServerTask("live_srv")
+        server._refresh_lock = asyncio.Lock()
+        server._rpc_lock = RaceRpcLock(server)
+        server._config = {}
+        server.session = OldSession()
+        server._registered_tool_names = ["mcp__live_srv__old_tool"]
+
+        with patch("tools.registry.registry", mock_registry):
+            await server._refresh_tools()
+
+        assert server._registered_tool_names == ["mcp__live_srv__old_tool"]
+        assert "session is not connected" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_refresh_task_does_not_log_failure_when_session_disappears(self, caplog):
+        server = MCPServerTask("live_srv")
+        server.session = None
+
+        await server._refresh_tools_task()
+
+        assert "dynamic tool refresh failed" not in caplog.text
 
 
 class TestMessageHandler:
