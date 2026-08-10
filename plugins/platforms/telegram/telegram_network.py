@@ -10,6 +10,7 @@ IPv4 addresses.
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
 import logging
 import socket
@@ -129,12 +130,13 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                 attempt_order.append(ip)
 
         last_error: Exception | None = None
+        avoid_sticky_fallback = False
         for ip in attempt_order:
             candidate = request if ip is None else _rewrite_request_for_ip(request, ip)
             transport = self._primary if ip is None else await self._get_fallback(ip)
             try:
                 response = await transport.handle_async_request(candidate)
-                if ip is not None and self._sticky_ip != ip:
+                if ip is not None and self._sticky_ip != ip and not avoid_sticky_fallback:
                     async with self._sticky_lock:
                         if self._sticky_ip != ip:
                             self._sticky_ip = ip
@@ -156,6 +158,7 @@ class TelegramFallbackTransport(httpx.AsyncBaseTransport):
                                 ip,
                             )
                 if ip is None:
+                    avoid_sticky_fallback = _is_local_dns_or_fd_error(exc)
                     await self._reset_primary(transport)
                     logger.warning(
                         "[Telegram] Primary api.telegram.org connection failed (%s); trying fallback IPs %s",
@@ -317,6 +320,25 @@ def _rewrite_request_for_ip(request: httpx.Request, ip: str) -> httpx.Request:
         stream=request.stream,
         extensions=extensions,
     )
+
+
+def _is_local_dns_or_fd_error(exc: Exception) -> bool:
+    """Return whether an error came from local DNS or descriptor exhaustion."""
+    fd_errnos = {errno.EMFILE}
+    enfile = getattr(errno, "ENFILE", None)
+    if enfile is not None:
+        fd_errnos.add(enfile)
+
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, socket.gaierror):
+            return True
+        if isinstance(current, OSError) and current.errno in fd_errnos:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
 
 
 def _is_retryable_connect_error(exc: Exception) -> bool:

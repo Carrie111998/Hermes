@@ -29,6 +29,9 @@ Contract asserted here (mutation-survivable)
 2. A caller-supplied ``limits`` kwarg wins over the ``_POOL_LIMITS`` default.
 """
 
+import errno
+import socket
+
 import httpx
 import pytest
 
@@ -53,6 +56,14 @@ class _CountingTransport(httpx.AsyncBaseTransport):
             raise httpx.ConnectTimeout("timed out")
         if action == "connect_error":
             raise httpx.ConnectError("connect error")
+        if action == "dns_error":
+            cause = socket.gaierror(
+                getattr(socket, "EAI_AGAIN", -3), "temporary DNS failure"
+            )
+            raise httpx.ConnectError(str(cause)) from cause
+        if action == "fd_error":
+            cause = OSError(errno.EMFILE, "too many open files")
+            raise httpx.ConnectError(str(cause)) from cause
         return httpx.Response(200, request=request, text="ok")
 
     async def aclose(self) -> None:
@@ -141,6 +152,32 @@ async def test_failed_primary_pool_is_discarded_and_closed(monkeypatch):
         assert instances[0].closed
         assert not instances[1].closed
         assert not instances[2].closed
+    finally:
+        await transport.aclose()
+
+
+@pytest.mark.parametrize("failure", ["dns_error", "fd_error"])
+@pytest.mark.asyncio
+async def test_local_dns_or_fd_failure_does_not_make_fallback_sticky(
+    monkeypatch, failure
+):
+    """Local resolver/resource failures must not pin a fallback IP."""
+    behavior = {"api.telegram.org": failure, "149.154.167.220": "ok"}
+    instances = []
+
+    def factory(**kwargs):
+        transport = _CountingTransport(behavior, [])
+        instances.append(transport)
+        return transport
+
+    monkeypatch.setattr(tnet.httpx, "AsyncHTTPTransport", factory)
+    transport = tnet.TelegramFallbackTransport(["149.154.167.220"])
+    try:
+        response = await transport.handle_async_request(_telegram_request())
+        assert response.status_code == 200
+        assert len(instances) == 3
+        assert instances[0].closed
+        assert transport._sticky_ip is None
     finally:
         await transport.aclose()
 
