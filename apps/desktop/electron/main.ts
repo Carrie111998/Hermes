@@ -163,6 +163,7 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
+import { createPrimaryProfileOwner, resolveEffectivePrimaryProfile } from './primary-profile'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
@@ -8016,6 +8017,15 @@ function stopBackendChild(child) {
   stopBackendChildImpl(child, { forceKillProcessTree, isWindows: IS_WINDOWS })
 }
 
+// Frozen identity of the primary backend for its lifetime. The legacy
+// `active_profile` file is launch input, not a live routing signal.
+const primaryProfileOwner = createPrimaryProfileOwner(() =>
+  resolveEffectivePrimaryProfile({
+    desktopProfile: readActiveDesktopProfile(),
+    hermesHome: HERMES_HOME
+  })
+)
+
 // Soft gateway-mode apply: tear down the primary without resetting boot UI or
 // reloading the renderer. The shell stays up; the renderer wipes session lists
 // (so skeletons retrigger) and re-dials. Distinct from hard re-home (profile
@@ -8024,6 +8034,7 @@ function resetHermesConnection({ soft = false } = {}) {
   backendStartFailure = null
   remoteReauthFailure = null
   remoteLiveness.clear()
+  primaryProfileOwner.reset()
   const hermesProcess = backendConnectionState.invalidate()
   stopBackendChild(hermesProcess)
 
@@ -8108,11 +8119,12 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   })
 }
 
-// The profile the primary (window) backend runs as. readActiveDesktopProfile()
-// returns the desktop's stored preference, or null when unset (legacy launch
-// that defers to active_profile / default).
+// The profile the primary (window) backend actually runs as. An explicit
+// Desktop preference wins; otherwise mirror the CLI's profile-scoped
+// HERMES_HOME → legacy active_profile → default precedence. Freeze the result
+// until teardown so an external sticky-file edit cannot relabel a live backend.
 function primaryProfileKey() {
-  return readActiveDesktopProfile() || 'default'
+  return primaryProfileOwner.get()
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
@@ -10686,7 +10698,7 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
+ipcMain.handle('hermes:profile:get', async () => ({ profile: primaryProfileKey() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
   const next = writeActiveDesktopProfile(name)
 
