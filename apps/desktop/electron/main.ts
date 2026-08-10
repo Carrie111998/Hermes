@@ -33,7 +33,7 @@ import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
-import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
+import { dashboardFallbackArgs, serveBackendArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
@@ -8562,18 +8562,10 @@ async function startHermes() {
     // Resolve for the desktop's primary profile so a per-profile remote
     // override on the active profile is honored (falls back to env / global).
     const token = crypto.randomBytes(32).toString('base64url')
-    // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
-    const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
-
-    if (activeProfile) {
-      backendArgs.unshift('--profile', activeProfile)
-    }
+    // Pin every local launch to the frozen owner. Without this, a crash respawn
+    // could follow a changed legacy active_profile file while Electron kept
+    // routing and labeling the connection as the prior owner.
+    const backendArgs = serveBackendArgs(primaryProfileKey())
 
     const setup = await runPrimaryBackendStartup({
       connectRemote,

@@ -3,6 +3,7 @@ import path from 'node:path'
 
 import { test, vi } from 'vitest'
 
+import { serveBackendArgs } from './backend-command'
 import { createPrimaryProfileOwner, resolveEffectivePrimaryProfile } from './primary-profile'
 
 const ROOT = path.join(path.parse(process.cwd()).root, 'tmp', 'hermes-home')
@@ -56,4 +57,14 @@ test('primary owner stays frozen until the backend lifecycle resets', () => {
 
   owner.reset()
   assert.equal(owner.get(), 'work')
+})
+
+test('local respawns stay pinned when the legacy sticky profile changes', () => {
+  let stickyProfile = 'life'
+  const owner = createPrimaryProfileOwner(() => stickyProfile)
+
+  assert.deepEqual(serveBackendArgs(owner.get()), ['--profile', 'life', 'serve', '--host', '127.0.0.1', '--port', '0'])
+
+  stickyProfile = 'work'
+  assert.deepEqual(serveBackendArgs(owner.get()), ['--profile', 'life', 'serve', '--host', '127.0.0.1', '--port', '0'])
 })
