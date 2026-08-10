@@ -2360,6 +2360,9 @@ export const ja = defineLocale({
         loading: '内訳を読み込み中…',
         automaticCompression: (percent, tokens) => `約${percent}%で自動圧縮（${tokens}トークン）`,
         compressionDue: '次のモデル呼び出し前に圧縮が開始されます。',
+        compressNow: '今すぐ圧縮',
+        compressNowTitle: '次のターンの前にこのセッションを圧縮',
+        compressUnavailable: '現在のセッション処理が完了するまでお待ちください。',
         percentFull: percent => `${percent}% 使用中`,
         title: 'コンテキスト使用状況',
         tokensRemaining: tokens => `自動圧縮まで残り${tokens}トークン`,
@@ -2765,11 +2768,12 @@ export const ja = defineLocale({
     resumeStrandedBody:
       'このセッションへの接続に失敗し、自動再試行も停止しました。ゲートウェイが実行中か確認してから、もう一度お試しください。',
     resumeRetry: '再試行',
-    compactionGuardTitle: 'このセッションを圧縮中',
+    compactionGuardTitle: sessionLabel => `「${sessionLabel}」を圧縮中`,
+    compactionGuardSessionId: sessionId => `セッション ${sessionId}`,
     compactionGuardDescription:
-      'Hermes が以前のコンテキストを要約しています。メッセージの送信とこのセッションの変更は一時的に無効です。',
+      'Hermes がこのチャットの以前のコンテキストを要約しています。一時的にロックされるのはこのチャットだけで、他のセッションへ切り替えられます。',
     compactionGuardStatus:
-      '圧縮されたセッションが読み込まれると、この画面は自動的に解除されます。下書きは保持されます。',
+      '圧縮の完了または失敗が Hermes から報告されるまで、ここでの送信、ステアリング、キュー追加は無効です。下書きは保持されます。',
     compactionCompleteTitle: 'コンテキストを圧縮しました',
     compactionCompleteMessage: '過去の履歴が正常に要約されました。このセッションを続けられます。',
     compactionFailedTitle: 'コンテキストの圧縮に失敗しました',

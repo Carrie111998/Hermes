@@ -274,6 +274,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
   } = deps
 
   const unscopedStreamSessionIdRef = useRef<string | null>(null)
+  const manualCompactingSessionsRef = useRef(new Set<string>())
 
   // session.info arrives in bursts (agent build ready + turn end + title /
   // MCP / compress edges within the same second). Each used to fire its own
@@ -418,6 +419,16 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         const modelChanged = typeof payload?.model === 'string'
         const providerChanged = typeof payload?.provider === 'string'
         const runningChanged = typeof payload?.running === 'boolean'
+
+        // Manual `/compress` is an idle control operation rather than a turn:
+        // it emits `status.update(kind="compressing")`, then an authoritative
+        // idle session.info after committing the replacement history. Unlock
+        // without the automatic-compaction success toast — the slash action
+        // owns the richer success/aborted/no-op result from session.compress.
+        if (sessionId && payload?.running === false && manualCompactingSessionsRef.current.delete(sessionId)) {
+          setSessionCompacting(sessionId, false)
+        }
+
         // The backend stamps model/provider (as strings) on EVERY session.info,
         // so the presence flags above are true on every heartbeat/turn edge —
         // fine for the cheap atom writes below (nanostores skips identical
@@ -612,6 +623,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         flushQueuedDeltas(sessionId)
         pruneFinishedSessionSubagents(sessionId)
         setSessionCompacting(sessionId, false)
+        manualCompactingSessionsRef.current.delete(sessionId)
         compactedTurnRef.current.delete(sessionId)
         nativeSubagentSessionsRef.current.delete(sessionId)
         // A fresh turn on this session optimistically clears its billing wall;
@@ -782,6 +794,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // last item stuck pending/in_progress. Finished lists keep their linger.
         clearActiveSessionTodos(sessionId)
         setSessionCompacting(sessionId, false)
+        manualCompactingSessionsRef.current.delete(sessionId)
 
         flushQueuedDeltas(sessionId)
 
@@ -1183,9 +1196,22 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         if (sessionId && payload?.kind === 'compacting') {
           setSessionCompacting(sessionId, true)
           compactedTurnRef.current.add(sessionId)
+        } else if (sessionId && payload?.kind === 'compressing') {
+          setSessionCompacting(sessionId, true)
+          manualCompactingSessionsRef.current.add(sessionId)
         } else if (sessionId && payload?.kind === 'compacted') {
           completeSessionCompaction(sessionId)
           compactedTurnRef.current.delete(sessionId)
+        } else if (
+          sessionId &&
+          payload?.kind === 'ready' &&
+          manualCompactingSessionsRef.current.delete(sessionId)
+        ) {
+          // `ready` is the manual compressor's finally edge. It also fires on
+          // abort/error paths that do not emit session.info, so it must always
+          // release the lock but must not claim success; `/compress` renders the
+          // authoritative RPC result (or error) immediately afterward.
+          setSessionCompacting(sessionId, false)
         } else if (sessionId && payload?.kind === 'process') {
           // The gateway's notification poller announces background process
           // completions / watch matches here — re-sync the status stack.
@@ -1263,6 +1289,7 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
           clearClarifyRequest(undefined, sessionId)
           clearActiveSessionTodos(sessionId)
           setSessionCompacting(sessionId, false)
+          manualCompactingSessionsRef.current.delete(sessionId)
           compactedTurnRef.current.delete(sessionId)
         }
 

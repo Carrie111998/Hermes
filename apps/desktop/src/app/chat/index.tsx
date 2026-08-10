@@ -343,6 +343,13 @@ export const ChatView = memo(function ChatView({
   const sessions = useStore($sessions)
   const resumeExhaustedSessionId = useStore($resumeExhaustedSessionId)
 
+  const compactionSessionLabel = useMemo(() => {
+    const identity = selectedSessionId || activeSessionId
+    const storedSession = identity ? sessions.find(session => sessionMatchesStoredId(session, identity)) : null
+
+    return storedSession ? sessionTitle(storedSession) : NEW_SESSION_TITLE
+  }, [activeSessionId, selectedSessionId, sessions])
+
   // Durable composer/queue scope (lineage root) so auto-compression tip rotation
   // does not wipe an in-progress draft or orphan /queue entries. For the
   // primary view, the route is authoritative over the store selection — the
@@ -529,7 +536,7 @@ export const ChatView = memo(function ChatView({
           so a tiled/background session's blocking prompt surfaces instead of
           stalling to timeout. */}
       <PromptOverlays sessionId={activeSessionId} />
-      <CompactionGuard sessionId={activeSessionId} />
+      <CompactionGuard sessionId={activeSessionId} sessionLabel={compactionSessionLabel} />
 
       <ChatRuntimeBoundary
         busy={busy}

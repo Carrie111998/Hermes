@@ -2,7 +2,7 @@ import { act, cleanup, renderHook, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { $clarifyRequests } from '@/store/clarify'
-import type { ComposerAttachment } from '@/store/composer'
+import { type ComposerAttachment, stashSessionDraft, takeSessionDraft } from '@/store/composer'
 import { $gateway } from '@/store/gateway'
 
 import { useComposerSubmit } from './use-composer-submit'
@@ -69,6 +69,7 @@ function renderSubmitHook({
 describe('useComposerSubmit busy-turn routing', () => {
   afterEach(() => {
     cleanup()
+    takeSessionDraft('stored-session')
     vi.restoreAllMocks()
   })
 
@@ -106,6 +107,31 @@ describe('useComposerSubmit busy-turn routing', () => {
     expect(onSteer).not.toHaveBeenCalled()
     expect(onSubmit).not.toHaveBeenCalled()
     expect(onCancel).not.toHaveBeenCalled()
+  })
+
+  it('preserves the existing draft when an external control submits a side-effect command', async () => {
+    stashSessionDraft('stored-session', 'unfinished user draft', [])
+    const { hook, onSubmit } = renderSubmitHook({ text: 'unfinished user draft' })
+
+    act(() => {
+      hook.result.current.dispatchSubmit('/compress', undefined, { preserveDraft: true })
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('/compress', { composerScope: 'stored-session' }))
+    expect(takeSessionDraft('stored-session').text).toBe('unfinished user draft')
+  })
+
+  it('does not overwrite the existing draft when a preserved side-effect command is rejected', async () => {
+    stashSessionDraft('stored-session', 'unfinished user draft', [])
+    const { hook, onSubmit } = renderSubmitHook({ text: 'unfinished user draft' })
+    onSubmit.mockResolvedValueOnce(false)
+
+    act(() => {
+      hook.result.current.dispatchSubmit('/compress', undefined, { preserveDraft: true })
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled())
+    expect(takeSessionDraft('stored-session').text).toBe('unfinished user draft')
   })
 
   it('runs slash commands immediately while busy', async () => {

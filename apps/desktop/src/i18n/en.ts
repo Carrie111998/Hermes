@@ -2552,6 +2552,9 @@ export const en: Translations = {
         loading: 'Loading breakdown…',
         automaticCompression: (percent, tokens) => `Automatic compression near ${percent}% (${tokens} tokens)`,
         compressionDue: 'Compression will start before the next model call.',
+        compressNow: 'Compress now',
+        compressNowTitle: 'Compress this session before the next turn',
+        compressUnavailable: 'Wait for the current session activity to finish.',
         percentFull: percent => `${percent}% Full`,
         title: 'Context Usage',
         tokensRemaining: tokens => `${tokens} tokens remaining`,
@@ -2942,11 +2945,12 @@ export const en: Translations = {
     resumeStrandedBody:
       'The connection to this session failed and automatic retries gave up. Check that the gateway is running, then try again.',
     resumeRetry: 'Retry',
-    compactionGuardTitle: 'Compressing this session',
+    compactionGuardTitle: sessionLabel => `Compressing “${sessionLabel}”`,
+    compactionGuardSessionId: sessionId => `Session ${sessionId}`,
     compactionGuardDescription:
-      'Hermes is summarizing earlier context. Sending messages and changing this session are temporarily disabled.',
+      'Hermes is summarizing earlier context in this chat. Only this chat is temporarily locked; you can switch to other sessions.',
     compactionGuardStatus:
-      'This window will unlock automatically after the compressed session is loaded. Your draft is preserved.',
+      'Sending, steering, and queueing are disabled here until Hermes reports that compression completed or failed. Your draft is preserved.',
     compactionCompleteTitle: 'Context compressed',
     compactionCompleteMessage: 'Earlier history was summarized successfully. This session is ready to continue.',
     compactionFailedTitle: 'Context compression failed',

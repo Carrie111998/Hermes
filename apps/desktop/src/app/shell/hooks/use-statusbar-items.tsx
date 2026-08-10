@@ -3,6 +3,7 @@ import { useCallback, useMemo } from 'react'
 
 import type { CommandCenterSection } from '@/app/command-center'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
+import { requestPrimarySessionCompression } from '@/app/shell/context-compression-action'
 import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/store'
@@ -16,6 +17,7 @@ import { contextBarLabel, contextCompressionPressure, LiveDuration, usageContext
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
+import { $compactingSessions } from '@/store/compaction'
 import { copyFilePath, revealFile } from '@/store/file-actions'
 import { revealFileInTree } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
@@ -120,6 +122,7 @@ export function useStatusbarItems({
   const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
+  const compactingSessions = useStore($compactingSessions)
 
   // The FOCUSED session (interacted tile, else the primary — the same
   // derivation the titlebar title follows): every session-scoped readout
@@ -151,6 +154,9 @@ export function useStatusbarItems({
 
   const activeSessionId = primaryFocused ? primaryActiveSessionId : (focusedRuntimeId ?? null)
   const busy = primaryFocused ? primaryBusy : focusedBusy
+  const activeSessionCompacting = Boolean(activeSessionId && compactingSessions[activeSessionId])
+  const manualCompressionAvailable = primaryFocused && Boolean(activeSessionId)
+  const manualCompressionDisabled = busy || activeSessionCompacting
 
   // EMPTY_USAGE (module constant) keeps the fallback referentially stable —
   // a fresh `{...}` each render would bust the usage-label memos below.
@@ -565,7 +571,9 @@ export function useStatusbarItems({
         menuClassName: 'w-auto border-(--ui-stroke-secondary) p-0',
         menuContent: (
           <ContextUsagePanel
+            compressNowDisabled={manualCompressionDisabled}
             currentUsage={currentUsage}
+            onCompressNow={manualCompressionAvailable ? requestPrimarySessionCompression : undefined}
             onUsageSnapshot={publishContextUsage}
             requestGateway={requestGateway}
             sessionId={activeSessionId}
@@ -574,6 +582,19 @@ export function useStatusbarItems({
         title: contextPressureTitle,
         toggleLabel: copy.toggleContextUsage,
         variant: 'menu'
+      },
+      {
+        className: contextPressureClassName,
+        disabled: manualCompressionDisabled,
+        hidden: contextPressure === 'normal' || !manualCompressionAvailable,
+        id: 'context-compress-now',
+        label: copy.contextUsagePanel.compressNow,
+        lockedVisible: true,
+        onSelect: requestPrimarySessionCompression,
+        title: manualCompressionDisabled
+          ? copy.contextUsagePanel.compressUnavailable
+          : copy.contextUsagePanel.compressNowTitle,
+        variant: 'action'
       },
       {
         detail: <LiveDuration since={sessionStartedAt} />,
@@ -617,6 +638,8 @@ export function useStatusbarItems({
       contextUsage,
       copy,
       currentUsage,
+      manualCompressionAvailable,
+      manualCompressionDisabled,
       publishContextUsage,
       requestGateway,
       sessionStartedAt,

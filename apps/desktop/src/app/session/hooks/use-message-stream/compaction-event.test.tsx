@@ -100,6 +100,43 @@ describe('useMessageStream compaction lifecycle', () => {
     ])
   })
 
+  it('keeps manual compression locked until its authoritative session.info edge', async () => {
+    await mountStream()
+    setSessionCompacting(OTHER_SID, true)
+
+    emit('status.update', { kind: 'compressing' })
+    expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true, [SID]: true })
+
+    // Unlike automatic mid-turn compaction, arbitrary model output is not a
+    // manual-compression completion edge.
+    emit('message.delta', { text: 'unrelated stream output' })
+    expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true, [SID]: true })
+
+    emit('session.info', { running: false })
+
+    expect($compactingSessions.get()).toEqual({ [OTHER_SID]: true })
+    expect($notifications.get()).toEqual([])
+  })
+
+  it('releases a manual compression lock on terminal ready without claiming success', async () => {
+    await mountStream()
+
+    emit('status.update', { kind: 'compressing' })
+    emit('status.update', { kind: 'ready' })
+
+    expect($compactingSessions.get()).toEqual({})
+    expect($notifications.get()).toEqual([])
+  })
+
+  it('does not treat ready as completion for automatic mid-turn compaction', async () => {
+    await mountStream()
+
+    emit('status.update', { kind: 'compacting' })
+    emit('status.update', { kind: 'ready' })
+
+    expect($compactingSessions.get()).toEqual({ [SID]: true })
+  })
+
   it('unlocks with an explicit failure notice when compaction errors', async () => {
     await mountStream()
 

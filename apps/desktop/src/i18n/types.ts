@@ -2148,6 +2148,9 @@ export interface Translations {
         loading: string
         automaticCompression: (percent: number, tokens: string) => string
         compressionDue: string
+        compressNow: string
+        compressNowTitle: string
+        compressUnavailable: string
         percentFull: (percent: number) => string
         title: string
         tokensRemaining: (tokens: string) => string
@@ -2492,7 +2495,8 @@ export interface Translations {
     resumeStrandedTitle: string
     resumeStrandedBody: string
     resumeRetry: string
-    compactionGuardTitle: string
+    compactionGuardTitle: (sessionLabel: string) => string
+    compactionGuardSessionId: (sessionId: string) => string
     compactionGuardDescription: string
     compactionGuardStatus: string
     compactionCompleteTitle: string

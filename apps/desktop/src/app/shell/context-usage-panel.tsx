@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+import { Button } from '@/components/ui/button'
 import { useI18n } from '@/i18n'
 import { compactNumber } from '@/lib/format'
 import { AlertTriangle } from '@/lib/icons'
@@ -8,7 +9,9 @@ import { cn } from '@/lib/utils'
 import type { ContextBreakdown, ContextUsageCategory, UsageStats } from '@/types/hermes'
 
 interface ContextUsagePanelProps {
+  compressNowDisabled?: boolean
   currentUsage: UsageStats
+  onCompressNow?: () => void
   onUsageSnapshot?: (
     usage: Pick<
       UsageStats,
@@ -24,7 +27,9 @@ interface ContextUsagePanelProps {
 }
 
 export function ContextUsagePanel({
+  compressNowDisabled = false,
   currentUsage,
+  onCompressNow,
   onUsageSnapshot,
   requestGateway,
   sessionId
@@ -143,12 +148,28 @@ export function ContextUsagePanel({
           data-pressure={compressionPressure}
           data-slot="context-compression-threshold"
         >
-          <p className="flex items-center gap-1.5 font-medium">
-            {compressionPressure !== 'normal' && <AlertTriangle className="size-3 shrink-0" />}
-            <span>
-              {copy.automaticCompression(compressionThresholdPercent, compactNumber(compressionThresholdTokens))}
-            </span>
-          </p>
+          <div className="flex items-start justify-between gap-2">
+            <p className="flex min-w-0 items-center gap-1.5 font-medium">
+              {compressionPressure !== 'normal' && <AlertTriangle className="size-3 shrink-0" />}
+              <span>
+                {copy.automaticCompression(compressionThresholdPercent, compactNumber(compressionThresholdTokens))}
+              </span>
+            </p>
+
+            {compressionPressure !== 'normal' && onCompressNow && (
+              <Button
+                className="h-6 shrink-0 px-2 text-[0.6875rem]"
+                disabled={compressNowDisabled}
+                onClick={onCompressNow}
+                size="xs"
+                title={compressNowDisabled ? copy.compressUnavailable : copy.compressNowTitle}
+                type="button"
+                variant="outline"
+              >
+                {copy.compressNow}
+              </Button>
+            )}
+          </div>
           <p className="mt-1 opacity-80">
             {tokensUntilCompression === 0
               ? copy.compressionDue
