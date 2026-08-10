@@ -1846,11 +1846,16 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         "tool_calls": [],
         "error": None,
     }
+
+    def _bounded_summary(value: str, fallback: str = "") -> str:
+        text = value or fallback
+        return text[:240] + "…" if len(text) > 240 else text
+
     try:
         from run_agent import AIAgent
     except Exception as e:
         result_meta["error"] = f"AIAgent import failed: {e}"
-        result_meta["summary"] = result_meta["error"]
+        result_meta["summary"] = _bounded_summary(result_meta["error"])
         return result_meta
 
     # Resolve provider + model the same way the CLI does, so the curator
@@ -1968,16 +1973,9 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         if conversation_failed or conversation_error:
             error = str(conversation_error or "conversation failed")
             result_meta["error"] = error
-            error_summary = f"error ({error})"
-            result_meta["summary"] = (
-                error_summary[:240] + "…"
-                if len(error_summary) > 240
-                else error_summary
-            )
+            result_meta["summary"] = _bounded_summary(f"error ({error})")
         else:
-            result_meta["summary"] = (
-                (final[:240] + "…") if len(final) > 240 else (final or "no change")
-            )
+            result_meta["summary"] = _bounded_summary(final, "no change")
 
         # Collect tool calls for the report. Walk the forked agent's
         # session messages and extract every tool_call made during the
@@ -2000,7 +1998,7 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         result_meta["tool_calls"] = _calls
     except Exception as e:
         result_meta["error"] = f"error: {e}"
-        result_meta["summary"] = result_meta["error"]
+        result_meta["summary"] = _bounded_summary(result_meta["error"])
     finally:
         if review_agent is not None:
             try:

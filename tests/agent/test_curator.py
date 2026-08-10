@@ -838,6 +838,16 @@ def test_review_fork_preserves_structured_conversation_failure(curator_env, monk
     assert result["error"] == long_error
     assert result["summary"] == f"error ({long_error})"[:240] + "…"
 
+    class _FailingAgent:
+        def __init__(self, **_kwargs):
+            raise RuntimeError(long_error)
+
+    monkeypatch.setattr("run_agent.AIAgent", _FailingAgent)
+    result = curator._run_llm_review("review")
+
+    assert result["error"] == f"error: {long_error}"
+    assert result["summary"] == result["error"][:240] + "…"
+
 
 
 
