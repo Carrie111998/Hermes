@@ -53,6 +53,8 @@ class TraceState:
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Keyed by child_session_id: subagent_stop carries no child_subagent_id.
+    subagents: Dict[str, Any] = field(default_factory=dict)
     last_updated_at: float = field(default_factory=time.time)
 
 
@@ -362,6 +364,24 @@ def _trace_key(
     if task_id:
         return task_id
     return _scope_prefix(task_id, session_id)
+
+
+def _state_for_turn(turn_id: str) -> Optional[str]:
+    """Resolve a live trace key from a turn id alone.
+
+    The subagent hooks carry ``parent_turn_id`` but no ``task_id``, and
+    ``_scope_prefix`` prefers ``task_id`` when the LLM hooks minted the key —
+    so rebuilding the key here would miss whenever a task id is in play.
+    ``turn_id`` is already unique per turn, so match on its suffix instead.
+    Caller must hold ``_STATE_LOCK``.
+    """
+    if not turn_id:
+        return None
+    suffix = f":turn:{turn_id}"
+    for key in _TRACE_STATE:
+        if key.endswith(suffix):
+            return key
+    return None
 
 
 def _is_base64_data_uri(value: str) -> bool:
@@ -1376,6 +1396,69 @@ def on_session_finalize(*, session_id: str = "", **_: Any) -> None:
         _debug(f"finalize flush failed: {exc}")
 
 
+def on_subagent_start(*, parent_session_id: Any = None, parent_turn_id: str = "",
+                      parent_subagent_id: Any = None, child_session_id: Any = None,
+                      child_subagent_id: Any = None, child_role: str = "",
+                      child_goal: Any = None, **_: Any) -> None:
+    client = _get_langfuse()
+    if client is None or not child_session_id:
+        return
+
+    with _STATE_LOCK:
+        key = _state_for_turn(parent_turn_id)
+        state = _TRACE_STATE.get(key) if key else None
+        if state is None:
+            return
+        metadata = {
+            "child_session_id": child_session_id,
+            "child_subagent_id": child_subagent_id,
+            "child_role": child_role,
+        }
+        if parent_subagent_id:
+            metadata["parent_subagent_id"] = parent_subagent_id
+        state.subagents[str(child_session_id)] = _start_child_observation(
+            state,
+            client=client,
+            name=f"Subagent: {child_role or 'delegate'}",
+            as_type="span",
+            input_value=_capture_content(child_goal),
+            metadata=metadata,
+        )
+
+
+def on_subagent_stop(*, parent_session_id: Any = None, parent_turn_id: str = "",
+                     child_session_id: Any = None, child_role: str = "",
+                     child_summary: Any = None, child_status: Any = None,
+                     tool_call_history: Any = None, duration_ms: Any = None,
+                     **_: Any) -> None:
+    if not child_session_id:
+        return
+
+    with _STATE_LOCK:
+        key = _state_for_turn(parent_turn_id)
+        state = _TRACE_STATE.get(key) if key else None
+        if state is None:
+            return
+        observation = state.subagents.pop(str(child_session_id), None)
+
+    if observation is None:
+        return
+
+    metadata: Dict[str, Any] = {"child_role": child_role}
+    if child_status:
+        metadata["status"] = child_status
+    if duration_ms:
+        metadata["duration_ms"] = duration_ms
+    if isinstance(tool_call_history, list):
+        metadata["tool_call_count"] = len(tool_call_history)
+        metadata["tool_calls"] = _capture_content(tool_call_history)
+    _end_observation(
+        observation,
+        output=_capture_content(child_summary),
+        metadata=metadata,
+    )
+
+
 def register(ctx) -> None:
     # Register for both hook name variants so the plugin works across
     # Hermes versions.  pre_api_request / post_api_request fire per API
@@ -1389,3 +1472,5 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", on_post_tool_call)
     ctx.register_hook("on_session_finalize", on_session_finalize)
     ctx.register_hook("on_session_end", on_session_finalize)
+    ctx.register_hook("subagent_start", on_subagent_start)
+    ctx.register_hook("subagent_stop", on_subagent_stop)

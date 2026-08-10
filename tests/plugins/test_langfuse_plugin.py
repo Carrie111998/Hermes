@@ -25,12 +25,13 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All nine hooks the plugin implements.
+        # All eleven hooks the plugin implements.
         assert set(data["hooks"]) == {
             "pre_api_request", "post_api_request", "api_request_error",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
             "on_session_finalize", "on_session_end",
+            "subagent_start", "subagent_stop",
         }
         # Required env vars are the user-facing HERMES_ prefixed keys.
         assert "HERMES_LANGFUSE_PUBLIC_KEY" in data["requires_env"]
@@ -1261,3 +1262,116 @@ class TestSessionFinalizeHook:
         mod._TRACE_STATE.clear()
         # _LANGFUSE_CLIENT is None on a fresh module; must not raise or init.
         mod.on_session_finalize(session_id="whatever")
+
+
+# ---------------------------------------------------------------------------
+# Subagent tracing: delegated children as spans under the parent turn
+# ---------------------------------------------------------------------------
+
+class TestSubagentTracing:
+    """``tools/delegate_tool.py`` emits subagent_start/subagent_stop. The
+    payloads carry ``parent_turn_id`` but no ``task_id``, so the parent trace
+    must be resolved by turn id rather than by rebuilding the scope key."""
+
+    def _fresh_plugin(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        return importlib.import_module("plugins.observability.langfuse")
+
+    def _state(self, mod, monkeypatch, key, spans):
+        class _Obs:
+            def __init__(self, kw):
+                self.kw = kw
+                self.ended = False
+                self.updates = {}
+
+            def update(self, **kw):
+                self.updates.update(kw)
+
+            def end(self, **kw):
+                self.ended = True
+
+        class _Root:
+            def start_observation(self, **kw):
+                obs = _Obs(kw)
+                spans.append(obs)
+                return obs
+
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+        state = mod.TraceState(trace_id="trace-1", root_ctx=None, root_span=_Root())
+        monkeypatch.setitem(mod._TRACE_STATE, key, state)
+        return state
+
+    def test_start_attaches_span_despite_task_scoped_key(self, monkeypatch):
+        mod = self._fresh_plugin()
+        spans = []
+        # Key minted by the LLM hooks with a task id — a naive rebuild from
+        # session_id alone would not match this.
+        state = self._state(mod, monkeypatch, "task:task-9:turn:turn-7", spans)
+
+        mod.on_subagent_start(
+            parent_session_id="sess-1",
+            parent_turn_id="turn-7",
+            child_session_id="child-sess-1",
+            child_subagent_id="sub-1",
+            child_role="researcher",
+            child_goal="find the thing",
+        )
+
+        assert len(spans) == 1
+        assert spans[0].kw["name"] == "Subagent: researcher"
+        assert spans[0].kw["metadata"]["child_subagent_id"] == "sub-1"
+        assert "child-sess-1" in state.subagents
+
+    def test_stop_ends_span_and_records_outcome(self, monkeypatch):
+        mod = self._fresh_plugin()
+        spans = []
+        state = self._state(mod, monkeypatch, "task:task-9:turn:turn-7", spans)
+
+        mod.on_subagent_start(
+            parent_session_id="sess-1", parent_turn_id="turn-7",
+            child_session_id="child-sess-1", child_role="researcher",
+            child_goal="find the thing",
+        )
+        mod.on_subagent_stop(
+            parent_session_id="sess-1", parent_turn_id="turn-7",
+            child_session_id="child-sess-1", child_role="researcher",
+            child_summary="found it", child_status="ok",
+            tool_call_history=[{"name": "read_file"}, {"name": "grep"}],
+            duration_ms=1234,
+        )
+
+        assert spans[0].ended is True
+        assert spans[0].updates["metadata"]["status"] == "ok"
+        assert spans[0].updates["metadata"]["tool_call_count"] == 2
+        assert spans[0].updates["metadata"]["duration_ms"] == 1234
+        # Popped so a repeated stop cannot double-end the span.
+        assert not state.subagents
+
+    def test_unknown_turn_is_a_noop(self, monkeypatch):
+        mod = self._fresh_plugin()
+        spans = []
+        self._state(mod, monkeypatch, "task:task-9:turn:turn-7", spans)
+
+        mod.on_subagent_start(
+            parent_turn_id="turn-does-not-exist",
+            child_session_id="child-sess-1", child_role="researcher",
+        )
+        mod.on_subagent_stop(
+            parent_turn_id="turn-does-not-exist",
+            child_session_id="child-sess-1",
+        )
+
+        assert spans == []
+
+    def test_start_without_child_session_is_a_noop(self, monkeypatch):
+        mod = self._fresh_plugin()
+        spans = []
+        self._state(mod, monkeypatch, "task:task-9:turn:turn-7", spans)
+
+        # subagent_stop keys on child_session_id, so a start without one could
+        # never be matched and must not open an unclosable span.
+        mod.on_subagent_start(
+            parent_turn_id="turn-7", child_session_id=None, child_role="researcher",
+        )
+
+        assert spans == []
