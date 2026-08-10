@@ -146,6 +146,58 @@ class RecordingAdapter:
 
 
 @pytest.mark.asyncio
+async def test_discord_task_parent_guard_uses_metadata_target_precedence(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    config = GatewayConfig(
+        platforms={
+            Platform.DISCORD: PlatformConfig(
+                enabled=True,
+                extra={"agent_task_forum_channels": ["protected-parent"]},
+            ),
+        },
+    )
+    router = DeliveryRouter(config, adapters={Platform.DISCORD: adapter})
+    target = DeliveryTarget(
+        platform=Platform.DISCORD,
+        chat_id="ordinary-chat",
+        thread_id="benign-target-thread",
+    )
+
+    with pytest.raises(ValueError, match="task channel"):
+        await router._deliver_to_platform(
+            target,
+            "blocked",
+            metadata={"thread_id": "protected-parent"},
+        )
+
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
+async def test_discord_task_parent_guard_rejects_conflicting_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
+    adapter = RecordingAdapter()
+    config = GatewayConfig(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
+    )
+    router = DeliveryRouter(config, adapters={Platform.DISCORD: adapter})
+
+    with pytest.raises(ValueError, match="Conflicting Discord delivery"):
+        await router._deliver_to_platform(
+            DeliveryTarget(platform=Platform.DISCORD, chat_id="ordinary-chat"),
+            "blocked",
+            metadata={"thread_id": "one", "message_thread_id": "two"},
+        )
+
+    assert adapter.calls == []
+
+
+@pytest.mark.asyncio
 async def test_native_adapter_wins_when_relay_also_fronts_platform(tmp_path, monkeypatch):
     monkeypatch.setattr("gateway.delivery.get_hermes_home", lambda: tmp_path)
     native = RecordingAdapter()
