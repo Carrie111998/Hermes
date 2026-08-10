@@ -712,10 +712,11 @@ _WINDOWS_DESTRUCTIVE_ROOT_BLOCK = [
     # identifies the drive-letter root as the implicit target.
     "format-volume D:",
     "Format-Volume -DriveLetter H:",
-]
-# Note: ``Initialize-Disk`` and ``Clear-Disk`` wipe numbered *disks*
-# (not filesystem roots); they fall under the disk-wipe floor and are
-# out of scope for the filesystem-root guard.
+    # UNC share roots and Windows device namespace forms.
+    "rd /s /q \\\\server\\share\\",
+    "Remove-Item -Recurse -Force \\\\?\\C:\\",
+    "Remove-Item -Recurse -Force \\\\server\\share",
+]  # noqa: E501
 
 
 _WINDOWS_DESTRUCTIVE_USER_FOLDER_ALLOW = [
@@ -733,12 +734,64 @@ def test_filesystem_root_guard_blocks_windows_destructive(command):
     is_hl, desc = detect_hardline_command(command)
     assert is_hl, f"root-target command slipped past the floor: {command!r}"
     assert desc, "expected a non-empty hardline description"
-    # Either the new root-target guard or an existing recursive-delete
-    # pattern should fire — but the new guard is the one that catches
-    # ``rd /s /q C:\\`` on its own and is the regression target for #82842.
-    assert "filesystem root" in desc.lower() or "recursive delete" in desc.lower(), (
-        f"unexpected description {desc!r} for {command!r}"
+    # The new root-target guard is the only rule that returns the
+    # literal ``destructive command targets a filesystem root``
+    # description — a stale assertion on ``recursive delete`` lets
+    # pre-existing patterns shadow the new guard and silently break
+    # the regression for #82842. Tighten the assertion to the exact
+    # string so a future pattern-layer edit cannot mask the fix.
+    assert "filesystem root" in desc.lower(), (
+        f"description {desc!r} lacks the filesystem-root signature for {command!r}"
     )
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
+def test_filesystem_root_guard_endtoend_blocks_windows_destructive(command, monkeypatch):
+    """End-to-end through ``check_all_command_guards``: the candidate
+    command must come back ``approved=False`` regardless of the
+    yolo / session-allowlist / smart-approval path that follows.
+
+    MoA (independent full-diff review) flagged that the yolo test in
+    the previous version only invoked ``detect_hardline_command`` and
+    bypassed the surrounding approval chain — leaving the question
+    open whether the floor actually fires before the user-facing
+    pipeline can run. This test pins the end-to-end contract.
+    """
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    # No callback ⇒ hardline floor should still refuse; the user is
+    # never consulted for a hardline block.
+    for env_type in ("posix", "windows", "wsl", "cmd"):
+        result = check_all_command_guards(command, env_type=env_type, approval_callback=None)
+        assert result["approved"] is False, (
+            f"check_all_command_guards wrongly approved {command!r} on {env_type!r}: {result!r}"
+        )
+        # Hardline path must surface explicitly — a regular
+        # non-hardline block (for example the *softer* approval
+        # prompt path) would let the user consent and silently bypass
+        # the floor.
+        assert result.get("hardline") is True, (
+            f"root-target command must trigger the hardline floor on {env_type!r}: {result!r}"
+        )
+        assert "filesystem root" in (result.get("message") or "").lower(), (
+            f"hardline block reason must name the filesystem root on {env_type!r}: {result!r}"
+        )
+
+
+@pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
+def test_filesystem_root_guard_unaltered_by_yolo_in_full_pipeline(command, clean_session, monkeypatch):
+    """With yolo=1 in the full approval pipeline, root-target destructive
+    commands still come back rejected."""
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    enable_session_yolo("hardline_test")
+    try:
+        for env_type in ("posix", "windows", "wsl", "cmd"):
+            result = check_all_command_guards(command, env_type=env_type, approval_callback=None)
+            assert result["approved"] is False, (
+                f"yolo bypassed the root-target guard in full pipeline on {env_type!r}: {command!r}: {result!r}"
+            )
+    finally:
+        disable_session_yolo("hardline_test")
 
 
 @pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_ROOT_BLOCK)
@@ -758,6 +811,40 @@ def test_root_target_guard_unaffected_by_yolo(command, clean_session, monkeypatc
         assert desc
     finally:
         disable_session_yolo("hardline_test")
+
+
+def test_filesystem_root_guard_preserves_existing_posix_root_coverage():
+    """Regression for the existing POSIX-root detection: the
+    filesystem-root guard fix must not regress ``rm -rf /`` (and
+    its quoted / brace-extension equivalents).
+
+    All forms resolve to ``/`` under the shell and were already
+    covered by HARDLINE_PATTERNS; this test pins that the new guard
+    cooperates rather than replaces the legacy behaviour, and that
+    each form's description remains non-empty.
+    """
+    cases = [
+        'rm -rf /',
+        'rm -rf /*',
+        'rm -rf //',
+        'rm -rf /.',
+        'rm -rf /..',
+        'rm -rf "/"',
+        'rm -rf "${HOME}"',
+        'sudo rm -rf /',
+    ]
+    for cmd in cases:
+        is_h, desc = detect_hardline_command(cmd)
+        assert is_h, f"existing POSIX root coverage regressed for {cmd!r}"
+        assert desc, f"empty hardline description for {cmd!r}"
+        desc_lower = desc.lower()
+        assert (
+            "filesystem root" in desc_lower
+            or "system directory" in desc_lower
+            or "home directory" in desc_lower
+            or "recursive delete of root filesystem" in desc_lower
+            or "home" in desc_lower
+        ), f"unexpected description {desc!r} for {cmd!r}"
 
 
 @pytest.mark.parametrize("command", _WINDOWS_DESTRUCTIVE_USER_FOLDER_ALLOW)
