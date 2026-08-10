@@ -131,10 +131,9 @@ function SidebarSessionRowImpl({
   const pinnedLabel = pinnedFacts.join(' · ')
   // Chips that ride in the BODY, beside the title. The kebab lifts out of the
   // actions slot, so it only ever covers what's in there — a body chip has no
-  // reason to step aside, and the hover-age (which does overlay the body) is
-  // dropped rather than made to fight them.
+  // reason to step aside, and the hover-age (which sits in the actions column)
+  // is dropped rather than made to fight them.
   const bodyChip = Boolean(pr) || pinnedProfile || (showProfile && hasProfileTag)
-  const pinnedMeta = Boolean(pinnedLabel) || bodyChip
   // A handed-off session's live source is local, but it originated on a
   // messaging platform — surface that origin as a small badge so e.g. a
   // Telegram thread continued here still reads as Telegram.
@@ -174,15 +173,16 @@ function SidebarSessionRowImpl({
           <div className="relative z-2 flex items-center justify-end" data-row-actions>
             {/* Pinned metadata stays put through a turn — it was switched on to
                 be read. Only the tail hands its slot to the kebab; anything
-                ahead of it stays legible while you hover. The hover-only age is
-                an overlay instead, so it needs the row to open up 48px of right
-                padding — which beside a body chip reads as a hole. A row that
-                already shows a chip skips it. */}
+                ahead of it stays legible while you hover. The hover-only age
+                sits in normal flow too (opacity fade only, never absolute) so
+                the actions column reserves its width at rest — hovering never
+                shrinks the title's truncate point or paints over its glyphs
+                (#82807). A row that already shows a chip skips it. */}
             {(pinnedLabel || (!liveTurn && !bodyChip)) && (
               <span
                 className={cn(
                   'pointer-events-none whitespace-nowrap text-right text-[0.625rem] leading-none text-(--ui-text-tertiary)',
-                  !pinnedLabel && 'absolute right-6 opacity-0 transition-opacity group-hover:opacity-100'
+                  !pinnedLabel && 'opacity-0 transition-opacity group-hover:opacity-100'
                 )}
               >
                 {pinnedLabel ? (
@@ -266,10 +266,12 @@ function SidebarSessionRowImpl({
       >
         {showsRunningArc(dotState) && <span aria-hidden="true" className="arc-border arc-row" />}
         <SidebarRowBody
-          // Pinned metadata already sits in the actions slot, so the title only
-          // needs a gap from it — and the same gap on hover, or the row would
-          // jump every time the kebab took over.
-          className={cn('z-0', pinnedMeta ? 'pr-2' : 'group-hover:pr-12', branchStem && 'pl-3.5')}
+          // The actions column (kebab + optional metadata/age) always sits in
+          // normal flow now, so the grid's auto track already reserves its
+          // width — the title only needs a fixed gap from it, the same at rest
+          // and on hover, or the truncate point would jump the moment you
+          // hover (#82807).
+          className={cn('z-0 pr-2', branchStem && 'pl-3.5')}
           // Middle-click = open in a new tab (browser muscle memory).
           {...middleClickHandlers(() => {
             triggerHaptic('selection')
