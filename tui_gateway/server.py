@@ -470,7 +470,15 @@ def _load_busy_input_mode() -> str:
     if not isinstance(display, dict):
         display = {}
     raw = str(display.get("busy_input_mode", "") or "").strip().lower()
-    return raw if raw in {"queue", "steer", "interrupt"} else "interrupt"
+    if raw not in {"queue", "steer", "interrupt"}:
+        if raw:
+            logger.warning(
+                "Unrecognized busy_input_mode %r; falling back to 'interrupt'. "
+                "Supported values: 'queue', 'steer', 'interrupt'.",
+                raw,
+            )
+        return "interrupt"
+    return raw
 
 
 def _load_interim_assistant_messages() -> bool:
