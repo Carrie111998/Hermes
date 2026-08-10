@@ -374,8 +374,6 @@ export const zh: Translations = {
         title: '安装插件',
         description: '在安装前查看此仓库包含哪些组件。',
         repoLabel: '仓库',
-        repoPlaceholder: 'owner/repo 或 Git URL',
-        installFromGit: '从 Git 安装',
         includesHeading: '此包包含',
         agentLabel: '智能体插件',
         desktopLabel: '桌面 UI',

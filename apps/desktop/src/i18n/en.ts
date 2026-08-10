@@ -384,8 +384,6 @@ export const en: Translations = {
         title: 'Install plugin',
         description: 'Review what this repository contains before installing anything.',
         repoLabel: 'Repository',
-        repoPlaceholder: 'owner/repo or git URL',
-        installFromGit: 'Install from Git',
         includesHeading: 'This package includes',
         agentLabel: 'Agent plugin',
         desktopLabel: 'Desktop UI',

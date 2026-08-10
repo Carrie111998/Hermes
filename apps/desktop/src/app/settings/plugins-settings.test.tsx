@@ -1,5 +1,4 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const { requestGateway } = vi.hoisted(() => ({ requestGateway: vi.fn() }))
@@ -19,14 +18,6 @@ import {
 import { $connection, $gatewayState } from '@/store/session'
 
 import { PluginsSettings } from './plugins-settings'
-
-function renderPluginsSettings() {
-  return render(
-    <MemoryRouter>
-      <PluginsSettings />
-    </MemoryRouter>
-  )
-}
 
 const legacyRow = {
   name: 'Legacy plugin',
@@ -54,11 +45,11 @@ afterEach(() => {
 
 describe('PluginsSettings', () => {
   it('renders and searches plugin rows returned without a canonical key', () => {
-    renderPluginsSettings()
+    render(<PluginsSettings />)
 
     expect(screen.getByText('Legacy plugin')).toBeTruthy()
 
-    fireEvent.change(screen.getByPlaceholderText('Search plugins…'), { target: { value: 'pre-key' } })
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'pre-key' } })
 
     expect(screen.getByText('Legacy plugin')).toBeTruthy()
   })
@@ -67,7 +58,7 @@ describe('PluginsSettings', () => {
     // Name-addressed toggles flip every same-named plugin across category
     // dirs (image_gen/fal vs video_gen/fal) — the reason toggles moved to
     // canonical keys. A pre-contract-v6 row must never reach the RPC.
-    renderPluginsSettings()
+    render(<PluginsSettings />)
 
     const toggle = screen.getByRole('switch', { name: 'Enable Legacy plugin' })
 
@@ -88,7 +79,7 @@ describe('PluginsSettings', () => {
 
     $agentPlugins.set([legacyRow, sibling])
 
-    renderPluginsSettings()
+    render(<PluginsSettings />)
 
     expect(screen.getAllByRole('switch', { name: 'Enable Legacy plugin' })).toHaveLength(2)
     expect(screen.getByText(sibling.description)).toBeTruthy()
@@ -101,7 +92,7 @@ describe('PluginsSettings', () => {
     $agentPlugins.set([keyedRow])
     requestGateway.mockResolvedValue({ ok: true, plugin: { ...keyedRow, status: 'enabled' } })
 
-    renderPluginsSettings()
+    render(<PluginsSettings />)
     fireEvent.click(screen.getByRole('switch', { name: 'Enable Legacy plugin' }))
 
     await waitFor(() =>

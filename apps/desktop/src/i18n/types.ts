@@ -333,8 +333,6 @@ export interface Translations {
         title: string
         description: string
         repoLabel: string
-        repoPlaceholder: string
-        installFromGit: string
         includesHeading: string
         agentLabel: string
         desktopLabel: string
