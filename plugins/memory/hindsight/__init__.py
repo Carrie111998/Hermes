@@ -56,6 +56,12 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.6.1"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+# Upper bound for the synchronous recall fallback in prefetch() (first turn
+# of a session). The memory manager runs prefetch in a thread with an 8 s
+# budget (agent/memory_manager.py _EXTERNAL_PREFETCH_TIMEOUT_S); staying
+# under it keeps the first turn fast and avoids marking the provider as
+# "stuck". Normal embedded recalls are ~1-2 s on this class of workload.
+_SYNC_RECALL_FALLBACK_TIMEOUT = 6.0  # seconds
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -1074,9 +1080,9 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._client = Hindsight(**kwargs)
         return self._client
 
-    def _run_sync(self, coro):
+    def _run_sync(self, coro, timeout: float | None = None):
         """Schedule *coro* on the shared loop using the configured timeout."""
-        return _run_sync(coro, timeout=self._timeout)
+        return _run_sync(coro, timeout=timeout if timeout is not None else self._timeout)
 
     def _is_retriable_embedded_connection_error(self, exc: Exception) -> bool:
         """Return True for stale embedded-daemon connection failures."""
@@ -1160,11 +1166,11 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation):
+    def _run_hindsight_operation(self, operation, timeout: float | None = None):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
         try:
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1175,7 +1181,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return self._run_sync(operation(client), timeout=timeout)
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1469,6 +1475,51 @@ class HindsightMemoryProvider(MemoryProvider):
             f"hindsight_retain to store facts."
         )
 
+    def _build_recall_kwargs(self, query: str) -> dict:
+        """Build the recall API kwargs shared by the async and sync prefetch paths."""
+        if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
+            query = query[:self._recall_max_input_chars]
+        recall_kwargs: dict = {
+            "bank_id": self._bank_id, "query": query,
+            "budget": self._budget, "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        if self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        return recall_kwargs
+
+    @staticmethod
+    def _format_recall_results(resp) -> str:
+        """Render recall results into the bullet list injected into context."""
+        results = getattr(resp, "results", None)
+        if not results:
+            return ""
+        return "\n".join(f"- {r.text}" for r in results if r.text)
+
+    def _sync_recall(self, query: str) -> str:
+        """Blocking recall with the current query; returns context text.
+
+        Fallback used when no background prefetch result is queued — first
+        turn of a session, or the queued recall raced/failed. Runs inline in
+        the memory manager's prefetch thread (8 s budget), bounded by
+        _SYNC_RECALL_FALLBACK_TIMEOUT so a slow bank never stalls the first
+        turn — on timeout it degrades to the previous cold-start behavior
+        (no injected memory).
+        """
+        recall_kwargs = self._build_recall_kwargs(query)
+        logger.debug("Prefetch: synchronous recall fallback (bank=%s, query_len=%d, budget=%s)",
+                     self._bank_id, len(recall_kwargs["query"]), self._budget)
+        resp = self._run_hindsight_operation(
+            lambda client: client.arecall(**recall_kwargs),
+            timeout=_SYNC_RECALL_FALLBACK_TIMEOUT,
+        )
+        text = self._format_recall_results(resp)
+        logger.debug("Prefetch: synchronous recall returned %d results",
+                     len(resp.results) if getattr(resp, "results", None) else 0)
+        return text
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             logger.debug("Prefetch: waiting for background thread to complete")
@@ -1476,6 +1527,16 @@ class HindsightMemoryProvider(MemoryProvider):
         with self._prefetch_lock:
             result = self._prefetch_result
             self._prefetch_result = ""
+        if not result and self._auto_recall and self._memory_mode != "tools" and not self._shutting_down.is_set():
+            # No queued result from a previous turn (first message of a session,
+            # or the background recall raced/failed). Do a synchronous recall
+            # with the CURRENT query so the first turn still gets memory.
+            logger.debug("Prefetch: no queued result; synchronous recall fallback")
+            try:
+                result = self._sync_recall(query)
+            except Exception as e:
+                logger.debug("Hindsight synchronous recall fallback failed: %s", e, exc_info=True)
+                result = ""
         if not result:
             logger.debug("Prefetch: no results available")
             return ""
@@ -1508,21 +1569,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
                     text = resp.text or ""
                 else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
+                    recall_kwargs = self._build_recall_kwargs(query)
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
                                  self._bank_id, len(query), self._budget)
                     resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
+                    text = self._format_recall_results(resp)
                 if text:
                     with self._prefetch_lock:
                         self._prefetch_result = text

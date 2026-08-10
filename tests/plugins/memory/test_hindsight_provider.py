@@ -21,6 +21,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    _SYNC_RECALL_FALLBACK_TIMEOUT,
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
@@ -791,7 +792,10 @@ class TestToolHandlers:
 
 
 class TestPrefetch:
-    def test_prefetch_returns_empty_when_no_result(self, provider):
+    def test_prefetch_returns_empty_when_recall_has_no_results(self, provider):
+        # On a cold start the sync fallback runs; an empty recall still
+        # yields no context (graceful degradation, same as the old path).
+        provider._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[]))
         assert provider.prefetch("test") == ""
 
     def test_prefetch_default_preamble(self, provider):
@@ -855,6 +859,98 @@ class TestPrefetch:
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+
+class TestPrefetchSyncFallback:
+    """prefetch() must not leave the first turn of a session memory-less.
+
+    The async design queues a recall at the end of turn N and injects it at
+    the start of turn N+1, so the very first message of a session has no
+    queued result. prefetch() falls back to a synchronous recall with the
+    CURRENT query so the first turn still gets injected memory.
+    """
+
+    def test_prefetch_falls_back_to_sync_recall(self, provider):
+        result = provider.prefetch("oil change")
+        assert "- Memory 1" in result
+        assert "- Memory 2" in result
+        provider._client.arecall.assert_called_once()
+        assert provider._client.arecall.call_args.kwargs["query"] == "oil change"
+
+    def test_prefetch_uses_queued_result_without_sync_recall(self, provider):
+        provider._prefetch_result = "- queued memory"
+        result = provider.prefetch("irrelevant")
+        assert "- queued memory" in result
+        provider._client.arecall.assert_not_called()
+
+    def test_prefetch_skips_fallback_in_tools_mode(self, provider_with_config):
+        p = provider_with_config(memory_mode="tools")
+        assert p.prefetch("oil change") == ""
+        p._client.arecall.assert_not_called()
+
+    def test_prefetch_skips_fallback_when_auto_recall_off(self, provider_with_config):
+        p = provider_with_config(auto_recall=False)
+        assert p.prefetch("oil change") == ""
+        p._client.arecall.assert_not_called()
+
+    def test_sync_fallback_uses_bounded_timeout(self, provider, monkeypatch):
+        captured = {}
+
+        def _fake_operation(operation, timeout=None):
+            captured["timeout"] = timeout
+            return SimpleNamespace(results=[SimpleNamespace(text="m")])
+
+        monkeypatch.setattr(provider, "_run_hindsight_operation", _fake_operation)
+        result = provider.prefetch("query")
+        # Contract: the fallback passes the module's bounded timeout (kept
+        # under the memory manager's 8s prefetch budget), whatever its value.
+        assert captured["timeout"] == _SYNC_RECALL_FALLBACK_TIMEOUT
+        assert captured["timeout"] < 8.0
+        assert "- m" in result
+
+    def test_sync_fallback_truncates_long_query(self, provider_with_config):
+        p = provider_with_config(recall_max_input_chars=10)
+        p.prefetch("x" * 100)
+        assert len(p._client.arecall.call_args.kwargs["query"]) <= 10
+
+    def test_sync_fallback_degrades_gracefully_on_failure(self, provider, monkeypatch):
+        def _boom(operation, timeout=None):
+            raise RuntimeError("daemon down")
+
+        monkeypatch.setattr(provider, "_run_hindsight_operation", _boom)
+        assert provider.prefetch("query") == ""
+
+
+class TestRecallHelpers:
+    def test_build_recall_kwargs_includes_params(self, provider_with_config):
+        p = provider_with_config(
+            recall_tags=["t1"],
+            recall_tags_match="all",
+            recall_max_tokens=1024,
+            recall_types=["world"],
+        )
+        kwargs = p._build_recall_kwargs("query here")
+        assert kwargs["bank_id"] == "test-bank"
+        assert kwargs["budget"] == "mid"
+        assert kwargs["max_tokens"] == 1024
+        assert kwargs["tags"] == ["t1"]
+        assert kwargs["tags_match"] == "all"
+        assert kwargs["types"] == ["world"]
+        assert kwargs["query"] == "query here"
+
+    def test_format_recall_results_skips_empty_text(self, provider):
+        resp = SimpleNamespace(
+            results=[
+                SimpleNamespace(text="a"),
+                SimpleNamespace(text=""),
+                SimpleNamespace(text="b"),
+            ]
+        )
+        assert provider._format_recall_results(resp) == "- a\n- b"
+
+    def test_format_recall_results_empty(self, provider):
+        assert provider._format_recall_results(SimpleNamespace(results=[])) == ""
+        assert provider._format_recall_results(SimpleNamespace()) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -1248,8 +1344,11 @@ class TestSessionSwitchBufferFlush:
         provider._prefetch_result = "old-session recall: User likes Rust"
         provider.on_session_switch("new-sid")
         assert provider._prefetch_result == ""
-        # And subsequent prefetch() should now report empty, not the leftover.
-        assert provider.prefetch("anything") == ""
+        # The queued leftover is gone; a subsequent prefetch returns fresh
+        # memory for the current query (sync fallback), never the stale text.
+        result = provider.prefetch("anything")
+        assert "old-session recall" not in result
+        assert "Memory 1" in result
 
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
         """on_session_switch must wait for an in-flight prefetch from the
