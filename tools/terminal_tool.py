@@ -1,3 +1,36 @@
+def _contains_state_db_delete(command: str) -> bool:
+    """True when the command deletes/moves/truncates the live SQLite session store.
+
+    Only matches when a destructive operator directly targets the state.db
+    file (or its WAL/SHM siblings). Read-only queries that merely mention the
+    name (grep/find/ls/echo) pass through.
+    """
+    import re
+
+    c = command or ""
+    if "state.db" not in c and r"state\.db" not in c:
+        return False
+
+    # state.db plus optional -wal/-shm/-journal suffix.
+    # Negative lookahead excludes backup/derivative names (state.db.bak,
+    # state.db_old, state.db2) — those are safe to delete.
+    target = r"state\.db(?:-wal|-shm|-journal)?(?![A-Za-z0-9_.])"
+    patterns = [
+        # rm / rm -rf / unlink on the file (possibly via glob/var)
+        rf"\b(?:rm|unlink)\b[^\n;|&]*?{target}\b",
+        # mv on the file (moving it away)
+        rf"\b(?:mv)\b[^\n;|&]*?{target}\b",
+        # truncate on the file
+        rf"\btruncate\b[^\n;|&]*?{target}\b",
+        # dd writing to the file
+        rf"\bdd\b[^\n;|&]*?of=\s*[\"']?{target}\b",
+        # shell redirects that overwrite the file
+        rf"(?:^|[;\s])(?:>>?|1>>?)\s*[\"']?{target}\b",
+        # find with -delete or -exec rm targeting the file
+        rf"\bfind\b[^\n;|&]*?{target}[^\n;|&]*?(?:-delete|-exec\b[^\n;|&]*?\brm\b)",
+    ]
+    return any(re.search(p, c, re.IGNORECASE) for p in patterns)
+
 #!/usr/bin/env python3
 """
 Terminal Tool Module
@@ -2910,6 +2943,21 @@ def terminal_tool(
                     "error": _self_repo_msg,
                     "status": "blocked",
                 }, ensure_ascii=False)
+
+        # State.db protection (added by repair): never delete/move the live
+        # session store from inside the gateway process.
+        if _contains_state_db_delete(command):
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "error": (
+                    "Blocked: deleting or moving state.db/state.db-wal/state.db-shm "
+                    "from inside the gateway process would corrupt the live session "
+                    "store. Run such maintenance from a separate shell with the "
+                    "gateway stopped."
+                ),
+                "status": "error",
+            }, ensure_ascii=False)
 
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)

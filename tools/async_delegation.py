@@ -47,6 +47,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.state_db_write_lock import state_db_write_lock
 from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
@@ -137,7 +138,15 @@ def _connect() -> sqlite3.Connection:
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_state import apply_wal_with_fallback
 
-    apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
+    # SessionDB owns initial WAL activation.  A short-lived ledger connection
+    # must only verify that ownership state, never re-run journal_mode=WAL
+    # against the gateway's live WAL/SHM files.
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
+    if mode != "wal":
+        apply_wal_with_fallback(
+            conn, db_label="state.db (async_delegation)", require_wal=True
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
             delegation_id TEXT PRIMARY KEY,
@@ -189,12 +198,14 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     to the garbage collector. On a long-running gateway that exhausts
     ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
     """
-    conn = _connect()
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    path = _db_path()
+    with state_db_write_lock(path):
+        conn = _connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:

@@ -906,21 +906,9 @@ class SessionSearchMixin:
                 # reclaimed until a later VACUUM. Non-fatal.
                 logger.warning("VACUUM after FTS optimize failed: %s", exc)
                 vacuum_ok = False
-            # Best-effort: fold the WAL back into the main file so the on-disk
-            # size settles now rather than at close(). NOTE this is REFUSED
-            # (SQLITE_BUSY) while any other connection holds a WAL read-mark —
-            # e.g. a live gateway sharing the DB — so it is not sufficient on
-            # its own. Callers must therefore NOT size the result by stat()ing
-            # the file; use :meth:`logical_size_bytes`, which is truthful
-            # immediately regardless of readers.
-            try:
-                with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug(
-                    "WAL checkpoint (TRUNCATE) after optimize VACUUM failed: %s",
-                    exc,
-                )
+            # Do not reset/truncate the WAL after VACUUM.  The live state.db
+            # uses only PASSIVE checkpoints; file-size reporting uses logical
+            # size rather than forcing an unsafe physical shrink.
 
         # Phase 4: stamp the FTS storage layout as current, clear the "available"
         # flag, and advance schema_version if it was somehow still behind (the

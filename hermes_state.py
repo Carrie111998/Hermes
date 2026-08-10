@@ -40,6 +40,7 @@ from agent.skill_commands import (
     describe_skill_invocation,
 )
 from hermes_constants import get_hermes_home
+from hermes_cli.state_db_write_lock import state_db_write_lock
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
@@ -700,20 +701,39 @@ def _on_disk_journal_mode(conn: sqlite3.Connection) -> Optional[str]:
 
     Returns the mode string (e.g. ``"wal"``, ``"delete"``), or ``None``
     if the value cannot be determined (new DB, or PRAGMA read failed).
+
+    A PRAGMA read can fail transiently with ``disk i/o error`` on
+    virtualized block devices (XFS on cloud hosts).  Treating that as
+    "mode unknown" caused callers to *downgrade* to DELETE while other
+    connections still held WAL open — the mixed-journal-mode corruption
+    (process downgrades → WAL/SHM unlinked under live holders → handle
+    becomes (deleted) → malformed).  Retry the read a few times before
+    giving up: transient EIO clears, deterministic unsupported-filesystem
+    errors do not.  ``None`` is still returned on final failure so the
+    caller's existing "unknown → refuse to downgrade" logic applies.
     """
-    try:
-        row = conn.execute("PRAGMA journal_mode").fetchone()
-    except sqlite3.OperationalError:
-        return None
-    if row is None:
-        return None
-    mode = row[0]
-    if isinstance(mode, bytes):  # defensive: sqlite3 occasionally returns bytes
+    last_exc: Optional[Exception] = None
+    for _ in range(4):
         try:
-            mode = mode.decode("ascii")
-        except UnicodeDecodeError:
+            row = conn.execute("PRAGMA journal_mode").fetchone()
+        except sqlite3.OperationalError as exc:
+            last_exc = exc
+            if "disk i/o error" not in str(exc).lower():
+                return None
+            time.sleep(0.05)
+            continue
+        if row is None:
             return None
-    return str(mode).strip().lower() if mode is not None else None
+        mode = row[0]
+        if isinstance(mode, bytes):  # defensive: sqlite3 occasionally returns bytes
+            try:
+                mode = mode.decode("ascii")
+            except UnicodeDecodeError:
+                return None
+        return str(mode).strip().lower() if mode is not None else None
+    if last_exc is not None:
+        logger.debug("_on_disk_journal_mode: retries exhausted on disk read (%s)", last_exc)
+    return None
 
 
 def _apply_macos_checkpoint_barrier(conn: sqlite3.Connection) -> None:
@@ -926,6 +946,12 @@ def apply_wal_with_fallback(
         _enforce_macos_synchronous_full(conn)
         return "wal"
 
+    # StateDB callers can mandate WAL.  A configured DELETE mode must never
+    # override that invariant for Hermes' live canonical state database.
+    if require_wal and configured == "delete":
+        logger.warning("%s: ignoring database.journal_mode=delete; live state.db requires WAL", db_label)
+        configured = "wal"
+
     # #68545: honor the canonical database.journal_mode setting. Existing
     # on-disk WAL databases were returned above and are never live-downgraded.
     if configured == "delete":
@@ -1018,7 +1044,18 @@ def apply_wal_with_fallback(
         # the mode cannot be verified at all (probe blocked by a concurrent
         # opener's locks) — ownership is not provably exclusive either way.
         existing = _on_disk_journal_mode(conn)
-        if existing == "wal" or existing is None:
+        if existing == "wal":
+            raise
+        if existing is None:
+            # On-disk mode is UNKNOWN (transient read failure that
+            # survived retries). Never downgrade from an unknown state:
+            # if a sibling connection holds WAL open, PRAGMA
+            # journal_mode=DELETE unlinks the live -wal/-shm files
+            # (handle becomes (deleted)) and corrupts the DB. Fail this
+            # connection instead — the EIO is transient and a later
+            # retry/restart will succeed.
+            if require_wal:
+                raise WalUnsupportedError(str(exc)) from exc
             raise
         if require_wal:
             # Caller mandates WAL — fail loudly instead of degrading to DELETE.
@@ -1336,6 +1373,21 @@ def is_malformed_db_error(exc: BaseException) -> bool:
     if not isinstance(exc, sqlite3.DatabaseError):
         return False
     return any(marker in str(exc).lower() for marker in _MALFORMED_SCHEMA_MARKERS)
+
+
+def _is_not_a_database_error(exc: BaseException) -> bool:
+    """True if *exc* is SQLite's 'file is not a database' error.
+
+    Raised when a connection's backing file is not a SQLite database — the
+    runtime connection-corruption class (#20260809): a sibling process
+    (forked curator agent, external repair pass) replaced/truncated the file
+    out from under the live connection.  The file on disk may be perfectly
+    healthy; the CONNECTION is broken.  Distinct from the malformed-schema
+    class: the fix is a reconnect, not schema surgery.
+    """
+    if not isinstance(exc, sqlite3.DatabaseError):
+        return False
+    return "file is not a database" in str(exc).lower()
 
 
 # Markers that mean the host filesystem cannot accept another write. Kept as
@@ -2448,6 +2500,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     _COMPRESSION_BUSY_WAIT_S = 5.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    _SQLITE_BUSY_TIMEOUT_MS = 5000
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
     _WRITE_RETRY_SLOW_MIN_S = 0.250  # 250ms
     _WRITE_RETRY_SLOW_MAX_S = 1.000  # 1s
@@ -2539,6 +2592,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # in place at most once per SessionDB instance so a genuinely
         # unrecoverable database can't put writers into a rebuild loop.
         self._fts_runtime_rebuild_attempted = False
+        # One-shot guard for the runtime connection-reopen recovery on the
+        # write path (#20260809). A connection whose backing file was
+        # replaced/truncated by a sibling process surfaces as "file is not a
+        # database" on every write; we close and reopen the connection at
+        # most once per SessionDB instance so a genuinely unrecoverable
+        # database can't put writers into a reconnect loop.
+        self._notadb_reconnect_attempted = False
         # One-shot guard for the usermerge-floor config write on the
         # incremental FTS merge cadence (see _merge_fts_incrementally).
         self._fts_usermerge_floor_applied = False
@@ -2576,7 +2636,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     tracking_path=self.db_path,
                     uri=True,
                     check_same_thread=False,
-                    timeout=1.0,
+                    timeout=self._SQLITE_BUSY_TIMEOUT_MS / 1000.0,
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
@@ -2664,13 +2724,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
-                )
-                apply_database_pragmas(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                self._conn.execute(f"PRAGMA busy_timeout={self._SQLITE_BUSY_TIMEOUT_MS}")
+                # WAL activation and schema reconciliation can write the DB
+                # header/schema.  They share the same cross-process ownership
+                # gate as normal transactions.
+                with state_db_write_lock(self.db_path):
+                    self._wal_active = (
+                        apply_wal_with_fallback(
+                            self._conn, db_label="state.db", require_wal=True
+                        ) == "wal"
+                    )
+                    apply_database_pragmas(self._conn, db_label="state.db")
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                    self._init_schema()
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -3118,17 +3185,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                with state_db_write_lock(self.db_path):
+                    with self._lock:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -3178,6 +3246,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.DatabaseError as exc:
                 if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
+                # Runtime connection-corruption self-heal (#20260809): a
+                # connection whose backing file was replaced/truncated by a
+                # sibling process (e.g. a forked curator agent inheriting and
+                # closing the write fd, or an external repair pass) surfaces
+                # as "file is not a database" on EVERY subsequent write.
+                # Without a reconnect branch the gateway wedges permanently:
+                # every transcript/routing write raises, messages stay in
+                # memory, and swap grows without bound until the process is
+                # killed. Close the broken connection, reopen the DB file,
+                # and retry the write once. The reopen re-runs
+                # _connect_and_init_with_lock_patience() so schema/WAL
+                # reconciliation happens on the fresh connection.
+                if _is_not_a_database_error(exc):
+                    if not self._reconnect_after_notadb():
+                        raise
+                    continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
                 # while the canonical messages table is intact. Recover here,
@@ -3226,6 +3310,65 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._WRITE_RETRY_MAX_S,
             )
         time.sleep(min(jitter, max(deadline - now, 0.001)))
+        return True
+
+    def _reconnect_after_notadb(self) -> bool:
+        """Close the corrupted write connection and reopen state.db.
+
+        Returns True when the connection was successfully replaced and the
+        failed write should be retried.  Mirrors the constructor's
+        ``_connect_and_init`` so WAL/schema reconciliation runs on the fresh
+        connection.  Never raises -- logs and returns False on failure so the
+        original error propagates.
+
+        One-shot per instance: a genuinely unrecoverable database must not
+        put writers into a reconnect loop that pins CPU on every write.
+        """
+        if self._notadb_reconnect_attempted:
+            return False
+        self._notadb_reconnect_attempted = True
+        logger.warning(
+            "state.db connection reported 'file is not a database' — closing "
+            "and reopening the connection to self-heal (one-shot)."
+        )
+        try:
+            with self._lock:
+                if self._conn is not None:
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
+                new_conn = _connect_tracked_db(
+                    str(self.db_path),
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                new_conn.row_factory = sqlite3.Row
+                new_conn.execute(f"PRAGMA busy_timeout={self._SQLITE_BUSY_TIMEOUT_MS}")
+                # Publish BEFORE schema init: _init_schema/_reconcile_columns
+                # operate on self._conn, not on the local variable.
+                self._conn = new_conn
+                with state_db_write_lock(self.db_path):
+                    self._wal_active = (
+                        apply_wal_with_fallback(
+                            new_conn, db_label="state.db", require_wal=True
+                        )
+                        == "wal"
+                    )
+                    apply_database_pragmas(new_conn, db_label="state.db")
+                    new_conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
+                    self._init_schema()
+        except Exception as exc:
+            logger.error(
+                "state.db reconnect after 'file is not a database' failed (%s); "
+                "the database may need the full offline repair path.",
+                exc,
+            )
+            return False
+        logger.warning("state.db connection reopened successfully; retrying the failed write.")
         return True
 
     @staticmethod
@@ -3358,10 +3501,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         periodic use because it does not block concurrent writers and
         cannot corrupt B-tree pages under I/O pressure.
 
-        PASSIVE does not truncate the WAL file — it stays at its
-        high-water mark.  WAL truncation happens in :meth:`close`
-        (TRUNCATE) and pre-VACUUM checkpoints, which run infrequently
-        under controlled conditions.
+        PASSIVE does not truncate the WAL file.  The file stays at its
+        high-water mark, bounded by SQLite's normal reuse and configured
+        journal-size limit.  Hermes never truncates a live state.db WAL.
 
         Previous TRUNCATE strategy caused B-tree corruption on large
         databases (65K+ pages) due to the exclusive-lock I/O pressure
@@ -3384,8 +3526,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Close the database connection.
 
         Drains queued token deltas first (the background writer needs the
-        connection). Writable connections then attempt a TRUNCATE WAL
-        checkpoint so exiting writer processes help shrink the WAL file.
+        connection), then closes without a destructive WAL checkpoint.
         Read-only connections never request a checkpoint.
         """
         self._stop_token_writer()
@@ -3414,14 +3555,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._read_local.conn = None
         with self._lock:
             if self._conn:
-                if not self.read_only:
-                    try:
-                        self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                    except Exception as exc:
-                        logger.debug(
-                            "WAL checkpoint (TRUNCATE) at close failed: %s",
-                            exc,
-                        )
                 self._conn.close()
                 self._conn = None
 
@@ -7508,6 +7641,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            # FK self-heal: ensure the session parent row exists. A missing
+            # row (deleted by cleanup or never created after a transient
+            # create_session failure) would otherwise raise FOREIGN KEY
+            # constraint failed and abort the whole turn.
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, source, started_at) "
+                "VALUES (?, 'unknown', ?)",
+                (session_id, time.time()),
+            )
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -7613,6 +7755,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         def _do(conn):
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
+            )
+            # FK self-heal: same guarantee as append_message — a missing
+            # sessions row must never abort the batch flush.
+            conn.execute(
+                "INSERT OR IGNORE INTO sessions (id, source, started_at) "
+                "VALUES (?, 'unknown', ?)",
+                (session_id, time.time()),
             )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
@@ -10650,13 +10799,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
-        with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (TRUNCATE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
+        with state_db_write_lock(self.db_path):
+            with self._lock:
+                # VACUUM is an explicit offline-maintenance operation.  Do not
+                # truncate a WAL from a live SessionDB connection first.
+                self._conn.execute("VACUUM")
         return optimized
 
     def maybe_auto_prune_and_vacuum(

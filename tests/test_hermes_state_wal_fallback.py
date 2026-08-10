@@ -459,7 +459,7 @@ class TestGetLastInitError:
 
         cause = get_last_init_error()
         assert cause is not None
-        assert "OperationalError" in cause
+        assert "WalUnsupportedError" in cause
         assert "locking protocol" in cause
 
 
@@ -485,9 +485,9 @@ class TestFormatSessionDbUnavailable:
         assert msg.startswith("Cannot /resume:")
 
 
-class TestSessionDbUsesWalFallback:
-    def test_sessiondb_works_when_wal_unavailable(self, tmp_path):
-        """E2E: SessionDB initializes and performs a write on a WAL-blocked FS."""
+class TestSessionDbRequiresWal:
+    def test_sessiondb_refuses_when_wal_unavailable(self, tmp_path):
+        """Canonical state.db must never degrade to DELETE journal mode."""
         target = tmp_path / "nfs_style.db"
 
         real_connect = sqlite3.connect
@@ -502,25 +502,12 @@ class TestSessionDbUsesWalFallback:
             return real_connect(str(target), factory=factory, **kwargs)
 
         with patch("hermes_state.sqlite3.connect", side_effect=gated_connect):
-            db = SessionDB(db_path=target)
+            with pytest.raises(WalUnsupportedError):
+                SessionDB(db_path=target)
+        assert attempts[0] >= 1
 
-        try:
-            # WAL was attempted and rejected — fallback kicked in
-            assert attempts[0] >= 1, (
-                "WAL pragma was never executed — check the patch target"
-            )
-            # SessionDB is usable end-to-end: create a session, read it back
-            db.create_session(session_id="s1", source="cli", model="test")
-            sess = db.get_session("s1")
-            assert sess is not None
-            assert sess["source"] == "cli"
-            # No init error was recorded since init succeeded via the fallback
-            assert get_last_init_error() is None
-        finally:
-            db.close()
-
-    def test_sessiondb_works_when_wal_is_silently_refused(self, tmp_path, caplog):
-        """E2E: SessionDB stays usable when WAL silently no-ops to DELETE."""
+    def test_sessiondb_refuses_when_wal_is_silently_refused(self, tmp_path, caplog):
+        """Canonical state.db must fail closed on a silent WAL refusal."""
         target = tmp_path / "macnfs_style.db"
 
         real_connect = sqlite3.connect
@@ -535,23 +522,5 @@ class TestSessionDbUsesWalFallback:
 
         with patch("hermes_state.sqlite3.connect", side_effect=gated_connect):
             with caplog.at_level("ERROR", logger="hermes_state"):
-                db = SessionDB(db_path=target)
-
-        try:
-            assert db._conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
-            db.create_session(session_id="s2", source="cli", model="test")
-            sess = db.get_session("s2")
-            assert sess is not None
-            assert sess["source"] == "cli"
-            assert get_last_init_error() is None
-        finally:
-            db.close()
-
-        errors = [
-            r
-            for r in caplog.records
-            if r.levelname == "ERROR" and "state.db" in r.getMessage()
-        ]
-        assert len(errors) == 1, (
-            "silent WAL refusal should emit exactly one state.db error"
-        )
+                with pytest.raises(WalUnsupportedError):
+                    SessionDB(db_path=target)

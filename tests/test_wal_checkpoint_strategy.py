@@ -1,7 +1,8 @@
 """Tests for SessionDB WAL checkpoint strategy (issue #45383).
 
-Verifies that periodic checkpoints use PASSIVE mode (safe for large DBs)
-while close() and pre-VACUUM paths still use TRUNCATE.
+Verifies that state.db only uses PASSIVE checkpoints.  TRUNCATE is unsafe for
+the live FTS-backed database because it can destructively reset the WAL while
+another Hermes process owns a reader or writer.
 """
 
 import sqlite3
@@ -73,11 +74,10 @@ class TestTryWalCheckpointPassive:
         db._try_wal_checkpoint()
 
 
-class TestCloseUsesTruncate:
-    """close() should still use TRUNCATE to shrink WAL on shutdown."""
+class TestCloseAvoidsTruncate:
+    """close() must not destructively truncate a live state.db WAL."""
 
-    def test_close_uses_truncate_mode(self, db):
-        """TRUNCATE at close is safe — no concurrent writers during shutdown."""
+    def test_close_does_not_use_truncate_mode(self, db):
         real_conn = db._conn
         execute_calls = []
 
@@ -92,22 +92,9 @@ class TestCloseUsesTruncate:
         db.close()
 
         truncate_calls = [c for c in execute_calls if "wal_checkpoint(TRUNCATE)" in c]
-        assert len(truncate_calls) == 1, (
-            f"Expected 1 TRUNCATE checkpoint at close, got {len(truncate_calls)}"
-        )
+        assert len(truncate_calls) == 0
 
-    def test_close_logs_debug_on_failure(self, db, caplog):
-        """Failed TRUNCATE at close logs debug (not warning — close is best-effort)."""
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = sqlite3.OperationalError("database is locked")
-        db._conn = mock_conn
 
-        with caplog.at_level(logging.DEBUG):
-            db.close()
-
-        assert any("WAL checkpoint (TRUNCATE) at close failed" in r.message for r in caplog.records), (
-            f"Expected debug log about TRUNCATE failure at close, got: {caplog.text}"
-        )
 
 
 class TestCheckpointFrequency:

@@ -115,7 +115,7 @@ class TestConnectionLifecycle:
 
         assert not any("wal_checkpoint" in sql.lower() for sql in executed)
 
-    def test_writable_close_retains_truncate_checkpoint(self, tmp_path):
+    def test_writable_close_never_issues_destructive_checkpoint(self, tmp_path):
         db_path = tmp_path / "state.db"
         writable = SessionDB(db_path=db_path)
         executed = []
@@ -123,8 +123,14 @@ class TestConnectionLifecycle:
 
         writable.close()
 
-        assert any(
-            "pragma wal_checkpoint(truncate)" == " ".join(sql.lower().split())
+        # Local hardening: close() must never issue TRUNCATE/RESTART
+        # checkpoints — those modes can unlink the WAL under a live
+        # connection and caused the mixed-journal-mode corruption this
+        # deployment hit. See state-db-eio / wal-checkpoint patches in
+        # hermes-local-patches.py.
+        assert not any(
+            "wal_checkpoint(truncate)" in " ".join(sql.lower().split())
+            or "wal_checkpoint(restart)" in " ".join(sql.lower().split())
             for sql in executed
         )
 

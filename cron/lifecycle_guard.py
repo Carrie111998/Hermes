@@ -169,6 +169,13 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
 
         segment: list[str] = []
         for token in tokens:
+            if "\x00" in token:
+                # NUL byte (tokenized out of binary content) is never a
+                # real command/script path. Drop it so downstream
+                # Path(...) ops can't raise embedded-null-byte
+                # (#76762 follow-up 2: _resolve_terminal_script_path /
+                # _iter_referenced_shell_scripts still crashed).
+                continue
             if token and set(token) <= _CONTROL_CHARS:
                 if segment:
                     yield segment
@@ -429,6 +436,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
+        # A NUL byte in the path (tokenized out of binary content) makes
+        # os.open raise ValueError, not OSError — treat it like an unreadable
+        # path so the guard can never crash the caller (#76762 follow-up).
+        if "\x00" in str(path):
+            return None, False
         descriptor = os.open(path, flags)
     except (OSError, ValueError):
         # OSError: unreadable / missing / over-long paths. ValueError: an

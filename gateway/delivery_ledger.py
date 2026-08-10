@@ -50,6 +50,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli.state_db_write_lock import state_db_write_lock
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +93,15 @@ def _connect() -> sqlite3.Connection:
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_state import apply_wal_with_fallback
 
-    apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
+    # SessionDB owns initial WAL activation.  A short-lived ledger connection
+    # must only verify that ownership state, never re-run journal_mode=WAL
+    # against the gateway's live WAL/SHM files.
+    row = conn.execute("PRAGMA journal_mode").fetchone()
+    mode = str(row[0]).strip().lower() if row and row[0] is not None else ""
+    if mode != "wal":
+        apply_wal_with_fallback(
+            conn, db_label="state.db (delivery_ledger)", require_wal=True
+        )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS delivery_obligations (
             obligation_id TEXT PRIMARY KEY,
@@ -124,12 +133,14 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     bug was #69567 / PR #69594). ``record_obligation`` runs on every outbound
     final response, so this ledger is the highest-frequency leaker.
     """
-    conn = _connect()
-    try:
-        with conn:
-            yield conn
-    finally:
-        conn.close()
+    path = _db_path()
+    with state_db_write_lock(path):
+        conn = _connect()
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
 
 def _owner_stamp() -> tuple[int, Optional[int]]:
