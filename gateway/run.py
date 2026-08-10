@@ -2425,8 +2425,10 @@ from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
     GATEWAY_FATAL_CONFIG_EXIT_CODE,
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    is_gateway_supervisor_process,
     parse_restart_after_turn_timeout,
     parse_restart_drain_timeout,
+    should_defer_supervised_sigterm_restart,
 )
 
 
@@ -27282,6 +27284,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _shutdown_ctx = None
             logger.debug("snapshot_shutdown_context failed: %s", _e)
 
+        defer_supervised_sigterm_restart = should_defer_supervised_sigterm_restart(
+            received_signal,
+            planned_stop=planned_stop,
+            planned_takeover=planned_takeover,
+            supervised=is_gateway_supervisor_process(),
+        )
+
         if planned_takeover:
             logger.info(
                 "Received %s as a planned --replace takeover — exiting cleanly",
@@ -27291,6 +27300,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             logger.info(
                 "Received %s as a planned gateway stop — exiting cleanly",
                 _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM/SIGINT",
+            )
+        elif defer_supervised_sigterm_restart:
+            logger.info(
+                "Received %s from an external supervisor — deferring restart "
+                "until active work completes",
+                _shutdown_ctx["signal"] if _shutdown_ctx else "SIGTERM",
             )
         else:
             _signal_initiated_shutdown = True
@@ -27328,6 +27343,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
+        if defer_supervised_sigterm_restart:
+            # launchd/systemd normally restart by SIGTERM. Route that through
+            # the same after-turn wait as /restart and SIGUSR1; otherwise
+            # stop() force-interrupts active tasks after the short drain cap.
+            runner.request_restart(detached=False, via_service=True)
+            return
         asyncio.create_task(runner.stop())
 
     def restart_signal_handler():

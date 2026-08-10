@@ -2,6 +2,7 @@
 
 import math
 import os
+import signal
 from collections.abc import Mapping
 
 from hermes_cli.config import DEFAULT_CONFIG
@@ -53,6 +54,29 @@ def is_gateway_supervisor_process(
         "yes",
         "on",
     }
+
+
+def should_defer_supervised_sigterm_restart(
+    received_signal: int | None,
+    *,
+    planned_stop: bool,
+    planned_takeover: bool,
+    supervised: bool,
+) -> bool:
+    """Whether an unmarked supervisor SIGTERM should preserve active work.
+
+    Service managers restart a gateway by sending SIGTERM, but that signal has
+    no sender identity. For a supervised gateway it is therefore the common
+    restart path, not evidence that in-flight work should be cancelled.
+    Explicit Hermes stops and ``--replace`` takeovers write markers first and
+    intentionally retain their immediate-stop behaviour.
+    """
+    return bool(
+        supervised
+        and received_signal == signal.SIGTERM
+        and not planned_stop
+        and not planned_takeover
+    )
 
 
 def is_container_restart_context() -> bool:

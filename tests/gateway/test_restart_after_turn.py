@@ -1,9 +1,12 @@
 """Unit tests for in-band restart after-turn deferral helpers (#77184)."""
 
+import signal
+
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_AFTER_TURN_TIMEOUT,
     parse_restart_after_turn_timeout,
     resolve_restart_exit_wait_budget,
+    should_defer_supervised_sigterm_restart,
 )
 from gateway.run import GatewayRunner
 
@@ -21,6 +24,25 @@ def test_resolve_restart_exit_wait_budget_covers_both_phases():
     assert resolve_restart_exit_wait_budget(0, 0, headroom=15) == 15.0
     assert resolve_restart_exit_wait_budget(180, 21600, headroom=15) == 180 + 21600 + 15
     assert resolve_restart_exit_wait_budget("bad", "bad", headroom="x") == 0.0
+
+
+def test_supervised_unmarked_sigterm_uses_restart_path():
+    """A launchd restart must not truncate a live turn at the drain cap."""
+    assert should_defer_supervised_sigterm_restart(
+        signal.SIGTERM, planned_stop=False, planned_takeover=False, supervised=True
+    ) is True
+    assert should_defer_supervised_sigterm_restart(
+        signal.SIGTERM, planned_stop=True, planned_takeover=False, supervised=True
+    ) is False
+    assert should_defer_supervised_sigterm_restart(
+        signal.SIGTERM, planned_stop=False, planned_takeover=True, supervised=True
+    ) is False
+    assert should_defer_supervised_sigterm_restart(
+        signal.SIGTERM, planned_stop=False, planned_takeover=False, supervised=False
+    ) is False
+    assert should_defer_supervised_sigterm_restart(
+        signal.SIGINT, planned_stop=False, planned_takeover=False, supervised=True
+    ) is False
 
 
 def test_load_restart_after_turn_timeout_preserves_zero(tmp_path, monkeypatch):
