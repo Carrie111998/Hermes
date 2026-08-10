@@ -201,6 +201,26 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
+def _sanitize_mcp_tool_name(name: str) -> str:
+    """Normalize an MCP-prefixed tool name to match the registry form.
+
+    MCP server names are sanitized at registration time (hyphens and other
+    non-word characters become underscores).  The model may emit the
+    *original* server name (e.g. ``mcp__my-server__tool``) which won't
+    match the sanitized registry entry (``mcp__my_server__tool``).
+    Apply the same sanitization to the server and tool segments so the
+    lookup succeeds regardless of which form the model provides.
+    """
+    from tools.mcp_tool import MCP_TOOL_NAME_PREFIX, _MCP_NAME_DELIM, sanitize_mcp_name_component
+    if not name.startswith(MCP_TOOL_NAME_PREFIX):
+        return name
+    rest = name[len(MCP_TOOL_NAME_PREFIX):]
+    parts = rest.split(_MCP_NAME_DELIM, 1)
+    if len(parts) == 2:
+        return f"{MCP_TOOL_NAME_PREFIX}{sanitize_mcp_name_component(parts[0])}{_MCP_NAME_DELIM}{sanitize_mcp_name_component(parts[1])}"
+    return name
+
+
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
@@ -213,10 +233,14 @@ def is_deferrable_tool_name(name: str) -> bool:
         return False
     if name in _core_tool_names():
         return False
+    # Sanitize MCP-prefixed names to match the registry form (hyphens -> underscores).
+    canonical = _sanitize_mcp_tool_name(name)
     # Check registry toolset for MCP prefix.
     try:
         from tools.registry import registry
-        entry = registry.get_entry(name)
+        entry = registry.get_entry(canonical)
+        if entry is None:
+            entry = registry.get_entry(name)
         if entry is None:
             return False
         if entry.toolset.startswith("mcp-"):
@@ -1041,12 +1065,14 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
             return None, {}, f"tool_call 'arguments' is not valid JSON: {e}"
     if not isinstance(raw_args, dict):
         return None, {}, "tool_call 'arguments' must be an object"
+    # Normalize MCP-prefixed names so hyphenated server names resolve correctly.
+    canonical = _sanitize_mcp_tool_name(name)
     if not is_deferrable_tool_name(name):
         return None, {}, (
             f"'{name}' is not a deferrable tool. If it appears in the model-facing tools "
             "list already, call it directly instead of via tool_call."
         )
-    return name, raw_args, None
+    return canonical, raw_args, None
 
 
 __all__ = [
