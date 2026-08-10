@@ -2103,7 +2103,7 @@ class TestConfigRoundTrip:
         self.client = TestClient(app)
         self.client.headers[_SESSION_HEADER_NAME] = _SESSION_TOKEN
 
-    def test_buzz_canonical_save_removes_only_legacy_access_overrides(self):
+    def test_buzz_canonical_save_removes_legacy_control_overrides(self):
         from hermes_cli.config import load_config, read_raw_config, save_config
 
         save_config({
@@ -2112,6 +2112,8 @@ class TestConfigRoundTrip:
                     "allowed_users": "legacy-invalid-scalar",
                     "allow_all_users": True,
                     "require_mention": False,
+                    "thread_require_mention": False,
+                    "transport": "poll",
                 },
             },
         })
@@ -2120,6 +2122,8 @@ class TestConfigRoundTrip:
         canonical = web_config["gateway"]["platforms"]["buzz"]["extra"]
         canonical["allowed_users"] = ["b" * 64]
         canonical["allow_all_users"] = False
+        canonical["require_mention"] = True
+        canonical["thread_require_mention"] = True
 
         response = self.client.put("/api/config", json={"config": web_config})
         assert response.status_code == 200
@@ -2129,7 +2133,16 @@ class TestConfigRoundTrip:
         assert raw_canonical["allowed_users"] == ["b" * 64]
         effective = load_config()["gateway"]["platforms"]["buzz"]["extra"]
         assert effective["allow_all_users"] is False
-        assert raw["buzz"]["extra"] == {"require_mention": False}
+        assert effective["require_mention"] is True
+        assert effective["thread_require_mention"] is True
+        legacy_extra = raw.get("buzz", {}).get("extra", {})
+        assert not {
+            "allowed_users",
+            "allow_all_users",
+            "require_mention",
+            "thread_require_mention",
+        }.intersection(legacy_extra)
+        assert legacy_extra == {"transport": "poll"}
 
 
 

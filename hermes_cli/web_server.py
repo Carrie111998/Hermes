@@ -7052,13 +7052,13 @@ def _validation_config_for_buzz_access(
 def _remove_shadowed_legacy_buzz_access(
     merged: Dict[str, Any], incoming: Dict[str, Any]
 ) -> None:
-    """Remove legacy access keys superseded by a canonical Dashboard save.
+    """Remove legacy controls superseded by a canonical Dashboard save.
 
     ``buzz.extra`` remains supported for unrelated legacy Buzz settings, but
-    its access keys otherwise override the Dashboard-owned canonical path at
-    gateway startup.  Remove only canonical keys explicitly supplied by the
-    caller so a successful Dashboard save cannot leave an invisible policy in
-    force.
+    its access and mention keys otherwise override the Dashboard-owned
+    canonical path at gateway startup or during live mention-policy refresh.
+    Remove only canonical keys explicitly supplied by the caller so a
+    successful Dashboard save cannot leave an invisible policy in force.
     """
     try:
         canonical_extra = incoming["gateway"]["platforms"]["buzz"]["extra"]
@@ -7067,7 +7067,12 @@ def _remove_shadowed_legacy_buzz_access(
     if not isinstance(canonical_extra, dict):
         return
 
-    supplied = {"allowed_users", "allow_all_users"}.intersection(canonical_extra)
+    supplied = {
+        "allowed_users",
+        "allow_all_users",
+        "require_mention",
+        "thread_require_mention",
+    }.intersection(canonical_extra)
     if not supplied:
         return
 
