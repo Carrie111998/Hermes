@@ -230,6 +230,11 @@ try:
     try:
         from mcp.client.streamable_http import streamable_http_client
         _MCP_NEW_HTTP = True
+        # mcp >= 2.0.0 removed the deprecated `streamablehttp_client` name
+        # entirely, so the try/except above never sets _MCP_HTTP_AVAILABLE.
+        # The new-name import is a full replacement for HTTP transport, so
+        # treat it as equally sufficient.
+        _MCP_HTTP_AVAILABLE = True
     except ImportError:
         _MCP_NEW_HTTP = False
     try:
@@ -2936,7 +2941,19 @@ class MCPServerTask:
         # initialize request and reject session-less POSTs otherwise.
         # Seed it as a client-level default, but treat user overrides as
         # case-insensitive so conventional casing is preserved.
-        if not any(key.lower() == "mcp-protocol-version" for key in headers):
+        #
+        # Only do this for the deprecated transport path. The non-deprecated
+        # transport (mcp >= 1.24.0, _MCP_NEW_HTTP) negotiates and manages
+        # this header itself after the handshake. Per the 2026-07-28 protocol
+        # revision, compliant servers require MCP-Protocol-Version to be
+        # accompanied by matching Mcp-Method/Mcp-Name request-metadata
+        # headers; injecting only this one header makes an otherwise-fully-
+        # negotiated client look like a "partial implementation" and some
+        # servers reject that harder than a client that sends none of the
+        # three (treated as a legitimate legacy client). See #<issue>.
+        if not _MCP_NEW_HTTP and not any(
+            key.lower() == "mcp-protocol-version" for key in headers
+        ):
             headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION
         connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
         ssl_verify = config.get("ssl_verify", True)
@@ -3069,9 +3086,23 @@ class MCPServerTask:
             return reason
 
         if _MCP_NEW_HTTP:
-            # New API (mcp >= 1.24.0): build an explicit httpx.AsyncClient
-            # matching the SDK's own create_mcp_http_client defaults.
-            import httpx
+            # New API (mcp >= 1.24.0): build an explicit AsyncClient matching
+            # the SDK's own create_mcp_http_client defaults.
+            #
+            # mcp >= 2.0.0 vendors its own httpx fork (`httpx2`) and its
+            # OAuthClientProvider now subclasses `httpx2.Auth` instead of
+            # `httpx.Auth`. Passing an httpx2-based auth object as the
+            # `auth=` kwarg to a plain `httpx.AsyncClient` fails client-side
+            # validation ("Invalid 'auth' argument") because the two Auth
+            # base classes are unrelated. Prefer httpx2 (the module actually
+            # used internally by streamable_http_client) when present so the
+            # client and its auth/transport types line up; httpx2's public
+            # API mirrors httpx's closely enough that the rest of this
+            # function works unchanged either way.
+            try:
+                import httpx2 as httpx
+            except ImportError:
+                import httpx
 
             _original_url = httpx.URL(url)
 
@@ -3098,9 +3129,14 @@ class MCPServerTask:
             # http_client is provided, so we wrap in async-with.
             try:
                 async with httpx.AsyncClient(**client_kwargs) as http_client:
-                    async with streamable_http_client(url, http_client=http_client) as (
-                        read_stream, write_stream, _get_session_id,
-                    ):
+                    async with streamable_http_client(url, http_client=http_client) as _streams:
+                        # mcp >= 2.0.0 dropped the session-id mechanism (2026-07-28
+                        # spec) so this transport now yields a 2-tuple instead of
+                        # the older 3-tuple with a get_session_id callable.
+                        if len(_streams) == 3:
+                            read_stream, write_stream, _get_session_id = _streams
+                        else:
+                            read_stream, write_stream = _streams
                         async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
                             # Bound the handshake (#59349) — see stdio path.
                             self.initialize_result = await asyncio.wait_for(
@@ -5328,8 +5364,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             _mark_proven = getattr(server, "_mark_session_proven", None)
             if _mark_proven is not None:
                 _mark_proven()
-            # MCP CallToolResult has .content (list of content blocks) and .isError
-            if result.isError:
+            # MCP CallToolResult exposes .content (list of content blocks) and
+            # an error flag. mcp >= 2.0.0 renamed the field from the
+            # camelCase `isError` to snake_case `is_error`; accept either so
+            # this keeps working across SDK versions without pinning.
+            _is_error = getattr(result, "is_error", None)
+            if _is_error is None:
+                _is_error = getattr(result, "isError", False)
+            if _is_error:
                 error_text = ""
                 for block in (result.content or []):
                     if getattr(block, "text", None):

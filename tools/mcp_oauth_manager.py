@@ -134,9 +134,15 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            timeout: float | None = None,
             **kwargs: Any,
         ):
+            # mcp >= 2.0.0 dropped the `timeout` constructor param from the
+            # base OAuthClientProvider entirely. Pop it here so it isn't
+            # passed to super().__init__(), which would raise
+            # `unexpected keyword argument 'timeout'` on newer SDKs.
             super().__init__(*args, **kwargs)
+            self._hermes_timeout = timeout
             self._hermes_server_name = server_name
             self._hermes_home = ""
             # When the client_id comes from config.yaml (pre-registered), an
