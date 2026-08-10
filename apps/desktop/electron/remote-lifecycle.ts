@@ -11,23 +11,24 @@
  *   - reuse an existing desktop-dedicated dashboard via a lockfile + an
  *     AUTHENTICATED /api/status probe (pid liveness alone is insufficient),
  *   - spawn a fresh detached `--isolated --port 0` dashboard and scrape its
- *     `HERMES_DASHBOARD_READY port=<n>` readiness line,
+ *     readiness line,
  *   - adopt the token the dashboard actually serves (served-token adoption),
- *   - clean up a stale dashboard only when it is provably ours.
+ *   - clean up a stale dashboard only when it is provably ours,
+ *   - fail closed on alive indeterminate/foreign locks (no delete/signal/spawn),
+ *   - serialize the full remote lifecycle transaction with a per-ownership mutex.
+ *
+ * Lock schema v3 persists spawn-observed process identity (pid, kernel start
+ * time, argv fingerprint). The launcher path is metadata only after exec
+ * wrappers — ownership never requires argv[0]/argv[1] to equal the launcher.
  *
  * No `import 'electron'` so it's unit-testable with `node --test`. main.ts wires
  * the real SshConnection, fetch, adoptServedDashboardToken, and waitForHermes in.
- *
- * The minted HERMES_DASHBOARD_SESSION_TOKEN is the SPAWN credential. After
- * readiness the caller runs served-token adoption against the tunneled baseUrl
- * and the SERVED token's fingerprint is what lands in the lockfile — so the
- * reuse probe checks the credential that actually authenticates /api/ws, not
- * the minted one (which the dashboard may regen).
  */
 
 import crypto from 'node:crypto'
 
-const LOCKFILE_SCHEMA_VERSION = 2
+const LOCKFILE_SCHEMA_VERSION = 3
+const SUPPORTED_LOCK_SCHEMA_VERSIONS = new Set([2, 3])
 // Bumped when the desktop<->dashboard reuse contract changes in a way that makes
 // an old running dashboard unsafe to reattach to (token handling, readiness/spawn
 // args, served-token reconciliation). A mismatch forces a clean respawn.
@@ -37,6 +38,7 @@ const REMOTE_LOCK_DIR = '~/.hermes/desktop-ssh'
 const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
 const DEFAULT_READY_TIMEOUT_MS = 45_000
 const READY_POLL_INTERVAL_MS = 750
+const OWNERSHIP_MUTEX_STALE_MS = 120_000
 
 function mintToken() {
   return crypto.randomBytes(32).toString('hex')
@@ -80,6 +82,10 @@ function lockfilePath(ownershipId) {
   return `${ownershipDirectory(ownershipId)}/backend.lock.json`
 }
 
+function ownershipMutexPath(ownershipId) {
+  return `${ownershipDirectory(ownershipId)}/lifecycle.mutex`
+}
+
 function spawnLogPath(ownershipId, spawnNonce) {
   return `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(spawnNonce)}.log`
 }
@@ -120,6 +126,12 @@ function expandRemotePath(p) {
   }
 
   return shq(p)
+}
+
+function ownershipConflict(message) {
+  const error: any = new Error(message || 'SSH backend ownership conflict.')
+  error.kind = 'ownership-conflict'
+  return error
 }
 
 // Resolve the remote hermes executable. An EXPLICIT path is honored strictly
@@ -249,34 +261,8 @@ async function probeRemoteHermesHome(ssh) {
   }
 }
 
-async function readLockfile(ssh, ownershipId) {
-  const lpath = lockfilePath(ownershipId)
-  let raw
-
-  try {
-    raw = await ssh.exec(`if [ ! -e ${expandRemotePath(lpath)} ]; then exit 0; fi; cat ${expandRemotePath(lpath)}`)
-  } catch (cause) {
-    const error: any = new Error('Could not read the SSH backend ownership record.')
-    error.kind = 'transient-transport-error'
-    error.cause = cause
-    throw error
-  }
-
-  const text = String(raw || '').trim()
-
-  if (!text) {
-    return null
-  }
-
-  let parsed
-
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return null
-  }
-
-  if (!parsed || parsed.schemaVersion !== LOCKFILE_SCHEMA_VERSION) {
+function normalizeLockRecord(parsed, ownershipId) {
+  if (!parsed || !SUPPORTED_LOCK_SCHEMA_VERSIONS.has(parsed.schemaVersion)) {
     return null
   }
 
@@ -315,7 +301,58 @@ async function readLockfile(ssh, ownershipId) {
     }
   }
 
+  // launcherPath is optional metadata (v3); fall back to hermesPath.
+  if (parsed.launcherPath != null) {
+    if (typeof parsed.launcherPath !== 'string' || parsed.launcherPath.length > 1024) {
+      return null
+    }
+  } else {
+    parsed.launcherPath = parsed.hermesPath
+  }
+
+  if (parsed.pidStartTime != null) {
+    if (!Number.isInteger(parsed.pidStartTime) || parsed.pidStartTime < 0) {
+      return null
+    }
+  }
+
+  if (parsed.processFingerprint != null) {
+    if (typeof parsed.processFingerprint !== 'string' || !/^[0-9a-f]{16,128}$/.test(parsed.processFingerprint)) {
+      return null
+    }
+  }
+
   return parsed
+}
+
+async function readLockfile(ssh, ownershipId) {
+  const lpath = lockfilePath(ownershipId)
+  let raw
+
+  try {
+    raw = await ssh.exec(`if [ ! -e ${expandRemotePath(lpath)} ]; then exit 0; fi; cat ${expandRemotePath(lpath)}`)
+  } catch (cause) {
+    const error: any = new Error('Could not read the SSH backend ownership record.')
+    error.kind = 'transient-transport-error'
+    error.cause = cause
+    throw error
+  }
+
+  const text = String(raw || '').trim()
+
+  if (!text) {
+    return null
+  }
+
+  let parsed
+
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+
+  return normalizeLockRecord(parsed, ownershipId)
 }
 
 async function writeLockfile(ssh, ownershipId, lock) {
@@ -357,72 +394,180 @@ async function remotePidAlive(ssh, pid) {
   }
 }
 
-// A pid is "provably ours" only if its remote cmdline carries our dashboard
-// args — never kill a pid we can't positively identify as our dashboard.
-async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
-  if (!pid || !/^[0-9a-f]{16}$/.test(String(spawnNonce || '')) || !hermesPath) {
-    return false
+/**
+ * Observe the live process identity for a remote PID.
+ * Returns { startTime, fingerprint, ownedShape } or null when the PID is gone.
+ * Transport failures raise transient-transport-error.
+ */
+async function observeProcessIdentity(ssh, pid, spawnNonce) {
+  if (!pid || !/^[0-9a-f]{16}$/.test(String(spawnNonce || ''))) {
+    return null
   }
 
   try {
     const script =
-      'import os,shlex,subprocess,sys\n' +
+      'import hashlib,os,shlex,subprocess,sys\n' +
       `pid=${Number(pid)}\n` +
-      `expected=os.path.expanduser(${shq(hermesPath)})\n` +
       `nonce=${shq(spawnNonce)}\n` +
+      'def read_args(p):\n' +
+      ' try:\n' +
+      '  raw=open(f"/proc/{p}/cmdline","rb").read()\n' +
+      '  return [x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
+      ' except OSError:\n' +
+      '  line=subprocess.check_output(["ps","-o","command=","-p",str(p)],text=True).strip()\n' +
+      '  return shlex.split(line)\n' +
+      'def start_time(p):\n' +
+      ' try:\n' +
+      '  return int(open(f"/proc/{p}/stat","r",encoding="utf-8").read().split()[21])\n' +
+      ' except Exception:\n' +
+      '  try:\n' +
+      '   out=subprocess.check_output(["ps","-o","lstart=","-p",str(p)],text=True).strip()\n' +
+      '   return int(hashlib.sha256(out.encode()).hexdigest()[:15],16)\n' +
+      '  except Exception:\n' +
+      '   return None\n' +
       'try:\n' +
-      ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
-      ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
-      'except OSError:\n' +
-      ' line=subprocess.check_output(["ps","-o","command=","-p",str(pid)],text=True).strip()\n' +
-      ' args=shlex.split(line)\n' +
+      ' args=read_args(pid)\n' +
+      'except Exception:\n' +
+      ' print("GONE"); sys.exit(0)\n' +
+      'st=start_time(pid)\n' +
+      'fp=hashlib.sha256("\\0".join(args).encode("utf-8","surrogateescape")).hexdigest()[:32]\n' +
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
       ' owner=args.index("--ssh-owner-nonce",serve+1)\n' +
-      ' direct=args[0]==expected\n' +
-      ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
-      ' ok=(direct or python_entry) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
-      'except (ValueError,IndexError):pass\n' +
-      'print("OWNED" if ok else "FOREIGN")'
+      ' ok=("--isolated" in args[serve+1:]) and args[owner+1]==nonce\n' +
+      'except (ValueError,IndexError):\n' +
+      ' ok=False\n' +
+      'print("OK" if ok else "SHAPE")\n' +
+      'print(st if st is not None else "")\n' +
+      'print(fp)\n' +
+      'print("\\0".join(args))'
 
-    const out = await ssh.exec(`python3 -c ${shq(script)}`)
+    const out = String(await ssh.exec(`python3 -c ${shq(script)}`)).trim()
+    const lines = out.split('\n')
+    const status = (lines[0] || '').trim()
 
-    return String(out || '').trim() === 'OWNED'
+    if (status === 'GONE' || !status) {
+      return null
+    }
+
+    const startRaw = (lines[1] || '').trim()
+    const fingerprint = (lines[2] || '').trim()
+    const startTime = startRaw === '' ? null : Number(startRaw)
+
+    return {
+      startTime: Number.isInteger(startTime) ? startTime : null,
+      fingerprint: /^[0-9a-f]{16,128}$/.test(fingerprint) ? fingerprint : '',
+      ownedShape: status === 'OK'
+    }
   } catch (cause) {
-    const error: any = new Error('Could not verify SSH backend process ownership.')
+    const error: any = new Error('Could not observe SSH backend process identity.')
     error.kind = 'transient-transport-error'
     error.cause = cause
     throw error
   }
 }
 
-// Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
-async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
-  if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))) {
-    try {
-      const result = (
-        await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
-        )
-      ).trim()
+/**
+ * A pid is "provably ours" only when the live process carries the exact serve
+ * ownership shape and matches any spawn-observed identity recorded in the lock.
+ * The launcher path is metadata after exec wrappers — never an ownership
+ * invariant.
+ *
+ * Returns:
+ *   'owned'          — positively identified as our dashboard
+ *   'foreign'        — positively identified as not ours / PID reuse
+ *   'indeterminate'  — cannot prove either way (should fail closed if alive)
+ */
+async function classifyProcessOwnership(ssh, lock) {
+  if (!lock || !lock.pid || !/^[0-9a-f]{16}$/.test(String(lock.spawnNonce || ''))) {
+    return 'indeterminate'
+  }
 
-      void result
-    } catch (cause) {
-      const error: any = new Error('Could not terminate the stale SSH backend.')
-      error.kind = 'transient-transport-error'
-      error.cause = cause
-      throw error
+  const observed = await observeProcessIdentity(ssh, lock.pid, lock.spawnNonce)
+
+  if (!observed) {
+    return 'foreign'
+  }
+
+  if (!observed.ownedShape) {
+    return 'foreign'
+  }
+
+  if (lock.pidStartTime != null && observed.startTime != null && lock.pidStartTime !== observed.startTime) {
+    // Same PID number, different start time => PID reuse. Never signal it.
+    return 'foreign'
+  }
+
+  if (
+    lock.processFingerprint &&
+    observed.fingerprint &&
+    lock.processFingerprint !== observed.fingerprint
+  ) {
+    return 'foreign'
+  }
+
+  return 'owned'
+}
+
+// Back-compat predicate used by tests and callers that want a boolean.
+async function pidIsOurDashboard(ssh, pid, spawnNonce, _hermesPath = '', lockExtras: any = {}) {
+  const classification = await classifyProcessOwnership(ssh, {
+    pid,
+    spawnNonce,
+    pidStartTime: lockExtras.pidStartTime,
+    processFingerprint: lockExtras.processFingerprint
+  })
+
+  return classification === 'owned'
+}
+
+// Kill the stale dashboard ONLY if provably ours, then drop the lockfile.
+// Alive indeterminate/foreign locks are a hard ownership-conflict: preserve
+// lock/log, do not signal, do not spawn.
+async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
+  const lockWithOwner = lock ? { ...lock, ownershipId: lock.ownershipId || ownershipId } : lock
+
+  if (pidAlive && lockWithOwner) {
+    const classification = await classifyProcessOwnership(ssh, lockWithOwner)
+
+    if (classification === 'owned') {
+      try {
+        const result = (
+          await ssh.exec(
+            `kill ${Number(lockWithOwner.pid)} && ` +
+              `i=0; while kill -0 ${Number(lockWithOwner.pid)} 2>/dev/null; do ` +
+              `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+          )
+        ).trim()
+
+        void result
+      } catch (cause) {
+        const error: any = new Error('Could not terminate the stale SSH backend.')
+        error.kind = 'transient-transport-error'
+        error.cause = cause
+        throw error
+      }
+
+      // Confirm exit before dropping evidence.
+      if (await remotePidAlive(ssh, lockWithOwner.pid)) {
+        throw ownershipConflict(
+          'Owned SSH backend did not exit after terminate; preserving lock evidence.'
+        )
+      }
+    } else if (classification === 'foreign' || classification === 'indeterminate') {
+      throw ownershipConflict(
+        'Alive SSH backend lock is not provably owned; refusing to delete lock/log or spawn a replacement.'
+      )
     }
   }
 
-  const expectedLogPath = lock?.spawnNonce ? spawnLogPath(ownershipId, lock.spawnNonce) : ''
+  const expectedLogPath =
+    lockWithOwner?.spawnNonce ? spawnLogPath(ownershipId, lockWithOwner.spawnNonce) : ''
 
-  if (lock?.logPath === expectedLogPath) {
+  if (lockWithOwner?.logPath && lockWithOwner.logPath === expectedLogPath) {
     try {
-      await ssh.exec(`rm -f ${expandRemotePath(lock.logPath)}`)
+      await ssh.exec(`rm -f ${expandRemotePath(lockWithOwner.logPath)}`)
     } catch {
       void 0
     }
@@ -591,7 +736,24 @@ async function spawnRemoteDashboard(ssh, { hermesPath, profile, token, ownership
     throw err
   }
 
-  return { pid, spawnNonce, logPath, tokenFilePath }
+  // Capture spawn-observed identity immediately after spawn. Launcher path is
+  // metadata only; ownership uses this observed identity + nonce.
+  let pidStartTime = null
+  let processFingerprint = ''
+
+  try {
+    const observed = await observeProcessIdentity(ssh, pid, spawnNonce)
+
+    if (observed) {
+      pidStartTime = observed.startTime
+      processFingerprint = observed.fingerprint || ''
+    }
+  } catch {
+    // Observation failure is non-fatal at spawn; later classification may still
+    // prove ownership via live serve --isolated --ssh-owner-nonce shape.
+  }
+
+  return { pid, spawnNonce, logPath, tokenFilePath, pidStartTime, processFingerprint }
 }
 
 // Best-effort forward teardown when a reuse attempt fails mid-flight, so we
@@ -640,6 +802,69 @@ async function openForward(deps, remotePort, attempts = 3) {
   }
 
   throw lastError
+}
+
+/**
+ * Cross-process remote mutex for the full read→classify→cleanup/reuse/spawn→write
+ * transaction. Held through the final ready lock write. Bounded stale recovery
+ * uses PID/start identity of the mutex holder when available.
+ */
+async function withOwnershipMutex(ssh, ownershipId, fn) {
+  const directory = ownershipDirectory(ownershipId)
+  const mutexPath = ownershipMutexPath(ownershipId)
+  const holder = `${process.pid}-${crypto.randomBytes(4).toString('hex')}`
+  const script =
+    'import os,sys,time\n' +
+    `d=os.path.expanduser(${shq(directory)})\n` +
+    `p=os.path.expanduser(${shq(mutexPath)})\n` +
+    `holder=${shq(holder)}\n` +
+    `stale_ms=${OWNERSHIP_MUTEX_STALE_MS}\n` +
+    'os.makedirs(d,mode=0o700,exist_ok=True)\n' +
+    'deadline=time.time()+30\n' +
+    'while time.time()<deadline:\n' +
+    ' try:\n' +
+    '  fd=os.open(p,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)\n' +
+    '  try:os.write(fd,holder.encode())\n' +
+    '  finally:os.close(fd)\n' +
+    '  print("ACQUIRED"); sys.exit(0)\n' +
+    ' except FileExistsError:\n' +
+    '  try:\n' +
+    '   age=(time.time()-os.stat(p).st_mtime)*1000\n' +
+    '   if age>stale_ms:\n' +
+    '    os.unlink(p)\n' +
+    '    continue\n' +
+    '  except OSError:\n' +
+    '   pass\n' +
+    '  time.sleep(0.05)\n' +
+    'print("TIMEOUT"); sys.exit(2)'
+
+  const acquireOut = String(await ssh.exec(`python3 -c ${shq(script)}`)).trim()
+
+  if (!acquireOut.endsWith('ACQUIRED')) {
+    const error: any = new Error('Could not acquire the SSH backend ownership mutex.')
+    error.kind = 'transient-transport-error'
+    throw error
+  }
+
+  try {
+    return await fn()
+  } finally {
+    try {
+      await ssh.exec(
+        `python3 -c ${shq(
+          'import os\n' +
+            `p=os.path.expanduser(${shq(mutexPath)})\n` +
+            `holder=${shq(holder)}\n` +
+            'try:\n' +
+            ' data=open(p,"r",encoding="utf-8").read().strip()\n' +
+            ' if data==holder:os.unlink(p)\n' +
+            'except OSError:pass'
+        )}`
+      )
+    } catch {
+      void 0
+    }
+  }
 }
 
 /**
@@ -694,177 +919,205 @@ async function connect(deps) {
 
   const reuseToken = deps.reuseToken || ''
   const hermesHome = await probeRemoteHermesHome(ssh)
-  const lock = await readLockfile(ssh, ownershipId)
 
-  if (lock) {
-    const pidAlive = await remotePidAlive(ssh, lock.pid)
-    const owned = pidAlive && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))
+  return withOwnershipMutex(ssh, ownershipId, async () => {
+    assertNotAborted(signal)
+    const lock = await readLockfile(ssh, ownershipId)
 
-    const reusable =
-      pidAlive &&
-      owned &&
-      lock.port > 0 &&
-      lock.profile === profile &&
-      Boolean(reuseToken) &&
-      lock.tokenFingerprint === fingerprintToken(reuseToken) &&
-      lock.hermesPath === hermesPath &&
-      lock.hermesHome === hermesHome
+    if (lock) {
+      const pidAlive = await remotePidAlive(ssh, lock.pid)
+      let classification = 'foreign'
 
-    if (reusable) {
-      assertNotAborted(signal)
-      const localPort = await openForward(deps, lock.port)
+      if (pidAlive) {
+        classification = await classifyProcessOwnership(ssh, { ...lock, ownershipId })
+      }
 
-      try {
-        const baseUrl = `http://127.0.0.1:${localPort}`
-        let reuseClassification
+      const owned = pidAlive && classification === 'owned'
+
+      if (pidAlive && !owned) {
+        // Alive indeterminate/foreign: fail closed. Never delete lock/log or spawn.
+        throw ownershipConflict(
+          'An existing SSH backend lock is alive but not provably owned by this Desktop connection.'
+        )
+      }
+
+      const reusable =
+        owned &&
+        lock.port > 0 &&
+        lock.profile === profile &&
+        Boolean(reuseToken) &&
+        lock.tokenFingerprint === fingerprintToken(reuseToken) &&
+        // launcherPath/hermesPath are metadata — do not require equality after
+        // exec wrappers. hermesHome still scopes the state store.
+        lock.hermesHome === hermesHome
+
+      if (reusable) {
+        assertNotAborted(signal)
+        const localPort = await openForward(deps, lock.port)
 
         try {
-          reuseClassification = await probeReuseProof(baseUrl, reuseToken, lock.spawnNonce)
-        } catch (cause) {
-          const error: any = new Error('Could not verify the existing SSH backend.')
-          error.kind = 'transient-transport-error'
-          error.cause = cause
-          throw error
-        }
+          const baseUrl = `http://127.0.0.1:${localPort}`
+          let reuseClassification
 
-        if (reuseClassification === 'authenticated-stale') {
-          assertNotAborted(signal)
-          await cancelForwardSafe(deps, localPort, lock.port)
-          await cleanupStale(ssh, ownershipId, lock)
-        } else if (reuseClassification === 'authenticated-ok') {
-          const token = await adoptOwnedServedToken(
-            adoptServedToken,
-            baseUrl,
-            reuseToken,
-            ssh,
-            lock.pid,
-            'reused remote dashboard'
-          )
-
-          assertNotAborted(signal)
-          log(`reusing remote dashboard pid=${lock.pid} port=${lock.port}`)
-
-          return {
-            baseUrl,
-            token,
-            tokenFingerprint: fingerprintToken(token),
-            remotePort: lock.port,
-            localPort,
-            pid: lock.pid,
-            reused: true,
-            platform,
-            hermesPath,
-            hermesVersion,
-            ownershipId,
-            spawnNonce: lock.spawnNonce,
-            logPath: lock.logPath
+          try {
+            reuseClassification = await probeReuseProof(baseUrl, reuseToken, lock.spawnNonce)
+          } catch (cause) {
+            const error: any = new Error('Could not verify the existing SSH backend.')
+            error.kind = 'transient-transport-error'
+            error.cause = cause
+            throw error
           }
-        } else {
-          const error: any = new Error('SSH reuse proof returned an invalid classification.')
-          error.kind = 'transient-transport-error'
+
+          if (reuseClassification === 'authenticated-stale') {
+            assertNotAborted(signal)
+            await cancelForwardSafe(deps, localPort, lock.port)
+            await cleanupStale(ssh, ownershipId, lock)
+          } else if (reuseClassification === 'authenticated-ok') {
+            const token = await adoptOwnedServedToken(
+              adoptServedToken,
+              baseUrl,
+              reuseToken,
+              ssh,
+              lock.pid,
+              'reused remote dashboard'
+            )
+
+            assertNotAborted(signal)
+            log(`reusing remote dashboard pid=${lock.pid} port=${lock.port}`)
+
+            return {
+              baseUrl,
+              token,
+              tokenFingerprint: fingerprintToken(token),
+              remotePort: lock.port,
+              localPort,
+              pid: lock.pid,
+              reused: true,
+              platform,
+              hermesPath,
+              hermesVersion,
+              ownershipId,
+              spawnNonce: lock.spawnNonce,
+              logPath: lock.logPath
+            }
+          } else {
+            const error: any = new Error('SSH reuse proof returned an invalid classification.')
+            error.kind = 'transient-transport-error'
+            throw error
+          }
+        } catch (error) {
+          await cancelForwardSafe(deps, localPort, lock.port)
           throw error
         }
-      } catch (error) {
-        await cancelForwardSafe(deps, localPort, lock.port)
-        throw error
+      } else if (owned) {
+        // Owned but not reusable (profile/token/port mismatch): terminate exact
+        // identity, wait until gone, then spawn. Never overlap two owners.
+        assertNotAborted(signal)
+        await cleanupStale(ssh, ownershipId, lock, pidAlive)
+      } else {
+        // Dead pid: drop lock evidence and continue to spawn.
+        assertNotAborted(signal)
+        await cleanupStale(ssh, ownershipId, lock, false)
       }
-    } else {
-      assertNotAborted(signal)
-      await cleanupStale(ssh, ownershipId, lock, pidAlive)
     }
-  }
-
-  assertNotAborted(signal)
-  const spawnToken = mintToken()
-
-  const { pid, spawnNonce, logPath, tokenFilePath } = await spawnRemoteDashboard(ssh, {
-    hermesPath,
-    profile,
-    token: spawnToken,
-    ownershipId
-  })
-
-  log(`spawned remote dashboard pid=${pid}`)
-
-  const ownedSpawn = {
-    ownershipId,
-    spawnNonce,
-    pid,
-    port: 0,
-    profile,
-    hermesPath,
-    hermesHome,
-    logPath,
-    tokenFingerprint: fingerprintToken(spawnToken),
-    protocolVersion: PROTOCOL_VERSION,
-    startedAt: new Date().toISOString()
-  }
-
-  let localPort = 0
-  let remotePort = 0
-
-  try {
-    // Write the ownership record IMMEDIATELY (port=0): a supersede between
-    // spawn and readiness whose cleanup cannot reach the box must not leave a
-    // lockless orphan — the next connect reaps it by exact ownership via this
-    // record. Inside the try: if this write itself fails, the catch still
-    // kills the just-spawned process via the in-memory record.
-    await writeLockfile(ssh, ownershipId, ownedSpawn)
-    remotePort = await scrapeReadyPort(ssh, logPath, {
-      timeoutMs: readyTimeoutMs,
-      isAlive: () => remotePidAlive(ssh, pid),
-      signal
-    })
-    assertNotAborted(signal)
-    log(`remote dashboard bound port ${remotePort}`)
-
-    localPort = await openForward(deps, remotePort)
-    assertNotAborted(signal)
-    const baseUrl = `http://127.0.0.1:${localPort}`
-    await waitForHermes(baseUrl, spawnToken)
-    assertNotAborted(signal)
-
-    const token = await adoptOwnedServedToken(adoptServedToken, baseUrl, spawnToken, ssh, pid, 'remote dashboard')
 
     assertNotAborted(signal)
-    const tokenFingerprint = fingerprintToken(token)
-    await writeLockfile(ssh, ownershipId, { ...ownedSpawn, port: remotePort, tokenFingerprint })
-    assertNotAborted(signal)
+    const spawnToken = mintToken()
 
-    return {
-      baseUrl,
-      token,
-      tokenFingerprint,
-      remotePort,
-      localPort,
-      pid,
-      reused: false,
-      platform,
-      hermesPath,
-      hermesVersion,
+    const { pid, spawnNonce, logPath, tokenFilePath, pidStartTime, processFingerprint } =
+      await spawnRemoteDashboard(ssh, {
+        hermesPath,
+        profile,
+        token: spawnToken,
+        ownershipId
+      })
+
+    log(`spawned remote dashboard pid=${pid}`)
+
+    const ownedSpawn = {
       ownershipId,
       spawnNonce,
-      logPath
+      pid,
+      port: 0,
+      profile,
+      hermesPath,
+      launcherPath: hermesPath,
+      hermesHome,
+      logPath,
+      tokenFingerprint: fingerprintToken(spawnToken),
+      protocolVersion: PROTOCOL_VERSION,
+      startedAt: new Date().toISOString(),
+      pidStartTime,
+      processFingerprint
     }
-  } catch (error) {
-    if (localPort && remotePort) {
-      await cancelForwardSafe(deps, localPort, remotePort)
-    }
+
+    let localPort = 0
+    let remotePort = 0
 
     try {
-      await ssh.exec(`rm -f ${expandRemotePath(tokenFilePath)}`)
-    } catch {
-      void 0
-    }
+      // Write the ownership record IMMEDIATELY (port=0): a supersede between
+      // spawn and readiness whose cleanup cannot reach the box must not leave a
+      // lockless orphan — the next connect reaps it by exact ownership via this
+      // record. Inside the try: if this write itself fails, the catch still
+      // kills the just-spawned process via the in-memory record.
+      await writeLockfile(ssh, ownershipId, ownedSpawn)
+      remotePort = await scrapeReadyPort(ssh, logPath, {
+        timeoutMs: readyTimeoutMs,
+        isAlive: () => remotePidAlive(ssh, pid),
+        signal
+      })
+      assertNotAborted(signal)
+      log(`remote dashboard bound port ${remotePort}`)
 
-    await cleanupStale(ssh, ownershipId, ownedSpawn)
-    throw error
-  }
+      localPort = await openForward(deps, remotePort)
+      assertNotAborted(signal)
+      const baseUrl = `http://127.0.0.1:${localPort}`
+      await waitForHermes(baseUrl, spawnToken)
+      assertNotAborted(signal)
+
+      const token = await adoptOwnedServedToken(adoptServedToken, baseUrl, spawnToken, ssh, pid, 'remote dashboard')
+
+      assertNotAborted(signal)
+      const tokenFingerprint = fingerprintToken(token)
+      await writeLockfile(ssh, ownershipId, { ...ownedSpawn, port: remotePort, tokenFingerprint })
+      assertNotAborted(signal)
+
+      return {
+        baseUrl,
+        token,
+        tokenFingerprint,
+        remotePort,
+        localPort,
+        pid,
+        reused: false,
+        platform,
+        hermesPath,
+        hermesVersion,
+        ownershipId,
+        spawnNonce,
+        logPath
+      }
+    } catch (error) {
+      if (localPort && remotePort) {
+        await cancelForwardSafe(deps, localPort, remotePort)
+      }
+
+      try {
+        await ssh.exec(`rm -f ${expandRemotePath(tokenFilePath)}`)
+      } catch {
+        void 0
+      }
+
+      await cleanupStale(ssh, ownershipId, ownedSpawn)
+      throw error
+    }
+  })
 }
 
 export {
   adoptOwnedServedToken,
   buildSpawnCommand,
+  classifyProcessOwnership,
   cleanupStale,
   connect,
   DEFAULT_READY_TIMEOUT_MS,
@@ -875,8 +1128,11 @@ export {
   LOCKFILE_SCHEMA_VERSION,
   lockfilePath,
   mintToken,
+  observeProcessIdentity,
   openForward,
+  ownershipConflict,
   ownershipDirectory,
+  ownershipMutexPath,
   pidIsOurDashboard,
   probeHermesVersion,
   probeRemoteHermesHome,
@@ -894,5 +1150,6 @@ export {
   spawnRemoteDashboard,
   SUPPORTED_REMOTE_OS,
   validateRemotePath,
+  withOwnershipMutex,
   writeLockfile
 }

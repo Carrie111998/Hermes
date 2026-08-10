@@ -4199,7 +4199,7 @@ class TestValidateProviderCredential:
 
 
 class TestDesktopCronTicker:
-    """The dashboard backend fires cron jobs itself only when desktop-spawned."""
+    """The dashboard backend fires cron jobs itself only when admitted."""
 
     def _client(self):
         try:
@@ -4210,16 +4210,70 @@ class TestDesktopCronTicker:
 
         return TestClient(app)
 
-    def test_ticker_runs_when_desktop(self, monkeypatch, _isolate_hermes_home):
+    def test_ticker_runs_when_desktop_fallback_admitted(self, monkeypatch, _isolate_hermes_home):
         import threading
         import cron.scheduler as sched
+        import hermes_cli.web_server as ws
 
         called = threading.Event()
         monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
         monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(ws, "_SSH_OWNER_NONCE", None)
+        monkeypatch.setattr(ws, "_SCHEDULER_ROLE", "local-primary")
+        monkeypatch.setattr(ws, "_canonical_gateway_is_live", lambda **k: False)
+        monkeypatch.setattr(ws, "_try_acquire_desktop_scheduler_lease", lambda: True)
+        monkeypatch.setattr(ws, "_release_desktop_scheduler_lease", lambda: None)
+        # Reset lease handle so admit path is deterministic in-process.
+        ws._desktop_scheduler_lease_fh = None
 
         with self._client():
-            assert called.wait(3.0), "expected cron tick under HERMES_DESKTOP=1"
+            assert called.wait(3.0), "expected cron tick under admitted desktop fallback"
+
+    def test_ticker_not_started_for_ssh_owned_isolated_backend(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import threading
+        import cron.scheduler as sched
+        import hermes_cli.web_server as ws
+
+        called = threading.Event()
+        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(ws, "_SSH_OWNER_NONCE", "0123456789abcdef")
+        monkeypatch.setattr(ws, "_SCHEDULER_ROLE", "none")
+        monkeypatch.setattr(ws, "_canonical_gateway_is_live", lambda **k: False)
+        monkeypatch.setattr(ws, "_try_acquire_desktop_scheduler_lease", lambda: True)
+        ws._desktop_scheduler_lease_fh = None
+
+        with self._client():
+            assert not called.wait(0.6), "SSH-owned isolated backend must not run desktop cron"
+
+    def test_ticker_suppressed_when_canonical_gateway_live(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import threading
+        import cron.scheduler as sched
+        import hermes_cli.web_server as ws
+
+        called = threading.Event()
+        monkeypatch.setattr(sched, "tick", lambda *a, **k: called.set())
+        monkeypatch.setenv("HERMES_DESKTOP", "1")
+        monkeypatch.setattr(ws, "_SSH_OWNER_NONCE", None)
+        monkeypatch.setattr(ws, "_SCHEDULER_ROLE", "local-primary")
+        monkeypatch.setattr(ws, "_canonical_gateway_is_live", lambda **k: True)
+        monkeypatch.setattr(ws, "_try_acquire_desktop_scheduler_lease", lambda: True)
+        ws._desktop_scheduler_lease_fh = None
+
+        with self._client():
+            assert not called.wait(0.6), "live canonical gateway must suppress desktop fallback"
+
+    def test_apply_ssh_owner_nonce_forces_scheduler_role_none(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "_SCHEDULER_ROLE", "local-primary")
+        ws._apply_ssh_owner_nonce("0123456789abcdef")
+        assert ws.get_scheduler_role() == "none"
+        assert ws._SSH_OWNER_NONCE == "0123456789abcdef"
 
 
 class TestServeIndexMissingIndex:
