@@ -100,3 +100,33 @@ def test_config_error_alerts_on_stdout(wrapper, monkeypatch, capsys):
     assert wrapper.main() == 0
     out = capsys.readouterr().out
     assert "repos.json is malformed" in out
+
+
+def test_alert_carries_the_counter_line_the_job_prompt_requires(wrapper, monkeypatch, capsys):
+    """The live cron prompt reformats `repos=.. prs=.. builds=.. emitted=.. errors=..`.
+
+    Going silent on no-change must not strip those counters from the ticks
+    that DO speak, or the agent has nothing to derive them from and will
+    omit or invent them in the delivered summary and AGENT_ITERATION_JSON.
+    """
+    summary = wrapper.PollSummary(
+        repos_polled=2,
+        prs_observed=5,
+        builds_observed=3,
+        transitions_emitted=1,
+        transitions=[{"kind": "pr", "repo": "o/r", "id": "12", "state": "merged"}],
+        errors=["o/r2: 403 forbidden"],
+    )
+    monkeypatch.setattr(wrapper, "load_config", lambda: object())
+    monkeypatch.setattr(wrapper, "run_poll", lambda bus, config: summary)
+
+    wrapper.main()
+    out = capsys.readouterr().out
+
+    assert "repos=2" in out
+    assert "prs=5" in out
+    assert "builds=3" in out
+    assert "emitted=1" in out
+    assert "errors=1" in out
+    # The named detail must survive alongside the counters.
+    assert "o/r#12" in out and "403 forbidden" in out
