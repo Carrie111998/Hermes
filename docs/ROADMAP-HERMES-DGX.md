@@ -25,8 +25,8 @@
 
 ## Goals and ticket order
 
-1. `ARCH-001-MAINLINE-001` — reconcile ARCH-001 onto clean Hermes `main`.
-2. `ARCH-002` — extend the runtime-state contract after ARCH-001 is merged.
+1. `CI-BASELINE-001` — restore blocking Python CI while preserving behavior.
+2. `ARCH-002` — extend the runtime-state contract after CI is green.
 3. `ARCH-003` — audit/replay integration after the shared state boundary is
    stable.
 4. `ARCH-004` — redaction and SQLite/WAL safeguards after the preceding
@@ -38,7 +38,8 @@
 |---|---|---|
 | `ARCH-001` | complete | Merged to Hermes `main` and deployed to DGX; service active after restart. |
 | `ARCH-001-MAINLINE-001` | `COMPLETE` (Codex READY; AGY waived by owner) | Merge `ec50a154…`; compile and 35 targeted tests passed; runtime restart verified. |
-| `ARCH-002` to `ARCH-004` | proposed | Ready for ticket planning now that ARCH-001 is on mainline. |
+| `CI-BASELINE-001` | `IMPLEMENTED_PENDING_CI` | Five failures fixed locally; affected modules, ARCH-001 regression, Ruff, and compileall pass; GitHub Actions still pending. |
+| `ARCH-002` to `ARCH-004` | proposed | Start after CI-BASELINE-001 is green and reviewed. |
 
 ARCH-001 was merged by owner-authorized admin merge because the repository's
 baseline CI still has unrelated pre-existing failures. The ARCH-001 targeted

@@ -9039,14 +9039,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._queue_startup_restore_event(event)
             return None
 
-        pending_ocr_result = await self._handle_pending_image_ocr_choice(event)
-        if pending_ocr_result is not None:
-            return pending_ocr_result
-
-        pending_last30days_result = await self._handle_pending_last30days_choice(event)
-        if pending_last30days_result is not None:
-            return pending_last30days_result
-
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
@@ -9154,6 +9146,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # Pending interactive state is user/session-scoped and must only be
+        # inspected after the authorization gate above. In particular, an
+        # anonymous sender outside an allowlisted chat must not reach a session
+        # key lookup before being dropped.
+        pending_ocr_result = await self._handle_pending_image_ocr_choice(event)
+        if pending_ocr_result is not None:
+            return pending_ocr_result
+
+        pending_last30days_result = await self._handle_pending_last30days_choice(event)
+        if pending_last30days_result is not None:
+            return pending_last30days_result
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
