@@ -7410,14 +7410,21 @@ def shutdown_cached_clients() -> None:
 
     Call this during CLI shutdown, *before* the event loop is closed, to
     avoid ``AsyncHttpxClientWrapper.__del__`` raising on a dead loop.
+
+    Snapshot and clear the cache under the lock, then close transports outside
+    it. Async transport shutdown may block while an owner loop drains; holding
+    the global cache lock during that wait stalls unrelated auxiliary callers
+    and can turn teardown into a process-wide lock convoy.
     """
     with _client_cache_lock:
-        for key, entry in list(_client_cache.items()):
-            client = entry[0]
-            if client is None:
-                continue
-            _close_cached_client(client, close_async=True)
+        clients = [
+            entry[0]
+            for entry in _client_cache.values()
+            if entry[0] is not None
+        ]
         _client_cache.clear()
+    for client in clients:
+        _close_cached_client(client, close_async=True)
 
 
 def cleanup_stale_async_clients() -> None:
