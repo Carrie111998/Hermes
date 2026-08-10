@@ -27,7 +27,7 @@ describe('CompactionGuard', () => {
     expect(screen.getByText(/Sending messages and changing this session are temporarily disabled/i)).not.toBeNull()
   })
 
-  it('cannot be dismissed while compaction remains active', () => {
+  it('cannot be dismissed while compaction remains active', async () => {
     setSessionCompacting(SID, true)
     render(<CompactionGuard sessionId={SID} />)
     const downstreamShortcut = vi.fn()
@@ -37,6 +37,15 @@ describe('CompactionGuard', () => {
     expect(screen.queryByRole('button', { name: /close/i })).toBeNull()
     fireEvent.keyDown(window.document, { key: 'Escape' })
     fireEvent.keyDown(window, { ctrlKey: true, key: 'n' })
+
+    // Radix installs its outside-pointer listener on a deferred tick.
+    await new Promise(resolve => setTimeout(resolve, 10))
+    const overlay = window.document.querySelector('[data-slot="dialog-overlay"]') as HTMLElement
+    fireEvent.pointerDown(overlay, { button: 0 })
+    fireEvent.pointerUp(overlay, { button: 0 })
+    fireEvent.click(overlay, { button: 0 })
+    await new Promise(resolve => setTimeout(resolve, 10))
+
     expect(screen.getByRole('dialog')).not.toBeNull()
     expect(downstreamShortcut).not.toHaveBeenCalled()
 
