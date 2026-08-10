@@ -112,10 +112,17 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
 
     const incoming = result.sessions.filter(s => normalizeSessionSource(s.source) === platform)
 
-    setMessagingSessions(prev => [
-      ...prev.filter(s => !inPlatform(s)),
-      ...mergeSessionPage(prev.filter(inPlatform), incoming, sessionsToKeep())
-    ])
+    setMessagingSessions(prev => {
+      const existing = prev.filter(inPlatform)
+      // Same don't-clobber rule as refreshSessions: a read that errored tells us
+      // nothing new, so keep the platform's existing rows alongside whatever
+      // did come back.
+      const keep = (result.errors ?? []).length
+        ? new Set([...sessionsToKeep(), ...existing.map(s => s.id)])
+        : sessionsToKeep()
+
+      return [...prev.filter(s => !inPlatform(s)), ...mergeSessionPage(existing, incoming, keep)]
+    })
 
     const total = result.total ?? incoming.length
     setMessagingPlatformTotals(prev => ({ ...prev, [platform]: Math.max(total, incoming.length) }))
@@ -151,6 +158,8 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       setSessionsLoading(true)
     }
 
+    let succeeded = false
+
     try {
       const limit = $sessionsLimit.get()
 
@@ -177,9 +186,33 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         messagingLimit: MESSAGING_SECTION_LIMIT,
         messagingExclude: MESSAGING_EXCLUDED_SOURCES
       })
+      succeeded = true
 
       if (refreshSessionsRequestRef.current === requestId) {
         const recents = result.recents
+
+        // A refresh that could not read some profile's rows must not evict the
+        // rows we already hold for it (desktop AGENTS.md: merge, don't
+        // clobber). The backend reports per-profile read failures in `errors`;
+        // a transport-level failure throws above and the previous list simply
+        // stays put. But a RESOLVED response can still be partial — a profile
+        // whose DB read failed, or a remote/primary that contributed nothing —
+        // and merging that page as authoritative drops every idle session of
+        // the failed profile until the next successful refresh (the
+        // "sessions disappeared, then came back when I made a new chat" bug).
+        // Preserve rows for the failed profiles; an unscoped error ('primary'
+        // or profile-less, emitted when the whole backend couldn't be read)
+        // preserves everything, since we cannot tell which rows are stale.
+        const errors = result.errors ?? []
+        const unscopedError = errors.some(e => !e?.profile?.trim() || e.profile === 'primary')
+        const erroredProfiles = new Set(
+          errors
+            .map(e => e?.profile?.trim())
+            .filter((p): p is string => Boolean(p) && p !== 'primary')
+            .map(normalizeProfileKey)
+        )
+        const preserve = (s: SessionInfo) =>
+          unscopedError || erroredProfiles.has(normalizeProfileKey(s.profile))
 
         // Drop rows the user just deleted/archived: a refresh can race an
         // in-flight mutation and the backend page still carries the doomed row.
@@ -198,7 +231,24 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         // identity, or every sidebar memo keyed on $sessions recomputes and the
         // whole list re-renders once per turn/broadcast for nothing.
         setSessions(prev => {
-          const next = mergeSessionPage(prev, incoming, sessionsToKeep())
+          const keep = sessionsToKeep()
+
+          if (unscopedError || erroredProfiles.size > 0) {
+            for (const session of prev) {
+              if (
+                tombstones.has(session.id) ||
+                (session._lineage_root_id != null && tombstones.has(session._lineage_root_id))
+              ) {
+                continue
+              }
+
+              if (preserve(session)) {
+                keep.add(session.id)
+              }
+            }
+          }
+
+          const next = mergeSessionPage(prev, incoming, keep)
 
           return sameCronSignature(prev, next) ? prev : next
         })
@@ -230,7 +280,12 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
       }
     } finally {
-      if (showLoading && refreshSessionsRequestRef.current === requestId) {
+      // A failed INITIAL fetch must not paint a terminal "no sessions yet" —
+      // the refresh likely raced the backend coming up (gateway restart,
+      // remote re-mint), and every later refresh trigger (reconnect, new chat,
+      // turn completion, background sync) repopulates the list. Keep the
+      // skeletons until one succeeds; a populated list simply stays put.
+      if (showLoading && refreshSessionsRequestRef.current === requestId && (succeeded || $sessions.get().length > 0)) {
         setSessionsLoading(false)
       }
     }
@@ -256,6 +311,32 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     })
 
     const keep = sessionsToKeep(key)
+
+    // The paged profile's read errored → this page is partial, not
+    // authoritative. Keep the rows we already hold for it so the pager can't
+    // evict known sessions on a transient backend failure.
+    const errors = result.errors ?? []
+    const errored = errors.some(e => {
+      const name = e?.profile?.trim()
+
+      return !name || name === 'primary' || normalizeProfileKey(name) === key
+    })
+
+    if (errored) {
+      const tombstones = $removedSessionIds.get()
+
+      for (const s of $sessions.get()) {
+        if (!inKey(s)) {
+          continue
+        }
+
+        if (tombstones.has(s.id) || (s._lineage_root_id != null && tombstones.has(s._lineage_root_id))) {
+          continue
+        }
+
+        keep.add(s.id)
+      }
+    }
 
     setSessions(prev => [
       ...prev.filter(s => !inKey(s)),

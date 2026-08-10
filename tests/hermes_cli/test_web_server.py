@@ -476,6 +476,32 @@ class TestWebServerEndpoints:
             "sidebar-stale"
         ]
 
+    def test_profiles_sidebar_reports_profile_enumeration_failure(self, monkeypatch):
+        """A failed profile enumeration must not read as "no sessions".
+
+        When list_profiles() yields nothing, the sidebar falls back to scanning
+        only the "default" profile. For a non-default recents scope that
+        fallback produces an empty page which, merged as authoritative, would
+        make every session of the real profile vanish until the next successful
+        refresh — so the endpoint must report the failure in ``errors`` for
+        clients to preserve the rows they already hold.
+        """
+        from hermes_cli import profiles as profiles_mod
+
+        monkeypatch.setattr(profiles_mod, "list_profiles", lambda: [])
+
+        response = self.client.get(
+            "/api/profiles/sessions/sidebar?recents_profile=main&recents_limit=20"
+        )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["recents"]["sessions"] == []
+        assert any(
+            entry["profile"] == "main" and "enumerat" in entry["error"]
+            for entry in payload["errors"]
+        )
+
     def test_heal_gives_up_when_reconcile_cannot_fix_the_store(self, monkeypatch):
         """A probe failure reconciliation can't cure must not retry forever.
 

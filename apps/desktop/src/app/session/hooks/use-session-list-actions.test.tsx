@@ -45,11 +45,13 @@ const row = (id: string, over: Partial<SessionInfo> = {}): SessionInfo =>
 const sidebar = (
   recents: { sessions: SessionInfo[]; profiles_truncated?: Record<string, boolean> },
   cron: SessionInfo[] = [],
-  messaging: SessionInfo[] = []
+  messaging: SessionInfo[] = [],
+  errors: SidebarSessionsResponse['errors'] = []
 ): SidebarSessionsResponse => ({
   recents: { sessions: recents.sessions, profiles_truncated: recents.profiles_truncated },
   cron: { sessions: cron },
-  messaging: { sessions: messaging }
+  messaging: { sessions: messaging },
+  ...(errors.length ? { errors } : {})
 })
 
 const listSidebarSessions = vi.fn()
@@ -247,5 +249,135 @@ describe('refreshSessions batches slices into one request', () => {
     })
 
     expect(getCronJobs).toHaveBeenLastCalledWith('all')
+  })
+})
+
+describe('refreshSessions preserves known rows when a profile read errors', () => {
+  it('keeps rows of a profile whose read errored (merge, don\'t clobber)', async () => {
+    // A resolved refresh can be partial: profile 'main' errored server-side so
+    // its rows are missing from the page. They must survive — the failure is a
+    // transient backend condition, not a deletion.
+    setSessions([
+      row('main-1', { profile: 'main' }),
+      row('main-2', { profile: 'main' }),
+      row('work-1', { profile: 'work' })
+    ])
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [row('work-1', { profile: 'work' })] }, [], [], [
+        { profile: 'main', error: 'database locked' }
+      ])
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'main' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    const ids = $sessions.get().map(s => s.id)
+    expect(ids).toContain('main-1')
+    expect(ids).toContain('main-2')
+    expect(ids).toContain('work-1')
+  })
+
+  it('still evicts rows of healthy profiles the page omitted', async () => {
+    // Granularity guard: only the errored profile's rows are protected. A
+    // healthy profile's row that legitimately aged off the page must still go.
+    setSessions([
+      row('main-1', { profile: 'main' }),
+      row('main-2', { profile: 'main' }),
+      row('work-1', { profile: 'work' }),
+      row('work-2', { profile: 'work' })
+    ])
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [row('work-1', { profile: 'work' })] }, [], [], [
+        { profile: 'main', error: 'database locked' }
+      ])
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'main' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    const ids = $sessions.get().map(s => s.id)
+    expect(ids).toContain('main-1')
+    expect(ids).toContain('main-2')
+    expect(ids).toContain('work-1')
+    expect(ids).not.toContain('work-2')
+  })
+
+  it('preserves everything when the error is unscoped (primary backend down)', async () => {
+    setSessions([row('a', { profile: 'default' }), row('b', { profile: 'work' })])
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [] }, [], [], [{ profile: 'primary', error: 'backend unreachable' }])
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(s => s.id).sort()).toEqual(['a', 'b'])
+  })
+
+  it('does not resurrect a tombstoned row of an errored profile', async () => {
+    removed.ids = new Set(['main-2'])
+    setSessions([row('main-1', { profile: 'main' }), row('main-2', { profile: 'main' })])
+    listSidebarSessions.mockResolvedValue(
+      sidebar({ sessions: [] }, [], [], [{ profile: 'main', error: 'database locked' }])
+    )
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'main' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(s => s.id)).toEqual(['main-1'])
+  })
+})
+
+describe('refreshSessions initial-fetch failure', () => {
+  it('keeps the loading state when the first fetch fails on an empty list', async () => {
+    // Cold-start race: the sidebar refresh fired before the (remote) backend
+    // was ready. A terminal "no sessions yet" would look exactly like data
+    // loss until the user happened to trigger another refresh — keep the
+    // skeletons instead, and resolve them on the next successful refresh.
+    listSidebarSessions.mockRejectedValue(new Error('backend unreachable'))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await expect(result.current.refreshSessions()).rejects.toThrow('backend unreachable')
+    })
+
+    expect($sessionsLoading.get()).toBe(true)
+    expect($sessions.get()).toEqual([])
+
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [row('a')] }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessionsLoading.get()).toBe(false)
+    expect($sessions.get().map(s => s.id)).toEqual(['a'])
+  })
+
+  it('keeps an already-populated list on a failed refresh', async () => {
+    setSessions([row('a'), row('b')])
+    listSidebarSessions.mockRejectedValue(new Error('backend unreachable'))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await expect(result.current.refreshSessions()).rejects.toThrow('backend unreachable')
+    })
+
+    expect($sessions.get().map(s => s.id)).toEqual(['a', 'b'])
+    expect($sessionsLoading.get()).toBe(false)
   })
 })

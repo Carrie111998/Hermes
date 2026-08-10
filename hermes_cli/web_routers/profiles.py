@@ -256,6 +256,9 @@ def get_profiles_sessions_sidebar(
 
     # cron + messaging are cross-profile; recents is scoped to recents_profile.
     # Scan every profile once regardless (each DB opened a single time).
+    recents_scope = (recents_profile or "all").strip() or "all"
+    errors: List[Dict[str, str]] = []
+
     try:
         infos = profiles_mod.list_profiles()
         targets: List[Tuple[str, Path]] = [(info.name, info.path) for info in infos]
@@ -263,9 +266,16 @@ def get_profiles_sessions_sidebar(
         _log.exception("GET /api/profiles/sessions/sidebar: list_profiles failed")
         targets = []
     if not targets:
+        # Cannot enumerate profiles — the fallback to a bare "default" DB must
+        # not read as "no sessions exist" for the requested scope. Report the
+        # failure so clients preserve the rows they already hold: a refresh
+        # that merges an empty page as authoritative makes every session of a
+        # non-default profile vanish until the next successful refresh.
         targets.append(("default", profiles_mod.get_profile_dir("default")))
+        errors.append(
+            {"profile": "primary" if recents_scope == "all" else recents_scope, "error": "profile enumeration failed"}
+        )
 
-    recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
 
@@ -277,7 +287,6 @@ def get_profiles_sessions_sidebar(
     cron_rows: List[Dict[str, Any]] = []
     messaging_rows: List[Dict[str, Any]] = []
     recents_truncated: Dict[str, bool] = {}
-    errors: List[Dict[str, str]] = []
     now = time.time()
 
     def _tag(rows: List[Dict[str, Any]], name: str) -> List[Dict[str, Any]]:

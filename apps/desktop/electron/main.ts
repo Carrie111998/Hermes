@@ -10047,7 +10047,14 @@ async function interceptSessionRequestForRemote(request) {
     const requested = (searchParams.get('profile') || 'all').trim() || 'all'
 
     if (requested !== 'all') {
-      return profileHasRemoteOverride(requested) ? remoteSessionList(requested, searchParams) : undefined
+      return profileHasRemoteOverride(requested)
+        ? remoteSessionList(requested, searchParams).catch(error => ({
+            sessions: [],
+            total: 0,
+            profile_totals: {},
+            errors: [{ profile: requested, error: error instanceof Error ? error.message : String(error) }]
+          }))
+        : undefined
     }
 
     return mergeRemoteProfileSessions(searchParams, remoteProfiles)
@@ -10114,7 +10121,11 @@ async function interceptSessionRequestForRemote(request) {
         sessions: rowsOf(messaging),
         total: Number(messaging?.total) || rowsOf(messaging).length
       },
-      errors: []
+      // A dead remote must not read as "no sessions": surface the per-slice
+      // failures so the renderer preserves the rows it already holds (desktop
+      // AGENTS.md: merge, don't clobber). Each slice payload carries its own
+      // errors (primary fetch failure, unreachable remote-override profile).
+      errors: [...(recents?.errors ?? []), ...(cron?.errors ?? []), ...(messaging?.errors ?? [])]
     }
   }
 
@@ -10212,6 +10223,11 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 
   const base = (await fetchPrimaryProfileSessions(searchParams, fetchJsonForProfile)) as any
 
+  // The primary may have failed into an empty page (fetchPrimaryProfileSessions
+  // surfaces that as errors, never as a silent success) — carry its failures so
+  // the caller can tell "backend down" from "no sessions".
+  const errors = [...(base.errors ?? [])]
+
   // Over-fetch each remote from offset 0 (limit+offset rows) so the merged window
   // is correct for this page — mirrors the primary's per-profile over-fetch.
   const remoteParams = new URLSearchParams(searchParams)
@@ -10226,7 +10242,13 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   // Swap each remote profile's stale local rows/total for the remote's real ones.
   await Promise.all(
     remoteProfiles.map(async name => {
-      const list = await remoteSessionList(name, remoteParams).catch(() => null)
+      const list = await remoteSessionList(name, remoteParams).catch(error => {
+        // Report, don't silently drop: an unreachable remote must not read as
+        // "this profile has no sessions" or the sidebar evicts its rows.
+        errors.push({ profile: name, error: error instanceof Error ? error.message : String(error) })
+
+        return null
+      })
 
       if (!list) {
         delete profileTotals[name] // dead remote → drop its stale local total too
@@ -10244,7 +10266,14 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   const recency = s => s?.[order] ?? s?.started_at ?? 0
   merged.sort((a, b) => recency(b) - recency(a))
 
-  return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
+  return {
+    ...(base as any),
+    sessions: merged.slice(offset, offset + limit),
+    total,
+    profile_totals: profileTotals,
+    // Explicit so the collected remote failures are not lost in the base spread.
+    errors
+  }
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
