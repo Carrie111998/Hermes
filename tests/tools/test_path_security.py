@@ -264,7 +264,7 @@ class TestExtractFilesystemTargets:
         )
 
     def test_outer_quoted_unc_non_root_does_not_block(self):
-        """Round-7 MoA flagged that ``cmd /c \"rd /s /q \\\\server\\share\\folder\"``
+        r"""Round-7 MoA flagged that ``cmd /c \"rd /s /q \\\\server\\share\\folder\"``
         (UNC non-root wrapped in outer quotes) was being incorrectly
         classified as a root target via the new outer-quote re-tokenize
         pass.
@@ -274,14 +274,31 @@ class TestExtractFilesystemTargets:
         is correctly classified as non-root because the trailing
         ``\\folder`` segment turns it into a child path of the share,
         not the share-root itself.
+
+        Round-9 MoA review (2026-08-10) flagged that the previous
+        version of this test assigned ``cmd`` but never used it — the
+        assertion only checked :func:`is_filesystem_root` directly
+        instead of exercising the outer-quote re-tokenize pipeline.
+        The regression now runs the FULL pipeline::
+
+          cmd -> extract_filesystem_targets -> is_filesystem_root on each
+              AND detect_hardline_command on the original.
         """
         cmd = r'cmd /c "rd /s /q \\server\share\folder"'
+        from tools.approval import detect_hardline_command
         from tools.path_security import is_filesystem_root
 
-        # Sanity: the primary helper must NOT classify the wrapped
-        # UNC non-root target as a filesystem root.
-        assert not is_filesystem_root(r'\\server\share\folder'), (
-            "UNC non-root '\\\\server\\share\\folder' must not be a root"
+        # Outer-quote re-tokenize must surface the inner UNC token.
+        tokens = extract_filesystem_targets(cmd)
+        # The extracted token must classify as non-root (the inner
+        # share is followed by ``\\folder``, not the share root).
+        assert not any(is_filesystem_root(t) for t in tokens), (
+            f"wrapped UNC non-root must not yield a root token, got {tokens!r}"
+        )
+        # End-to-end hardline must NOT fire.
+        is_hl, desc = detect_hardline_command(cmd)
+        assert not is_hl, (
+            f"wrapped UNC non-root must not be hardline-blocked, got desc={desc!r}"
         )
 
     def test_unconditional_fallback_emits_root_when_only_drive_seen(self):
