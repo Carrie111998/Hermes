@@ -383,6 +383,7 @@ class ProcessSession:
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
+    persist_on_turn_abandon: bool = False       # Explicitly survive gateway abandoned-turn reaping
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
     # Watcher/notification metadata (persisted for crash recovery)
@@ -971,6 +972,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        persist_on_turn_abandon: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -998,6 +1000,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            persist_on_turn_abandon=persist_on_turn_abandon,
         )
 
         pty_scope_attempted = False
@@ -1209,6 +1212,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        persist_on_turn_abandon: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1230,6 +1234,7 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            persist_on_turn_abandon=persist_on_turn_abandon,
         )
 
         # Run the command in the sandbox with output capture
@@ -2392,6 +2397,7 @@ class ProcessRegistry:
             exclude_ids=frozenset(baseline_ids or ()),
             source=source,
             consume_output=True,
+            skip_persist_on_turn_abandon=True,
         )
 
     def kill_all(
@@ -2401,6 +2407,7 @@ class ProcessRegistry:
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
+        skip_persist_on_turn_abandon: bool = False,
     ) -> int:
         """Kill all running processes, optionally filtered by task_id. Returns count killed."""
         with self._lock:
@@ -2409,6 +2416,10 @@ class ProcessRegistry:
                 if (task_id is None or s.task_id == task_id)
                 and s.id not in exclude_ids
                 and not s.exited
+                and (
+                    not skip_persist_on_turn_abandon
+                    or not s.persist_on_turn_abandon
+                )
             ]
 
         killed = 0
