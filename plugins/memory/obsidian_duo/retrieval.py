@@ -99,5 +99,8 @@ class MemoryRetriever:
         return MemoryPacket(
             memories=tuple(memories),
             conflicts=tuple(dict.fromkeys(conflicts)),
-            no_verified_memory=not bool(memories),
+            no_verified_memory=not any(
+                self._verification_score(record.verification) >= self._verification_score(Verification.SOURCE_SUPPORTED)
+                for record in memories
+            ),
         )

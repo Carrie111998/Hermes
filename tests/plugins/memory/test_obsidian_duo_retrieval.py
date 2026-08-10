@@ -49,6 +49,20 @@ def test_retrieval_surfaces_conflicts_and_bounded_no_result(tmp_path):
     assert empty.no_verified_memory is True
 
 
+def test_unverified_recall_does_not_claim_verified_memory(tmp_path):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    store.upsert_memory(
+        MemoryRecord("mem_unverified", "Use blue theme", "preference", "global"),
+        "seed",
+    )
+
+    packet = MemoryRetriever(store).retrieve(RetrievalRequest("blue theme", max_memories=1))
+
+    assert packet.memories
+    assert packet.no_verified_memory is True
+
+
 def test_retrieval_does_not_admit_record_over_token_budget(tmp_path):
     store = SqliteMemoryStore(tmp_path / "memory.db")
     store.initialize()

@@ -25,9 +25,16 @@ def run_diagnostics() -> dict:
         return {"config": "unavailable", "message": type(exc).__name__}
     vault = Path(config.vault_path)
     db_path = home / "obsidian_duo" / "memory.db"
+    try:
+        from .vault import ObsidianVault
+        checked_vault = ObsidianVault(vault, config.managed_folder)
+        managed_root_valid = checked_vault.managed_root.is_dir() or not checked_vault.managed_root.exists()
+    except Exception:
+        managed_root_valid = False
     result = {
         "vault_reachable": vault.is_dir(),
         "managed_folder": (vault / config.managed_folder).is_dir(),
+        "managed_root_valid": managed_root_valid,
         "database": db_path.exists(),
     }
     if db_path.exists():
@@ -43,10 +50,57 @@ def run_diagnostics() -> dict:
     return result
 
 
+def _open_broker():
+    from .broker import EmbeddedMemoryBroker
+    from .policy import MemoryPolicy
+    from .retrieval import MemoryRetriever
+    from .store import SqliteMemoryStore
+    from .vault import ObsidianVault
+
+    home, config = _paths()
+    store = SqliteMemoryStore(home / "obsidian_duo" / "memory.db")
+    vault = ObsidianVault(Path(config.vault_path), config.managed_folder)
+    broker = EmbeddedMemoryBroker(
+        config=config, store=store, vault=vault, policy=MemoryPolicy(),
+        retriever=MemoryRetriever(store),
+    )
+    broker.start()
+    return broker
+
+
 def obsidian_duo_command(args) -> None:
     command = getattr(args, "obsidian_duo_command", "status")
     if command == "doctor":
         result = run_diagnostics()
+    elif command in {"status", "rebuild-index", "reconcile", "pending", "conflicts", "stats"}:
+        broker = _open_broker()
+        try:
+            if command == "status":
+                result = {"status": broker.status().__dict__}
+            elif command == "rebuild-index":
+                result = {"rebuild": broker.vault.rebuild_from_vault(
+                    broker.store, full=bool(getattr(args, "full", False))
+                ).__dict__}
+            elif command == "reconcile":
+                broker.vault.scan_managed_changes(broker.store)
+                result = {"reconciled": broker.process_manual_changes()}
+            elif command == "pending":
+                rows = broker.store.connection().execute(
+                    "SELECT candidate_id, payload, status, created_at FROM candidates ORDER BY created_at"
+                ).fetchall()
+                result = {"pending": [dict(row) for row in rows]}
+            elif command == "conflicts":
+                rows = broker.store.connection().execute(
+                    "SELECT memory_id, conflicting_memory_id, reason, status FROM conflicts ORDER BY conflict_id"
+                ).fetchall()
+                result = {"conflicts": [dict(row) for row in rows]}
+            else:
+                rows = broker.store.connection().execute(
+                    "SELECT name, value FROM metrics ORDER BY name"
+                ).fetchall()
+                result = {"stats": {row["name"]: row["value"] for row in rows}}
+        finally:
+            broker.shutdown(1.0)
     else:
         result = {"command": command, **run_diagnostics()}
     print(json.dumps(result, sort_keys=True, default=str))

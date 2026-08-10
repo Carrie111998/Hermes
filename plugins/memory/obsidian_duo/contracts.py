@@ -64,6 +64,14 @@ class MemoryRecord:
     importance: float = 0.0
     evidence_ids: tuple[str, ...] = ()
     relationships: tuple[str, ...] = ()
+    source_session_id: str = ""
+    task_id: str = ""
+    project_id: str = ""
+    child_session_id: str = ""
+    mission_id: str = ""
+    agent_id: str = ""
+    created_at: str = field(default="", compare=False)
+    updated_at: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True)

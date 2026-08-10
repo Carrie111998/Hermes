@@ -7,13 +7,14 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from pathlib import PureWindowsPath
 from typing import Iterator
 
 import yaml
 
 from .contracts import Authority, MemoryRecord, MemoryStatus, Verification
 from .store import SqliteMemoryStore
-from .security import assert_safe_to_persist
+from .security import assert_safe_to_persist, redact_secrets
 
 
 @dataclass(frozen=True)
@@ -38,9 +39,43 @@ class RebuildResult:
 
 
 class ObsidianVault:
+    MEMORY_TYPE_FOLDERS = {
+        "project": "Projects",
+        "decision": "Decisions",
+        "research": "Research",
+        "person": "People",
+        "preference": "Preferences",
+        "lesson": "Lessons",
+        "workflow": "Workflows",
+        "task": "Tasks",
+        "entity": "Entities",
+        "fact": "Entities",
+        "candidate": "Inbox",
+        "conflict": "Conflicts",
+    }
+
     def __init__(self, vault_path: Path, managed_folder: str):
         self.vault_path = Path(vault_path)
-        self.managed_root = self.vault_path / managed_folder
+        raw_folder = str(managed_folder or "")
+        folder_path = Path(raw_folder)
+        if (
+            not raw_folder.strip()
+            or folder_path.is_absolute()
+            or PureWindowsPath(raw_folder).is_absolute()
+            or PureWindowsPath(raw_folder).drive
+            or ".." in folder_path.parts
+        ):
+            raise ValueError("managed_folder must be a relative path inside the vault")
+        self.vault_root = self.vault_path.resolve()
+        self.managed_root = (self.vault_path / folder_path).resolve()
+        self._assert_inside(self.managed_root, self.vault_root, "managed_folder")
+
+    @staticmethod
+    def _assert_inside(path: Path, root: Path, label: str) -> None:
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"{label} escapes the configured vault") from exc
 
     def ensure_managed_structure(self) -> None:
         for name in (
@@ -54,10 +89,29 @@ class ObsidianVault:
             return
         yield from sorted(path for path in self.vault_path.rglob("*.md") if path.is_file())
 
+    def catalog_external_markdown_paths(self) -> Iterator[Path]:
+        ignored = {".git", ".trash", ".obsidian", "node_modules", "__pycache__"}
+        managed = self.managed_root.resolve()
+        for path in self.catalog_markdown_paths() or ():
+            resolved = path.resolve()
+            if resolved == managed or managed in resolved.parents:
+                continue
+            if any(part in ignored or part.startswith(".") and part in {".cache", ".tmp"} for part in path.parts):
+                continue
+            yield path
+
     def _managed_path(self, record: MemoryRecord) -> Path:
-        folder = self.managed_root / record.memory_type
+        memory_type = str(record.memory_type or "").strip().lower()
+        if memory_type not in self.MEMORY_TYPE_FOLDERS:
+            raise ValueError(f"unsupported memory_type: {record.memory_type!r}")
+        folder = (self.managed_root / self.MEMORY_TYPE_FOLDERS[memory_type]).resolve()
+        self._assert_inside(folder, self.managed_root, "managed memory folder")
+        self._assert_inside(folder, self.vault_root, "managed memory folder")
         folder.mkdir(parents=True, exist_ok=True)
-        return folder / f"{record.memory_id}.md"
+        path = folder / f"{record.memory_id}.md"
+        self._assert_inside(path.resolve(), self.managed_root, "managed note")
+        self._assert_inside(path.resolve(), self.vault_root, "managed note")
+        return path
 
     def parse_note(self, path: Path) -> ParsedNote:
         text = Path(path).read_text(encoding="utf-8")
@@ -88,6 +142,14 @@ class ObsidianVault:
             "importance": record.importance,
             "evidence_ids": list(record.evidence_ids),
             "relationships": list(record.relationships),
+            "source_session_id": record.source_session_id,
+            "task_id": record.task_id,
+            "project_id": record.project_id,
+            "child_session_id": record.child_session_id,
+            "mission_id": record.mission_id,
+            "agent_id": record.agent_id,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
         }
         return "---\n" + yaml.safe_dump(metadata, sort_keys=False).rstrip() + "\n---\n" + record.content.rstrip() + "\n"
 
@@ -154,6 +216,14 @@ class ObsidianVault:
                     importance=float(metadata.get("importance") or 0.0),
                     evidence_ids=tuple(metadata.get("evidence_ids") or ()),
                     relationships=tuple(metadata.get("relationships") or ()),
+                    source_session_id=str(metadata.get("source_session_id") or ""),
+                    task_id=str(metadata.get("task_id") or ""),
+                    project_id=str(metadata.get("project_id") or ""),
+                    child_session_id=str(metadata.get("child_session_id") or ""),
+                    mission_id=str(metadata.get("mission_id") or ""),
+                    agent_id=str(metadata.get("agent_id") or ""),
+                    created_at=str(metadata.get("created_at") or ""),
+                    updated_at=str(metadata.get("updated_at") or ""),
                 )
                 store.upsert_memory(record, "vault scan")
                 store.set_note_index(str(path), note.memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
@@ -168,9 +238,35 @@ class ObsidianVault:
         if full:
             with store.connection():
                 store.connection().execute("DELETE FROM note_index")
+                store.connection().execute("DELETE FROM external_index")
+                store.connection().execute("DELETE FROM memory_fts WHERE memory_id LIKE 'external_%'")
+                store.connection().execute("DELETE FROM memories WHERE memory_id LIKE 'external_%'")
         result = self.scan_managed_changes(store)
+        external_reparsed = 0
+        external_paths = tuple(self.catalog_external_markdown_paths() or ())
+        for path in external_paths:
+            stat = path.stat()
+            previous = store.connection().execute(
+                "SELECT memory_id,mtime_ns,size,content_hash FROM external_index WHERE path=?",
+                (str(path),),
+            ).fetchone()
+            if previous and previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size:
+                continue
+            content_hash = self._hash(path)
+            if previous and previous["content_hash"] == content_hash:
+                store.set_external_index(str(path), previous["memory_id"], stat.st_mtime_ns, stat.st_size, content_hash)
+                continue
+            content = redact_secrets(path.read_text(encoding="utf-8")[:12000])
+            memory_id = "external_" + hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:24]
+            store.upsert_memory(MemoryRecord(
+                memory_id, content, "fact", "external", authority=Authority.SOURCE,
+                verification=Verification.SOURCE_SUPPORTED,
+                relationships=(f"source_path:{path}",),
+            ), "external markdown index")
+            store.set_external_index(str(path), memory_id, stat.st_mtime_ns, stat.st_size, content_hash)
+            external_reparsed += 1
         return RebuildResult(
-            scanned=len(list(self.managed_root.rglob("*.md"))),
-            reparsed=len(result.reparsed_paths),
+            scanned=len(list(self.managed_root.rglob("*.md"))) + len(external_paths),
+            reparsed=len(result.reparsed_paths) + external_reparsed,
             malformed=len(result.malformed_paths),
         )

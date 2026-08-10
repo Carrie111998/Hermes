@@ -40,7 +40,6 @@ MEMORY_DUO_SCHEMA = {
             "content": {"type": "string"},
             "memory_type": {"type": "string"},
             "project": {"type": "string"},
-            "semantic": {"type": "boolean"},
         },
         "required": ["action"],
     },
@@ -63,6 +62,7 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         self._hermes_home = Path(kwargs["hermes_home"])
         config = ObsidianDuoConfig.load(self._hermes_home)
+        self._config = config
         store = SqliteMemoryStore(self._hermes_home / "obsidian_duo" / "memory.db")
         vault = ObsidianVault(Path(config.vault_path), config.managed_folder)
         retriever = MemoryRetriever(store)
@@ -77,7 +77,11 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
             vault=vault,
             policy=MemoryPolicy(),
             retriever=retriever,
-            inference=MemoryInference(self._llm) if self._llm else None,
+            inference=(
+                MemoryInference(self._llm)
+                if self._llm and config.inference_mode != "disabled"
+                else None
+            ),
             sync_adapter=sync_adapter,
         )
         broker.start()
@@ -95,7 +99,12 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if not self._broker or not query or query.strip().lower() in {"thanks", "thank you", "ok", "okay"}:
             return ""
-        packet = self._broker.retrieve(RetrievalRequest(query=query, session_id=session_id))
+        packet = self._broker.retrieve(RetrievalRequest(
+            query=query,
+            session_id=session_id,
+            max_memories=self._config.recall_max_memories,
+            max_tokens=self._config.recall_max_tokens,
+        ))
         if packet.no_verified_memory:
             return ""
         lines = [
@@ -135,7 +144,7 @@ class ObsidianDuoMemoryProvider(MemoryProvider):
                 authority=authority,
                 verification=verification,
                 metadata={**metadata, "event_kind": "builtin_memory_write"},
-            ))
+            ), host_confirmed=authority is Authority.USER)
 
     def on_delegation(self, task: str, result: str, **kwargs) -> None:
         if self._broker:

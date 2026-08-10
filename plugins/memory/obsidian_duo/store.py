@@ -85,6 +85,13 @@ class SqliteMemoryStore:
                     importance REAL NOT NULL,
                     evidence_ids TEXT NOT NULL,
                     relationships TEXT NOT NULL,
+                    source_session_id TEXT NOT NULL DEFAULT '',
+                    task_id TEXT NOT NULL DEFAULT '',
+                    project_id TEXT NOT NULL DEFAULT '',
+                    child_session_id TEXT NOT NULL DEFAULT '',
+                    mission_id TEXT NOT NULL DEFAULT '',
+                    agent_id TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
                 CREATE TABLE IF NOT EXISTS memory_versions (
@@ -140,6 +147,14 @@ class SqliteMemoryStore:
                     parse_status TEXT NOT NULL DEFAULT 'indexed',
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+                CREATE TABLE IF NOT EXISTS external_index (
+                    path TEXT PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    size INTEGER NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
                 CREATE TABLE IF NOT EXISTS journal (
                     txn_id TEXT PRIMARY KEY,
                     operation TEXT NOT NULL,
@@ -156,6 +171,15 @@ class SqliteMemoryStore:
                 );
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(memories)")}
+            for name in (
+                "source_session_id", "task_id", "project_id", "child_session_id",
+                "mission_id", "agent_id",
+            ):
+                if name not in columns:
+                    conn.execute(f"ALTER TABLE memories ADD COLUMN {name} TEXT NOT NULL DEFAULT ''")
+            if "created_at" not in columns:
+                conn.execute("ALTER TABLE memories ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES('version', ?)",
                 (str(self.SCHEMA_VERSION),),
@@ -176,6 +200,13 @@ class SqliteMemoryStore:
             record.importance,
             json.dumps(record.evidence_ids),
             json.dumps(record.relationships),
+            record.source_session_id,
+            record.task_id,
+            record.project_id,
+            record.child_session_id,
+            record.mission_id,
+            record.agent_id,
+            record.created_at,
         )
 
     def upsert_memory(self, record: MemoryRecord, version_reason: str) -> None:
@@ -191,14 +222,19 @@ class SqliteMemoryStore:
             conn.execute(
                 """INSERT INTO memories(
                     memory_id, content, memory_type, scope, status, authority,
-                    verification, confidence, importance, evidence_ids, relationships
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    verification, confidence, importance, evidence_ids, relationships,
+                    source_session_id, task_id, project_id, child_session_id, mission_id,
+                    agent_id, created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(memory_id) DO UPDATE SET
                     content=excluded.content, memory_type=excluded.memory_type,
                     scope=excluded.scope, status=excluded.status,
                     authority=excluded.authority, verification=excluded.verification,
                     confidence=excluded.confidence, importance=excluded.importance,
                     evidence_ids=excluded.evidence_ids, relationships=excluded.relationships,
+                    source_session_id=excluded.source_session_id, task_id=excluded.task_id,
+                    project_id=excluded.project_id, child_session_id=excluded.child_session_id,
+                    mission_id=excluded.mission_id, agent_id=excluded.agent_id,
                     updated_at=CURRENT_TIMESTAMP""",
                 self._serialize_memory(record),
             )
@@ -220,6 +256,10 @@ class SqliteMemoryStore:
             verification=Verification(row["verification"]), confidence=row["confidence"],
             importance=row["importance"], evidence_ids=tuple(json.loads(row["evidence_ids"])),
             relationships=tuple(json.loads(row["relationships"])),
+            source_session_id=row["source_session_id"], task_id=row["task_id"],
+            project_id=row["project_id"], child_session_id=row["child_session_id"],
+            mission_id=row["mission_id"], agent_id=row["agent_id"],
+            created_at=row["created_at"], updated_at=row["updated_at"],
         )
 
     def insert_evidence(self, record: EvidenceRecord) -> None:
@@ -289,6 +329,16 @@ class SqliteMemoryStore:
                 mtime_ns=excluded.mtime_ns,size=excluded.size,content_hash=excluded.content_hash,
                 parse_status=excluded.parse_status,updated_at=CURRENT_TIMESTAMP""",
                 (path, memory_id, mtime_ns, size, content_hash, parse_status),
+            )
+
+    def set_external_index(self, path: str, memory_id: str, mtime_ns: int, size: int, content_hash: str) -> None:
+        with self.connection():
+            self.connection().execute(
+                """INSERT INTO external_index(path,memory_id,mtime_ns,size,content_hash)
+                VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET memory_id=excluded.memory_id,
+                mtime_ns=excluded.mtime_ns,size=excluded.size,content_hash=excluded.content_hash,
+                updated_at=CURRENT_TIMESTAMP""",
+                (path, memory_id, mtime_ns, size, content_hash),
             )
 
     def metrics_increment(self, name: str, value: int = 1) -> None:

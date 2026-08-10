@@ -6,6 +6,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 
 from .config import ObsidianDuoConfig
@@ -19,6 +20,7 @@ from .contracts import (
     MemoryPacket,
     RetrievalRequest,
     MemoryRecord,
+    MemoryStatus,
 )
 from .policy import MemoryPolicy
 from .retrieval import MemoryRetriever
@@ -47,10 +49,14 @@ class EmbeddedMemoryBroker:
         self._stop = threading.Event()
         self._state = "UNAVAILABLE"
         self._state_lock = threading.Lock()
+        self._event_buffers: dict[str, list[MemoryEvent]] = {}
+        self._event_buffer_lock = threading.Lock()
+        self._last_managed_scan = 0.0
 
     def start(self) -> None:
         self.store.initialize()
         self.vault.ensure_managed_structure()
+        self.recover()
         self._state = "READY"
 
     def _ensure_worker(self) -> None:
@@ -71,6 +77,15 @@ class EmbeddedMemoryBroker:
                     break
                 try:
                     self.store.metrics_increment(f"event.{event.event_type}")
+                    self._retain_event(event)
+                    if event.event_type in {"task_complete", "session_end", "delegation_result"}:
+                        session_key = event.session_id or "__default__"
+                        with self._event_buffer_lock:
+                            retained = list(self._event_buffers.get(session_key, ()))
+                        if retained:
+                            self.consolidate(event.event_type, retained)
+                            with self._event_buffer_lock:
+                                self._event_buffers.pop(session_key, None)
                 finally:
                     self._events.task_done()
         finally:
@@ -108,13 +123,49 @@ class EmbeddedMemoryBroker:
             else:
                 self.store.metrics_increment("events.deferred")
 
+    def _retain_event(self, event: MemoryEvent) -> None:
+        """Keep only bounded, non-secret lifecycle context for later consolidation."""
+        content = (event.content or "")[:4000]
+        if not content and event.event_type == "turn":
+            return
+        retained = MemoryEvent(
+            event_type=event.event_type,
+            content=content,
+            mission_id=event.mission_id,
+            task_id=event.task_id,
+            agent_id=event.agent_id,
+            parent_agent_id=event.parent_agent_id,
+            workspace_id=event.workspace_id,
+            project_id=event.project_id,
+            session_id=event.session_id,
+            metadata=dict(event.metadata),
+        )
+        session_key = event.session_id or "__default__"
+        with self._event_buffer_lock:
+            buffer = self._event_buffers.setdefault(session_key, [])
+            buffer.append(retained)
+            del buffer[:-32]
+
     def retrieve(self, request: RetrievalRequest) -> MemoryPacket:
         self.store.initialize()
+        now = time.monotonic()
+        if now - self._last_managed_scan >= self.config.managed_scan_min_interval_seconds:
+            self.vault.scan_managed_changes(self.store)
+            self.process_manual_changes()
+            self._last_managed_scan = now
         return self.retriever.retrieve(request)
 
-    def propose(self, candidate: MemoryCandidate) -> CandidateDecision:
-        decision = self.policy.evaluate(candidate)
-        if decision.action == "promote":
+    def propose(self, candidate: MemoryCandidate, *, host_confirmed: bool = False) -> CandidateDecision:
+        if not host_confirmed:
+            candidate = replace(
+                candidate,
+                authority=Authority.AGENT,
+                verification=Verification.UNVERIFIED,
+                metadata={**dict(candidate.metadata), "event_kind": "tool_proposal"},
+            )
+        existing = self.store.hot_memory_candidates(limit=max(32, self.config.recall_max_memories * 2))
+        decision = self.policy.merge_or_conflict(existing, candidate)
+        if decision.action in {"promote", "supersede"}:
             memory_id = str(candidate.metadata.get("memory_id") or new_id("memory"))
             record = MemoryRecord(
                 memory_id=memory_id,
@@ -125,6 +176,18 @@ class EmbeddedMemoryBroker:
                 verification=candidate.verification,
                 confidence=float(candidate.metadata.get("confidence", 0.0) or 0.0),
                 importance=float(candidate.metadata.get("importance", 0.0) or 0.0),
+                evidence_ids=tuple(item.evidence_id for item in candidate.evidence),
+                source_session_id=str(candidate.metadata.get("source_session_id") or ""),
+                task_id=str(candidate.metadata.get("task_id") or ""),
+                project_id=str(candidate.metadata.get("project_id") or ""),
+                child_session_id=str(candidate.metadata.get("child_session_id") or ""),
+                mission_id=str(candidate.metadata.get("mission_id") or ""),
+                agent_id=str(candidate.metadata.get("agent_id") or ""),
+                relationships=(
+                    (f"supersedes:{decision.memory_id}",)
+                    if decision.action == "supersede" and decision.memory_id
+                    else ()
+                ),
             )
             txn_id = new_id("txn")
             path = self.vault._managed_path(record)
@@ -136,6 +199,16 @@ class EmbeddedMemoryBroker:
             payload.update({"content_hash": content_hash, "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
             self.store.record_journal(txn_id, "promote", "written", payload)
             self.store.upsert_memory(record, "promotion")
+            if decision.action == "supersede" and decision.memory_id:
+                old = self.store.get_memory(decision.memory_id)
+                if old is not None:
+                    self.store.upsert_memory(
+                        replace(old, status=MemoryStatus.SUPERSEDED),
+                        "superseded by user correction",
+                    )
+                    self.store.record_relationship(
+                        record.memory_id, old.memory_id, "supersedes", {"reason": decision.reason}
+                    )
             for evidence in candidate.evidence:
                 self.store.insert_evidence(evidence)
                 self.store.link_evidence(memory_id, evidence.evidence_id)
@@ -143,7 +216,12 @@ class EmbeddedMemoryBroker:
             self.store.record_journal(txn_id, "promote", "indexed", payload)
             self.store.record_journal(txn_id, "promote", "committed", payload)
             return CandidateDecision("promote", memory_id=memory_id, reason=decision.reason)
-        if decision.action in {"stage", "conflict"}:
+        if decision.action == "conflict":
+            candidate_id = self.store.stage_candidate(candidate)
+            if decision.memory_id:
+                self.store.record_conflict(decision.memory_id, candidate_id, decision.reason)
+            return decision
+        if decision.action == "stage":
             self.store.stage_candidate(candidate)
         return decision
 
@@ -164,6 +242,7 @@ class EmbeddedMemoryBroker:
         self._state = "RECOVERING"
         self.store.initialize()
         scan = self.vault.scan_managed_changes(self.store)
+        recovered = 0
         conn = self.store.connection()
         rows = conn.execute(
             "SELECT txn_id FROM journal WHERE state IN ('prepared','written','indexed')"
@@ -183,11 +262,12 @@ class EmbeddedMemoryBroker:
                 if self.store.get_memory(memory_id) is None or indexed is None:
                     raise ValueError("durable index incomplete")
                 self.store.record_journal(row["txn_id"], journal["operation"], "committed", {**payload, "recovered": True})
+                recovered += 1
             except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError) as exc:
                 self.store.record_journal(row["txn_id"], journal["operation"], "recovery_failed", {"reason": str(exc)[:120]})
         self.process_manual_changes()
         self._state = "READY"
-        return RecoveryResult(recovered=len(rows), malformed=len(scan.malformed_paths))
+        return RecoveryResult(recovered=recovered, malformed=len(scan.malformed_paths))
 
     def process_manual_changes(self) -> int:
         """Index changed managed notes as user corrections without rewriting them."""
@@ -204,7 +284,7 @@ class EmbeddedMemoryBroker:
             if previous["parse_status"] not in {"manual_pending", "needs_attention"} and previous["mtime_ns"] == stat.st_mtime_ns and previous["size"] == stat.st_size:
                 continue
             content_hash = self.vault._hash(path)
-            if content_hash == previous["content_hash"]:
+            if content_hash == previous["content_hash"] and previous["parse_status"] != "manual_pending":
                 continue
             try:
                 parsed = self.vault.parse_note(path)

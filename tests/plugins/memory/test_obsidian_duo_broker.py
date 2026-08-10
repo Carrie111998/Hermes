@@ -2,7 +2,15 @@ from pathlib import Path
 
 from plugins.memory.obsidian_duo.broker import EmbeddedMemoryBroker
 from plugins.memory.obsidian_duo.config import ObsidianDuoConfig
-from plugins.memory.obsidian_duo.contracts import MemoryCandidate, MemoryEvent, MemoryRecord
+from plugins.memory.obsidian_duo.contracts import (
+    Authority,
+    EvidenceRecord,
+    MemoryCandidate,
+    MemoryEvent,
+    MemoryRecord,
+    RetrievalRequest,
+    Verification,
+)
 from plugins.memory.obsidian_duo.policy import MemoryPolicy
 from plugins.memory.obsidian_duo.retrieval import MemoryRetriever
 from plugins.memory.obsidian_duo.store import SqliteMemoryStore
@@ -44,6 +52,19 @@ def test_broker_starts_worker_lazily_and_flushes(tmp_path):
     broker.shutdown(5)
 
 
+def test_session_completion_consolidates_retained_events_without_turn_llm(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+
+    broker.observe(MemoryEvent("turn", content="We chose SQLite for durable memory", session_id="s1"))
+    broker.observe(MemoryEvent("task_complete", content="Decision: use SQLite", session_id="s1"))
+
+    assert broker.flush("session_end", 5)
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0] >= 1
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM metrics WHERE name='event.turn'").fetchone()[0] == 1
+    broker.shutdown(5)
+
+
 def test_broker_recovers_written_journal_by_rescanning(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()
@@ -51,7 +72,7 @@ def test_broker_recovers_written_journal_by_rescanning(tmp_path):
 
     result = broker.recover()
 
-    assert result.recovered >= 1
+    assert result.recovered == 0
     assert broker.store.connection().execute(
         "SELECT state FROM journal WHERE txn_id='tx_1'"
     ).fetchone()[0] == "recovery_failed"
@@ -62,16 +83,105 @@ def test_explicit_promotion_persists_note_index_and_memory(tmp_path):
     broker.start()
     decision = broker.propose(MemoryCandidate(
         "Use SQLite for durable memory", metadata={"event_kind": "explicit_remember"}
-    ))
+    ), host_confirmed=True)
     assert decision.action == "promote"
     assert broker.store.get_memory(decision.memory_id).content == "Use SQLite for durable memory"
     assert list(broker.vault.managed_root.rglob(f"{decision.memory_id}.md"))
 
 
+def test_model_proposal_cannot_claim_user_confirmation(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+
+    decision = broker.propose(MemoryCandidate(
+        "Model asserted user preference",
+        authority=Authority.USER,
+        verification=Verification.USER_CONFIRMED,
+        metadata={"event_kind": "explicit_remember"},
+    ))
+
+    assert decision.action == "stage"
+    assert broker.store.get_memory(decision.memory_id) is None
+    staged = broker.store.connection().execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+    assert staged == 1
+
+
+def test_promotion_runs_conflict_policy_before_writing(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    broker.store.upsert_memory(
+        MemoryRecord(
+            "mem_old", "Use the blue theme", "preference", "global",
+            importance=1.0, authority=Authority.USER,
+            verification=Verification.USER_CONFIRMED,
+        ),
+        "test setup",
+    )
+
+    decision = broker.propose(MemoryCandidate(
+        "Use the red theme",
+        memory_type="preference",
+        metadata={"event_kind": "decision_confirmed", "contradicts": "mem_old"},
+    ), host_confirmed=True)
+
+    assert decision.action == "conflict"
+    assert decision.memory_id == "mem_old"
+    assert broker.store.connection().execute("SELECT COUNT(*) FROM memories WHERE content='Use the red theme'").fetchone()[0] == 0
+    assert broker.store.connection().execute(
+        "SELECT COUNT(*) FROM conflicts WHERE memory_id='mem_old'"
+    ).fetchone()[0] == 1
+
+
+def test_promotion_persists_evidence_and_provenance(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    candidate = MemoryCandidate(
+        "Use SQLite for durable memory",
+        memory_type="decision",
+        evidence=(EvidenceRecord("ev_1", "user_message", "SQLite chosen", session_id="s1"),),
+        metadata={
+            "event_kind": "explicit_remember", "source_session_id": "s1",
+            "task_id": "t1", "project_id": "p1", "mission_id": "m1", "agent_id": "a1",
+        },
+    )
+
+    decision = broker.propose(candidate, host_confirmed=True)
+    record = broker.store.get_memory(decision.memory_id)
+    metadata = broker.vault.parse_note(next(broker.vault.managed_root.rglob(f"{decision.memory_id}.md"))).metadata
+
+    assert record.evidence_ids == ("ev_1",)
+    assert record.source_session_id == "s1"
+    assert record.task_id == "t1"
+    assert metadata["evidence_ids"] == ["ev_1"]
+    assert metadata["project_id"] == "p1"
+
+
+def test_user_correction_supersedes_existing_memory(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.start()
+    broker.store.upsert_memory(
+        MemoryRecord(
+            "mem_old", "Use the blue theme", "preference", "global",
+            importance=1.0, authority=Authority.AGENT,
+        ),
+        "test setup",
+    )
+
+    decision = broker.propose(MemoryCandidate(
+        "Use the red theme", memory_type="preference",
+        authority=Authority.USER, verification=Verification.USER_CONFIRMED,
+        metadata={"event_kind": "user_correction", "contradicts": "mem_old"},
+    ), host_confirmed=True)
+
+    assert decision.action == "promote"
+    assert broker.store.get_memory("mem_old").status.value == "superseded"
+    assert broker.store.get_memory(decision.memory_id).content == "Use the red theme"
+
+
 def test_manual_edit_becomes_user_authority_without_rewriting_note(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()
-    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "agent text", "Facts", "global"))
+    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "agent text", "fact", "global"))
     broker.vault.scan_managed_changes(broker.store)
     note.write_text(note.read_text().replace("agent text", "user correction"), encoding="utf-8")
 
@@ -81,10 +191,25 @@ def test_manual_edit_becomes_user_authority_without_rewriting_note(tmp_path):
     assert broker.store.get_memory("mem_1").authority.value == "user"
 
 
+def test_retrieve_reconciles_eligible_manual_edit(tmp_path):
+    broker = make_broker(tmp_path)
+    broker.config.managed_scan_min_interval_seconds = 0
+    broker.start()
+    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "old agent text", "fact", "global"))
+    broker.vault.scan_managed_changes(broker.store)
+    note.write_text(note.read_text().replace("old agent text", "manual user edit"), encoding="utf-8")
+
+    packet = broker.retrieve(RetrievalRequest(query="manual user edit", max_memories=4, max_tokens=40))
+
+    assert packet.memories[0].content == "manual user edit"
+    assert packet.memories[0].authority is Authority.USER
+    assert note.read_text().endswith("manual user edit\n")
+
+
 def test_malformed_manual_edit_is_left_untouched(tmp_path):
     broker = make_broker(tmp_path)
     broker.start()
-    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "valid", "Facts", "global"))
+    note = broker.vault.write_managed_note(MemoryRecord("mem_1", "valid", "fact", "global"))
     broker.vault.scan_managed_changes(broker.store)
     note.write_text("---\nmalformed", encoding="utf-8")
     broken = note.read_text()
