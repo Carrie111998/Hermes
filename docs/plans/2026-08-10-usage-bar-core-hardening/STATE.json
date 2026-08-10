@@ -34,5 +34,11 @@
     "m2_codex_round1": "4 findings (provider 归因 blocker + focus/alert/假竞态) → 654b4065e 全部修复并补真竞态/切换/residual 回归测试",
     "codex_rereview": "WAIVED by user 2026-08-10 (以后无需 Codex 复验)"
   },
-  "not_claimed": "不宣称 release ready: 发布门禁 (回滚包 MANIFEST/恢复演练/双向兼容 smoke/上游 merge) 仍未执行, 维持文档记录的发布前阻塞条件"
+  "not_claimed": "不宣称 release ready: 发布门禁 (回滚包 MANIFEST/恢复演练/双向兼容 smoke/上游 merge) 仍未执行, 维持文档记录的发布前阻塞条件",
+  "ux_compaction": {
+    "commit": "bacaa4e07",
+    "changes": "上下文用量分类默认折叠(disclosure); 提供商按使用排序(当前会话置顶+当前徽标→有真实额度→需注意); unsupported 合并为单行折叠组(note 仅一次); 健康状态图标化(CheckCircle2/Clock/AlertCircle); 额度行内联(label+bar+% left)",
+    "tests": "desktop 36 passed, typecheck x3, build exit 0",
+    "note": "排序 currentProvider 取自 contract.local.provider (会话事实), 非路由 is_current"
+  }
 }
