@@ -2848,6 +2848,8 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        from tools.approval import get_run_approval_policy
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -2865,6 +2867,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "tools execute on the API-server host unless a future "
                     "explicit split-runtime mode is enabled."
                 ),
+            },
+            "security": {
+                "run_approval_policy": get_run_approval_policy(),
             },
             "protocols": {
                 "run_approval_identity_binding": {

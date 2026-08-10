@@ -2696,6 +2696,51 @@ def is_approval_bypass_active() -> bool:
     )
 
 
+def _load_run_approval_security_config() -> dict:
+    """Strictly load config for the externally attested approval posture.
+
+    Unlike the interactive approval helpers, this path must not silently
+    substitute defaults when config loading fails.  A caller that cannot read
+    the policy cannot truthfully attest it and must fail closed.
+    """
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    if not isinstance(config, dict):
+        raise RuntimeError("Hermes config did not decode to an object")
+    return config
+
+
+def get_run_approval_policy() -> dict:
+    """Return the exact approval-bypass posture advertised to Runs clients."""
+    config = _load_run_approval_security_config()
+    approvals = config.get("approvals", {}) or {}
+    delegation = config.get("delegation", {}) or {}
+    if not isinstance(approvals, dict) or not isinstance(delegation, dict):
+        raise RuntimeError("Hermes approval policy blocks must be objects")
+
+    mode = _normalize_approval_mode(approvals.get("mode", "manual"))
+    subagent_auto_approve = is_truthy_value(
+        delegation.get("subagent_auto_approve", False)
+    )
+    with _lock:
+        session_yolo_count = len(_session_yolo)
+        session_approved_count = sum(
+            1 for patterns in _session_approved.values() if patterns
+        )
+        permanent_approved_count = len(_permanent_approved)
+
+    return {
+        "version": 1,
+        "mode": mode,
+        "frozen_yolo": bool(_YOLO_MODE_FROZEN),
+        "session_yolo_count": session_yolo_count,
+        "session_approved_count": session_approved_count,
+        "permanent_approved_count": permanent_approved_count,
+        "subagent_auto_approve": subagent_auto_approve,
+    }
+
+
 def _get_approval_timeout() -> int:
     """Read the approval timeout from config. Defaults to 300 seconds.
 
