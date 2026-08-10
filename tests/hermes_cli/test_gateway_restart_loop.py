@@ -540,8 +540,17 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    @pytest.mark.parametrize(
+        "shebang",
+        [
+            "#!/usr/bin/env python3",
+            "#!/usr/bin/env -S -u PYTHONPATH python3 -I",
+            "#!/usr/bin/env --unset PYTHONPATH python3",
+            "#!/usr/bin/python3",
+        ],
+    )
     def test_safe_executable_python_shebang_script_passes_through(
-        self, monkeypatch, tmp_path
+        self, monkeypatch, tmp_path, shebang
     ):
         """Python source must not be shell-tokenized as executable commands.
 
@@ -554,7 +563,7 @@ class TestTerminalToolGatewayLifecycleGuard:
         calls = []
         script = tmp_path / "safe-wrapper"
         script.write_text(
-            "#!/usr/bin/env python3\n"
+            f"{shebang}\n"
             "from pathlib import Path\n"
             'ROOT = Path("/home/pistomat/rack")\n'
             'print("safe")\n',
@@ -613,6 +622,10 @@ class TestTerminalToolGatewayLifecycleGuard:
             'os.execle("/bin/launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
             "from os import execlpe as launch\n"
             'launch("launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            "from subprocess import *\n"
+            'run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "from os import *\n"
+            'execle("/bin/launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
         ],
     )
     def test_executable_python_shebang_neutral_launchctl_submit_stays_blocked(
@@ -838,6 +851,27 @@ class TestLifecycleGuardModule:
         script.write_text('import os\nos.system("hermes gateway restart")\n', encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("clean prompt", str(script))
+
+    @pytest.mark.parametrize(
+        "python_body",
+        [
+            "import subprocess\n"
+            'subprocess.run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "import subprocess as sp\n"
+            'sp.run(["launchctl", "bootstrap", "gui/501", "/tmp/helper.plist"])\n',
+            "from subprocess import *\n"
+            'run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+        ],
+    )
+    def test_python_cron_script_process_api_lifecycle_command_blocks(
+        self, tmp_path, python_body
+    ):
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        script = tmp_path / "unsafe.py"
+        script.write_text(python_body, encoding="utf-8")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("daily", str(script))
 
     def test_absolute_path_binary_does_not_crash_guard(self):
         """#76762: a terminal command invoking a binary by absolute path

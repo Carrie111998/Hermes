@@ -531,16 +531,36 @@ def _python_shebang(text: str) -> bool:
                 if index < len(arguments):
                     interpreter = Path(arguments[index]).name
                 break
-            if argument == "-S":
+            if argument in {"-S", "--split-string"}:
                 index += 1
-                if index < len(arguments):
-                    interpreter = Path(arguments[index]).name
-                break
-            if argument.startswith("-") or re.match(
-                r"^[A-Za-z_][A-Za-z0-9_]*=", argument
+                continue
+            if argument.startswith("--split-string="):
+                split_value = argument.partition("=")[2]
+                try:
+                    arguments[index : index + 1] = shlex.split(split_value)
+                except ValueError:
+                    return False
+                continue
+            if argument in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0"}:
+                index += 2
+                continue
+            if argument.startswith(("--unset=", "--chdir=", "--argv0=")) or re.match(
+                r"^-[uCa].+", argument
             ):
                 index += 1
                 continue
+            if argument in {
+                "-i",
+                "--ignore-environment",
+                "-0",
+                "--null",
+                "-v",
+                "--debug",
+            } or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", argument):
+                index += 1
+                continue
+            if argument.startswith("-"):
+                return False
             interpreter = Path(argument).name
             break
 
@@ -584,19 +604,6 @@ def _iter_python_command_payloads(text: str) -> Iterator[str]:
     except (SyntaxError, ValueError):
         return
 
-    module_aliases = {"os": "os", "subprocess": "subprocess"}
-    function_aliases: dict[str, str] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name in {"os", "subprocess"}:
-                    module_aliases[alias.asname or alias.name] = alias.name
-        elif isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess"}:
-            for alias in node.names:
-                function_aliases[alias.asname or alias.name] = (
-                    f"{node.module}.{alias.name}"
-                )
-
     subprocess_calls = {
         "subprocess.Popen",
         "subprocess.call",
@@ -610,6 +617,32 @@ def _iter_python_command_payloads(text: str) -> Iterator[str]:
     os_vector_calls = {"os.execv", "os.execve", "os.execvp", "os.execvpe"}
     os_list_calls = {"os.execl", "os.execlp"}
     os_list_with_env_calls = {"os.execle", "os.execlpe"}
+    supported_calls = (
+        subprocess_calls
+        | os_single_argument_calls
+        | os_vector_calls
+        | os_list_calls
+        | os_list_with_env_calls
+    )
+
+    module_aliases = {"os": "os", "subprocess": "subprocess"}
+    function_aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name in {"os", "subprocess"}:
+                    module_aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.ImportFrom) and node.module in {"os", "subprocess"}:
+            for alias in node.names:
+                if alias.name == "*":
+                    prefix = f"{node.module}."
+                    for call_name in supported_calls:
+                        if call_name.startswith(prefix):
+                            function_aliases[call_name.removeprefix(prefix)] = call_name
+                else:
+                    function_aliases[alias.asname or alias.name] = (
+                        f"{node.module}.{alias.name}"
+                    )
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -875,6 +908,7 @@ def check_gateway_lifecycle(
     """
     combined = prompt or ""
     python_script = False
+    script_text = ""
     if script:
         resolved_script = _resolve_script_path(script)
         python_script = resolved_script is not None and resolved_script.suffix == ".py"
@@ -887,12 +921,20 @@ def check_gateway_lifecycle(
         # shell: the shell-script reference walk is a false-positive
         # generator on Python sources (pathlib's "/" operator resolves to
         # the filesystem root and trips the regular-file check, blocking
-        # every innocent .py cron script, #77131). The direct command
-        # regex below still scans the full text, so a literal
-        # `hermes gateway restart` embedded in a .py script is still
-        # blocked. Non-regular/oversized script files still fail closed
-        # via the lifecycle-shaped sentinel in _read_script_for_scanning.
+        # every innocent .py cron script, #77131). Scan direct command text
+        # plus statically literal Python process APIs without treating
+        # arbitrary Python tokens as shell commands. Non-regular/oversized
+        # script files still fail closed via the lifecycle sentinel above.
         unsafe = _lifecycle_command_scan_with_data_exemption(combined)
+        if not unsafe and script_text:
+            script_dir = _resolve_script_directory(script) if script else None
+            unsafe = _contains_unsafe_gateway_action(
+                script_text,
+                cwd=script_dir,
+                depth=0,
+                visited=set(),
+                source_is_python=True,
+            )
     else:
         script_dir = _resolve_script_directory(script) if script else None
         unsafe = contains_gateway_lifecycle_command_or_referenced_script(
