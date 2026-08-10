@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
+from plugins.platforms.whatsapp.adapter import WhatsAppAdapter, _apply_yaml_config
 
 
 @pytest.fixture(autouse=True)
@@ -91,5 +91,76 @@ def test_from_owner_does_not_double_prefix_when_already_tagged():
     assert event is not None
     assert event.metadata.get("whatsapp_from_owner") is True
     assert event.text == "[owner reply] already tagged"
+
+
+def _oversight_adapter(*, home="15550001111", respond_as_owner=False):
+    adapter = _make_adapter()
+    adapter._oversight_mode = True
+    adapter._oversight_home_channel = home
+    adapter._respond_as_owner = respond_as_owner
+    adapter._running = True
+    adapter._http_session = MagicMock()
+    return adapter
+
+
+def test_oversight_blocks_owner_forwarded_contact_reply_before_transport():
+    adapter = _oversight_adapter()
+
+    result = asyncio.run(
+        adapter.send("15550002222@s.whatsapp.net", "busy/system/agent reply")
+    )
+
+    assert result.success is True
+    assert result.raw_response == {
+        "suppressed": True,
+        "reason": "oversight_outbound_policy",
+    }
+    adapter._http_session.post.assert_not_called()
+
+
+def test_oversight_allows_home_chat_with_equivalent_jid_shape():
+    adapter = _oversight_adapter(home="+1 (555) 000-1111")
+
+    assert adapter._oversight_allows_outbound("15550001111@s.whatsapp.net") is True
+
+
+def test_oversight_without_home_channel_fails_closed():
+    adapter = _oversight_adapter(home="")
+
+    assert adapter._oversight_allows_outbound("15550002222@s.whatsapp.net") is False
+
+
+def test_oversight_explicit_respond_as_owner_allows_contact_outbound():
+    adapter = _oversight_adapter(respond_as_owner=True)
+
+    assert adapter._oversight_allows_outbound("15550002222@s.whatsapp.net") is True
+
+
+def test_oversight_yaml_options_seed_adapter_extra(monkeypatch):
+    for name in (
+        "WHATSAPP_REQUIRE_MENTION",
+        "WHATSAPP_MENTION_PATTERNS",
+        "WHATSAPP_FREE_RESPONSE_CHATS",
+        "WHATSAPP_DM_POLICY",
+        "WHATSAPP_ALLOWED_USERS",
+        "WHATSAPP_GROUP_POLICY",
+        "WHATSAPP_GROUP_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    seeded = _apply_yaml_config(
+        {},
+        {
+            "oversight_mode": True,
+            "respond_as_owner": False,
+            "forward_owner_messages": True,
+        },
+    )
+
+    assert seeded == {
+        "oversight_mode": True,
+        "respond_as_owner": False,
+        "forward_owner_messages": True,
+    }
 
 
