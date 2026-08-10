@@ -11196,6 +11196,52 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 _session_db_bootstrap_lock = threading.Lock()
 
 
+class _PooledSessionDB:
+    """Thin proxy over a pool-owned read-only SessionDB handle.
+
+    Callers written for the old open-per-request pattern call ``db.close()``
+    after use.  A pool handle must instead be returned with
+    ``_session_db_pool.release()`` — closing it directly leaves the pool's
+    ``db_in_use`` flag True while the underlying connection is dead, so every
+    later acquire falls through to the borrow path and connections pile up
+    (Issue #146).  This proxy forwards attribute access to the real handle and
+    maps ``close()`` to ``release()``, so existing call sites need no changes.
+    """
+
+    __slots__ = ("_db", "_pool_key", "_cached", "_released")
+
+    def __init__(self, db, pool_key: str, cached: bool):
+        object.__setattr__(self, "_db", db)
+        object.__setattr__(self, "_pool_key", pool_key)
+        object.__setattr__(self, "_cached", cached)
+        object.__setattr__(self, "_released", False)
+
+    def __getattr__(self, name: str):
+        # Only called when the attribute is not found on the proxy itself.
+        return getattr(self._db, name)
+
+    def __setattr__(self, name: str, value):
+        if name in ("_db", "_pool_key", "_cached", "_released"):
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._db, name, value)
+
+    def close(self) -> None:
+        if self._released:
+            return
+        object.__setattr__(self, "_released", True)
+        from hermes_cli.web_routers import _session_db_pool
+
+        _session_db_pool.release(self._pool_key, self._db, cached=self._cached)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+        return False
+
+
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
     """Open a SessionDB with an explicit access mode for a profile.
 
@@ -11239,7 +11285,17 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
         # connection per profile instead of a fresh WAL-mode open per request,
         # which used to pile up fds under desktop polling (Errno 24). The
         # pool probes fresh handles (stale-schema check) before caching them.
-        return _session_db_pool.acquire(pool_key, db_path)[0]
+        db, cached = _session_db_pool.acquire(pool_key, db_path)
+        # Issue #146: callers written for the old open-per-request pattern call
+        # ``db.close()`` — but a pooled handle must be returned via
+        # ``_session_db_pool.release()``.  ``db.close()`` on a pooled handle
+        # closes the connection out from under the pool while ``db_in_use``
+        # stays True, so every later acquire falls through to the borrow path
+        # whose accounting is never released — connections pile up unboundedly
+        # (~0.7 FD/h observed).  Return a thin proxy whose ``close()`` calls
+        # ``release()`` instead; all 13 existing call sites keep working
+        # unchanged.
+        return _PooledSessionDB(db, pool_key, cached)
 
     try:
         return _open_probed()

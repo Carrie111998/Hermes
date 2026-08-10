@@ -175,3 +175,74 @@ def test_drop_idle_closes_but_keeps_inflight(profile_db: Path) -> None:
     release("dev", db, cached=True)
     drop_idle("dev")  # now idle — closed
     assert _live_count(profile_db) == 0
+
+
+# ── Issue #146: proxy close() must release the pool handle ──────────
+# Call sites written for the old open-per-request pattern call db.close().
+# If close() on a pooled handle bypasses release(), the cached handle's
+# db_in_use stays True while the connection is dead -> every later acquire
+# falls through to the borrow path whose accounting is never released ->
+# connections pile up unboundedly. The proxy must map close() -> release().
+
+def test_pooled_proxy_close_releases_cached_handle(profile_db: Path) -> None:
+    from hermes_cli.web_server import _PooledSessionDB
+
+    db, cached = acquire("dev", profile_db)
+    assert cached is True
+    proxy = _PooledSessionDB(db, "dev", cached)
+
+    # Callers call close() — it must release (return) the cached handle,
+    # not close the connection out from under the pool.
+    proxy.close()
+    assert proxy._released is True
+    assert _live_count(profile_db) == 1, "cached handle must stay alive in pool"
+
+    # Subsequent acquire reuses the SAME handle (not a fresh borrow).
+    db2, cached2 = acquire("dev", profile_db)
+    assert cached2 is True
+    assert db2 is db, "cached handle must be reusable after proxy close"
+    release("dev", db2, cached=True)
+    assert _live_count(profile_db) == 1
+
+
+def test_pooled_proxy_close_is_idempotent(profile_db: Path) -> None:
+    from hermes_cli.web_server import _PooledSessionDB
+
+    db, cached = acquire("dev", profile_db)
+    proxy = _PooledSessionDB(db, "dev", cached)
+    proxy.close()
+    proxy.close()  # second close must be a no-op
+    assert proxy._released is True
+    assert _live_count(profile_db) == 1
+
+
+def test_pooled_proxy_forwards_methods(profile_db: Path) -> None:
+    from hermes_cli.web_server import _PooledSessionDB
+
+    db, cached = acquire("dev", profile_db)
+    proxy = _PooledSessionDB(db, "dev", cached)
+    # Attribute forwarding: methods on the real SessionDB work through proxy.
+    rows = proxy.list_sessions_rich(limit=1, compact_rows=True)
+    assert isinstance(rows, list)
+    proxy.close()
+    release("dev", db, cached=True)
+
+
+def test_pooled_proxy_borrow_close_returns_accounting(profile_db: Path) -> None:
+    from hermes_cli.web_server import _PooledSessionDB
+
+    # Hold the cached handle, then acquire a borrow; close() on the borrow
+    # proxy must decrement borrow_count so the pool doesn't wedge.
+    db1, cached1 = acquire("dev", profile_db)
+    assert cached1 is True
+
+    db2, cached2 = acquire("dev", profile_db)
+    assert cached2 is False  # borrow path while cached is busy
+    proxy2 = _PooledSessionDB(db2, "dev", cached2)
+    proxy2.close()
+
+    with _session_db_pool._pool_lock:
+        entry = _session_db_pool._pool["dev"]
+        assert entry.borrow_count == 0, "borrow proxy close must restore accounting"
+
+    release("dev", db1, cached=True)
