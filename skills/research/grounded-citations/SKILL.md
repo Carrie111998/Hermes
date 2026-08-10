@@ -1,7 +1,7 @@
 ---
 name: grounded-citations
 description: "Ground answers and documents in cited, verifiable sources."
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent + Teknium
 license: MIT
 platforms: [linux, macos, windows]
@@ -15,7 +15,7 @@ metadata:
 # Grounded Citations
 
 Every claim taken from an outside source gets an inline numbered citation and a
-`Sources:` list, Perplexity-style. A ledger script owns the `url → [n]` mapping
+labeled `Sources:` list. A ledger script owns the `url → [n]` mapping
 so the numbers and URLs come from retrieval, never from memory — the model only
 ever emits small integers it was handed.
 
@@ -61,8 +61,9 @@ S=~/.hermes/skills/research/grounded-citations/scripts/sources.py
 python3 "$S" reset                                  # start a clean ledger
 python3 "$S" add https://example.com/a --title "A"  # prints: [1]
 python3 "$S" add https://example.com/b --title "B"  # prints: [2]
+python3 "$S" annotate 1 --label "Localized label" --description "Why it matters."
 python3 "$S" list                                   # ledger table
-python3 "$S" render                                 # Sources: block
+python3 "$S" render --heading "Localized Sources"  # labeled chat block
 python3 "$S" verify draft.md                        # catch bad citations
 ```
 
@@ -77,9 +78,10 @@ id within a ledger, so ids stay stable across many search/extract rounds.
 | Register a source, get its id | `sources.py add <url> [--title T]` |
 | Register several at once | `sources.py add <url1> <url2> ...` |
 | Register from JSON tool output | `sources.py ingest results.json` |
+| Add localized chat metadata | `sources.py annotate <id> --label L [--description D]` |
 | Attach verbatim evidence to a source | `sources.py quote <id> --text "exact wording" --from page.txt` |
 | Show ledger | `sources.py list [--json]` |
-| Render the Sources block | `sources.py render [--style markdown\|plain\|footnotes\|bibtex\|evidence] [--only 1,3]` |
+| Render the Sources block | `sources.py render [--style chat\|markdown\|plain\|footnotes\|bibtex\|evidence] [--heading H] [--only 1,3]` |
 | Render only what a draft cites | `sources.py render --cited-in draft.md` |
 | Rewrite a draft's Sources block in place | `sources.py render --replace-in draft.md` |
 | Check a draft's citations | `sources.py verify draft.md [--strict] [--min-coverage 0.6] [--evidence]` |
@@ -96,7 +98,14 @@ in a draft — reusing the ledger keeps the numbering stable.
 prose. Registering later, from memory, is the failure mode this skill exists to
 prevent.
 
-③ **Write cite-while-drafting.** Place the bracketed id(s) immediately after
+③ **Annotate sources for chat.** After reading the retrieved content, use
+`annotate` to supply a concise visible label and, when useful, a one-line
+description in the active conversation locale. Summarize what the source
+supports; do not mechanically translate a noisy HTML title. If extraction did
+not provide enough context, skip annotation — `render` will use a conservative
+host/path label and will not invent a description.
+
+④ **Write cite-while-drafting.** Place the bracketed id(s) immediately after
 each sentence the source supports:
 
 ```
@@ -111,20 +120,25 @@ Ice floats because it is less dense than liquid water.[1][2]
 - Quote exact figures, dates, and names as the source states them; flag gaps
   explicitly ("no source found for X") instead of smoothing them over.
 
-④ **Append the Sources block** with `sources.py render --cited-in <draft>` so
+⑤ **Append the Sources block** with `sources.py render --cited-in <draft>` so
 the id → URL mapping is generated mechanically from the ledger, not retyped.
-For non-markdown targets pick the matching `--style` and follow
+The default `chat` style emits compact labeled Markdown links; localize its
+heading with `--heading`. Use `--style markdown` for the previous raw URL form
+needed by scripts and technical exports. For non-markdown targets pick the
+matching `--style` and follow
 `references/citation-formats.md` for placement (footnotes in docx, endnotes in
 PDF/LaTeX, a Sources slide in decks, per-page source lists in wiki output).
 
-⑤ **Verify before delivering** — `sources.py verify <draft>` exits non-zero on
+⑥ **Verify before delivering** — `sources.py verify <draft>` exits non-zero on
 unknown ids, on a Sources block that disagrees with the ledger, or (with
 `--min-coverage`) on prose that is too thinly cited. Fix and re-run.
 
-⑥ **Chat answers** follow the same steps with the draft in your reply: register
-sources, cite inline, end with the rendered `Sources:` list. For a short answer
-you may render the block from `sources.py render --only <ids>` instead of
-writing to a file.
+⑦ **Chat answers** follow the same steps with the draft in your reply: register
+and annotate sources, cite inline, then end with
+`sources.py render --heading "<localized heading>" --only <ids>`. The authored
+Markdown links stay compact on CLI, messaging, Web, and Desktop while retaining
+the ledger URL as their target. For a longer answer, use `--replace-in` and run
+`verify` on the resulting draft.
 
 ## Fact-Checking Mode
 
@@ -198,6 +212,10 @@ and read the `info: stats:` line to see the counts before picking a number.
   only between tasks.
 - **Retyping URLs into the Sources block.** Always `render`. A hand-typed URL
   is an unverified claim.
+- **Using page titles as localized labels.** Titles may be noisy or in a
+  different language. Derive labels and descriptions from retrieved content;
+  when that content is unavailable, leave the source unannotated for the safe
+  host/path fallback.
 - **Citing a search snippet as if you read the page.** A `web_search`
   description supports only what it literally says. Cite the extracted page
   when the claim needs the body — `web_extract` it first.
