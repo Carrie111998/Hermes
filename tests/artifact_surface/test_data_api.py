@@ -1,6 +1,11 @@
 import json
 import sqlite3
+from unittest.mock import patch
+
+import pytest
+
 from artifact_surface import data_api
+from events import paths as event_paths
 
 
 def test_read_events(tmp_path):
@@ -361,6 +366,76 @@ def test_read_devflow_surfaces_active_and_expired_leases(tmp_path):
 
     assert [lease["lease_id"] for lease in result["active_leases"]] == ["lse_active"]
     assert [lease["lease_id"] for lease in result["expired_leases"]] == ["lse_expired"]
+
+
+@pytest.mark.parametrize("profile_scoped", [True, False], ids=["profile-root", "custom-root"])
+def test_read_devflow_defaults_match_ddp_canonical_paths(tmp_path, monkeypatch, profile_scoped):
+    root = tmp_path / "hermes-root"
+    configured_home = root / "profiles" / "main" if profile_scoped else root
+    configured_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(configured_home))
+
+    expected = {
+        "ledger": event_paths.delegation_ledger_path(),
+        "allowlist": event_paths.devflow_allowlist_path(),
+        "sentinel": event_paths.autonomy_sentinel_path(),
+    }
+    for path in expected.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    _write_devflow_ledger(expected["ledger"])
+    expected["allowlist"].write_text(
+        json.dumps({"targets": {"parity": {"live_gateway_imports": True}}}),
+        encoding="utf-8",
+    )
+    expected["sentinel"].touch()
+
+    real_connect = sqlite3.connect
+    opened = []
+
+    def capture_connect(database, *args, **kwargs):
+        opened.append((database, kwargs.copy()))
+        return real_connect(database, *args, **kwargs)
+
+    with patch.object(data_api.sqlite3, "connect", side_effect=capture_connect), \
+         patch.object(event_paths, "delegation_ledger_path", wraps=event_paths.delegation_ledger_path) as ledger_default, \
+         patch.object(event_paths, "devflow_allowlist_path", wraps=event_paths.devflow_allowlist_path) as allowlist_default, \
+         patch.object(event_paths, "autonomy_sentinel_path", wraps=event_paths.autonomy_sentinel_path) as sentinel_default:
+        result = data_api.read_devflow(now="2026-08-09T00:00:00+00:00")
+
+    ledger_default.assert_called_once_with()
+    allowlist_default.assert_called_once_with()
+    sentinel_default.assert_called_once_with()
+    assert result["ledger_total"] == 2
+    assert result["live_gateway_imports"] == {"parity": True}
+    assert result["autonomy_sentinel_note"] == "enabled"
+    assert opened == [(f"file:{expected['ledger']}?mode=ro", {"uri": True})]
+
+
+def test_read_devflow_explicit_ddp_paths_remain_authoritative(tmp_path):
+    injected = tmp_path / "injected"
+    injected.mkdir()
+    ledger = injected / "ledger.db"
+    allowlist = injected / "allowlist.json"
+    sentinel = injected / "sentinel"
+    _write_devflow_ledger(ledger)
+    allowlist.write_text(
+        json.dumps({"targets": {"injected": {"live_gateway_imports": True}}}),
+        encoding="utf-8",
+    )
+    sentinel.touch()
+
+    with patch.object(event_paths, "delegation_ledger_path", side_effect=AssertionError("default ledger used")), \
+         patch.object(event_paths, "devflow_allowlist_path", side_effect=AssertionError("default allowlist used")), \
+         patch.object(event_paths, "autonomy_sentinel_path", side_effect=AssertionError("default sentinel used")):
+        result = data_api.read_devflow(
+            ledger_path=ledger,
+            allowlist_path=allowlist,
+            sentinel_path=sentinel,
+        )
+
+    assert result["ledger_total"] == 2
+    assert result["live_gateway_imports"] == {"injected": True}
+    assert result["autonomy_sentinel_note"] == "enabled"
 
 
 def test_read_devflow_surfaces_live_gateway_policy(tmp_path):

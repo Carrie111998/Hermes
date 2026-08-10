@@ -61,6 +61,27 @@ def test_transition_subcommand(queue_mode, capsys, monkeypatch):
     assert "TRIAGED" in capsys.readouterr().out
 
 
+def test_transition_cli_passes_preread_state_as_expected_state(
+    queue_mode, capsys, monkeypatch
+):
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
+    cli.main(["delegate"])
+    from devflow_delegation.emitter import DelegationEmitter
+
+    rid = DelegationEmitter().ledger.list_requests()[0]["request_id"]
+    observed = {}
+
+    def capture_transition(_ledger, _bus, request_id, to_state, **kwargs):
+        observed.update(request_id=request_id, to_state=to_state, **kwargs)
+        return to_state
+
+    monkeypatch.setattr(cli, "transition", capture_transition)
+    assert cli.main([
+        "transition", "--request-id", rid, "--to", "TRIAGED", "--actor", "test"
+    ]) == 0
+    assert observed["expected_from_state"] == "REQUESTED"
+
+
 def test_transition_illegal_exits_2(queue_mode, capsys, monkeypatch):
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO(json.dumps(make_delegate_kwargs())))
     cli.main(["delegate"])

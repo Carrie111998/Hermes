@@ -94,6 +94,9 @@ def _planned_ledger(tmp_path, **request_overrides):
     request = _request(**request_overrides)
     ledger.insert_request(request)
     transition(ledger, None, request.request_id, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(
+        request.request_id, "operator", "approve", "fixture setup", f"token-{request.request_id}"
+    )
     transition(ledger, None, request.request_id, "PLANNED", actor="operator")
     return ledger, request
 
@@ -152,6 +155,9 @@ def test_executor_skips_ineligible_before_eligible_work(tmp_path):
     accepted.idempotency_key = "test:accepted:v1"
     ledger.insert_request(accepted)
     transition(ledger, None, accepted.request_id, "TRIAGED", actor="operator")
+    assert ledger.record_human_decision(
+        accepted.request_id, "operator", "approve", "fixture setup", f"token-{accepted.request_id}"
+    )
     transition(ledger, None, accepted.request_id, "PLANNED", actor="operator")
 
     result = run_executor_tick(ledger, _allowlist(_target(repo, tmp_path, command=_write_source_command())), None, pr_client=FakePrClient())

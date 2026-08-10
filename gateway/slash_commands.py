@@ -4693,6 +4693,66 @@ class GatewaySlashCommandsMixin:
             ledger, bus = emitter.ledger, emitter.bus
         return ledger, bus
 
+    def _ddp_read_stage(self, request_id: str):
+        """Resolve the lazy control plane and perform the complete stage read."""
+        ledger, _bus = self._ddp_ledger_and_bus()
+        row = ledger.get_request(request_id)
+        existing = ledger.human_decision_for_request(request_id) if row is not None else None
+        return row, existing
+
+    def _ddp_commit_confirmation(
+        self,
+        *,
+        request_id: str,
+        actor: str,
+        decision: str,
+        evidence_ref: str,
+        token: str,
+        target_state: str,
+    ):
+        """Run the complete durable confirmation transaction synchronously."""
+        from devflow_delegation.lifecycle import transition
+
+        ledger, bus = self._ddp_ledger_and_bus()
+        with ledger.transaction():
+            inserted = ledger.record_human_decision(
+                request_id,
+                actor,
+                decision,
+                evidence_ref,
+                token,
+            )
+            if inserted:
+                transition(
+                    ledger,
+                    None,
+                    request_id,
+                    target_state,
+                    actor=actor,
+                    evidence_ref=evidence_ref,
+                    expected_from_state="TRIAGED",
+                )
+        return inserted, bus
+
+    @staticmethod
+    def _ddp_emit_confirmation_telemetry(
+        bus,
+        *,
+        request_id: str,
+        target_state: str,
+        actor: str,
+    ) -> None:
+        """Emit best-effort telemetry after the durable commit is visible."""
+        from devflow_delegation.lifecycle import emit_transition_event
+
+        emit_transition_event(
+            bus,
+            request_id=request_id,
+            from_state="TRIAGED",
+            to_state=target_state,
+            actor=actor,
+        )
+
     async def _handle_ddp_decision_command(self, event: MessageEvent, decision: str) -> str:
         """Stage one bounded, evidence-backed DDP lifecycle decision."""
         actor = self._ddp_actor_for_source(event.source)
@@ -4713,8 +4773,7 @@ class GatewaySlashCommandsMixin:
             return f"Usage: /{canonical} <request-id> <evidence>"
 
         try:
-            ledger, _bus = self._ddp_ledger_and_bus()
-            row = ledger.get_request(request_id)
+            row, existing = await asyncio.to_thread(self._ddp_read_stage, request_id)
             if row is None:
                 return f"Unknown DDP request: {request_id}"
             if row.get("state") != "TRIAGED":
@@ -4722,7 +4781,6 @@ class GatewaySlashCommandsMixin:
                     f"DDP request {request_id} is {row.get('state')}, not TRIAGED; "
                     "no approval decision can be applied."
                 )
-            existing = ledger.human_decision_for(request_id, actor)
         except Exception as exc:
             logger.warning("DDP decision ledger unavailable: %s", exc)
             return "❌ DDP ledger is unavailable; no decision was recorded."
@@ -4773,28 +4831,20 @@ class GatewaySlashCommandsMixin:
         request_id = pending["request_id"]
         target_state = "PLANNED" if decision == "approve" else "DECLINED"
         try:
-            from devflow_delegation.lifecycle import IllegalTransitionError, emit_transition_event, transition
+            from devflow_delegation.lifecycle import IllegalTransitionError
 
-            ledger, bus = self._ddp_ledger_and_bus()
-            with ledger.transaction():
-                inserted = ledger.record_human_decision(
-                    request_id,
-                    actor,
-                    decision,
-                    pending["evidence_ref"],
-                    token,
-                )
-                if not inserted:
-                    self._ddp_confirmation_store().pop(token, None)
-                    return f"DDP request {request_id} was already decided; no transition was added."
-                transition(
-                    ledger,
-                    None,
-                    request_id,
-                    target_state,
-                    actor=actor,
-                    evidence_ref=pending["evidence_ref"],
-                )
+            inserted, bus = await asyncio.to_thread(
+                self._ddp_commit_confirmation,
+                request_id=request_id,
+                actor=actor,
+                decision=decision,
+                evidence_ref=pending["evidence_ref"],
+                token=token,
+                target_state=target_state,
+            )
+            if not inserted:
+                self._ddp_confirmation_store().pop(token, None)
+                return f"DDP request {request_id} was already decided; no transition was added."
         except IllegalTransitionError as exc:
             return f"DDP decision was not applied: {exc}"
         except Exception as exc:
@@ -4807,11 +4857,11 @@ class GatewaySlashCommandsMixin:
         # retryable until the token expires.
         self._ddp_confirmation_store().pop(token, None)
         try:
-            emit_transition_event(
+            await asyncio.to_thread(
+                self._ddp_emit_confirmation_telemetry,
                 bus,
                 request_id=request_id,
-                from_state="TRIAGED",
-                to_state=target_state,
+                target_state=target_state,
                 actor=actor,
             )
         except Exception:

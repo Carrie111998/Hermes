@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -112,6 +114,121 @@ def _seed_triaged(ledger: DelegationLedger) -> str:
     ledger.insert_request(request)
     transition(ledger, None, request.request_id, "TRIAGED", actor="triage")
     return request.request_id
+
+
+@pytest.mark.asyncio
+async def test_ddp_stage_read_runs_off_event_loop_thread(tmp_path, monkeypatch):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    request_id = _seed_triaged(ledger)
+    runner = _make_runner(ledger)
+    event_loop_thread = threading.get_ident()
+    observed_threads = []
+    original = ledger.get_request
+
+    def capture_thread(*args, **kwargs):
+        observed_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "get_request", capture_thread)
+
+    result = await runner._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} operator reviewed")
+    )
+
+    assert "ddp-approve-confirm" in result
+    assert observed_threads and all(thread_id != event_loop_thread for thread_id in observed_threads)
+
+
+@pytest.mark.asyncio
+async def test_ddp_complete_confirm_transaction_runs_off_event_loop_thread(tmp_path, monkeypatch):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    request_id = _seed_triaged(ledger)
+    runner = _make_runner(ledger)
+    source = _make_source()
+    prompt = await runner._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} operator reviewed", source)
+    )
+    token = prompt.rsplit(" ", 1)[-1].strip("`.")
+    event_loop_thread = threading.get_ident()
+    observed_threads = []
+    original = ledger.record_human_decision
+
+    def capture_thread(*args, **kwargs):
+        observed_threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "record_human_decision", capture_thread)
+
+    result = await runner._handle_ddp_approve_confirm_command(
+        _make_event(f"/ddp-approve-confirm {token}", source)
+    )
+
+    assert "approved" in result.lower()
+    assert observed_threads and all(thread_id != event_loop_thread for thread_id in observed_threads)
+    assert ledger.get_request(request_id)["state"] == "PLANNED"
+
+
+@pytest.mark.asyncio
+async def test_ddp_post_commit_telemetry_runs_off_event_loop_and_sees_commit(tmp_path):
+    class InspectingBus:
+        def __init__(self, ledger, request_id):
+            self.ledger = ledger
+            self.request_id = request_id
+            self.thread_id = None
+            self.commit_visible = False
+
+        def emit(self, **_kwargs):
+            self.thread_id = threading.get_ident()
+            self.commit_visible = self.ledger.get_request(self.request_id)["state"] == "PLANNED"
+
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    request_id = _seed_triaged(ledger)
+    runner = _make_runner(ledger)
+    bus = InspectingBus(ledger, request_id)
+    runner._ddp_bus = bus
+    source = _make_source()
+    prompt = await runner._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} operator reviewed", source)
+    )
+    token = prompt.rsplit(" ", 1)[-1].strip("`.")
+    event_loop_thread = threading.get_ident()
+
+    result = await runner._handle_ddp_approve_confirm_command(
+        _make_event(f"/ddp-approve-confirm {token}", source)
+    )
+
+    assert "approved" in result.lower()
+    assert bus.thread_id != event_loop_thread
+    assert bus.commit_visible is True
+
+
+@pytest.mark.asyncio
+async def test_ddp_blocking_stage_read_keeps_event_loop_responsive(tmp_path, monkeypatch):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    request_id = _seed_triaged(ledger)
+    runner = _make_runner(ledger)
+    entered = threading.Event()
+    release = threading.Event()
+    original = ledger.get_request
+
+    def blocking_read(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "get_request", blocking_read)
+    command = asyncio.create_task(runner._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} operator reviewed")
+    ))
+    try:
+        await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.5)
+        ticked = asyncio.Event()
+        asyncio.get_running_loop().call_soon(ticked.set)
+        await asyncio.wait_for(ticked.wait(), timeout=0.2)
+    finally:
+        release.set()
+
+    assert "ddp-approve-confirm" in await command
 
 
 @pytest.mark.asyncio
@@ -271,7 +388,7 @@ async def test_ddp_approve_fails_closed_when_decision_lookup_is_unavailable(tmp_
     def unavailable(*_args, **_kwargs):
         raise sqlite3.OperationalError("ledger busy")
 
-    monkeypatch.setattr(ledger, "human_decision_for", unavailable)
+    monkeypatch.setattr(ledger, "human_decision_for_request", unavailable)
     result = await runner._handle_ddp_approve_command(
         _make_event(f"/ddp-approve {request_id} operator reviewed")
     )
@@ -334,6 +451,40 @@ async def test_ddp_approve_confirm_replay_does_not_add_a_transition(tmp_path):
 
     assert "already" in replay.lower()
     assert [item["to_state"] for item in ledger.transitions_for(request_id)] == ["TRIAGED", "PLANNED"]
+
+
+@pytest.mark.asyncio
+async def test_ddp_unconfirmed_token_is_invalid_after_runner_restart_and_can_be_restaged(tmp_path):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    request_id = _seed_triaged(ledger)
+    source = _make_source()
+    runner_a = _make_runner(ledger)
+    runner_b = _make_runner(ledger)
+
+    prompt_a = await runner_a._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} operator reviewed", source)
+    )
+    old_token = prompt_a.rsplit(" ", 1)[-1].strip("`.")
+    stale_confirmation = await runner_b._handle_ddp_approve_confirm_command(
+        _make_event(f"/ddp-approve-confirm {old_token}", source)
+    )
+
+    assert "unknown" in stale_confirmation.lower() or "expired" in stale_confirmation.lower()
+    assert ledger.human_decision_for_request(request_id) is None
+    assert ledger.get_request(request_id)["state"] == "TRIAGED"
+
+    prompt_b = await runner_b._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} operator reviewed", source)
+    )
+    new_token = prompt_b.rsplit(" ", 1)[-1].strip("`.")
+    confirmed = await runner_b._handle_ddp_approve_confirm_command(
+        _make_event(f"/ddp-approve-confirm {new_token}", source)
+    )
+
+    assert new_token != old_token
+    assert "approved" in confirmed.lower()
+    assert ledger.get_request(request_id)["state"] == "PLANNED"
+    assert ledger.human_decision_for_request(request_id)["decision"] == "approve"
 
 
 @pytest.mark.asyncio
@@ -431,6 +582,39 @@ async def test_ddp_confirm_uses_durable_token_guard_for_concurrent_delivery(tmp_
     assert ledger.get_request(request_id)["state"] == "TRIAGED"
     assert len(ledger.transitions_for(request_id)) == 1
     assert token not in runner._ddp_confirmation_store()
+
+
+@pytest.mark.asyncio
+async def test_competing_admin_approve_and_decline_has_one_deterministic_winner(tmp_path):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    request_id = _seed_triaged(ledger)
+    runner = _make_runner(ledger, admin_ids=("admin-1", "admin-2"))
+    admin_1 = _make_source("admin-1")
+    admin_2 = _make_source("admin-2")
+
+    approve_prompt = await runner._handle_ddp_approve_command(
+        _make_event(f"/ddp-approve {request_id} reviewed", admin_1)
+    )
+    decline_prompt = await runner._handle_ddp_decline_command(
+        _make_event(f"/ddp-decline {request_id} not ready", admin_2)
+    )
+    approve_token = approve_prompt.rsplit(" ", 1)[-1].strip("`.")
+    decline_token = decline_prompt.rsplit(" ", 1)[-1].strip("`.")
+
+    approved = await runner._handle_ddp_approve_confirm_command(
+        _make_event(f"/ddp-approve-confirm {approve_token}", admin_1)
+    )
+    declined = await runner._handle_ddp_decline_confirm_command(
+        _make_event(f"/ddp-decline-confirm {decline_token}", admin_2)
+    )
+
+    assert "approved" in approved.lower()
+    assert "already decided" in declined.lower()
+    assert ledger.get_request(request_id)["state"] == "PLANNED"
+    assert ledger.human_decision_for_request(request_id)["decision"] == "approve"
+    assert [item["to_state"] for item in ledger.transitions_for(request_id)] == [
+        "TRIAGED", "PLANNED"
+    ]
 
 
 @pytest.mark.asyncio
@@ -536,6 +720,9 @@ async def test_ddp_rejects_unknown_and_non_triaged_requests(tmp_path):
     assert "unknown" in unknown.lower()
 
     request_id = _seed_triaged(ledger)
+    assert ledger.record_human_decision(
+        request_id, "fixture", "approve", "fixture setup", "token-non-triaged"
+    )
     transition(ledger, None, request_id, "PLANNED", actor="fixture")
     non_triaged = await runner._handle_ddp_decline_command(
         _make_event(f"/ddp-decline {request_id} no longer relevant")

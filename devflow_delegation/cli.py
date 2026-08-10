@@ -162,9 +162,11 @@ def _cmd_transition(args) -> int:
                 f"TRIAGED -> {args.to} is a human decision; use authenticated "
                 f"{command} with its confirmation command instead"
             )
+        expected_from_state = row["state"] if row is not None else None
         new_state = transition(
             em.ledger, em.bus, args.request_id, args.to,
-            actor=args.actor, evidence_ref=args.evidence_ref)
+            actor=args.actor, evidence_ref=args.evidence_ref,
+            expected_from_state=expected_from_state)
     except IllegalTransitionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

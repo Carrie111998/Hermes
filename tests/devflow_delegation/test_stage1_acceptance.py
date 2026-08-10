@@ -47,6 +47,9 @@ def test_synthetic_request_traverses_full_control_plane(queue_all):
     # operator approval path; production approval uses the gateway protocol.
     assert cli.main(["transition", "--request-id", r.request_id, "--to", "TRIAGED",
                      "--actor", "acceptance"]) == 0
+    assert em.ledger.record_human_decision(
+        r.request_id, "acceptance", "approve", "fixture setup", "token-acceptance"
+    )
     assert transition(em.ledger, em.bus, r.request_id, "PLANNED", actor="acceptance") == "PLANNED"
 
     row = em.ledger.get_request(r.request_id)

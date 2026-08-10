@@ -18,7 +18,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 
 from hermes_constants import get_default_hermes_root
-from events.paths import events_db_path
+from events import paths as event_paths
 
 ACTIVITY_EVENT_TYPES = (
     "job_discovered", "job_vip_discovered", "job_scored", "job_high_score",
@@ -42,7 +42,7 @@ def _root() -> Path:
 
 def read_events(*, db_path: Optional[Path] = None, limit: int = 80,
                 event_type: Optional[str] = None) -> list[dict]:
-    db = db_path or events_db_path()
+    db = db_path or event_paths.events_db_path()
     if not Path(db).exists():
         return []
     try:
@@ -525,12 +525,12 @@ def read_devflow(
     writes or exceptions.
     """
     root = _root()
-    devflow_dir = root / "devflow"
-    db = Path(ledger_path) if ledger_path is not None else devflow_dir / "delegation_ledger.db"
+    db = (Path(ledger_path) if ledger_path is not None
+          else event_paths.delegation_ledger_path())
     allowlist = (Path(allowlist_path) if allowlist_path is not None
-                 else devflow_dir / "allowlist.json")
+                 else event_paths.devflow_allowlist_path())
     sentinel = (Path(sentinel_path) if sentinel_path is not None
-                else devflow_dir / ".autonomy_enabled")
+                else event_paths.autonomy_sentinel_path())
     config_path = (Path(gateway_config_path) if gateway_config_path is not None
                    else root / "profiles" / "main" / "config.yaml")
     cron_path = (Path(cron_jobs_path) if cron_jobs_path is not None

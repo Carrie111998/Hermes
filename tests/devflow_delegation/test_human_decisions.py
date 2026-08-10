@@ -1,3 +1,5 @@
+import sqlite3
+
 import pytest
 
 from devflow_delegation.contract import parse_request
@@ -105,3 +107,95 @@ def test_schema_creates_human_decisions_table(tmp_path):
         for row in ledger._conn().execute("SELECT name FROM sqlite_master WHERE type='table'")
     }
     assert "human_decisions" in tables
+
+
+def test_human_decision_is_unique_request_wide_and_has_request_lookup(tmp_path):
+    ledger = DelegationLedger(tmp_path / "delegation_ledger.db")
+    request = _request()
+    ledger.insert_request(request)
+
+    assert ledger.record_human_decision(
+        request.request_id, "telegram:u1", "approve", "reviewed", "token-1"
+    )
+    assert not ledger.record_human_decision(
+        request.request_id, "telegram:u2", "decline", "disagreed", "token-2"
+    )
+    decision = ledger.human_decision_for_request(request.request_id)
+    assert decision is not None
+    assert decision["actor"] == "telegram:u1"
+    assert decision["decision"] == "approve"
+
+
+@pytest.mark.parametrize(
+    ("actor", "decision", "evidence_ref", "confirmation_token"),
+    [
+        ("", "approve", "reviewed", "token-1"),
+        ("telegram:u1", "maybe", "reviewed", "token-1"),
+        ("telegram:u1", "approve", "", "token-1"),
+        ("telegram:u1", "approve", "reviewed", ""),
+    ],
+)
+def test_human_decision_validates_inputs(
+    tmp_path, actor, decision, evidence_ref, confirmation_token
+):
+    ledger = DelegationLedger(tmp_path / "delegation_ledger.db")
+    request = _request()
+    ledger.insert_request(request)
+
+    with pytest.raises(ValueError):
+        ledger.record_human_decision(
+            request.request_id, actor, decision, evidence_ref, confirmation_token
+        )
+
+
+def test_existing_db_migration_adds_request_wide_unique_index(tmp_path):
+    db_path = tmp_path / "delegation_ledger.db"
+    ledger = DelegationLedger(db_path)
+    request = _request()
+    ledger.insert_request(request)
+    ledger.close()
+    conn = sqlite3.connect(db_path)
+    conn.execute("DROP INDEX IF EXISTS uq_human_decisions_request")
+    conn.commit()
+    conn.close()
+
+    migrated = DelegationLedger(db_path)
+    indexes = {
+        row[1]
+        for row in migrated._conn().execute("PRAGMA index_list(human_decisions)")
+    }
+    assert "uq_human_decisions_request" in indexes
+
+
+def test_existing_db_migration_fails_without_deleting_conflicting_rows(tmp_path):
+    db_path = tmp_path / "delegation_ledger.db"
+    ledger = DelegationLedger(db_path)
+    request = _request()
+    ledger.insert_request(request)
+    conn = ledger._conn()
+    conn.execute("DROP INDEX IF EXISTS uq_human_decisions_request")
+    conn.execute(
+        "INSERT INTO human_decisions "
+        "(request_id, actor, decision, evidence_ref, confirmation_token, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (request.request_id, "telegram:u1", "approve", "reviewed", "token-1", "2026-01-01"),
+    )
+    conn.execute(
+        "INSERT INTO human_decisions "
+        "(request_id, actor, decision, evidence_ref, confirmation_token, created_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (request.request_id, "telegram:u2", "decline", "disagreed", "token-2", "2026-01-02"),
+    )
+    conn.commit()
+    ledger.close()
+
+    with pytest.raises(RuntimeError, match="conflicting legacy human_decisions"):
+        DelegationLedger(db_path)
+
+    check = sqlite3.connect(db_path)
+    try:
+        assert check.execute(
+            "SELECT COUNT(*) FROM human_decisions WHERE request_id=?", (request.request_id,)
+        ).fetchone()[0] == 2
+    finally:
+        check.close()

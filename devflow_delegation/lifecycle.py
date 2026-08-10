@@ -64,15 +64,37 @@ def transition(
     actor: str,
     policy_version: str = "policy-v1",
     evidence_ref: Optional[str] = None,
+    expected_from_state: Optional[str] = None,
 ) -> str:
+    def validate(from_state: str) -> None:
+        if expected_from_state is not None and from_state != expected_from_state:
+            raise IllegalTransitionError(
+                f"request {request_id} is {from_state}; expected {expected_from_state}"
+            )
+        if to_state not in TRANSITIONS.get(from_state, frozenset()):
+            raise IllegalTransitionError(
+                f"illegal transition {from_state} -> {to_state} for {request_id}"
+            )
+        if from_state == "TRIAGED" and to_state in {"PLANNED", "DECLINED"}:
+            lookup = getattr(ledger, "human_decision_for_request", None)
+            decision = lookup(request_id) if lookup is not None else None
+            required = "approve" if to_state == "PLANNED" else "decline"
+            if decision is None:
+                raise IllegalTransitionError(
+                    f"TRIAGED -> {to_state} requires durable human decision provenance"
+                )
+            if decision["decision"] != required or decision["actor"] != actor:
+                raise IllegalTransitionError(
+                    f"human decision does not authorize TRIAGED -> {to_state} for {actor}"
+                )
+
     tx = getattr(ledger, "transaction", None)
     if tx is None:
         row = ledger.get_request(request_id)
         if row is None:
             raise IllegalTransitionError(f"unknown request: {request_id}")
         from_state = row["state"]
-        if to_state not in TRANSITIONS.get(from_state, frozenset()):
-            raise IllegalTransitionError(f"illegal transition {from_state} -> {to_state} for {request_id}")
+        validate(from_state)
         terminal_reason = to_state if to_state in TERMINAL_STATES else None
         ledger.set_state(request_id, to_state, terminal_reason=terminal_reason)
         ledger.record_transition(request_id, from_state, to_state, actor, policy_version, evidence_ref)
@@ -82,10 +104,7 @@ def transition(
             if row is None:
                 raise IllegalTransitionError(f"unknown request: {request_id}")
             from_state = row["state"]
-            if to_state not in TRANSITIONS.get(from_state, frozenset()):
-                raise IllegalTransitionError(
-                    f"illegal transition {from_state} -> {to_state} for {request_id}"
-                )
+            validate(from_state)
             terminal_reason = to_state if to_state in TERMINAL_STATES else None
             ledger.set_state(request_id, to_state, terminal_reason=terminal_reason)
             ledger.record_transition(request_id, from_state, to_state, actor, policy_version, evidence_ref)

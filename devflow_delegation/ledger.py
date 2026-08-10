@@ -148,6 +148,7 @@ class DelegationLedger:
         conn = self._conn()
         conn.executescript(_SCHEMA)
         conn.executescript(_HUMAN_DECISIONS_SCHEMA)
+        self._ensure_request_wide_human_decision_uniqueness(conn)
         for statement in (*_LEASE_MIGRATIONS, *_REQUEST_MIGRATIONS):
             try:
                 conn.execute(statement)
@@ -155,6 +156,23 @@ class DelegationLedger:
                 if "duplicate column name" not in str(exc).lower():
                     raise
         conn.commit()
+
+    @staticmethod
+    def _ensure_request_wide_human_decision_uniqueness(conn: sqlite3.Connection) -> None:
+        conflicts = conn.execute(
+            "SELECT request_id, COUNT(*) AS n FROM human_decisions "
+            "GROUP BY request_id HAVING COUNT(*) > 1 ORDER BY request_id"
+        ).fetchall()
+        if conflicts:
+            request_ids = ", ".join(str(row["request_id"]) for row in conflicts)
+            raise RuntimeError(
+                "conflicting legacy human_decisions prevent request-wide uniqueness: "
+                f"{request_ids}; resolve explicitly without deleting rows"
+            )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_human_decisions_request "
+            "ON human_decisions(request_id)"
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -296,6 +314,17 @@ class DelegationLedger:
         confirmation_token: str,
     ) -> bool:
         """Persist a one-time human decision. Returns False on replay."""
+        values = {
+            "request_id": request_id,
+            "actor": actor,
+            "evidence_ref": evidence_ref,
+            "confirmation_token": confirmation_token,
+        }
+        for name, value in values.items():
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} must be a non-empty string")
+        if decision not in {"approve", "decline"}:
+            raise ValueError("decision must be approve or decline")
         conn = self._conn()
         try:
             inserted = conn.execute(
@@ -310,12 +339,19 @@ class DelegationLedger:
             self._outer_rollback(conn)
             raise
 
-    def human_decision_for(self, request_id: str, actor: str) -> Optional[Dict[str, Any]]:
+    def human_decision_for_request(self, request_id: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("request_id must be a non-empty string")
         row = self._conn().execute(
-            "SELECT * FROM human_decisions WHERE request_id=? AND actor=?",
-            (request_id, actor),
+            "SELECT * FROM human_decisions WHERE request_id=?", (request_id,)
         ).fetchone()
         return self._row_to_dict(row)
+
+    def human_decision_for(self, request_id: str, actor: str) -> Optional[Dict[str, Any]]:
+        decision = self.human_decision_for_request(request_id)
+        if decision is None or decision["actor"] != actor:
+            return None
+        return decision
 
     # ------------------------------------------------------------------- read
     @staticmethod
