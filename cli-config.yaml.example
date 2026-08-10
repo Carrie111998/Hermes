@@ -853,10 +853,6 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
-  # Disabled toolsets in this profile. By default, subagent delegation is off.
-  # disabled_toolsets:
-  #   - delegation
-
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.
