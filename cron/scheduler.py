@@ -3895,6 +3895,10 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 _ACTIVITY_REGISTRY = None
 _ACTIVITY_REGISTRY_LOADED = False
+#: tick() dispatches jobs through a ThreadPoolExecutor, so two mapped jobs can
+#: reach the first registry load at once. Without this lock the second thread
+#: sees LOADED=True while the value is still None and silently loses telemetry.
+_ACTIVITY_REGISTRY_LOCK = threading.Lock()
 
 #: Terminal evidence labels per early branch. The plan's ``wakeAgent:false``
 #: label is normalized to ``wake_gate_false`` because the telemetry store only
@@ -3920,16 +3924,25 @@ def _load_activity_registry():
 def _get_activity_registry():
     """Return the process-cached registry, or None to behave as unmapped."""
     global _ACTIVITY_REGISTRY, _ACTIVITY_REGISTRY_LOADED
-    if not _ACTIVITY_REGISTRY_LOADED:
-        _ACTIVITY_REGISTRY_LOADED = True
+    if _ACTIVITY_REGISTRY_LOADED:
+        return _ACTIVITY_REGISTRY
+    with _ACTIVITY_REGISTRY_LOCK:
+        # Re-check inside the lock: a racing thread may have finished the load
+        # while this one waited.
+        if _ACTIVITY_REGISTRY_LOADED:
+            return _ACTIVITY_REGISTRY
         try:
-            _ACTIVITY_REGISTRY = _load_activity_registry()
+            registry = _load_activity_registry()
         except Exception as exc:
             logger.warning(
                 "activity policy registry unavailable: %s", type(exc).__name__
             )
-            _ACTIVITY_REGISTRY = None
-    return _ACTIVITY_REGISTRY
+            registry = None
+        # Publish the value BEFORE the flag so no thread can observe a
+        # "loaded" cache that is still empty.
+        _ACTIVITY_REGISTRY = registry
+        _ACTIVITY_REGISTRY_LOADED = True
+        return registry
 
 
 def _resolve_cron_activity_policy(job: dict):

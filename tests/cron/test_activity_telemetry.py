@@ -442,6 +442,48 @@ def test_finish_helper_swallows_an_invalid_outcome(hermes_env, registry, caplog)
     assert "ValueError" in caplog.text
 
 
+def test_concurrent_first_load_never_serves_a_half_built_cache(hermes_env, monkeypatch):
+    """The parallel cron pool starts mapped jobs concurrently.
+
+    A check-then-act cache that publishes "loaded" before the value is built
+    hands the second thread ``None`` and silently drops that job's telemetry.
+    """
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from activity_policy.registry import ActivityRegistry
+    from cron import scheduler
+
+    built = ActivityRegistry.from_mapping({
+        "enforcement": "observe",
+        "activities": {"fleet.tests.script": _policy_declaration(["mapped-script-job"], "D0")},
+    })
+    started = threading.Barrier(2)
+    calls = []
+
+    def _slow_load():
+        calls.append(1)
+        # Wide enough that a check-then-act cache publishes "loaded" while the
+        # value is still None and the racing thread reads the hole.
+        time.sleep(0.2)
+        return built
+
+    monkeypatch.setattr(scheduler, "_load_activity_registry", _slow_load)
+    monkeypatch.setattr(scheduler, "_ACTIVITY_REGISTRY", None, raising=False)
+    monkeypatch.setattr(scheduler, "_ACTIVITY_REGISTRY_LOADED", False, raising=False)
+
+    def _racer(_index):
+        started.wait(timeout=5)
+        return scheduler._get_activity_registry()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(_racer, range(2)))
+
+    assert len(calls) == 1, "registry must be loaded exactly once"
+    assert all(result is built for result in results)
+
+
 def test_unloadable_registry_behaves_as_unmapped(hermes_env, monkeypatch, caplog):
     from activity_policy.schema import PolicyError
     from cron import scheduler

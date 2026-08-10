@@ -53,5 +53,12 @@ Delivery stays `unknown` on every row. Process-level success never becomes seman
 ## Positive control
 Every test drives the real `run_job` seam and asserts against the real SQLite store rather than a mocked helper. To prove the suite is armed, `_resolve_cron_activity_policy` was temporarily short-circuited to return `None`: **15 of 20 tests failed**. The 5 that still passed are exactly the compatibility tests (unmapped script job, unmapped model job, unloadable registry, open-failure isolation, finish-helper guard), which assert "no telemetry and unchanged behavior" and therefore hold in a dormant adapter by design. The scheduler was then restored and re-verified green.
 
+## Review
+Independent review returned SPEC COMPLIANCE PASS with one Important finding: `_get_activity_registry()` used an unguarded check-then-act cache while `tick()` dispatches jobs through a `ThreadPoolExecutor`, so a second mapped job starting during the first registry load could observe `LOADED=True` with the value still `None` and silently lose its telemetry.
+
+Fixed with a module-level load lock plus double-checked locking, and the value is now published *before* the loaded flag so no thread can observe an empty "loaded" cache. RED was proven first: a two-thread test showed the loader ran exactly once while one racer still received `None`. After the fix: **21 passed**, and a broader cron re-run (`test_activity_telemetry`, `test_scheduler`, `test_parallel_pool`, `test_cron_no_agent`, `test_cron_profile_isolation`) reported **375 passed**.
+
+The reviewer independently traced all 20 tests and confirmed the 15/20 mutation-probe count, and confirmed the evidence-allowlist widening does not weaken the Task 2 security property.
+
 ## Boundary preserved
 No live `profiles/main/cron/jobs.json` was read or written, no schedule/model/provider/profile/credential/delivery configuration changed, no service was restarted, and telemetry remains `enforcement: observe`. The runtime path is not activated by this task.
