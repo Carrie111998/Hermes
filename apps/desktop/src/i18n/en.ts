@@ -2544,6 +2544,7 @@ export const en: Translations = {
         accountLoading: 'Loading account usage',
         accountTitle: 'Provider Accounts',
         accountUnsupported: 'Account usage is not supported by this backend',
+        allNoUsage: count => `${count} configured providers don't report usage`,
         callsAndTokens: (calls, tokens) => `${calls} calls · ${tokens} tokens`,
         categoryDetails: 'Category details',
         currentBadge: 'Current',
@@ -2558,7 +2559,6 @@ export const en: Translations = {
         localUnavailable: 'No local session analytics are available',
         modelSummary: (provider, model) => `${provider} · ${model}`,
         openInCommandCenter: 'Open in Command Center',
-        otherProviders: count => `Other providers (${count})`,
         quota: {
           error: 'Provider usage request failed',
           unavailable: 'Provider usage is unavailable',
@@ -2570,7 +2570,6 @@ export const en: Translations = {
         resetsAt: time => `Resets ${time}`,
         sourceOfficial: 'Official provider data',
         staleData: 'Cached data',
-        unsupportedShort: 'No usage reporting',
         updatedAt: time => `Updated ${time}`,
         categories: {
           conversation: 'Conversation',

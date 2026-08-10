@@ -187,15 +187,15 @@ describe('ContextUsagePanel', () => {
     )
 
     expect(await screen.findByText('openai-codex')).toBeTruthy()
-    expect(screen.queryByText('local-provider')).toBeNull()
     expect(screen.getByText('Account lpha')).toBeTruthy()
     expect(screen.getByText('Account beta')).toBeTruthy()
     expect(screen.getByText('60% remaining')).toBeTruthy()
     expect(screen.getByText('Cooling down')).toBeTruthy()
-    // Unsupported providers merge into one collapsed group with a single note.
-    expect(screen.getAllByText(/No usage reporting/).length).toBe(1)
-    fireEvent.click(screen.getByRole('button', { name: /Other providers \(1\)/ }))
-    expect(screen.getByText('local-provider')).toBeTruthy()
+    // Unsupported providers are hidden entirely in the quick layer — no row,
+    // no disclosure — as long as at least one provider has a real signal.
+    expect(screen.queryByText('local-provider')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Other providers/ })).toBeNull()
+    expect(screen.queryByText(/don't report usage/)).toBeNull()
     expect(screen.getByText('openai-codex · runtime-model')).toBeTruthy()
     expect(screen.getByText('2 calls · 140 tokens')).toBeTruthy()
     expect(requestGateway).toHaveBeenCalledWith('usage.accounts', {

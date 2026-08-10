@@ -2723,9 +2723,9 @@ export const zh: Translations = {
         accountError: '无法加载账号用量',
         accountLoading: '正在加载账号用量',
         accountTitle: '提供商账号',
+        allNoUsage: count => `已配置 ${count} 个提供商均不报告用量`,
         categoryDetails: '分类详情',
         currentBadge: '当前',
-        unsupportedShort: '不报告用量',
         accountUnsupported: '当前后端不支持账号用量',
         callsAndTokens: (calls, tokens) => `${calls} 次调用 · ${tokens} tokens`,
         health: {
@@ -2745,7 +2745,6 @@ export const zh: Translations = {
         },
         remaining: percent => `剩余 ${percent}%`,
         openInCommandCenter: '在命令中心打开',
-        otherProviders: count => `其他 ${count} 个提供商`,
         refresh: '刷新',
         refreshing: '刷新中…',
         resetsAt: time => `重置于 ${time}`,

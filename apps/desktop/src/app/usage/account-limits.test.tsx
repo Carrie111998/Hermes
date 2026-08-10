@@ -335,29 +335,29 @@ describe('AccountLimitsView usage-ordered layout', () => {
     return base
   }
 
-  it('pins the current session provider with a badge and merges unsupported providers into a collapsed group', () => {
-    const { container } = render(<AccountLimitsView contract={orderedContract()} />)
+  it('pins the current session provider with a badge and hides unsupported providers entirely', () => {
+    render(<AccountLimitsView contract={orderedContract()} />)
 
     const kimi = screen.getByText('kimi-coding')
     expect(kimi.parentElement?.textContent).toContain('Current')
 
-    // Unsupported providers are hidden behind a collapsed disclosure.
+    // Unused providers leave no trace in the quick layer — no rows, no
+    // disclosure, no repeated "does not report" notes.
     expect(screen.queryByText('copilot')).toBeNull()
     expect(screen.queryByText('deepseek')).toBeNull()
+    expect(screen.queryByRole('button', { name: /Other providers/ })).toBeNull()
+    expect(screen.queryByText(/No usage reporting/)).toBeNull()
+  })
 
-    const disclosure = screen.getByRole('button', { name: /Other providers \(2\)/ })
-    expect(disclosure.getAttribute('aria-expanded')).toBe('false')
-    expect(disclosure.textContent).toContain('2/2')
+  it('shows one quiet line only when every configured provider is hidden', () => {
+    const contract = orderedContract()
+    contract.local = { status: 'unavailable' }
+    contract.providers = contract.providers.filter(p => p.usage_capability === 'unsupported')
 
-    fireEvent.click(disclosure)
-    expect(disclosure.getAttribute('aria-expanded')).toBe('true')
-    expect(screen.getByText('copilot')).toBeTruthy()
-    expect(screen.getByText('deepseek')).toBeTruthy()
+    render(<AccountLimitsView contract={contract} />)
 
-    // The repeated per-provider "does not report usage" line appears only once,
-    // on the group header — not once per provider.
-    const notes = container.querySelectorAll('[data-slot="unsupported-note"]')
-    expect(notes).toHaveLength(1)
+    expect(screen.getByText(/2 configured providers don't report usage/)).toBeTruthy()
+    expect(screen.queryByText('copilot')).toBeNull()
   })
 
   it('renders a health icon next to each account status', () => {
@@ -367,5 +367,42 @@ describe('AccountLimitsView usage-ordered layout', () => {
     expect(badge).toBeTruthy()
     expect(badge?.querySelector('svg')).toBeTruthy()
     expect(badge?.textContent).toContain('Ready')
+  })
+
+  it('renders freshness and reset as relative time', () => {
+    const contract = makeContract()
+    const now = Date.now()
+    contract.providers[0].accounts[0].quota.fetched_at = new Date(now - 90_000).toISOString()
+    contract.providers[0].accounts[0].quota.stale = true
+    contract.providers[0].accounts[0].quota.windows = [
+      { label: 'Weekly', reset_at: new Date(now + 3 * 86_400_000).toISOString(), used_percent: 40 }
+    ]
+
+    render(<AccountLimitsView contract={contract} />)
+
+    // Intl.RelativeTimeFormat localizes ("2 min. ago" / "2分钟前") — assert
+    // relative semantics in a locale-agnostic way.
+    expect(screen.getByRole('status').textContent).toMatch(/ago|前/)
+    expect(screen.getByText(/Resets in 3 days|3天后/)).toBeTruthy()
+  })
+
+  it('colors the quota bar by remaining threshold: default → amber <20% → red <5%', () => {
+    const contract = makeContract()
+    contract.providers[0].accounts[0].quota.windows = [
+      { label: 'Comfortable', used_percent: 40 },
+      { label: 'Low', used_percent: 85 },
+      { label: 'Critical', used_percent: 97 }
+    ]
+
+    render(<AccountLimitsView contract={contract} />)
+
+    const comfortable = screen.getByRole('progressbar', { name: 'Comfortable: 60% remaining' })
+    const low = screen.getByRole('progressbar', { name: 'Low: 15% remaining' })
+    const critical = screen.getByRole('progressbar', { name: 'Critical: 3% remaining' })
+
+    expect(comfortable.querySelector('[class*="bg-amber-500"]')).toBeNull()
+    expect(comfortable.querySelector('[class*="bg-destructive"]')).toBeNull()
+    expect(low.querySelector('[class*="bg-amber-500"]')).toBeTruthy()
+    expect(critical.querySelector('[class*="bg-destructive"]')).toBeTruthy()
   })
 })

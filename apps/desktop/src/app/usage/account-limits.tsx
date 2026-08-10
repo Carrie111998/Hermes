@@ -4,8 +4,8 @@ import { ErrorIcon } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { Progress } from '@/components/ui/progress'
 import { useI18n } from '@/i18n'
-import { AlertCircle, CheckCircle2, ChevronDown, ChevronRight, Clock } from '@/lib/icons'
-import { fmtDateTime } from '@/lib/time'
+import { AlertCircle, CheckCircle2, Clock } from '@/lib/icons'
+import { relativeTime } from '@/lib/time'
 import type { UsageAccount, UsageAccountsContract, UsageProvider } from '@/types/hermes'
 
 export type AccountLimitsState = 'error' | 'loading' | 'ready' | 'unsupported'
@@ -202,7 +202,7 @@ export function AccountLimitsStateNotice({ state }: { state: AccountLimitsState 
   return null
 }
 
-function formatTimestamp(value: null | string | undefined): string {
+function formatRelative(value: null | string | undefined): string {
   if (!value) {
     return ''
   }
@@ -210,7 +210,7 @@ function formatTimestamp(value: null | string | undefined): string {
   if (Number.isNaN(date.getTime())) {
     return ''
   }
-  return fmtDateTime.format(date)
+  return relativeTime(date.getTime())
 }
 
 function AccountLimitRow({
@@ -226,7 +226,7 @@ function AccountLimitRow({
   const reason = quota.reason?.trim() ?? ''
   const isAuthFailure = reason.startsWith('Credential authentication failed')
   const alertWorthy = quota.status === 'error' || isAuthFailure
-  const fetchedAt = formatTimestamp(quota.fetched_at)
+  const fetchedAt = formatRelative(quota.fetched_at)
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -244,7 +244,11 @@ function AccountLimitRow({
           {quota.windows.map(window => {
             const used = Math.min(100, Math.max(0, Math.round(window.used_percent ?? 0)))
             const remaining = 100 - used
-            const resetAt = formatTimestamp(window.reset_at)
+            const resetAt = formatRelative(window.reset_at)
+            // Threshold tones: the exact % text is always present (redundant
+            // cue); the bar tone adds a pre-attentive warning channel.
+            const low = remaining < 20
+            const critical = remaining < 5
 
             return (
               <div className="flex flex-col gap-1" key={`${account.account_id}:${window.label}`}>
@@ -255,10 +259,18 @@ function AccountLimitRow({
                   <Progress
                     aria-label={`${window.label}: ${copy.remaining(remaining)}`}
                     className="min-w-0 flex-1"
+                    destructive={critical}
+                    fillClassName={!critical && low ? 'bg-amber-500' : undefined}
                     size="sm"
                     value={remaining / 100}
                   />
-                  <span className="shrink-0 tabular-nums text-foreground">{copy.remaining(remaining)}</span>
+                  <span
+                    className={`shrink-0 tabular-nums ${
+                      critical ? 'text-destructive' : low ? 'text-amber-600 dark:text-amber-400' : 'text-foreground'
+                    }`}
+                  >
+                    {copy.remaining(remaining)}
+                  </span>
                 </div>
                 {resetAt && (
                   <span className="pl-16 text-[0.625rem] text-muted-foreground">{copy.resetsAt(resetAt)}</span>
@@ -344,14 +356,11 @@ export function AccountLimitsView({
 }) {
   const { t } = useI18n()
   const copy = t.shell.statusbar.contextUsagePanel
-  const [unsupportedOpen, setUnsupportedOpen] = useState(false)
   const hasProviderReported = contract.providers.some(provider =>
     provider.accounts.some(account => account.quota.source === 'provider_reported')
   )
   const currentProvider = contract.local.status === 'available' ? contract.local.provider : null
   const { pinned, unsupported } = orderUsageProviders(contract.providers, currentProvider)
-  const unsupportedReady = unsupported.reduce((sum, provider) => sum + provider.routing.ready, 0)
-  const unsupportedAccounts = unsupported.reduce((sum, provider) => sum + provider.accounts.length, 0)
 
   return (
     <div className="flex min-w-0 flex-col gap-3" data-slot="account-limits">
@@ -386,6 +395,10 @@ export function AccountLimitsView({
 
       {!contract.providers.length && <p className="text-[0.6875rem] text-muted-foreground">{copy.accountEmpty}</p>}
 
+      {pinned.length === 0 && unsupported.length > 0 && (
+        <p className="text-[0.6875rem] text-muted-foreground">{copy.allNoUsage(unsupported.length)}</p>
+      )}
+
       {pinned.map(provider => (
         <ProviderLimits
           copy={copy}
@@ -395,39 +408,6 @@ export function AccountLimitsView({
         />
       ))}
 
-      {unsupported.length > 0 && (
-        <section className="flex min-w-0 flex-col gap-1.5">
-          <button
-            aria-expanded={unsupportedOpen}
-            className="flex min-w-0 items-center gap-1.5 text-left text-[0.6875rem] text-muted-foreground hover:text-foreground focus-visible:text-foreground focus-visible:underline"
-            onClick={() => setUnsupportedOpen(open => !open)}
-            type="button"
-          >
-            {unsupportedOpen ? (
-              <ChevronDown aria-hidden className="size-3 shrink-0" />
-            ) : (
-              <ChevronRight aria-hidden className="size-3 shrink-0" />
-            )}
-            <span className="min-w-0 truncate">
-              {copy.otherProviders(unsupported.length)}{' '}
-              <span data-slot="unsupported-note">({copy.unsupportedShort})</span>
-            </span>
-            <span className="shrink-0 tabular-nums">
-              {unsupportedReady}/{unsupportedAccounts}
-            </span>
-          </button>
-
-          {unsupportedOpen &&
-            unsupported.map(provider => (
-              <div className="flex items-baseline justify-between gap-2 pl-4" key={provider.provider}>
-                <span className="min-w-0 truncate text-muted-foreground">{provider.provider}</span>
-                <span className="shrink-0 text-[0.6875rem] text-muted-foreground">
-                  {provider.routing.ready}/{provider.accounts.length} {copy.health.ready}
-                </span>
-              </div>
-            ))}
-        </section>
-      )}
     </div>
   )
 }

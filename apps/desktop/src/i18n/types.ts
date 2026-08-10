@@ -2151,6 +2151,7 @@ export interface Translations {
         accountLoading: string
         accountTitle: string
         accountUnsupported: string
+        allNoUsage: (count: number) => string
         callsAndTokens: (calls: number, tokens: string) => string
         categoryDetails: string
         currentBadge: string
@@ -2167,7 +2168,6 @@ export interface Translations {
         loading: string
         modelSummary: (provider: string, model: string) => string
         openInCommandCenter: string
-        otherProviders: (count: number) => string
         percentFull: (percent: number) => string
         quota: {
           error: string
@@ -2182,7 +2182,6 @@ export interface Translations {
         staleData: string
         title: string
         tokenSummary: (used: string, max: string) => string
-        unsupportedShort: string
         updatedAt: (time: string) => string
       }
       session: string
