@@ -4814,6 +4814,20 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
 
     segments = key.split(".")
     top = segments[0]
+    auxiliary_defaults = DEFAULT_CONFIG.get("auxiliary")
+
+    # Every auxiliary task may define an ordered provider fallback chain even
+    # though the per-task defaults intentionally omit an empty list.  Treat the
+    # runtime-supported leaf as schema-known so `hermes config set` does not
+    # warn that a valid route is ignored.
+    if (
+        len(segments) == 3
+        and top == "auxiliary"
+        and isinstance(auxiliary_defaults, dict)
+        and segments[1] in auxiliary_defaults
+        and segments[2] == "fallback_chain"
+    ):
+        return True, None
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
     # A leading underscore on the top-level segment (e.g. ``_test.shim_marker``)
@@ -4967,18 +4981,38 @@ def set_config_value(key: str, value: str, force: bool = False):
     # Preserve values for string-typed settings.  In particular, enum members
     # such as approvals.mode="off" must not become YAML booleans.  Unknown keys
     # retain the historical best-effort coercion behavior.
-    coerced_value: Any = value
-    if not isinstance(_default_value_for_key(key), str):
+    write_value: Any = value
+    if key.startswith("auxiliary.") and key.endswith(".fallback_chain"):
+        try:
+            write_value = json.loads(value)
+        except (TypeError, json.JSONDecodeError) as exc:
+            print(
+                f"✗ Invalid fallback chain for '{key}': expected a JSON list "
+                f"of provider/model objects ({exc})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not isinstance(write_value, list) or not all(
+            isinstance(entry, dict)
+            and isinstance(entry.get("provider"), str)
+            and bool(entry["provider"].strip())
+            for entry in write_value
+        ):
+            print(
+                f"✗ Invalid fallback chain for '{key}': expected a JSON list "
+                "whose entries each have a non-empty 'provider' string",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+    elif not isinstance(_default_value_for_key(key), str):
         if value.lower() in {'true', 'yes', 'on'}:
-            coerced_value = True
+            write_value = True
         elif value.lower() in {'false', 'no', 'off'}:
-            coerced_value = False
+            write_value = False
         elif value.isdigit():
-            coerced_value = int(value)
+            write_value = int(value)
         elif value.replace('.', '', 1).isdigit():
-            coerced_value = float(value)
-
-    value = coerced_value
+            write_value = float(value)
     # Normalize a scalar ``model`` key before writing sub-keys so that
     # ``hermes config set model.provider openai`` doesn't silently
     # destroy the model id when ``model`` is a bare string shorthand
@@ -5046,7 +5080,7 @@ def set_config_value(key: str, value: str, force: bool = False):
                     file=sys.stderr,
                 )
                 sys.exit(1)
-    _set_nested(user_config, key, value)
+    _set_nested(user_config, key, write_value)
     # Normalize the api_base → base_url alias at set-time too (issue #8919),
     # so a fresh `hermes config set model.api_base ...` lands on the canonical
     # key the runtime resolver actually reads, instead of being silently
@@ -5065,16 +5099,16 @@ def set_config_value(key: str, value: str, force: bool = False):
     # config.yaml is authoritative, but terminal_tool only reads TERMINAL_ENV etc.
     env_var = terminal_config_env_var_for_key(key)
     if env_var and key != "terminal.cwd":
-        save_env_value(env_var, _terminal_env_value(value))
+        save_env_value(env_var, _terminal_env_value(write_value))
 
     # Setting display.skin is an explicit "apply NOW" — bump the skin file's
     # mtime so the gateway watcher's (name, mtime) signature moves even when the
     # name is unchanged (re-affirming the active skin after a surface missed the
     # original activation). Built-ins have no file; a name switch already moves
     # their signature.
-    if key == "display.skin" and isinstance(value, str) and value:
+    if key == "display.skin" and isinstance(write_value, str) and write_value:
         try:
-            skin_file = get_hermes_home() / "skins" / f"{value}.yaml"
+            skin_file = get_hermes_home() / "skins" / f"{write_value}.yaml"
             if skin_file.exists():
                 skin_file.touch()
         except Exception:
@@ -5085,13 +5119,13 @@ def set_config_value(key: str, value: str, force: bool = False):
     # (lowercase, so it misses the .env api_keys list above) and would otherwise
     # print the raw secret to the terminal.
     _leaf_key = key.rsplit(".", 1)[-1].lower()
-    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(value, str) and value:
+    if _leaf_key in _SECRET_CONFIG_KEYS and isinstance(write_value, str) and write_value:
         from agent.redact import mask_secret
-        _display_value = mask_secret(value)
+        _display_value = mask_secret(write_value)
     else:
-        _display_value = value
+        _display_value = write_value
     print(f"✓ Set {key} = {_display_value} in {config_path}")
-    warn_unpinned_cron_jobs_after_model_config_change(key, value, user_config)
+    warn_unpinned_cron_jobs_after_model_config_change(key, write_value, user_config)
 
     # Post-write unknown-key notice (#34067): value IS saved, but tell the
     # user the runtime may never read it and suggest the likely-intended path.

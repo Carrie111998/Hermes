@@ -1849,6 +1849,39 @@ class TestAuxiliaryFallbackLayering:
             reason="provider unavailable",
         )
 
+    def test_configured_chain_advances_after_labeled_fallback_fails(self):
+        """A failed fallback label must skip that provider on the next pass."""
+        from agent.auxiliary_client import _try_configured_fallback_chain
+
+        kimi_client = MagicMock()
+        luna_client = MagicMock()
+        chain = [
+            {"provider": "kimi-coding", "model": "kimi-k3"},
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+        ]
+
+        def resolve_entry(entry):
+            if entry["provider"] == "kimi-coding":
+                return kimi_client, entry["model"]
+            return luna_client, entry["model"]
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value={"fallback_chain": chain},
+        ), patch(
+            "agent.auxiliary_client._resolve_fallback_entry",
+            side_effect=resolve_entry,
+        ):
+            client, model, label = _try_configured_fallback_chain(
+                "compression",
+                "fallback_chain[0](kimi-coding)",
+                reason="payment error",
+            )
+
+        assert client is luna_client
+        assert model == "gpt-5.6-luna"
+        assert label == "fallback_chain[1](openai-codex)"
+
 
     def test_fallback_entry_openai_codex_uses_oauth_pool_without_inline_key(self):
         """Configured Codex fallback resolves through Hermes auth / credential pool."""
@@ -1889,6 +1922,21 @@ class TestTryMainAgentModelFallback:
              patch("agent.auxiliary_client._read_main_model", return_value="some-model"):
             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
         assert client is None and model is None and label == ""
+
+    def test_labeled_failed_fallback_does_not_retry_same_main_provider(self):
+        from agent.auxiliary_client import _try_main_agent_model_fallback
+
+        with patch("agent.auxiliary_client._read_main_provider", return_value="kimi-coding"), \
+             patch("agent.auxiliary_client._read_main_model", return_value="kimi-k3"), \
+             patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            client, model, label = _try_main_agent_model_fallback(
+                "fallback_chain[0](kimi-coding)",
+                task="compression",
+                reason="payment error",
+            )
+
+        assert client is None and model is None and label == ""
+        mock_resolve.assert_not_called()
 
 
     def test_resolves_main_provider_client(self):

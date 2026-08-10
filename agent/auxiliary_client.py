@@ -5022,8 +5022,9 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
-    # Normalise the failed provider label for matching.
-    skip = failed_provider.lower().strip()
+    # Normalise labels minted by an earlier fallback attempt so a failed
+    # configured candidate is not rediscovered under its raw provider id.
+    skip = _fallback_provider_from_label(failed_provider).lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
     # (e.g. main_provider="openrouter" → skip "openrouter" in chain)
     main_provider = _read_main_provider()
@@ -5118,7 +5119,10 @@ def _try_main_agent_model_fallback(
     skip_model = (failed_model or "").strip().lower() or None
     if should_skip_candidate(
         BackendIdentity.build(provider=main_provider, model=main_model),
-        BackendIdentity.build(provider=failed_provider, model=skip_model),
+        BackendIdentity.build(
+            provider=_fallback_provider_from_label(failed_provider),
+            model=skip_model,
+        ),
         FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL,
     ):
         # The thing that failed IS the main model (or the failure was
@@ -5240,6 +5244,12 @@ def _try_configured_fallback_chain(
     entry in order.  Each entry must have at least ``provider``; ``model``,
     ``base_url``, and ``api_key`` are optional.
 
+    ``failed_provider`` may be either a provider id or a fallback label minted
+    by an earlier resolution attempt (for example
+    ``fallback_chain[0](kimi-coding)``).  Labels must be reduced back to their
+    provider identity before skip checks; otherwise a failed first fallback is
+    selected again instead of advancing through the chain.
+
     ``failed_model`` narrows the skip check to the exact (provider, model)
     pair that just failed, rather than the whole provider. Without it every
     entry sharing the failed provider is skipped (the original behaviour).
@@ -5283,7 +5293,8 @@ def _try_configured_fallback_chain(
     )
 
     failed_ident = BackendIdentity.build(
-        provider=failed_provider, model=skip_model,
+        provider=_fallback_provider_from_label(failed_provider),
+        model=skip_model,
     )
     failure_scope = (
         FailureScope.MODEL if skip_model else FailureScope.CREDENTIAL

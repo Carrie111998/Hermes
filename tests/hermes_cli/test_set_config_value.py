@@ -121,6 +121,32 @@ class TestConfigYamlRouting:
         assert "vercel_runtime: python3.13" in config
         assert "TERMINAL_VERCEL_RUNTIME=python3.13" in env_content
 
+    def test_auxiliary_fallback_chain_json_is_saved_as_yaml_list(
+        self, _isolated_hermes_home, capsys,
+    ):
+        set_config_value(
+            "auxiliary.compression.fallback_chain",
+            '[{"provider":"openai-codex","model":"gpt-5.6-luna"},'
+            '{"provider":"kimi-coding","model":"kimi-k3"}]',
+        )
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        chain = reloaded["auxiliary"]["compression"]["fallback_chain"]
+        assert chain == [
+            {"provider": "openai-codex", "model": "gpt-5.6-luna"},
+            {"provider": "kimi-coding", "model": "kimi-k3"},
+        ]
+        assert "not a recognized config key" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("value", ["not-json", "{}", '[{"model":"missing-provider"}]'])
+    def test_auxiliary_fallback_chain_rejects_invalid_shapes(
+        self, _isolated_hermes_home, value,
+    ):
+        with pytest.raises(SystemExit):
+            set_config_value("auxiliary.compression.fallback_chain", value)
+        assert not (_isolated_hermes_home / "config.yaml").exists()
+
 
 # ---------------------------------------------------------------------------
 # Empty / falsy values — regression tests for #4277
