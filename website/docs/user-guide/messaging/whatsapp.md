@@ -268,11 +268,14 @@ gateway:
 Named routes have the following safeguards:
 
 - They apply only to direct messages. Group messages always remain on Hermes's `default` queue,
-  even if a group ID appears in `chat_ids`.
-- A command matches the prefix exactly, or the prefix followed by a space or newline.
-  `/secondary-task` does not match the `/secondary` prefix.
-- Consumer IDs are lowercased and may contain letters, digits, `_`, and `-`; they must be 1–64
-  characters, cannot be `default`, and at most 16 valid routes are loaded.
+  even if a group ID appears in `chat_ids`. The direct chat JID must exactly match an entry in
+  `chat_ids`.
+- Prefix matching is case-insensitive and ignores leading whitespace. The command boundary must
+  be the end of the message, a space, or a newline, so `/secondary-task` does not match the
+  `/secondary` prefix.
+- Consumer IDs are lowercased, must start with a letter or digit, and may then contain letters,
+  digits, `_`, and `-`. They must be 1–64 characters, cannot be `default`, and at most 16 valid
+  routes are loaded.
 - Each queue holds at most 100 events and drops its oldest event when full. One inbound event is
   placed in exactly one queue.
 
