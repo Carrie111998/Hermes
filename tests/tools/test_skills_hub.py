@@ -880,6 +880,63 @@ class TestQuarantineBundleBinaryAssets:
 
         assert not absolute_target.exists()
 
+    def test_quarantine_bundle_rejects_ads_colon_file_paths(self, tmp_path):
+        """F-02: a bundle member with a colon in a component (``file.py:payload``)
+        is an NTFS Alternate Data Stream marker — the visible file passes
+        ``rglob``-based review while hidden, scanner-invisible bytes are written
+        into it. Reject it before it reaches disk, on any OS."""
+        import tools.skills_hub as hub
+
+        hub_dir = tmp_path / "skills" / ".hub"
+        with patch.object(hub, "SKILLS_DIR", tmp_path / "skills"), \
+             patch.object(hub, "HUB_DIR", hub_dir), \
+             patch.object(hub, "LOCK_FILE", hub_dir / "lock.json"), \
+             patch.object(hub, "QUARANTINE_DIR", hub_dir / "quarantine"), \
+             patch.object(hub, "AUDIT_LOG", hub_dir / "audit.log"), \
+             patch.object(hub, "TAPS_FILE", hub_dir / "taps.json"), \
+             patch.object(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache"):
+            bundle = SkillBundle(
+                name="demo",
+                files={
+                    "SKILL.md": "---\nname: demo\n---\n",
+                    "scripts/helper.py:payload": "print(24680)",
+                },
+                source="well-known",
+                identifier="well-known:https://example.com/.well-known/skills/demo",
+                trust_level="community",
+            )
+
+            with pytest.raises(ValueError, match="Unsafe bundle file path"):
+                quarantine_bundle(bundle)
+
+        assert not (tmp_path / "skills" / "scripts").exists()
+
+    def test_normalize_bundle_path_rejects_colon_anywhere(self):
+        """The colon guard covers the whole class, not just ``helper.py:payload``:
+        a colon in any component (leading drive letter, mid-path, or bare) is
+        rejected, while ordinary portable paths still normalize."""
+        from tools.skills_hub import _normalize_bundle_path
+
+        rejected = (
+            "scripts/helper.py:payload",   # trailing-component ADS marker
+            "scripts/a:b.py",              # mid-component colon
+            "a:b/scripts/helper.py",       # leading-component colon
+            "scripts/helper.py:",          # empty stream name
+            "C:",                          # bare Windows drive letter
+            "C:/Windows/System32",         # drive-qualified absolute-ish path
+        )
+        for bad in rejected:
+            with pytest.raises(ValueError, match="Unsafe bundle file path"):
+                _normalize_bundle_path(bad, field_name="bundle file path", allow_nested=True)
+
+        # Legitimate portable paths are unaffected.
+        assert _normalize_bundle_path(
+            "scripts/helper.py", field_name="bundle file path", allow_nested=True
+        ) == "scripts/helper.py"
+        assert _normalize_bundle_path(
+            "assets/data/sample.wav", field_name="bundle file path", allow_nested=True
+        ) == "assets/data/sample.wav"
+
 
 # ---------------------------------------------------------------------------
 # GitHubSource._download_directory — tree API + fallback (#2940)
@@ -1148,12 +1205,14 @@ class TestInstallPathSafety:
         )
 
         with patch.object(hub, "SKILLS_DIR", skills_dir), \
-             patch.object(hub, "QUARANTINE_DIR", quarantine_root):
+             patch.object(hub, "QUARANTINE_DIR", quarantine_root), \
+             patch("tools.skill_usage.record_installed") as record_installed:
             with pytest.raises(ValueError, match="symlink"):
                 hub.install_from_quarantine(
                     q_dir, "bad-skill", "", bundle, scan_result,
                 )
 
+        record_installed.assert_not_called()
         assert not (skills_dir / "bad-skill" / "leak.txt").exists()
         assert secret.read_text() == "data exfiltration payload\n"
 
@@ -1433,6 +1492,45 @@ class TestInstallPathSafety:
                 )
 
         assert (skills_dir / "notes").read_text() == "not a directory"
+
+    def test_install_from_quarantine_records_successful_install(self, tmp_path):
+        import tools.skills_hub as hub
+        from tools.skills_guard import ScanResult
+
+        skills_dir = tmp_path / "skills"
+        quarantine_root = skills_dir / ".hub" / "quarantine"
+        q_dir = quarantine_root / "pending"
+        q_dir.mkdir(parents=True)
+        skill_md = "---\nname: good-skill\n---\n\n# Good skill\n"
+        (q_dir / "SKILL.md").write_text(skill_md, encoding="utf-8")
+        bundle = hub.SkillBundle(
+            name="good-skill",
+            files={"SKILL.md": skill_md},
+            source="community",
+            identifier="good/source",
+            trust_level="community",
+        )
+        scan_result = ScanResult(
+            skill_name="good-skill",
+            source="community",
+            trust_level="community",
+            verdict="safe",
+        )
+
+        with patch.object(hub, "SKILLS_DIR", skills_dir), \
+             patch.object(hub, "QUARANTINE_DIR", quarantine_root), \
+             patch("tools.skill_usage.record_installed") as record_installed:
+            installed = hub.install_from_quarantine(
+                q_dir,
+                "good-skill",
+                "",
+                bundle,
+                scan_result,
+            )
+
+        assert installed == skills_dir / "good-skill"
+        assert installed.is_dir()
+        record_installed.assert_called_once_with("good-skill")
 
 
 # ---------------------------------------------------------------------------
