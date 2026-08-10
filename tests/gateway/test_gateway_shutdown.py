@@ -80,12 +80,17 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
     with (
         patch("gateway.status.remove_pid_file"),
         patch("gateway.status.write_runtime_status"),
+        patch(
+            "agent.auxiliary_client.close_cached_async_clients_for_loop",
+            new_callable=AsyncMock,
+        ) as close_cached_async_clients_for_loop,
         patch("agent.auxiliary_client.shutdown_cached_clients") as shutdown_cached_clients,
     ):
         await runner.stop()
 
     running_agent.interrupt.assert_called_once_with("Gateway shutting down")
     disconnect_mock.assert_awaited_once()
+    close_cached_async_clients_for_loop.assert_awaited_once()
     shutdown_cached_clients.assert_called_once()
     assert runner.adapters == {}
     assert runner._running_agents == {}

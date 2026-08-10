@@ -25,6 +25,7 @@ import json
 import re
 import asyncio
 import logging
+import sys
 import threading
 import time
 from typing import Dict, Any, List, Optional, Tuple
@@ -72,6 +73,18 @@ def _is_dispatcher_owned_worker() -> bool:
 _tool_loop = None          # persistent loop for the main (CLI) thread
 _tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
+
+
+def _drain_auxiliary_clients(loop) -> None:
+    """Physically close auxiliary transports while their owner loop still runs."""
+    module = sys.modules.get("agent.auxiliary_client")
+    if module is None:
+        return
+    try:
+        close_for_loop = module.close_cached_async_clients_for_loop
+        loop.run_until_complete(close_for_loop(loop))
+    except Exception:
+        logger.debug("Auxiliary client drain failed", exc_info=True)
 
 
 def _get_tool_loop():
@@ -155,6 +168,7 @@ def _run_async(coro):
                 asyncio.set_event_loop(worker_loop)
                 return worker_loop.run_until_complete(coro)
             finally:
+                _drain_auxiliary_clients(worker_loop)
                 try:
                     # Cancel anything still pending (e.g. task cancelled
                     # externally via call_soon_threadsafe on timeout).
