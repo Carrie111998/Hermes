@@ -1448,6 +1448,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         key = data.get("readReceiptKey")
         if not isinstance(key, dict):
             return
+        chat_id = data.get("chatId") or key.get("remoteJid") or ""
+        if not self._oversight_allows_outbound(str(chat_id)):
+            return
         try:
             import aiohttp
 
