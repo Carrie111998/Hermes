@@ -14,10 +14,21 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from .sanitize import sanitize_metadata, sanitize_value
+from .embedding.base import EmbeddingModelIdentity
+from .embedding.vectors import (
+    FLOAT32_LE_DTYPE,
+    cosine_similarity,
+    l2_normalize,
+    pack_float32_le,
+    unpack_float32_le,
+)
 
 logger = logging.getLogger("hermes.plugins.semantic_graph")
 
-SCHEMA_VERSION = 1
+DB_SCHEMA_VERSION = 2
+GRAPH_SCHEMA_VERSION = 1
+# Backwards-compatible alias retained for existing importers.
+SCHEMA_VERSION = DB_SCHEMA_VERSION
 
 DDL_CORE = """
 CREATE TABLE IF NOT EXISTS graph_runs (
@@ -211,6 +222,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS artifacts_fts USING fts5(
 );
 """
 
+MIGRATION_V2_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS node_embeddings (
+        node_id TEXT NOT NULL,
+        namespace TEXT NOT NULL,
+        provider TEXT NOT NULL,
+        model TEXT NOT NULL,
+        revision TEXT NOT NULL DEFAULT '',
+        serializer_version INTEGER NOT NULL CHECK(serializer_version > 0),
+        dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+        dtype TEXT NOT NULL DEFAULT 'float32-le' CHECK(dtype = 'float32-le'),
+        vector_blob BLOB NOT NULL CHECK(length(vector_blob) = dimensions * 4),
+        source_text_hash TEXT NOT NULL CHECK(length(source_text_hash) = 64),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(node_id, namespace),
+        FOREIGN KEY(node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_node_embeddings_namespace
+        ON node_embeddings(namespace)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_node_embeddings_source_hash
+        ON node_embeddings(namespace, source_text_hash)
+    """,
+)
+
+_NODE_EMBEDDING_COLUMNS = {
+    "node_id", "namespace", "provider", "model", "revision",
+    "serializer_version", "dimensions", "dtype", "vector_blob",
+    "source_text_hash", "created_at", "updated_at",
+}
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
@@ -289,21 +335,106 @@ class SemanticGraphStore:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+        if version > DB_SCHEMA_VERSION:
+            raise RuntimeError(
+                "semantic-graph database schema "
+                f"{version} is newer than supported schema {DB_SCHEMA_VERSION}"
+            )
+
         if version < 1:
-            conn.executescript(DDL_CORE)
-            try:
-                conn.executescript(DDL_FTS)
-                self.fts_enabled = True
-            except sqlite3.Error as exc:
-                logger.warning("semantic-graph: FTS5 unavailable, LIKE fallback: %s", exc)
-                self.fts_enabled = False
-            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        else:
-            # Detect whether FTS tables exist.
-            row = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
-            ).fetchone()
-            self.fts_enabled = row is not None
+            self._create_schema_v1(conn)
+            version = 1
+        if version < 2:
+            self._apply_migration(
+                conn,
+                target_version=2,
+                statements=MIGRATION_V2_STATEMENTS,
+            )
+
+        self._detect_fts(conn)
+
+    def _create_schema_v1(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(DDL_CORE)
+        try:
+            conn.executescript(DDL_FTS)
+        except sqlite3.Error as exc:
+            logger.warning("semantic-graph: FTS5 unavailable, LIKE fallback: %s", exc)
+        conn.execute("PRAGMA user_version = 1")
+
+    def _apply_migration(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        target_version: int,
+        statements: tuple[str, ...],
+    ) -> None:
+        if conn.in_transaction:
+            raise RuntimeError("schema migration must start outside an active transaction")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for statement in statements:
+                conn.execute(statement)
+            self._validate_node_embeddings_schema(conn)
+            conn.execute(f"PRAGMA user_version = {int(target_version)}")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+    def _validate_node_embeddings_schema(self, conn: sqlite3.Connection) -> None:
+        rows = conn.execute("PRAGMA table_info(node_embeddings)").fetchall()
+        actual = {str(row["name"]) for row in rows}
+        if actual != _NODE_EMBEDDING_COLUMNS:
+            missing = sorted(_NODE_EMBEDDING_COLUMNS - actual)
+            extra = sorted(actual - _NODE_EMBEDDING_COLUMNS)
+            raise RuntimeError(
+                "invalid node_embeddings schema: "
+                f"missing={missing}, extra={extra}"
+            )
+
+        primary_key = sorted(
+            (int(row["pk"]), str(row["name"]))
+            for row in rows
+            if int(row["pk"])
+        )
+        if primary_key != [(1, "node_id"), (2, "namespace")]:
+            raise RuntimeError(
+                "invalid node_embeddings schema: "
+                "must have PRIMARY KEY(node_id, namespace)"
+            )
+
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='node_embeddings'"
+        ).fetchone()
+        table_sql = str(sql_row["sql"] or "").lower() if sql_row else ""
+        required_constraints = (
+            "check(serializer_version > 0)",
+            "check(dimensions > 0)",
+            "check(dtype = 'float32-le')",
+            "check(length(vector_blob) = dimensions * 4)",
+            "check(length(source_text_hash) = 64)",
+        )
+        if any(constraint not in table_sql for constraint in required_constraints):
+            raise RuntimeError("invalid node_embeddings constraints")
+
+        fk_rows = conn.execute("PRAGMA foreign_key_list(node_embeddings)").fetchall()
+        has_node_fk = any(
+            str(row["table"]) == "nodes"
+            and str(row["from"]) == "node_id"
+            and str(row["to"]) == "node_id"
+            and str(row["on_delete"]).upper() == "CASCADE"
+            for row in fk_rows
+        )
+        if not has_node_fk:
+            raise RuntimeError(
+                "node_embeddings must reference nodes(node_id) with ON DELETE CASCADE"
+            )
+
+    def _detect_fts(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
+        ).fetchone()
+        self.fts_enabled = row is not None
 
     def get_status_counts(self) -> dict[str, Any]:
         self.ensure_ready()
@@ -311,8 +442,10 @@ class SemanticGraphStore:
             def _c(table: str) -> int:
                 return int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
 
+            db_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
             return {
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": db_version,
+                "graph_schema_version": GRAPH_SCHEMA_VERSION,
                 "fts_enabled": self.fts_enabled,
                 "runs": _c("graph_runs"),
                 "nodes": _c("nodes"),
@@ -361,7 +494,7 @@ class SemanticGraphStore:
                     turn_id,
                     model,
                     platform,
-                    SCHEMA_VERSION,
+                    GRAPH_SCHEMA_VERSION,
                     now,
                     _dumps(metadata or {}),
                 ),
@@ -455,7 +588,7 @@ class SemanticGraphStore:
         node["metadata"] = sanitize_metadata(node.get("metadata") or {})
         node_id = node["node_id"]
         now = _utcnow()
-        with self._connect() as conn:
+        with self.transaction() as conn:
             existing = conn.execute(
                 "SELECT * FROM nodes WHERE node_id = ?", (node_id,)
             ).fetchone()
@@ -491,16 +624,38 @@ class SemanticGraphStore:
                     new_status = old_status
                 if old_status in {"rejected", "superseded"} and new_status not in {"rejected", "superseded"}:
                     new_status = old_status
+
+                next_node_type = node.get("node_type", existing["node_type"])
+                next_subtype = node.get("subtype", existing["subtype"])
+                next_label = node.get("label", existing["label"])
+                next_normalized_label = node.get(
+                    "normalized_label", existing["normalized_label"]
+                )
+                next_identity_key = node.get("identity_key", existing["identity_key"])
+                semantic_changed = (
+                    str(existing["node_type"]),
+                    str(existing["subtype"]),
+                    str(existing["label"]),
+                    str(existing["summary"]),
+                    str(existing["identity_key"]),
+                ) != (
+                    str(next_node_type),
+                    str(next_subtype),
+                    str(next_label),
+                    str(summary),
+                    str(next_identity_key),
+                )
                 conn.execute(
-                    "UPDATE nodes SET subtype=?, label=?, normalized_label=?, summary=?, "
+                    "UPDATE nodes SET node_type=?, subtype=?, label=?, normalized_label=?, summary=?, "
                     "identity_key=?, status=?, authority=?, confidence=?, salience=?, "
                     "metadata_json=?, updated_at=? WHERE node_id=?",
                     (
-                        node.get("subtype", existing["subtype"]),
-                        node.get("label", existing["label"]),
-                        node.get("normalized_label", existing["normalized_label"]),
+                        next_node_type,
+                        next_subtype,
+                        next_label,
+                        next_normalized_label,
                         summary,
-                        node.get("identity_key", existing["identity_key"]),
+                        next_identity_key,
                         new_status,
                         new_authority,
                         conf,
@@ -514,7 +669,12 @@ class SemanticGraphStore:
                     conn.execute("DELETE FROM nodes_fts WHERE node_id = ?", (node_id,))
                     conn.execute(
                         "INSERT INTO nodes_fts(node_id, label, summary) VALUES (?,?,?)",
-                        (node_id, node.get("label", existing["label"]), summary),
+                        (node_id, next_label, summary),
+                    )
+                if semantic_changed:
+                    conn.execute(
+                        "DELETE FROM node_embeddings WHERE node_id = ?",
+                        (node_id,),
                     )
                 return {"node_id": node_id, "updated": True}
             conn.execute(
@@ -742,6 +902,103 @@ class SemanticGraphStore:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM nodes WHERE node_id=?", (node_id,)).fetchone()
             return dict(row) if row else None
+
+    def upsert_node_embedding(
+        self,
+        *,
+        node_id: str,
+        identity: EmbeddingModelIdentity,
+        vector: Any,
+        source_text_hash: str,
+    ) -> dict[str, Any]:
+        self.ensure_ready()
+        if not re.fullmatch(r"[0-9a-f]{64}", source_text_hash):
+            raise ValueError("source_text_hash must be a lowercase SHA-256 hex digest")
+        blob = pack_float32_le(vector, expected_dimensions=identity.dimensions)
+        now = _utcnow()
+        with self.transaction() as conn:
+            if conn.execute("SELECT 1 FROM nodes WHERE node_id=?", (node_id,)).fetchone() is None:
+                raise KeyError(f"unknown node_id: {node_id}")
+            conn.execute(
+                """
+                INSERT INTO node_embeddings(
+                    node_id, namespace, provider, model, revision,
+                    serializer_version, dimensions, dtype, vector_blob,
+                    source_text_hash, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(node_id, namespace) DO UPDATE SET
+                    provider=excluded.provider, model=excluded.model,
+                    revision=excluded.revision, serializer_version=excluded.serializer_version,
+                    dimensions=excluded.dimensions, dtype=excluded.dtype,
+                    vector_blob=excluded.vector_blob, source_text_hash=excluded.source_text_hash,
+                    updated_at=excluded.updated_at
+                """,
+                (node_id, identity.namespace, identity.provider, identity.model, identity.revision,
+                 identity.serializer_version, identity.dimensions, FLOAT32_LE_DTYPE, blob,
+                 source_text_hash, now, now),
+            )
+        return {"node_id": node_id, "namespace": identity.namespace,
+                "dimensions": identity.dimensions, "source_text_hash": source_text_hash}
+
+    def get_node_embedding(
+        self, *, node_id: str, namespace: str,
+        expected_source_text_hash: str | None = None,
+    ) -> Optional[dict[str, Any]]:
+        self.ensure_ready()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM node_embeddings WHERE node_id=? AND namespace=?",
+                (node_id, namespace),
+            ).fetchone()
+        if row is None or (expected_source_text_hash is not None
+                           and row["source_text_hash"] != expected_source_text_hash):
+            return None
+        result = dict(row)
+        result["vector"] = unpack_float32_le(
+            result.pop("vector_blob"), dimensions=int(result["dimensions"])
+        )
+        return result
+
+    def search_node_embeddings_exact(
+        self, *, namespace: str, query_vector: Any, top_k: int,
+        min_similarity: float = -1.0, node_ids: Any = None,
+        expected_source_hashes: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        self.ensure_ready()
+        if top_k <= 0:
+            return []
+        if not -1.0 <= min_similarity <= 1.0:
+            raise ValueError("min_similarity must be between -1 and 1")
+        query = l2_normalize(query_vector)
+        clauses = ["namespace = ?"]
+        params: list[Any] = [namespace]
+        if node_ids is not None:
+            ids = sorted(set(node_ids))
+            if not ids:
+                return []
+            clauses.append("node_id IN (" + ",".join("?" for _ in ids) + ")")
+            params.extend(ids)
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT node_id, namespace, dimensions, vector_blob, source_text_hash "
+                "FROM node_embeddings WHERE " + " AND ".join(clauses) + " ORDER BY node_id",
+                params,
+            ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            dimensions = int(row["dimensions"])
+            if dimensions != len(query):
+                continue
+            expected = expected_source_hashes.get(row["node_id"]) if expected_source_hashes else None
+            if expected is not None and row["source_text_hash"] != expected:
+                continue
+            vector = unpack_float32_le(row["vector_blob"], dimensions=dimensions)
+            score = cosine_similarity(query, vector)
+            if score >= min_similarity:
+                results.append({"node_id": row["node_id"], "namespace": row["namespace"],
+                                "similarity": score, "source_text_hash": row["source_text_hash"]})
+        results.sort(key=lambda item: (-float(item["similarity"]), str(item["node_id"])))
+        return results[:top_k]
 
     def get_edge(self, edge_id: str) -> Optional[dict[str, Any]]:
         self.ensure_ready()
