@@ -651,13 +651,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Gemini/MaaS ids use the publisher prefix Vertex's openapi endpoint
     # expects (see hermes_cli/model_setup_flows.py); Claude ids are bare
     # because they route through the AnthropicVertex SDK (rawPredict).
+    # Exactly one model per Claude family: resolve_alias() raises
+    # AmbiguousAliasError rather than guessing, so listing two opus
+    # generations here would break the bare `/model opus` shorthand.
     # Gemini entries validated live against a GCP project (global region,
     # HTTP 200) as of 2026-07-21 (PR #68767).
     "vertex": [
         "claude-opus-5",
         "claude-fable-5",
         "claude-sonnet-5",
-        "claude-opus-4-8",
         "google/gemini-3.1-pro-preview",
         "google/gemini-3-pro-preview",
         "google/gemini-3.6-flash",

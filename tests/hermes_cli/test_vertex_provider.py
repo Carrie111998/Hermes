@@ -245,12 +245,10 @@ def test_vertex_normalization_agrees_with_anthropic_detection():
         assert is_anthropic_vertex_model(normalized)
 
 
-@pytest.mark.parametrize("short_alias", ["sonnet", "fable", "opus", "claude"])
+@pytest.mark.parametrize("short_alias", ["sonnet", "fable", "opus"])
 def test_short_claude_aliases_resolve_on_vertex(short_alias):
-    """Short Claude aliases for models actually in Vertex's curated catalog
-    (_PROVIDER_MODELS["vertex"]: claude-fable-5, claude-opus-4-8,
-    claude-sonnet-5) must resolve to a bare, is_anthropic_vertex_model-
-    recognized ID.
+    """Family-specific Claude aliases must resolve to a bare,
+    is_anthropic_vertex_model-recognized ID on vertex.
 
     A missing MODEL_ALIASES entry (e.g. "fable" was absent) makes
     resolve_alias() return None, so switch_model() falls through and passes
@@ -258,6 +256,13 @@ def test_short_claude_aliases_resolve_on_vertex(short_alias):
     /openapi endpoint then 400s with "Malformed publisher model (model:
     'fable')" because the bare short name was never routed through the
     AnthropicVertex SDK path in the first place.
+
+    Invariant: each alias here names exactly ONE family in the curated
+    vertex catalog, so resolution must be unambiguous. Listing two
+    generations of the same family (e.g. opus-5 and opus-4-8) would make
+    resolve_alias raise AmbiguousAliasError instead — see
+    test_bare_claude_alias_is_ambiguous_on_vertex for the deliberate
+    multi-family case.
 
     Note: "haiku" is deliberately excluded — Vertex's curated catalog
     doesn't currently list a haiku model, so that alias legitimately
@@ -271,3 +276,23 @@ def test_short_claude_aliases_resolve_on_vertex(short_alias):
     provider, resolved_model, _alias_name = result
     assert provider == "vertex"
     assert is_anthropic_vertex_model(resolved_model)
+
+
+def test_bare_claude_alias_is_ambiguous_on_vertex():
+    """The bare "claude" alias spans every Claude family in the curated
+    vertex catalog, so it must raise rather than silently pick one.
+
+    resolve_alias() deliberately refuses to guess among multiple matches:
+    version-sort heuristics have repeatedly landed on the wrong model
+    (dated snapshots outranking point releases, suffix tiebreaks picking
+    the cheapest tier). Asserting the raise pins that contract so a future
+    catalog edit can't reintroduce silent selection.
+    """
+    from hermes_cli.model_switch import AmbiguousAliasError, resolve_alias
+
+    with pytest.raises(AmbiguousAliasError) as exc:
+        resolve_alias("claude", "vertex")
+
+    # Every candidate offered to the user must be a real Claude id.
+    assert all("claude" in m.lower() for m in exc.value.candidates)
+    assert len(exc.value.candidates) > 1
