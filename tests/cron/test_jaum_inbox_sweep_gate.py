@@ -176,8 +176,23 @@ class TestMissingDirectories:
                           now=time.time()).wake is False
 
 
+@pytest.fixture
+def sweeps(tmp_path, mod, monkeypatch):
+    """Redirect the retention prune away from the real sweeps directory.
+
+    ``mod.main()`` prunes on every call. Without this the suite would delete
+    the operator's actual sweep summaries.
+    """
+    directory = tmp_path / "workspace" / "sweeps"
+    directory.mkdir(parents=True)
+    monkeypatch.setattr(mod, "SWEEPS_DIR", directory)
+    return directory
+
+
 class TestStdoutContract:
-    def test_sleep_prints_wake_false_as_last_line(self, mod, boxes, capsys, monkeypatch):
+    def test_sleep_prints_wake_false_as_last_line(
+        self, mod, boxes, sweeps, capsys, monkeypatch
+    ):
         main, cv = boxes
         monkeypatch.setattr(mod, "MAIN_INBOX", main)
         monkeypatch.setattr(mod, "CV_INBOX", cv)
@@ -186,7 +201,9 @@ class TestStdoutContract:
         last = [ln for ln in capsys.readouterr().out.splitlines() if ln.strip()][-1]
         assert json.loads(last) == {"wakeAgent": False}
 
-    def test_wake_prints_wake_true_and_a_reason(self, mod, boxes, capsys, monkeypatch):
+    def test_wake_prints_wake_true_and_a_reason(
+        self, mod, boxes, sweeps, capsys, monkeypatch
+    ):
         main, cv = boxes
         _touch(main, "20260810T00_MYSTERY_zz.json", 1)
         monkeypatch.setattr(mod, "MAIN_INBOX", main)
@@ -198,3 +215,70 @@ class TestStdoutContract:
         assert json.loads(lines[-1]) == {"wakeAgent": True}
         # The agent should be told why it was woken.
         assert "candidate" in out.lower()
+
+    def test_prune_never_pollutes_the_wake_line(
+        self, mod, boxes, sweeps, capsys, monkeypatch
+    ):
+        """Prune diagnostics go to stderr; stdout stays a clean contract."""
+        main, cv = boxes
+        _touch(sweeps, "20260401T00_main_inbox_sweep.md", 30 * 24)
+        monkeypatch.setattr(mod, "MAIN_INBOX", main)
+        monkeypatch.setattr(mod, "CV_INBOX", cv)
+
+        assert mod.main() == 0
+        captured = capsys.readouterr()
+        assert json.loads(captured.out.strip()) == {"wakeAgent": False}
+        assert "pruned 1 sweep summary file(s)" in captured.err
+
+
+class TestSweepSummaryRetention:
+    def _prune(self, mod, directory):
+        return mod.prune_sweep_summaries(directory=directory, now=time.time())
+
+    def test_summary_past_retention_is_deleted(self, mod, sweeps):
+        stale = _touch(sweeps, "20260401T00_main_inbox_sweep.md", 8 * 24)
+        assert self._prune(mod, sweeps) == 1
+        assert not stale.exists()
+
+    def test_summary_inside_retention_is_kept(self, mod, sweeps):
+        fresh = _touch(sweeps, "20260810T00_main_inbox_sweep.md", 6 * 24)
+        assert self._prune(mod, sweeps) == 0
+        assert fresh.exists()
+
+    @pytest.mark.parametrize("name", sorted({
+        "README.md",
+        "main_inbox_sweep.py",
+        "_main_inbox_sweeper_helper.py",
+        "_main_inbox_sweep_plan.py",
+        "_main_inbox_sweep_plan.json",
+        "20260415T061917Z_manual_backlog_flush.json",
+    }))
+    def test_protected_entries_survive_regardless_of_age(self, mod, sweeps, name):
+        """Helper code and the provenance marker are not summaries."""
+        kept = _touch(sweeps, name, 400 * 24)
+        assert self._prune(mod, sweeps) == 0
+        assert kept.exists()
+
+    def test_subdirectories_are_never_touched(self, mod, sweeps):
+        """No recursion — __pycache__ and friends are out of scope."""
+        cache = sweeps / "__pycache__"
+        cache.mkdir()
+        nested = _touch(cache, "helper.cpython-311.pyc", 400 * 24)
+
+        assert self._prune(mod, sweeps) == 0
+        assert cache.is_dir()
+        assert nested.exists()
+
+    def test_missing_directory_is_a_no_op(self, mod, tmp_path):
+        assert mod.prune_sweep_summaries(
+            directory=tmp_path / "gone", now=time.time()
+        ) == 0
+
+    def test_prune_does_not_disturb_the_wake_decision(self, mod, boxes, sweeps):
+        """Retention and the wake decision are independent concerns."""
+        main, cv = boxes
+        _touch(sweeps, "20260401T00_main_inbox_sweep.md", 400 * 24)
+        _touch(main, "20260810T00_MYSTERY_zz.json", 1)
+
+        assert self._prune(mod, sweeps) == 1
+        assert _decide(mod, main, cv).wake is True
