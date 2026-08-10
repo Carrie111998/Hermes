@@ -27,30 +27,46 @@ def _read(path: Path) -> str:
 
 
 def check_hermes_one_block(repo: Path) -> None:
-    path = repo / "hermes_cli" / "web_server.py"
-    text = _read(path)
-    if not text:
+    """D-004: logic in hermes_one_model_library.py; thin mount in web_server.py."""
+    mod = repo / "hermes_cli" / "hermes_one_model_library.py"
+    ws = repo / "hermes_cli" / "web_server.py"
+    mod_text = _read(mod)
+    ws_text = _read(ws)
+    if not mod_text or not ws_text:
         return
 
-    markers = [
+    mod_markers = [
         "HERMES_ONE_MODEL_LIBRARY_COMPAT_V1",
         "def _hermes_one_model_library_path",
         "def _hermes_one_read_model_library",
+        'def mount_hermes_one_model_library',
         '@app.get("/api/model/library")',
         '@app.post("/api/model/library")',
         '@app.patch("/api/model/library/{model_id:path}")',
         '@app.delete("/api/model/library/{model_id:path}")',
-        "get_hermes_home() / \"models.json\"",
+        'get_hermes_home() / "models.json"',
     ]
-    missing = [m for m in markers if m not in text]
-    if missing:
+    ws_markers = [
+        "HERMES_ONE_MODEL_LIBRARY_COMPAT_V1",
+        "mount_hermes_one_model_library(app)",
+        "from hermes_cli.hermes_one_model_library import mount_hermes_one_model_library",
+    ]
+
+    missing_mod = [m for m in mod_markers if m not in mod_text]
+    missing_ws = [m for m in ws_markers if m not in ws_text]
+    if missing_mod or missing_ws:
+        bits = []
+        if missing_mod:
+            bits.append(f"module missing {missing_mod[:3]}")
+        if missing_ws:
+            bits.append(f"web_server missing {missing_ws}")
+        _record("hermes_one_web_server", "fail", "; ".join(bits))
+    else:
         _record(
             "hermes_one_web_server",
-            "fail",
-            f"{path}: missing {len(missing)} marker(s): {missing[:3]}{'...' if len(missing) > 3 else ''}",
+            "pass",
+            f"{mod.name}+{ws.name}: module + mount intact ({len(mod_markers)}+{len(ws_markers)} markers)",
         )
-    else:
-        _record("hermes_one_web_server", "pass", f"{path}: all {len(markers)} markers present")
 
 
 def check_openrouter_prune(repo: Path) -> None:
@@ -76,7 +92,12 @@ def check_openrouter_prune(repo: Path) -> None:
 
 
 def check_files_exist(repo: Path) -> None:
-    for rel in ("hermes_cli/web_server.py", "agent/credential_pool.py", "AGENTS.md"):
+    for rel in (
+        "hermes_cli/web_server.py",
+        "hermes_cli/hermes_one_model_library.py",
+        "agent/credential_pool.py",
+        "AGENTS.md",
+    ):
         path = repo / rel
         if path.is_file():
             _record(f"exists:{rel}", "pass", str(path))

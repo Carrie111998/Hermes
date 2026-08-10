@@ -156,6 +156,17 @@ Commits syncados: `#83143` fmt, `#83138` titlebar tahoe, `#83139` fmt, fullscree
 
 **Próximo passo:** revalidar cron `avaliacao-agente-dande` ou D-004 pluginizar patches
 
+### 2026-08-10 — Cron revalidado + D-004 extração
+
+| Passo | Resultado |
+|---|---|
+| `hermes cron run 619f7053817f` | **OK** — succeeded (~8.8 min); `last_status=ok`, `last_error=null` |
+| tool_delay | Confirmado stale — código atual aceita/ignora; gateway com build novo |
+| Extrair model library | OK — `hermes_cli/hermes_one_model_library.py` |
+| Mount fino em web_server | OK — ~5 linhas |
+| patch-guard atualizado | OK |
+| OpenRouter prune | mantido inline (candidato PR upstream) |
+
 ### 2026-08-10 — Fim de sessão / handoff
 
 Handoff em `registros/RETOMADA_SESSAO.md`.

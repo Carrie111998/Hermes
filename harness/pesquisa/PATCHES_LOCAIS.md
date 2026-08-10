@@ -1,14 +1,16 @@
 # Patches Locais — Hermes One vs Upstream
 
-**Classificação:** Confirmada (git diff + leitura de código, 2026-08-10)
+**Classificação:** Confirmada (git diff + leitura de código, 2026-08-10)  
+**D-004 (2026-08-10):** model library **extraída** para `hermes_cli/hermes_one_model_library.py`; `web_server.py` só monta. OpenRouter prune permanece inline (candidato a PR upstream).
 
-Estes patches existem no checkout local e **não estão no upstream** NousResearch. Risco alto em merges de `main`.
+Estes patches existem no checkout local e **não estão no upstream** NousResearch. Risco em merges de `main` — reduzido após extração.
 
 ---
 
 ## 1. HERMES_ONE_MODEL_LIBRARY_COMPAT_V1
 
-**Arquivo:** `hermes_cli/web_server.py` (~linhas 19942–20103)
+**Módulo:** `hermes_cli/hermes_one_model_library.py`  
+**Mount:** `hermes_cli/web_server.py` (~3 linhas: import + `mount_hermes_one_model_library(app)`)
 
 **Propósito:** Endpoints REST para biblioteca de modelos remotos — consumidor **Hermes One externo** ou SSH remote picker. O `apps/desktop` upstream usa `/api/model/options` e `/api/model/set` (**não** consome `/api/model/library`).
 
@@ -21,57 +23,43 @@ Estes patches existem no checkout local e **não estão no upstream** NousResear
 
 **Persistência:** `%LOCALAPPDATA%\hermes\models.json` (HERMES_HOME-aware via `get_hermes_home()`)
 
-**Design intencional:**
+**Por que não `/api/plugins/...`:** clientes Hermes One hard-codam `/api/model/library`. Plugin dashboard monta sob `/api/plugins/<name>/` e quebraria o contrato. Extração modular + mount fino é o passo seguro; plugin completo exigiria hook de prefixo custom no core.
 
-- Atalhos ficam no host remoto (SSH), não no desktop
-- Não altera semântica upstream de `/api/model/set` e `/api/model/options`
-- Escrita atômica via `.tmp` + `replace()`
-
-**Autenticação:** `/api/model/library` **não** está em `PUBLIC_API_PATHS` — requer `X-Hermes-Session-Token` ou `Authorization: Bearer` (ver `hermes_cli/dashboard_auth/public_paths.py` + middleware em `web_server.py`).
-
-**Backups locais:** `hermes_cli/web_server.py.orig` (untracked)
+**Autenticação:** `/api/model/library` **não** está em `PUBLIC_API_PATHS` — requer session token.
 
 ---
 
 ## 2. OpenRouter credential pool prune
 
-**Arquivo:** `agent/credential_pool.py` (~linhas 2589–2597)
+**Arquivo:** `agent/credential_pool.py`
 
-**Propósito:** Quando `OPENROUTER_API_KEY` está ausente em `.env`/env, remove entries do pool com `source=env:OPENROUTER_API_KEY`.
+**Propósito:** Quando `OPENROUTER_API_KEY` está ausente, remove entries do pool com `source=env:OPENROUTER_API_KEY` (evita zumbi — INCIDENTE-AUTH-JSON-REWRITE).
 
-**Motivação (comentário no código):**
-
-> Sem isso, entry zumbi fica pra sempre (re-seed não acontece mas a entry antiga não some). Ver INCIDENTE-AUTH-JSON-REWRITE.
-
-**Backups locais:** `agent/credential_pool.py.bak.patch-20260729_120216` (untracked)
+**Status D-004:** permanece patch local; candidato forte a **PR upstream** (bug fix genérico, sem Hermes One).
 
 ---
 
 ## 3. package-lock.json drift
 
-**Arquivo:** `package-lock.json` (~24 linhas)
-
-**Classificação:** Side-effect de `npm install` local — provavelmente não intencional como patch.
-
-**Ação recomendada:** Reverter ou regenerar após merge limpo.
+Side-effect de `npm install` local — **não** é patch. Reverter se aparecer dirty.
 
 ---
 
-## Estratégias futuras (D-004 pendente)
+## Estratégias D-004
 
-| Opção | Prós | Contras |
-|---|---|---|
-| **Manter patches manuais** | Rápido, zero refactor | Conflito a cada merge |
-| **Extrair para plugin** | Alinhado AGENTS.md, mergeável | Esforço; web_server pode precisar hook genérico |
-| **PR upstream** | Mantém fork limpo | Model library pode ser escopo Hermes One only; prune OpenRouter pode ser aceito |
+| Etapa | Status |
+|---|---|
+| Manter patches manuais | ✅ baseline |
+| Extrair model library para módulo + mount fino | ✅ feito 2026-08-10 |
+| Plugin `/api/plugins/...` | ❌ bloqueado por contrato Hermes One |
+| Hook core `register_api_mount(prefix=...)` | pendente (se quiser plugin puro) |
+| PR upstream OpenRouter prune | pendente |
 
 ---
 
 ## Checklist pós-merge
 
-- [ ] Grep `HERMES_ONE` — bloco intacto?
-- [ ] Grep `INCIDENTE-AUTH-JSON-REWRITE` / prune OpenRouter intacto?
-- [ ] `scripts/run_tests.sh tests/agent/` (diretório — **sem glob**; ver `run_tests_parallel.py`)
-- [ ] Smoke GET/POST `/api/model/library` com `hermes serve` + token de sessão (ver Fluxo 3)
-- [ ] Cliente Hermes One / SSH picker lê shortcuts (se aplicável — **não** validar via `apps/desktop` upstream)
-- [ ] Smoke manual até existir teste HTTP automatizado do bloco `HERMES_ONE_*`
+- [ ] `python harness/scripts/hermes_patch_guard.py` → ok
+- [ ] Grep `HERMES_ONE` em `hermes_one_model_library.py` + mount em `web_server.py`
+- [ ] Grep `INCIDENTE-AUTH-JSON-REWRITE` em `credential_pool.py`
+- [ ] Smoke GET/POST `/api/model/library` com `hermes serve` + token

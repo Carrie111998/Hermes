@@ -10,6 +10,7 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 | D-002 | 2026-08-10 | Documentação inicial nível **completo** (pesquisa + planos + registros) | Mapeamento harness-architect |
 | D-003 | 2026-08-10 | Objetivo: operação **Hermes One** local; upstream só patch genérico | Usuário: ok |
 | D-004 | 2026-08-10 | Patches: **manter manuais**; pluginização follow-up | Usuário: ok |
+| D-004b | 2026-08-10 | Model library extraída p/ `hermes_one_model_library.py` + mount fino; plugin `/api/plugins` inviável (contrato Hermes One) | Esta sessão |
 | D-005 | 2026-08-10 | Superfície prioritária: **Desktop** + **gateway** (Telegram) | Usuário: ok |
 | D-006 | 2026-08-10 | Ambiente: **Windows nativo** + testes via Git Bash/MinGit | Usuário: ok |
 | D-008 | 2026-08-10 | Revisão code-reviewer: plano aprovado com ressalvas; docs corrigidos | Agent abad2f36 |
@@ -38,7 +39,7 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 
 ## Próximo passo
 
-1. Revalidar job `avaliacao-agente-dande` (erro stale `tool_delay`)
-2. Pluginizar patches Hermes One (D-004 follow-up)
+1. (Opcional) PR upstream do OpenRouter prune
+2. (Opcional) Hook core `register_api_mount(prefix=...)` se quiser plugin puro Hermes One
 
-~~Sync origin/main~~ ✅ `667c85c773` · ~~SQLite 3.53.1~~ ✅ · ~~shim hermes.cmd~~ ✅ · provider **minimax-oauth / MiniMax-M3** · config **v34**
+~~avaliacao-agente-dande~~ ✅ revalidado (`last_status: ok`, sem `tool_delay`) · ~~D-004 extração modular~~ ✅ · sync origin/main ✅ · MiniMax ✅ · SQLite 3.53.1 ✅

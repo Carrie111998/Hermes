@@ -49,7 +49,7 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 | relatorio-repos-18h | MiniMax-M3 | ok |
 | inbox-listar-dande | MiniMax-M3 | pausado |
 | cliente-perfil-dande | MiniMax-M3 | ok |
-| avaliacao-agente-dande | MiniMax-M3 | last_error stale `tool_delay` |
+| avaliacao-agente-dande | MiniMax-M3 | ✅ revalidado 12:06 (`ok`) |
 | v1-inbox-snapshot-30min | gpt-5.5 | ok |
 | cerebro-faxina | gpt-5.5 | ok |
 
@@ -59,10 +59,10 @@ CLI no PATH (`hermes`) já aponta para `venv\Scripts\hermes.exe`. Fallback:
 
 | # | Item | Prioridade |
 |---|---|---|
-| 1 | Revalidar `avaliacao-agente-dande` (stale `tool_delay`) | Baixa |
-| 2 | Evitar doctor/gateway via `.venv` (SQLite 3.50.4) | Baixa |
-| 3 | Fix/revalidar `avaliacao-agente-dande` | Baixa |
-| 4 | Pluginizar patches Hermes One (D-004) | Baixa |
+| 1 | (Opcional) PR upstream OpenRouter prune | Baixa |
+| 2 | (Opcional) hook `register_api_mount` p/ plugin puro | Baixa |
+| 3 | ~~Fix avaliacao-agente-dande~~ ✅ | — |
+| 4 | ~~D-004 extração modular~~ ✅ | — |
 
 ---
 
