@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { UsageAccountsContract } from '@/types/hermes'
 
-import { AccountLimitsView, useUsageAccounts } from './account-limits'
+import { AccountLimitsView, orderUsageProviders, useUsageAccounts } from './account-limits'
 
 function makeContract(overrides?: Partial<UsageAccountsContract>): UsageAccountsContract {
   return {
@@ -232,5 +232,140 @@ describe('useUsageAccounts', () => {
     render(<Harness requestGateway={requestGateway as never} />)
 
     await waitFor(() => expect(screen.getByTestId('state').textContent).toBe('unsupported'))
+  })
+})
+
+describe('orderUsageProviders', () => {
+  function provider(name: string, capability: 'supported' | 'unsupported', quotaStatus?: string) {
+    return {
+      accounts: [
+        {
+          account_id: `acct_${name}`,
+          health: { auth_type: 'api_key', status: 'ready' as const },
+          quota: { status: (quotaStatus ?? 'unsupported') as never, windows: [] },
+          routing: { priority: 0, request_count: 0 }
+        }
+      ],
+      provider: name,
+      routing: { cooldown: 0, error: 0, expired: 0, ready: 1, unavailable: 0 },
+      usage_capability: capability
+    }
+  }
+
+  it('orders current session provider first, then real quota, then attention, then unsupported', () => {
+    const providers = [
+      provider('copilot', 'unsupported'),
+      provider('openai-codex', 'supported', 'error'),
+      provider('kimi-coding', 'supported', 'available'),
+      provider('openrouter', 'supported', 'available'),
+      provider('deepseek', 'unsupported')
+    ]
+
+    const { pinned, unsupported } = orderUsageProviders(providers, 'openrouter')
+
+    expect(pinned.map(p => p.provider)).toEqual(['openrouter', 'kimi-coding', 'openai-codex'])
+    expect(unsupported.map(p => p.provider)).toEqual(['copilot', 'deepseek'])
+  })
+
+  it('keeps input order within a group and works without a current provider', () => {
+    const providers = [
+      provider('b-no-quota', 'supported', 'error'),
+      provider('a-available', 'supported', 'available'),
+      provider('c-available', 'supported', 'available')
+    ]
+
+    const { pinned, unsupported } = orderUsageProviders(providers, null)
+
+    expect(pinned.map(p => p.provider)).toEqual(['a-available', 'c-available', 'b-no-quota'])
+    expect(unsupported).toEqual([])
+  })
+})
+
+describe('AccountLimitsView usage-ordered layout', () => {
+  function orderedContract(): UsageAccountsContract {
+    const base = makeContract()
+    base.local = { provider: 'kimi-coding', status: 'available' }
+    base.providers = [
+      {
+        accounts: [
+          {
+            account_id: 'acct_cop1',
+            health: { auth_type: 'api_key', status: 'ready' },
+            quota: { status: 'unsupported', windows: [] },
+            routing: { priority: 0, request_count: 0 }
+          }
+        ],
+        provider: 'copilot',
+        routing: { cooldown: 0, error: 0, expired: 0, ready: 1, unavailable: 0 },
+        usage_capability: 'unsupported'
+      },
+      {
+        accounts: [
+          {
+            account_id: 'acct_kimi1',
+            display_name: 'Kimi 1',
+            health: { auth_type: 'api_key', status: 'ready' },
+            quota: {
+              fetched_at: '2026-08-10T04:00:00Z',
+              source: 'provider_reported',
+              status: 'available',
+              windows: [{ label: 'Weekly', used_percent: 25 }]
+            },
+            routing: { priority: 0, request_count: 1 }
+          }
+        ],
+        provider: 'kimi-coding',
+        routing: { cooldown: 0, error: 0, expired: 0, ready: 1, unavailable: 0 },
+        usage_capability: 'supported'
+      },
+      {
+        accounts: [
+          {
+            account_id: 'acct_ds1',
+            health: { auth_type: 'api_key', status: 'ready' },
+            quota: { status: 'unsupported', windows: [] },
+            routing: { priority: 0, request_count: 0 }
+          }
+        ],
+        provider: 'deepseek',
+        routing: { cooldown: 0, error: 0, expired: 0, ready: 1, unavailable: 0 },
+        usage_capability: 'unsupported'
+      }
+    ]
+    return base
+  }
+
+  it('pins the current session provider with a badge and merges unsupported providers into a collapsed group', () => {
+    const { container } = render(<AccountLimitsView contract={orderedContract()} />)
+
+    const kimi = screen.getByText('kimi-coding')
+    expect(kimi.parentElement?.textContent).toContain('Current')
+
+    // Unsupported providers are hidden behind a collapsed disclosure.
+    expect(screen.queryByText('copilot')).toBeNull()
+    expect(screen.queryByText('deepseek')).toBeNull()
+
+    const disclosure = screen.getByRole('button', { name: /Other providers \(2\)/ })
+    expect(disclosure.getAttribute('aria-expanded')).toBe('false')
+    expect(disclosure.textContent).toContain('2/2')
+
+    fireEvent.click(disclosure)
+    expect(disclosure.getAttribute('aria-expanded')).toBe('true')
+    expect(screen.getByText('copilot')).toBeTruthy()
+    expect(screen.getByText('deepseek')).toBeTruthy()
+
+    // The repeated per-provider "does not report usage" line appears only once,
+    // on the group header — not once per provider.
+    const notes = container.querySelectorAll('[data-slot="unsupported-note"]')
+    expect(notes).toHaveLength(1)
+  })
+
+  it('renders a health icon next to each account status', () => {
+    const { container } = render(<AccountLimitsView contract={orderedContract()} />)
+
+    const badge = container.querySelector('[data-slot="health-badge"]')
+    expect(badge).toBeTruthy()
+    expect(badge?.querySelector('svg')).toBeTruthy()
+    expect(badge?.textContent).toContain('Ready')
   })
 })

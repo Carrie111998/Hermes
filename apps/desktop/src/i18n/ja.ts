@@ -2349,6 +2349,9 @@ export const ja = defineLocale({
       contextUsage: 'コンテキスト使用状況',
       contextUsagePanel: {
         accountName: suffix => `アカウント ${suffix}`,
+        categoryDetails: 'カテゴリ詳細',
+        currentBadge: '現在',
+        unsupportedShort: '使用量レポートなし',
         accountEmpty: '設定済みのアカウントはありません',
         accountError: 'アカウント使用量を読み込めませんでした',
         accountLoading: 'アカウント使用量を読み込み中',
@@ -2372,6 +2375,7 @@ export const ja = defineLocale({
         },
         remaining: percent => `残り ${percent}%`,
         openInCommandCenter: 'コマンドセンターで開く',
+        otherProviders: count => `その他のプロバイダー (${count})`,
         refresh: '更新',
         refreshing: '更新中…',
         resetsAt: time => `リセット: ${time}`,

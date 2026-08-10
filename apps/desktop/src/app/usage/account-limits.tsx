@@ -4,6 +4,7 @@ import { ErrorIcon } from '@/components/ui/error-state'
 import { Loader } from '@/components/ui/loader'
 import { Progress } from '@/components/ui/progress'
 import { useI18n } from '@/i18n'
+import { AlertCircle, CheckCircle2, ChevronDown, ChevronRight, Clock } from '@/lib/icons'
 import { fmtDateTime } from '@/lib/time'
 import type { UsageAccount, UsageAccountsContract, UsageProvider } from '@/types/hermes'
 
@@ -12,6 +13,71 @@ export type AccountLimitsState = 'error' | 'loading' | 'ready' | 'unsupported'
 type RequestGateway = <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
 
 type AccountLimitsCopy = ReturnType<typeof useI18n>['t']['shell']['statusbar']['contextUsagePanel']
+
+/**
+ * Order providers by actual usefulness: the current session's provider first
+ * (session fact from local analytics — not a routing guess), then providers
+ * with real quota data, then supported providers needing attention, with
+ * unsupported providers split out for the merged collapsed group. Ordering is
+ * stable within each group (backend priority order is preserved).
+ */
+export function orderUsageProviders(
+  providers: readonly UsageProvider[],
+  currentProvider?: null | string
+): { pinned: UsageProvider[]; unsupported: UsageProvider[] } {
+  const groupOf = (provider: UsageProvider): number => {
+    if (currentProvider && provider.provider === currentProvider) {
+      return 0
+    }
+    if (provider.usage_capability === 'supported') {
+      return provider.accounts.some(account => account.quota.status === 'available') ? 1 : 2
+    }
+    return 3
+  }
+
+  return {
+    pinned: providers
+      .map((provider, index) => ({ group: groupOf(provider), index, provider }))
+      .filter(entry => entry.group < 3)
+      .sort((a, b) => a.group - b.group || a.index - b.index)
+      .map(entry => entry.provider),
+    unsupported: providers.filter(provider => groupOf(provider) === 3)
+  }
+}
+
+const HEALTH_ICON = {
+  cooldown: Clock,
+  error: AlertCircle,
+  expired: AlertCircle,
+  ready: CheckCircle2,
+  unavailable: AlertCircle
+} as const
+
+const HEALTH_TONE = {
+  cooldown: 'text-muted-foreground',
+  error: 'text-destructive',
+  expired: 'text-destructive',
+  ready: 'text-emerald-500',
+  unavailable: 'text-muted-foreground'
+} as const
+
+function HealthBadge({
+  copy,
+  status
+}: {
+  copy: AccountLimitsCopy
+  status: UsageAccount['health']['status']
+}) {
+  const Icon = HEALTH_ICON[status] ?? AlertCircle
+  const tone = HEALTH_TONE[status] ?? 'text-muted-foreground'
+
+  return (
+    <span className={`inline-flex shrink-0 items-center gap-1 text-[0.6875rem] ${tone}`} data-slot="health-badge">
+      <Icon aria-hidden className="size-3" />
+      {copy.health[status]}
+    </span>
+  )
+}
 
 export function isMissingUsageMethodError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error ?? '')
@@ -168,7 +234,7 @@ function AccountLimitRow({
         <span className="min-w-0 truncate text-foreground">
           {account.display_name ?? copy.accountName(account.account_id.slice(-4))}
         </span>
-        <span className="shrink-0 text-[0.6875rem] text-muted-foreground">{copy.health[account.health.status]}</span>
+        <HealthBadge copy={copy} status={account.health.status} />
       </div>
 
       {quota.plan && <span className="text-[0.6875rem] text-muted-foreground">{quota.plan}</span>}
@@ -182,15 +248,20 @@ function AccountLimitRow({
 
             return (
               <div className="flex flex-col gap-1" key={`${account.account_id}:${window.label}`}>
-                <div className="flex items-center justify-between gap-2 text-[0.6875rem]">
-                  <span className="min-w-0 truncate text-muted-foreground">{window.label}</span>
+                <div className="flex items-center gap-2 text-[0.6875rem]">
+                  <span className="w-14 shrink-0 truncate text-muted-foreground">{window.label}</span>
+                  {/* The label says "% left", so the fill must visualize the
+                      remaining share — never the used share. */}
+                  <Progress
+                    aria-label={`${window.label}: ${copy.remaining(remaining)}`}
+                    className="min-w-0 flex-1"
+                    size="sm"
+                    value={remaining / 100}
+                  />
                   <span className="shrink-0 tabular-nums text-foreground">{copy.remaining(remaining)}</span>
                 </div>
-                {/* The label says "% left", so the fill must visualize the
-                    remaining share — never the used share. */}
-                <Progress aria-label={`${window.label}: ${copy.remaining(remaining)}`} size="sm" value={remaining / 100} />
                 {resetAt && (
-                  <span className="text-[0.625rem] text-muted-foreground">{copy.resetsAt(resetAt)}</span>
+                  <span className="pl-16 text-[0.625rem] text-muted-foreground">{copy.resetsAt(resetAt)}</span>
                 )}
               </div>
             )
@@ -225,23 +296,28 @@ function AccountLimitRow({
 
 function ProviderLimits({
   copy,
+  isCurrent,
   provider
 }: {
   copy: AccountLimitsCopy
+  isCurrent?: boolean
   provider: UsageProvider
 }) {
   return (
     <section className="flex min-w-0 flex-col gap-2">
       <div className="flex items-baseline justify-between gap-2">
-        <span className="min-w-0 truncate font-medium text-foreground">{provider.provider}</span>
+        <span className="flex min-w-0 items-baseline gap-1.5">
+          <span className="min-w-0 truncate font-medium text-foreground">{provider.provider}</span>
+          {isCurrent && (
+            <span className="shrink-0 rounded-[3px] bg-accent/60 px-1 py-px text-[0.625rem] text-foreground">
+              {copy.currentBadge}
+            </span>
+          )}
+        </span>
         <span className="shrink-0 text-[0.6875rem] text-muted-foreground">
           {provider.routing.ready}/{provider.accounts.length} {copy.health.ready}
         </span>
       </div>
-
-      {provider.usage_capability === 'unsupported' && (
-        <p className="text-[0.6875rem] text-muted-foreground">{copy.quota.unsupported}</p>
-      )}
 
       {provider.accounts.map(account => (
         <AccountLimitRow
@@ -268,9 +344,14 @@ export function AccountLimitsView({
 }) {
   const { t } = useI18n()
   const copy = t.shell.statusbar.contextUsagePanel
+  const [unsupportedOpen, setUnsupportedOpen] = useState(false)
   const hasProviderReported = contract.providers.some(provider =>
     provider.accounts.some(account => account.quota.source === 'provider_reported')
   )
+  const currentProvider = contract.local.status === 'available' ? contract.local.provider : null
+  const { pinned, unsupported } = orderUsageProviders(contract.providers, currentProvider)
+  const unsupportedReady = unsupported.reduce((sum, provider) => sum + provider.routing.ready, 0)
+  const unsupportedAccounts = unsupported.reduce((sum, provider) => sum + provider.accounts.length, 0)
 
   return (
     <div className="flex min-w-0 flex-col gap-3" data-slot="account-limits">
@@ -305,9 +386,48 @@ export function AccountLimitsView({
 
       {!contract.providers.length && <p className="text-[0.6875rem] text-muted-foreground">{copy.accountEmpty}</p>}
 
-      {contract.providers.map(provider => (
-        <ProviderLimits copy={copy} key={provider.provider} provider={provider} />
+      {pinned.map(provider => (
+        <ProviderLimits
+          copy={copy}
+          isCurrent={Boolean(currentProvider && provider.provider === currentProvider)}
+          key={provider.provider}
+          provider={provider}
+        />
       ))}
+
+      {unsupported.length > 0 && (
+        <section className="flex min-w-0 flex-col gap-1.5">
+          <button
+            aria-expanded={unsupportedOpen}
+            className="flex min-w-0 items-center gap-1.5 text-left text-[0.6875rem] text-muted-foreground hover:text-foreground focus-visible:text-foreground focus-visible:underline"
+            onClick={() => setUnsupportedOpen(open => !open)}
+            type="button"
+          >
+            {unsupportedOpen ? (
+              <ChevronDown aria-hidden className="size-3 shrink-0" />
+            ) : (
+              <ChevronRight aria-hidden className="size-3 shrink-0" />
+            )}
+            <span className="min-w-0 truncate">
+              {copy.otherProviders(unsupported.length)}{' '}
+              <span data-slot="unsupported-note">({copy.unsupportedShort})</span>
+            </span>
+            <span className="shrink-0 tabular-nums">
+              {unsupportedReady}/{unsupportedAccounts}
+            </span>
+          </button>
+
+          {unsupportedOpen &&
+            unsupported.map(provider => (
+              <div className="flex items-baseline justify-between gap-2 pl-4" key={provider.provider}>
+                <span className="min-w-0 truncate text-muted-foreground">{provider.provider}</span>
+                <span className="shrink-0 text-[0.6875rem] text-muted-foreground">
+                  {provider.routing.ready}/{provider.accounts.length} {copy.health.ready}
+                </span>
+              </div>
+            ))}
+        </section>
+      )}
     </div>
   )
 }

@@ -2272,6 +2272,9 @@ export const zhHant = defineLocale({
       contextUsage: '上下文使用量',
       contextUsagePanel: {
         accountName: suffix => `帳號 ${suffix}`,
+        categoryDetails: '分類詳情',
+        currentBadge: '目前',
+        unsupportedShort: '不回報用量',
         accountEmpty: '尚未設定帳號',
         accountError: '無法載入帳號用量',
         accountLoading: '正在載入帳號用量',
@@ -2295,6 +2298,7 @@ export const zhHant = defineLocale({
         },
         remaining: percent => `剩餘 ${percent}%`,
         openInCommandCenter: '在命令中心開啟',
+        otherProviders: count => `其他 ${count} 個供應商`,
         refresh: '重新整理',
         refreshing: '重新整理中…',
         resetsAt: time => `重置於 ${time}`,

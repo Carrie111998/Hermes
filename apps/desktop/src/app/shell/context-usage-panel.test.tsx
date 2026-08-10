@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
@@ -187,12 +187,15 @@ describe('ContextUsagePanel', () => {
     )
 
     expect(await screen.findByText('openai-codex')).toBeTruthy()
-    expect(screen.getByText('local-provider')).toBeTruthy()
+    expect(screen.queryByText('local-provider')).toBeNull()
     expect(screen.getByText('Account lpha')).toBeTruthy()
     expect(screen.getByText('Account beta')).toBeTruthy()
     expect(screen.getByText('60% remaining')).toBeTruthy()
     expect(screen.getByText('Cooling down')).toBeTruthy()
-    expect(screen.getAllByText('This provider does not report account usage').length).toBeGreaterThan(0)
+    // Unsupported providers merge into one collapsed group with a single note.
+    expect(screen.getAllByText(/No usage reporting/).length).toBe(1)
+    fireEvent.click(screen.getByRole('button', { name: /Other providers \(1\)/ }))
+    expect(screen.getByText('local-provider')).toBeTruthy()
     expect(screen.getByText('openai-codex · runtime-model')).toBeTruthy()
     expect(screen.getByText('2 calls · 140 tokens')).toBeTruthy()
     expect(requestGateway).toHaveBeenCalledWith('usage.accounts', {

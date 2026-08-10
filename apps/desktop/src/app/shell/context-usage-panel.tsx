@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Loader } from '@/components/ui/loader'
 import { useI18n } from '@/i18n'
 import { compactNumber } from '@/lib/format'
+import { ChevronDown, ChevronRight } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import type {
   ContextBreakdown,
@@ -34,6 +35,7 @@ export function ContextUsagePanel({
   const copy = t.shell.statusbar.contextUsagePanel
   const [breakdown, setBreakdown] = useState<ContextBreakdown | null>(null)
   const [loading, setLoading] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
   const { contract, refresh, refreshing, state: accountState } = useUsageAccounts({
     profile,
     requestGateway,
@@ -116,19 +118,39 @@ export function ContextUsagePanel({
 
       <ContextUsageBar categories={categories} segmentTotal={segmentTotal} />
 
-      <ul className="flex flex-col gap-1.5">
-        {categories.map(category => (
-          <li className="flex items-center justify-between gap-2" key={category.id}>
-            <span className="flex min-w-0 items-center gap-2">
-              <span className="size-2 shrink-0 rounded-[2px]" style={{ background: category.color }} />
+      {categories.length > 0 && (
+        <div className="flex flex-col gap-1.5">
+          <button
+            aria-expanded={detailsOpen}
+            className="flex items-center gap-1 text-left text-[0.6875rem] text-muted-foreground hover:text-foreground focus-visible:text-foreground focus-visible:underline"
+            onClick={() => setDetailsOpen(open => !open)}
+            type="button"
+          >
+            {detailsOpen ? (
+              <ChevronDown aria-hidden className="size-3 shrink-0" />
+            ) : (
+              <ChevronRight aria-hidden className="size-3 shrink-0" />
+            )}
+            {copy.categoryDetails} ({categories.length})
+          </button>
 
-              <span className="truncate text-muted-foreground">{category.label}</span>
-            </span>
+          {detailsOpen && (
+            <ul className="flex flex-col gap-1.5">
+              {categories.map(category => (
+                <li className="flex items-center justify-between gap-2" key={category.id}>
+                  <span className="flex min-w-0 items-center gap-2">
+                    <span className="size-2 shrink-0 rounded-[2px]" style={{ background: category.color }} />
 
-            <span className="shrink-0 tabular-nums text-foreground">{compactNumber(category.tokens)}</span>
-          </li>
-        ))}
-      </ul>
+                    <span className="truncate text-muted-foreground">{category.label}</span>
+                  </span>
+
+                  <span className="shrink-0 tabular-nums text-foreground">{compactNumber(category.tokens)}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
 
       {loading && <Loader className="size-5 text-muted-foreground" label={copy.loading} type="fourier-flow" />}
 
