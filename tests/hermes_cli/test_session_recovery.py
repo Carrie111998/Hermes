@@ -594,6 +594,200 @@ def test_cli_allow_partial_salvages_rows_across_a_corrupt_leaf(
     }
 
 
+def _surviving_output_bundle(output: Path) -> list[str]:
+    """Every path ``_validate_paths`` would refuse a retry on."""
+
+    return [
+        str(session_recovery._sidecar_path(output, suffix))
+        for suffix in session_recovery._SIDECAR_SUFFIXES
+        if os.path.lexists(session_recovery._sidecar_path(output, suffix))
+    ]
+
+
+def test_failed_recovery_leaves_no_output_to_block_a_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-run failure must not lock the user out of retrying.
+
+    ``_validate_paths`` refuses to start when the output *or any of its
+    journal sidecars* already exists, so a half-written output turns the one
+    command a damaged database has left into a permanent refusal naming a
+    file the user never created.
+    """
+
+    source = tmp_path / "state.db"
+    _make_source(source)
+    output = tmp_path / "recovered.db"
+
+    def _disk_error(destination: sqlite3.Connection) -> dict[str, object]:
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(session_recovery, "_finalize_derived_metadata", _disk_error)
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    assert _surviving_output_bundle(output) == []
+
+    # The retry is the point: it must get past the overwrite guard entirely.
+    monkeypatch.undo()
+    report = recover_session_database(source, output, work_dir=tmp_path)
+    assert report["complete"] is True
+    assert report["installed"] is False
+
+
+def test_keyboard_interrupt_during_recovery_leaves_no_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C is the reported case, so the cleanup must catch ``BaseException``.
+
+    An ``except Exception`` cleanup passes the disk-error test above and still
+    leaves the stub behind for the interrupt that people actually hit.
+    """
+
+    source = tmp_path / "state.db"
+    _make_source(source)
+    output = tmp_path / "interrupted.db"
+
+    def _interrupt(destination: sqlite3.Connection) -> dict[str, object]:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(session_recovery, "_finalize_derived_metadata", _interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        recover_session_database(source, output, work_dir=tmp_path)
+
+    assert _surviving_output_bundle(output) == []
+
+
+def test_failed_output_initialization_leaves_no_journal_sidecars(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The output can fail *while* it is being created, sidecars and all.
+
+    ``SessionDB`` creates the database before it finishes initializing it, so a
+    constructor that raises part way leaves a live WAL behind and never hands
+    back a handle anything can close. ``_validate_paths`` refuses on every
+    entry of ``_SIDECAR_SUFFIXES``, so removing the database on its own still
+    leaves ``recovered.db-wal`` blocking the retry.
+    """
+
+    source = tmp_path / "state.db"
+    _make_source(source)
+    output = tmp_path / "half-initialized.db"
+
+    real_session_db = session_recovery.SessionDB
+    leaked: list[SessionDB] = []
+
+    def _fail_after_creating(*args: object, **kwargs: object) -> SessionDB:
+        # Deliberately left open: an unflushed WAL is what makes this the
+        # sidecar case rather than a plain leftover database file.
+        leaked.append(real_session_db(*args, **kwargs))
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(session_recovery, "SessionDB", _fail_after_creating)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+            recover_session_database(source, output, work_dir=tmp_path)
+
+        assert leaked, "the stub never reached the real constructor"
+        assert _surviving_output_bundle(output) == []
+    finally:
+        for database in leaked:
+            database.close()
+
+
+def test_verification_failure_keeps_the_output_for_inspection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The boundary: cleanup belongs on the raise path only.
+
+    ``_verify_recovered_database`` collects errors and returns, and the CLI
+    tells the user to review a report for an output that failed verification,
+    so that output must survive.
+    """
+
+    source = tmp_path / "state.db"
+    _make_source(source)
+    output = tmp_path / "unverified.db"
+
+    def _failed_verification(*args: object, **kwargs: object) -> dict[str, object]:
+        return {
+            "errors": ["forced verification failure"],
+            "warnings": [],
+            "table_counts": {},
+            "integrity_check": ["ok"],
+            "foreign_key_check": [],
+            "complete": False,
+            "healthy": False,
+            "loss_detected": False,
+        }
+
+    monkeypatch.setattr(
+        session_recovery,
+        "_verify_recovered_database",
+        _failed_verification,
+    )
+    report = recover_session_database(source, output, work_dir=tmp_path)
+
+    assert report["complete"] is False
+    assert report["verified"] is False
+    assert output.exists()
+
+
+def test_failed_report_write_leaves_no_report_to_block_a_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same lockout, one artifact along.
+
+    ``write_recovery_report`` opens with ``"x"`` and ``hermes sessions
+    recover`` refuses the whole command when the report path already exists,
+    so a ``json.dump`` that dies part way blocks the next run before recovery
+    even starts.
+    """
+
+    destination = tmp_path / "recovered.db.recovery.json"
+
+    def _no_space(*args: object, **kwargs: object) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(session_recovery.json, "dump", _no_space)
+    with pytest.raises(OSError, match="No space left on device"):
+        session_recovery.write_recovery_report(destination, {"operation": "recover"})
+
+    assert not os.path.lexists(destination)
+
+    monkeypatch.undo()
+    written = session_recovery.write_recovery_report(
+        destination,
+        {"operation": "recover"},
+    )
+    assert json.loads(written.read_text(encoding="utf-8")) == {
+        "operation": "recover"
+    }
+
+
+def test_report_write_never_removes_a_file_it_did_not_create(
+    tmp_path: Path,
+) -> None:
+    """The refusal itself must stay non-destructive.
+
+    ``open("x")`` raising ``FileExistsError`` means the report was written by
+    an earlier run, so the failure path must leave it exactly as it was.
+    """
+
+    destination = tmp_path / "recovered.db.recovery.json"
+    destination.write_text("earlier report", encoding="utf-8")
+
+    with pytest.raises(FileExistsError):
+        session_recovery.write_recovery_report(destination, {"operation": "recover"})
+
+    assert destination.read_text(encoding="utf-8") == "earlier report"
+
+
 def test_partial_recovery_clears_only_unreadable_system_prompt_refs(
     tmp_path: Path,
 ) -> None:
