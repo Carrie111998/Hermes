@@ -320,7 +320,11 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    @pytest.mark.windows_only
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
+        # Windows-only: the fake ``sys.platform`` could not reproduce the
+        # ``Scripts/python.exe`` launcher layout or the CREATE_NO_WINDOW
+        # creationflags this branch exists for.
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
 
@@ -354,9 +358,7 @@ class TestRunJobScript:
             captured["kwargs"] = kwargs
             return FakeProcess()
 
-        monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
-        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
         monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
 
         success, output = _run_job_script("probe.py")
@@ -364,13 +366,14 @@ class TestRunJobScript:
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000000
+        assert captured["kwargs"]["creationflags"] == sched_mod.windows_hide_flags()
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
 
 
     def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
+        # No platform patching: the Linux CI host already takes this branch.
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
 
@@ -391,7 +394,6 @@ class TestRunJobScript:
             captured["kwargs"] = kwargs
             return FakeProcess()
 
-        monkeypatch.setattr(sched_mod.sys, "platform", "linux")
         monkeypatch.setattr(sched_mod.subprocess, "Popen", fake_popen)
 
         success, output = _run_job_script("probe.py")
@@ -609,6 +611,51 @@ class TestRunJobScript:
             # Preserve the no-leak property even when the assertion regresses.
             os.kill(child_pid, 9)
         assert not escaped_child_alive, "inner controller child survived outer timeout"
+
+    def test_emoji_stdout_round_trips_through_script_capture(self, cron_env):
+        """Emoji in script stdout must reach the caller intact (#42384).
+
+        On Windows the fix is the utf-8 + errors='replace' popen kwargs
+        (asserted above); on POSIX the UTF-8 locale default must already
+        carry emoji through. Either way the delivery content is the real
+        text, never an exception.
+        """
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "emoji.py"
+        script.write_text(
+            'import sys\n'
+            'sys.stdout.buffer.write("backup done \\N{PARTY POPPER} 日次".encode("utf-8"))\n',
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script("emoji.py")
+
+        assert success is True
+        assert "backup done 🎉 日次" == output
+
+    def test_invalid_utf8_stdout_does_not_raise(self, cron_env):
+        """Truncated/invalid UTF-8 in script stdout must never escape as an
+        exception (#47393) — a raised UnicodeDecodeError higher up would
+        silently drop the whole delivery (#42384). The run may fail, but it
+        must fail as a (False, message) result the scheduler can deliver.
+        """
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "bad_bytes.py"
+        # b'\xe6\x97' is the first two bytes of a three-byte CJK sequence —
+        # a truncated write, exactly the shape reported in #47393.
+        script.write_text(
+            "import sys\n"
+            "sys.stdout.buffer.write(b'partial \\xe6\\x97')\n",
+            encoding="utf-8",
+        )
+
+        success, output = _run_job_script("bad_bytes.py")  # must not raise
+
+        assert isinstance(success, bool)
+        assert isinstance(output, str)
+        assert output  # a message is always produced, never a silent drop
 
 
 class TestBuildJobPromptWithScript:
