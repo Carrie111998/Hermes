@@ -134,6 +134,19 @@ Send and receive iMessages. Markdown is automatically stripped for clean plain-t
 ### Tapback Reactions
 Love, like, dislike, laugh, emphasize, and question reactions. Requires the BlueBubbles [Private API helper](https://docs.bluebubbles.app/helper-bundle/installation).
 
+### Emoji Working Acknowledgement
+
+For a lightweight acknowledgement that does not require the Private API helper, configure a standalone emoji response:
+
+```yaml
+platforms:
+  bluebubbles:
+    extra:
+      working_ack_emoji: "👀"
+```
+
+Hermes sends the emoji to the exact originating chat before processing, then sends the final answer normally. Set `BLUEBUBBLES_WORKING_ACK_EMOJI` instead if you prefer an environment variable. Leave both unset to disable it.
+
 ### Typing Indicators
 Shows "typing..." in the iMessage conversation while the agent is processing. Requires Private API.
 

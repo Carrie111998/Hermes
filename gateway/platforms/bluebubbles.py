@@ -192,6 +192,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not str(self.webhook_path).startswith("/"):
             self.webhook_path = f"/{self.webhook_path}"
         self.send_read_receipts = bool(extra.get("send_read_receipts", True))
+        _working_ack = extra.get("working_ack_emoji")
+        if _working_ack is None:
+            _working_ack = os.getenv("BLUEBUBBLES_WORKING_ACK_EMOJI", "")
+        self.working_ack_emoji = str(_working_ack or "").strip()
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
@@ -782,6 +786,28 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
     # Tapback reactions
     # ------------------------------------------------------------------
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Send an optional emoji-only acknowledgement to the originating chat."""
+        if (
+            not self.working_ack_emoji
+            or event.is_command()
+            or not event.source
+            or not event.source.chat_id
+        ):
+            return
+        result = await self.send(
+            event.source.chat_id,
+            self.working_ack_emoji,
+            reply_to=event.message_id,
+        )
+        if not result.success:
+            logger.debug(
+                "[%s] Working acknowledgement failed for %s: %s",
+                self.name,
+                event.source.chat_id,
+                result.error,
+            )
 
     # ------------------------------------------------------------------
     # Chat info

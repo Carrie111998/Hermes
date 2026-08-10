@@ -288,6 +288,62 @@ class TestBlueBubblesGuidResolution:
         assert "user@example.com" not in adapter._guid_cache
 
 
+class TestBlueBubblesWorkingAcknowledgement:
+    @pytest.mark.asyncio
+    async def test_sends_configured_emoji_to_exact_originating_chat(self, monkeypatch):
+        from gateway.platforms.base import MessageEvent, SendResult
+        from gateway.session import SessionSource
+
+        adapter = _make_adapter(monkeypatch, working_ack_emoji="👀")
+        sent = []
+
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            sent.append((chat_id, content, reply_to))
+            return SendResult(success=True, message_id="ack-guid")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        event = MessageEvent(
+            text="Please handle this",
+            source=SessionSource(
+                platform=Platform.BLUEBUBBLES,
+                chat_id="iMessage;+;group-chat",
+                chat_type="group",
+            ),
+            message_id="trigger-guid",
+        )
+
+        await adapter.on_processing_start(event)
+
+        assert sent == [("iMessage;+;group-chat", "👀", "trigger-guid")]
+
+    @pytest.mark.asyncio
+    async def test_skips_working_emoji_when_not_configured(self, monkeypatch):
+        from gateway.platforms.base import MessageEvent, SendResult
+        from gateway.session import SessionSource
+
+        adapter = _make_adapter(monkeypatch)
+        sent = []
+
+        async def fake_send(chat_id, content, reply_to=None, metadata=None):
+            sent.append((chat_id, content, reply_to))
+            return SendResult(success=True, message_id="ack-guid")
+
+        monkeypatch.setattr(adapter, "send", fake_send)
+        event = MessageEvent(
+            text="Please handle this",
+            source=SessionSource(
+                platform=Platform.BLUEBUBBLES,
+                chat_id="iMessage;+;group-chat",
+                chat_type="group",
+            ),
+            message_id="trigger-guid",
+        )
+
+        await adapter.on_processing_start(event)
+
+        assert sent == []
+
+
 class TestBlueBubblesAttachmentDownload:
     """Verify _download_attachment routes to the correct cache helper."""
 
