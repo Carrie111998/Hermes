@@ -146,6 +146,60 @@ jobs:
           path: test_durations.json
           retention-days: 1
 
+  # Python 3.14 compatibility lane.
+  #
+  # The project's historical CI interpreter is 3.11; the 3.14 support
+  # surface (daemon_pool WorkerContext, requires-python ceiling) is only
+  # exercised by this lane. Runs the same per-file-isolation slices as the
+  # 3.11 lane (no xdist, no shared workers), on a subset of the files to
+  # bound CI time — the 3.14-specific surface lives in
+  # tests/tools/test_daemon_pool.py plus the delegate/async clusters that
+  # depend on the daemon pool.
+  test-py314:
+    needs: generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.9.28"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.14
+        uses: ./.github/actions/retry
+        with:
+          command: uv python install 3.14
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.14 --extra all --extra dev
+
+      - name: Minimize uv cache
+        run: uv cache prune --ci
+
+      - name: Run 3.14 compatibility tests
+        run: |
+          source .venv/bin/activate
+          python -m pytest \
+            tests/tools/test_daemon_pool.py \
+            tests/tools/test_delegate.py \
+            tests/tools/test_async_delegation.py \
+            tests/agent/test_compression_concurrent_fork.py \
+            -q --no-header -p no:cacheprovider
+        env:
+          # Ensure tests don't accidentally call real APIs
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+
   # Merge per-slice duration data into a single cache, so future runs
   # (including PRs) get balanced slicing.
   save-durations:
