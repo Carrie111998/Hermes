@@ -2375,15 +2375,326 @@ _INLINE_BACKGROUND_AMP_RE = re.compile(r"\s&\s")
 _TRAILING_BACKGROUND_AMP_RE = re.compile(r"\s&\s*(?:#.*)?$")
 
 
+# Characters that terminate a bare (unquoted) heredoc delimiter word.
+_HEREDOC_BARE_STOP = set(" \t|&;()<>'\"\\$`")
+
+
+def _shell_comment_index(line: str) -> int | None:
+    """Return index of ``#`` starting a shell comment, or None."""
+    i = 0
+    n = len(line)
+    in_single = in_double = False
+    while i < n:
+        ch = line[i]
+        if ch == "\\" and not in_single and i + 1 < n:
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            i += 1
+            continue
+        if ch == "#" and (i == 0 or line[i - 1] in " \t;|&"):
+            return i
+        i += 1
+    return None
+
+
+def _parse_shell_word(line: str, start: int, limit: int) -> tuple[str | None, int]:
+    """Parse one composite shell word from ``line[start:limit]``.
+
+    Returns ``(word, end_index)`` or ``(None, -1)`` when the word is empty,
+    contains an unterminated quote, or uses expandable ``$`` / backtick syntax
+    (``$'…'``, ``$"…"``, ``$VAR``, command substitution) — fail-closed.
+    """
+    parts: list[str] = []
+    i = start
+    while i < limit:
+        ch = line[i]
+        if ch in " \t":
+            break
+        if ch == "'":
+            j = i + 1
+            while j < limit and line[j] != "'":
+                j += 1
+            if j >= limit:
+                return None, -1
+            parts.append(line[i + 1 : j])
+            i = j + 1
+        elif ch == '"':
+            j = i + 1
+            buf: list[str] = []
+            while j < limit:
+                if line[j] == "\\" and j + 1 < limit:
+                    buf.append(line[j + 1])
+                    j += 2
+                elif line[j] == '"':
+                    break
+                elif line[j] in "$`":
+                    return None, -1
+                else:
+                    buf.append(line[j])
+                    j += 1
+            if j >= limit:
+                return None, -1
+            parts.append("".join(buf))
+            i = j + 1
+        elif ch == "\\":
+            if i + 1 >= limit:
+                return None, -1
+            parts.append(line[i + 1])
+            i += 2
+        elif ch in "$`":
+            return None, -1
+        elif ch in "|&;()<>":
+            break
+        else:
+            j = i
+            while j < limit and line[j] not in _HEREDOC_BARE_STOP:
+                j += 1
+            parts.append(line[i:j])
+            i = j
+    word = "".join(parts)
+    if not word:
+        return None, -1
+    return word, i
+
+
+def _heredoc_scan_unterminated(stack: list) -> bool:
+    """True when compound shell context on the line did not close (fail-closed)."""
+    return len(stack) > 0
+
+
+def _heredoc_scan_suppresses_shift(stack: list) -> bool:
+    """True when ``<<`` is arithmetic/test syntax, not a heredoc opener."""
+    return any(
+        entry["kind"] in ("dollar_arith", "arith_cmd", "test_bracket")
+        for entry in stack
+    )
+
+
+def _heredoc_scan_in_cmd_sub(stack: list) -> bool:
+    return any(entry["kind"] == "cmd_sub" for entry in stack)
+
+
+def _heredoc_stack_in_dollar_arith(stack: list) -> bool:
+    return any(entry["kind"] == "dollar_arith" for entry in stack)
+
+
+def _heredoc_stack_top_arith(stack: list) -> dict | None:
+    if not stack:
+        return None
+    top = stack[-1]
+    if top["kind"] in ("dollar_arith", "arith_cmd"):
+        return top
+    return None
+
+
+def _heredoc_close_arith_paren(stack: list) -> bool:
+    """Pop innermost arithmetic on ``)``; return False when unmatched (fail-closed)."""
+    top = _heredoc_stack_top_arith(stack)
+    if top is None:
+        return False
+    if top["paren_depth"] > 0:
+        top["paren_depth"] -= 1
+    elif top["close_remaining"] > 1:
+        top["close_remaining"] -= 1
+    else:
+        stack.pop()
+    return True
+
+
+def _find_heredoc_markers_on_line(line: str) -> list[tuple[str, bool]] | None:
+    """Return all heredoc openers on *line* in left-to-right order.
+
+    Returns ``None`` when any opener has an ambiguous delimiter (fail-closed),
+    when compound shell context is unterminated on the line (``$((``,
+    ``((``, ``[[``, ``$(``), or when command substitution contains heredoc
+    syntax (``<<`` inside ``$(...)`` — not soundly supported across lines).
+    """
+    comment_idx = _shell_comment_index(line)
+    limit = comment_idx if comment_idx is not None else len(line)
+    markers: list[tuple[str, bool]] = []
+    i = 0
+    in_single = False
+    in_double = False
+    stack: list[dict] = []
+    malformed = False
+    while i < limit:
+        ch = line[i]
+        if ch == "\\" and not in_single and i + 1 < limit:
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if in_single or in_double:
+            i += 1
+            continue
+
+        if ch == "$" and i + 2 < limit and line[i + 1 : i + 3] == "((":
+            stack.append(
+                {"kind": "dollar_arith", "close_remaining": 2, "paren_depth": 0}
+            )
+            i += 3
+            continue
+        if ch == "$" and i + 1 < limit and line[i + 1] == "(":
+            stack.append({"kind": "cmd_sub"})
+            i += 2
+            continue
+
+        if (
+            ch == "("
+            and i + 1 < limit
+            and line[i + 1] == "("
+            and not _heredoc_stack_in_dollar_arith(stack)
+        ):
+            stack.append(
+                {"kind": "arith_cmd", "close_remaining": 2, "paren_depth": 0}
+            )
+            i += 2
+            continue
+
+        if ch == "[" and i + 1 < limit and line[i + 1] == "[":
+            stack.append({"kind": "test_bracket"})
+            i += 2
+            continue
+
+        if ch == "(" and _heredoc_stack_top_arith(stack) is not None:
+            _heredoc_stack_top_arith(stack)["paren_depth"] += 1
+            i += 1
+            continue
+
+        if ch == ")":
+            if stack and stack[-1]["kind"] == "cmd_sub":
+                stack.pop()
+            elif _heredoc_stack_top_arith(stack) is not None:
+                if not _heredoc_close_arith_paren(stack):
+                    malformed = True
+            else:
+                malformed = True
+            i += 1
+            continue
+
+        if (
+            stack
+            and stack[-1]["kind"] == "test_bracket"
+            and ch == "]"
+            and i + 1 < limit
+            and line[i + 1] == "]"
+        ):
+            stack.pop()
+            i += 2
+            continue
+
+        if ch == "<" and i + 1 < limit and line[i + 1] == "<":
+            if _heredoc_scan_in_cmd_sub(stack):
+                return None
+            if _heredoc_scan_suppresses_shift(stack):
+                i += 2
+                continue
+            if i + 2 < limit and line[i + 2] == "<":
+                i += 3
+                while i < limit and line[i] in " \t":
+                    i += 1
+                _word, next_i = _parse_shell_word(line, i, limit)
+                if next_i == -1:
+                    return None
+                i = next_i if next_i >= i else i
+                continue
+            j = i + 2
+            strip_dash = False
+            if j < limit and line[j] == "-":
+                strip_dash = True
+                j += 1
+            while j < limit and line[j] in " \t":
+                j += 1
+            word, next_i = _parse_shell_word(line, j, limit)
+            if word is None:
+                return None
+            markers.append((word, strip_dash))
+            i = next_i
+            continue
+        i += 1
+    if malformed or _heredoc_scan_unterminated(stack):
+        return None
+    return markers
+
+
+def _strip_heredoc_bodies(command: str) -> str:
+    """Remove heredoc bodies so regex checks don't match inside inline data.
+
+    Keeps every heredoc's opening line and delimiter line, drops the body
+    lines between them. Runs before quote stripping because heredoc bodies
+    routinely contain unbalanced quotes that would derail quote-pair regexes.
+    An unterminated heredoc consumes the rest of the command (all data).
+
+    When any heredoc delimiter cannot be parsed unambiguously, returns
+    *command* unchanged so dangerous operators after it remain detectable.
+
+    Left-shift ``<<`` inside shell arithmetic (``$(( ... ))``, ``(( ... ))``)
+    or lexical tests (``[[ ... ]]``) is never treated as a heredoc opener.
+    Unterminated compound context on a line, or heredoc syntax inside
+    ``$(...)`` command substitution, also returns *command* unchanged
+    (fail-closed) rather than mis-stripping executable trailing commands.
+    """
+    lines = command.split("\n")
+    out_lines: list[str] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        markers = _find_heredoc_markers_on_line(line)
+        if markers is None:
+            return command
+        out_lines.append(line)
+        if not markers:
+            i += 1
+            continue
+        queue = list(markers)
+        i += 1
+        while queue and i < n:
+            word, strip_dash = queue.pop(0)
+            while i < n:
+                body = lines[i]
+                if strip_dash:
+                    terminated = body.lstrip("\t") == word
+                else:
+                    terminated = body == word
+                if terminated:
+                    out_lines.append(body)
+                    i += 1
+                    break
+                i += 1
+        if queue:
+            break
+    return "\n".join(out_lines)
+
+
 def _strip_quotes(command: str) -> str:
     """Remove single- and double-quoted content so regex checks don't match inside strings.
 
     This prevents false positives when keywords like 'nohup' or 'setsid' appear
     in commit messages, Python -c code, echo arguments, or PR body text.
-    Also strips backtick-quoted content and heredoc-style inline text.
+    Also strips backtick-quoted content and heredoc bodies (inline script/data
+    payloads, e.g. ``python3 - <<'EOF' ... EOF``).
     """
+    # Remove heredoc bodies first — they can hold unbalanced quotes and shell
+    # operators that are data, not commands.
+    result = _strip_heredoc_bodies(command)
     # Remove single-quoted strings (no escaping inside single quotes in shell)
-    result = re.sub(r"'[^']*'", "''", command)
+    result = re.sub(r"'[^']*'", "''", result)
     # Remove double-quoted strings (handle escaped quotes)
     result = re.sub(r'"(?:[^"\\]|\\.)*"', '""', result)
     # Remove backtick-quoted strings
