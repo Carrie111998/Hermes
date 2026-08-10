@@ -253,7 +253,7 @@ _MCP_SDK_LAZY_SYMBOLS = frozenset({
     "CreateMessageResult", "CreateMessageResultWithTools", "ErrorData",
     "SamplingCapability", "SamplingToolsCapability", "TextContent",
     "ToolUseContent", "ElicitRequestParams", "ElicitResult",
-    "ServerNotification", "ToolListChangedNotification",
+    "ToolListChangedNotification",
     "PromptListChangedNotification", "ResourceListChangedNotification",
 })
 
@@ -288,8 +288,8 @@ def _ensure_mcp_sdk() -> bool:
     global CreateMessageResult, CreateMessageResultWithTools, ErrorData
     global SamplingCapability, SamplingToolsCapability, TextContent, ToolUseContent
     global ElicitRequestParams, ElicitResult
-    global ServerNotification, ToolListChangedNotification
-    global PromptListChangedNotification, ResourceListChangedNotification
+    global ToolListChangedNotification, PromptListChangedNotification
+    global ResourceListChangedNotification
 
     if not _MCP_AVAILABLE:
         return False
@@ -351,7 +351,6 @@ def _ensure_mcp_sdk() -> bool:
             # Notification types for dynamic tool discovery (tools/list_changed)
             try:
                 from mcp.types import (
-                    ServerNotification,
                     ToolListChangedNotification,
                     PromptListChangedNotification,
                     ResourceListChangedNotification,
@@ -2311,8 +2310,8 @@ class MCPServerTask:
                 ):
                     await decision_return_bridge.handle_notification(self, root)
                     return
-                if _MCP_NOTIFICATION_TYPES and isinstance(message, ServerNotification):
-                    match message.root:
+                if _MCP_NOTIFICATION_TYPES:
+                    match root:
                         case ToolListChangedNotification():
                             logger.info(
                                 "MCP server '%s': received tools/list_changed notification",

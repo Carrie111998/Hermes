@@ -33,6 +33,26 @@ async def test_opted_in_message_handler_routes_closed_return_notification() -> N
     handled.assert_awaited_once_with(server, notification)
 
 
+@pytest.mark.asyncio
+async def test_opted_in_message_handler_preserves_stock_list_changed() -> None:
+    from mcp.types import ToolListChangedNotification
+
+    server = mcp_tool.MCPServerTask("conduit")
+    server._config = {"decision_return": True}
+    wrapped = ConduitServerNotification(
+        root=ToolListChangedNotification(
+            method="notifications/tools/list_changed"
+        )
+    )
+
+    with patch.object(
+        mcp_tool.MCPServerTask, "_schedule_tools_refresh"
+    ) as scheduled:
+        await server._make_message_handler()(wrapped)
+
+    scheduled.assert_called_once_with()
+
+
 def _run_mcp_call(coro_or_factory, timeout=30):
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
     loop = asyncio.new_event_loop()
