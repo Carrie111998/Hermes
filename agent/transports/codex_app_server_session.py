@@ -284,6 +284,7 @@ class CodexAppServerSession:
         developer_instructions: Optional[str] = None,
         dynamic_tools: Optional[list[dict[str, Any]]] = None,
         dynamic_tool_handler: Optional[Callable[[str, dict[str, Any], str], Any]] = None,
+        restrict_native_tools: bool = False,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
@@ -313,6 +314,7 @@ class CodexAppServerSession:
         self._developer_instructions = developer_instructions
         self._dynamic_tools = list(dynamic_tools) if dynamic_tools is not None else None
         self._dynamic_tool_handler = dynamic_tool_handler
+        self._restrict_native_tools = restrict_native_tools
         self._dynamic_call_ids: set[str] = set()
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
@@ -374,6 +376,10 @@ class CodexAppServerSession:
             params["developerInstructions"] = self._developer_instructions
         if self._dynamic_tools is not None:
             params["dynamicTools"] = self._dynamic_tools
+        if self._restrict_native_tools:
+            # Codex app-server derives shell/write tools from environments;
+            # an explicit MCP-only Hermes selection has none.
+            params["environments"] = []
         result = self._client.request("thread/start", params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's

@@ -123,9 +123,9 @@ class TestConfiguredMcpDynamicTools:
             mcp_tool,
             "_mcp_tool_server_names",
             {
-                "mcp__law_firm_ops__list_email_obligations": "law_firm_ops",
-                "mcp__law_firm_ops__get_email_obligation": "law_firm_ops",
-                "mcp__law_firm_ops__get_email_obligation_monitor_status": "law_firm_ops",
+                "mcp__law_firm_ops__list_email_obligations": "law-firm-ops",
+                "mcp__law_firm_ops__get_email_obligation": "law-firm-ops",
+                "mcp__law_firm_ops__get_email_obligation_monitor_status": "law-firm-ops",
                 "mcp__other__unconfigured": "other",
             },
         )
@@ -232,7 +232,9 @@ class TestConfiguredMcpDynamicTools:
             disabled_toolsets=["outlook"],
         )
 
-        dynamic_tools, targets = _configured_mcp_dynamic_tools(agent)
+        dynamic_tools, targets, mcp_only, origin_session_targets = (
+            _configured_mcp_dynamic_tools(agent)
+        )
 
         assert calls == [
             {
@@ -271,6 +273,85 @@ class TestConfiguredMcpDynamicTools:
         }
         with pytest.raises(TypeError):
             targets["other"] = "mcp__other__tool"
+        assert mcp_only is False
+        assert origin_session_targets == frozenset()
+
+    def test_mcp_only_selection_projects_the_restricted_obligation_schema(
+        self, monkeypatch
+    ) -> None:
+        from agent.codex_runtime import _configured_mcp_dynamic_tools
+        import model_tools
+        from tools import mcp_tool
+
+        name = "mcp__law_firm_ops__list_email_obligations"
+        get_name = "mcp__law_firm_ops__get_email_obligation"
+        status_name = "mcp__law_firm_ops__get_email_obligation_monitor_status"
+        schema = {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string"},
+                "matter_query": {"type": "string"},
+                "origin_session_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+            },
+            "required": ["origin_session_id", "view", "limit", "offset"],
+        }
+        get_schema = {
+            "type": "object",
+            "properties": {"obligation_id": {"type": "string"}, "origin_session_id": {"type": "string"}},
+            "required": ["obligation_id", "origin_session_id"],
+        }
+        status_schema = {
+            "type": "object",
+            "properties": {"origin_session_id": {"type": "string"}},
+            "required": ["origin_session_id"],
+        }
+        monkeypatch.setattr(
+            mcp_tool,
+            "_mcp_tool_server_names",
+            {name: "law-firm-ops", get_name: "law-firm-ops", status_name: "law-firm-ops"},
+        )
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: [
+                {"function": {"name": name, "parameters": schema}},
+                {"function": {"name": get_name, "parameters": get_schema}},
+                {"function": {"name": status_name, "parameters": status_schema}},
+            ],
+        )
+
+        dynamic_tools, targets, mcp_only, origin_session_targets = (
+            _configured_mcp_dynamic_tools(
+                SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
+            )
+        )
+
+        assert mcp_only is True
+        assert [tool["name"] for tool in dynamic_tools] == [
+            "list_email_obligations",
+            "get_email_obligation",
+            "get_email_obligation_monitor_status",
+        ]
+        assert dict(targets) == {
+            "list_email_obligations": name,
+            "get_email_obligation": get_name,
+            "get_email_obligation_monitor_status": status_name,
+        }
+        assert origin_session_targets == frozenset({name, get_name, status_name})
+        assert dynamic_tools[0]["inputSchema"] == {
+            "type": "object",
+            "properties": {
+                "view": {"type": "string"},
+                "matter_query": {"type": "string"},
+            },
+            "required": ["view"],
+        }
+        for tool in dynamic_tools:
+            assert "origin_session_id" not in tool["inputSchema"]["properties"]
+            assert "origin_session_id" not in tool["inputSchema"].get("required", [])
+        assert "origin_session_id" in schema["properties"]
 
     def test_explicit_empty_toolsets_are_deny_all(self, monkeypatch) -> None:
         from agent.codex_runtime import _configured_mcp_dynamic_tools
@@ -284,7 +365,39 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=[], disabled_toolsets=None)
-        ) == ([], {})
+        ) == ([], {}, True, frozenset())
+
+    def test_unrelated_mcp_origin_schema_is_unchanged(self, monkeypatch) -> None:
+        from agent.codex_runtime import _configured_mcp_dynamic_tools
+        import model_tools
+        from tools import mcp_tool
+
+        name = "mcp__other__list_email_obligations"
+        schema = {
+            "type": "object",
+            "properties": {
+                "origin_session_id": {"type": "string"},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+            },
+            "required": ["origin_session_id", "limit", "offset"],
+        }
+        monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", {name: "other"})
+        monkeypatch.setattr(
+            model_tools,
+            "get_tool_definitions",
+            lambda **kwargs: [{"function": {"name": name, "parameters": schema}}],
+        )
+
+        dynamic_tools, _targets, mcp_only, origin_session_targets = (
+            _configured_mcp_dynamic_tools(
+                SimpleNamespace(enabled_toolsets=["other"], disabled_toolsets=None)
+            )
+        )
+
+        assert mcp_only is True
+        assert dynamic_tools[0]["inputSchema"] == schema
+        assert origin_session_targets == frozenset()
 
     def test_catalog_or_registry_errors_fail_closed(self, monkeypatch) -> None:
         from agent.codex_runtime import _configured_mcp_dynamic_tools
@@ -304,7 +417,7 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
-        ) == ([], {})
+        ) == ([], {}, False, frozenset())
 
         monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", object())
         monkeypatch.setattr(
@@ -315,7 +428,7 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
-        ) == ([], {})
+        ) == ([], {}, False, frozenset())
 
     @pytest.mark.parametrize(
         ("registered", "raw_name"),
@@ -360,7 +473,7 @@ class TestConfiguredMcpDynamicTools:
 
         assert _configured_mcp_dynamic_tools(
             SimpleNamespace(enabled_toolsets=["law-firm-ops"], disabled_toolsets=None)
-        ) == ([], {})
+        ) == ([], {}, False, frozenset())
 
     def test_alias_dispatches_registered_name_and_rejects_unknown(self, monkeypatch) -> None:
         from agent import codex_runtime
@@ -400,13 +513,34 @@ class TestConfiguredMcpDynamicTools:
                         "name": "list_email_obligations",
                         "description": "Canonical obligations.",
                         "inputSchema": {"type": "object", "properties": {}},
-                    }
+                    },
+                    {
+                        "type": "function",
+                        "name": "get_email_obligation",
+                        "description": "Canonical obligation.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                    {
+                        "type": "function",
+                        "name": "unrelated",
+                        "description": "Unrelated MCP tool.",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
                 ],
                 MappingProxyType(
                     {
                         "list_email_obligations": (
                             "mcp__law_firm_ops__list_email_obligations"
-                        )
+                        ),
+                        "get_email_obligation": "mcp__law_firm_ops__get_email_obligation",
+                        "unrelated": "mcp__other__unrelated",
+                    }
+                ),
+                True,
+                frozenset(
+                    {
+                        "mcp__law_firm_ops__list_email_obligations",
+                        "mcp__law_firm_ops__get_email_obligation",
                     }
                 ),
             ),
@@ -452,25 +586,72 @@ class TestConfiguredMcpDynamicTools:
         )
 
         handler = captured["dynamic_tool_handler"]
-        assert handler("list_email_obligations", {"status": "open"}, "call-1") == "ok"
+        assert handler("list_email_obligations", {"view": "open"}, "call-1") == "ok"
         assert dispatched == [
             (
-                ("mcp__law_firm_ops__list_email_obligations", {"status": "open"}, "task-1"),
+                (
+                    "mcp__law_firm_ops__list_email_obligations",
+                    {"view": "open", "origin_session_id": "session-1"},
+                    "task-1",
+                ),
                 {
                     "tool_call_id": "call-1",
                     "session_id": "session-1",
-                    "enabled_tools": ["mcp__law_firm_ops__list_email_obligations"],
+                    "enabled_tools": [
+                        "mcp__law_firm_ops__get_email_obligation",
+                        "mcp__law_firm_ops__list_email_obligations",
+                        "mcp__other__unrelated",
+                    ],
                     "enabled_toolsets": ["law-firm-ops"],
                     "disabled_toolsets": None,
                 },
-            )
+            ),
         ]
         with pytest.raises(ValueError, match="unknown Codex dynamic tool"):
             handler("unknown", {}, "call-2")
-        assert len(dispatched) == 1
+        with pytest.raises(ValueError, match="model-supplied origin_session_id"):
+            handler(
+                "list_email_obligations",
+                {"origin_session_id": "model-supplied"},
+                "call-3",
+            )
+        with pytest.raises(ValueError, match="model-supplied origin_session_id"):
+            handler(
+                "get_email_obligation",
+                {"origin_session_id": "caller-supplied"},
+                "call-4",
+            )
+        assert handler("get_email_obligation", {}, "call-5") == "ok"
+        assert dispatched[1] == (
+            (
+                "mcp__law_firm_ops__get_email_obligation",
+                {"origin_session_id": "session-1"},
+                "task-1",
+            ),
+            {
+                "tool_call_id": "call-5",
+                "session_id": "session-1",
+                "enabled_tools": [
+                    "mcp__law_firm_ops__get_email_obligation",
+                    "mcp__law_firm_ops__list_email_obligations",
+                    "mcp__other__unrelated",
+                ],
+                "enabled_toolsets": ["law-firm-ops"],
+                "disabled_toolsets": None,
+            },
+        )
+        assert handler("unrelated", {"origin_session_id": "caller-supplied"}, "call-6") == "ok"
+        assert dispatched[2][0][1] == {"origin_session_id": "caller-supplied"}
+        agent.session_id = ""
+        with pytest.raises(ValueError, match="missing trusted Hermes session id"):
+            handler("list_email_obligations", {"view": "open"}, "call-4")
+        assert len(dispatched) == 3
         assert [tool["name"] for tool in captured["dynamic_tools"]] == [
-            "list_email_obligations"
+            "list_email_obligations",
+            "get_email_obligation",
+            "unrelated",
         ]
+        assert captured["restrict_native_tools"] is True
 
 
 class TestSpawnEnvIsolation:

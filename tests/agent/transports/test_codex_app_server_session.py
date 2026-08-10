@@ -183,6 +183,7 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+        assert "environments" not in params
         receipt = next(
             json.loads(record.message.partition("=")[2])
             for record in caplog.records
@@ -217,6 +218,7 @@ class TestLifecycle:
         assert params["developerInstructions"] == "SENSITIVE INSTRUCTIONS"
         assert params["dynamicTools"] == dynamic_tools
         assert "outlook" not in str(params["dynamicTools"]).lower()
+        assert "environments" not in params
         assert client.initialize_kwargs["capabilities"] == {"experimentalApi": True}
         assert "permissions" not in client.initialize_kwargs
         receipt_records = [
@@ -250,6 +252,29 @@ class TestLifecycle:
         )
         assert receipt["dynamic_tools_explicit"] is True
         assert receipt["dynamic_tool_names"] == []
+
+    def test_thread_start_disables_native_environments_for_mcp_only_selection(self):
+        client = FakeClient()
+        s = make_session(
+            client,
+            dynamic_tools=[
+                {"type": "function", "name": "list_email_obligations"},
+                {"type": "function", "name": "get_email_obligation"},
+                {"type": "function", "name": "get_email_obligation_monitor_status"},
+            ],
+            restrict_native_tools=True,
+        )
+        s.ensure_started()
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["dynamicTools"] == [
+            {"type": "function", "name": "list_email_obligations"},
+            {"type": "function", "name": "get_email_obligation"},
+            {"type": "function", "name": "get_email_obligation_monitor_status"},
+        ]
+        assert {tool["name"] for tool in params["dynamicTools"]}.isdisjoint(
+            {"exec_command", "shell", "terminal", "tool_search", "tool_describe", "tool_call"}
+        )
+        assert params["environments"] == []
 
     def test_session_uses_private_codex_home(self):
         client = FakeClient()
