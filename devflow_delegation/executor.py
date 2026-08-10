@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Protocol, Sequence
@@ -309,8 +310,12 @@ def _planned_rows(ledger: DelegationLedger) -> list[Dict[str, Any]]:
     return sorted(ledger.list_requests(state="PLANNED", limit=200), key=lambda row: (row["created_at"], row["request_id"]))
 
 
-def _target_is_eligible(row: Dict[str, Any], allowlist: Allowlist, pr_client: Optional[PrClient]) -> bool:
-    if pr_client is None or row.get("source_kind") not in EXECUTOR_ALLOWED_SOURCES:
+def _target_is_eligible(row: Dict[str, Any], allowlist: Allowlist, pr_client: Optional[PrClient], mode: str) -> bool:
+    if row.get("source_kind") not in EXECUTOR_ALLOWED_SOURCES:
+        return False
+    # Canary opens a real PR and therefore requires an injected client; shadow
+    # never pushes and is eligible without one.
+    if mode == "canary" and pr_client is None:
         return False
     target = resolve_target(allowlist, str(row.get("target_repo") or ""))
     if target is None:
@@ -319,12 +324,14 @@ def _target_is_eligible(row: Dict[str, Any], allowlist: Allowlist, pr_client: Op
         return False
     return (
         target.executor_enabled
-        and target.synthetic_fixture
+        and (target.synthetic_fixture or target.canary_real)
         and not target.live_gateway_imports
         and target.max_autonomous_action == "create_pr"
         and bool(target.implementation_command)
         and bool(target.github_repo)
         and bool(target.worktree_base)
+        and bool(target.allowed_globs)
+        and (target.pr_budget >= 1 if target.canary_real else True)
     )
 
 
@@ -349,6 +356,38 @@ def _mark_failed(
         logger.exception("failed to record executor failure for %s", request_id)
 
 
+def _diff_line_count(worktree_path: Path, paths: Sequence[str]) -> int:
+    """Best-effort added+removed line count for the scoped shadow change.
+
+    ``git add -N`` (intent-to-add) surfaces untracked files in the diff without
+    committing; the worktree is disposable and removed in the caller's finally
+    block, so mutating its index here has no lasting effect.
+    """
+    if not paths:
+        return 0
+    _run_checked(["git", "add", "-N", "--", *paths], cwd=worktree_path, timeout_seconds=20, label="git add intent")
+    numstat = _run_checked(["git", "diff", "--numstat", "--", *paths], cwd=worktree_path, timeout_seconds=20, label="git diff numstat")
+    total = 0
+    for line in numstat.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        added, removed = parts[0].strip(), parts[1].strip()
+        total += (int(added) if added.isdigit() else 0) + (int(removed) if removed.isdigit() else 0)
+    return total
+
+
+def _shadow_ref(paths_count: int, lines: int, branch: str, title: str) -> str:
+    """Compact, leak-free shadow evidence: counts + safe branch + sanitized title.
+
+    Deliberately excludes absolute paths, file contents, prompts, and model
+    details, matching the projection's sanitization posture.
+    """
+    safe_title = re.sub(r"\s+", " ", str(title or "")).strip()[:80]
+    safe_title = "".join(ch for ch in safe_title if ch.isprintable())
+    return f"paths={paths_count} lines={lines} branch={branch} title={safe_title}"
+
+
 def run_executor_tick(
     ledger: DelegationLedger,
     allowlist: Allowlist,
@@ -357,16 +396,28 @@ def run_executor_tick(
     actor: str = "ddp.executor",
     policy_version: str = "policy-v1",
     pr_client: Optional[PrClient] = None,
+    mode: str = "shadow",
+    request_id: Optional[str] = None,
 ) -> Dict[str, int]:
-    """Process one eligible synthetic request, stopping at ``MERGE_PENDING``.
+    """Process one eligible request.
 
-    Without an injected PR client or an enabled synthetic target this function is
-    a safe no-op. It never converts an absent PR into ledger state.
+    ``mode="shadow"`` (default) runs the pipeline to ``VALIDATED``, records a
+    leak-free ``shadow`` artifact, and STOPS — no push, no PR, no remote side
+    effect; eligible without a ``pr_client``. ``mode="canary"`` runs the full
+    path to ``MERGE_PENDING`` and requires an injected ``pr_client`` plus an
+    available PR budget. An unknown mode is a safe no-op. ``request_id``
+    restricts selection to one designated request.
     """
+    if mode not in {"shadow", "canary"}:
+        return {"processed": 0, "errors": 0, "skipped": 0}
+
     skipped = 0
     row: Optional[Dict[str, Any]] = None
-    for candidate in _planned_rows(ledger):
-        if _target_is_eligible(candidate, allowlist, pr_client):
+    candidates = _planned_rows(ledger)
+    if request_id is not None:
+        candidates = [c for c in candidates if c["request_id"] == request_id]
+    for candidate in candidates:
+        if _target_is_eligible(candidate, allowlist, pr_client, mode):
             row = candidate
             break
         skipped += 1
@@ -381,6 +432,8 @@ def run_executor_tick(
     branch = ""
     lease: Optional[Dict[str, Any]] = None
     try:
+        envelope = json.loads(row["envelope_json"])
+        title = str(envelope.get("title") or "")
         checkout_path, worktree_base = _validate_target_boundary(target)
         validation_count = sum(len(group) for group in (
             target.test_commands, target.lint_commands, target.typecheck_commands, target.build_commands,
@@ -411,19 +464,25 @@ def run_executor_tick(
             ledger.add_artifact(request_id, "validation", ref)
         transition(ledger, bus, request_id, "VALIDATED", actor=actor, policy_version=policy_version)
 
+        if mode == "shadow":
+            # Shadow stops here: record the intended outcome and take no remote
+            # action. No push, no PR, no lifecycle beyond VALIDATED.
+            lines = _diff_line_count(worktree_path, changed_paths)
+            ledger.add_artifact(request_id, "shadow", _shadow_ref(len(changed_paths), lines, branch, title))
+            return {"processed": 1, "errors": 0, "skipped": skipped}
+
         _stage_commit_push(
-            worktree_path, target, paths=changed_paths,
-            title=json.loads(row["envelope_json"])["title"], request_id=request_id,
+            worktree_path, target, paths=changed_paths, title=title, request_id=request_id,
         )
         if not ledger.renew_heartbeat(request_id, lease["lease_id"], expires_in_seconds=lease_seconds):
             raise ExecutorError("lost lease before PR creation")
 
-        assert pr_client is not None  # eligibility checks it; preserves protocol typing
+        assert pr_client is not None  # eligibility checks it in canary mode
         pr = pr_client.create_pr(
             worktree_path=worktree_path,
             branch=branch,
             base_branch=target.default_branch,
-            title=json.loads(row["envelope_json"])["title"][:160],
+            title=title[:160],
             body=f"Automated DDP Stage 2 PR.\n\nrequest-id: {request_id}",
             repo=target.github_repo,
         )
