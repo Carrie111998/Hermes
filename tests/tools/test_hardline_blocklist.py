@@ -259,6 +259,7 @@ _WINDOWS_DYNAMIC_ROOT_DELETE_BLOCK = [
     "cmd /c rd /s /q %TARGET%\\folder\\..",
     'cmd /c "echo ready && rd /s /q %SYSTEMDRIVE%\\"',
     "cmd /c r^d /s /q %TARGET%",
+    '''powershell -Command 'cmd /c "echo ready & rd /s /q $env:SystemDrive/"' ''',
 ]
 
 
@@ -268,6 +269,7 @@ _WINDOWS_DYNAMIC_ROOT_DELETE_ALLOW = [
     "cmd /c rd /s /q %SystemRoot%\\Temp",
     "cmd /c rd /s /q %TARGET%\\scoped",
     'cmd /c "echo ready & rd /s /q %TARGET%\\scoped"',
+    '''powershell -Command 'cmd /c "echo ready ^& rd /s /q $env:SystemDrive/"' ''',
 ]
 
 

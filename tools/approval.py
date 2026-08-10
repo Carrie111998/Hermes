@@ -515,9 +515,9 @@ _WINDOWS_RD_PAYLOAD_PATTERN = (
 _WINDOWS_RD_PAYLOAD_INVOCATION_PATTERN = (
     _CMDPOS + _WINDOWS_RD_PREFIX + r'(?P<arguments>[^;\n|&)]*)'
 )
-_WINDOWS_CMD_PAYLOAD_PATTERNS = (
-    _WINDOWS_CMD_PREFIX + r'(?P<payload>[^\n]*)',
-    _WINDOWS_POWERSHELL_CMD_PREFIX + r'(?P<payload>[^\n]*)',
+_WINDOWS_CMD_PAYLOAD_SPECS = (
+    (_WINDOWS_CMD_PREFIX + r'(?P<payload>[^\n]*)', False),
+    (_WINDOWS_POWERSHELL_CMD_PREFIX + r'(?P<payload>[^\n]*)', True),
 )
 
 HARDLINE_PATTERNS = [
@@ -579,8 +579,8 @@ _WINDOWS_RD_PAYLOAD_INVOCATION_RE = re.compile(
     _RE_FLAGS,
 )
 _WINDOWS_CMD_PAYLOAD_RES = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in _WINDOWS_CMD_PAYLOAD_PATTERNS
+    (re.compile(pattern, re.IGNORECASE), strips_outer_quote)
+    for pattern, strips_outer_quote in _WINDOWS_CMD_PAYLOAD_SPECS
 )
 _WINDOWS_ARGUMENT_TOKEN_RE = re.compile(r'"[^"]*"|\'[^\']*\'|\S+')
 _WINDOWS_DRIVE_VARIABLE_RE = re.compile(
@@ -634,9 +634,14 @@ def _windows_path_is_root_or_unscoped_dynamic(token: str) -> bool:
 def _windows_cmd_payload_variants(command: str):
     """Yield cmd-owned payloads with cmd escapes and separators exposed."""
     seen: set[str] = set()
-    for payload_re in _WINDOWS_CMD_PAYLOAD_RES:
+    for payload_re, strips_outer_quote in _WINDOWS_CMD_PAYLOAD_RES:
         for match in payload_re.finditer(command):
             payload = match.group("payload").strip()
+            # The PowerShell prefix consumes the opening quote that owns its
+            # command string. Remove the corresponding trailing quote before
+            # checking whether cmd itself wrapped the whole /c payload.
+            if strips_outer_quote and payload.endswith(("\"", "'")):
+                payload = payload[:-1].rstrip()
             if (
                 len(payload) >= 2
                 and payload[0] == payload[-1]
