@@ -354,16 +354,15 @@ class CodexAppServerSession:
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
+            capabilities=(
+                {"experimentalApi": True}
+                if self._dynamic_tools is not None
+                else {}
+            ),
         )
-        # Permission selection is intentionally NOT sent on thread/start.
-        # Two reasons (live-tested against codex 0.130.0):
-        #   1. `thread/start.permissions` is gated behind the experimentalApi
-        #      capability on this codex version — we'd have to opt in during
-        #      initialize and accept the unstable surface.
-        #   2. Even with experimentalApi declared and the correct shape
-        #      (`{"type": "profile", "id": "..."}`, not `{"profileId": ...}`),
-        #      codex requires a matching `[permissions]` table in
-        #      ~/.codex/config.toml or it fails the request with
+        # Explicit dynamicTools requires only experimentalApi (Codex 0.147).
+        # Permissions are intentionally omitted: Codex requires a matching
+        # `[permissions]` table in ~/.codex/config.toml or it fails with
         #      'default_permissions requires a [permissions] table'.
         # Letting codex pick its default (`:read-only` unless the user has
         # configured otherwise in their codex config.toml) is the standard

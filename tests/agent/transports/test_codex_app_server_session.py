@@ -45,6 +45,7 @@ class FakeClient:
 
     # API matching CodexAppServerClient
     def initialize(self, **kwargs):
+        self.initialize_kwargs = kwargs
         self._initialized = True
         return {"userAgent": "fake/0.0.0", "codexHome": "/tmp",
                 "platformOs": "linux", "platformFamily": "unix"}
@@ -172,14 +173,13 @@ class TestLifecycle:
         assert len(method_calls) == 1
 
     def test_thread_start_passes_cwd_only(self, caplog):
-        """thread/start carries cwd. We intentionally do NOT pass `permissions`
-        on this codex version (experimentalApi-gated + requires matching
-        config.toml [permissions] table). Letting codex use its default
-        (read-only unless user configures otherwise) is the documented path."""
+        """Omitted dynamic tools initialize with no capabilities or permissions."""
         client = FakeClient()
         s = make_session(client, permission_profile="workspace-write")
         caplog.set_level(logging.INFO, logger=session_mod.__name__)
         s.ensure_started()
+        assert client.initialize_kwargs["capabilities"] == {}
+        assert "permissions" not in client.initialize_kwargs
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
@@ -217,6 +217,8 @@ class TestLifecycle:
         assert params["developerInstructions"] == "SENSITIVE INSTRUCTIONS"
         assert params["dynamicTools"] == dynamic_tools
         assert "outlook" not in str(params["dynamicTools"]).lower()
+        assert client.initialize_kwargs["capabilities"] == {"experimentalApi": True}
+        assert "permissions" not in client.initialize_kwargs
         receipt_records = [
             record.message
             for record in caplog.records
@@ -239,6 +241,8 @@ class TestLifecycle:
         s.ensure_started()
         _, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["dynamicTools"] == []
+        assert client.initialize_kwargs["capabilities"] == {"experimentalApi": True}
+        assert "permissions" not in client.initialize_kwargs
         receipt = next(
             json.loads(record.message.partition("=")[2])
             for record in caplog.records
