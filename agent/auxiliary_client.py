@@ -5171,6 +5171,13 @@ def _try_main_agent_model_fallback(
         # The thing that failed IS the main model (or the failure was
         # provider-wide) — nothing to fall back to.
         return None, None, ""
+    if task == "vision" and not _main_model_supports_vision(main_provider, main_model):
+        logger.warning(
+            "Auxiliary vision fallback: skipping text-only main model %s/%s",
+            main_provider, main_model,
+        )
+        return None, None, ""
+
     if _is_provider_unhealthy(main_provider):
         _log_skip_unhealthy(main_provider, task)
         return None, None, ""
