@@ -1,0 +1,23 @@
+name: finance_records
+version: 0.1.0
+description: "Safe Telegram finance message recorder for Japanese income/expense/repayment messages. Dry-run by default; live Google Sheets writes fail closed unless explicitly enabled and mapped."
+author: NousResearch
+kind: backend
+hooks:
+  - pre_gateway_dispatch
+optional_env:
+  FINANCE_ALLOWED_TELEGRAM_CHAT_IDS:
+    description: "Comma-separated Telegram chat IDs allowed to be parsed/recorded. Unset means no finance processing."
+  FINANCE_TIMEZONE:
+    description: "IANA timezone for date parsing; defaults to Asia/Tokyo."
+  FINANCE_DRY_RUN:
+    description: "Defaults true. Keep true for fake/dry-run storage."
+  FINANCE_SHEETS_ENABLED:
+    description: "Defaults false. Must be true with FINANCE_DRY_RUN=false for live Sheets attempts."
+  CASHFLOW_SPREADSHEET_ID:
+    description: "Cashflow spreadsheet ID; defaults to the documented finance workbook ID."
+  REPAYMENT_SPREADSHEET_ID:
+    description: "Repayment spreadsheet ID; defaults to the documented repayment workbook ID."
+  GOOGLE_APPLICATION_CREDENTIALS:
+    description: "Path to a Google service-account JSON file for live mode. Do not commit this file."
+    password: true
