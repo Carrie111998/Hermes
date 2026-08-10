@@ -574,11 +574,23 @@ def _run_curses_menu(
                     key = stdscr.getch()
 
                     if search.active:
-                        # Active search consumes query-editing keys; nav keys
-                        # fall through to be decoded below.
-                        handled, confirm, changed = _handle_active_search_key(
-                            curses, key, search
+                        # A raw 27 is ambiguous: it is either a lone ESC or the
+                        # introducer of a CSI/SS3 cursor sequence, which is how
+                        # many terminals still deliver arrow keys (see
+                        # _decode_menu_key). Run the continuation probe FIRST so
+                        # an arrow press moves the cursor instead of being read
+                        # as "stop searching and wipe the query".
+                        esc_action = (
+                            _decode_menu_key(stdscr, key) if key == 27 else None
                         )
+                        if esc_action is not None and esc_action != NAV_CANCEL:
+                            handled = confirm = changed = False
+                        else:
+                            # Active search consumes query-editing keys; nav keys
+                            # fall through to be decoded below.
+                            handled, confirm, changed = _handle_active_search_key(
+                                curses, key, search
+                            )
                         if changed:
                             scroll_offset = 0
                             cursor, cursor_pos = _reconcile_cursor(
@@ -593,7 +605,13 @@ def _run_curses_menu(
                             continue
                         if handled:
                             continue
-                        action = _decode_menu_key(stdscr, key)
+                        # An already-decoded ESC sequence must not be decoded a
+                        # second time — its bytes are gone from the queue.
+                        action = (
+                            esc_action
+                            if esc_action is not None
+                            else _decode_menu_key(stdscr, key)
+                        )
                     elif key == ord("/"):
                         search.active = True
                         continue
