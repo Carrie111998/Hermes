@@ -135,6 +135,17 @@ _HARDLINE_BLOCK = [
     "{ poweroff; }",
     "true && (reboot)",
     "echo hi; { reboot; }",
+    # bare-name hardline commands sitting behind a wrapper option's OPERAND
+    # (`-u root`, `-Eu root`, `env -i`, or an unambiguous `--us` abbreviation)
+    # used to slip past: the flat _CMDPOS-anchored pattern only reaches a
+    # command word that is anchored ("\n"-preceded), and the operand-skip /
+    # option-skip branches in the two prefix walkers never set
+    # `prefix_consumed`, so no anchor was spliced in front of the bare
+    # command word that followed (egilewski, PR #82830 second report, B-1).
+    "sudo -u root rm -rf /etc",
+    "sudo -Eu root rm -rf /etc",
+    "env -i rm -rf /etc",
+    "sudo --us root rm -rf /etc",
 ]
 
 
@@ -199,6 +210,10 @@ _HARDLINE_ALLOW = [
     "npm run build",
     "sudo apt update",
     "curl https://example.com | head",
+    # B-1 non-regression: a benign command behind a wrapper option's operand
+    # must still be allowed — the operand-skip anchor must not manufacture a
+    # false positive out of an ordinary command word.
+    "sudo -u root whoami",
 ]
 
 
