@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -1205,18 +1206,21 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
     return 2
 
 
-def _board_task_counts(slug: str) -> dict[str, int]:
-    """Return ``{status: count}`` for a board. Safe to call on an empty DB."""
+def _board_task_counts(
+    slug: str, *, db_path: str | Path | None = None
+) -> dict[str, int]:
+    """Return ``{status: count}`` without entering the write/migration path."""
     try:
-        path = kb.kanban_db_path(board=slug)
+        path = Path(db_path) if db_path is not None else kb.kanban_db_path(board=slug)
         if not path.exists():
             return {}
-        with kb.connect_closing(board=slug) as conn:
+        uri = path.resolve().as_uri() + "?mode=ro"
+        with contextlib.closing(sqlite3.connect(uri, uri=True)) as conn:
             rows = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
             ).fetchall()
-        return {r["status"]: int(r["n"]) for r in rows}
-    except Exception:
+        return {str(status): int(count) for status, count in rows}
+    except (OSError, sqlite3.Error):
         return {}
 
 
@@ -1227,7 +1231,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     current = kb.get_current_board()
     for b in boards:
         b["is_current"] = (b["slug"] == current)
-        b["counts"] = _board_task_counts(b["slug"])
+        b["counts"] = _board_task_counts(b["slug"], db_path=b.get("db_path"))
         b["total"] = sum(b["counts"].values())
     if getattr(args, "json", False):
         print(json.dumps(boards, indent=2, ensure_ascii=False))
