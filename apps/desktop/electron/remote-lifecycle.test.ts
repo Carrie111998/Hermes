@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import { exec as nodeExec } from 'node:child_process'
+import { exec as nodeExec, spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import { promisify } from 'node:util'
 
 import { test } from 'vitest'
@@ -265,15 +268,23 @@ test('locateHermes uses a login shell for the command -v probe', async () => {
   )
 })
 
-test('probeRemotePlatform accepts Linux and macOS', async () => {
+test('probeRemotePlatform accepts Linux only for replacement backends', async () => {
   assert.deepEqual(await probeRemotePlatform(fakeSsh([[/uname/, 'Linux\nx86_64']])), {
     os: 'Linux',
     arch: 'x86_64'
   })
-  assert.deepEqual(await probeRemotePlatform(fakeSsh([[/uname/, 'Darwin\narm64']])), {
-    os: 'Darwin',
-    arch: 'arm64'
-  })
+})
+
+test('probeRemotePlatform rejects Darwin as unsupported replacement platform', async () => {
+  await assert.rejects(
+    () => probeRemotePlatform(fakeSsh([[/uname/, 'Darwin\narm64']])),
+    (err: any) => {
+      assert.equal(err.kind, 'unsupported-platform')
+      assert.match(String(err.message), /Darwin|macOS|pidfd|replacement/i)
+
+      return true
+    }
+  )
 })
 
 test('probeRemotePlatform rejects unsupported remote platforms', async () => {
@@ -1448,22 +1459,38 @@ test('adversarial stale takeover loses the original owner mutation fence', async
   assert.equal(mutate, 2)
 })
 
-test('Darwin termination path is identity-stable without pidfd', async () => {
+test('non-pidfd termination fails closed as UNSUPPORTED (no prove-then-kill)', async () => {
   const lock = ownedLock({ pid: 5 })
 
   const ssh = fakeSsh([
     [/terminate_result|pidfd_open/, (command: string) => {
       assert.match(command, /pidfd_open/)
-      assert.match(command, /ps","-o","lstart=|ps.*lstart/)
-      assert.match(command, /signal\.SIGTERM|SIGTERM/)
+      assert.match(command, /UNSUPPORTED/)
+      assert.match(command, /finish\(["']UNSUPPORTED["']\)/)
+      // Non-pidfd branch must finish UNSUPPORTED without a post-proof signal.
+      const nonPidfd = command.split('AttributeError,NotImplementedError,OSError')[1] || ''
+      assert.match(nonPidfd, /UNSUPPORTED/)
+      assert.ok(!/os\.k[i]ll\(pid,\s*signal\.SIGTERM\)/.test(nonPidfd))
 
-      // Simulate non-pidfd host falling through to Darwin path and succeeding.
-      return 'TERMINATED\n'
+      return 'UNSUPPORTED\n'
     }]
   ])
 
   const result = await terminateOwnedProcess(ssh, lock)
-  assert.equal(result, 'TERMINATED')
+  assert.equal(result, 'UNSUPPORTED')
+})
+
+test('cleanupStale surfaces unsupported-platform when termination lacks pidfd', async () => {
+  const lock = ownedLock({ pid: 5 })
+  const ssh = fakeSsh([
+    [/print\("OK" if ok else "SHAPE"\)/, ownedIdentityOut()],
+    [/terminate_result|pidfd_open/, 'UNSUPPORTED\n']
+  ])
+
+  await assert.rejects(
+    () => cleanupStale(ssh, OWNERSHIP_ID, lock, true),
+    (err: any) => err.kind === 'unsupported-platform'
+  )
 })
 
 test('lease-fenced termination checks owner-epoch token under flock', async () => {
@@ -1488,3 +1515,190 @@ test('lease-fenced termination checks owner-epoch token under flock', async () =
   const result = await terminateOwnedProcess(ssh, lock, lease)
   assert.equal(result, 'LOST')
 })
+
+
+// ---------------------------------------------------------------------------
+// Real two-process / local-helper owner-epoch adversarial interleavings.
+// Executes production Python fencing helpers against a real temp HOME so tests
+// fail if token fencing is removed from spawn/write/remove/heartbeat paths.
+// ---------------------------------------------------------------------------
+
+function makeTempHome() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-owner-epoch-'))
+}
+
+function rmTempHome(home: string) {
+  fs.rmSync(home, { recursive: true, force: true })
+}
+
+/** SSH stub that actually runs remote python3 -c helpers against a temp HOME. */
+function localHelperSsh(home: string) {
+  const calls: string[] = []
+
+  return {
+    calls,
+    async exec(command: string, options: any = {}) {
+      calls.push(command)
+      const result = spawnSync('bash', ['-lc', command], {
+        encoding: 'utf8',
+        input: options?.stdinData,
+        env: { ...process.env, HOME: home },
+        timeout: 15_000
+      })
+
+      if (result.status !== 0 && result.status !== null) {
+        const err: any = new Error(result.stderr || result.stdout || `exit ${result.status}`)
+        err.status = result.status
+        throw err
+      }
+
+      return result.stdout || ''
+    }
+  }
+}
+
+function mutexPathFor(home: string) {
+  return path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID, 'lifecycle.mutex')
+}
+
+function readMutex(home: string) {
+  return fs.readFileSync(mutexPathFor(home), 'utf8').trim()
+}
+
+test('real local-helper: stale takeover rewrites inode; prior owner heartbeat LOST', async () => {
+  const home = makeTempHome()
+  try {
+    const sshA = localHelperSsh(home)
+    const sshB = localHelperSsh(home)
+    let leaseAToken = ''
+    let successorWrote = false
+
+    // Outer owner A is expected to end in ownership-conflict after B reclaims.
+    await assert.rejects(
+      () => withOwnershipMutex(sshA as any, OWNERSHIP_ID, async leaseA => {
+        leaseAToken = leaseA.token
+        assert.equal(readMutex(home), leaseA.token)
+
+        // Force lease stale for successor reclaim (same inode rewrite).
+        const p = mutexPathFor(home)
+        const past = Math.floor(Date.now() / 1000) - 10_000
+        fs.utimesSync(p, past, past)
+
+        await withOwnershipMutex(sshB as any, OWNERSHIP_ID, async leaseB => {
+          assert.notEqual(leaseB.token, leaseAToken)
+          assert.equal(readMutex(home), leaseB.token)
+
+          // Successor fenced write must succeed under the new epoch.
+          await writeLockfile(sshB as any, OWNERSHIP_ID, ownedLock({ pid: 22, port: 2 }), leaseB)
+          const lockPath = path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID, 'backend.lock.json')
+          assert.equal(JSON.parse(fs.readFileSync(lockPath, 'utf8')).pid, 22)
+          successorWrote = true
+          return 'b-ok'
+        }, { heartbeatMs: 60_000 })
+
+        // Stale owner heartbeat must LOST (token mismatch under flock).
+        await leaseA.assertHeld()
+      }, { heartbeatMs: 60_000 }),
+      (err: any) => err.kind === 'ownership-conflict'
+    )
+
+    assert.equal(successorWrote, true)
+    // After B releases, mutex file may be gone; the important proof is conflict + write.
+  } finally {
+    rmTempHome(home)
+  }
+})
+
+test('real local-helper: fenced remove LOST after concurrent successor reclaim', async () => {
+  const home = makeTempHome()
+  try {
+    const sshA = localHelperSsh(home)
+    const sshB = localHelperSsh(home)
+    const lockPath = path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID, 'backend.lock.json')
+
+    await assert.rejects(
+      () => withOwnershipMutex(sshA as any, OWNERSHIP_ID, async leaseA => {
+        await writeLockfile(sshA as any, OWNERSHIP_ID, ownedLock({ pid: 7, port: 9 }), leaseA)
+        assert.ok(fs.existsSync(lockPath))
+
+        const p = mutexPathFor(home)
+        const past = Math.floor(Date.now() / 1000) - 10_000
+        fs.utimesSync(p, past, past)
+
+        await withOwnershipMutex(sshB as any, OWNERSHIP_ID, async leaseB => {
+          assert.equal(readMutex(home), leaseB.token)
+          // B keeps the lock evidence while holding the new epoch.
+          assert.ok(fs.existsSync(lockPath))
+          return 'ok'
+        }, { heartbeatMs: 60_000 })
+
+        // Stale owner cannot fence-remove after successor reclaim.
+        await cleanupStale(sshA as any, OWNERSHIP_ID, ownedLock({ pid: 7, port: 9 }), false, leaseA)
+      }, { heartbeatMs: 60_000 }),
+      (err: any) => err.kind === 'ownership-conflict'
+    )
+
+    // Lock evidence remains because stale owner could not complete fenced remove.
+    assert.ok(fs.existsSync(lockPath))
+  } finally {
+    rmTempHome(home)
+  }
+})
+
+test('real local-helper: unfenced mutation helper would not LOST (fencing required)', async () => {
+  // Negative control: a mutation that skips token compare can still write after
+  // takeover. Documents why production paths must keep lease_token fencing.
+  const home = makeTempHome()
+  try {
+    const dir = path.join(home, '.hermes', 'desktop-ssh', OWNERSHIP_ID)
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const mutex = path.join(dir, 'lifecycle.mutex')
+    fs.writeFileSync(mutex, 'ownerB:epochB', { mode: 0o600 })
+    const target = path.join(dir, 'unfenced.txt')
+
+    const unfenced = `
+import os
+p=os.path.expanduser(${JSON.stringify('~/.hermes/desktop-ssh/' + OWNERSHIP_ID + '/unfenced.txt')})
+os.makedirs(os.path.dirname(p), exist_ok=True)
+open(p,'w').write('bad')
+print('WROTE')
+`
+    const result = spawnSync('python3', ['-c', unfenced], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home }
+    })
+    assert.equal(result.status, 0)
+    assert.equal(fs.readFileSync(target, 'utf8'), 'bad')
+
+    // Fenced equivalent must LOST against successor token.
+    const fenced = `
+import os,sys
+try:
+ import fcntl
+except ImportError:
+ fcntl=None
+p=os.path.expanduser(${JSON.stringify('~/.hermes/desktop-ssh/' + OWNERSHIP_ID + '/lifecycle.mutex')})
+lease_token='ownerA:stale'
+try:
+ lease_fd=os.open(p,os.O_RDWR)
+except OSError:
+ print('LOST'); raise SystemExit(0)
+if fcntl is not None:
+ fcntl.flock(lease_fd,fcntl.LOCK_EX)
+data=os.read(lease_fd,4096).decode().strip()
+if data!=lease_token:
+ os.close(lease_fd)
+ print('LOST'); raise SystemExit(0)
+os.close(lease_fd)
+print('HELD')
+`
+    const fencedResult = spawnSync('python3', ['-c', fenced], {
+      encoding: 'utf8',
+      env: { ...process.env, HOME: home }
+    })
+    assert.match(String(fencedResult.stdout || ''), /LOST/)
+  } finally {
+    rmTempHome(home)
+  }
+})
+
