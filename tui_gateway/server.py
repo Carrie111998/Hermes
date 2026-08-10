@@ -4834,16 +4834,16 @@ def _compress_session_history(
         return 0, usage
     partial, keep_last, focus_topic = parse_partial_compress_args(focus_topic or "")
     # Boundary-aware split: only the head is summarized; the most recent
-    # `keep_last` exchanges ride along verbatim. A degenerate split (empty
-    # tail — everything would be kept, or no head left to compress) falls
-    # back to full compression so the user still gets an action.
+    # `keep_last` exchanges ride along verbatim. If no head remains to
+    # summarize, honor the protected-tail request with a no-op instead of
+    # silently falling back to full compression.
     tail: list = []
     head = history
     if partial:
         head, tail = split_history_for_partial_compress(history, keep_last)
         if not tail:
-            partial = False
-            head = history
+            usage = _get_usage(agent)
+            return 0, usage
     if approx_tokens is None:
         # Include system prompt + tool schemas so the figure reflects real
         # request pressure, not a transcript-only underestimate (#6217).
