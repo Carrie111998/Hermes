@@ -28,7 +28,7 @@ Harness vive **dentro deste repo** (`hermes-agent/harness/`).
 ## Pendências
 
 - D-007: `.git/info/exclude` para `harness/` (recomendado)
-- Próxima skill: `hermes-test-slice`
+- Próximo: pluginizar patches Hermes One (D-004)
 
 ## Boot / retomada
 

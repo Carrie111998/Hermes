@@ -19,6 +19,10 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 | D-011 | 2026-08-10 | Branch `local/harness` criada com patches Hermes One + harness/ | Esta sessão |
 | D-012 | 2026-08-10 | Skill `hermes-gateway-ops` implementada (status/logs/restart) | Esta sessão |
 | D-013 | 2026-08-10 | Skill `hermes-credential-audit` implementada (pool sem expor tokens) | Esta sessão |
+| D-014 | 2026-08-10 | Config migrada v33→v34 via `hermes doctor --fix` | Esta sessão |
+| D-015 | 2026-08-10 | Skill `hermes-cron-audit` implementada (jobs paused/overdue/ticker) | Esta sessão |
+| D-016 | 2026-08-10 | `hermes update` + restart gateway; branch `local/harness` restaurada pós-update | Esta sessão |
+| D-017 | 2026-08-10 | Cron jobs Codex usam **`gpt-5.5`**, não `gpt-5.2-codex` (conta ChatGPT) | `codex_models.py` + run ok |
 
 ## Pendentes
 
@@ -34,6 +38,7 @@ Registro de decisões do harness agêntico local. Atualizar a cada portão de ap
 
 ## Próximo passo
 
-1. **`hermes doctor --fix`** — migrar config v33→v34 (opcional)
-2. Skill **`hermes-cron-audit`**
-3. Pluginizar patches Hermes One (D-004 follow-up)
+1. **Commit** harness (cron-audit + docs) na `local/harness`
+2. Definir `model.default: gpt-5.5` em config.yaml
+3. `hermes update` — SQLite WAL-reset (parar gateway antes)
+4. Pluginizar patches Hermes One (D-004 follow-up)

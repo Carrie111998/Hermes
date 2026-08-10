@@ -83,6 +83,30 @@
 | `model.provider=openai-codex` | OK — config.yaml atualizado |
 | Handoff | OK — `RETOMADA_SESSAO.md` atualizado |
 
+### 2026-08-10 — Skill hermes-cron-audit + v34 + update
+
+| Passo | Resultado |
+|---|---|
+| `hermes doctor --fix` | OK — config v33→v34 |
+| Script `hermes_cron_audit.py` | OK — 6 jobs, ticker healthy |
+| Skill Cursor | OK — `~/.cursor/skills/hermes-cron-audit/` |
+| Cron edit (sem model) | OK — 4709e6e007c8, 0c6cbfc15cae → openai-codex/gpt-5.2-codex |
+| `hermes update` | OK — already up to date; ⚠ trocou para `main` (restaurado) |
+| Gateway restart | OK — default + profiles |
+
+**Próximo passo:** pluginizar patches (D-004) ou definir `model.default`
+
+### 2026-08-10 — Fix model Codex + validação cron
+
+| Passo | Resultado |
+|---|---|
+| Cron edit → `gpt-5.5` | OK — 4709e6e007c8, 0c6cbfc15cae (gpt-5.2-codex rejeitado) |
+| `hermes cron run 4709e6e007c8` | OK — succeeded |
+| Auditoria pós-fix | OK — job fora de `failed_ids`; só 619f7053817f stale |
+| Handoff | OK — `RETOMADA_SESSAO.md` atualizado |
+
+**Próximo passo:** commit harness (cron-audit + docs) na `local/harness`
+
 ### 2026-08-10 — Fim de sessão
 
 Handoff completo em `registros/RETOMADA_SESSAO.md`. Continuar em nova janela Cursor.
