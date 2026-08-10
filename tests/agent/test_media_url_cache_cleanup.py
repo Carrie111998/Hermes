@@ -42,6 +42,7 @@ def test_truncated_stream_does_not_leave_partial_cache_file(
     response = MagicMock()
     response.headers = {"Content-Type": content_type}
     response.raise_for_status.return_value = None
+    response.__enter__.return_value = response
 
     def truncated_chunks(*, chunk_size):
         del chunk_size
@@ -59,6 +60,7 @@ def test_truncated_stream_does_not_leave_partial_cache_file(
         getattr(module, function_name)("https://cdn.example.test/media")
 
     assert list(cache_dir.iterdir()) == []
+    assert response.__exit__.called
 
 
 @pytest.mark.parametrize(
@@ -95,6 +97,7 @@ def test_final_cache_name_is_published_only_after_stream_finishes(
     response = MagicMock()
     response.headers = {"Content-Type": content_type}
     response.raise_for_status.return_value = None
+    response.__enter__.return_value = response
     visible_during_stream = []
 
     def complete_chunks(*, chunk_size):
@@ -117,3 +120,4 @@ def test_final_cache_name_is_published_only_after_stream_finishes(
     assert visible_during_stream[0][0].startswith(".")
     assert visible_during_stream[0][0].endswith(".part")
     assert [path.name for path in cache_dir.iterdir()] == [result.name]
+    assert response.__exit__.called
