@@ -95,6 +95,7 @@ class MemoryPacket:
     evidence: tuple[EvidenceRecord, ...] = ()
     conflicts: tuple[str, ...] = ()
     uncertainties: tuple[str, ...] = ()
+    no_verified_memory: bool = False
 
 
 @dataclass(frozen=True)

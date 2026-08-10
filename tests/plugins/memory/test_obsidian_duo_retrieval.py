@@ -1,0 +1,58 @@
+from plugins.memory.obsidian_duo.contracts import (
+    MemoryRecord,
+    MemoryStatus,
+    RetrievalRequest,
+    Verification,
+)
+from plugins.memory.obsidian_duo.retrieval import MemoryRetriever, RecallClass
+from plugins.memory.obsidian_duo.store import SqliteMemoryStore
+
+
+def test_retrieval_is_scope_aware_and_excludes_superseded(tmp_path):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    store.upsert_memory(
+        MemoryRecord("hud_decision", "HUD drag uses pointer capture", "decision", "project:hermes", verification=Verification.USER_CONFIRMED),
+        "seed",
+    )
+    store.upsert_memory(
+        MemoryRecord("hud_old", "HUD drag used polling", "decision", "project:hermes", status=MemoryStatus.SUPERSEDED),
+        "seed",
+    )
+    store.upsert_memory(
+        MemoryRecord("other", "Pointer capture in another project", "lesson", "project:other"),
+        "seed",
+    )
+
+    packet = MemoryRetriever(store).retrieve(
+        RetrievalRequest("HUD drag pointer", scope="project:hermes", max_memories=5)
+    )
+
+    ids = [memory.memory_id for memory in packet.memories]
+    assert ids[0] == "hud_decision"
+    assert "hud_old" not in ids
+    assert "other" not in ids
+
+
+def test_retrieval_surfaces_conflicts_and_bounded_no_result(tmp_path):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    store.initialize()
+    store.upsert_memory(MemoryRecord("mem_1", "Use blue theme", "preference", "global"), "seed")
+    store.record_conflict("mem_1", "mem_2", "red versus blue")
+    retriever = MemoryRetriever(store)
+
+    packet = retriever.retrieve(RetrievalRequest("blue theme", max_memories=1, max_tokens=3))
+    empty = retriever.retrieve(RetrievalRequest("unrelated spacecraft", max_memories=1))
+
+    assert packet.conflicts == ("mem_1",)
+    assert len(packet.memories) == 1
+    assert empty.no_verified_memory is True
+
+
+def test_query_classification_is_deterministic(tmp_path):
+    store = SqliteMemoryStore(tmp_path / "memory.db")
+    retriever = MemoryRetriever(store)
+
+    assert retriever.classify_query("") is RecallClass.NONE
+    assert retriever.classify_query('"exact decision"') is RecallClass.EXACT
+    assert retriever.classify_query("project:hermes status") is RecallClass.STRUCTURED
