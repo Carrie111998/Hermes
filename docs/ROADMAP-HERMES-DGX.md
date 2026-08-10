@@ -30,6 +30,36 @@
 3. ARCH-003 — audit/replay integration after the shared state boundary is stable.
 4. ARCH-004 — redaction and SQLite/WAL safeguards after the preceding contracts are accepted.
 
+## Broader Hermes product and engineering order
+
+Product priority is deliberately distinct from engineering implementation order.
+
+### Product priority
+
+1. Verify the private Telegram baseline: DM, one allowlisted user, /status,
+   restart recovery.
+2. Gateway plus cron/job health monitoring and failure/recovery alerts.
+3. Mobile HITL for destructive Hermes operations.
+4. Verify voice and file handoff in the real deployment.
+5. Safe remote coding-agent workflow on Spark, including Claude/Codex/AGY,
+   TaskRouter, worktrees, runner supervision, and external CLI HITL.
+6. Team Telegram bot with pairing, per-user sessions, groups, and isolation.
+7. Scheduled briefings and knowledge-base workflows.
+8. Multi-bot or bot-to-bot collaboration last.
+
+### Remote-coding engineering order
+
+1. Capability probes and shared interfaces.
+2. TaskRouter with git worktree isolation and SQLite path leases.
+3. Runner Supervisor.
+4. Claude/Codex/Antigravity AGY adapters.
+5. Approval integration.
+6. Thin Hermes /goal hook without changing the Goal loop.
+7. Telegram/Spark end-to-end validation and health monitoring.
+
+The skills lane supports this roadmap but does not change the product priority,
+the Goal loop, or the TaskRouter implementation order.
+
 ## Long-term skills lane
 
 The consolidated skills roadmap is
