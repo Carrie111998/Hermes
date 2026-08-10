@@ -147,6 +147,21 @@ platforms:
 
 Hermes sends the emoji to the exact originating chat before processing, then sends the final answer normally. Set `BLUEBUBBLES_WORKING_ACK_EMOJI` instead if you prefer an environment variable. Leave both unset to disable it.
 
+### Conversation Allowlist
+
+Restrict Hermes to exact BlueBubbles conversations with `allowed_chat_guids`:
+
+```yaml
+platforms:
+  bluebubbles:
+    extra:
+      allowed_chat_guids:
+        - "any;+;approved-group-guid"
+        - "any;-;approved-direct-address"
+```
+
+When configured, messages from every unlisted group or direct chat are acknowledged by the webhook but ignored before the agent starts, so no working emoji or final answer is sent. Matching ignores only the BlueBubbles service prefix (`any` versus `iMessage`) while preserving the group/direct marker and conversation identifier. `BLUEBUBBLES_ALLOWED_CHAT_GUIDS` accepts a JSON or comma-separated list.
+
 ### Typing Indicators
 Shows "typing..." in the iMessage conversation while the agent is processing. Requires Private API.
 

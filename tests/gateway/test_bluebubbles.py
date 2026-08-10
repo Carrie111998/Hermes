@@ -170,6 +170,76 @@ class TestBlueBubblesWebhookParsing:
         assert second.status == 200
         assert len(handled) == 1
 
+    @pytest.mark.asyncio
+    async def test_chat_allowlist_blocks_unlisted_direct_message(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            send_read_receipts=False,
+            allowed_chat_guids=[
+                "any;+;approved-group",
+                "any;-;+15550000001",
+            ],
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                {
+                    "type": "new-message",
+                    "data": {
+                        "guid": "blocked-dm-message",
+                        "text": "Hello from an unapproved DM",
+                        "handle": {"address": "+15550000002"},
+                        "isFromMe": False,
+                        "isGroup": False,
+                        "chats": [{"guid": "any;-;+15550000002"}],
+                    },
+                }
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_chat_allowlist_accepts_service_alias_for_approved_dm(self, monkeypatch):
+        adapter = _make_adapter(
+            monkeypatch,
+            send_read_receipts=False,
+            allowed_chat_guids=["any;-;+15550000001"],
+        )
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(
+            _FakeBlueBubblesRequest(
+                {
+                    "type": "new-message",
+                    "data": {
+                        "guid": "approved-dm-message",
+                        "text": "Hello from the approved DM",
+                        "handle": {"address": "+15550000001"},
+                        "isFromMe": False,
+                        "isGroup": False,
+                        "chats": [{"guid": "iMessage;-;+15550000001"}],
+                    },
+                }
+            )
+        )
+        await asyncio.sleep(0)
+
+        assert response.status == 200
+        assert len(handled) == 1
+        assert handled[0].source.chat_id == "iMessage;-;+15550000001"
+
     def test_webhook_can_fall_back_to_sender_when_chat_fields_missing(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         payload = {

@@ -196,6 +196,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if _working_ack is None:
             _working_ack = os.getenv("BLUEBUBBLES_WORKING_ACK_EMOJI", "")
         self.working_ack_emoji = str(_working_ack or "").strip()
+        _allowed_chat_guids = extra.get("allowed_chat_guids")
+        if _allowed_chat_guids is None:
+            _allowed_chat_guids = os.getenv("BLUEBUBBLES_ALLOWED_CHAT_GUIDS", "")
+        self._allowed_chat_keys = {
+            self._chat_scope_key(chat_id)
+            for chat_id in self._parse_chat_allowlist(_allowed_chat_guids)
+            if self._chat_scope_key(chat_id)
+        }
         _require_mention = extra.get("require_mention")
         if _require_mention is None:
             _require_mention = os.getenv("BLUEBUBBLES_REQUIRE_MENTION")
@@ -934,6 +942,36 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 return candidate.strip()
         return None
 
+    @staticmethod
+    def _parse_chat_allowlist(value: Any) -> List[str]:
+        """Parse a list or JSON/comma-separated string of allowed chat GUIDs."""
+        if isinstance(value, (list, tuple, set)):
+            return [str(item).strip() for item in value if str(item).strip()]
+        if not value:
+            return []
+        text = str(value).strip()
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, list):
+                return [str(item).strip() for item in parsed if str(item).strip()]
+        return [item.strip() for item in re.split(r"[,\n]", text) if item.strip()]
+
+    @staticmethod
+    def _chat_scope_key(chat_id: Any) -> str:
+        """Normalize a chat GUID while ignoring BlueBubbles' service prefix."""
+        value = str(chat_id or "").strip().casefold()
+        if ";" in value:
+            return value.split(";", 1)[1]
+        return value
+
+    def _chat_is_allowed(self, chat_id: Any) -> bool:
+        if not self._allowed_chat_keys:
+            return True
+        return self._chat_scope_key(chat_id) in self._allowed_chat_keys
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -1088,8 +1126,14 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             while len(self._seen_message_guids) > _SEEN_MESSAGE_GUIDS_SIZE:
                 self._seen_message_guids.popitem(last=False)
 
-        session_chat_id = chat_guid or chat_identifier
+        session_chat_id = str(chat_guid or chat_identifier)
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+        if not self._chat_is_allowed(session_chat_id):
+            logger.info(
+                "[bluebubbles] ignoring message from unapproved chat=%s",
+                _redact(str(session_chat_id)),
+            )
+            return web.Response(text="ok")
         if is_group and self.require_mention:
             if not self._message_matches_mention_patterns(text):
                 logger.debug(
