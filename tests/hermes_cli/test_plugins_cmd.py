@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
+import sys
+import io
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -935,7 +938,135 @@ class TestInstallLoadSmoke:
             "check_fn=lambda: True)\n"
         )
         d = self._write_plugin(tmp_path, body)
-        # The stub ctx is a SimpleNamespace; the real tool registry must be
-        # untouched. We just assert the function returns None (no exception)
-        # and runs register() against the stub.
+        # The stub ctx returns no-ops; the real tool registry must be untouched.
+        # We just assert the function returns None (no exception) and runs
+        # register() against the stub.
         assert _smoke_test_plugin_load(d) is None
+
+    def test_provider_plugin_register_succeeds(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        # A real provider plugin (e.g. plugins/web/firecrawl) calls
+        # ctx.register_web_search_provider(...), which the old 4-method stub
+        # did not expose. The permissive stub must satisfy it.
+        body = (
+            "class _P:\n    pass\n"
+            "def register(ctx):\n"
+            "    ctx.register_web_search_provider(_P())\n"
+            "    ctx.register_platform(_P())\n"
+            "    ctx.register_secret_source(_P())\n"
+        )
+        d = self._write_plugin(tmp_path, body)
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_sys_modules_cleanup(self, tmp_path):
+        import sys
+
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        # A plugin that imports a submodule must not leak module entries into
+        # sys.modules after the smoke test returns.
+        sub = tmp_path / "leaky_plugin"
+        sub.mkdir()
+        (sub / "plugin.yaml").write_text("name: leaky-plugin\nversion: 1.0.0\n")
+        (sub / "__init__.py").write_text(
+            "from . import _helper\n"
+            "def register(ctx):\n    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        (sub / "_helper.py").write_text("VALUE = 1\n")
+
+        module_name = f"_hermes_plugin_smoke_{sub.name}"
+        assert _smoke_test_plugin_load(sub) is None
+        assert module_name not in sys.modules
+        assert f"{module_name}._helper" not in sys.modules
+
+
+class TestCmdInstallConsentGating:
+    """The load smoke test must NOT execute plugin code before the user
+    affirmatively opts in to enabling the plugin.
+
+    Regression guard for the pre-consent execution bug: cmd_install used to
+    call _smoke_test_plugin_load() while enable was still None (before the
+    "Enable now?" prompt), so a plain interactive/non-tty install ran third-
+    party __init__.py/register() for a plugin the user never enabled.
+    """
+
+    class _TtyStringIO(io.StringIO):
+        """StringIO that reports itself as a TTY so cmd_install's prompt runs."""
+
+        def isatty(self) -> bool:  # type: ignore[override]
+            return True
+
+    def _make_good_repo(self, tmp_path) -> str:
+        import subprocess
+
+        repo_root = tmp_path / "goodrepo"
+        repo_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo_root)],
+            check=True,
+            capture_output=True,
+        )
+        (repo_root / "plugin.yaml").write_text("name: good-plugin\nversion: 1.0.0\n")
+        (repo_root / "__init__.py").write_text(
+            "def register(ctx):\n    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-q", "--allow-empty", "-m", "x"],
+            check=True,
+            capture_output=True,
+        )
+        return f"file://{repo_root}"
+
+    def test_non_tty_install_does_not_run_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        # Non-tty stdin -> should_enable resolves to False without prompting.
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        monkeypatch.setattr(sys, "stdout", io.StringIO())
+        pc.cmd_install(self._make_good_repo(tmp_path), force=True)
+        assert calls == [], "smoke test must not run for a non-enabled install"
+
+    def test_declined_prompt_does_not_run_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        # TTY present but user answers 'n' -> should_enable = False.
+        monkeypatch.setattr(sys, "stdin", self._TtyStringIO("n\n"))
+        monkeypatch.setattr(sys, "stdout", self._TtyStringIO())
+        pc.cmd_install(self._make_good_repo(tmp_path), force=True)
+        assert calls == [], "smoke test must not run when enablement is declined"
+
+    def test_affirmative_prompt_runs_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        # User answers 'y' -> should_enable = True -> smoke test runs.
+        monkeypatch.setattr(sys, "stdin", self._TtyStringIO("y\n"))
+        monkeypatch.setattr(sys, "stdout", self._TtyStringIO())
+        pc.cmd_install(self._make_good_repo(tmp_path), force=True)
+        assert len(calls) == 1, "smoke test must run after affirmative enablement"

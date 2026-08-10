@@ -288,6 +288,32 @@ def _read_manifest(plugin_dir: Path) -> dict:
         return {}
 
 
+class _StubPluginContext:
+    """Permissive throwaway context for the install-time load smoke test.
+
+    The real ``PluginContext`` exposes ~18 ``register_*`` methods (tool, hook,
+    command, middleware, web_search_provider, platform, secret_source, …) plus
+    attributes like ``manifest``/``config``/``logger``. Rather than hand-mirror
+    that surface (which silently breaks whenever plugins.py gains a registrar),
+    this stub returns a no-op for any ``register_*`` access and a few other
+    well-known attributes, and raises ``AttributeError`` for anything else.
+    That lets a valid provider/platform/secret-source plugin run ``register()``
+    without mutating the live tool registry.
+    """
+
+    def __init__(self, name: str):
+        self.manifest = {"name": name}
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("register_") or attr in {
+            "get_config",
+            "get_secret",
+            "logger",
+        }:
+            return lambda *a, **k: None
+        raise AttributeError(attr)
+
+
 def _smoke_test_plugin_load(plugin_dir: Path) -> Optional[str]:
     """Best-effort load check run at install time.
 
@@ -303,17 +329,16 @@ def _smoke_test_plugin_load(plugin_dir: Path) -> Optional[str]:
     is reported but does NOT block install, matching the existing policy that
     ``requires_env``/manifest warnings don't abort the install.
 
-    The stub context mirrors the real ``PluginContext`` registrar surface
-    (register_tool / register_hook / register_middleware / register_command)
-    with no-ops, so ``register()`` runs without mutating the live tool
-    registry.
+    Callers MUST only invoke this after the user has affirmatively opted in to
+    enabling the plugin (explicit ``--enable`` or a ``y`` at the prompt) — it
+    imports and executes arbitrary third-party plugin code. See cmd_install /
+    dashboard_install_plugin, which gate on the resolved enable flag.
     """
     init_file = plugin_dir / "__init__.py"
     if not init_file.exists():
         return None
 
     import importlib.util
-    import types
 
     module_name = f"_hermes_plugin_smoke_{plugin_dir.name}"
     try:
@@ -324,31 +349,27 @@ def _smoke_test_plugin_load(plugin_dir: Path) -> Optional[str]:
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
     except Exception as exc:  # ImportError, SyntaxError, etc.
+        sys.modules.pop(module_name, None)
         return f"import failed: {type(exc).__name__}: {exc}"
 
-    register_fn = getattr(module, "register", None)
-    if register_fn is None:
-        # No register() — declarative plugin, nothing to exercise.
-        return None
-
-    captured: dict = {}
-
-    def _noop_register(**kwargs):
-        captured[kwargs.get("name")] = kwargs
-
-    stub_ctx = types.SimpleNamespace(
-        register_tool=_noop_register,
-        register_hook=lambda *a, **k: None,
-        register_middleware=lambda *a, **k: None,
-        register_command=lambda *a, **k: None,
-        manifest={"name": plugin_dir.name},
-    )
     try:
+        register_fn = getattr(module, "register", None)
+        if register_fn is None:
+            # No register() — declarative plugin, nothing to exercise.
+            return None
+
+        stub_ctx = _StubPluginContext(plugin_dir.name)
         register_fn(stub_ctx)
     except Exception as exc:
         return f"register() raised: {type(exc).__name__}: {exc}"
     finally:
+        # Avoid leaking the smoke module (and any submodules it imported) into
+        # sys.modules for the life of the process.
         sys.modules.pop(module_name, None)
+        for leaked in [
+            m for m in sys.modules if m.startswith(f"{module_name}.")
+        ]:
+            sys.modules.pop(leaked, None)
     return None
 
 
@@ -710,19 +731,6 @@ def cmd_install(
             f"plugin.json, or __init__.py. It may not be a valid Hermes plugin.",
         )
 
-    # Best-effort load check: catch a plugin whose __init__/register() is
-    # broken so the user sees it at install time, not as a silent skip at
-    # gateway start. Skip it when the plugin is explicitly installed disabled
-    # (enable=False) — running it imports and calls register() on arbitrary
-    # plugin code, so we avoid executing plugin code the user chose not to
-    # enable. For enable=True or interactive install we still run it.
-    load_check = _smoke_test_plugin_load(target) if enable is not False else None
-    if load_check:
-        console.print(
-            f"[yellow]Warning:[/yellow] {installed_name} installed but its "
-            f"load check failed: {load_check}",
-        )
-
     _prompt_plugin_env_vars(installed_manifest, console)
 
     _display_after_install(target, identifier)
@@ -741,6 +749,17 @@ def cmd_install(
             should_enable = False
 
     if should_enable:
+        # Best-effort load check: catch a plugin whose __init__/register() is
+        # broken so the user sees it at install time, not as a silent skip at
+        # gateway start. We only reach here after an affirmative enable
+        # (explicit --enable or a "y" at the prompt), so running it imports
+        # and executes plugin code the user has consented to.
+        load_check = _smoke_test_plugin_load(target)
+        if load_check:
+            console.print(
+                f"[yellow]Warning:[/yellow] {installed_name} enabled but its "
+                f"load check failed: {load_check}",
+            )
         enabled = _get_enabled_set()
         disabled = _get_disabled_set()
         enabled.add(installed_name)
