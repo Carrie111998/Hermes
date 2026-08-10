@@ -430,5 +430,7 @@ SCENES = r"""
 
 html = TEMPLATE.replace("__LIGHT_TOKENS__", LIGHT).replace("__DARK_TOKENS__", DARK).replace("__SCENES__", SCENES)
 out = HERE / "usage-bar-mockup.html"
-out.write_text(html, encoding="utf-8")
+# newline="" keeps LF on disk (Windows write_text would otherwise emit CRLF,
+# which fails the repo's `git diff --check` trailing-whitespace gate).
+out.write_text(html, encoding="utf-8", newline="")
 print(f"wrote {out} ({len(html)} bytes)")
