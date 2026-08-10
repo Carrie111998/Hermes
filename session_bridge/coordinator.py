@@ -79,6 +79,7 @@ from .sidebar_reconciliation import (
 from .preview import build_session_preview
 from .store import (
     SIDEBAR_EXCLUSION_REASONS,
+    LocalSessionOwnsCanonicalId,
     SessionBridgeStore,
     SidebarSource,
     SidebarSourcePage,
@@ -895,6 +896,7 @@ class _SidebarExecutor(Protocol):
 _ProviderHealth = dict[str, float | str | None]
 _RECENT_ERROR_LIMIT = 20
 _CODEX_SCAN_FAILURE_CODE = "codex_scan_failed"
+_CODEX_SCAN_LOCAL_OWNER_CODE = "codex_local_session_owns_id"
 _CODEX_SCAN_STAGES = frozenset({
     "full_history_project",
     "immediate_project",
@@ -4302,6 +4304,7 @@ class SessionBridgeCoordinator:
         indexed = 0
         rebuilt = 0
         failed = 0
+        locally_owned = 0
         for thread_summary in summaries:
             try:
                 projection = await self._provider_call(
@@ -4318,6 +4321,14 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except LocalSessionOwnsCanonicalId:
+                # Hermes materialises its own Codex-provider sessions under the
+                # same canonical id the bridge uses for imported native threads.
+                # The local row is authoritative and is never adopted, but this
+                # is a benign steady state -- counting it as a scan failure
+                # degrades the provider and starves every downstream lane.
+                locally_owned += 1
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="full_history_project",
@@ -4329,6 +4340,17 @@ class SessionBridgeCoordinator:
                 continue
             indexed += 1
             rebuilt += int(not result.first_seen)
+        if locally_owned:
+            # Counted, never silent: these threads stay outside the bridge
+            # catalog by design.
+            try:
+                _LOG.info(
+                    "codex_scan_diagnostic stage=full_history_project code=%s excluded=%d",
+                    _CODEX_SCAN_LOCAL_OWNER_CODE,
+                    locally_owned,
+                )
+            except Exception:
+                pass
         return ScanSummary(
             provider=Provider.CODEX,
             discovered=len(summaries),

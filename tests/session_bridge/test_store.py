@@ -62,6 +62,7 @@ from session_bridge.store import (
     SIDEBAR_EXCLUSION_REASONS,
     SIDEBAR_FATAL_ERRORS,
     SIDEBAR_RETRYABLE_ERRORS,
+    LocalSessionOwnsCanonicalId,
     SessionBridgeStore,
     sidebar_precreate_terminal_evidence_digest,
     sidebar_terminal_evidence_digest,
@@ -75,6 +76,79 @@ def db(tmp_path):
     database = SessionDB(tmp_path / "state.db")
     yield database
     database.close()
+
+
+def _import_projection(
+    native_id: str, *, provider: Provider = Provider.CODEX
+) -> SessionProjection:
+    return SessionProjection(
+        provider=provider,
+        native_id=native_id,
+        title=f"[Codex] imported {native_id}",
+        cwd="C:/workspace/project",
+        started_at=10.0,
+        last_active=20.0,
+        messages=(),
+        native_path=f"C:/{provider.value}/{native_id}.jsonl",
+        native_status="active",
+        native_cursor=f"cursor-{native_id}",
+        native_hash=f"hash-{native_id}",
+        git_branch=None,
+        parser_version=3,
+        origin_kind=OriginKind.NATIVE,
+        origin_bridge_id=None,
+    )
+
+
+def test_upsert_rejects_canonical_id_owned_by_a_different_source(db) -> None:
+    """A genuine collision -- another provider's session holds the canonical id."""
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    projection = _import_projection("019d8db5-d883-7813-b219-09645d5c1aac")
+    store.upsert_projection(projection)
+    session_id = canonical_session_id(Provider.CODEX, projection.native_id)
+    with db._lock:
+        db._conn.execute(
+            "DELETE FROM external_sessions WHERE session_id = ?", (session_id,)
+        )
+        db._conn.execute(
+            "UPDATE sessions SET source = 'claude' WHERE id = ?", (session_id,)
+        )
+        db._conn.commit()
+
+    with pytest.raises(ValueError, match="session ID collision") as excinfo:
+        store.upsert_projection(projection)
+    # A foreign owner is a real conflict, NOT the benign local-owner condition.
+    assert not isinstance(excinfo.value, LocalSessionOwnsCanonicalId)
+
+
+def test_locally_owned_canonical_id_is_distinguishable(db) -> None:
+    """Hermes' own codex-provider sessions occupy `codex:<native_id>` too.
+
+    Both systems legitimately claim one id for the same underlying thread, with
+    different message representations, so the local row is authoritative and is
+    never adopted. It must be distinguishable from a real collision so scans can
+    exclude it instead of failing -- 1,586 such rows were degrading the Codex
+    provider and starving every downstream lane.
+    """
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    projection = _import_projection("019f6bfe-86a5-70d3-8b3f-abe07500dd98")
+    store.upsert_projection(projection)
+    session_id = canonical_session_id(Provider.CODEX, projection.native_id)
+    with db._lock:
+        db._conn.execute(
+            "DELETE FROM external_sessions WHERE session_id = ?", (session_id,)
+        )
+        db._conn.commit()
+
+    with pytest.raises(LocalSessionOwnsCanonicalId):
+        store.upsert_projection(projection)
+
+    # and the local content is left untouched
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT source FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+    assert row["source"] == Provider.CODEX.value
 
 
 def _claude_visibility_identity(

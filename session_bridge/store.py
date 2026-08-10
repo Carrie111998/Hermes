@@ -810,6 +810,23 @@ class SidebarSourcePage(list[SidebarSource]):
         self.next_cursor = next_cursor
 
 
+class LocalSessionOwnsCanonicalId(ValueError):
+    """A local, non-bridge session already materialises this canonical id.
+
+    Hermes writes its own Codex-provider sessions to ``codex:<native_id>`` --
+    the same namespace the bridge uses for imported native Codex threads -- so
+    both systems can legitimately claim one id for the same underlying thread,
+    materialised with different message representations.
+
+    This is neither corruption nor a failed import. The local row holds
+    authoritative content the bridge never wrote (delegation/heartbeat turns,
+    thousands of messages), so it must never be adopted or overwritten. It is a
+    known, benign condition: scans count it as an exclusion rather than a
+    failure, because treating it as a failure degrades the provider and starves
+    every downstream lane that depends on a healthy scan.
+    """
+
+
 class SessionBridgeStore:
     """Transactional persistence for the cross-harness session bridge."""
 
@@ -3421,6 +3438,14 @@ class SessionBridgeStore:
                     and session_row["source"] == provider.value
                 )
                 if not matching_identity:
+                    if (
+                        external_row is None
+                        and session_row["source"] == provider.value
+                    ):
+                        raise LocalSessionOwnsCanonicalId(
+                            "session ID collision for imported session "
+                            f"{session_id!r}"
+                        )
                     raise ValueError(
                         f"session ID collision for imported session {session_id!r}"
                     )
