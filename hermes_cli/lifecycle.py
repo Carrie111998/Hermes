@@ -15,7 +15,10 @@ def invoke_hook(hook_name: str, **kwargs: Any) -> List[Any]:
 
         observe_lifecycle(hook_name, **kwargs)
     except Exception:
-        logger.warning("Built-in observability hook failed", exc_info=True)
+        logger.warning(
+            "Built-in observability hook failed",
+            exc_info=hook_name != "pre_api_request",
+        )
 
     from hermes_cli import plugins
 
@@ -56,7 +59,10 @@ def invoke_hook_enforced(hook_name: str, **kwargs: Any) -> List[Any]:
 
         observe_lifecycle(hook_name, **kwargs)
     except Exception:
-        logger.warning("Built-in observability hook failed", exc_info=True)
+        logger.warning(
+            "Built-in observability hook failed",
+            exc_info=hook_name != "pre_api_request",
+        )
 
     from hermes_cli import plugins
 

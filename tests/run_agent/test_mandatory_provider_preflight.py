@@ -80,7 +80,12 @@ def _response(content: str = "allowed") -> SimpleNamespace:
     return SimpleNamespace(choices=[choice], model="synthetic-response", usage=None)
 
 
-def _run_agent(*, provider: str = "custom", base_url: str = "https://blocked.invalid/v1"):
+def _run_agent(
+    *,
+    provider: str = "custom",
+    base_url: str = "https://blocked.invalid/v1",
+    api_mode: str = "chat_completions",
+):
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -91,7 +96,7 @@ def _run_agent(*, provider: str = "custom", base_url: str = "https://blocked.inv
             provider=provider,
             model="SENTINEL-MODEL",
             base_url=base_url,
-            api_mode="chat_completions",
+            api_mode=api_mode,
             quiet_mode=True,
             skip_context_files=True,
             skip_memory=True,
@@ -102,6 +107,16 @@ def _run_agent(*, provider: str = "custom", base_url: str = "https://blocked.inv
     agent._save_trajectory = MagicMock()
     agent._cleanup_task_resources = MagicMock()
     return agent
+
+
+def _codex_transport_result() -> Dict[str, Any]:
+    return {
+        "final_response": "allowed",
+        "messages": [{"role": "assistant", "content": "allowed"}],
+        "api_calls": 1,
+        "completed": True,
+        "failed": False,
+    }
 
 
 @pytest.mark.parametrize(
@@ -148,6 +163,59 @@ def test_approved_openai_codex_official_route_dispatches_once(tmp_path, monkeypa
     agent.client.chat.completions.create.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_code"),
+    [
+        (None, "mandatory_hook_missing"),
+        ("raise", "mandatory_hook_exception"),
+        ("malformed", "mandatory_hook_malformed_result"),
+        ("block", "mandatory_hook_blocked"),
+    ],
+)
+def test_mandatory_preflight_failures_stop_before_codex_app_server_transport(
+    tmp_path,
+    monkeypatch,
+    mode,
+    expected_code,
+):
+    _configure_home(tmp_path, monkeypatch, mode=mode)
+    agent = _run_agent(api_mode="codex_app_server")
+    transport = MagicMock(return_value=_codex_transport_result())
+    agent._run_codex_app_server_turn = transport
+
+    result = agent.run_conversation("SENTINEL-MESSAGE")
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["failure_reason"] == expected_code
+    assert result["api_calls"] == 0
+    transport.assert_not_called()
+    assert result["final_response"] == result["error"]
+    assert "SENTINEL-CREDENTIAL" not in result["final_response"]
+    assert "opaque-secret-1234567890" not in result["final_response"]
+    assert "https://blocked.invalid" not in result["final_response"]
+
+
+def test_approved_openai_codex_app_server_route_dispatches_once(
+    tmp_path,
+    monkeypatch,
+):
+    _configure_home(tmp_path, monkeypatch, mode="route")
+    agent = _run_agent(
+        provider="openai-codex",
+        base_url=OFFICIAL_CODEX_URL,
+        api_mode="codex_app_server",
+    )
+    transport = MagicMock(return_value=_codex_transport_result())
+    agent._run_codex_app_server_turn = transport
+
+    result = agent.run_conversation("approved request")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "allowed"
+    transport.assert_called_once()
+
+
 def test_malformed_mandatory_hook_config_fails_closed(tmp_path, monkeypatch):
     hermes_home = _configure_home(
         tmp_path, monkeypatch, mode="route", mandatory=False
@@ -173,6 +241,58 @@ def test_malformed_mandatory_hook_config_fails_closed(tmp_path, monkeypatch):
     agent.client.chat.completions.create.assert_not_called()
 
 
+@pytest.mark.parametrize("plugins_value", ["invalid", ["invalid"]])
+def test_malformed_plugins_parent_config_fails_closed(
+    tmp_path,
+    monkeypatch,
+    plugins_value,
+):
+    hermes_home = _configure_home(
+        tmp_path, monkeypatch, mode="route", mandatory=False
+    )
+    (hermes_home / "config.yaml").write_text(
+        yaml.safe_dump({"plugins": plugins_value}),
+        encoding="utf-8",
+    )
+    agent = _run_agent(api_mode="codex_app_server")
+    transport = MagicMock(return_value=_codex_transport_result())
+    agent._run_codex_app_server_turn = transport
+
+    result = agent.run_conversation("must not dispatch")
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "mandatory_hook_config_invalid"
+    assert result["api_calls"] == 0
+    transport.assert_not_called()
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_app_server"])
+def test_unexpected_mandatory_preflight_exception_fails_closed(
+    tmp_path,
+    monkeypatch,
+    api_mode,
+):
+    _configure_home(tmp_path, monkeypatch, mode="route")
+    agent = _run_agent(api_mode=api_mode)
+    transport = MagicMock(return_value=_codex_transport_result())
+    agent._run_codex_app_server_turn = transport
+
+    with patch(
+        "hermes_cli.lifecycle.invoke_hook_enforced",
+        side_effect=RuntimeError("unexpected SENTINEL-CREDENTIAL"),
+    ):
+        result = agent.run_conversation("must not dispatch")
+
+    assert result["failed"] is True
+    assert result["failure_reason"] == "mandatory_hook_exception"
+    assert result["api_calls"] == 0
+    client = agent.client
+    assert client is not None
+    client.chat.completions.create.assert_not_called()
+    transport.assert_not_called()
+    assert "SENTINEL-CREDENTIAL" not in result["final_response"]
+
+
 def test_non_mandatory_observer_exception_remains_isolated(tmp_path, monkeypatch):
     _configure_home(tmp_path, monkeypatch, mode="raise", mandatory=False)
     agent = _run_agent()
@@ -182,6 +302,53 @@ def test_non_mandatory_observer_exception_remains_isolated(tmp_path, monkeypatch
     assert result["completed"] is True
     assert result["final_response"] == "allowed"
     agent.client.chat.completions.create.assert_called_once()
+
+
+def test_non_mandatory_provider_observer_exception_does_not_leak_to_logs(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    _configure_home(tmp_path, monkeypatch, mode="raise", mandatory=False)
+    agent = _run_agent()
+
+    with caplog.at_level(logging.WARNING):
+        result = agent.run_conversation("observer failure must not block")
+
+    assert result["completed"] is True
+    client = agent.client
+    assert client is not None
+    assert client.chat.completions.create.call_count == 1
+    assert "SENTINEL-CREDENTIAL" not in caplog.text
+
+
+def test_builtin_provider_observer_exception_does_not_leak_to_logs(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    def raise_for_provider_request(hook_name, **kwargs):
+        if hook_name == "pre_api_request":
+            raise RuntimeError("observer leaked SENTINEL-CREDENTIAL")
+
+    _configure_home(tmp_path, monkeypatch, mode=None, mandatory=False)
+    agent = _run_agent()
+
+    with (
+        patch("hermes_cli.observability.handles_hook", return_value=True),
+        patch(
+            "hermes_cli.observability.observe_lifecycle",
+            side_effect=raise_for_provider_request,
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        result = agent.run_conversation("observer failure must not block")
+
+    assert result["completed"] is True
+    client = agent.client
+    assert client is not None
+    assert client.chat.completions.create.call_count == 1
+    assert "SENTINEL-CREDENTIAL" not in caplog.text
 
 
 def test_mandatory_audit_event_is_key_allowlisted_and_payload_free(

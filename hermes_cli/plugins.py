@@ -309,9 +309,19 @@ def _get_mandatory_hook_plugins(hook_name: str) -> List[str]:
     """
     from hermes_cli.config import load_config_readonly
 
-    configured = cfg_get(
-        load_config_readonly(), "plugins", "mandatory_hooks", default={}
-    )
+    config = load_config_readonly()
+    if not isinstance(config, dict):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+    plugins_config = config.get("plugins", {})
+    if plugins_config in (None, {}):
+        return []
+    if not isinstance(plugins_config, dict):
+        raise MandatoryHookError(
+            "mandatory_hook_config_invalid", hook_name, "config"
+        )
+    configured = plugins_config.get("mandatory_hooks", {})
     if configured in (None, {}):
         return []
     if not isinstance(configured, dict):
@@ -385,6 +395,28 @@ def _audit_mandatory_hook(
             },
             sort_keys=True,
         )
+    )
+
+
+def _log_hook_callback_failure(
+    hook_name: str,
+    callback: Callable,
+    exc: Exception,
+) -> None:
+    """Log observer failure without exposing provider-request payloads."""
+    callback_name = getattr(callback, "__name__", type(callback).__name__)
+    if hook_name == "pre_api_request":
+        logger.warning(
+            "Hook '%s' callback %s raised; details suppressed",
+            hook_name,
+            callback_name,
+        )
+        return
+    logger.warning(
+        "Hook '%s' callback %s raised: %s",
+        hook_name,
+        callback_name,
+        exc,
     )
 
 
@@ -2247,12 +2279,7 @@ class PluginManager:
                 if ret is not None:
                     results.append(ret)
             except Exception as exc:
-                logger.warning(
-                    "Hook '%s' callback %s raised: %s",
-                    hook_name,
-                    getattr(cb, "__name__", repr(cb)),
-                    exc,
-                )
+                _log_hook_callback_failure(hook_name, cb, exc)
         return results
 
     def invoke_hook_enforced(self, hook_name: str, **kwargs: Any) -> List[Any]:
@@ -2300,12 +2327,7 @@ class PluginManager:
                     if ret is not None:
                         results.append(ret)
                 except Exception as exc:
-                    logger.warning(
-                        "Hook '%s' callback %s raised: %s",
-                        hook_name,
-                        getattr(cb, "__name__", repr(cb)),
-                        exc,
-                    )
+                    _log_hook_callback_failure(hook_name, cb, exc)
                 continue
 
             try:
