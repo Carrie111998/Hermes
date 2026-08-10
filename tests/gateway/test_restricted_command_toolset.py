@@ -16,8 +16,6 @@ APPROVED_COMMAND_TOOLS = {
     "write_file",
     "patch",
     "search_files",
-    "web_search",
-    "web_extract",
     "vision_analyze",
     "delegate_task",
     "todo",

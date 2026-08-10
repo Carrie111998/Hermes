@@ -283,7 +283,6 @@ TOOLSETS = {
         "tools": [
             "terminal", "process",
             "read_file", "write_file", "patch", "search_files",
-            "web_search", "web_extract",
             "vision_analyze", "delegate_task", "todo",
         ],
         "includes": [],
