@@ -86,6 +86,38 @@ def _with_mentions_disabled(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _normalized_id_set(value: Any) -> set[str]:
+    """Return a normalized set from a YAML list or comma-separated string."""
+    if isinstance(value, list):
+        return {str(item).strip() for item in value if str(item).strip()}
+    if isinstance(value, str):
+        return {item.strip() for item in value.split(",") if item.strip()}
+    return set()
+
+
+def _binding_scope_allows(
+    extra: Dict[str, Any],
+    sender_id: str,
+    channel_type: str,
+    channel_id: str,
+) -> bool:
+    """Enforce optional evaOS binding-derived DM/channel authorization.
+
+    Legacy Mattermost configurations omit both keys and retain the existing
+    platform allowlist behavior. Once either key is present, binding scope is
+    enabled and a missing or empty ACL denies that chat type.
+    """
+    if not any(key in extra for key in ("dm_allowed_users", "channel_allowed_users")):
+        return True
+    if channel_type == "D":
+        return sender_id in _normalized_id_set(extra.get("dm_allowed_users"))
+
+    configured = extra.get("channel_allowed_users")
+    if isinstance(configured, dict):
+        return sender_id in _normalized_id_set(configured.get(channel_id))
+    return sender_id in _normalized_id_set(configured)
+
+
 def check_mattermost_requirements() -> bool:
     """Return True if the Mattermost adapter runtime dependency is available."""
     try:
@@ -842,6 +874,21 @@ class MattermostAdapter(BasePlatformAdapter):
         channel_id = post.get("channel_id", "")
         channel_type_raw = data.get("channel_type", "O")
         chat_type = _CHANNEL_TYPE_MAP.get(channel_type_raw, "channel")
+        sender_id = post.get("user_id", "")
+        sender_name = data.get("sender_name", "").lstrip("@") or sender_id
+
+        # evaOS resolves dashboard bindings to exact Mattermost user/channel
+        # identifiers in profile-local config. This is deliberately separate
+        # from the platform-wide allowlist: a person may be channel-authorized
+        # while their DM access to the same agent remains denied.
+        extra = self.config.extra or {}
+        if not _binding_scope_allows(extra, sender_id, channel_type_raw, channel_id):
+            logger.debug(
+                "Mattermost: ignoring binding-scope denied sender (type=%s channel=%s)",
+                channel_type_raw,
+                channel_id,
+            )
+            return
 
         # For DMs, user_id is sufficient.  For channels, check for @mention.
         message_text = post.get("message", "")
@@ -901,10 +948,6 @@ class MattermostAdapter(BasePlatformAdapter):
                     message_text = re.sub(
                         re.escape(pattern), "", message_text, flags=re.IGNORECASE
                     ).strip()
-
-        # Resolve sender info.
-        sender_id = post.get("user_id", "")
-        sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
         # Thread support: if the post is in a thread, use root_id. In
         # thread mode, top-level channel posts are valid roots for progress.
@@ -1229,15 +1272,13 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
     The MattermostAdapter reads its runtime configuration via
     ``os.getenv()`` for ``MATTERMOST_REQUIRE_MENTION``,
     ``MATTERMOST_FREE_RESPONSE_CHANNELS``, and
-    ``MATTERMOST_ALLOWED_CHANNELS``.  Rather than rewrite those call sites
-    to read from ``PlatformConfig.extra``, this hook keeps the env-driven
-    model and merely owns the YAML→env translation here, next to the
-    adapter that consumes it.
+    ``MATTERMOST_ALLOWED_CHANNELS``.  Those legacy settings retain their
+    environment bridge. Binding-derived DM/channel user ACLs are returned as
+    profile-local ``PlatformConfig.extra`` instead.
 
     Env vars take precedence over YAML — every assignment is guarded
     by ``not os.getenv(...)`` so an explicit env var survives a config.yaml
-    update.  Returns ``None`` because no extras are seeded into
-    ``PlatformConfig.extra`` directly (everything flows through env).
+    update.
     """
     if "require_mention" in mattermost_cfg and not os.getenv("MATTERMOST_REQUIRE_MENTION"):
         os.environ["MATTERMOST_REQUIRE_MENTION"] = str(mattermost_cfg["require_mention"]).lower()
@@ -1252,7 +1293,14 @@ def _apply_yaml_config(yaml_cfg: dict, mattermost_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["MATTERMOST_ALLOWED_CHANNELS"] = str(ac)
-    return None  # all settings flow through env; nothing to merge into extras
+    # Binding-derived authorization is behavioral, non-secret config. Keep it
+    # in profile-local config.yaml rather than inventing new environment
+    # variables. The gateway merges this return value into PlatformConfig.extra.
+    extras: dict[str, Any] = {}
+    for key in ("dm_allowed_users", "channel_allowed_users"):
+        if key in mattermost_cfg:
+            extras[key] = mattermost_cfg[key]
+    return extras or None
 
 
 # ---------------------------------------------------------------------------

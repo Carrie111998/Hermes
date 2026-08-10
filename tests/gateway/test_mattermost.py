@@ -394,6 +394,82 @@ class TestMattermostMentionBehavior:
             assert self.adapter.handle_message.called
 
 
+class TestMattermostBindingScope:
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._bot_user_id = "bot_user_id"
+        self.adapter._bot_username = "hermes-bot"
+        self.adapter.handle_message = AsyncMock()
+
+    def _event(self, *, user_id="user_allowed", channel_type="D", channel_id="dm_1"):
+        return {
+            "event": "posted",
+            "data": {
+                "post": json.dumps({
+                    "id": f"post_{user_id}_{channel_id}",
+                    "user_id": user_id,
+                    "channel_id": channel_id,
+                    "message": "@hermes-bot synthetic",
+                }),
+                "channel_type": channel_type,
+                "sender_name": "@synthetic",
+            },
+        }
+
+    @pytest.mark.asyncio
+    async def test_channel_only_binding_denies_dm_and_allows_exact_private_channel(self):
+        self.adapter.config.extra.update({
+            "dm_allowed_users": [],
+            "channel_allowed_users": {"agent_private": ["user_allowed"]},
+        })
+
+        await self.adapter._handle_ws_event(self._event())
+        assert not self.adapter.handle_message.called
+
+        await self.adapter._handle_ws_event(
+            self._event(channel_type="P", channel_id="agent_private")
+        )
+        assert self.adapter.handle_message.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_channel_binding_denies_unassigned_user_and_other_channel(self):
+        self.adapter.config.extra.update({
+            "dm_allowed_users": ["user_allowed"],
+            "channel_allowed_users": {"agent_private": ["user_allowed"]},
+        })
+
+        await self.adapter._handle_ws_event(
+            self._event(user_id="user_denied", channel_type="P", channel_id="agent_private")
+        )
+        await self.adapter._handle_ws_event(
+            self._event(channel_type="P", channel_id="other_private")
+        )
+        assert not self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_channel_only_config_denies_dm_when_counterpart_key_is_absent(self):
+        self.adapter.config.extra.update({
+            "channel_allowed_users": {"agent_private": ["user_allowed"]},
+        })
+        await self.adapter._handle_ws_event(self._event())
+        assert not self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_dm_only_config_denies_channel_when_counterpart_key_is_absent(self):
+        self.adapter.config.extra.update({
+            "dm_allowed_users": ["user_allowed"],
+        })
+        await self.adapter._handle_ws_event(
+            self._event(channel_type="P", channel_id="agent_private")
+        )
+        assert not self.adapter.handle_message.called
+
+    @pytest.mark.asyncio
+    async def test_legacy_config_without_binding_scope_preserves_existing_behavior(self):
+        await self.adapter._handle_ws_event(self._event())
+        assert self.adapter.handle_message.call_count == 1
+
+
 # ---------------------------------------------------------------------------
 # File upload (send_image)
 # ---------------------------------------------------------------------------
@@ -592,5 +668,3 @@ async def test_mattermost_top_level_channel_post_is_thread_root():
     assert msg_event.source.thread_id == "top_post_123"
     assert msg_event.source.message_id == "top_post_123"
     assert msg_event.message_id == "top_post_123"
-
-

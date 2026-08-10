@@ -8,7 +8,7 @@ PR #58421 and extended in the follow-up.
 """
 import hermes_cli.config as config_mod
 import hermes_cli.cli_output as cli_output_mod
-from plugins.platforms.mattermost.adapter import interactive_setup
+from plugins.platforms.mattermost.adapter import _apply_yaml_config, interactive_setup
 
 
 def _patch_setup_io(monkeypatch, prompts, saved, removed, existing):
@@ -50,4 +50,21 @@ class TestMattermostHomeChannelClear:
         assert "MATTERMOST_HOME_CHANNEL" in removed
         assert "MATTERMOST_HOME_CHANNEL" not in saved
 
+
+def test_binding_scope_stays_in_profile_local_config(monkeypatch):
+    for key in ("MATTERMOST_DM_ALLOWED_USERS", "MATTERMOST_CHANNEL_ALLOWED_USERS"):
+        monkeypatch.delenv(key, raising=False)
+    extras = _apply_yaml_config(
+        {},
+        {
+            "dm_allowed_users": ["user-dm"],
+            "channel_allowed_users": {"channel-agent": ["user-channel"]},
+        },
+    )
+    assert extras == {
+        "dm_allowed_users": ["user-dm"],
+        "channel_allowed_users": {"channel-agent": ["user-channel"]},
+    }
+    assert "MATTERMOST_DM_ALLOWED_USERS" not in __import__("os").environ
+    assert "MATTERMOST_CHANNEL_ALLOWED_USERS" not in __import__("os").environ
 

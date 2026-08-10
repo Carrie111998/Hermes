@@ -252,6 +252,29 @@ Behavior:
 
 See also: [admin/user slash command split](../../reference/slash-commands.md#permissions-and-adminuser-split).
 
+## Profile-local binding ACLs
+
+Managed multi-user installations can narrow DM and private-channel access
+independently inside the Hermes profile's `config.yaml`:
+
+```yaml
+mattermost:
+  allowed_channels:
+    - "agent-private-channel-id"
+  dm_allowed_users:
+    - "mattermost-user-id-with-dm-access"
+  channel_allowed_users:
+    agent-private-channel-id:
+      - "mattermost-user-id-with-channel-access"
+```
+
+`dm_allowed_users` applies only to direct messages.
+`channel_allowed_users` may be a single user-ID list for every non-DM channel,
+or a mapping from channel ID to its exact user-ID list. An explicit empty list
+denies that path. If these keys are absent, existing Mattermost behavior is
+unchanged. The check runs before attachments are downloaded or a message is
+handed to Hermes.
+
 ## Troubleshooting
 
 ### Bot is not responding to messages
