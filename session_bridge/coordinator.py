@@ -4424,6 +4424,7 @@ class SessionBridgeCoordinator:
         discovered = len(summaries)
         indexed = 0
         failed = 0
+        locally_owned = 0
         for thread_summary in summaries:
             try:
                 projection = await self._provider_call(
@@ -4444,6 +4445,10 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except LocalSessionOwnsCanonicalId:
+                # Hermes owns this canonical id; never adopted, never a failure.
+                locally_owned += 1
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="immediate_project",
@@ -4454,6 +4459,15 @@ class SessionBridgeCoordinator:
                 failed += 1
                 continue
             indexed += 1
+        if locally_owned:
+            try:
+                _LOG.info(
+                    "codex_scan_diagnostic stage=immediate_project code=%s excluded=%d",
+                    _CODEX_SCAN_LOCAL_OWNER_CODE,
+                    locally_owned,
+                )
+            except Exception:
+                pass
         return ScanSummary(
             provider=Provider.CODEX,
             discovered=discovered,
@@ -4795,6 +4809,7 @@ class SessionBridgeCoordinator:
         await self._save_pending(provider, staged_ids)
         selected_ids = staged_ids[: self._scan_batch_size]
         indexed = 0
+        locally_owned = 0
         for native_id in selected_ids:
             try:
                 summary = summaries_by_native_id.get(native_id)
@@ -4825,6 +4840,15 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except LocalSessionOwnsCanonicalId:
+                # Hermes owns this canonical id (its own Codex-provider session).
+                # It is never adopted, but it must not poison the batch: this
+                # handler returns on any error, so treating it as a failure
+                # aborts the whole scan AND leaves the id staged, so every
+                # subsequent cycle re-attempts the same thread forever and the
+                # provider never leaves the degraded state.
+                locally_owned += 1
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="persistent_project",
@@ -4841,6 +4865,16 @@ class SessionBridgeCoordinator:
                     duration_ms=0,
                 )
             indexed += 1
+        if locally_owned:
+            # Counted, never silent: these threads stay outside the catalog.
+            try:
+                _LOG.info(
+                    "codex_scan_diagnostic stage=persistent_project code=%s excluded=%d",
+                    _CODEX_SCAN_LOCAL_OWNER_CODE,
+                    locally_owned,
+                )
+            except Exception:
+                pass
 
         await self._commit_scan_batch(
             provider,
