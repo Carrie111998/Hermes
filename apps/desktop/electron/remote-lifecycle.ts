@@ -7,7 +7,9 @@
  * step (injected). Knows how to:
  *
  *   - locate the Hermes install on the remote (login-shell probe),
- *   - gate the remote platform to Linux/macOS via `uname`,
+ *   - gate the remote platform to Linux via `uname` (Darwin/macOS remote
+ *     backends are unsupported because process replacement lacks an
+ *     identity-stable non-pidfd signal primitive),
  *   - reuse an existing desktop-dedicated dashboard via a lockfile + an
  *     AUTHENTICATED /api/status probe (pid liveness alone is insufficient),
  *   - spawn a fresh detached `--isolated --port 0` dashboard and scrape its
@@ -35,7 +37,10 @@ const SUPPORTED_LOCK_SCHEMA_VERSIONS = new Set([2, 3])
 const PROTOCOL_VERSION = 1
 const READY_RE = /^HERMES_(?:BACKEND|DASHBOARD)_READY port=(\d+)/m
 const REMOTE_LOCK_DIR = '~/.hermes/desktop-ssh'
-const SUPPORTED_REMOTE_OS = new Set(['Linux', 'Darwin'])
+// Linux only: remote replacement requires pidfd-bound signaling so a reused PID
+// cannot receive SIGTERM. Darwin has no identity-stable non-pidfd primitive we
+// accept for replacement, so macOS remotes fail closed at platform probe.
+const SUPPORTED_REMOTE_OS = new Set(['Linux'])
 const DEFAULT_READY_TIMEOUT_MS = 45_000
 const READY_POLL_INTERVAL_MS = 750
 // macOS sshd starts non-interactive shells with a 256-FD soft limit even when
@@ -244,7 +249,9 @@ async function probeRemotePlatform(ssh) {
 
   if (!SUPPORTED_REMOTE_OS.has(osName)) {
     const err: any = new Error(
-      `Unsupported remote platform "${osName || 'unknown'}". Hermes Desktop SSH mode supports Linux, macOS, and Windows remote hosts.`
+      `Unsupported remote platform "${osName || 'unknown'}". Hermes Desktop SSH backend replacement supports Linux only ` +
+        '(identity-stable pidfd termination). Darwin/macOS remotes are not supported for replacement because a ' +
+        'prove-then-kill path can signal a reused PID.'
     )
 
     err.kind = 'unsupported-platform'
@@ -599,7 +606,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, _hermesPath = '', lockExt
  * Re-prove identity and signal through a pidfd in one remote helper. The pidfd
  * binds the signal target before the final identity check, so PID reuse between
  * proof and signal cannot redirect SIGTERM to a replacement process. Platforms
- * without pidfds fail closed rather than using a racy standalone `kill`.
+ * without pidfds fail closed with UNSUPPORTED — never prove-then-os.kill.
  */
 async function terminateOwnedProcess(ssh, lock, lease: any = null) {
   const expectedStart = lock.pidStartTime == null ? 'None' : String(Number(lock.pidStartTime))
@@ -685,13 +692,9 @@ async function terminateOwnedProcess(ssh, lock, lease: any = null) {
     ' except ProcessLookupError:\n' +
     '  finish("GONE")\n' +
     ' except (AttributeError,NotImplementedError,OSError):\n' +
-    '  # Darwin / non-pidfd hosts: identity-stable best-effort terminate path.\n' +
-    '  prove_identity()\n' +
-    '  try:\n' +
-    '   os.kill(pid,signal.SIGTERM)\n' +
-    '  except ProcessLookupError:\n' +
-    '   finish("GONE")\n' +
-    '  finish("TERMINATED")\n' +
+    '  # No identity-stable non-pidfd signal primitive is accepted. Refuse to\n' +
+    '  # prove_identity()+os.kill (PID-reuse race). Darwin is unsupported.\n' +
+    '  finish("UNSUPPORTED")\n' +
     ' try:\n' +
     '  prove_identity()\n' +
     '  try:signal.pidfd_send_signal(pidfd,signal.SIGTERM)\n' +
@@ -731,6 +734,14 @@ async function cleanupStale(ssh, ownershipId, lock, pidAlive = true, lease: any 
         throw ownershipConflict(
           'SSH backend identity or lifecycle lease changed before termination; preserving lock evidence.'
         )
+      }
+
+      if (terminateResult === 'UNSUPPORTED') {
+        const error: any = new Error(
+          'SSH backend replacement requires identity-stable pidfd termination; this remote platform is unsupported.'
+        )
+        error.kind = 'unsupported-platform'
+        throw error
       }
 
       if (!['TERMINATED', 'GONE'].includes(terminateResult)) {
@@ -1146,7 +1157,7 @@ async function withOwnershipMutex(ssh, ownershipId, fn, options: any = {}) {
     '   # Owner-epoch reclaim: rewrite the same inode under flock. Never\n' +
     '   # pathname-unlink a lease we have not proven stale while holding it.\n' +
     '   if age>stale_ms:\n' +
-    '    os.lseek(fd,0); os.ftruncate(fd,0)\n' +
+    '    os.lseek(fd,0,os.SEEK_SET); os.ftruncate(fd,0)\n' +
     '    os.write(fd,token.encode()); os.fsync(fd)\n' +
     '    try:os.utime(p,None)\n' +
     '    except OSError:pass\n' +
