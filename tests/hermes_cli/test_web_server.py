@@ -4326,6 +4326,37 @@ class TestDesktopCronTicker:
         assert ws.get_scheduler_role() == "none"
         assert ws._SSH_OWNER_NONCE == "0123456789abcdef"
 
+    def test_no_fcntl_lease_acquires_once_and_releases_owned_path(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import builtins
+        import hermes_cli.web_server as ws
+
+        real_import = builtins.__import__
+
+        def no_fcntl(name, *args, **kwargs):
+            if name == "fcntl":
+                raise ImportError("simulated Windows")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", no_fcntl)
+        ws._desktop_scheduler_lease_fh = None
+        ws._desktop_scheduler_lease_fallback_path = None
+        lease_path = ws._desktop_scheduler_lease_path()
+
+        assert ws._try_acquire_desktop_scheduler_lease() is True
+        first_handle = ws._desktop_scheduler_lease_fh
+        assert first_handle is not None
+        assert lease_path.exists()
+
+        # Simulate a second process/module instance while the first handle lives.
+        ws._desktop_scheduler_lease_fh = None
+        assert ws._try_acquire_desktop_scheduler_lease() is False
+        ws._desktop_scheduler_lease_fh = first_handle
+
+        ws._release_desktop_scheduler_lease()
+        assert not lease_path.exists()
+
 
 class TestServeIndexMissingIndex:
     """_serve_index must not raise per-request when index.html vanishes
