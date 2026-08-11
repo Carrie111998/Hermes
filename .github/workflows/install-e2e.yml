@@ -63,13 +63,15 @@ jobs:
     outputs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
-      # This job only reads tag names and runs one script, so take the cheap
-      # checkout: no blobs (filter), no other files (sparse), but DO fetch tags
-      # -- they are the whole input, and the default shallow checkout has none.
+      # This job only reads tag names and runs one script, so avoid blobs and
+      # unrelated paths.  It must, however, fetch the complete ref history:
+      # the shallow checkout plus fetch-tags combination does not populate the
+      # refs/tags namespace reliably under checkout v6, and tags are this job's
+      # entire input.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           filter: blob:none
-          fetch-tags: true
+          fetch-depth: 0
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
       - id: pick
