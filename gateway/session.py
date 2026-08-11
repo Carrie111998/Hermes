@@ -3659,7 +3659,9 @@ class SessionStore:
                     session_id, message
                 ),
             )
-            if not remaining:
+            if remaining is None:
+                return False
+            if remaining == 0:
                 spooled_sessions.discard(session_id)
             return remaining == 0
         except Exception as exc:
