@@ -18,6 +18,24 @@ from hermes_cli import kanban_db as kb
 _MATERIAL_EVENT_KINDS = ("blocked", "gave_up", "block_loop_detected")
 _REPLY_MARKER_RE = re.compile(r"\[kanban-gate:([a-f0-9]{32})\]", re.IGNORECASE)
 
+# Only an explicit human-input contract may page Kevin for a decision. Other
+# block kinds are operational state and belong in the ops channel. Legacy
+# untyped cards remain compatible only when their reason names a protected
+# decision class rather than using generic words such as "approval".
+_LEGACY_PROTECTED_GATE_RE = re.compile(
+    r"(?:"
+    r"(?:product|business)\s+(?:decision|judg(?:e)?ment)|"
+    r"(?:spend|billing|purchase|payment)\s+(?:approval|authorization)|"
+    r"(?:secret|credential|api[- ]?key|password)\s+(?:needed|required|from kevin)|"
+    r"(?:destructive|data[- ]?loss|production data (?:deletion|migration))|"
+    r"(?:delete|remove)\s+(?:all\s+|the\s+)?(?:customer\s+)?(?:records|production database)|"
+    r"decision.{0,40}\bship\b|"
+    r"force[- ]?push|history rewrite|live trad(?:e|ing)|"
+    r"irreversible infrastructure removal|legal|compliance"
+    r")",
+    re.IGNORECASE,
+)
+
 
 @dataclass(frozen=True)
 class ProactiveSupervisorConfig:
@@ -52,12 +70,27 @@ class ProactiveSupervisorConfig:
 @dataclass
 class ReconcileResult:
     protected_gates: list[str] = field(default_factory=list)
+    engineering_followups: list[str] = field(default_factory=list)
     recovered: list[str] = field(default_factory=list)
     recovery_exhausted: list[str] = field(default_factory=list)
 
     @property
     def changed(self) -> bool:
-        return bool(self.protected_gates or self.recovered or self.recovery_exhausted)
+        return bool(
+            self.protected_gates
+            or self.engineering_followups
+            or self.recovered
+            or self.recovery_exhausted
+        )
+
+
+def _is_protected_gate(*, block_kind: str, reason: str) -> bool:
+    """Return whether this blocker is allowed to request a Kevin decision."""
+    if block_kind == "needs_input":
+        return True
+    if block_kind:
+        return False
+    return bool(_LEGACY_PROTECTED_GATE_RE.search(reason))
 
 
 @dataclass(frozen=True)
@@ -214,14 +247,13 @@ def reconcile_board(
         event_kind = str(row["event_kind"])
         block_kind = str(payload.get("kind") or row.get("block_kind") or "")
 
-        # Recovery is allowlisted, not inferred. Legacy, malformed, plugin, and
-        # future block kinds remain human gates until they opt into the typed
-        # transient contract. A block-loop event is always deliberate triage,
-        # even when the repeated underlying blocker was transient.
+        # Recovery is allowlisted, not inferred. A block-loop event is always
+        # deliberate engineering triage even when its underlying block was
+        # transient; it must not become a vague approval page.
         recoverable = (
             block_kind == "transient" and event_kind in {"blocked", "gave_up"}
         )
-        protected = not recoverable
+        protected = _is_protected_gate(block_kind=block_kind, reason=reason)
         if protected:
             if _ensure_supervisor_subscription(
                 conn,
@@ -233,6 +265,19 @@ def reconcile_board(
                 mode="protected_gate",
             ):
                 result.protected_gates.append(task_id)
+            continue
+
+        if not recoverable:
+            if _ensure_supervisor_subscription(
+                conn,
+                board=board,
+                task_id=task_id,
+                event_id=event_id,
+                config=config,
+                notifier_profile=notifier_profile,
+                mode="engineering_followup",
+            ):
+                result.engineering_followups.append(task_id)
             continue
 
         recovered, state = kb.supervisor_recover_task(
@@ -312,6 +357,12 @@ def render_supervisor_event(
             "Reply to this message with the decision. Hermes will attach it to "
             "the existing task and resume the same work graph.\n"
             f"[kanban-gate:{token}]"
+        )
+    if mode == "engineering_followup":
+        return (
+            f"Hermes paused {title}: {reason[:700]}\n\n"
+            "Engineering follow-up is required in the ops workstream. "
+            "No Kevin decision is requested."
         )
     if mode != "recovery_exhausted":
         return ""

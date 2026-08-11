@@ -839,6 +839,36 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_create_reroutes_quiet_channel_notifications_to_ops(monkeypatch, worker_env, tmp_path):
+    home = tmp_path / "route-home" / ".hermes"
+    home.mkdir(parents=True)
+    (home / "config.yaml").write_text(
+        "kanban:\n"
+        "  notification_route:\n"
+        "    platform: discord\n"
+        "    chat_id: ops-channel\n"
+        "    chat_type: channel\n"
+        "    quiet_chat_ids:\n"
+        "      - hermes-conversation\n"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "hermes-conversation")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "channel")
+
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "routed task", "assignee": "peer"})
+    created = json.loads(out)
+
+    assert created["ok"] is True
+    assert created["subscribed"] is True
+    subs = _sub_index(_list_subs_for_task(created["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["platform"] == "discord"
+    assert subs[0]["chat_id"] == "ops-channel"
+    assert subs[0]["delivery_metadata"]["_kanban_rerouted_from_chat_id"] == "hermes-conversation"
+
+
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent

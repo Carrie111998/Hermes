@@ -1388,6 +1388,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
     We never want a notification bookkeeping failure to fail the
     kanban_create that the agent is mid-conversation about.
     """
+    cfg: dict[str, Any] = {}
     try:
         cfg = load_config()
         if not cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
@@ -1429,6 +1430,27 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+        rerouted_from_chat_id = ""
+        route = cfg_get(cfg, "kanban", "notification_route", default={}) or {}
+        if isinstance(route, dict):
+            route_platform = str(route.get("platform") or "").strip().lower()
+            route_chat_id = str(route.get("chat_id") or "").strip()
+            quiet_chat_ids = {
+                str(value).strip()
+                for value in (route.get("quiet_chat_ids") or [])
+                if str(value).strip()
+            }
+            if (
+                route_platform
+                and route_chat_id
+                and platform.lower() == route_platform
+                and chat_id in quiet_chat_ids
+            ):
+                rerouted_from_chat_id = chat_id
+                chat_id = route_chat_id
+                thread_id = str(route.get("thread_id") or "").strip() or None
+                chat_type = str(route.get("chat_type") or "channel").strip() or "channel"
+                user_id = None
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
@@ -1440,6 +1462,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             except Exception:
                 notifier_profile = "default"
         delivery_metadata: dict[str, Any] = {}
+        if rerouted_from_chat_id:
+            delivery_metadata["_kanban_rerouted_from_chat_id"] = rerouted_from_chat_id
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
         if chat_type:

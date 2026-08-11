@@ -187,10 +187,7 @@ def test_untyped_legacy_protected_gate_is_not_auto_recovered(
         conn.close()
 
 
-@pytest.mark.parametrize("kind", ["needs_input", "capability"])
-def test_typed_human_gate_is_protected_regardless_of_wording(
-    tmp_path, monkeypatch, kind
-):
+def test_typed_human_gate_is_protected_regardless_of_wording(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()
     conn = kb.connect()
@@ -200,7 +197,7 @@ def test_typed_human_gate_is_protected_regardless_of_wording(
             conn,
             task_id,
             reason="Which option should I choose?",
-            kind=kind,
+            kind="needs_input",
         )
 
         result = reconcile_board(
@@ -210,6 +207,40 @@ def test_typed_human_gate_is_protected_regardless_of_wording(
         assert result.protected_gates == [task_id]
         assert result.recovered == []
         assert kb.get_task(conn, task_id).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_capability_block_is_engineering_followup_not_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Public Lands release", assignee="forge")
+        reason = (
+            "Exact head pushed and verified; production unchanged; GitHub auth invalid; "
+            "continuation will retry"
+        )
+        assert kb.block_task(conn, task_id, reason=reason, kind="capability")
+        blocked = _latest_event(conn, task_id, "blocked")
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+
+        assert result.protected_gates == []
+        assert result.engineering_followups == [task_id]
+        metadata = kb.list_notify_subs(conn, task_id)[0]["delivery_metadata"]
+        assert metadata["_kanban_supervisor_mode"] == "engineering_followup"
+        rendered = render_supervisor_event(
+            board="default",
+            task=kb.get_task(conn, task_id),
+            event=SimpleNamespace(id=blocked["id"], payload=blocked["payload"]),
+            delivery_metadata=metadata,
+            current_event_id=blocked["id"],
+        )
+        assert rendered and "No Kevin decision is requested" in rendered
+        assert "Reply to this message" not in rendered
     finally:
         conn.close()
 
@@ -250,7 +281,7 @@ def test_dispatcher_gave_up_is_typed_transient_and_recovered(
         conn.close()
 
 
-def test_unknown_typed_block_fails_closed_and_renders_gate(tmp_path, monkeypatch):
+def test_unknown_typed_block_fails_closed_as_engineering_followup(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()
     conn = kb.connect()
@@ -284,10 +315,12 @@ def test_unknown_typed_block_fails_closed_and_renders_gate(tmp_path, monkeypatch
             delivery_metadata=metadata,
             current_event_id=blocked["id"],
         )
-        assert result.protected_gates == [task_id]
+        assert result.protected_gates == []
+        assert result.engineering_followups == [task_id]
         assert result.recovered == []
         assert task.status == "blocked"
-        assert rendered and "Reply to this message" in rendered
+        assert rendered and "No Kevin decision is requested" in rendered
+        assert "Reply to this message" not in rendered
     finally:
         conn.close()
 
@@ -312,7 +345,8 @@ def test_current_block_loop_triage_is_never_auto_recovered(tmp_path, monkeypatch
             conn, board="default", config=_config(), notifier_profile="default"
         )
 
-        assert result.protected_gates == [task_id]
+        assert result.protected_gates == []
+        assert result.engineering_followups == [task_id]
         assert result.recovered == []
         task = kb.get_task(conn, task_id)
         assert task is not None and task.status == "triage"
