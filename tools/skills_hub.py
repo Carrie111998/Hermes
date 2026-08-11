@@ -526,6 +526,10 @@ def github_provider_for(repo: str) -> Optional[str]:
 # source ids — they narrow the merged results to GitHub-tap skills carrying the
 # matching ``extra.provider`` label (see ``_filter_results_by_provider``).
 _PROVIDER_FILTER_VALUES = frozenset(v.lower() for v in GITHUB_TAP_PROVIDERS.values())
+_FULL_GIT_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_GITHUB_PR_URL_RE = re.compile(
+    r"^https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?$", re.IGNORECASE
+)
 
 
 def _filter_results_by_provider(
@@ -630,39 +634,42 @@ class GitHubSource(SkillSource):
 
         return results[:limit]
 
-    def fetch(self, identifier: str) -> Optional[SkillBundle]:
-        """
-        Download a skill from GitHub.
-        identifier format: "owner/repo/path/to/skill-dir"
-        """
+    def fetch(
+        self, identifier: str, *, ref: Optional[str] = None, pr: Optional[str] = None,
+    ) -> Optional[SkillBundle]:
+        """Download a skill, optionally pinned to an immutable GitHub checkout."""
         parts = identifier.split("/", 2)
         if len(parts) < 3:
             return None
-
         repo = f"{parts[0]}/{parts[1]}"
-        skill_path = parts[2]
+        skill_path = parts[2].rstrip("/")
 
-        skill_md = self._fetch_file_content(repo, f"{skill_path.rstrip('/')}/SKILL.md")
+        if ref is not None or pr is not None:
+            if ref and pr:
+                raise ValueError("Specify either --ref or --pr, not both")
+            checkout = self._resolve_immutable_checkout(repo, ref=ref, pr=pr)
+            if checkout is None:
+                return None
+            resolved_sha, git_metadata = checkout
+            return self._fetch_skill_at_sha(repo, skill_path, identifier, resolved_sha, git_metadata)
+
+        # Preserve the legacy default-branch path for existing installs.
+        skill_md = self._fetch_file_content(repo, f"{skill_path}/SKILL.md")
         if skill_md is None:
             return None
         referenced = _referenced_support_paths(skill_md)
         if referenced is None:
             return None
-
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
         tree = self._get_repo_tree(repo)
         if tree is not None:
             branch, entries = tree
-            prefix = f"{skill_path.rstrip('/')}/"
+            prefix = f"{skill_path}/"
             entries_by_path = {item.get("path", ""): item for item in entries}
             for rel_path in sorted(referenced):
                 item_path = f"{prefix}{rel_path}"
                 item = entries_by_path.get(item_path)
-                if item is None:
-                    logger.warning("Referenced skill support file is missing: %s", item_path)
-                    return None
-                if item.get("type") != "blob" or item.get("mode") == "120000":
-                    logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
+                if item is None or item.get("type") != "blob" or item.get("mode") == "120000":
                     return None
                 content = self._fetch_file_bytes(repo, item_path)
                 if content is None:
@@ -671,29 +678,100 @@ class GitHubSource(SkillSource):
             revision = self._tree_revisions.get(repo) or branch
         else:
             for rel_path in referenced:
-                content = self._fetch_file_bytes(repo, f"{skill_path.rstrip('/')}/{rel_path}")
+                content = self._fetch_file_bytes(repo, f"{skill_path}/{rel_path}")
                 if content is None:
                     return None
                 files[rel_path] = content
             revision = ""
-
-        skill_name = skill_path.rstrip("/").split("/")[-1]
-        trust = self.trust_level_for(identifier)
-
         return SkillBundle(
-            name=skill_name,
-            files=files,
-            source="github",
-            identifier=identifier,
-            trust_level=trust,
-            metadata={
-                "source_url": (
-                    f"https://github.com/{repo}/tree/{revision}/{skill_path}"
-                    if revision else f"https://github.com/{repo}/{skill_path}"
-                ),
-                "source_revision": revision,
-            },
+            name=skill_path.split("/")[-1], files=files, source="github", identifier=identifier,
+            trust_level=self.trust_level_for(identifier),
+            metadata={"source_url": f"https://github.com/{repo}/tree/{revision}/{skill_path}" if revision else f"https://github.com/{repo}/{skill_path}", "source_revision": revision},
         )
+
+    def _resolve_immutable_checkout(self, repo: str, *, ref: Optional[str], pr: Optional[str]) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Resolve a branch/PR once; every subsequent request is SHA-addressed."""
+        requested = pr if pr is not None else ref
+        if not isinstance(requested, str) or not requested.strip():
+            raise ValueError("Git selector must not be empty")
+        requested, resolved_at = requested.strip(), datetime.now(timezone.utc).isoformat()
+        if pr is not None:
+            match = _GITHUB_PR_URL_RE.fullmatch(requested)
+            if match:
+                if f"{match.group(1)}/{match.group(2)}".lower() != repo.lower():
+                    raise ValueError("GitHub PR URL repository must match the skill identifier")
+                number = int(match.group(3))
+            elif requested.isdigit() and int(requested) > 0:
+                number = int(requested)
+            else:
+                raise ValueError("--pr must be a positive GitHub PR number or pull-request URL")
+            response = self._github_get(f"https://api.github.com/repos/{repo}/pulls/{number}")
+            if response is None or response.status_code != 200:
+                return None
+            data = response.json()
+            if not isinstance(data, dict):
+                return None
+            head = data.get("head", {})
+            if not isinstance(head, dict):
+                return None
+            head_repo = head.get("repo") or {}
+            if not isinstance(head_repo, dict):
+                return None
+            head_repo_name, resolved_sha = head_repo.get("full_name", ""), head.get("sha", "")
+            if not isinstance(head_repo_name, str) or head_repo_name.lower() != repo.lower():
+                raise ValueError("Fork PRs are rejected by default")
+            if not isinstance(resolved_sha, str) or not _FULL_GIT_SHA_RE.fullmatch(resolved_sha):
+                return None
+            resolved_sha = resolved_sha.lower()
+            return resolved_sha, {"selector_type": "pr", "requested_selector": requested, "resolved_sha": resolved_sha, "resolved_at": resolved_at, "pr": {"number": data.get("number", number), "url": data.get("html_url", f"https://github.com/{repo}/pull/{number}"), "head_sha": resolved_sha, "head_ref": head.get("ref", ""), "head_label": head.get("label", ""), "head_repo": head_repo_name}}
+        if _FULL_GIT_SHA_RE.fullmatch(requested):
+            resolved_sha, selector_type = requested.lower(), "commit"
+        elif re.fullmatch(r"[0-9a-fA-F]{1,39}", requested):
+            raise ValueError("Commit SHAs must be full 40-character commit SHA values")
+        else:
+            response = self._github_get(f"https://api.github.com/repos/{repo}/commits/{requested}")
+            if response is None or response.status_code != 200:
+                return None
+            resolved_sha = response.json().get("sha", "")
+            if not isinstance(resolved_sha, str) or not _FULL_GIT_SHA_RE.fullmatch(resolved_sha):
+                return None
+            resolved_sha, selector_type = resolved_sha.lower(), "ref"
+        return resolved_sha, {"selector_type": selector_type, "requested_selector": requested, "resolved_sha": resolved_sha, "resolved_at": resolved_at}
+
+    def _fetch_skill_at_sha(self, repo: str, skill_path: str, identifier: str, resolved_sha: str, git_metadata: Dict[str, Any]) -> Optional[SkillBundle]:
+        """Fetch the complete regular-file skill tree from an isolated SHA tree."""
+        response = self._github_get(f"https://api.github.com/repos/{repo}/git/trees/{resolved_sha}", params={"recursive": "1"}, timeout=30)
+        if response is None or response.status_code != 200:
+            return None
+        tree_data = response.json()
+        if not isinstance(tree_data, dict) or tree_data.get("truncated"):
+            return None
+        prefix = f"{skill_path}/"
+        entries = [e for e in tree_data.get("tree", []) if isinstance(e, dict) and str(e.get("path", "")).startswith(prefix)]
+        if not any(e.get("path") == f"{skill_path}/SKILL.md" and e.get("type") == "blob" and e.get("mode") != "120000" for e in entries):
+            return None
+        files: Dict[str, Union[str, bytes]] = {}
+        for entry in entries:
+            if entry.get("type") != "blob" or entry.get("mode") == "120000" or not isinstance(entry.get("sha"), str):
+                return None
+            blob = self._github_get(f"https://api.github.com/repos/{repo}/git/blobs/{entry['sha']}", headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"})
+            if blob is None or blob.status_code != 200:
+                return None
+            try:
+                relative_path = _validate_bundle_rel_path(entry["path"][len(prefix):])
+            except ValueError:
+                # A pinned checkout is still untrusted input. Fail closed rather
+                # than allowing an unsupported path to escape the skill bundle.
+                return None
+            files[relative_path] = blob.content
+        skill_md = files.get("SKILL.md")
+        if not isinstance(skill_md, bytes):
+            return None
+        try:
+            files["SKILL.md"] = skill_md.decode("utf-8")
+        except (KeyError, UnicodeDecodeError):
+            return None
+        return SkillBundle(name=skill_path.split("/")[-1], files=files, source="github", identifier=identifier, trust_level=self.trust_level_for(identifier), metadata={"source_url": f"https://github.com/{repo}/tree/{resolved_sha}/{skill_path}", "source_revision": resolved_sha, "git": git_metadata})
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         """Fetch just the SKILL.md metadata for preview."""

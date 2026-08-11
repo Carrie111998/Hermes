@@ -502,7 +502,7 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
-               name_override: str = "") -> None:
+               name_override: str = "", ref: str = "", pr: str = "") -> None:
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -533,7 +533,20 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     c.print(f"\n[bold]Fetching:[/] {identifier}")
 
-    meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
+    if ref or pr:
+        from tools.skills_hub import GitHubSource
+        github_source = next((source for source in sources if isinstance(source, GitHubSource)), None)
+        if github_source is None:
+            c.print("[bold red]Error:[/] GitHub source is unavailable.\n")
+            return
+        try:
+            meta = github_source.inspect(identifier)
+            bundle = github_source.fetch(identifier, ref=ref or None, pr=pr or None)
+        except ValueError as exc:
+            c.print(f"[bold red]Error:[/] {exc}\n")
+            return
+    else:
+        meta, bundle, _matched_source = _resolve_source_meta_and_bundle(identifier, sources)
 
     if not bundle:
         # Check if any source hit GitHub API rate limit
@@ -1711,7 +1724,8 @@ def skills_command(args) -> None:
     elif action == "install":
         do_install(args.identifier, category=args.category, force=args.force,
                    skip_confirm=getattr(args, "yes", False),
-                   name_override=getattr(args, "name", "") or "")
+                   name_override=getattr(args, "name", "") or "",
+                   ref=getattr(args, "ref", "") or "", pr=getattr(args, "pr", "") or "")
     elif action == "inspect":
         do_inspect(args.identifier)
     elif action == "list":
@@ -1865,11 +1879,13 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "install":
         if not args:
-            c.print("[bold red]Usage:[/] /skills install <identifier-or-url> [--name <name>] [--category <cat>] [--force] [--now]\n")
+            c.print("[bold red]Usage:[/] /skills install <identifier-or-url> [--name <name>] [--category <cat>] [--ref <ref>|--pr <number-or-url>] [--force] [--now]\n")
             return
         identifier = args[0]
         category = ""
         name_override = ""
+        ref = ""
+        pr = ""
         # Slash commands run inside prompt_toolkit where input() hangs.
         # Always skip confirmation — the user typing the command is implicit consent.
         skip_confirm = True
@@ -1882,9 +1898,16 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
                 category = args[i + 1]
             elif a == "--name" and i + 1 < len(args):
                 name_override = args[i + 1]
+            elif a == "--ref" and i + 1 < len(args):
+                ref = args[i + 1]
+            elif a == "--pr" and i + 1 < len(args):
+                pr = args[i + 1]
+        if ref and pr:
+            c.print("[bold red]Error:[/] Specify either --ref or --pr, not both.\n")
+            return
         do_install(identifier, category=category, force=force,
                    skip_confirm=skip_confirm, invalidate_cache=invalidate_cache,
-                   name_override=name_override, console=c)
+                   name_override=name_override, ref=ref, pr=pr, console=c)
 
     elif action == "inspect":
         if not args:

@@ -101,6 +101,13 @@ def build_skills_parser(subparsers, *, cmd_skills: Callable) -> None:
     skills_install.add_argument(
         "--force", action="store_true", help="Install despite blocked scan verdict"
     )
+    selector_group = skills_install.add_mutually_exclusive_group()
+    selector_group.add_argument(
+        "--ref", default="", help="Git branch/ref or full 40-character commit SHA (GitHub skills only)"
+    )
+    selector_group.add_argument(
+        "--pr", default="", help="GitHub PR number or URL (same-repository PRs only)"
+    )
     skills_install.add_argument(
         "--yes",
         "-y",
