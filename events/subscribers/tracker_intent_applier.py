@@ -29,6 +29,7 @@ from typing import Dict
 from events.bus import EventBus
 from events.schema import Event
 from events.subscribers.base import BaseSubscriber
+from hermes_constants import get_default_hermes_root
 
 from intent_applier import (
     IdempotencyTracker,
@@ -95,7 +96,30 @@ def _redrive_config_from_env() -> dict:
 
 
 def _hermes_root() -> Path:
-    return Path(os.environ.get("HERMES_ROOT", str(Path.home() / ".hermes")))
+    """The canonical ~/.hermes root holding the cross-profile tracker mailbox.
+
+    ``HERMES_ROOT`` stays an explicit override. The fallback goes through
+    ``get_default_hermes_root()`` — the same resolver ``events/paths.py``
+    uses — rather than ``Path.home() / ".hermes"``. In production the two
+    agree exactly: a profile-scoped ``HERMES_HOME`` (``<root>/profiles/main``)
+    still resolves to ``~/.hermes``, and an unset ``HERMES_HOME`` also
+    resolves to ``~/.hermes``.
+
+    The difference shows up under test. ``tests/conftest.py`` points
+    ``HERMES_HOME`` at a per-test tempdir, and ``get_default_hermes_root()``
+    returns an out-of-tree root as-is — so the subscriber now reads a tmp
+    mailbox. With the old ``Path.home()`` fallback nothing could redirect it,
+    so every test calling ``events.gateway_integration.startup()`` rehydrated
+    the idempotency DB from the REAL ``~/.hermes/mailbox/tracker/processed``
+    (2,308 files, ~14s cold / ~2.7s warm), wrote to the REAL
+    ``~/.hermes/events/applier_state.db``, and started a live applier thread
+    against the production inbox. That is the ``Path.home() / ".hermes"``
+    callsite bug ``tests/conftest.py`` warns about.
+    """
+    override = os.environ.get("HERMES_ROOT")
+    if override:
+        return Path(override)
+    return get_default_hermes_root()
 
 
 def _tracker_mailbox(root: Path) -> Dict[str, Path]:
