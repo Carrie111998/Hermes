@@ -1842,6 +1842,23 @@ class TestListSessionsRich:
         assert [session["id"] for session in sessions] == ["lane_tip"]
         assert sessions[0]["_lineage_root_id"] == "lane_root"
 
+    def test_session_reset_continuation_remains_listable(self, db):
+        """A reset starts a new conversation; its persisted lineage must not hide it."""
+        db.create_session("before_reset", "telegram")
+        db.set_session_title("before_reset", "Before reset")
+        db.end_session("before_reset", "session_reset")
+        db.create_session(
+            "after_reset",
+            "telegram",
+            parent_session_id="before_reset",
+        )
+        db.set_session_title("after_reset", "After reset")
+        db.append_message("after_reset", "user", "new conversation")
+
+        ids = [session["id"] for session in db.list_sessions_rich(source="telegram")]
+
+        assert "after_reset" in ids
+
     def test_session_key_predicate_can_use_session_key_index(self, db):
         plan = db._conn.execute(
             "EXPLAIN QUERY PLAN "

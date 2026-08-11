@@ -98,19 +98,39 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
-# Rows that surface in pickers: roots + branch children (subagent runs and
-# compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+# A session reset/expiry creates a fresh top-level conversation while retaining
+# parent_session_id for provenance.  It is neither a branch nor a compression
+# continuation, so list and retention paths must recognize it explicitly rather
+# than treating it like an ephemeral subagent row.
+_BOUNDARY_CHILD_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from') IS NULL"
+    " AND EXISTS (SELECT 1 FROM sessions p"
+    "            WHERE p.id = {a}.parent_session_id"
+    "            AND p.end_reason IN ('session_reset', 'session_switch', 'idle',"
+    "                                 'daily', 'suspended', 'resume_pending_expired')"
+    "            AND {a}.started_at >= p.ended_at)"
+)
+
+
+# Rows that surface in pickers: roots, real branches, and new conversations
+# created at an explicit/automatic session boundary. Subagent runs and
+# compression continuations stay hidden.
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')}"
+    f" OR {_BOUNDARY_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
-    """Subagent runs (cascade-delete targets), not branches or compression tips."""
+    """Subagent runs (cascade-delete targets), not user-visible continuations."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
     compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    boundary = _BOUNDARY_CHILD_SQL.format(a=alias)
     return (
         f"({alias}.parent_session_id IS NOT NULL"
         f" AND NOT ({branch})"
-        f" AND NOT ({compression}))"
+        f" AND NOT ({compression})"
+        f" AND NOT ({boundary}))"
     )
 
 

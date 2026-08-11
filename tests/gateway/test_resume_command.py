@@ -107,6 +107,31 @@ class TestHandleResumeCommand:
         assert "/resume 1" in result
         db.close()
 
+    @pytest.mark.asyncio
+    async def test_list_named_sessions_includes_reset_continuation(self, tmp_path):
+        """A reset child is a new user conversation, not an invisible subagent."""
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        event = _make_event(text="/resume")
+        lane_key = _session_key_for_event(event)
+        db.create_session(
+            "before_reset", "telegram", session_key=lane_key,
+            user_id="12345", chat_id="67890",
+        )
+        db.end_session("before_reset", "session_reset")
+        db.create_session(
+            "after_reset", "telegram", session_key=lane_key,
+            user_id="12345", chat_id="67890", parent_session_id="before_reset",
+        )
+        db.set_session_title("after_reset", "Plan four weeks of fun")
+
+        runner = _make_runner(session_db=db, event=event)
+        result = await runner._handle_resume_command(event)
+
+        assert "Plan four weeks of fun" in result
+        db.close()
+
 
     @pytest.mark.asyncio
     async def test_resume_clears_session_model_overrides(self, tmp_path):
