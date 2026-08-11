@@ -9,9 +9,9 @@ updated_at: 2026-08-11
 
 ## 当前里程碑
 
-**M2 — Canonical Turn**
+**M3 — Agent Loop 与回合可靠性**
 
-当前目标：沿 Classic CLI 追踪一次最小真实回合，定位每个状态突变、持久化点和错误边界。
+当前目标：把已追踪的 canonical text/tool turn提升为完整状态机，系统覆盖 retry、fallback、empty recovery、budget、interrupt 和 crash matrix。
 
 ## 里程碑状态
 
@@ -19,8 +19,8 @@ updated_at: 2026-08-11
 |---|---|---:|---|
 | M0 研究基线与工作协议 | completed | high | 分支、恢复协议、计划、基线、模板和索引已建立 |
 | M1 系统全景架构 | completed | high | 系统上下文、进程模型、一级模块图与顶层数据流均已有源码证据 |
-| M2 Canonical Turn | in progress | high | 已完成 Classic CLI 无工具回合与 canonical 工具回合；下一单元比较 CLI/Gateway/Desktop 构造与交付 |
-| M3 Agent Loop | pending | — | — |
+| M2 Canonical Turn | completed | high | 无工具回合、工具回合、入口 ownership 与 delivery 对照均已有源码/测试证据 |
+| M3 Agent Loop | in progress | medium | 下一单元建立 conversation loop 状态机和 exit-reason taxonomy |
 | M4 Prompt/Context/Provider | pending | — | — |
 | M5 Tool Runtime | pending | — | — |
 | M6 Memory/Session | pending | — | — |
@@ -34,9 +34,9 @@ updated_at: 2026-08-11
 
 ## 当前研究单元
 
-- 比较 Classic CLI、Gateway 和 Desktop/TUI gateway 如何构造或复用 `AIAgent`。
-- 建立入口参数、session ownership、callback、approval 和 final delivery 对照。
-- 验证 `response_previewed` / `response_transformed` 如何防止流式/最终响应重复投递。
+- 枚举 `conversation_loop` 的状态、transition 和所有 terminal `turn_exit_reason`。
+- 将 retry/fallback、tool continuation、compression、interrupt 和 grace-call 画成状态机。
+- 建立成功/失败/partial/interrupted/completed 返回字段的真值矩阵。
 
 ## 已确认事实
 
@@ -67,15 +67,22 @@ updated_at: 2026-08-11
 - approval 分布在 plugin escalation、loop guardrail、ACP edit gate 和 handler-native policy，`tool.started` 不代表所有后续审批已通过。
 - `make_tool_result_message()` 同时承担 Provider/DB 字段、untrusted output framing 和 effect disposition。
 - `OPEN-M2-001`：aggregate budget 与 `/steer` 在 per-result flush 后原地改写已标记 tool row，可能造成热运行 Provider context 与 cold-resume SessionDB 内容差异；已核对代码和提交意图，尚待 real DB 复现。
+- “共享 Agent Core”是共享 library kernel，不是单一中央 Agent 服务；CLI、Gateway、`tui_gateway` 在各自 Python 进程内持有实例。
+- CLI 以 active route signature 复用一个当前 Agent；Gateway 以 session key/config signature/message-count guard 管理 LRU cache；TUI/Desktop backend 以 runtime sid session table 持有 per-session Agent。
+- Gateway 每轮从 durable transcript 重建安全 replay，同时在同一 cached Agent live history 更长时保留它，兼顾跨进程 coherence 与同进程写失败下的连续性。
+- Cached Agent 的 callback、ContextVar、reasoning/service-tier/request override 必须每轮重绑，不能成为跨会话静态状态。
+- `response_previewed` 表示 final candidate 已作为 interim 发布，不等于任意 stream/progress 已送达；`response_transformed` 表示旧 stream 不包含最终展示变换。
+- Messaging Gateway 只有确认 delivered payload 与 completed final 匹配时才设 `already_sent`；stale 或 transformed final 优先 edit，失败回退普通 send。
+- `tui_gateway` 始终发送 authoritative `message.complete`；Ink 与 Desktop 使用不同但明确测试的 interim segmentation policy 合并 client state。
 - 系统架构研究必须把 prompt-cache stability、role alternation 和 narrow-waist tool surface 作为跨模块约束。
 
 ## 待回答问题
 
-1. Gateway 与 Desktop 如何利用 `response_previewed`/`response_transformed` 避免重复投递？
-2. 三个入口在 Agent cache/reuse、SessionDB ownership、approval callback 和 profile/cwd 绑定上有什么差异？
-3. route/model 切换后，CLI history 与 Agent prompt/tool snapshot 如何重新建立？
+1. `conversation_loop` 的所有 exit reason 如何映射到 completed/failed/partial/interrupted？
+2. retry、credential rotation、fallback model 与 one-turn grace call 的优先级是什么？
+3. empty response、dropped tool call、verification nudge 与 max-iteration recovery 如何保持角色交替？
 4. `OPEN-M2-001` 能否由 real SessionDB cold-resume test 稳定复现？
 
 ## 下一步
 
-创建 M2 的 CLI/Gateway/Desktop 入口对照；随后运行或补充 `OPEN-M2-001` 的最小冷恢复契约。
+创建 M3 Agent Loop 状态机和 exit-reason/return-field 矩阵；将 `OPEN-M2-001` 纳入 crash recovery matrix。

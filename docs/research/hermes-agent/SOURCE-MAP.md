@@ -73,3 +73,4 @@ confidence: medium
 - [顶层数据流](./architecture/data-flow.md)：展示/API/持久化视图、tool-call 回路和失败边界。
 - [Classic CLI 最小回合](./flows/canonical-cli-turn.md)：线程外壳、staged input、Provider projection、无工具终止和最终展示投影。
 - [Canonical 工具回合](./flows/canonical-tool-turn.md)：intent/result 双持久化门、ordered batch segments、middleware/approval 与恢复语义。
+- [入口 Surface 对照](./flows/entry-surface-comparison.md)：三类 Python Agent owner 与四类 UI/delivery policy。

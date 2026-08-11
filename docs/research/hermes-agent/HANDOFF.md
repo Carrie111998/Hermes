@@ -11,8 +11,8 @@ updated_at: 2026-08-11
 
 - Branch：`docs/hermes-architecture-deep-dive`
 - Baseline：`dd0827710`
-- Milestone：M2 — Canonical Turn
-- Working document：[flows/canonical-tool-turn.md](./flows/canonical-tool-turn.md)
+- Milestone：M3 — Agent Loop 与回合可靠性
+- Working document：[flows/entry-surface-comparison.md](./flows/entry-surface-comparison.md)
 
 ## 本次已完成
 
@@ -38,23 +38,27 @@ updated_at: 2026-08-11
 - 将 INV-004、INV-005 升级为 code/tests verified，并新增 result persistence 的 INV-015。
 - 通过 `858bedea02` 和 `0fd0db1a8` 核对 result-first persistence 与 budget 后 steer 的历史意图。
 - 记录 `OPEN-M2-001`：budget/steer 在 flush 后原地改写已标记 tool row，热运行与 cold resume 可能分叉；尚未运行 real DB 复现。
+- 比较 CLI、Messaging Gateway 和 `tui_gateway` 的 Agent ownership、lazy build、reuse/rebuild 和 history owner。
+- 确认 Desktop 复用 `tui_gateway` backend，不是第四套 Agent runtime；与 Ink 的差异位于 client transcript reducer。
+- 还原 `response_previewed`、`response_transformed`、stream delivery flags 和 `already_sent` 的不同语义。
+- 验证 Gateway 的 payload match/stale reconcile/transformed edit/normal-send fallback，以及 TUI/Desktop 的 `message.complete` settle。
+- 创建 `flows/entry-surface-comparison.md`，完成 M2 Canonical Turn。
 
 ## 尚未完成
 
-- 尚未创建 CLI/Gateway/Desktop 构造参数与交付语义对照。
 - `OPEN-M2-001` 尚未通过可运行的 real SessionDB cold-resume test 复现。
-- 当前工作区未发现项目 `.venv`/`venv` pytest executable，本单元只阅读了行为测试源码。
+- 尚未建立 M3 conversation-loop 完整状态机和 exit-reason taxonomy。
+- 当前工作区未发现项目 `.venv`/`venv` pytest executable，本阶段只阅读了行为测试源码。
 
 ## 下次会话的准确动作
 
 1. 读取本目录的 `README.md`、`PROGRESS.md` 和本文件。
-2. 读取 `flows/canonical-cli-turn.md` 和 `architecture/data-flow.md`。
-3. 从 Classic CLI 的 `_init_agent`/`chat`、Gateway turn executor/agent cache、`tui_gateway.server::_make_agent` 采集 Agent 构造与复用参数。
-4. 对照 session id/history owner、platform metadata、toolsets、cwd/profile、stream/progress/approval callbacks。
-5. 沿 Gateway delivery 与 Desktop JSON-RPC response adoption 追踪 `response_previewed` / `response_transformed`。
-6. 创建 `flows/entry-surface-comparison.md` 并提交独立研究单元。
-7. 若环境可运行 pytest，再为 `OPEN-M2-001` 建立 real SessionDB 最小复现；否则保留为明确开放问题。
+2. 读取 `flows/canonical-cli-turn.md`、`flows/canonical-tool-turn.md` 和 `flows/entry-surface-comparison.md`。
+3. 在 `agent/conversation_loop.py` 枚举 `_turn_exit_reason` 的全部赋值点，并按 terminal/retry/continue 分类。
+4. 追踪 iteration budget、grace call、empty/dropped-tool recovery、credential rotation、fallback 和 compression transition。
+5. 创建 `modules/agent-loop.md`，先画主状态机，再补 exit-reason/return-field 矩阵。
+6. 将 interrupt、persistence failure 和 `OPEN-M2-001` 纳入后续 crash matrix。
 
 ## 工作区提示
 
-当前分支应包含 `ea3bfe794`、`ab0e14d73`、`2c39face3` 和 `4dabf7827`；继续前运行 `git status --short --branch`。
+当前分支应包含 `ea3bfe794`、`ab0e14d73`、`2c39face3`、`4dabf7827` 和 `6fd28cf63`；继续前运行 `git status --short --branch`。

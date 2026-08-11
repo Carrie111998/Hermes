@@ -17,3 +17,4 @@
 
 - [Classic CLI 最小回合](./canonical-cli-turn.md)：从 prompt-toolkit 输入，经同步 Agent loop，到 canonical persistence 与最终展示投影。
 - [Canonical 工具回合](./canonical-tool-turn.md)：从 assistant intent 的副作用前持久化，经 middleware/approval/dispatch，到 result 的完成投影前持久化。
+- [入口 Surface 对照](./entry-surface-comparison.md)：CLI、Gateway、Ink TUI 与 Desktop 的 Agent ownership、history、callback 和 final delivery 差异。
