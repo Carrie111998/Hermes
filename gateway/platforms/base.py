@@ -6042,6 +6042,18 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
+    def session_key_for_source(self, source: SessionSource) -> str:
+        """Return this adapter's physical active/pending slot key."""
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            thread_sessions_per_user=self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        )
+
     async def handle_message(self, event: MessageEvent) -> None:
         """
         Process an incoming message.
@@ -6067,7 +6079,8 @@ class BasePlatformAdapter(ABC):
         if needs_topic_recovery:
             await asyncio.to_thread(self._apply_topic_recovery, event)
 
-        session_key = build_session_key(
+        session_key = self.session_key_for_source(event.source)
+        derived_state_key = build_session_key(
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
@@ -6076,11 +6089,11 @@ class BasePlatformAdapter(ABC):
         expected_session_key = str(
             (event.metadata or {}).get("gateway_session_key") or ""
         ).strip()
-        if expected_session_key and session_key != expected_session_key:
+        if expected_session_key and derived_state_key != expected_session_key:
             logger.warning(
                 "Dropping internally routed event: expected session=%s derived=%s",
                 expected_session_key,
-                session_key,
+                derived_state_key,
             )
             return
 
