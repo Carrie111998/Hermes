@@ -196,9 +196,9 @@ import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
+import { canHandOffLockedUpdateToInstaller, listWindowsInstallVenvHolders } from './update-lock-handoff'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
-import { canHandOffLockedUpdateToInstaller, listWindowsInstallVenvHolders } from './update-lock-handoff'
 import {
   buildRelaunchScript,
   collectRelaunchArgs,
