@@ -323,13 +323,26 @@ def _(rid, params: dict) -> dict:
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
     display_kind = None
     display_metadata = None
-    if params.get("display_kind") == "goal_resume" and isinstance(text, str):
+    if params.get("display_kind") == "goal_resume":
         with session["history_lock"]:
             expected = session.get("_pending_goal_resume_projection")
-            if isinstance(expected, str) and text == expected:
-                session.pop("_pending_goal_resume_projection", None)
-                display_kind = "goal_resume"
-                display_metadata = {"display_text": "/goal resume"}
+            if (
+                not isinstance(text, str)
+                or not isinstance(expected, str)
+                or text != expected
+            ):
+                # command.dispatch and prompt.submit are separate RPCs. A
+                # pause, clear, or replacement goal can invalidate the resume
+                # between them; never downgrade that stale synthetic request
+                # into an ordinary user turn.
+                return globals()["_err"](
+                    rid,
+                    4091,
+                    "stale goal resume — the goal changed before submission",
+                )
+            session.pop("_pending_goal_resume_projection", None)
+            display_kind = "goal_resume"
+            display_metadata = {"display_text": "/goal resume"}
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise

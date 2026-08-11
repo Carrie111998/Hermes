@@ -235,6 +235,66 @@ def test_goal_resume_after_budget_exhaustion_dispatches_next_turn(server, sessio
     assert server._sessions[sid]["queued_prompt"] is None
 
 
+@pytest.mark.parametrize("invalidating_arg", ["pause", "clear", "replacement goal"])
+def test_stale_goal_resume_is_rejected_after_goal_state_changes(
+    server, session, invalidating_arg
+):
+    sid, _, s = session
+
+    _call(server, "command.dispatch", name="goal", arg="original goal", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    resume = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )
+    stale_prompt = resume["result"]["message"]
+
+    _call(
+        server,
+        "command.dispatch",
+        name="goal",
+        arg=invalidating_arg,
+        session_id=sid,
+    )
+    response = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=stale_prompt,
+        display_kind="goal_resume",
+    )
+
+    assert response["error"]["code"] == 4091
+    assert "stale goal resume" in response["error"]["message"]
+    assert s["history"] == []
+    assert s["running"] is False
+
+
+def test_goal_resume_projection_mismatch_is_not_downgraded_to_an_ordinary_prompt(
+    server, session
+):
+    sid, _, s = session
+
+    _call(server, "command.dispatch", name="goal", arg="original goal", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    resume = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )
+    expected = resume["result"]["message"]
+
+    response = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=f"{expected} (stale copy)",
+        display_kind="goal_resume",
+    )
+
+    assert response["error"]["code"] == 4091
+    assert s["_pending_goal_resume_projection"] == expected
+    assert s["history"] == []
+    assert s["running"] is False
+
+
 # ── slash.exec /goal routing ──────────────────────────────────────────
 
 
