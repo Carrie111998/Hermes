@@ -253,6 +253,38 @@ def save_checkpoint(data: Dict[str, Any]) -> None:
     path.write_text(json.dumps(_json_safe(data), indent=2, sort_keys=True), encoding="utf-8")
 
 
+_STATS_MERGE_SKIP = {"session_id", "title", "started_at", "last_active", "source"}
+
+
+def _merge_stats_monotonic(cached: Dict[str, Any], fresh: Dict[str, Any]) -> Dict[str, Any]:
+    """Element-wise max of a session's fresh stats with its cached scan.
+
+    Session transcripts are lossy: context compaction rewrites a session's
+    messages (and bumps ``last_active``), which invalidates the fingerprint
+    and forces re-analysis of the *smaller* surviving transcript. Real
+    activity only ever adds events, so a per-session metric that goes DOWN
+    between scans is an artifact of history compression, not of usage —
+    keep the max so lifetime totals never silently regress. Collection
+    fields (e.g. ``model_names``) merge by union for the same reason.
+    Session metadata (`_STATS_MERGE_SKIP`) always takes the fresh value.
+    """
+    merged = dict(fresh)
+    for key, old in cached.items():
+        if key in _STATS_MERGE_SKIP:
+            continue
+        new = merged.get(key)
+        if isinstance(old, bool) or isinstance(new, bool):
+            merged[key] = bool(old) or bool(new)
+        elif isinstance(old, (int, float)) and isinstance(new, (int, float)):
+            merged[key] = max(old, new)
+        elif isinstance(old, (set, list)) and isinstance(new, (set, list)):
+            union = set(old) | set(new)
+            merged[key] = union if isinstance(new, set) else sorted(union)
+        elif key not in merged:
+            merged[key] = old
+    return merged
+
+
 def session_fingerprint(meta: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "last_active": meta.get("last_active"),
@@ -651,6 +683,10 @@ def scan_sessions(
             else:
                 messages = db.get_messages(sid)
                 stats = analyze_messages(sid, meta.get("title") or meta.get("preview") or "Untitled", messages)
+                if isinstance(cached_stats, dict):
+                    # Same session, changed fingerprint: the transcript may have
+                    # been compacted. Merge monotonically so counts never drop.
+                    stats = _merge_stats_monotonic(cached_stats, stats)
                 rescanned += 1
 
             stats["session_id"] = sid
@@ -834,7 +870,16 @@ def _compute_from_scan(scan: Dict[str, Any], *, is_partial: bool = False) -> Dic
         if not is_partial and result["unlocked"] and unlock_id not in unlocks:
             unlocks[unlock_id] = {"unlocked_at": now, "first_tier": result.get("tier"), "evidence": evidence_for(definition, scan.get("sessions", []))}
         item = {**definition, **result}
-        if result["unlocked"]:
+        recorded = unlocks.get(unlock_id)
+        if recorded and not result["unlocked"]:
+            # Unlock floor: state.json is the durable record of what was
+            # earned; the live aggregate can lose its backing when compaction
+            # shrinks session history. Once earned, never displayed as
+            # un-earned — floor at the recorded first tier.
+            item["unlocked"] = True
+            item["state"] = "unlocked"
+            item["tier"] = item.get("tier") or recorded.get("first_tier")
+        if item["unlocked"]:
             item["unlocked_at"] = unlocks.get(unlock_id, {}).get("unlocked_at")
             item["evidence"] = unlocks.get(unlock_id, {}).get("evidence") or evidence_for(definition, scan.get("sessions", []))
         evaluated.append(display_achievement(item))
