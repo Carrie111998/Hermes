@@ -31,6 +31,7 @@ import atexit
 import copy
 import io
 import logging
+import math
 import os
 import queue
 import sys
@@ -181,6 +182,28 @@ def clear_session_context() -> None:
 # ---------------------------------------------------------------------------
 
 
+_DISCORD_RECONNECT_TEMPLATE = "Attempting a reconnect in %.2fs"
+_TELEGRAM_RETRY_ABORT_TEMPLATE = "%s Failed run number %s of %s. Aborting."
+_TELEGRAM_DELETE_WEBHOOK_PREFIXES = frozenset(
+    {
+        "Network Retry Loop (Bootstrap delete Webhook):",
+        "Network Retry Loop (Bootstrap delete Webhook): Timed out: Timed out.",
+    }
+)
+_TELEGRAM_UPDATER_SHUTDOWN_MESSAGE = (
+    "Error while calling `get_updates` one more time to mark all fetched updates. "
+    "Suppressing error to ensure graceful shutdown. When polling for "
+    "updates is restarted, updates may be fetched again. Please adjust timeouts "
+    "via `ApplicationBuilder` or the parameter `get_updates_request` of `Bot`."
+)
+
+
+def _is_nonnegative_finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value) and value >= 0
+
+
 def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> None:
     """Demote SDK-internal retry records whose failure is owned by an adapter.
 
@@ -192,20 +215,34 @@ def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> 
     """
     if record.levelno != logging.ERROR:
         return
-    message = record.getMessage()
-    recovered_retry = (
+    args = record.args
+    discord_retry = (
         record.name == "discord.client"
-        and message.startswith("Attempting a reconnect in ")
-    ) or (
+        and record.msg == _DISCORD_RECONNECT_TEMPLATE
+        and isinstance(args, tuple)
+        and len(args) == 1
+        and _is_nonnegative_finite_number(args[0])
+    )
+    telegram_retry = (
         record.name == "telegram.ext"
-        and message.startswith("Network Retry Loop (Bootstrap delete Webhook):")
-        and message.endswith("Failed run number 0 of 0. Aborting.")
-    ) or (
+        and record.msg == _TELEGRAM_RETRY_ABORT_TEMPLATE
+        and isinstance(args, tuple)
+        and len(args) == 3
+        and args[0] in _TELEGRAM_DELETE_WEBHOOK_PREFIXES
+        and type(args[1]) is int
+        and args[1] == 0
+        and type(args[2]) is int
+        and args[2] == 0
+    )
+    telegram_shutdown = (
         record.name == "telegram.ext.Updater"
-        and message.startswith(
-            "Error while calling `get_updates` one more time to mark all fetched updates."
-        )
-        and "Suppressing error to ensure graceful shutdown." in message
+        and record.msg == _TELEGRAM_UPDATER_SHUTDOWN_MESSAGE
+        and not args
+    )
+    recovered_retry = (
+        discord_retry
+        or telegram_retry
+        or telegram_shutdown
     )
     if recovered_retry:
         record.levelno = logging.WARNING

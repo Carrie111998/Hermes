@@ -257,33 +257,50 @@ class TestRecoveredTransportRetrySeverity:
     """SDK retry noise is warning-level; adapter-owned failures stay errors."""
 
     @pytest.mark.parametrize(
-        ("logger_name", "message"),
+        ("logger_name", "message", "args"),
         [
-            ("discord.client", "Attempting a reconnect in 1.44s"),
+            ("discord.client", "Attempting a reconnect in %.2fs", (1.44,)),
             (
                 "telegram.ext",
-                "Network Retry Loop (Bootstrap delete Webhook): Failed run number 0 of 0. Aborting.",
+                "%s Failed run number %s of %s. Aborting.",
+                ("Network Retry Loop (Bootstrap delete Webhook):", 0, 0),
             ),
             (
                 "telegram.ext.Updater",
                 "Error while calling `get_updates` one more time to mark all fetched updates. "
-                "Suppressing error to ensure graceful shutdown.",
+                "Suppressing error to ensure graceful shutdown. When polling for "
+                "updates is restarted, updates may be fetched again. Please adjust timeouts "
+                "via `ApplicationBuilder` or the parameter `get_updates_request` of `Bot`.",
+                (),
             ),
         ],
     )
-    def test_exact_sdk_recovery_records_are_downgraded(self, caplog, logger_name, message):
+    def test_exact_sdk_recovery_records_are_downgraded(
+        self, caplog, logger_name, message, args
+    ):
         caplog.set_level(logging.WARNING)
-        logging.getLogger(logger_name).error(message)
+        logging.getLogger(logger_name).error(message, *args)
         record = caplog.records[-1]
         assert record.levelno == logging.WARNING
         assert record.levelname == "WARNING"
-        assert record.getMessage() == message
+        assert record.msg == message
+        assert record.args == args
 
     @pytest.mark.parametrize(
         ("logger_name", "message"),
         [
             ("discord.client", "Authentication failed while connecting"),
+            (
+                "discord.client",
+                "Attempting a reconnect in 1.00s; authentication failed permanently",
+            ),
             ("telegram.ext", "Network Retry Loop for outbound delivery aborted"),
+            (
+                "telegram.ext.Updater",
+                "Error while calling `get_updates` one more time to mark all fetched updates. "
+                "Suppressing error to ensure graceful shutdown. Authentication failed and "
+                "shutdown is incomplete",
+            ),
             (
                 "hermes_plugins.discord_platform.adapter",
                 "[Discord] Discord Gateway WebSocket remained unhealthy; forcing reconnect",
@@ -296,6 +313,53 @@ class TestRecoveredTransportRetrySeverity:
         record = caplog.records[-1]
         assert record.levelno == logging.ERROR
         assert record.levelname == "ERROR"
+
+    @pytest.mark.parametrize(
+        ("logger_name", "message", "args"),
+        [
+            ("discord.client", "Attempting a reconnect in %.2fs", (-1.0,)),
+            ("discord.client", "Attempting a reconnect in %.2fs", (float("nan"),)),
+            ("discord.client", "Attempting a reconnect in %.2fs", (True,)),
+            (
+                "telegram.ext",
+                "%s Failed run number %s of %s. Aborting.",
+                (
+                    "Network Retry Loop (Bootstrap delete Webhook): "
+                    "Authentication failed permanently.",
+                    0,
+                    0,
+                ),
+            ),
+            (
+                "telegram.ext",
+                "%s Failed run number %s of %s. Aborting.",
+                ("Network Retry Loop (Bootstrap delete Webhook):", True, 0),
+            ),
+        ],
+    )
+    def test_sdk_templates_with_unapproved_arguments_remain_errors(
+        self, caplog, logger_name, message, args
+    ):
+        caplog.set_level(logging.WARNING)
+        logging.getLogger(logger_name).error(message, *args)
+        record = caplog.records[-1]
+        assert record.levelno == logging.ERROR
+        assert record.levelname == "ERROR"
+
+    def test_unrelated_malformed_error_formatting_is_not_evaluated(self):
+        factory = logging.getLogRecordFactory()
+        record = factory(
+            "unrelated.library",
+            logging.ERROR,
+            __file__,
+            1,
+            "broken %s",
+            (1, 2),
+            None,
+        )
+        assert record.levelno == logging.ERROR
+        assert record.msg == "broken %s"
+        assert record.args == (1, 2)
 
 
 class TestComponentFilter:
