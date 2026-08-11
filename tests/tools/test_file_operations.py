@@ -778,6 +778,41 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         assert ops._sample_file_bytes("/tmp/cjk.md") == payload
 
+    def test_base64_garbled_output_falls_back_to_od(self, mock_env):
+        # base64 exits 0 but its stdout is not base64 (terminal fence leak /
+        # prompt contamination) — must fall through to od instead of giving
+        # up. Review ask on #83000.
+        payload = (b"a" * 999 + "中文字符".encode("utf-8"))[:1000]
+        hex_lines = " ".join(f"{b:02x}" for b in payload)
+
+        def side_effect(command, **kwargs):
+            if "| base64" in command:
+                return {"output": "not!base64@", "returncode": 0}
+            if "od -An -v -t x1" in command:
+                return {"output": hex_lines + "\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        assert ops._sample_file_bytes("/tmp/cjk.md") == payload
+
+    def test_base64_empty_output_falls_back_to_od(self, mock_env):
+        # base64 exits 0 but produces nothing (fence stripping emptied it) —
+        # must not short-circuit to b""; let od arbitrate the empty case.
+        payload = b"hello"
+        hex_lines = " ".join(f"{b:02x}" for b in payload)
+
+        def side_effect(command, **kwargs):
+            if "| base64" in command:
+                return {"output": "", "returncode": 0}
+            if "od -An -v -t x1" in command:
+                return {"output": hex_lines + "\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        assert ops._sample_file_bytes("/tmp/x.txt") == payload
+
     def test_od_transport_rejects_non_hex_shell_error(self, mock_env):
         # od itself missing: shell error text must not be parsed as bytes.
         def side_effect(command, **kwargs):

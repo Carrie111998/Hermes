@@ -910,7 +910,12 @@ class ShellFileOperations(FileOperations):
         When ``base64`` is unavailable (Windows cmd, minimal busybox
         variants, restricted remote shells), retry the same sample through
         the POSIX-standard ``od -An -v -t x1`` hex transport — strictly more
-        available than base64, and equally lossless (#82997).
+        available than base64, and equally lossless (#82997). The od
+        transport also catches the cases where base64 exists but its output
+        is not trustworthy (empty after fence stripping, non-base64
+        characters, decode failure) — every degraded path lands on the byte
+        layer, so the legacy text-sample heuristic only runs on shells
+        missing both tools.
 
         Returns the sample bytes, or ``None`` when neither transport could
         produce clean output (exotic shells without both tools); callers
@@ -922,9 +927,11 @@ class ShellFileOperations(FileOperations):
         if result.exit_code == 0:
             encoded = _strip_terminal_fence_leaks(result.stdout)
             encoded = "".join(encoded.split())
-            if not encoded:
-                return b""
-            if re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+            # Only a clean base64 payload is trusted: empty output, non-base64
+            # characters (terminal fence leaks, prompt contamination) and
+            # decode failures all fall through to the od transport, exactly
+            # like a missing base64 — every degraded path lands on bytes.
+            if encoded and re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
                 try:
                     return base64.b64decode(encoded, validate=True)
                 except (binascii.Error, ValueError):
