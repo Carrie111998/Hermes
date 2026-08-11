@@ -205,3 +205,67 @@ Two surfaces, one core, different failure conventions:
 - Agent memory: `reference-editable-finder-drift-and-console-script-lock`
 - Existing packaging test: `tests/test_packaging_metadata.py` (commit b197c5c6d)
 - Precedent: `hermes_cli/events_doctor.py` `check_code_drift`
+
+---
+
+## Verified 2026-08-11
+
+### The MAPPING parse reads the real generated artifact
+
+The live finder holds **37** MAPPING entries (23 packages + 14 `py-modules`, as
+predicted). A copy with the five 2026-08-10 names deleted holds **32**, and
+`resolve_install_root` reads that copy correctly — resolving the root to
+`C:\Users\diego\.hermes\agent-src` from the MAPPING targets even though the
+file itself sat in a temp directory, and reporting exactly
+`activity_policy`, `activity_telemetry`, `devflow_delegation`,
+`jobflow_dispatch`, `session_bridge` as absent.
+
+One correction to the plan's script: `re.sub` with a plain replacement string
+mangles the Windows backslashes in `repr(mapping)` as escape sequences. The
+replacement must be a lambda.
+
+### The breadth and depth layers fire against the real interpreter
+
+Running the probe with `PYTHONNOUSERSITE=1` (suppressing the user-site finder,
+so the interpreter is genuinely blind) reported **37 of 37 declared names
+missing** and `events.gateway_integration` failing with
+`ModuleNotFoundError: No module named 'events'` — the real chain from the
+outage, through real import machinery rather than a fixture.
+
+### The verification found a defect the fixtures could not
+
+The first run of the above printed:
+
+    Why: The editable finder holds 37 of the 37 declared names.
+    Remedy — regenerate the finder by reinstalling the editable package:
+        pip install -e . --no-deps
+
+That diagnosis contradicts the FAIL above it, and the remedy is wrong:
+reinstalling regenerates a finder that is already complete. A finder that
+**lists** every name that failed to resolve is not stale — it is not being
+**loaded**. Real causes: a different interpreter than the one owning the
+install, user site-packages disabled (`PYTHONNOUSERSITE=1` / `python -s`), or a
+deleted `.pth`. A Windows service or Scheduled Task with a scrubbed
+environment reaches this state without anyone intending it.
+
+Fixed in `50edfc58e`. `Findings` gained `finder_is_stale: bool | None` —
+`True` when the finder omits a missing name, `False` when it lists them all,
+`None` when undetermined. `analyze` selects the matching diagnosis, and
+`remedy_lines` returns not-loaded guidance instead of the reinstall block when
+it is `False`. `render` and `doctor_section_lines` both pass the flag through,
+so the two surfaces cannot give contradictory advice. Undetermined still
+defaults to the reinstall remedy.
+
+This is the whole argument for keeping the end-to-end step: every fixture in
+the suite passed while the guard was giving misleading remediation on the one
+scenario the fixtures did not model.
+
+### Regression suite
+
+`tests/hermes_cli/test_install_doctor.py` + `tests/test_packaging_metadata.py`
+→ **53 passed**. The existing packaging tests are untouched; this guard is
+additive and covers a different property.
+
+Against the unmodified environment the guard exits **0** and reports
+`[OK] every declared package resolves from a neutral cwd`, which is correct —
+the drift was repaired before this work began.
