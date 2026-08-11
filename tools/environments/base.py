@@ -179,18 +179,24 @@ def touch_activity_if_due(
         pass
 
 
-def get_sandbox_dir() -> Path:
+def get_sandbox_dir(*, create: bool = True) -> Path:
     """Return the host-side root for all sandbox storage (Docker workspaces,
     Singularity overlays/SIF cache, etc.).
 
     Configurable via TERMINAL_SANDBOX_DIR. Defaults to {HERMES_HOME}/sandboxes/.
+
+    ``create=False`` resolves the path without materialising it, so a caller
+    that only wants to *capture* the location — a deferred cleanup hook binding
+    its target at registration — does not leave a sandbox tree behind on every
+    process that merely asks where sandboxes would go.
     """
     custom = os.getenv("TERMINAL_SANDBOX_DIR")
     if custom:
         p = Path(custom)
     else:
         p = get_hermes_home() / "sandboxes"
-    p.mkdir(parents=True, exist_ok=True)
+    if create:
+        p.mkdir(parents=True, exist_ok=True)
     return p
 
 

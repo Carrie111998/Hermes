@@ -69,24 +69,33 @@ def _save_snapshots(data: dict) -> None:
     _save_json_store(_SNAPSHOT_STORE, data)
 
 
-def _get_scratch_dir() -> Path:
+def _get_scratch_dir(*, create: bool = True) -> Path:
+    """Resolve the sandbox scratch root.
+
+    ``create=False`` resolves without materialising anything — see
+    ``tools.terminal_tool.resolve_scratch_dir``, which uses it to capture the
+    root at registration time for a sweep that runs at interpreter exit.
+    """
     custom_scratch = os.getenv("TERMINAL_SCRATCH_DIR")
     if custom_scratch:
         scratch_path = Path(custom_scratch)
-        scratch_path.mkdir(parents=True, exist_ok=True)
+        if create:
+            scratch_path.mkdir(parents=True, exist_ok=True)
         return scratch_path
 
     from tools.environments.base import get_sandbox_dir
-    sandbox = get_sandbox_dir() / "singularity"
+    sandbox = get_sandbox_dir(create=create) / "singularity"
 
     scratch = Path("/scratch")
     if scratch.exists() and os.access(scratch, os.W_OK):
         user_scratch = scratch / os.getenv("USER", "hermes") / "hermes-agent"
-        user_scratch.mkdir(parents=True, exist_ok=True)
-        logger.info("Using /scratch for sandboxes: %s", user_scratch)
+        if create:
+            user_scratch.mkdir(parents=True, exist_ok=True)
+            logger.info("Using /scratch for sandboxes: %s", user_scratch)
         return user_scratch
 
-    sandbox.mkdir(parents=True, exist_ok=True)
+    if create:
+        sandbox.mkdir(parents=True, exist_ok=True)
     return sandbox
 
 
