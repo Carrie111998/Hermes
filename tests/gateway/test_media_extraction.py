@@ -383,5 +383,40 @@ class TestStaleToolMediaLeak:
         )
 
 
+class TestMediaTagCleanupReNonAsciiBoundary:
+    """MEDIA_TAG_CLEANUP_RE must treat non-ASCII characters (e.g. CJK) as a
+    valid trailing boundary so a MEDIA: path followed directly by Chinese
+    text without whitespace is still extracted instead of leaking the
+    literal ``MEDIA:`` text to the user.
+    """
+
+    @pytest.mark.parametrize("text, expected_path", [
+        # CJK glued directly after the path (the regression)
+        ("已生成并验证成功。MEDIA:/opt/data/cache/excel-send-test.xlsx为啥会发送个",
+         "/opt/data/cache/excel-send-test.xlsx"),
+        ("文件在 MEDIA:/tmp/photo.png请下载", "/tmp/photo.png"),
+        ("报告已生成:MEDIA:/tmp/report.pdf请注意查收", "/tmp/report.pdf"),
+        ("MEDIA:C:\\Users\\me\\a.xlsx中文", "C:\\Users\\me\\a.xlsx"),
+        # CJK with existing separator still works
+        ("文件在 MEDIA:/tmp/photo.png 请下载", "/tmp/photo.png"),
+    ])
+    def test_non_ascii_boundary_extracts_path(self, text, expected_path):
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        match = MEDIA_TAG_CLEANUP_RE.search(text)
+        assert match is not None, f"Should match: {text}"
+        assert match.group("path") == expected_path
+
+    @pytest.mark.parametrize("text", [
+        "just a sentence without media",
+        "MEDIA:/nope.py",  # .py not in the deliverable extension list
+        "MEDIA:/nope.log",  # .log not in the deliverable extension list
+    ])
+    def test_no_media_no_match(self, text):
+        from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+
+        assert MEDIA_TAG_CLEANUP_RE.search(text) is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -1939,11 +1939,17 @@ _MEDIA_EXT_ALTERNATION = "|".join(
 # guard keeps multi-part extensions intact — for ``archive.tar.gz`` the
 # ``.`` after ``tar`` is followed by ``g``, so the match must extend to
 # ``.gz`` instead of stopping early at ``.tar``.
+#
+# Non-ASCII boundary: the trailing lookahead also accepts any non-ASCII
+# character (``[^\x00-\x7F]``) as a boundary, so a tag whose path is
+# followed directly by CJK text without whitespace (e.g.
+# ``MEDIA:/x/a.xlsx已生成``) still extracts cleanly instead of leaking the
+# literal ``MEDIA:`` text to the user.
 MEDIA_TAG_CLEANUP_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+?`|"[^"\n]+?"|'[^'\n]+?'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])\S+?(?:[^\S\n]+\S+?)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
-    r'''(?=[\s`"'*_,;:)\]}\[]|MEDIA:|\.(?:\s|$)|$)[`"'*_]{0,3}\.?''',
+    r'''(?=[\s`"'*_,;:)\]}\[]|MEDIA:|\.(?:\s|$)|$|[^\x00-\x7F])[`"'*_]{0,3}\.?''',
     re.IGNORECASE,
 )
 
