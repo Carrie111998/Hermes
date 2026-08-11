@@ -1148,24 +1148,12 @@ def _strip_image_parts_from_parts(parts: Any) -> Any:
     return out if had_image else None
 
 
-# #83714 — the shrunk value is replayed back to the model as its OWN past
-# tool call on every subsequent turn. A bare, prose-shaped marker like
-# "...[truncated]" is exactly the kind of terse ellipsis abbreviation a
-# model is already inclined to produce, so a model conditioned on seeing
-# itself "get away with" that pattern in its own history will imitate it in
-# a *new* tool call — writing the literal marker into a file instead of the
-# real content (observed with deepseek-v4-pro; see PR #83752 for the
-# resulting file-corruption guard). This marker is deliberately NOT
-# prose-shaped: distinctive non-ASCII delimiters that don't occur in normal
-# code/text, an explicit "not real content" disclaimer, and a per-instance
-# character count that won't match the next omission point even if copied
-# verbatim — all raise the bar against a model treating this as a stylistic
-# convention worth reusing.
-_COMPRESSION_MARKER_TEMPLATE = (
-    "⟪HERMES-CONTEXT-COMPRESSION: {omitted:,} of {total:,} chars omitted here "
-    "by Hermes's context compressor. This is NOT part of the original tool "
-    "call and must never be reproduced in new output — always write full, "
-    "untruncated content.⟫"
+# #83714 — shrunk tool-call args are replayed as the model's OWN past output.
+# Marker text lives in tools.truncation_markers so the write/patch guard can
+# refuse the same token if a model ever copies it (#83752 / #83843).
+from tools.truncation_markers import (
+    COMPRESSION_MARKER_TEMPLATE as _COMPRESSION_MARKER_TEMPLATE,
+    format_compression_marker as _format_compression_marker,
 )
 
 
@@ -1208,7 +1196,7 @@ def _truncate_tool_call_args_json(args: str, head_chars: int = 200) -> str:
     def _shrink(obj: Any) -> Any:
         if isinstance(obj, str):
             if len(obj) > head_chars:
-                marker = _COMPRESSION_MARKER_TEMPLATE.format(
+                marker = _format_compression_marker(
                     omitted=len(obj) - head_chars, total=len(obj)
                 )
                 return obj[:head_chars] + marker

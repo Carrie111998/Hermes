@@ -1011,12 +1011,33 @@ class TestTruncationPlaceholderGuard:
         from tools.file_tools import _find_truncation_placeholder
 
         assert _find_truncation_placeholder("hello ...[truncated]") == "...[truncated]"
-        assert _find_truncation_placeholder("hello … [truncated] world") == "… [truncated]"
+        assert _find_truncation_placeholder("hello … [truncated] world")
         assert _find_truncation_placeholder("plain [truncated] marker") == "[truncated]"
         assert _find_truncation_placeholder("// ... unchanged ...\ndef f(): pass")
+        assert _find_truncation_placeholder("# ... rest of file ...\npass")
+        assert "HERMES-CONTEXT-COMPRESSION" in (
+            _find_truncation_placeholder(
+                "x" * 10
+                + "⟪HERMES-CONTEXT-COMPRESSION: 1 of 2 chars omitted here "
+                + "by Hermes's context compressor. This is NOT part of the original tool "
+                + "call and must never be reproduced in new output — always write full, "
+                + "untruncated content.⟫"
+            )
+            or ""
+        )
         assert _find_truncation_placeholder("normal content, nothing odd here") is None
         assert _find_truncation_placeholder("") is None
         assert _find_truncation_placeholder(None) is None
+
+    def test_find_truncation_placeholder_count_based_vs_original(self):
+        """#68512: pre-existing one occurrence is ok; adding a second is not."""
+        from tools.file_tools import _find_truncation_placeholder
+
+        original = "def foo():\n    // ... unchanged ...\n    pass\n"
+        same = original + "def bar():\n    return 1\n"
+        assert _find_truncation_placeholder(same, original) is None
+        doubled = original + "def bar():\n    // ... unchanged ...\n    pass\n"
+        assert _find_truncation_placeholder(doubled, original) is not None
 
     @patch("tools.file_tools._get_file_ops")
     def test_write_file_rejects_truncation_placeholder(self, mock_get):
@@ -1132,3 +1153,14 @@ class TestTruncationPlaceholderGuard:
 
         garbage = "not a real v4a patch at all"
         assert _extract_v4a_added_content(garbage) == garbage
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_write_file_rejects_hermes_compression_marker(self, mock_get):
+        from tools.file_tools import write_file_tool
+        from tools.truncation_markers import format_compression_marker
+
+        content = "line one\n" + format_compression_marker(omitted=100, total=300) + "\n"
+        result = json.loads(write_file_tool("/tmp/corrupt.py", content))
+        assert "error" in result
+        assert "truncation placeholder" in result["error"].lower()
+        mock_get.assert_not_called()

@@ -1333,44 +1333,13 @@ def _is_internal_file_tool_content(content: str) -> bool:
     )
 
 
-# #83714 — models occasionally emit a truncation-placeholder marker in a
-# ``write_file``/``patch`` string argument instead of the full content it
-# was supposed to replace (observed with deepseek-v4-pro via the deepseek
-# provider). Hermes itself uses this exact marker to signal truncated tool
-# *output* elsewhere (todo_tool.py, file_operations.py's per-line cap,
-# mcp_tool.py) — the leading theory is the model is imitating a pattern it
-# has seen in its own context rather than Hermes truncating the argument
-# in transit (no length-based slicing of ``content``/``new_string`` exists
-# anywhere between JSON-parsing the tool call and the write/patch below).
-# Whatever the mechanism, writing the marker literally corrupts the file,
-# so it's caught here and refused before any bytes touch disk.
-_TRUNCATION_PLACEHOLDER_PATTERNS = [
-    re.compile(r'\.\.\.\s*\[truncated\]', re.IGNORECASE),
-    re.compile(r'…\s*\[truncated\]', re.IGNORECASE),  # "… [truncated]"
-    re.compile(r'\[truncated\]', re.IGNORECASE),
-    re.compile(r'//\s*\.\.\.\s*(?:rest\s+)?unchanged\s*\.\.\.', re.IGNORECASE),
-    re.compile(r'/\*\s*\.\.\.\s*(?:rest\s+)?unchanged\s*\.\.\.\s*\*/', re.IGNORECASE),
-]
-
-
-def _find_truncation_placeholder(text: str | None) -> str | None:
-    """Return the matched placeholder substring if ``text`` contains a
-    truncation-placeholder marker, else None.
-
-    These markers are legitimate in Hermes's own tool *output* (truncated
-    reads, search results) but never legitimate in the content a model is
-    asking to *write* — a real file that happens to contain the literal
-    string ``[truncated]`` is vanishingly unlikely, and the cost of a false
-    positive (a clear error asking the model to retry) is far lower than
-    the cost of a false negative (silent file corruption).
-    """
-    if not text:
-        return None
-    for pattern in _TRUNCATION_PLACEHOLDER_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            return match.group(0)
-    return None
+# #83714 / #68512 / #83843 — refuse AI truncation placeholders and Hermes
+# compressor markers on the write path. Detection lives in
+# tools.truncation_markers (shared with the context compressor) and uses
+# count-based comparison when an original baseline is available so
+# pre-existing docs/tests that mention markers are not blocked, but adding
+# a NEW occurrence still is.
+from tools.truncation_markers import find_new_truncation_placeholder as _find_truncation_placeholder
 
 
 def _extract_v4a_added_content(patch_content: str) -> str:
@@ -2383,12 +2352,11 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     return tool_error("path required")
                 if old_string is None or new_string is None:
                     return tool_error("old_string and new_string required")
-                # #83714 — only flag a marker that's new to new_string. If
-                # old_string already contains the same literal text (e.g. a
-                # legitimate edit to a docstring that mentions "[truncated]"),
-                # this is not the model abbreviating its own output.
-                _placeholder = _find_truncation_placeholder(new_string)
-                if _placeholder and _placeholder.lower() not in (old_string or "").lower():
+                # #83714 / #68512 — count-based: only flag markers that are
+                # NEW relative to old_string (adding a second truncated stub
+                # still fails even if one already existed).
+                _placeholder = _find_truncation_placeholder(new_string, old_string)
+                if _placeholder:
                     return tool_error(
                         _truncation_placeholder_error("new_string", _placeholder)
                     )
