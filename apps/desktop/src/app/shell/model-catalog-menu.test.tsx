@@ -42,7 +42,7 @@ afterEach(() => {
 
 // A minimal controller — these tests are about the CATALOG's own behaviour
 // (what it lists, what it offers), not about what any host does with a pick.
-function renderMenu() {
+function renderMenu(requestGateway?: <T>(method: string, params?: Record<string, unknown>) => Promise<T>) {
   const select = vi.fn()
 
   const controller: ModelMenuController = {
@@ -59,7 +59,7 @@ function renderMenu() {
     <QueryClientProvider client={client}>
       <DropdownMenu open>
         <DropdownMenuContent>
-          <ModelCatalogMenu controller={controller} />
+          <ModelCatalogMenu controller={controller} requestGateway={requestGateway} />
         </DropdownMenuContent>
       </DropdownMenu>
     </QueryClientProvider>
@@ -73,6 +73,18 @@ function renderMenu() {
 // the kanban board would end up disagreeing about what "my models" means —
 // which is exactly the drift extracting this component was meant to prevent.
 describe('the catalog owns model curation', () => {
+  it('loads through the reconnecting gateway request path when supplied', async () => {
+    const requestGateway = vi.fn().mockResolvedValue({
+      providers: [{ models: ['claude-sonnet-4-6'], name: 'Anthropic', slug: 'anthropic' }]
+    })
+
+    renderMenu(requestGateway as never)
+
+    await screen.findByText(/Sonnet 4 6/i)
+    expect(requestGateway).toHaveBeenCalledWith('model.options', { explicit_only: true })
+    expect(getGlobalModelOptions).not.toHaveBeenCalled()
+  })
+
   it('honours the stored Edit Models shortlist', async () => {
     setVisibleModels(new Set([modelVisibilityKey('google', 'gemini-2.5-flash')]))
 
@@ -104,5 +116,25 @@ describe('the catalog owns model curation', () => {
     fireEvent.click(screen.getByText('Edit Models…'))
 
     expect($modelVisibilityOpen.get()).toBe(true)
+  })
+
+  it('marks explicitly uncensored models as NSFW with a distinct colour', async () => {
+    getGlobalModelOptions.mockResolvedValue({
+      providers: [
+        {
+          authenticated: true,
+          models: ['venice-uncensored-1-2', 'qwen3-coder-480b-a35b-instruct-turbo'],
+          name: 'Venice',
+          slug: 'venice'
+        }
+      ]
+    })
+
+    renderMenu()
+
+    const badge = await screen.findByText('NSFW')
+    expect(badge.className).toContain('text-rose-')
+    expect(screen.getByText('KEY/OAUTH SET')).not.toBeNull()
+    expect(screen.getByText(/Qwen3 Coder/i).className).not.toContain('text-rose-')
   })
 })

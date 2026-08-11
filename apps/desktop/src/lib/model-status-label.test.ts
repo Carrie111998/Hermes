@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { currentPickerSelection, displayModelName, formatModelStatusLabel } from './model-status-label'
+import {
+  currentPickerSelection,
+  displayModelName,
+  formatModelStatusLabel,
+  isExplicitContentModel
+} from './model-status-label'
 import { reasoningEffortLabel } from './reasoning-effort'
 
 describe('model-status-label', () => {
@@ -9,6 +14,14 @@ describe('model-status-label', () => {
     expect(displayModelName('openai/gpt-5.5-fast')).toBe('GPT-5.5')
     expect(displayModelName('deepseek/deepseek-v4-pro-thinking')).toBe('Deepseek V4 Pro')
     expect(displayModelName('openai/gpt-5.5')).toBe('GPT-5.5')
+  })
+
+  it('only flags explicitly labelled NSFW or uncensored model ids', () => {
+    expect(isExplicitContentModel('venice-uncensored-1-2')).toBe(true)
+    expect(isExplicitContentModel('venice-uncensored-role-play')).toBe(true)
+    expect(isExplicitContentModel('my-nsfw-bypass-model')).toBe(true)
+    expect(isExplicitContentModel('qwen3-coder-480b-a35b-instruct-turbo')).toBe(false)
+    expect(isExplicitContentModel('openai/gpt-5.6-sol')).toBe(false)
   })
 
   it('strips trailing date-pin snapshots from the display name', () => {
