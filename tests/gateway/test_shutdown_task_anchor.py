@@ -1,33 +1,26 @@
 """Regression: the SIGINT/SIGTERM shutdown task must stay strongly referenced.
 
-``shutdown_signal_handler`` in ``gateway/run.py`` finishes by scheduling
-``runner.stop()``.  For a long time it did that with a bare
-``asyncio.create_task(...)`` and threw the handle away.  The event loop keeps
-only a weak reference to a task, so a still-pending task can be
-garbage-collected mid-flight — which is exactly why the *other* signal path
-(``request_restart``, SIGUSR1) holds ``self._restart_task`` and says so in a
-comment.
+The gateway's signal handler cannot await, so it schedules ``stop()`` as a
+task.  For a long time it did that with a bare ``asyncio.create_task(...)`` and
+threw the handle away.  The event loop keeps only a weak reference to a task,
+so a still-pending task can be garbage-collected mid-flight — which is exactly
+why the *other* signal path (``request_restart``, SIGUSR1) holds
+``self._restart_task`` and says so in a comment.
 
 If the shutdown task is collected before ``stop()`` reaches
 ``self._stop_task = asyncio.create_task(_stop_impl())``, no teardown coroutine
-is ever created: the gateway simply keeps running until systemd's
-``TimeoutStopSec`` escalates to SIGKILL, so in-flight turns are never drained
-and sessions are never finalized.
+is ever created: the gateway simply keeps running until the service manager's
+stop timeout escalates to SIGKILL, so in-flight turns are never drained and
+sessions are never finalized.
 
-``shutdown_signal_handler`` is a closure built inside the gateway start path and
-cannot be imported, so the three structural invariants below are asserted by
-parsing ``gateway/run.py`` — the same technique
-``test_adapter_connect_is_reconnect_contract.py`` uses for a contract that also
-cannot be reached by importing.  The cancel-sweep invariant *is* reachable and
-is exercised behaviourally against a real ``stop()``.
+``GatewayRunner._schedule_shutdown_task`` owns that behaviour and is what the
+signal handler calls.
 """
 
 from __future__ import annotations
 
-import ast
 import asyncio
 import contextlib
-from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -36,31 +29,28 @@ from gateway.run import GatewayRunner
 from tests.gateway.restart_test_helpers import make_restart_runner
 
 
-RUN_PY = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+def _make_runner_with_blocking_stop():
+    """A bare runner whose ``stop()`` parks until the returned event is set."""
+    runner, adapter = make_restart_runner()
+    release = asyncio.Event()
+    calls: list[int] = []
 
+    async def _blocking_stop() -> None:
+        calls.append(1)
+        await release.wait()
 
-def _shutdown_signal_handler_node() -> ast.FunctionDef:
-    """The single ``shutdown_signal_handler`` definition in ``gateway/run.py``."""
-    tree = ast.parse(RUN_PY.read_text(encoding="utf-8"))
-    matches = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "shutdown_signal_handler"
-    ]
-    assert len(matches) == 1, (
-        "expected exactly one shutdown_signal_handler in gateway/run.py, found "
-        f"{len(matches)} — this test needs updating if the handler moved or was "
-        "renamed"
+    runner.stop = _blocking_stop
+    runner._schedule_shutdown_task = GatewayRunner._schedule_shutdown_task.__get__(
+        runner, GatewayRunner
     )
-    return matches[0]
+    return runner, adapter, release, calls
 
 
-def _is_create_task(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "create_task"
-    )
+async def _drain(*tasks: asyncio.Task) -> None:
+    for task in tasks:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def test_gateway_runner_declares_a_shutdown_task_slot():
@@ -75,66 +65,68 @@ def test_gateway_runner_declares_a_shutdown_task_slot():
     assert GatewayRunner._shutdown_task is None
 
 
-def test_shutdown_handler_never_discards_a_created_task():
-    """No ``asyncio.create_task(...)`` in the handler may be a bare statement."""
-    handler = _shutdown_signal_handler_node()
-    discarded = [
-        node
-        for node in ast.walk(handler)
-        if isinstance(node, ast.Expr) and _is_create_task(node.value)
-    ]
-    assert discarded == [], (
-        "shutdown_signal_handler discards the result of asyncio.create_task(); "
-        "the event loop holds only a weak reference, so the task can be "
-        "garbage-collected before stop() creates _stop_impl and the gateway "
-        "then never shuts down"
-    )
+@pytest.mark.asyncio
+async def test_scheduling_shutdown_anchors_the_task_on_the_runner():
+    """The scheduled task is reachable from the runner, not just from the loop.
 
-
-def test_shutdown_handler_anchors_its_task_on_the_runner():
-    """The created task is stored in ``runner._shutdown_task``."""
-    handler = _shutdown_signal_handler_node()
-    anchored = [
-        target.attr
-        for node in ast.walk(handler)
-        if isinstance(node, ast.Assign) and _is_create_task(node.value)
-        for target in node.targets
-        if isinstance(target, ast.Attribute)
-    ]
-    assert anchored == ["_shutdown_task"], (
-        "expected the shutdown task to be anchored on the runner as "
-        f"_shutdown_task, found {anchored!r}"
-    )
-
-
-def test_shutdown_anchor_is_only_repointed_when_the_previous_task_is_done():
-    """A second signal must not overwrite the handle to the live teardown.
-
-    The handler runs more than once in ordinary operation (a second Ctrl+C, a
-    SIGINT followed by the service manager's SIGTERM, or the planned-stop
-    watcher thread racing a real signal via ``call_soon_threadsafe``).  An
-    unconditional assignment would drop the only strong reference to the task
-    that is actually shutting the gateway down.
+    The event loop holds only a weak reference to a task, so without this the
+    shutdown can be collected while still pending.
     """
-    handler = _shutdown_signal_handler_node()
-    guarded = False
-    for node in ast.walk(handler):
-        if not isinstance(node, ast.If):
-            continue
-        if not any(
-            isinstance(inner, ast.Assign) and _is_create_task(inner.value)
-            for inner in ast.walk(node)
-        ):
-            continue
-        if any(
-            isinstance(probe, ast.Attribute) and probe.attr == "done"
-            for probe in ast.walk(node.test)
-        ):
-            guarded = True
-    assert guarded, (
-        "the _shutdown_task assignment is not guarded by a done() check, so a "
-        "repeat signal replaces the handle to the still-running shutdown task"
-    )
+    runner, _adapter, release, calls = _make_runner_with_blocking_stop()
+
+    task = runner._schedule_shutdown_task()
+    await asyncio.sleep(0)
+
+    assert runner._shutdown_task is task
+    assert task.done() is False
+    assert calls == [1]
+
+    release.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_a_repeat_signal_does_not_replace_the_in_flight_shutdown_task():
+    """A second signal must reuse the task that owns the live teardown.
+
+    The handler re-enters in ordinary operation: a second Ctrl+C, a SIGINT
+    followed by the service manager's SIGTERM, or ``_run_planned_stop_watcher``
+    driving the same callable from its polling thread.  Re-pointing the anchor
+    would drop the only strong reference to the running shutdown.
+    """
+    runner, _adapter, release, calls = _make_runner_with_blocking_stop()
+
+    first = runner._schedule_shutdown_task()
+    await asyncio.sleep(0)
+    second = runner._schedule_shutdown_task()
+    await asyncio.sleep(0)
+
+    assert second is first
+    assert runner._shutdown_task is first
+    assert calls == [1], "the repeat signal started a second stop()"
+
+    release.set()
+    await first
+
+
+@pytest.mark.asyncio
+async def test_a_later_signal_schedules_again_once_the_previous_one_finished():
+    """The guard must not wedge the gateway if an earlier shutdown completed."""
+    runner, _adapter, release, calls = _make_runner_with_blocking_stop()
+
+    first = runner._schedule_shutdown_task()
+    await asyncio.sleep(0)
+    release.set()
+    await first
+
+    second = runner._schedule_shutdown_task()
+    await asyncio.sleep(0)
+
+    assert second is not first
+    assert runner._shutdown_task is second
+    assert calls == [1, 1]
+
+    await second
 
 
 @pytest.mark.asyncio
@@ -182,7 +174,4 @@ async def test_stop_does_not_cancel_the_anchored_shutdown_task():
             "_stop_task that runs this sweep"
         )
     finally:
-        for task in (shutdown_task, control_task):
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        await _drain(shutdown_task, control_task)
