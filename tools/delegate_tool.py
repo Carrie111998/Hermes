@@ -3224,6 +3224,14 @@ def delegate_task(
     if recovered_tasks is not None:
         tasks = recovered_tasks
 
+    # Whether batch mode was actually selected. The batch-only quality gate
+    # below must key off this, not off ``tasks is not None`` — models routinely
+    # emit every declared parameter, so a legitimate single-task call arrives as
+    # ``goal="..."`` alongside an empty ``tasks=[]``. That empty list is falsy
+    # here (single mode, correctly) but is not None, so a ``tasks is not None``
+    # gate would run the batch validator against the 1-item single-task list and
+    # reject a valid call with "Batch mode requires at least 2 tasks".
+    batch_mode = False
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
             return tool_error(
@@ -3234,6 +3242,7 @@ def delegate_task(
                 f"delegation.max_concurrent_children in config.yaml."
             )
         task_list = tasks
+        batch_mode = True
     elif goal and isinstance(goal, str) and goal.strip():
         single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
         if output_schema is not None:
@@ -3259,7 +3268,7 @@ def delegate_task(
     # child is spawned.  The single-`goal` form is deliberately exempt —
     # short goals are valid there.  Duplicate goals are allowed (best-of-N).
     # Inspired by: MoonshotAI/kimi-code agent-swarm.md validation rules (MIT).
-    if tasks is not None and isinstance(tasks, list):
+    if batch_mode:
         batch_error = _validate_batch_tasks(task_list)
         if batch_error:
             return tool_error(batch_error)
