@@ -170,6 +170,106 @@ def test_revision_retraction_and_dream_provenance_mapping(tmp_path: Path) -> Non
         memory.close()
 
 
+def test_dream_preview_has_zero_graph_mutation_and_apply_metadata_is_complete(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    memory, graph, bridge = _bridge(tmp_path)
+    try:
+        source_a = memory.remember(
+            "Episode A supports one reusable concept",
+            tags=["topic", "source"],
+            salience=0.8,
+        )
+        source_b = memory.remember(
+            "Episode B supports the same reusable concept",
+            tags=["topic", "source"],
+            salience=0.75,
+        )
+        assert bridge.after_remember(source_a)["success"] is True
+        assert bridge.after_remember(source_b)["success"] is True
+        memory._conn.execute(  # noqa: SLF001 - seed existing dream contract
+            "UPDATE memories SET dream_candidate = 1 WHERE memory_id IN (?, ?)",
+            (source_a["memory_id"], source_b["memory_id"]),
+        )
+        memory._conn.commit()  # noqa: SLF001
+
+        before_preview = graph.get_status_counts()
+        preview = memory.dream_preview()
+        assert graph.get_status_counts() == before_preview
+
+        cluster = preview["clusters"][0]
+        payload = {
+            "cluster_id": cluster["cluster_id"],
+            "source_memory_ids": cluster["source_memory_ids"],
+            "summary": "A validated reusable concept from two episodes.",
+            "tags": ["dream-summary", "semantic", "concept"],
+            "salience": 0.75,
+            "valence": 0.0,
+        }
+        applied = memory.dream_apply([payload])
+        outcome = bridge.after_dream_apply(applied)
+        assert outcome["success"] is True
+
+        item = applied["applied"][0]
+        semantic_id = item["semantic_memory_id"]
+        semantic_link = graph.get_memory_node_links(memory_id=semantic_id)[0]
+        semantic_node = graph.get_node(semantic_link["node_id"])
+        assert semantic_node is not None
+        assert semantic_node["node_type"] == "Concept"
+        metadata = json.loads(semantic_node["metadata_json"])
+        required = {
+            "source_memory_ids",
+            "source_graph_node_ids",
+            "provenance",
+            "applied_at",
+            "embedding_namespace",
+            "validation_state",
+            "idempotency_key",
+        }
+        assert required <= metadata.keys()
+        assert metadata["source_memory_ids"] == sorted(cluster["source_memory_ids"])
+        assert len(metadata["source_graph_node_ids"]) == 2
+        assert metadata["embedding_namespace"].startswith("llama.cpp:")
+        assert metadata["validation_state"] == "apply_validated"
+        assert item["source_graph_node_ids"] == [
+            value.replace(":", "")
+            for value in metadata["source_graph_node_ids"]
+        ]
+        assert item["embedding_namespace"] == metadata["embedding_namespace"]
+
+        derived = [
+            edge
+            for edge in graph.list_edges(include_rejected=True)
+            if edge["edge_type"] == "derived_from"
+            and edge["source_node_id"] == semantic_link["node_id"]
+        ]
+        assert len(derived) == 2
+        for edge in derived:
+            edge_metadata = json.loads(edge["metadata_json"])
+            assert required <= edge_metadata.keys()
+            assert graph.get_node(edge["target_node_id"])["node_type"] == "Event"
+        assert {
+            item["source_graph_node_id"].replace(":", "")
+            for item in metadata["provenance"]
+        } == set(item["source_graph_node_ids"])
+        assert {
+            item["relation"] for item in metadata["provenance"]
+        } == {"dream-derived"}
+
+        counts_after_first = graph.get_status_counts()
+        repeated = memory.dream_apply([payload])
+        repeated_outcome = bridge.after_dream_apply(repeated)
+        assert repeated["applied"][0]["status"] == "idempotent"
+        assert repeated_outcome["success"] is True
+        assert graph.get_status_counts() == counts_after_first
+        assert memory.get(source_a["memory_id"])["state"] == "archived"
+        assert memory.get(source_b["memory_id"])["state"] == "archived"
+    finally:
+        memory.close()
+
+
 def test_bridge_failure_never_rolls_back_canonical_write_and_repair_is_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

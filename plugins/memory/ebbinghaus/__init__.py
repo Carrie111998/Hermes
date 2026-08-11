@@ -526,6 +526,11 @@ class EbbinghausMemoryProvider(MemoryProvider):
             "prune_mode": sleep.prune_mode,
             "max_sleep_rehearsals": sleep.max_sleep_rehearsals,
             "max_negative_sleep_rehearsals": sleep.max_negative_sleep_rehearsals,
+            "recent_replay_limit": sleep.recent_replay_limit,
+            "remote_integration_limit": sleep.remote_integration_limit,
+            "max_negative_replay_per_budget": (
+                sleep.max_negative_replay_per_budget
+            ),
         }
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:

@@ -29,6 +29,8 @@ from .store import SemanticGraphStore, new_id
 logger = logging.getLogger("hermes.plugins.semantic_graph")
 
 _EMBEDDING_BACKFILL_BATCH_SIZE = 16
+_POST_TURN_EMBED_LIMIT = 3
+_POST_TURN_EMBED_SCAN_LIMIT = 32
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -225,6 +227,66 @@ class SemanticGraphRuntime:
         if "REDACTED" in text:
             return None
         return text, source_text_hash(text)
+
+    def _embed_pending_nodes_after_turn(self) -> None:
+        """Embed at most a few recent memory nodes after the answer, fail-open."""
+        if not self._config.embedding.enabled:
+            return
+        try:
+            backend = self._get_embedding_backend()
+            if backend is None:
+                return
+            store = self.store()
+            candidates: list[tuple[str, str, str]] = []
+            for node in store.list_nodes(
+                statuses=list(self._config.recall_statuses),
+                limit=_POST_TURN_EMBED_SCAN_LIMIT,
+            ):
+                if node.get("node_type") == "Actor" or (
+                    node.get("node_type") == "Event"
+                    and node.get("subtype") == "Turn"
+                ):
+                    continue
+                source = self._embedding_source(node)
+                if source is None:
+                    continue
+                text, text_hash = source
+                node_id = str(node["node_id"])
+                if store.get_node_embedding(
+                    node_id=node_id,
+                    namespace=backend.identity.namespace,
+                    expected_source_text_hash=text_hash,
+                ) is not None:
+                    continue
+                candidates.append((node_id, text, text_hash))
+                if len(candidates) >= _POST_TURN_EMBED_LIMIT:
+                    break
+            if not candidates:
+                return
+            vectors = backend.embed_documents([item[1] for item in candidates])
+            if len(vectors) != len(candidates):
+                raise EmbeddingBackendError(
+                    "embedding response count does not match input count"
+                )
+            for (node_id, _text, expected_hash), vector in zip(
+                candidates,
+                vectors,
+            ):
+                current = store.get_node(node_id)
+                current_source = self._embedding_source(current or {})
+                if current_source is None or current_source[1] != expected_hash:
+                    continue
+                store.upsert_node_embedding(
+                    node_id=node_id,
+                    identity=backend.identity,
+                    vector=vector,
+                    source_text_hash=expected_hash,
+                )
+        except Exception as exc:
+            logger.warning(
+                "semantic-graph post-turn embedding failed open: %s",
+                type(exc).__name__,
+            )
 
     def handle_embedding_backfill(
         self, args: Optional[dict] = None, **_kw: Any
@@ -877,12 +939,13 @@ class SemanticGraphRuntime:
 
     def on_post_llm_call(self, **kwargs: Any) -> None:
         try:
-            if not self._config.capture_turns:
-                return
-            user_message = str(kwargs.get("user_message") or "")
             assistant_response = str(kwargs.get("assistant_response") or "")
             if not assistant_response.strip():
                 return
+            if not self._config.capture_turns:
+                self._embed_pending_nodes_after_turn()
+                return
+            user_message = str(kwargs.get("user_message") or "")
             session_id = str(kwargs.get("session_id") or "")
             turn_id = str(kwargs.get("turn_id") or kwargs.get("task_id") or new_id())
             model = str(kwargs.get("model") or "")
@@ -994,6 +1057,7 @@ class SemanticGraphRuntime:
                     )
                 except Exception as exc:
                     logger.warning("semantic-graph auto_extract failed open: %s", exc)
+            self._embed_pending_nodes_after_turn()
         except Exception as exc:
             logger.warning("semantic-graph post_llm_call failed open: %s", exc)
 

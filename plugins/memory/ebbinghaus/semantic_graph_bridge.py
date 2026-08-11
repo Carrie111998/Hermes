@@ -12,11 +12,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
+from plugins.semantic_graph.embedding import EmbeddingModelIdentity
 from plugins.semantic_graph.sanitize import normalize_text, sanitize_text
 from plugins.semantic_graph.store import SemanticGraphStore
 
 from .policies import EbbinghausPolicies, is_protected
-from .store import EbbinghausMemoryStore
+from .store import EbbinghausMemoryStore, _dream_idempotency_key
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,11 @@ def _stable_id(kind: str, *parts: object) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _metadata_graph_id(node_id: str) -> str:
+    """Keep a structural hash recoverable without resembling an opaque secret."""
+    return ":".join(node_id[index : index + 16] for index in range(0, len(node_id), 16))
+
+
 def _split_tags(raw: Any) -> list[str]:
     if isinstance(raw, str):
         values = raw.replace(";", ",").split(",")
@@ -97,6 +103,7 @@ def _split_tags(raw: Any) -> list[str]:
 def _node_shape(memory: dict[str, Any]) -> tuple[str, str]:
     tags = set(_split_tags(memory.get("tags")))
     source = str(memory.get("source") or "").strip().lower()
+    memory_type = str(memory.get("memory_type") or "").strip().lower()
     if source == "validated_insight" or {"insight", "validated"} <= tags:
         return "Claim", "memory.insight"
     if "preference" in tags:
@@ -107,7 +114,8 @@ def _node_shape(memory: dict[str, Any]) -> tuple[str, str]:
         return "Decision", "memory.decision"
     if tags & {"procedure", "skill"}:
         return "Procedure", "memory.procedure"
-    memory_type = str(memory.get("memory_type") or "").strip().lower()
+    if memory_type == "semantic" and "concept" in tags:
+        return "Concept", "memory.concept"
     if memory_type == "episodic":
         return "Event", "memory.episodic"
     if memory_type == "semantic":
@@ -184,14 +192,37 @@ class EbbinghausSemanticGraphBridge:
             raise KeyError(f"memory_id not found: {memory_id}")
         return dict(row)
 
-    def _dream_sources(self, semantic_memory_id: int) -> list[int]:
+    def _dream_provenance(self, semantic_memory_id: int) -> list[dict[str, Any]]:
         with self._read_connection() as conn:
             rows = conn.execute(
-                "SELECT source_memory_id FROM memory_provenance "
+                "SELECT source_memory_id, relation, created_at FROM memory_provenance "
                 "WHERE semantic_memory_id = ? ORDER BY source_memory_id",
                 (int(semantic_memory_id),),
             ).fetchall()
-        return [int(row["source_memory_id"]) for row in rows]
+        return [dict(row) for row in rows]
+
+    def _dream_sources(self, semantic_memory_id: int) -> list[int]:
+        return [
+            int(row["source_memory_id"])
+            for row in self._dream_provenance(semantic_memory_id)
+        ]
+
+    @staticmethod
+    def _embedding_namespace() -> str:
+        """Resolve representation identity without probing or starting a server."""
+        try:
+            from plugins.semantic_graph.config import load_config
+
+            config = load_config().embedding
+            return EmbeddingModelIdentity(
+                provider="llama.cpp",
+                model=config.model,
+                revision=config.revision,
+                dimensions=config.dimensions,
+                serializer_version=config.serializer_version,
+            ).namespace
+        except Exception:
+            return "unavailable"
 
     def _open_apply_store(self) -> tuple[EbbinghausMemoryStore, bool]:
         if self._memory_store is not None:
@@ -347,15 +378,68 @@ class EbbinghausSemanticGraphBridge:
         self,
         memory_store: EbbinghausMemoryStore,
         semantic_memory_id: int,
-    ) -> None:
+    ) -> dict[str, Any]:
         with self._graph_store.transaction():
             semantic_node_id = self._sync_memory(
                 memory_store,
                 semantic_memory_id,
             )
             semantic = memory_store.get(semantic_memory_id)
-            for source_id in self._dream_sources(semantic_memory_id):
+            provenance_rows = self._dream_provenance(semantic_memory_id)
+            source_ids = [
+                int(row["source_memory_id"]) for row in provenance_rows
+            ]
+            source_node_ids: list[str] = []
+            for source_id in source_ids:
                 source_node_id = self._sync_memory(memory_store, source_id)
+                source_node_ids.append(source_node_id)
+            applied_at = max(
+                (float(row.get("created_at") or 0.0) for row in provenance_rows),
+                default=float(time.time()),
+            )
+            metadata = {
+                "source_memory_ids": source_ids,
+                "source_graph_node_ids": source_node_ids,
+                "provenance": [
+                    {
+                        "source_memory_id": source_id,
+                        "source_graph_node_id": source_node_id,
+                        "relation": str(row.get("relation") or "dream-derived"),
+                    }
+                    for source_id, source_node_id, row in zip(
+                        source_ids,
+                        source_node_ids,
+                        provenance_rows,
+                    )
+                ],
+                "applied_at": applied_at,
+                "embedding_namespace": self._embedding_namespace(),
+                "validation_state": "apply_validated",
+                "idempotency_key": _dream_idempotency_key(source_ids),
+            }
+            persisted_metadata = {
+                **metadata,
+                "source_graph_node_ids": [
+                    _metadata_graph_id(node_id) for node_id in source_node_ids
+                ],
+                "provenance": [
+                    {
+                        **item,
+                        "source_graph_node_id": _metadata_graph_id(
+                            str(item["source_graph_node_id"])
+                        ),
+                    }
+                    for item in metadata["provenance"]
+                ],
+                "graph_node_id_encoding": "colon-separated-hex",
+            }
+            self._graph_store.upsert_node(
+                {
+                    "node_id": semantic_node_id,
+                    "metadata": persisted_metadata,
+                }
+            )
+            for source_id, source_node_id in zip(source_ids, source_node_ids):
                 self._graph_store.upsert_edge(
                     {
                         "edge_id": _stable_id(
@@ -375,9 +459,16 @@ class EbbinghausSemanticGraphBridge:
                         ),
                         "status": "asserted",
                         "rationale": "Ebbinghaus dream provenance",
-                        "metadata": {},
+                        "metadata": {
+                            **persisted_metadata,
+                            "edge_source_memory_id": source_id,
+                            "edge_source_graph_node_id": _metadata_graph_id(
+                                source_node_id
+                            ),
+                        },
                     }
                 )
+        return metadata
 
     @staticmethod
     def _error_hash(exc: Exception) -> str:
@@ -478,17 +569,24 @@ class EbbinghausSemanticGraphBridge:
         outcomes: list[dict[str, Any]] = []
         for item in result.get("applied") or []:
             memory_id = int(item["semantic_memory_id"])
-            outcomes.append(
-                self._best_effort(
-                    operation="dream",
-                    memory_id=memory_id,
-                    related_memory_id=None,
-                    action=lambda memory_id=memory_id: self._sync_dream(
+            graph_metadata: dict[str, Any] = {}
+
+            def sync_dream(memory_id: int = memory_id) -> None:
+                nonlocal graph_metadata
+                graph_metadata = self._sync_dream(
                         self._memory_store,  # type: ignore[arg-type]
                         memory_id,
-                    ),
                 )
+
+            outcome = self._best_effort(
+                operation="dream",
+                memory_id=memory_id,
+                related_memory_id=None,
+                action=sync_dream,
             )
+            if outcome["success"]:
+                item.update(graph_metadata)
+            outcomes.append(outcome)
         return {
             "success": all(item["success"] for item in outcomes),
             "operation": "dream",
