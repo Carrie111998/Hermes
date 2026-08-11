@@ -172,7 +172,8 @@ export const ar = defineLocale({
     unmuteHaptics: 'تفعيل الاهتزازات',
     openSettings: 'فتح الإعدادات',
     openStarmap: 'فتح خريطة الذاكرة',
-    openKeybinds: 'اختصارات لوحة المفاتيح',
+    enterHud: 'وضع HUD',
+    exitHud: 'إنهاء وضع HUD',
     layoutEditor: 'محرر التخطيط',
     layoutEditorTitle: 'محرر التخطيط — انقر مع ⌘ لإعادة ضبط التخطيط'
   },
@@ -1302,6 +1303,12 @@ export const ar = defineLocale({
     count: count => `${count} ملف شخصي`,
     loading: 'جار التحميل...',
     newProfile: 'ملف شخصي جديد',
+    importProfile: 'استيراد ملف شخصي…',
+    exportProfile: 'تصدير ملف شخصي…',
+    imported: 'تم استيراد الملف الشخصي',
+    exported: 'تم تصدير الملف الشخصي',
+    failedImport: 'فشل استيراد الملف الشخصي',
+    failedExport: 'فشل تصدير الملف الشخصي',
     allProfiles: 'كل الملفات الشخصية',
     showAllProfiles: 'إظهار كل الملفات الشخصية',
     switchToProfile: name => `التبديل إلى ${name}`,
@@ -1562,6 +1569,7 @@ export const ar = defineLocale({
     noWorkspace: 'بدون مساحة عمل',
     projectEmpty: 'لا توجد جلسات بعد',
     noSessions: 'لا توجد جلسات بعد',
+    noFilterMatches: 'لا توجد جلسات تطابق عوامل التصفية هذه',
     projects: {
       sectionLabel: 'المشاريع',
       home: 'الرئيسية',
@@ -1599,6 +1607,9 @@ export const ar = defineLocale({
       newWorktreeDesc: 'سمِّ الفرع لشجرة العمل هذه.',
       branchPlaceholder: 'مثال: my-feature',
       startWorkFailed: 'تعذّر إنشاء شجرة العمل',
+      worktreeProjectLabel: 'المشروع',
+      worktreeProjectPlaceholder: 'ابحث في المشاريع…',
+      worktreeProjectNone: 'لا توجد مشاريع بمجلد',
       convertBranch: 'تحويل فرع...',
       convertBranchTitle: 'تحويل فرع',
       convertBranchDesc: 'افتح الفروع المسحوبة، أو أنشئ شجرة عمل لفرع حر.',
@@ -1607,6 +1618,7 @@ export const ar = defineLocale({
       branchOpenExisting: 'فتح',
       branchSwitchHome: 'تبديل الموطن',
       branchCreateWorktree: 'شجرة عمل جديدة',
+      branchTrackRemote: 'تتبع البعيد',
       branchesLoading: 'جار تحميل الفروع...',
       noBranches: 'لم يتم العثور على فروع',
       removeWorktree: 'إزالة شجرة العمل',
@@ -1642,6 +1654,7 @@ export const ar = defineLocale({
       needsInput: 'تحتاج إدخالا',
       waitingForAnswer: 'بانتظار إجابة',
       backgroundRunning: 'تعمل في الخلفية',
+      draftSession: 'مسودة — لم تُرسل بعد',
       finishedUnread: 'اكتملت وفيها جديد',
       hideTabBar: 'إخفاء شريط التبويبات',
       openInNewTab: 'فتح في تبويب جديد',
@@ -2146,10 +2159,6 @@ export const ar = defineLocale({
   },
   preview: {
     tab: 'معاينة',
-    closeTab: label => `إغلاق ${label}`,
-    closeOthers: 'إغلاق الأخرى',
-    closeToRight: 'إغلاق ما على اليمين',
-    closeAll: 'إغلاق الكل',
     closePane: 'إغلاق جزء المعاينة',
     loading: 'جار تحميل المعاينة',
     unavailable: 'المعاينة غير متاحة',
@@ -2245,6 +2254,7 @@ export const ar = defineLocale({
     closeRunningBody:
       'هذه المحادثة ما زالت تعمل (أو تنتظر إدخالك). إغلاق التبويب يخفيها فقط — ستحتفظ الجلسة بتقدمها ويمكن إعادة فتحها من الشريط الجانبي.',
     closeRunningConfirm: 'إغلاق التبويب',
+    reload: 'إعادة التحميل',
     closeOthers: 'إغلاق الأخرى',
     closeToRight: 'إغلاق ما على اليمين',
     closeAll: 'إغلاق الكل',
@@ -2273,7 +2283,8 @@ export const ar = defineLocale({
     layoutNamePlaceholder: fallback => `اسم التخطيط (${fallback})`,
     saveApply: 'حفظ وتطبيق',
     notExpressible: 'هذا الترتيب متشابك — لا يمكن تمثيله كتقسيمات متداخلة بعد',
-    zoneCount: count => `${count} مناطق`
+    zoneCount: count => `${count} مناطق`,
+    tabCount: count => `${count} تبويبات`
   },
   assistant: {
     thread: {
