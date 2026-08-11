@@ -634,7 +634,15 @@ def find_node_executable_on_path(command: str, path: str | None = None) -> str |
     *path* optionally overrides the ambient PATH for callers probing a
     constructed environment without mutating process-global state.
     """
-    search_path = os.environ.get("PATH", "") if path is None else path
+    if path is None:
+        if sys.platform != "win32":
+            # Preserve the normal call shape for callers and test doubles that
+            # intentionally model the ambient process PATH.
+            return shutil.which(command)
+        search_path = os.environ.get("PATH", "")
+    else:
+        search_path = path
+
     if sys.platform != "win32":
         return shutil.which(command, path=search_path)
 
