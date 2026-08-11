@@ -79,3 +79,34 @@ class TestSessionCwdOverride:
         finally:
             rt._SESSION_CWD.reset(token)
 
+
+class TestRemoteBackendSkipsLocalValidation:
+    """#83515: an SSH (or other remote) backend's cwd lives on the backend's
+    filesystem, not this host's — Path.is_dir() is always False for a path
+    that only exists on the remote target, so it must not be used to reject
+    an otherwise-valid remote cwd."""
+
+    def test_resolve_agent_cwd_honors_nonexistent_remote_session_cwd(self, monkeypatch):
+        remote = "/workspace/research"  # does not exist on this host
+        assert not Path(remote).is_dir()
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+        token = set_session_cwd(remote)
+        try:
+            assert resolve_agent_cwd() == Path(remote)
+        finally:
+            rt._SESSION_CWD.reset(token)
+
+    def test_resolve_agent_cwd_honors_nonexistent_remote_terminal_cwd(self, monkeypatch):
+        remote = "/workspace"  # does not exist on this host either
+        assert not Path(remote).is_dir()
+        monkeypatch.setenv("TERMINAL_ENV", "ssh")
+        monkeypatch.setenv("TERMINAL_CWD", remote)
+        assert resolve_agent_cwd() == Path(remote)
+
+    def test_local_backend_still_rejects_nonexistent_cwd(self, monkeypatch, tmp_path):
+        missing = tmp_path / "does-not-exist"
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        monkeypatch.setenv("TERMINAL_CWD", str(missing))
+        assert resolve_agent_cwd() == Path(os.getcwd())
+
