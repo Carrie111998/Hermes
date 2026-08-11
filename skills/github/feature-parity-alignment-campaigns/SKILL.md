@@ -4,10 +4,11 @@ description: Use when building out a Feature Parity & Alignment Campaign.
 version: 1.0.0
 author: Ares
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [Campaign, Parity, Platforms, Telegram, Discord, Slack, WhatsApp, 5x2x3, EPIC]
-    related_skills: [campaign-primitives, api-docs-gap-analysis, swarm-dedup-campaign, worktree-hive, github-issues]
+    related_skills: [github-issues, github-pr-workflow, hermes-agent-skill-authoring, codebase-inspection]
 ---
 
 # Feature Parity & Alignment Campaigns
