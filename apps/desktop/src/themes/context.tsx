@@ -69,6 +69,9 @@ const profilePref = <T extends string>(record: string, legacy: string, normalize
 export const skinPref = profilePref(PROFILE_SKINS_KEY, SKIN_KEY, normalizeSkin)
 export const modePref = profilePref(PROFILE_MODES_KEY, MODE_KEY, normalizeMode)
 
+/** Everything a peer window could change that this one has to repaint for. */
+const APPEARANCE_KEYS = new Set([SKIN_KEY, PROFILE_SKINS_KEY, MODE_KEY, PROFILE_MODES_KEY])
+
 // Last active profile — lets the boot paint pick its appearance before the
 // gateway reports which profile actually launched.
 const readBootProfileKey = () => normalizeProfileKey(storedString(LAST_PROFILE_KEY))
@@ -351,9 +354,38 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setModeState(modePref.resolve(profileKey))
   }, [profileKey])
 
+  // Appearance is per-profile localStorage, and every desktop window is another
+  // renderer on the same origin — so a switch made in the HUD (or any peer
+  // window) only ever repainted the window it was made in. `storage` fires in
+  // the OTHER windows, which is exactly the set that needs to catch up.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key && !APPEARANCE_KEYS.has(event.key)) {
+        return
+      }
+
+      const live = normalizeProfileKey($activeGatewayProfile.get())
+
+      setThemeNameState(skinPref.resolve(live))
+      setModeState(modePref.resolve(live))
+    }
+
+    window.addEventListener('storage', onStorage)
+
+    return () => window.removeEventListener('storage', onStorage)
+  }, [])
+
   const systemDark = useMediaQuery('(prefers-color-scheme: dark)')
   const resolvedMode = resolveMode(mode, systemDark)
-  const activeTheme = useMemo(() => deriveTheme(themeName, resolvedMode), [themeName, resolvedMode])
+
+  const activeTheme = useMemo(
+    () => deriveTheme(themeName, resolvedMode),
+    // deriveTheme resolves its seed through the merged registry, so the theme
+    // stores are its reactivity too — an in-place palette edit of the ACTIVE
+    // skin (live theme authoring) must repaint, not just a name switch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [themeName, resolvedMode, userThemes, backendThemes, registryVersion]
+  )
 
   // What actually gets painted (matches the `.dark` class applyTheme toggles).
   const renderedMode = useMemo(() => renderedModeFor(activeTheme.colors, resolvedMode), [activeTheme, resolvedMode])
