@@ -210,7 +210,12 @@ export function useModelControls({ queryClient, requestGateway }: ModelControlsO
         const result = await requestGateway<{ deferred?: boolean }>('config.set', {
           session_id: liveSessionId,
           key: 'model',
-          value: `${selection.model} --provider ${selection.provider} --session`
+          value: `${selection.model} --provider ${selection.provider} --session`,
+          // Disambiguates this from a hand-typed `--provider` override: the
+          // picker sets explicit_provider to identify the clicked catalog row,
+          // not because the user deliberately named a provider. The gateway's
+          // OpenCode Zen free-only gate relies on this to still apply.
+          picker_selected: true
         })
 
         // A pick made DURING a turn is queued by the gateway and applied at the
