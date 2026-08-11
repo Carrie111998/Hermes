@@ -114,6 +114,50 @@ def test_adapter_auth_check_stamps_secondary_profile(monkeypatch):
     assert captured["profile"] == "coder"
 
 
+@pytest.mark.parametrize("profile_name", [None, "coder"])
+def test_adapter_auth_check_restores_profile_scope_when_invoked_unscoped(
+    monkeypatch,
+    tmp_path,
+    profile_name,
+):
+    """PTB/reconnect callbacks must not depend on inherited ContextVar state."""
+    from agent import secret_scope as ss
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    from hermes_cli import profiles as profiles_mod
+
+    profile_home = tmp_path / (profile_name or "default")
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "WECOM_ALLOWED_USERS=scoped-user\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: str(profile_home))
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda _name: profile_home)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+
+    def fake_is_user_authorized(source):
+        assert source.profile == profile_name
+        return ss.get_secret("WECOM_ALLOWED_USERS") == source.user_id
+
+    runner._is_user_authorized = fake_is_user_authorized
+
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope(None)
+    try:
+        check = runner._make_adapter_auth_check(
+            Platform.WECOM,
+            profile_name=profile_name,
+        )
+        assert check("scoped-user", "dm", "dm-chat") is True
+        assert ss.current_secret_scope() is None
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(False)
+
+
 def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     """Secondary profiles must pass the same open-policy startup guard."""
     from gateway.run import _own_policy_open_startup_violation

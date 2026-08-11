@@ -362,29 +362,38 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
 
     # Query systemctl for TimeoutStopUSec.  Use --user OR system depending
     # on which manager actually owns the unit.  Try user first since
-    # that's the common case for hermes.
+    # that's the common case for hermes.  ``systemctl show`` returns success
+    # plus default properties for an unknown unit, so LoadState must confirm
+    # that the candidate is real before its timeout can win.
     timeout_us: Optional[int] = None
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl", *flag, "show", unit_name,
+                    "--property=LoadState",
+                    "--property=TimeoutStopUSec",
+                ],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
             continue
-        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        properties = {}
         for line in result.stdout.splitlines():
-            if line.startswith("TimeoutStopUSec="):
-                value = line.split("=", 1)[1].strip()
-                # Try numeric microseconds first
-                if value.isdigit():
-                    timeout_us = int(value)
-                else:
-                    timeout_us = _parse_systemd_duration_to_us(value)
-                if timeout_us is not None:
-                    break
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key] = value.strip()
+        if properties.get("LoadState") != "loaded":
+            continue
+        # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
+        value = properties.get("TimeoutStopUSec", "")
+        # Try numeric microseconds first
+        if value.isdigit():
+            timeout_us = int(value)
+        else:
+            timeout_us = _parse_systemd_duration_to_us(value)
         if timeout_us is not None:
             break
 

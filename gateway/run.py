@@ -14286,9 +14286,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         store, allow-all flags — stays the single source of truth.
 
         ``profile_name`` binds the callback to the secondary adapter's own
-        multiplex profile, so its ``SessionSource`` resolves that profile's
-        secret scope instead of falling back to the active profile.
+        multiplex profile.  The callback also restores that profile's runtime
+        scope itself: adapter callbacks may run in delayed/reconnected transport
+        tasks whose inherited ContextVar state is absent, and auth must remain
+        fail-closed without falsely rejecting an allowed sender.
         """
+        profile_home: Optional[Path] = None
+        if getattr(self.config, "multiplex_profiles", False):
+            if profile_name:
+                from hermes_cli.profiles import get_profile_dir
+
+                profile_home = Path(get_profile_dir(profile_name))
+            else:
+                profile_home = Path(get_hermes_home())
+
         def check(
             user_id: str,
             chat_type: Optional[str] = None,
@@ -14303,6 +14314,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
+            if profile_home is not None:
+                with _profile_runtime_scope(profile_home):
+                    return self._is_user_authorized(source)
             return self._is_user_authorized(source)
         return check
 

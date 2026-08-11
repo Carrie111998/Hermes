@@ -956,17 +956,38 @@ class TelegramAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
+        normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
+        if normalized_chat_type == "private":
+            normalized_chat_type = "dm"
+        elif normalized_chat_type == "supergroup":
+            normalized_chat_type = "forum" if thread_id is not None else "group"
+
+        # Approval/clarify callbacks can run in delayed PTB tasks with no
+        # inherited multiplex profile ContextVar. Prefer the gateway-supplied
+        # callback, which restores the adapter's captured profile scope, before
+        # falling back to legacy runner/env discovery.
+        try:
+            authorized = self._is_sender_authorized(
+                normalized_user_id,
+                chat_type=normalized_chat_type,
+                chat_id=str(chat_id or normalized_user_id),
+            )
+        except Exception:
+            logger.debug(
+                "[Telegram] Registered callback auth failed for user %s; "
+                "falling back to the legacy runner/env path",
+                normalized_user_id,
+                exc_info=True,
+            )
+            authorized = None
+        if authorized is not None:
+            return bool(authorized)
+
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
                 from gateway.session import SessionSource
-
-                normalized_chat_type = str(chat_type or "dm").strip().lower() or "dm"
-                if normalized_chat_type == "private":
-                    normalized_chat_type = "dm"
-                elif normalized_chat_type == "supergroup":
-                    normalized_chat_type = "forum" if thread_id is not None else "group"
 
                 source = SessionSource(
                     platform=Platform.TELEGRAM,
@@ -1154,6 +1175,26 @@ class TelegramAdapter(BasePlatformAdapter):
                     )
                 except Exception:
                     pass
+
+        # The gateway registers a platform-bound callback on every live adapter.
+        # Use it before inspecting the message-handler binding: multiplex message
+        # handlers are closures (no ``__self__``), and reconnect-created PTB tasks
+        # may have no inherited profile ContextVar.  The registered callback owns
+        # restoring the correct profile scope.
+        if authorized is None:
+            try:
+                authorized = self._is_sender_authorized(
+                    user_id,
+                    chat_type=source.chat_type,
+                    chat_id=source.chat_id,
+                )
+            except Exception:
+                logger.debug(
+                    "[Telegram] Registered auth callback failed for user %s; "
+                    "falling back to the legacy runner/env path",
+                    user_id,
+                    exc_info=True,
+                )
 
         if authorized is None:
             runner = getattr(getattr(self, "_message_handler", None), "__self__", None)

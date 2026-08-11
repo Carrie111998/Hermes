@@ -1184,6 +1184,20 @@ must be **cache-aware**: default to deferred invalidation (change takes
 effect next session), with an opt-in `--now` flag for immediate
 invalidation. See `/skills install --now` for the canonical pattern.
 
+### Gateway Multiplex Auth and Systemd Discovery
+
+- Adapter authorization callbacks must restore their captured profile runtime
+  scope. Delayed and reconnect-created transport tasks are not allowed to rely
+  on inherited `ContextVar` state; Telegram early intake and inline
+  approval/clarify callbacks must use the registered gateway authorization
+  callback before any process-env fallback. Keep the default and
+  secondary-profile regression cases in `test_multiplex_profile_authz.py` and
+  the end-to-end intake/callback cases in `test_telegram_auth_check.py`.
+- `systemctl show` can return success and default properties for an unknown unit.
+  Gateway timing checks must accept a manager candidate only when
+  `LoadState=loaded`; otherwise a synthetic user-manager `TimeoutStopUSec=90s`
+  can shadow the real system unit. Pin this in `test_shutdown_forensics.py`.
+
 ### Background Process Notifications (Gateway)
 
 When `terminal(background=true, notify_on_complete=true)` is used, the gateway runs a watcher that

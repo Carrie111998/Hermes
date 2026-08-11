@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import signal
 import sys
@@ -133,6 +134,47 @@ class TestParseSystemdDuration:
 # ---------------------------------------------------------------------------
 
 class TestCheckSystemdTimingAlignment:
+
+    def test_skips_not_found_user_unit_and_reads_loaded_system_unit(self, monkeypatch):
+        """A synthetic user-manager object must not shadow the real system unit."""
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+
+        real_open = open
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/self/cgroup":
+                return io.StringIO("0::/system.slice/hermes-gateway.service\n")
+            return real_open(path, *args, **kwargs)
+
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if "--user" in command:
+                stdout = (
+                    "LoadState=not-found\n"
+                    "FragmentPath=\n"
+                    "TimeoutStopUSec=1min 30s\n"
+                )
+            else:
+                stdout = (
+                    "LoadState=loaded\n"
+                    "FragmentPath=/etc/systemd/system/hermes-gateway.service\n"
+                    "TimeoutStopUSec=5min 30s\n"
+                )
+            return sf.subprocess.CompletedProcess(command, 0, stdout, "")
+
+        monkeypatch.setattr("builtins.open", fake_open)
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(300.0)
+
+        assert result is not None
+        assert result["timeout_stop_sec"] == 330.0
+        assert result["mismatch"] is False
+        assert len(calls) == 2
+        assert "--user" in calls[0]
+        assert "--user" not in calls[1]
 
     def test_returns_none_when_unit_undeterminable(self, monkeypatch):
         monkeypatch.setenv("INVOCATION_ID", "abc")

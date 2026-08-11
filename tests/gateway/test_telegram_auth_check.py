@@ -144,6 +144,93 @@ def test_is_user_authorized_from_message_allow_from():
     assert adapter._is_user_authorized_from_message(msg) is False
 
 
+def test_telegram_early_auth_uses_profile_scoped_gateway_callback(
+    monkeypatch,
+    tmp_path,
+):
+    """Reconnect intake must not fall back to another profile's process env."""
+    from agent import secret_scope as ss
+    from gateway.config import GatewayConfig
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+
+    profile_home = tmp_path / "default"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: str(profile_home))
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "999")
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+
+    def fake_is_user_authorized(source):
+        return ss.get_secret("TELEGRAM_ALLOWED_USERS") == source.user_id
+
+    runner._is_user_authorized = fake_is_user_authorized
+    adapter = _make_adapter()
+    adapter.set_authorization_check(
+        runner._make_adapter_auth_check(Platform.TELEGRAM)
+    )
+    message = _make_message(from_user_id=111, chat_id=111, chat_type="private")
+
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope(None)
+    try:
+        assert adapter._is_user_authorized_from_message(message) is True
+        assert ss.current_secret_scope() is None
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(False)
+
+
+def test_telegram_callback_auth_uses_profile_scoped_gateway_callback(
+    monkeypatch,
+    tmp_path,
+):
+    """Approval/clarify buttons must use the same scoped callback as intake."""
+    from agent import secret_scope as ss
+    from gateway.config import GatewayConfig
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+
+    profile_home = tmp_path / "default"
+    profile_home.mkdir()
+    (profile_home / ".env").write_text(
+        "TELEGRAM_ALLOWED_USERS=111\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(gateway_run, "get_hermes_home", lambda: str(profile_home))
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "999")
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+
+    def fake_is_user_authorized(source):
+        return ss.get_secret("TELEGRAM_ALLOWED_USERS") == source.user_id
+
+    runner._is_user_authorized = fake_is_user_authorized
+    adapter = _make_adapter()
+    adapter.set_authorization_check(
+        runner._make_adapter_auth_check(Platform.TELEGRAM)
+    )
+
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope(None)
+    try:
+        assert adapter._is_callback_user_authorized(
+            "111",
+            chat_type="private",
+            chat_id="111",
+        ) is True
+        assert ss.current_secret_scope() is None
+    finally:
+        ss.reset_secret_scope(scope_token)
+        ss.set_multiplex_active(False)
+
+
 def test_allowlist_dm_with_explicit_pair_behavior_reaches_gateway(monkeypatch):
     """Allowlist + unauthorized_dm_behavior:pair must not early-drop unknown DMs.
 
