@@ -120,11 +120,6 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-from tools.mcp_session_expiry import (
-    _SESSION_EXPIRED_MARKERS,
-    _EXC_TRAVERSAL_MAX_NODES,
-    _is_session_expired_error,
-)
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -4378,6 +4373,11 @@ def _handle_auth_error_and_retry(
 # only the transport-layer session state needs rebuilding.  See #13383.
 
 
+from tools.mcp_session_expiry import (
+    _SESSION_EXPIRED_MARKERS,
+    _EXC_TRAVERSAL_MAX_NODES,
+    _is_session_expired_error,
+)
 def _handle_session_expired_and_retry(
     server_name: str,
     exc: BaseException,
