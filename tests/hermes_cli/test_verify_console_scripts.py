@@ -66,3 +66,92 @@ class TestVerifyConsoleScriptsInstalled:
 
         assert {"hermes.exe", "hermes-agent.exe", "hermes-acp.exe"} <= names
         assert "hermes-gateway.exe" in names
+
+
+class TestWarnIfHermesLauncherBroken:
+    """Tests for _warn_if_hermes_launcher_broken (issue #83529).
+
+    A failed base install on POSIX (permission-denied venv files, most often
+    from a prior privileged run) can delete ``venv/bin/hermes`` before
+    failing to write its replacement, leaving the CLI unusable with no
+    indication why. This warning must fire on every platform, not just
+    Windows.
+    """
+
+    def test_no_warning_when_all_shims_present(
+        self, temp_pyproject, fake_scripts_dir, capsys
+    ):
+        for name in ("hermes", "hermes-agent", "hermes-acp"):
+            (fake_scripts_dir / name).write_bytes(b"fake")
+
+        with patch("hermes_cli.main._venv_scripts_dir", return_value=fake_scripts_dir):
+            from hermes_cli.main import _warn_if_hermes_launcher_broken
+
+            _warn_if_hermes_launcher_broken()
+
+        assert capsys.readouterr().out == ""
+
+    def test_warns_when_hermes_shim_missing_on_posix(
+        self, temp_pyproject, fake_scripts_dir, capsys
+    ):
+        # hermes shim missing entirely; the other two survived.
+        (fake_scripts_dir / "hermes-agent").write_bytes(b"fake")
+        (fake_scripts_dir / "hermes-acp").write_bytes(b"fake")
+
+        with patch("hermes_cli.main._venv_scripts_dir", return_value=fake_scripts_dir):
+            from hermes_cli.main import _warn_if_hermes_launcher_broken
+
+            _warn_if_hermes_launcher_broken()
+
+        out = capsys.readouterr().out
+        assert "broken" in out
+        assert "hermes" in out
+        assert "chown" in out
+
+    def test_no_action_when_not_running_from_a_venv(self, temp_pyproject, capsys):
+        with patch("hermes_cli.main._venv_scripts_dir", return_value=None):
+            from hermes_cli.main import _warn_if_hermes_launcher_broken
+
+            _warn_if_hermes_launcher_broken()
+
+        assert capsys.readouterr().out == ""
+
+
+class TestInstallPythonDependenciesWithOptionalFallback:
+    """The base-install retry used to be unguarded — a failure here skipped
+    straight past every recovery check (#83529)."""
+
+    def test_base_install_failure_warns_before_reraising(
+        self, temp_pyproject, fake_scripts_dir, monkeypatch
+    ):
+        import subprocess
+
+        import hermes_cli.main as main_mod
+
+        (fake_scripts_dir / "hermes-agent").write_bytes(b"fake")
+        (fake_scripts_dir / "hermes-acp").write_bytes(b"fake")
+
+        calls: list[list[str]] = []
+
+        def fake_run_quarantined_install(cmd, *, env=None, scripts_dir=None):
+            calls.append(cmd)
+            raise subprocess.CalledProcessError(2, cmd)
+
+        warned = []
+        monkeypatch.setattr(main_mod, "_is_windows", lambda: False)
+        monkeypatch.setattr(main_mod, "_venv_scripts_dir", lambda: fake_scripts_dir)
+        monkeypatch.setattr(
+            main_mod, "_run_quarantined_install", fake_run_quarantined_install
+        )
+        monkeypatch.setattr(
+            main_mod,
+            "_warn_if_hermes_launcher_broken",
+            lambda: warned.append(True),
+        )
+
+        with pytest.raises(subprocess.CalledProcessError):
+            main_mod._install_python_dependencies_with_optional_fallback(["uv", "pip"])
+
+        assert warned == [True]
+        # First attempt was `.[all]`, second (unguarded) was bare `.`.
+        assert len(calls) == 2
