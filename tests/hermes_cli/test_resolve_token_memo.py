@@ -75,11 +75,16 @@ def test_memo_expires_after_ttl(monkeypatch, tmp_path):
     calls = _count_transactions(monkeypatch)
 
     auth.resolve_nous_access_token()
-    cached_at, tok = auth._RESOLVE_TOKEN_CACHE
+    assert auth._RESOLVE_TOKEN_CACHE is not None
+    cached_home, cached_at, tok = auth._RESOLVE_TOKEN_CACHE
     monkeypatch.setattr(
         auth,
         "_RESOLVE_TOKEN_CACHE",
-        (cached_at - auth._RESOLVE_TOKEN_CACHE_TTL_S - 1.0, tok),
+        (
+            cached_home,
+            cached_at - auth._RESOLVE_TOKEN_CACHE_TTL_S - 1.0,
+            tok,
+        ),
     )
     auth.resolve_nous_access_token()
 

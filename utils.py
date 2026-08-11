@@ -622,6 +622,7 @@ def safe_json_loads(text: str, default: Any = None) -> Any:
 # is a true drop-in for ``safe_load`` (same restricted tag set), so prefer it
 # and fall back to the pure-Python loader only when libyaml isn't compiled in.
 _fast_yaml_loader = None
+_strict_yaml_loader = None
 
 
 def _get_fast_yaml_loader():
@@ -640,6 +641,62 @@ def fast_safe_load(stream: Any) -> Any:
     available, so behavior is identical everywhere — only the speed differs.
     """
     return yaml.load(stream, Loader=_get_fast_yaml_loader())
+
+
+def _get_strict_yaml_loader():
+    """Return a safe YAML loader that rejects duplicate mapping keys."""
+    global _strict_yaml_loader
+    if _strict_yaml_loader is not None:
+        return _strict_yaml_loader
+
+    StrictSafeLoader = type(
+        "StrictSafeLoader",
+        (_get_fast_yaml_loader(),),
+        {},
+    )
+
+    def _construct_unique_mapping(loader, node, deep=False):
+        if not isinstance(node, yaml.MappingNode):
+            raise yaml.constructor.ConstructorError(
+                None,
+                None,
+                f"expected a mapping node, but found {node.id}",
+                node.start_mark,
+            )
+        loader.flatten_mapping(node)
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            try:
+                duplicate = key in mapping
+            except TypeError as exc:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found an unhashable key",
+                    key_node.start_mark,
+                ) from exc
+            if duplicate:
+                raise yaml.constructor.ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    f"found duplicate key {key!r}",
+                    key_node.start_mark,
+                )
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    StrictSafeLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _construct_unique_mapping,
+    )
+    _strict_yaml_loader = StrictSafeLoader
+    return _strict_yaml_loader
+
+
+def strict_safe_load(stream: Any) -> Any:
+    """Safely parse YAML while rejecting duplicate keys at every depth."""
+    return yaml.load(stream, Loader=_get_strict_yaml_loader())  # type: ignore[arg-type]
 
 
 # ─── Environment Variable Helpers ─────────────────────────────────────────────

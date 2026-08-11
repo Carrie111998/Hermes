@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -120,6 +121,25 @@ def test_non_mapping_auth_policy_fails_closed(profile_env):
     from hermes_cli.auth import read_credential_pool
 
     _write(profile_env["profile"] / "config.yaml", {"auth": "invalid"})
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="global-openrouter", access_token="synthetic-global")],
+    }))
+
+    assert read_credential_pool("openrouter") == []
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    (
+        "auth:\n  inherit_global: false\n  inherit_global: true\n",
+        "auth:\n  inherit_global: false\nauth:\n  inherit_global: true\n",
+    ),
+)
+def test_duplicate_auth_policy_keys_fail_closed(profile_env, config_text):
+    from hermes_cli.auth import read_credential_pool
+
+    (profile_env["profile"] / "config.yaml").write_text(config_text)
     _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
         "openrouter": [_pool_entry(id="global-openrouter", access_token="synthetic-global")],
     }))
@@ -283,6 +303,71 @@ def test_inheritance_disabled_skips_ambient_pool_seeding(profile_env, monkeypatc
     pool = load_pool("openrouter")
 
     assert pool.entries() == []
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_inheritance_disabled_blocks_shared_nous_store(profile_env, monkeypatch):
+    import hermes_cli.auth as auth
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+    shared_dir = profile_env["global"].parent / "synthetic-shared"
+    shared_dir.mkdir()
+    monkeypatch.setenv("HERMES_SHARED_AUTH_DIR", str(shared_dir))
+    shared_path = shared_dir / auth.NOUS_SHARED_STORE_FILENAME
+    original = {
+        "access_token": "synthetic-shared-access",
+        "refresh_token": "synthetic-shared-refresh",
+    }
+    _write(shared_path, original)
+
+    refresh_called = False
+
+    def _unexpected_refresh(*args, **kwargs):
+        nonlocal refresh_called
+        refresh_called = True
+        raise AssertionError("shared credentials must not be refreshed")
+
+    monkeypatch.setattr(auth, "refresh_nous_oauth_from_state", _unexpected_refresh)
+
+    assert auth._read_shared_nous_state() is None
+    assert auth._try_import_shared_nous_state() is None
+    auth._write_shared_nous_state({
+        "access_token": "synthetic-replacement-access",
+        "refresh_token": "synthetic-replacement-refresh",
+    })
+    auth._clear_shared_nous_state("synthetic-test")
+
+    assert json.loads(shared_path.read_text()) == original
+    assert refresh_called is False
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_nous_token_memo_cannot_cross_into_isolated_profile(profile_env):
+    import hermes_cli.auth as auth
+    from hermes_cli.auth import AuthError
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    source_profile = profile_env["global"] / "profiles" / "source"
+    source_profile.mkdir()
+    _write(source_profile / "auth.json", _make_auth_store(providers={
+        "nous": {
+            "access_token": "synthetic-source-access",
+            "refresh_token": "synthetic-source-refresh",
+            "expires_at": (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat(),
+        },
+    }))
+    _disable_global_auth_inheritance(profile_env["profile"])
+    auth._RESOLVE_TOKEN_CACHE = None
+
+    token = set_hermes_home_override(source_profile)
+    try:
+        assert auth.resolve_nous_access_token() == "synthetic-source-access"
+    finally:
+        reset_hermes_home_override(token)
+
+    with pytest.raises(AuthError, match="not logged into Nous Portal"):
+        auth.resolve_nous_access_token()
+
     assert not (profile_env["profile"] / "auth.json").exists()
 
 

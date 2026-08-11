@@ -209,24 +209,38 @@ If you want this profile to work in a specific project by default, also set its 
 coder config set terminal.cwd /absolute/path/to/project
 ```
 
-### Credentialless profiles
+### Global-auth-isolated profiles
 
-Named profiles normally inherit provider credentials from the global Hermes
-auth store when they have no profile-local entry. To create a fail-closed
-profile that must not inherit or materialize authentication state, add:
+Named profiles normally inherit provider credentials from global Hermes auth
+stores when they have no profile-local entry. To create a fail-closed profile
+that must not inherit or materialize Hermes authentication state, add:
 
 ```yaml
 auth:
   inherit_global: false
 ```
 
-With this setting, Hermes does not read global-root credential pools or
-provider/OAuth singletons, does not seed ambient credentials into the profile,
-and refuses writes that would create or update the profile's `auth.json`.
-Inspection commands such as `hermes -p <name> auth list` remain read-only. The
-setting is deliberately fail-closed: if `inherit_global` is present, only the
-boolean value `true` enables inheritance and auth materialization. Omitting the
-setting preserves the standard profile behavior.
+With this setting, Hermes does not read global-root credential pools,
+provider/OAuth singletons, or the cross-profile shared Nous OAuth store. Nous
+token memos are also scoped to one canonical profile home. Hermes does not seed
+ambient credentials into the profile auth pool and refuses writes that would
+create or update the profile's `auth.json` or shared Nous state. Inspection
+commands such as `hermes -p <name> auth list` remain read-only.
+
+The setting is deliberately fail-closed: if `inherit_global` is present, only
+the boolean value `true` enables inheritance and auth materialization. Invalid,
+unreadable, malformed, or duplicate-key policy YAML denies those paths.
+Omitting the setting preserves the standard profile behavior.
+
+This setting is an **auth-store boundary**, not by itself a promise that the
+process has zero effective credentials. Existing profile-local auth entries and
+profile-local `.env` values remain local inputs. A directly exported provider
+key in the process environment can also remain available to provider runtime
+resolution without being seeded into `auth.json`. For a credentialless
+bootstrap check, additionally start Hermes with a constructed minimal
+environment, an empty profile with no `.env` or `auth.json`, and a disabled
+managed/external secret-source configuration; then verify the effective
+resolved state after startup.
 
 This protects Hermes provider auth state only. External tools can still use the
 OS user's `HOME`; combine it with `terminal.home_mode: profile` and an explicit

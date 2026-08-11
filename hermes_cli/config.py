@@ -695,7 +695,7 @@ def get_container_exec_info() -> Optional[dict]:
 
 # Re-export from hermes_constants — canonical definition lives there.
 from hermes_constants import get_hermes_home, get_process_hermes_home  # noqa: F811,E402
-from utils import atomic_replace, fast_safe_load
+from utils import atomic_replace, fast_safe_load, strict_safe_load
 
 def get_config_path() -> Path:
     """Get the main config file path."""
@@ -3031,7 +3031,7 @@ def read_raw_config_strict() -> Optional[Dict[str, Any]]:
             return copy.deepcopy(cached[1])
 
         with open(config_path, encoding="utf-8") as handle:
-            data = fast_safe_load(handle)
+            data = strict_safe_load(handle)
         if data is None:
             data = {}
         if not isinstance(data, dict):
