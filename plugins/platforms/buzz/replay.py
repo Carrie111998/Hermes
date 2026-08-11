@@ -618,9 +618,13 @@ async def dispatch_exact_event(
         }
         task = after_map[session_key]
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=wait_timeout)
+            # The authoritative gateway lock cannot be released while a
+            # replay session is still running. Let wait_for cancel the task
+            # and await its cancellation before returning the CLAIMED receipt.
+            await asyncio.wait_for(task, timeout=wait_timeout)
         except asyncio.TimeoutError:
-            result["session"]["status"] = "CLAIMED_RUNNING"
+            result["session"]["status"] = "CANCELLED"
+            result["session"]["quiesced"] = True
             _processing_result()
             result["outcome"] = {"status": CLAIMED, "code": "session_timeout"}
             return result

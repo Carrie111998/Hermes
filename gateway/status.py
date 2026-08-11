@@ -2205,6 +2205,13 @@ def get_running_pid(
         if _record_matches_live_gateway_pid(record, pid):
             return pid
 
+    # An active lock is authoritative even when its owner is not a gateway
+    # process (for example, the governed Buzz replay). Never unlink the lock
+    # inode while another process holds it: startup must fail closed at the
+    # subsequent acquire rather than replace the live owner's lock.
+    if lock_active:
+        return None
+
     _cleanup_invalid_pid_path(resolved_pid_path, cleanup_stale=cleanup_stale)
     if pid_path is None:
         runtime_pid = get_runtime_status_running_pid()

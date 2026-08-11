@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -131,6 +132,42 @@ class TestGatewayPidState:
 
         try:
             assert status.get_running_pid() == os.getpid()
+        finally:
+            status.release_gateway_runtime_lock()
+
+    def test_get_running_pid_preserves_active_non_gateway_lock_for_startup(
+        self, tmp_path, monkeypatch
+    ):
+        """An active replay lock must not be cleaned up by startup preflight."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status._clear_running_pid_cache()
+        monkeypatch.setattr(
+            status,
+            "_read_process_cmdline",
+            lambda _pid: "python -m hermes_cli.main gateway replay-buzz --event-id " + "a" * 64,
+        )
+        assert status.acquire_gateway_runtime_lock() is True
+        lock_path = tmp_path / "gateway.lock"
+        old_inode = lock_path.stat().st_ino
+        try:
+            assert status.get_running_pid() is None
+            assert lock_path.exists()
+            assert lock_path.stat().st_ino == old_inode
+
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock; "
+                    "ok=acquire_gateway_runtime_lock(); print(ok); "
+                    "release_gateway_runtime_lock() if ok else None",
+                ],
+                env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert probe.stdout.strip() == "False"
         finally:
             status.release_gateway_runtime_lock()
 

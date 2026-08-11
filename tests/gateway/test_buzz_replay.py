@@ -502,6 +502,68 @@ class ReplayLifecycleTests(unittest.TestCase):
             self.assertEqual(result["outcome"]["status"], COMPLETED)
             self.assertEqual(self._probe_gateway_lock(home), "True")
 
+    def test_timeout_quiesces_session_before_runner_close_and_lock_release(self):
+        import plugins.platforms.buzz.replay as replay_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            adapter = type("ReplayAdapter", (), {})()
+            adapter._channel_state = {}
+            adapter._session_tasks = {}
+            runner = object()
+            cancelled = []
+            side_effects = []
+            close_observation = {}
+            finish_gate = asyncio.Event()
+
+            async def handle_event(_channel, _state, _event):
+                async def slow_session():
+                    try:
+                        await finish_gate.wait()
+                    except asyncio.CancelledError:
+                        cancelled.append(True)
+                        raise
+                    side_effects.append("must-not-run")
+
+                adapter._session_tasks["slow-session"] = asyncio.create_task(slow_session())
+
+            adapter._handle_event = handle_event
+
+            async def prepare(_profile):
+                return runner, adapter, None, str(home)
+
+            async def watched(_adapter):
+                return {CHANNEL}
+
+            async def fetch(_adapter, _event_id):
+                return {"id": self.EVENT_ID, "created_at": 1_700_000_000}, {"found_count": 1}
+
+            def validate(*_args, **_kwargs):
+                return {"channel": CHANNEL}
+
+            async def close_runner(_runner):
+                task = adapter._session_tasks["slow-session"]
+                close_observation.update(
+                    task_done=task.done(),
+                    cancelled=bool(cancelled),
+                    startup_lock_probe=self._probe_gateway_lock(home),
+                )
+
+            async def exercise():
+                with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False),                      patch.object(replay_module, "_prepare_adapter", new=AsyncMock(side_effect=prepare)),                      patch.object(replay_module, "_watched_channels", new=AsyncMock(side_effect=watched)),                      patch.object(replay_module, "fetch_event", new=AsyncMock(side_effect=fetch)),                      patch.object(replay_module, "validate_event", new=validate),                      patch.object(replay_module, "_close_runner", new=close_runner):
+                    result = await run_replay("omar", self.EVENT_ID, wait_timeout=2.0)
+                return result
+
+            result = asyncio.run(exercise())
+
+            self.assertEqual(result["outcome"], {"status": CLAIMED, "code": "session_timeout"})
+            self.assertEqual(result["session"]["status"], "CANCELLED")
+            self.assertEqual(result["session"]["quiesced"], True)
+            self.assertEqual(close_observation["task_done"], True)
+            self.assertEqual(close_observation["cancelled"], True)
+            self.assertEqual(close_observation["startup_lock_probe"], "False")
+            self.assertEqual(side_effects, [])
+
     def test_transient_fetch_failure_leaves_no_row_and_controlled_retry_succeeds(self):
         import plugins.platforms.buzz.replay as replay_module
 
