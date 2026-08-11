@@ -114,6 +114,25 @@ class TestConfigYamlRouting:
             or "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE=True" in env_content
         )
 
+    def test_quoted_provider_key_with_literal_dot_is_one_path_segment(self, _isolated_hermes_home):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "providers:\n"
+            "  qwen3.5-397b-wafer-non-zdr:\n"
+            "    api: https://pass.wafer.ai/v1\n"
+        )
+
+        set_config_value(
+            'providers."qwen3.5-397b-wafer-non-zdr".extra_headers.Wafer-ZDR',
+            "required",
+        )
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        provider = reloaded["providers"]["qwen3.5-397b-wafer-non-zdr"]
+        assert provider["api"] == "https://pass.wafer.ai/v1"
+        assert provider["extra_headers"] == {"Wafer-ZDR": "required"}
+        assert "qwen3" not in reloaded["providers"]
+
     def test_terminal_vercel_runtime_goes_to_config_and_env(self, _isolated_hermes_home):
         set_config_value("terminal.vercel_runtime", "python3.13")
         config = _read_config(_isolated_hermes_home)
@@ -189,6 +208,28 @@ class TestConfigGetUnset:
         assert "access_token" not in reloaded["platforms"]["teams"]["extra"]
         assert reloaded["platforms"]["teams"]["extra"]["tenant_id"] == "tenant"
         assert "Unset platforms.teams.extra.access_token" in capsys.readouterr().out
+
+    def test_config_get_unset_quoted_provider_key_with_literal_dot(self, _isolated_hermes_home, capsys):
+        (_isolated_hermes_home / "config.yaml").write_text(
+            "providers:\n"
+            "  qwen3.5-397b-wafer-non-zdr:\n"
+            "    extra_headers:\n"
+            "      Wafer-ZDR: required\n"
+            "    api: https://pass.wafer.ai/v1\n"
+        )
+
+        key = 'providers."qwen3.5-397b-wafer-non-zdr".extra_headers.Wafer-ZDR'
+        config_command(argparse.Namespace(config_command="get", key=key, json=False))
+        assert capsys.readouterr().out.strip() == "required"
+
+        config_command(argparse.Namespace(config_command="unset", key=key))
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        provider = reloaded["providers"]["qwen3.5-397b-wafer-non-zdr"]
+        assert "extra_headers" not in provider
+        assert provider["api"] == "https://pass.wafer.ai/v1"
+        assert "Unset providers." in capsys.readouterr().out
 
 
 # ---------------------------------------------------------------------------

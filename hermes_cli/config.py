@@ -989,6 +989,51 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
+def _split_config_key_path(dotted_key: str) -> list[str]:
+    """Split a config key path, honoring quoted segments with literal dots.
+
+    Examples:
+      ``providers."qwen3.5".extra_headers`` →
+      ``["providers", "qwen3.5", "extra_headers"]``
+    """
+    parts: list[str] = []
+    current: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+
+    for char in dotted_key:
+        if escaped:
+            current.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote is not None:
+            escaped = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            else:
+                current.append(char)
+            continue
+        if char in {'"', "'"}:
+            quote = char
+            continue
+        if char == ".":
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+
+    if escaped:
+        current.append("\\")
+    if quote is not None:
+        parts.append(dotted_key)
+        return parts
+
+    parts.append("".join(current))
+    return parts
+
+
 def _set_nested(config, dotted_key: str, value):
     """Set a value at an arbitrarily nested dotted key path.
 
@@ -1011,7 +1056,7 @@ def _set_nested(config, dotted_key: str, value):
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
     """
-    parts = dotted_key.split(".")
+    parts = _split_config_key_path(dotted_key)
     current = config
     for part in parts[:-1]:
         if isinstance(current, list):
@@ -1073,7 +1118,7 @@ _MISSING = object()
 def _get_nested(config, dotted_key: str):
     """Return a dotted-path value from nested dict/list config data."""
     current = config
-    for part in dotted_key.split("."):
+    for part in _split_config_key_path(dotted_key):
         if isinstance(current, list):
             try:
                 current = current[int(part)]
@@ -1090,7 +1135,7 @@ def _get_nested(config, dotted_key: str):
 
 def _unset_nested(config, dotted_key: str) -> bool:
     """Remove a dotted-path value from nested dict/list config data."""
-    parts = dotted_key.split(".")
+    parts = _split_config_key_path(dotted_key)
     if not parts:
         return False
 
@@ -4704,7 +4749,7 @@ def _default_value_for_key(dotted_key: str):
     best-effort coercion used by ``config set``.
     """
     node = DEFAULT_CONFIG
-    for part in dotted_key.split("."):
+    for part in _split_config_key_path(dotted_key):
         if not isinstance(node, dict) or part not in node:
             return None
         node = node[part]
@@ -4810,7 +4855,7 @@ def _validate_config_key(key: str) -> tuple[bool, Optional[str]]:
     if not key:
         return False, None
 
-    segments = key.split(".")
+    segments = _split_config_key_path(key)
     top = segments[0]
 
     # ── Underscore-prefixed keys are internal/test markers ───────────
