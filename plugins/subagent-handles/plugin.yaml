@@ -1,0 +1,6 @@
+name: subagent-handles
+version: 0.2.0
+description: Subagent handle registry + mid-flight messaging
+author: michael-anselmi
+license: MIT
+kind: standalone
