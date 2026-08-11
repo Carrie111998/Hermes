@@ -92,6 +92,34 @@ class TestClarifyPrimitive:
             assert result == ""
 
 
+    def test_wait_for_response_unblocks_on_interrupt(self):
+        """A /stop or interrupt-mode message must unblock the wait well
+        before the timeout. ``wait_for_response`` runs on the agent thread,
+        so signalling the per-thread interrupt flag (what the gateway's
+        interrupt path does) must make it return immediately instead of
+        blocking the full clarify timeout (#83889)."""
+        from tools import clarify_gateway as cm
+        from tools.interrupt import clear_current_thread_interrupt, set_interrupt
+
+        tid = threading.current_thread().ident
+        cm.register("id-int", "sk-int", "Pick one", ["A", "B"])
+
+        def signal_interrupt():
+            time.sleep(0.05)
+            set_interrupt(True, tid)
+
+        threading.Thread(target=signal_interrupt).start()
+        start = time.monotonic()
+        result = cm.wait_for_response("id-int", timeout=10.0)
+        elapsed = time.monotonic() - start
+        clear_current_thread_interrupt()
+
+        assert result is None
+        assert elapsed < 5.0, f"wait blocked {elapsed:.1f}s despite interrupt"
+        # The entry is cleaned up on the interrupt exit path, same as timeout.
+        assert cm.get_pending_for_session("sk-int") is None
+
+
     def test_notify_register_unregister_clears_pending(self):
         """unregister_notify cancels any pending clarify so threads unwind."""
         from tools import clarify_gateway as cm
