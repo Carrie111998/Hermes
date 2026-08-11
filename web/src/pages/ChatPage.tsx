@@ -244,6 +244,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
+    ptyStateRef.current = "connecting";
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer]);
   const startFreshPty = useCallback(() => {
@@ -256,6 +257,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
+    ptyStateRef.current = "connecting";
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer]);
   const startFreshDashboardChat = useCallback(() => {
@@ -272,6 +274,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
+    ptyStateRef.current = "connecting";
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer, searchParams, setSearchParams]);
   // Raw state for the mobile side-sheet + a derived value that force-
