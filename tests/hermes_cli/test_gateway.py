@@ -641,14 +641,35 @@ def test_gateway_restart_on_windows_preserves_failure_fallback(monkeypatch):
     monkeypatch.setattr(gateway, "is_windows", lambda: True)
     monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
     monkeypatch.setattr(gateway_windows, "restart", fail_restart)
+    # The backend genuinely could not launch, so nothing is running. Stub this
+    # rather than inheriting the host's real gateway: the fallback is now gated
+    # on "did the failed restart leave a live gateway behind?", and an
+    # unstubbed probe would make this test pass or fail depending on whether
+    # the machine running it happens to have a gateway up.
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda *a, **k: [])
     monkeypatch.setattr(gateway, "stop_profile_gateway", lambda: calls.append("stop") or False)
     monkeypatch.setattr(gateway, "_wait_for_gateway_exit", lambda *args, **kwargs: calls.append("wait"))
-    monkeypatch.setattr(gateway, "run_gateway", lambda *args, **kwargs: calls.append("run"))
+    monkeypatch.setattr(gateway, "cleanup_gateway_state_files", lambda: [])
+    # Windows defaults the recovery relaunch to DETACHED, so this is the call
+    # the fallback actually makes. It was previously unstubbed, which meant
+    # every run of this test spawned a real background gateway on the host.
+    monkeypatch.setattr(
+        gateway,
+        "launch_gateway_detached",
+        lambda *args, **kwargs: calls.append("launch_detached") or 4242,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "run_gateway",
+        lambda *args, **kwargs: pytest.fail(
+            "Windows recovery must relaunch detached, not in the foreground"
+        ),
+    )
 
     args = SimpleNamespace(gateway_command="restart", system=False, all=False)
     gateway.gateway_command(args)
 
-    assert calls == ["restart", "stop", "wait", "run"]
+    assert calls == ["restart", "stop", "wait", "launch_detached"]
 
 
 def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys):

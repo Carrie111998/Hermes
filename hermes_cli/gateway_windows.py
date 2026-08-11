@@ -1677,6 +1677,26 @@ def restart() -> None:
 
     # Give Windows a moment to release the listening port.
     time.sleep(1.0)
+
+    # _wait_for_gateway_absent() above already proved the old gateway is gone,
+    # so anything alive NOW is a replacement a concurrent starter (the
+    # gateway watchdog, laptop-start.ps1) raced in during the drain + sleep
+    # window. Spawning on top of it leaves two gateways fighting over :8642;
+    # the loser fails the runtime-lock guard and exits nonzero, which reads as
+    # a failed restart even though the survivor is healthy.
+    #
+    # This re-check is safe here in a way it was not inside start(): a
+    # still-draining OLD gateway cannot reach this point, so it cannot no-op
+    # the relaunch the way it used to before this function stopped calling
+    # start().
+    concurrent_pids = _gateway_pids()
+    if concurrent_pids:
+        print(
+            "✓ Gateway already restarted by a concurrent starter "
+            f"(PID: {', '.join(map(str, concurrent_pids))}) — not spawning a second one"
+        )
+        return
+
     _launch_detached_gateway()
 
     if not _wait_for_gateway_ready(timeout_s=15.0):

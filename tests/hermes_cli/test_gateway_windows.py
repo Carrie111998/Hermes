@@ -1,6 +1,7 @@
 """Tests for hermes_cli.gateway_windows."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -573,6 +574,11 @@ def test_restart_relaunches_manual_gateway_without_persistence(monkeypatch):
     )
     monkeypatch.setattr(
         gateway_windows,
+        "_gateway_pids",
+        lambda: calls.append("concurrent_check") or [],
+    )
+    monkeypatch.setattr(
+        gateway_windows,
         "_spawn_detached",
         lambda: calls.append("spawn") or 12345,
     )
@@ -619,9 +625,131 @@ def test_restart_relaunches_manual_gateway_without_persistence(monkeypatch):
         "stop",
         ("wait_absent", {"timeout_s": 30.0}),
         ("sleep", 1.0),
+        "concurrent_check",
         "spawn",
         ("report_start", "direct spawn (PID 12345)"),
         ("wait_ready", {"timeout_s": 15.0}),
+    ]
+
+
+def test_restart_does_not_spawn_on_top_of_a_concurrent_starter(monkeypatch, capsys):
+    """A gateway raced in during the drain window must not get a twin.
+
+    ``_wait_for_gateway_absent`` already proved the OLD gateway is gone, so a
+    live PID at this point is a replacement started by the watchdog or
+    laptop-start.ps1. Before this guard, restart() spawned unconditionally and
+    the loser of the runtime-lock race exited nonzero -- which reads as a
+    failed restart even though the survivor is healthy.
+    """
+    calls = []
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: calls.append("stop"))
+    monkeypatch.setattr(
+        gateway_windows, "_wait_for_gateway_absent", lambda **kwargs: True
+    )
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [33333])
+    monkeypatch.setattr(
+        gateway_windows,
+        "_spawn_detached",
+        lambda *a, **k: pytest.fail("must not spawn on top of a live gateway"),
+    )
+    monkeypatch.setattr(
+        gateway_windows,
+        "_wait_for_gateway_ready",
+        lambda **kwargs: pytest.fail("must return before the readiness wait"),
+    )
+
+    gateway_windows.restart()
+
+    assert calls == ["stop"]
+    out = capsys.readouterr().out
+    assert "33333" in out
+    assert "not spawning a second one" in out
+
+
+def _arrange_windows_restart_fallthrough(monkeypatch, running_pids):
+    """Drive ``_gateway_command_inner('restart')`` down the Windows branch.
+
+    ``gateway_windows.restart()`` raises, so the generic recovery path below it
+    is reachable. Everything that path could use to tear down / relaunch a
+    gateway is stubbed to record instead of act.
+    """
+    calls = []
+
+    monkeypatch.setattr(gateway, "is_windows", lambda: True)
+    monkeypatch.setattr(gateway, "is_macos", lambda: False)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway, "_dispatch_via_service_manager_if_s6", lambda _a: False)
+    monkeypatch.setattr(gateway, "_dispatch_all_via_service_manager_if_s6", lambda _a: False)
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: False)
+
+    def _boom():
+        calls.append("windows_restart")
+        raise RuntimeError(
+            "Gateway restart did not produce a running gateway process."
+        )
+
+    monkeypatch.setattr(gateway_windows, "restart", _boom)
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda *a, **k: list(running_pids))
+    monkeypatch.setattr(
+        gateway,
+        "stop_profile_gateway",
+        lambda: calls.append("stop_profile_gateway") or True,
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_wait_for_gateway_exit",
+        lambda **kwargs: calls.append("wait_exit"),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "cleanup_gateway_state_files",
+        lambda: calls.append("cleanup_state_files") or [],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "launch_gateway_detached",
+        lambda *a, **k: calls.append("launch_detached") or 4242,
+    )
+    return calls
+
+
+def test_windows_restart_failure_does_not_tear_down_a_live_gateway(monkeypatch):
+    """A slow-but-healthy restart must not be stopped and relaunched again.
+
+    ``gateway_windows.restart()`` spawns the replacement BEFORE it waits for
+    readiness, so a slow boot makes it raise while a healthy gateway is coming
+    up. Falling through to the generic recovery path then stops that gateway,
+    deletes its lock/pid, and launches a third one -- observed on this machine
+    as pairs of detached gateways fighting over :8642.
+    """
+    calls = _arrange_windows_restart_fallthrough(monkeypatch, running_pids=[10588])
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(gateway_command="restart", all=False, system=False, detached=None)
+    )
+
+    assert calls == ["windows_restart"], (
+        "a live gateway must be left alone after gateway_windows.restart() raises"
+    )
+
+
+def test_windows_restart_failure_still_recovers_when_nothing_is_running(monkeypatch):
+    """The generic fallback must remain reachable when the restart truly failed."""
+    calls = _arrange_windows_restart_fallthrough(monkeypatch, running_pids=[])
+
+    gateway._gateway_command_inner(
+        SimpleNamespace(gateway_command="restart", all=False, system=False, detached=None)
+    )
+
+    assert calls == [
+        "windows_restart",
+        "stop_profile_gateway",
+        "wait_exit",
+        "cleanup_state_files",
+        "launch_detached",
     ]
 
 

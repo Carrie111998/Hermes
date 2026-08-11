@@ -7322,7 +7322,20 @@ def _gateway_command_inner(args):
                 gateway_windows.restart()
                 return
             except (subprocess.CalledProcessError, RuntimeError, OSError):
-                pass
+                # restart() spawns the replacement BEFORE it waits for
+                # readiness, so a slow boot makes it raise while a perfectly
+                # healthy gateway is still coming up. The generic path below
+                # assumes nothing is running: it would stop that gateway,
+                # delete its lock/pid, and launch a third one. Only fall
+                # through when the restart really did leave us with nothing.
+                surviving = list(find_gateway_pids())
+                if surviving:
+                    print(
+                        "✓ Gateway is running (PID: "
+                        f"{', '.join(map(str, surviving))}) — restart reported a "
+                        "timeout while it was still starting up"
+                    )
+                    return
 
         if not service_available:
             # systemd/launchd restart failed — check if linger is the issue
