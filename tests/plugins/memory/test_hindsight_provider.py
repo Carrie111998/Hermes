@@ -439,6 +439,11 @@ class TestConfig:
                 captured.update(kwargs)
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
+        # ``_get_client`` runs the lazy-install gate before importing
+        # ``hindsight``. That gate checks distribution metadata, not
+        # sys.modules, so with hindsight-client absent from the venv it
+        # raises and the stub above is never reached. Neutralize it.
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
         # _get_client() runs the lazy_deps gate before `from hindsight import
         # ...`, and that gate checks *distribution metadata*, not sys.modules —
