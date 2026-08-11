@@ -1,5 +1,6 @@
 """Tests for hermes_cli.gateway_windows."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -76,7 +77,9 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
 def test_build_gateway_cmd_script_forwards_proxy_env(monkeypatch):
     """The .cmd launcher must bake the user's proxy env so a logon/Startup
     gateway (running outside the interactive shell) still reaches Telegram/
-    Discord/HTTP (issue #83683)."""
+    Discord/HTTP (issue #83683). The proxy `set` lines must come BEFORE the
+    blocking python invocation — otherwise a manual CMD launch never passes
+    them to the gateway process (reviewer note on PR #83720)."""
     monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
     monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
     content = gateway_windows._build_gateway_cmd_script(
@@ -86,6 +89,19 @@ def test_build_gateway_cmd_script_forwards_proxy_env(monkeypatch):
     assert 'set "HTTPS_PROXY=http://proxy.example.com:8080"' in content
     # Base vars still present.
     assert 'set "HERMES_HOME=C:\\Hermes"' in content
+
+    # Ordering invariant: every proxy export must precede the gateway command
+    # line (the blocking invocation). A `set` after it never reaches the child.
+    lines = content.split("\r\n")
+    proxy_idx = next(
+        i for i, ln in enumerate(lines) if ln.startswith('set "TELEGRAM_PROXY=')
+    )
+    invoke_idx = next(
+        i for i, ln in enumerate(lines) if "hermes_cli.main" in ln
+    )
+    assert proxy_idx < invoke_idx, (
+        f"proxy export (line {proxy_idx}) must precede gateway invocation (line {invoke_idx})"
+    )
 
 
 def test_build_gateway_vbs_script_forwards_proxy_env(monkeypatch):
@@ -101,7 +117,9 @@ def test_build_gateway_vbs_script_forwards_proxy_env(monkeypatch):
 def test_build_gateway_argv_loads_proxy_snapshot(monkeypatch, tmp_path):
     """The direct-spawn path (manual start + desktop recovery relaunch) must
     reload the proxy env snapshot so a gateway launched by the desktop backend
-    still gets the user's proxy (issue #83683)."""
+    still gets the user's proxy (issue #83683). The snapshot only FILLS proxy
+    keys absent from the live environment — a stale snapshot must never
+    override a live proxy value (reviewer note on PR #83720)."""
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
     project = tmp_path / "project"
@@ -118,17 +136,69 @@ def test_build_gateway_argv_loads_proxy_snapshot(monkeypatch, tmp_path):
     monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
     monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(hermes_home))
 
-    # No snapshot yet -> the overlay carries no proxy (it does not read
-    # os.environ directly; that only happens in _spawn_detached).
+    # No snapshot yet, and live env empty (as the desktop backend process
+    # lacks the user's shell env) -> the overlay carries no proxy.
+    monkeypatch.delenv("TELEGRAM_PROXY", raising=False)
     argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
     assert "TELEGRAM_PROXY" not in env_overlay
 
-    # Write a snapshot including the user's proxy, then the overlay must carry
-    # it even though the spawning process's environment may not.
+    # Install-time snapshot captures a proxy the live environment lacks...
     monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
     gateway_windows._write_proxy_env_snapshot(str(hermes_home))
+    # ...then the live env loses it (as the desktop backend process would).
+    monkeypatch.delenv("TELEGRAM_PROXY", raising=False)
     argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
+    # The snapshot gap-fills the missing key.
     assert env_overlay["TELEGRAM_PROXY"] == "socks5://127.0.0.1:1080"
+
+
+def test_build_gateway_argv_live_proxy_wins_over_snapshot(monkeypatch, tmp_path):
+    """The direct-spawn overlay must let a LIVE proxy value win over the
+    install-time snapshot, so a user who changes their proxy after install is
+    never routed through the stale snapshot (reviewer note on PR #83720). The
+    snapshot only fills proxy keys ABSENT from the live environment — which is
+    exactly how the desktop backend's recovery relaunch (no user shell env)
+    still gets proxy (issue #83683)."""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    project = tmp_path / "project"
+    scripts = project / "venv" / "Scripts"
+    site_packages = project / "venv" / "Lib" / "site-packages"
+    scripts.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    venv_python = scripts / "python.exe"
+    venv_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_windows.sys, "platform", "win32")
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(venv_python))
+    monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(hermes_home))
+
+    # Snapshot captures a STALE proxy value (install time), live env empty.
+    monkeypatch.delenv("TELEGRAM_PROXY", raising=False)
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://stale:1080")
+    gateway_windows._write_proxy_env_snapshot(str(hermes_home))
+
+    # Spawning process now carries a FRESH, different proxy value.
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://current:1080")
+    argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
+    # Replicate _spawn_detached's merge: live env wins, snapshot only fills gaps.
+    merged = {**os.environ, **env_overlay}
+    # Live value must win — traffic must not go through the stale snapshot.
+    assert merged["TELEGRAM_PROXY"] == "socks5://current:1080"
+    # The overlay must NOT have overridden the live value with the stale one.
+    assert env_overlay.get("TELEGRAM_PROXY") != "socks5://stale:1080"
+
+    # A proxy key absent from the live environment is still gap-filled from the
+    # snapshot (the desktop backend process lacks the user's interactive shell env).
+    monkeypatch.setenv("DISCORD_PROXY", "socks5://discord-snapshot:1080")
+    gateway_windows._write_proxy_env_snapshot(str(hermes_home))
+    monkeypatch.delenv("DISCORD_PROXY", raising=False)
+    argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
+    merged = {**os.environ, **env_overlay}
+    assert merged["TELEGRAM_PROXY"] == "socks5://current:1080"
+    assert merged["DISCORD_PROXY"] == "socks5://discord-snapshot:1080"
 
 
 def test_proxy_env_snapshot_roundtrip_filters_keys(monkeypatch, tmp_path):

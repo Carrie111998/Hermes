@@ -500,6 +500,15 @@ def _build_gateway_cmd_script(
         *[_preserve_hermes_home_path(entry) for entry in extra_pythonpath],
     ]
     lines.append(f'set "PYTHONPATH={";".join([*pythonpath_entries, "%PYTHONPATH%"])}"')
+    # Forward proxy env captured at install time so the gateway can reach
+    # Telegram/Discord/HTTP through the user's proxy (issue #83683). The
+    # Scheduled Task / Startup run outside the user's interactive shell, so
+    # without this the gateway launched on logon has no proxy. These `set`
+    # lines MUST precede the gateway invocation below: a manual CMD launch runs
+    # the python command as a blocking foreground process, so any `set` emitted
+    # after it would execute only after the gateway exits and never reach it.
+    for _pk, _pv in _collect_proxy_env().items():
+        lines.append(f'set "{_pk}={_pv}"')
 
     prog_args = [python_exe_path, "-m", "hermes_cli.main"]
     if profile_arg:
@@ -510,12 +519,6 @@ def _build_gateway_cmd_script(
     # Do NOT use `--replace` for service-managed starts; repeated /Run calls
     # should be idempotent, not churn parent/child takeover loops.
     lines.append(" ".join(_quote_cmd_script_arg(a) for a in prog_args))
-    # Forward proxy env captured at install time so the gateway can reach
-    # Telegram/Discord/HTTP through the user's proxy (issue #83683). The
-    # Scheduled Task / Startup run outside the user's interactive shell, so
-    # without this the gateway launched on logon has no proxy.
-    for _pk, _pv in _collect_proxy_env().items():
-        lines.append(f'set "{_pk}={_pv}"')
     lines.append("exit /b 0")
     return "\r\n".join(lines) + "\r\n"
 
@@ -923,9 +926,13 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
     # direct-spawn path (manual `gateway start` and the desktop backend's
     # recovery relaunch) runs outside the user's interactive shell, so it would
     # otherwise start a gateway with no proxy and no messaging platforms. The
-    # spawning process's own environment (if it carries the proxy) still wins
-    # because `_spawn_detached` layers os.environ under this overlay anyway.
-    env_overlay.update(_load_proxy_env_snapshot(hermes_home))
+    # snapshot only fills proxy keys ABSENT from the spawning process's own
+    # environment — a live value (e.g. a proxy the user changed after install)
+    # always wins, so traffic is never routed through a stale snapshot.
+    snapshot = _load_proxy_env_snapshot(hermes_home)
+    for key, value in snapshot.items():
+        if key not in os.environ:
+            env_overlay[key] = value
     return argv, working_dir, env_overlay
 
 
