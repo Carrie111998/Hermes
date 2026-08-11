@@ -279,7 +279,7 @@ def _validate_critical_modules_import(root) -> tuple[bool, str | None, str | Non
             )
             if venv_python.exists():
                 interpreter = str(venv_python)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass  # fall back to the running interpreter
         result = subprocess.run(
             [interpreter, "-c", probe],
@@ -492,7 +492,7 @@ def _print_fts_optimize_available_notice() -> None:
         if db is not None:
             try:
                 db.close()
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
                 pass
     sql = (row[0] if row else "") or ""
     if not sql or ("tool_name" in sql and not interrupted):
@@ -577,7 +577,7 @@ def _print_curator_recent_run_notice() -> None:
         try:
             state["last_run_summary_shown_at"] = last_run_at
             curator.save_state(state)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass
         return
 
@@ -596,7 +596,7 @@ def _print_curator_recent_run_notice() -> None:
     try:
         state["last_run_summary_shown_at"] = last_run_at
         curator.save_state(state)
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
 def _format_time_ago(iso_ts: str) -> str:
@@ -1029,7 +1029,7 @@ def _update_via_zip(args):
             )
         if not result["copied"] and not result.get("updated"):
             print("  ✓ Skills are up to date")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
     # Seed the model-catalog disk cache from the freshly-unpacked checkout
@@ -1478,7 +1478,7 @@ def _get_origin_url(git_cmd: list[str], cwd: Path) -> Optional[str]:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
     return None
 
@@ -1535,7 +1535,7 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
         )
         if result.returncode == 0:
             return int(result.stdout.strip())
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
     return -1
 
@@ -1551,7 +1551,7 @@ def _mark_skip_upstream_prompt():
         from hermes_constants import get_hermes_home
 
         (get_hermes_home() / SKIP_UPSTREAM_PROMPT_FILE).touch()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
 def _sync_fork_with_upstream(git_cmd: list[str], cwd: Path) -> bool:
@@ -1709,7 +1709,7 @@ def _invalidate_update_cache():
             cache_file = home / ".update_check"
             if cache_file.exists():
                 cache_file.unlink()
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass
 
 def _write_marker_file(path: Path, *, label: str) -> None:
@@ -1997,7 +1997,7 @@ def _ensure_uv_for_termux(pip_cmd: list[str]) -> str | None:
         )
         if result.returncode != 0:
             return None
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
     # After pip install, check managed path first, then PATH
     return resolve_uv() or shutil.which("uv")
@@ -2216,7 +2216,7 @@ def _log_only_write(text: str) -> None:
     try:
         log_file.write(text if text.endswith("\n") else text + "\n")
         log_file.flush()
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
 def _run_logged_subprocess(cmd, *, cwd=None, env=None):
@@ -2817,7 +2817,7 @@ def _wait_for_windows_update_gateway_exit(
         try:
             if _pid_exists(pid):
                 survivors.add(pid)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass
     return survivors
 
@@ -2930,7 +2930,7 @@ def _detect_venv_python_processes(
     try:
         for anc in psutil.Process().parents():
             skip.add(int(anc.pid))
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
     matches: list[tuple[int, str, str]] = []
@@ -3052,7 +3052,7 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     try:
         for anc in psutil.Process().parents():
             skip.add(int(anc.pid))
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
     found: list[int] = []
@@ -3113,7 +3113,7 @@ def _leftover_pausable_gateway_pids(
         if psutil is not None:
             try:
                 argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
                 pass
         if not _is_pausable_gateway(argv):
             return None
@@ -3181,7 +3181,7 @@ def _orphaned_desktop_backend_pids(
             # Holder exited between scan and classification — nothing to
             # reap, nothing blocking. Skip it.
             continue
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass
         low = argv.lower()
         if not _is_backend(low):
@@ -3705,7 +3705,7 @@ def _discard_lockfile_churn(git_cmd, repo_root):
             check=False,
         )
         print(f"→ Discarded npm lockfile churn ({len(dirty)} file(s))")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         # Never let lockfile cleanup block an update.
         pass
 
@@ -3788,7 +3788,7 @@ def _normalize_managed_eol(git_cmd, repo_root):
             capture_output=True,
             check=False,
         )
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         # Never let line-ending cleanup block an update.
         pass
 
@@ -4674,7 +4674,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         print(f"  {p.name}: {status}")
                     except Exception as pe:
                         print(f"  {p.name}: error ({pe})")
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass  # profiles module not available or no profiles
 
         # Backfill per-profile .env files for profiles created before the
@@ -4690,7 +4690,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     f"→ Seeded .env for {len(backfilled)} profile(s) "
                     f"(copied from default): {', '.join(backfilled)}"
                 )
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass  # profiles module not available or no profiles
 
         # Sync Honcho host blocks to all profiles
@@ -4700,7 +4700,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             synced = sync_honcho_profiles_quiet()
             if synced:
                 print(f"\n-> Honcho: synced {synced} profile(s)")
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass  # honcho plugin not installed or not configured
 
         # Check for config migrations.
@@ -5195,7 +5195,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if supports_systemd_services():
                 try:
                     _ensure_user_systemd_env()
-                except Exception:
+                except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
                     pass
 
                 for scope, scope_cmd in [

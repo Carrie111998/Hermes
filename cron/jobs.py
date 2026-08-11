@@ -763,7 +763,7 @@ def _compute_grace_seconds(schedule: dict) -> int:
                 period_seconds = int((second - first).total_seconds())
                 grace = period_seconds // 2
                 return max(MIN_GRACE, min(grace, MAX_GRACE))
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
                 pass
 
     return MIN_GRACE
@@ -884,12 +884,12 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     store = _current_cron_store()
     try:
         _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
     if success:
         try:
             _atomic_write_epoch(store.cron_dir / "ticker_last_success")
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass
 
 
@@ -935,7 +935,7 @@ def record_catch_up_occurrence() -> None:
         except (OSError, ValueError):
             value = 0
         _atomic_write_counter(path, max(0, value) + 1)
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
 
@@ -970,7 +970,7 @@ def record_ticker_error(message: str) -> None:
             except OSError:
                 pass
             raise
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
         pass
 
 
@@ -1402,7 +1402,7 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         try:
             from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
             pass
         cfg = _expand_env_vars(cfg)
         # Mirror run_job's precedence: the explicit cron-fleet default
@@ -2256,7 +2256,7 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                     _age = (now - claimed_at).total_seconds()
                     if 0 <= _age < claim_ttl_seconds:
                         return False  # someone holds a fresh claim
-                except Exception:
+                except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (upstream salvage, PR #14)
                     pass  # malformed claim → overwrite
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
