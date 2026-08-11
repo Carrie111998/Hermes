@@ -44,7 +44,13 @@ class TestReadFileHandler:
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
-    def test_writes_content(self, mock_get):
+    def test_writes_content(self, mock_get, monkeypatch):
+        # This handler-wiring test intentionally uses a POSIX fixture path.
+        # Keep it in the backend namespace when pytest runs on Windows.
+        monkeypatch.setattr(
+            "tools.file_tools._uses_container_paths",
+            lambda task_id="default": True,
+        )
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {"status": "ok", "path": "/tmp/out.txt", "bytes": 13}
@@ -132,7 +138,13 @@ class TestWriteFileHandler:
 
 class TestPatchHandler:
     @patch("tools.file_tools._get_file_ops")
-    def test_replace_mode_calls_patch_replace(self, mock_get):
+    def test_replace_mode_calls_patch_replace(self, mock_get, monkeypatch):
+        # This handler-wiring test intentionally uses a POSIX fixture path.
+        # Keep it in the backend namespace when pytest runs on Windows.
+        monkeypatch.setattr(
+            "tools.file_tools._uses_container_paths",
+            lambda task_id="default": True,
+        )
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {"status": "ok", "replacements": 1}
@@ -225,7 +237,11 @@ class TestPatchSensitivePathExtraction:
     """
 
     @patch("tools.file_tools._get_file_ops")
-    def test_patch_move_to_sensitive_dst_blocked(self, mock_get):
+    def test_patch_move_to_sensitive_dst_blocked(self, mock_get, monkeypatch):
+        monkeypatch.setattr(
+            "tools.file_tools._uses_container_paths",
+            lambda task_id="default": True,
+        )
         from tools.file_tools import patch_tool
         patch_text = (
             "*** Begin Patch\n"
@@ -239,13 +255,17 @@ class TestPatchSensitivePathExtraction:
 
 
     @patch("tools.file_tools._get_file_ops")
-    def test_patch_update_no_space_after_asterisks_blocked(self, mock_get):
+    def test_patch_update_no_space_after_asterisks_blocked(self, mock_get, monkeypatch):
         """``***Update File:`` (no space after asterisks) must also be caught.
 
         patch_parser.py accepts this form (``\\s*`` in its regex), so the
         sensitive path check must be at least as lenient or the check
         is bypassed.
         """
+        monkeypatch.setattr(
+            "tools.file_tools._uses_container_paths",
+            lambda task_id="default": True,
+        )
         from tools.file_tools import patch_tool
         patch_text = (
             "*** Begin Patch\n"
@@ -480,6 +500,10 @@ class TestSensitivePathCheck:
 
 
     def test_system_path_still_blocked(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.file_tools._uses_container_paths",
+            lambda task_id="default": True,
+        )
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
 
@@ -488,9 +512,13 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "sensitive system path" in result["error"]
 
-    def test_macos_private_var_carveouts(self):
+    def test_macos_private_var_carveouts(self, monkeypatch):
         """macOS temp dirs under /private/var must not be blanket-blocked,
         while the genuinely-sensitive /private/var subtrees still are."""
+        monkeypatch.setattr(
+            "tools.file_tools._uses_container_paths",
+            lambda task_id="default": True,
+        )
         from tools.file_tools import _check_sensitive_path
 
         # $TMPDIR / /tmp / /var/folders realpath into these on macOS.
