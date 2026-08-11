@@ -39,6 +39,7 @@ from typing import Any, Callable, Optional
 
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
+from jobflow_dispatch.activate import resolve_job_id_for_activity
 from jobflow_dispatch.contracts import message_key as canonical_key, route_mailbox
 from jobflow_dispatch.store import is_available
 
@@ -55,35 +56,6 @@ def resolve_mode(raw: Optional[str] = None) -> str:
     """Read the dispatch mode, defaulting to off for anything unrecognised."""
     value = (raw if raw is not None else os.getenv(MODE_ENV, "")).strip().lower()
     return value if value in VALID_MODES else MODE_OFF
-
-
-def resolve_job_id_for_activity(activity_id: str) -> Optional[str]:
-    """Map a policy activity ID to exactly one enabled cron job ID.
-
-    Fails closed on zero or multiple matches: activating the wrong worker is
-    worse than not activating one, because the reconciler will catch the miss.
-    """
-    from activity_policy.registry import ActivityRegistry
-    from cron.jobs import load_jobs
-
-    registry = ActivityRegistry.load_default()
-    policy = registry.policies.get(activity_id)
-    if policy is None or not policy.aliases:
-        logger.warning("dispatch: no policy/alias for activity %s", activity_id)
-        return None
-
-    names = {alias for alias in policy.aliases}
-    matches = [
-        job for job in load_jobs()
-        if job.get("name") in names and job.get("enabled")
-    ]
-    if len(matches) != 1:
-        logger.warning(
-            "dispatch: activity %s resolved %d enabled jobs — refusing to guess",
-            activity_id, len(matches),
-        )
-        return None
-    return matches[0].get("id")
 
 
 class JobFlowDispatcher(BaseSubscriber):
