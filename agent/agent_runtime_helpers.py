@@ -3179,8 +3179,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                     window=next_args.get("window", 5),
                     sort=next_args.get("sort"),
                     detail=next_args.get("detail", "adaptive"),
+                    profile=next_args.get("profile"),
+                    scope=next_args.get("scope"),
                     db=session_db,
                     current_session_id=agent.session_id,
+                    current_platform=getattr(agent, "platform", None),
+                    current_chat_id=getattr(agent, "_chat_id", None),
+                    current_thread_id=getattr(agent, "_thread_id", None),
                 ),
                 next_args,
             )
