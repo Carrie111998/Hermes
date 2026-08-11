@@ -2508,9 +2508,10 @@ def _prune_orphaned_branches(repo_root: str) -> None:
 _ACCENT_ANSI_DEFAULT = "\033[1;38;2;255;215;0m"  # True-color #FFD700 bold — fallback
 _BOLD = "\033[1m"
 _RST = "\033[0m"
-_STREAM_PAD = ""  # No indent for streamed response text — leading whitespace pollutes
-# terminal copy/paste (every selected line carried 4 spaces).  Matches the
-# response Panel's flush-left padding.
+# Left padding for streamed response text. 0 = flush-left (default, best for
+# copy/paste).  Configurable via display.tui_padding in config.yaml (0-8).
+_pad_count = int(CLI_CONFIG.get("display", {}).get("tui_padding", 0))
+_STREAM_PAD = " " * max(0, min(_pad_count, 8))
 _STREAM_PARTIAL_PREVIEW_LEN = 60  # tail of an unfinished logical line mirrored
 # into the spinner while streaming (TTFT perception without hard-wrapping)
 
@@ -2970,13 +2971,12 @@ def _preserve_windows_dot_segments_for_markdown(text: str) -> str:
 def _terminal_width_for_streaming() -> int:
     """Display cells available inside the streamed response box.
 
-    The streaming path prefixes every line with ``_STREAM_PAD`` (now
-    empty — flush-left so copy/paste stays clean) inside an open
-    response panel.  The realigner uses this number as its budget when
-    deciding whether to keep a horizontal table or fall back to
-    vertical key-value rendering.  We subtract a small safety margin
-    so terminal-resize races don't push a borderline table into
-    mid-cell soft-wrap.
+    The streaming path prefixes every line with ``_STREAM_PAD`` (configurable
+    via display.tui_padding, default flush-left) inside an open response panel.
+    The realigner uses this number as its budget when deciding whether to keep
+    a horizontal table or fall back to vertical key-value rendering.  We subtract
+    a small safety margin so terminal-resize races don't push a borderline table
+    into mid-cell soft-wrap.
     """
 
     try:
