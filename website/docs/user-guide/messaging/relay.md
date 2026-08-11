@@ -64,9 +64,10 @@ What it does:
    `gateway.idp.token_url` is configured, your own IdP is used instead (the
    air-gapped / self-hosted-IdP path, no Nous Portal involved): with
    `client_id`/`client_secret` configured it performs a generic OAuth2
-   client-credentials grant; without them the URL is treated as an ambient
-   token endpoint (plain GET whose response body is the token — the
+   client-credentials grant; with neither configured the URL is treated as an
+   ambient token endpoint (plain GET whose response body is the token — the
    metadata-server pattern, e.g. Domino's `$DOMINO_API_PROXY/access-token`).
+   Configuring only one of the two credentials is an error.
 2. POSTs the enrollment token and a gateway id to the connector's
    `/relay/enroll` endpoint over TLS.
 3. The connector verifies the token (signature, single-use, tenant match),

@@ -190,6 +190,32 @@ def test_client_credentials_still_selected_when_creds_present(monkeypatch):
     assert captured["method"] == "POST"
 
 
+def test_partial_credentials_client_id_only_raises_without_get(monkeypatch):
+    """client_id without client_secret is a misconfig: loud error, no ambient GET."""
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp.test/token")
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_CLIENT_ID", "agent-client")
+
+    def fake_urlopen(req, timeout=None):
+        raise AssertionError("no HTTP request may be issued on partial credentials")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="client_secret missing"):
+        relay._resolve_relay_identity_token()
+
+
+def test_partial_credentials_client_secret_only_raises_without_get(monkeypatch):
+    """client_secret without client_id is a misconfig: loud error, no ambient GET."""
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp.test/token")
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_CLIENT_SECRET", "shh")
+
+    def fake_urlopen(req, timeout=None):
+        raise AssertionError("no HTTP request may be issued on partial credentials")
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="client_id missing"):
+        relay._resolve_relay_identity_token()
+
+
 def test_ambient_via_config_yaml(monkeypatch):
     """Ambient mode also engages when token_url comes from config.yaml, not env."""
     monkeypatch.setattr(

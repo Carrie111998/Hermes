@@ -513,8 +513,8 @@ def _resolve_relay_identity_token() -> str:
          ``client_credentials`` grant against the operator's own IdP (Entra;
          Keycloak; Authentik in the sandbox). The connector's Seam-A OIDC
          verifier reads a claim (default ``tid``) off it as the tenant.
-      1b. **Ambient token endpoint**: when ``token_url`` is configured WITHOUT
-         client credentials, the URL is treated as a metadata-server-style
+      1b. **Ambient token endpoint**: when ``token_url`` is configured with
+         NEITHER client_id nor client_secret, the URL is treated as a metadata-server-style
          ambient credential endpoint (e.g. Domino's
          ``$DOMINO_API_PROXY/access-token``): a plain GET whose response body
          IS the token — either a raw JWT string or a JSON envelope with an
@@ -553,7 +553,7 @@ def _resolve_relay_identity_token() -> str:
     import urllib.parse
     import urllib.request
 
-    if not client_id or not client_secret:
+    if not client_id and not client_secret:
         # Mode 1b — ambient token endpoint (no client credentials configured).
         # Plain GET; the body is the token, raw or JSON-enveloped.
         req = urllib.request.Request(
@@ -579,6 +579,17 @@ def _resolve_relay_identity_token() -> str:
                 "client_id and client_secret alongside token_url."
             )
         return token
+
+    if not client_id or not client_secret:
+        # Exactly one credential configured: this is a mistyped client_credentials
+        # setup, not an ambient endpoint. Keep the loud error (never GET the IdP).
+        missing = "client_secret" if client_id else "client_id"
+        raise RuntimeError(
+            f"gateway.idp.token_url is configured with a partial client credential "
+            f"({missing} missing). Configure both client_id and client_secret for "
+            f"the OAuth2 client_credentials grant, or neither to treat token_url "
+            f"as an ambient token endpoint (plain GET returning the token)."
+        )
 
     # Mode 1 — generic OAuth2 client_credentials grant.
     form = {
