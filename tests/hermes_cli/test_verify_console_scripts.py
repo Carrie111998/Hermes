@@ -106,7 +106,8 @@ class TestWarnIfHermesLauncherBroken:
         out = capsys.readouterr().out
         assert "broken" in out
         assert "hermes" in out
-        assert "chown" in out
+        chown_line = next(line for line in out.splitlines() if "chown" in line)
+        assert chown_line.endswith(f'sudo chown -R "$(id -un)" {fake_scripts_dir.parent}')
 
     def test_no_action_when_not_running_from_a_venv(self, temp_pyproject, capsys):
         with patch("hermes_cli.main._venv_scripts_dir", return_value=None):

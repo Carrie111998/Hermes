@@ -8714,7 +8714,7 @@ def _warn_if_hermes_launcher_broken() -> None:
     )
     print(f"    Check ownership with: ls -la {scripts_dir}")
     print(
-        f"    If it's owned by another user, fix it with: sudo chown -R \"$(id -un)\" {scripts_dir.parent.parent}"
+        f"    If it's owned by another user, fix it with: sudo chown -R \"$(id -un)\" {scripts_dir.parent}"
     )
     print("    Then re-run `hermes update` (or the setup script) to reinstall.")
 
