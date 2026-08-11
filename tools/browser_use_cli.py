@@ -51,9 +51,19 @@ def _blocked_url_in_code(code: str) -> Optional[str]:
 
 
 def _base_subprocess_env() -> dict:
+    """Return a credential-scrubbed, Python-runtime-neutral CLI environment.
+
+    Browser Use may run under a different Python version than Hermes (notably
+    uvx selecting Python 3.12 while Desktop embeds Python 3.11). Inheriting
+    PYTHONPATH or PYTHONHOME can make that isolated runtime import Hermes'
+    ABI-specific packages instead of its own dependencies.
+    """
     from tools.browser_tool import _build_browser_env
 
-    return _build_browser_env()
+    env = _build_browser_env()
+    env.pop("PYTHONPATH", None)
+    env.pop("PYTHONHOME", None)
+    return env
 
 
 def _read_browser_cfg() -> dict:

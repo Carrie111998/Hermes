@@ -663,6 +663,27 @@ class TestBrowserExec:
         assert 'got:print("hi")' in result["output"]
         assert "session" not in result
 
+    def test_python_runtime_vars_are_stripped(self, tmp_path, monkeypatch):
+        """Hermes' Python environment must not contaminate uvx/browser-use.
+
+        The Desktop launcher puts Hermes' Python 3.11 site-packages on
+        PYTHONPATH; browser-use currently runs under Python 3.12, so inheriting
+        that path can load ABI-incompatible extension modules.
+        """
+        cli = _fake_cli(
+            tmp_path,
+            'cat > /dev/null\nprintf "pythonpath_set:[%s]\\npythonhome_set:[%s]\\n" "${PYTHONPATH+x}" "${PYTHONHOME+x}"\n',
+        )
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setenv("PYTHONPATH", "/hermes/python3.11/site-packages")
+        monkeypatch.setenv("PYTHONHOME", "/hermes/python3.11")
+
+        result = json.loads(bu_cli.browser_exec("print(1)"))
+
+        assert result["success"] is True
+        assert "pythonpath_set:[]" in result["output"]
+        assert "pythonhome_set:[]" in result["output"]
+
     def test_session_sets_bu_name(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
