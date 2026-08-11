@@ -37,6 +37,25 @@ class TestExpandTilde:
             result = ft._expand_tilde("~/scratch/file.txt")
         assert result == "/opt/data/profiles/coder/home/scratch/file.txt"
 
+    def test_posix_profile_home_keeps_posix_separators(self):
+        """A POSIX profile home must not gain a host backslash (Windows host).
+
+        Container/SSH profile homes are consumed on the far side of a Docker
+        boundary, where ``posixpath.normpath`` does not treat ``\\`` as a
+        separator — a mixed path would name a component literally called
+        ``home\\scratch`` inside the container.
+        """
+        with patch("hermes_constants.get_subprocess_home", return_value="/opt/data/profiles/coder/home"):
+            result = ft._expand_tilde("~/scratch/nested/file.txt")
+        assert "\\" not in result
+        assert result == "/opt/data/profiles/coder/home/scratch/nested/file.txt"
+
+    def test_windows_profile_home_keeps_backslashes(self):
+        """A Windows-flavored profile home joins with a backslash."""
+        with patch("hermes_constants.get_subprocess_home", return_value="C:\\Users\\coder"):
+            result = ft._expand_tilde("~/scratch")
+        assert result == "C:\\Users\\coder\\scratch"
+
     def test_bare_tilde_expands_to_profile_home(self):
         """Bare ~ expands to the profile home."""
         with patch("hermes_constants.get_subprocess_home", return_value="/opt/data/profiles/coder/home"):
