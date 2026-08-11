@@ -151,6 +151,8 @@ _EMPTY_DIR_PROTECTED_TOP_LEVEL = frozenset({
     # User-authored project trees — never sweep empty directories
     # inside these (#75403).
     "patches", "projects", "skins", "themes", "contributors",
+    # User workspace trees (2026-08-12, sibling of guess_category protection).
+    "scripts", "docs", "state",
 })
 
 _EMPTY_DIR_SWEEP_PRUNE_DIRS = frozenset({
@@ -586,6 +588,13 @@ def guess_category(path: Path) -> Optional[str]:
             # tmp_* (#75403, also #32164, #37721).
             "patches", "projects", "skins", "themes", "contributors",
             "profiles", "backups", "optional-skills",
+            # User workspace trees (2026-08-12: scripts/tests/test_deny_ignore.py
+            # was tracked as category="test" and deleted at session end —
+            # three reproductions in 20 minutes).  Hermes' own disposable
+            # files live under cache/ and cron/output/; scripts/docs/state
+            # hold user/agent work products and must never be auto-deleted
+            # on name-prefix alone.
+            "scripts", "docs", "state",
         }:
             return None
         if top == "cron" or top == "cronjobs":
