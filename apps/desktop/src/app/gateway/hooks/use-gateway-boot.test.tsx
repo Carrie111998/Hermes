@@ -250,6 +250,32 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($gatewayState.get()).toBe('open')
   })
 
+  it('two hermes:connection:applied events firing back-to-back only run softSwitch once', async () => {
+    // Reproduces main's connection-config:apply race: the Settings "Apply"
+    // button and the cloud-agent "Connect" button are two independent UI
+    // triggers with independent pending-state guards, so nothing stops both
+    // firing close together — main can (pre-fix) emit
+    // hermes:connection:applied twice for one user action. Without a
+    // reentrancy guard in softSwitch(), each event independently wipes the
+    // session lists and re-dials — beforeConnectionSwitch() is called once
+    // per real softSwitch body execution, right after the guard, so its call
+    // count is the signal a guard vs. no-guard implementation disagrees on.
+    const beforeConnectionSwitch = vi.fn()
+    render(<Harness beforeConnectionSwitch={beforeConnectionSwitch} />)
+    await flushAsync()
+    expect(connectionApplied).not.toBeNull()
+    expect(beforeConnectionSwitch).not.toHaveBeenCalled()
+
+    act(() => {
+      connectionApplied?.()
+      connectionApplied?.()
+    })
+    await flushAsync()
+
+    expect(beforeConnectionSwitch).toHaveBeenCalledTimes(1)
+    expect($gatewayState.get()).toBe('open')
+  })
+
   it('a remote that drops post-boot keeps looping with NO boot.error (the dead-end CONNECTING combo)', async () => {
     render(<Harness />)
     await flushAsync()
