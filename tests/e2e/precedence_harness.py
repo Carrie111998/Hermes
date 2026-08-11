@@ -21,25 +21,46 @@ Two safety boundaries, both load-bearing — do not remove either:
    Phase 3, Packet 2, and it is safe to run at will (no API spend, no risk of
    a real Telegram send).
 
-`run_live_case()` — the actual model-invoking half of the P3.3 precedence
-experiment (Phase 3, Packet 3) — is an intentional, documented stub. It is
-NOT wired up. Before it can run for real, two things must happen, in order:
+`run_live_case()` (Packet 3) is now wired up, gated behind `verify_tool_isolation()`
+— a HARD precondition, checked from actual constructed-object state, not
+assumed from reading toolsets.py. Investigation for Packet 3 found TWO
+distinct tool-injection paths in `AIAgent.__init__` (run_agent.py):
 
-  (a) Operator authorization to spend real API budget on the target profile's
-      Anthropic credentials (Phase 3 plan, P3.14 / execution-authorization
-      note — Packets 4-11 including live runs are explicitly deferred until
-      the operator re-authorizes them).
-  (b) A concrete design for preventing the model from taking a real,
-      irreversible action mid-loop (e.g. calling `send_message` against a
-      live chat, or any other tool with external side effects) during a
-      precedence experiment that is deliberately testing whether the model
-      obeys "don't call send_message" instructions. `create_job(...,
-      enabled_toolsets=[...])` already exists as the mechanism for this
-      (see cron/jobs.py:508) — the live-call implementation must pass an
-      `enabled_toolsets` allowlist that excludes any message-sending /
-      delivery-capable toolset, and should additionally assert
-      `TelegramAdapter.send` (or the harness's mock of it) was never invoked
-      after each run, as a hard safety check, not just an instruction.
+  1. `self.tools = get_tool_definitions(enabled_toolsets=..., ...)` — gated by
+     the toolsets system. Passing `enabled_toolsets=[]` (an EMPTY LIST, not
+     None — None means "default to everything") is confirmed by direct read
+     of `model_tools.py:_compute_tool_definitions` to iterate zero times,
+     producing `tools_to_include = set()` and therefore zero tool schemas.
+  2. TWO post-assignment mutation sites append additional schemas to
+     `self.tools` AFTER step 1, bypassing enabled_toolsets entirely
+     (run_agent.py:1837, :2104): memory-provider tool schemas (gated by
+     `self._memory_manager`, which `skip_memory=True` forces to `None` —
+     confirmed at run_agent.py:1758) and context-engine tool schemas
+     (`self.context_compressor.get_tool_schemas()` — NOT gated by
+     skip_memory; the base `ContextEngine.get_tool_schemas()` returns `[]`
+     by default per agent/context_engine.py:151-157, but a profile config
+     could select a schema-producing engine like LCM, so this must be
+     checked on the actual constructed object, not assumed).
+
+`verify_tool_isolation(profile)` constructs a real `AIAgent` with
+`enabled_toolsets=[]`, `disabled_toolsets=<every known toolset name>` (belt
+and suspenders — redundant with #1 but free), and `skip_memory=True`, makes
+NO model call, and inspects `agent.tools` AND
+`agent.context_compressor.get_tool_schemas()` directly. `run_live_case()`
+refuses to proceed unless both are empty, printing the exact
+`P3 PACKET 3 BLOCKED — EXPERIMENT CANNOT ISOLATE MODEL FROM ACTION TOOLS`
+sentinel and raising if not.
+
+Credential/config resolution (`resolve_runtime_provider`, called inside
+`AIAgent.__init__`) is not covered by `isolated_cron_state()`'s targeted
+monkeypatches — those functions resolve `HERMES_HOME` via modules not
+independently pinned. `pin_hermes_home_env(profile)` sets the `HERMES_HOME`
+env var directly and MUST be called before the first import of any
+`hermes_cli.*` module in the process (i.e. at the very top of `_main()`,
+before any deferred import happens) — this mirrors how production
+"subprocess spawners... propagate HERMES_HOME explicitly" per
+hermes_constants.py's own docstring, rather than relying on any single
+module's caching behavior.
 
 Usage
 -----
@@ -262,31 +283,307 @@ def assemble_prompt(case: PrecedenceCase) -> dict:
     }
 
 
-def run_live_case(case: PrecedenceCase, profile: str, n_runs: int = 20):  # noqa: ARG001
-    """STUB — intentionally not implemented. See module docstring, points (a)
-    and (b), for what must happen before this can run. Do not implement this
-    by simply calling AIAgent.run_conversation() without first wiring the
-    enabled_toolsets exclusion and the post-run send-was-never-called assertion
-    described above — that would reintroduce exactly the "a defect at the end
-    of the pipeline gets attributed to the wrong layer" problem Phase 3 exists
-    to fix, applied to the experiment's own safety design.
+BLOCKED_SENTINEL = "P3 PACKET 3 BLOCKED — EXPERIMENT CANNOT ISOLATE MODEL FROM ACTION TOOLS"
+
+
+def pin_hermes_home_env(profile: str) -> Path:
+    """Set HERMES_HOME to *profile*'s root in the process environment.
+
+    MUST be called before the first import of any hermes_cli.* module in
+    this process — credential/config resolution (resolve_runtime_provider)
+    is not covered by isolated_cron_state()'s targeted monkeypatches, and
+    some modules snapshot HERMES_HOME at their own import time. This mirrors
+    how production subprocess spawners propagate HERMES_HOME explicitly
+    (hermes_constants.py's own docstring) rather than relying on any single
+    module's caching behavior.
     """
-    raise NotImplementedError(
-        "Packet 3 (live model calls) is deferred pending operator "
-        "re-authorization and the enabled_toolsets safety design described "
-        "in this module's docstring. Use assemble_prompt() for the "
-        "composition-only proof (Packet 2) instead."
+    import os
+
+    if profile not in PROFILE_ROOTS:
+        raise ValueError(f"Unknown profile {profile!r}; choose one of {list(PROFILE_ROOTS)}")
+    root = PROFILE_ROOTS[profile]
+    os.environ["HERMES_HOME"] = str(root)
+    return root
+
+
+def _resolve_experiment_runtime(profile: str) -> dict:
+    """Resolve model/provider/credentials exactly as cron/scheduler.py does
+    (scheduler.py:1083-1200, trimmed to what AIAgent construction needs),
+    so the experiment uses the SAME model and provider production cron jobs
+    for this profile actually use — not an arbitrary hardcoded model string.
+    Must be called after pin_hermes_home_env(profile).
+    """
+    import os
+    import yaml
+
+    hermes_home = PROFILE_ROOTS[profile]
+    model = os.getenv("HERMES_MODEL") or ""
+    cfg = {}
+    cfg_path = hermes_home / "config.yaml"
+    if cfg_path.exists():
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f) or {}
+        model_cfg = cfg.get("model", {})
+        if isinstance(model_cfg, str):
+            model = model_cfg
+        elif isinstance(model_cfg, dict):
+            model = model_cfg.get("default", model)
+
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    runtime = resolve_runtime_provider(requested=None)
+
+    return {
+        "model": model,
+        "api_key": runtime.get("api_key"),
+        "base_url": runtime.get("base_url"),
+        "provider": runtime.get("provider"),
+        "api_mode": runtime.get("api_mode"),
+    }
+
+
+def verify_tool_isolation(profile: str) -> dict:
+    """P3.0 — construct a real AIAgent with the intended experiment
+    configuration and inspect its ACTUAL tool surface. No model call is
+    made. This is runtime evidence (a real constructed object, real
+    toolset-registry resolution, real check_fn gating, real context-engine
+    selection for this profile's config.yaml) — not an assumption from
+    reading toolsets.py.
+
+    Checks BOTH known tool-injection paths in AIAgent.__init__:
+      1. self.tools, built from get_tool_definitions(enabled_toolsets=[]).
+      2. self.context_compressor.get_tool_schemas() — a second injection
+         point that bypasses enabled_toolsets entirely (run_agent.py:2104),
+         gated by which context-engine plugin the profile's config selects,
+         not by skip_memory. Must be checked on the real object.
+    """
+    from run_agent import AIAgent
+    from toolsets import get_toolset_names
+
+    rt = _resolve_experiment_runtime(profile)
+    agent = AIAgent(
+        model=rt["model"],
+        api_key=rt["api_key"],
+        base_url=rt["base_url"],
+        provider=rt["provider"],
+        api_mode=rt["api_mode"],
+        enabled_toolsets=[],
+        disabled_toolsets=get_toolset_names(),  # belt-and-suspenders; redundant with [] above
+        skip_memory=True,
+        skip_context_files=True,
+        quiet_mode=True,
+        platform="cron",
+        load_soul_identity=False,  # tool-isolation check only; identity irrelevant here
     )
+
+    tool_schema_names = sorted(
+        t.get("function", {}).get("name") for t in (agent.tools or [])
+    )
+
+    context_tool_schemas = []
+    try:
+        context_tool_schemas = agent.context_compressor.get_tool_schemas() or []
+    except Exception as exc:  # pragma: no cover - diagnostic only
+        context_tool_schemas = [{"error": str(exc)}]
+    context_tool_names = sorted(
+        s.get("name", "<unnamed>") for s in context_tool_schemas if isinstance(s, dict)
+    )
+
+    safe = not tool_schema_names and not context_tool_names
+    return {
+        "profile": profile,
+        "safe": safe,
+        "primary_tool_schema_names": tool_schema_names,
+        "context_engine_tool_names": context_tool_names,
+        "context_engine_class": type(agent.context_compressor).__name__,
+    }
+
+
+# Objective response classifiers (P3.4) — defined BEFORE any run is reviewed,
+# so classification criteria cannot be adjusted post-hoc based on observed
+# outputs. If criteria ever need to change after seeing results, that must
+# be recorded as a new, separate analysis pass, not a silent edit here.
+
+_STATUS_EMOJI = "✅🔵⬜❌⏳"
+
+
+def classify_emoji(raw_response: str) -> str:
+    return "emits_status_emoji" if any(c in raw_response for c in _STATUS_EMOJI) else "no_status_emoji"
+
+
+def classify_table(raw_response: str) -> str:
+    import re
+
+    sep_re = re.compile(r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$", re.M)
+    row_re = re.compile(r"^\s*\|.*\|\s*$", re.M)
+    if sep_re.search(raw_response) and row_re.search(raw_response):
+        return "emits_gfm_table"
+    return "no_table"
+
+
+def classify_completion_shape(raw_response: str) -> str:
+    """contract A = orchestrator.py's plain 3-line, no-emoji template
+    ('<TASK-ID> done — ...'); contract B = vault-task-workflow's ✅-prefixed
+    example ('✅ <TASK-ID> done — ...'). Ambiguous responses are retained as
+    'neither_ambiguous', not forced into A or B."""
+    import re
+
+    stripped = raw_response.strip()
+    if re.match(r"^✅\s*\S", stripped):
+        return "contract_b_emoji_prefixed"
+    if re.match(r"^[A-Za-z][\w-]*\s+done\s*[—-]", stripped) or re.match(r"^[A-Za-z][\w-]*\s+done:", stripped):
+        return "contract_a_plain"
+    return "neither_ambiguous"
+
+
+def offline_render_chain(raw_response: str) -> dict:
+    """P3.6 — apply the REAL post-generation enforcement and renderer
+    functions to already-captured raw output, entirely offline. Never sends
+    anything to Telegram; only calls the pure-text transform functions.
+    Distinguishes model obedience (raw) from sanitizer behavior
+    (post_enforcement) from renderer-introduced artifacts (telegram_rendered)."""
+    import importlib.util
+    import sys as _sys
+
+    spec = importlib.util.spec_from_file_location(
+        "phase3_cron_reply",
+        str(HERMES_ROOT / "profiles" / "ops-repair" / "plugins" / "ops-deterministic" / "cron_reply.py"),
+    )
+    cron_reply_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cron_reply_mod)
+    post_enforcement = cron_reply_mod.sanitize_cron_reply(raw_response)
+
+    from gateway.platforms.telegram import _wrap_markdown_tables
+
+    telegram_rendered = _wrap_markdown_tables(post_enforcement)
+
+    return {
+        "raw": raw_response,
+        "post_enforcement": post_enforcement,
+        "telegram_rendered": telegram_rendered,
+    }
+
+
+def run_live_case(case: PrecedenceCase, profile: str, n_runs: int, *, skills_override=None):
+    """P3.1/P3.3 — make N real model calls for *case* and capture raw
+    final_response, refusing to proceed unless verify_tool_isolation()
+    confirms zero action-capable tools. Never calls _deliver_result / any
+    Telegram send — only AIAgent.run_conversation() is invoked, and its
+    return value is captured directly; delivery code is never reached.
+
+    skills_override lets a paired condition (e.g. "SOUL.md only, no
+    response-modes") swap out the case's default skill list without
+    redefining the whole PrecedenceCase.
+    """
+    import hashlib
+
+    check = verify_tool_isolation(profile)
+    if not check["safe"]:
+        print(BLOCKED_SENTINEL)
+        print(json.dumps(check, indent=2))
+        raise RuntimeError(BLOCKED_SENTINEL)
+
+    from run_agent import AIAgent
+    from toolsets import get_toolset_names
+
+    rt = _resolve_experiment_runtime(profile)
+    skills = case.skills if skills_override is None else skills_override
+    with isolated_cron_state(profile):
+        assembled = assemble_prompt(PrecedenceCase(case.key, case.description, case.prompt, skills))
+        prompt_text = assembled["prompt"]
+        prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
+
+        results = []
+        for rep in range(1, n_runs + 1):
+            agent = AIAgent(
+                model=rt["model"],
+                api_key=rt["api_key"],
+                base_url=rt["base_url"],
+                provider=rt["provider"],
+                api_mode=rt["api_mode"],
+                enabled_toolsets=[],
+                disabled_toolsets=get_toolset_names(),
+                skip_memory=True,
+                skip_context_files=True,
+                quiet_mode=True,
+                platform="cron",
+                load_soul_identity=True,
+            )
+            # Re-verify on THIS instance too — cheap, and closes any gap
+            # between the pre-check instance and the one actually used.
+            live_tool_names = sorted(t.get("function", {}).get("name") for t in (agent.tools or []))
+            live_ctx_names = sorted(
+                s.get("name", "<unnamed>")
+                for s in (agent.context_compressor.get_tool_schemas() or [])
+                if isinstance(s, dict)
+            )
+            if live_tool_names or live_ctx_names:
+                print(BLOCKED_SENTINEL)
+                raise RuntimeError(BLOCKED_SENTINEL)
+
+            call_result = agent.run_conversation(prompt_text)
+            raw_response = call_result.get("final_response", "") if isinstance(call_result, dict) else str(call_result)
+
+            results.append({
+                "case": case.key,
+                "profile": profile,
+                "repetition": rep,
+                "n_runs": n_runs,
+                "prompt_hash": prompt_hash,
+                "skills": skills,
+                "model": agent.model,
+                "provider": getattr(agent, "provider", None),
+                "raw_final_response": raw_response,
+                "classify_emoji": classify_emoji(raw_response),
+                "classify_table": classify_table(raw_response),
+                "classify_completion_shape": classify_completion_shape(raw_response),
+                "effective_tool_names": live_tool_names,
+                "effective_context_tool_names": live_ctx_names,
+            })
+
+    return {
+        "case": case.key,
+        "prompt_hash": prompt_hash,
+        "prompt_chars": len(prompt_text),
+        "n_runs": n_runs,
+        "runs": results,
+    }
 
 
 def _main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", choices=list(PROFILE_ROOTS), default="ops-repair")
     parser.add_argument("--list", action="store_true", help="List available cases and exit")
-    parser.add_argument("--case", choices=list(CASES), help="Assemble and print one case")
-    parser.add_argument("--all", action="store_true", help="Assemble and print all cases")
+    parser.add_argument("--case", choices=list(CASES), help="Assemble and print/run one case")
+    parser.add_argument("--all", action="store_true", help="Assemble and print all cases (composition-only)")
+    parser.add_argument("--verify-isolation", action="store_true", help="P3.0: construct-only tool-isolation check, no model call")
+    parser.add_argument("--live", type=int, metavar="N", help="P3.1/P3.3: make N real model calls for --case")
+    parser.add_argument("--skills-override", nargs="*", help="Override --case's skill list for a paired condition")
     parser.add_argument("--out", type=Path, help="Write JSON results to this path instead of stdout")
     args = parser.parse_args()
+
+    # Must happen before ANY hermes_cli-dependent import in this process.
+    pin_hermes_home_env(args.profile)
+
+    if args.verify_isolation:
+        check = verify_tool_isolation(args.profile)
+        print(json.dumps(check, indent=2))
+        if not check["safe"]:
+            print(BLOCKED_SENTINEL)
+            return 1
+        return 0
+
+    if args.live is not None:
+        if not args.case:
+            parser.error("--live requires --case")
+        result = run_live_case(CASES[args.case], args.profile, args.live, skills_override=args.skills_override)
+        payload = json.dumps(result, indent=2, ensure_ascii=False)
+        if args.out:
+            args.out.write_text(payload, encoding="utf-8")
+            print(f"Wrote live results to {args.out}")
+        else:
+            print(payload)
+        return 0
 
     if args.list or not (args.case or args.all):
         for key, c in CASES.items():
