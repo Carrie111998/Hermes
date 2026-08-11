@@ -59,6 +59,37 @@ from agent.delegation_context import (
 logger = logging.getLogger(__name__)
 
 
+def _extract_cron_context_payload(text: str) -> str:
+    """Return the useful payload from a saved cron artifact.
+
+    Scheduler-generated cron outputs include the full assembled prompt for
+    provenance. Passing that whole file through ``context_from`` leaks upstream
+    instructions into downstream jobs. Preserve raw outputs that are not in the
+    scheduler artifact format, but for cron artifacts inject only the final
+    Response section, or the final Error section when the source job failed.
+    """
+    artifact = (text or "").strip()
+    if not artifact:
+        return ""
+
+    markers: list[tuple[int, str]] = []
+    for match in re.finditer(r"(?m)^## (Response|Error)\s*$", artifact):
+        markers.append((match.start(), match.group(1)))
+    if not markers:
+        return artifact
+
+    marker_start, marker_name = markers[-1]
+    marker_end = artifact.find("\n", marker_start)
+    if marker_end == -1:
+        return ""
+    payload = artifact[marker_end + 1 :].strip()
+    if not payload or payload == "(No response generated)":
+        return ""
+    if marker_name == "Error":
+        return f"## Error\n\n{payload}".strip()
+    return payload
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -2687,6 +2718,7 @@ def _build_job_prompt(
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                latest_output = _extract_cron_context_payload(latest_output)
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
