@@ -54,6 +54,33 @@ type UsageReport = {
 
 type ViewMode = 'daily' | 'weekly' | 'monthly'
 
+type MeterBucket = {
+  calls: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  estimated_cost_usd: number
+  unpriced_calls: number
+  included_calls: number
+  priced_calls: number
+  cache_hit_rate: number
+  has_unpriced: boolean
+}
+
+type MeterRoute = MeterBucket & {
+  provider: string
+  model: string
+  api_mode: string
+}
+
+type MeterSummary = {
+  month_label: string
+  month: { summary: MeterBucket; routes: MeterRoute[]; event_count: number }
+  all_time: { summary: MeterBucket; routes: MeterRoute[]; event_count: number }
+  caveat?: string
+}
+
 function intensityClass(level: number): string {
   // level 0..4; GitHub-style: empty = faint, 4 = solid green.
   const i = Math.max(0, Math.min(4, Math.round(level)))
@@ -259,6 +286,71 @@ function CostBuckets({ buckets }: { buckets: NonNullable<UsageReport['overview']
   )
 }
 
+function fmtPct(v: number): string {
+  if (!Number.isFinite(v) || v <= 0) {
+    return '0%'
+  }
+
+  return `${(v * 100).toFixed(v >= 0.1 ? 0 : 1)}%`
+}
+
+function CallMeter({ meter }: { meter: MeterSummary }) {
+  const month = meter.month.summary
+  const all = meter.all_time.summary
+  const routes = meter.month.routes.slice(0, 8)
+
+  return (
+    <div className="rounded-xl border border-(--ui-stroke-tertiary) bg-(--ui-bg-quaternary) p-3">
+      <div className="mb-1 flex items-baseline justify-between gap-2">
+        <div className="text-[0.68rem] text-(--ui-text-tertiary)">
+          per-call meter · {meter.month_label} + all-time
+        </div>
+        {month.has_unpriced && (
+          <div className="text-[0.62rem] text-(--ui-text-quaternary)">includes unpriced routes</div>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+        <SummaryCard
+          accent
+          label={`${meter.month_label} est.`}
+          value={month.unpriced_calls === month.calls && month.calls > 0 ? 'unpriced' : fmtUsd(month.estimated_cost_usd)}
+        />
+        <SummaryCard
+          label="all-time est."
+          value={all.unpriced_calls === all.calls && all.calls > 0 ? 'unpriced' : fmtUsd(all.estimated_cost_usd)}
+        />
+        <SummaryCard label="calls (month)" value={compactNumber(month.calls)} />
+        <SummaryCard label="cache hit" value={fmtPct(month.cache_hit_rate)} />
+      </div>
+      {routes.length > 0 && (
+        <div className="mt-3 flex flex-col gap-1">
+          <div className="text-[0.62rem] text-(--ui-text-quaternary)">routes this month</div>
+          {routes.map(r => {
+            const key = `${r.provider}:${r.model}:${r.api_mode}`
+            const label = r.model || r.provider || 'unknown'
+            const costLabel =
+              r.unpriced_calls > 0 && r.priced_calls === 0 && r.included_calls === 0
+                ? 'unpriced'
+                : fmtUsd(r.estimated_cost_usd)
+
+            return (
+              <div className="flex items-center justify-between gap-3 text-xs" key={key}>
+                <span className="truncate font-mono text-(--ui-text-secondary)">{label}</span>
+                <span className="shrink-0 font-mono tabular-nums text-(--ui-text-tertiary)">
+                  {compactNumber(r.calls)} calls · {costLabel}
+                </span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {meter.caveat && (
+        <div className="mt-2 text-[0.62rem] text-(--ui-text-quaternary)">{meter.caveat}</div>
+      )}
+    </div>
+  )
+}
+
 const VIEWS: Array<{ id: ViewMode; label: string }> = [
   { id: 'daily', label: 'Daily' },
   { id: 'weekly', label: 'Weekly' },
@@ -272,6 +364,12 @@ export function UsageView({ requestGateway }: { requestGateway: GatewayRequester
   const { data, isLoading, isError } = useQuery({
     queryKey: ['usage', 'overview', days],
     queryFn: () => requestGateway<UsageReport>('usage.overview', { days })
+  })
+
+  const meterQuery = useQuery({
+    queryKey: ['usage', 'meter', 'summary'],
+    queryFn: () => requestGateway<MeterSummary>('usage.meter.summary', {}),
+    retry: false
   })
 
   const o = data?.overview
@@ -317,11 +415,12 @@ export function UsageView({ requestGateway }: { requestGateway: GatewayRequester
       <header className="flex shrink-0 items-start justify-between gap-3 px-5 pt-5 pb-3">
         <div className="min-w-0">
           <h2 className="text-sm font-semibold text-foreground">Usage</h2>
-          <p className="truncate text-xs text-muted-foreground/80">Local token &amp; cost metering</p>
+          <p className="truncate text-xs text-muted-foreground/80">Session insights + installation-wide per-call meter</p>
         </div>
         <div className="flex shrink-0 items-center gap-1.5">{windowSelect}</div>
       </header>
       <div className="flex min-h-0 flex-1 flex-col gap-4 overflow-auto px-5 pb-5">
+        {meterQuery.data && <CallMeter meter={meterQuery.data} />}
         {isLoading && (
           <div className="flex h-full items-center justify-center">
             <GlyphSpinner ariaLabel="Loading usage" />

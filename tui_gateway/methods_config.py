@@ -374,6 +374,59 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5070, str(e))
 
 
+@method("usage.meter.summary")
+def _(rid, params: dict) -> dict:
+    """Installation-wide per-call meter: month-to-date + all-time.
+
+    Reads the usage-meter plugin ledger (global SQLite outside profile
+    session DBs). Empty/unavailable ledger returns zeros rather than
+    fabricated spend. Optional ``tz`` selects the month boundary.
+    """
+    try:
+        from plugins.usage_meter_api import meter_summary
+
+        tz = params.get("tz") or None
+        if tz is not None and not isinstance(tz, str):
+            return _err(rid, 5073, "tz must be a string timezone name")
+        return _ok(rid, meter_summary(tz_name=tz))
+    except Exception as e:
+        return _err(rid, 5074, str(e))
+
+
+@method("usage.meter.details")
+def _(rid, params: dict) -> dict:
+    """Provider/model route breakdown for the installation-wide meter.
+
+    ``scope`` is ``month`` (default) or ``all``.
+    """
+    try:
+        from plugins.usage_meter_api import meter_details
+
+        scope = params.get("scope") or "month"
+        if scope not in ("month", "all"):
+            return _err(rid, 5075, "scope must be 'month' or 'all'")
+        tz = params.get("tz") or None
+        if tz is not None and not isinstance(tz, str):
+            return _err(rid, 5073, "tz must be a string timezone name")
+        return _ok(rid, meter_details(scope=scope, tz_name=tz))
+    except Exception as e:
+        return _err(rid, 5076, str(e))
+
+
+@method("usage.meter.recent")
+def _(rid, params: dict) -> dict:
+    """Recent privacy-safe per-call events from the installation-wide meter."""
+    try:
+        from plugins.usage_meter_api import meter_recent
+
+        limit = int(params.get("limit") or 50)
+        if limit < 1 or limit > 500:
+            return _err(rid, 5077, "limit must be between 1 and 500")
+        return _ok(rid, meter_recent(limit=limit))
+    except Exception as e:
+        return _err(rid, 5078, str(e))
+
+
 @method("security.status")
 def _(rid, params: dict) -> dict:
     """Live security posture for the desktop Safety & Security panel.
