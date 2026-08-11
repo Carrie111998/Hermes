@@ -10,10 +10,24 @@ import os
 import re
 import stat
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+
+
+def _redirect_home(monkeypatch, user_home) -> None:
+    """Point BOTH ``$HOME`` and ``Path.home()`` at *user_home*.
+
+    Setting ``$HOME`` alone does not isolate these tests: the provider resolves
+    the profile env path via ``Path.home()``, which on Windows reads
+    ``USERPROFILE`` and ignores ``HOME``.  Without this, ``post_setup`` writes
+    into the developer's real ``~/.hindsight/profiles/`` instead of tmp_path.
+    """
+    monkeypatch.setenv("HOME", str(user_home))
+    monkeypatch.setenv("USERPROFILE", str(user_home))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(user_home)))
 
 from hermes_cli.memory_setup import _CANCELLED
 from plugins.memory.hindsight import (
@@ -426,6 +440,11 @@ class TestConfig:
 
         monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace(HindsightEmbedded=FakeHindsightEmbedded))
         monkeypatch.setattr("plugins.memory.hindsight._check_local_runtime", lambda: (True, ""))
+        # _get_client() runs the lazy_deps gate before `from hindsight import
+        # ...`, and that gate checks *distribution metadata*, not sys.modules —
+        # so without this the stub above is unreachable and the call raises
+        # ImportError on any machine without hindsight-client installed.
+        monkeypatch.setattr("tools.lazy_deps.ensure", lambda *a, **k: None)
 
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
@@ -449,7 +468,7 @@ class TestPostSetup:
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
         user_home.mkdir()
-        monkeypatch.setenv("HOME", str(user_home))
+        _redirect_home(monkeypatch, user_home)
         monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: hermes_home)
 
         save_config = MagicMock()
@@ -476,7 +495,7 @@ class TestPostSetup:
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
         user_home.mkdir()
-        monkeypatch.setenv("HOME", str(user_home))
+        _redirect_home(monkeypatch, user_home)
         monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: hermes_home)
 
         selections = iter([1, _CANCELLED])  # local_embedded, then cancel LLM picker
@@ -504,7 +523,7 @@ class TestPostSetup:
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
         user_home.mkdir()
-        monkeypatch.setenv("HOME", str(user_home))
+        _redirect_home(monkeypatch, user_home)
 
         selections = iter([1, 0])  # local_embedded, openai
         monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
@@ -538,7 +557,7 @@ class TestPostSetup:
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
         user_home.mkdir()
-        monkeypatch.setenv("HOME", str(user_home))
+        _redirect_home(monkeypatch, user_home)
 
         selections = iter([1, 0])  # local_embedded, openai
         monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
@@ -561,7 +580,7 @@ class TestPostSetup:
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
         user_home.mkdir()
-        monkeypatch.setenv("HOME", str(user_home))
+        _redirect_home(monkeypatch, user_home)
 
         selections = iter([1, 0])  # local_embedded, openai
         monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
@@ -588,7 +607,7 @@ class TestPostSetup:
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"
         user_home.mkdir()
-        monkeypatch.setenv("HOME", str(user_home))
+        _redirect_home(monkeypatch, user_home)
         monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: hermes_home)
 
         existing_config = {

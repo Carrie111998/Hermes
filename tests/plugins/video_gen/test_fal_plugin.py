@@ -141,9 +141,15 @@ class TestFamilyRouting:
         fake.submit = _submit  # type: ignore
         monkeypatch.setitem(sys.modules, "fal_client", fake)
 
-        # Reset the lazy global so it picks up our stub
+        # Seed the module cache with the stub rather than clearing it.
+        # _load_fal_client() short-circuits on a non-None cache; clearing it
+        # instead routes through tools.fal_common.import_fal_client, whose
+        # lazy_deps gate checks *distribution metadata* (importlib.metadata),
+        # not sys.modules — so the stub above would be unreachable and the
+        # provider would return missing_dependency on any machine without
+        # fal-client actually installed.
         from plugins.video_gen import fal as fal_plugin
-        fal_plugin._fal_client = None
+        monkeypatch.setattr(fal_plugin, "_fal_client", fake)
         # Also reset the managed client cache
         fal_plugin._managed_fal_video_client = None
         fal_plugin._managed_fal_video_client_config = None

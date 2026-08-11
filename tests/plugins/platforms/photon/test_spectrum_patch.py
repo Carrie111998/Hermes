@@ -214,7 +214,7 @@ def test_spectrum_patch_preserves_text_at_runtime(tmp_path: Path) -> None:
 
     harness = textwrap.dedent(
         f"""
-        import {{ rebuildFromAppleMessage, toInboundMessages }} from {str(chunk)!r};
+        import {{ rebuildFromAppleMessage, toInboundMessages }} from {Path(chunk).as_uri()!r};
         const assert = (c, m) => {{ if (!c) {{ console.error("FAIL: " + m); process.exit(1); }} }};
 
         // Mixed text + single attachment -> group [text@0, attachment@1].
