@@ -290,6 +290,52 @@ test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', a
   assert.ok(ours.calls.some(c => /rm -f/.test(c)))
 })
 
+test('cleanupStale force-kills a TERM-wedged backend only after ownership is revalidated', async () => {
+  let ownershipProofs = 0
+
+  const ssh = fakeSsh([
+    [
+      /print\("OWNED"/,
+      () => {
+        ownershipProofs++
+
+        return 'OWNED\n'
+      }
+    ],
+    [command => /^kill 333\b/.test(command) && !command.includes('kill -KILL'), 'STILL_RUNNING\n'],
+    [/kill -KILL 333\b/, '']
+  ])
+
+  await cleanupStale(ssh, OWNERSHIP_ID, ownedLock())
+
+  assert.equal(ownershipProofs, 2)
+  assert.ok(ssh.calls.some(command => /kill -KILL 333\b/.test(command)))
+  assert.ok(ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
+test('cleanupStale preserves the lock when ownership changes after TERM', async () => {
+  let ownershipProofs = 0
+
+  const ssh = fakeSsh([
+    [
+      /print\("OWNED"/,
+      () => {
+        ownershipProofs++
+
+        return ownershipProofs === 1 ? 'OWNED\n' : 'FOREIGN\n'
+      }
+    ],
+    [command => /^kill 333\b/.test(command) && !command.includes('kill -KILL'), 'STILL_RUNNING\n']
+  ])
+
+  await assert.rejects(
+    () => cleanupStale(ssh, OWNERSHIP_ID, ownedLock()),
+    (error: any) => error.kind === 'transient-transport-error'
+  )
+  assert.ok(!ssh.calls.some(command => /kill -KILL 333\b/.test(command)))
+  assert.ok(!ssh.calls.some(command => /rm -f .*backend\.lock\.json/.test(command)))
+})
+
 test('buildSpawnCommand is headless serve, detached, token not in argv', () => {
   const cmd = buildSpawnCommand('/x/hermes', 'work', { logPath: spawnLogPath(OWNERSHIP_ID, SPAWN_NONCE) })
   assert.match(cmd, /serve --isolated/)

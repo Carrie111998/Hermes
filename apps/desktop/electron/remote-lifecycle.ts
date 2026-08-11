@@ -406,15 +406,29 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
 async function cleanupStale(ssh, ownershipId, lock, pidAlive = true) {
   if (pidAlive && lock && (await pidIsOurDashboard(ssh, lock.pid, lock.spawnNonce, lock.hermesPath))) {
     try {
+      const pid = Number(lock.pid)
+
       const result = (
         await ssh.exec(
-          `kill ${Number(lock.pid)} && ` +
-            `i=0; while kill -0 ${Number(lock.pid)} 2>/dev/null; do ` +
-            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+          `kill ${pid} && ` +
+            `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
+            `i=$((i+1)); [ "$i" -ge 50 ] && { echo STILL_RUNNING; exit 0; }; sleep 0.1; done; echo EXITED`
         )
       ).trim()
 
-      void result
+      if (result === 'STILL_RUNNING') {
+        const stillOurs = await pidIsOurDashboard(ssh, pid, lock.spawnNonce, lock.hermesPath)
+
+        if (!stillOurs) {
+          throw new Error('SSH backend process ownership changed before force termination.')
+        }
+
+        await ssh.exec(
+          `kill -KILL ${pid} && ` +
+            `i=0; while kill -0 ${pid} 2>/dev/null; do ` +
+            `i=$((i+1)); [ "$i" -ge 50 ] && exit 1; sleep 0.1; done`
+        )
+      }
     } catch (cause) {
       const error: any = new Error('Could not terminate the stale SSH backend.')
       error.kind = 'transient-transport-error'
