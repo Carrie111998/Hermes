@@ -22255,6 +22255,46 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             *args,
         )
 
+    def _start_turn_executor(
+        self,
+        func: Callable[[], Any],
+        *,
+        session_key: Optional[str],
+        agent_holder: list,
+        worker_done: Optional[threading.Event] = None,
+    ) -> tuple[asyncio.Future, threading.Event]:
+        """Submit a turn worker with ownership covering its full cleanup."""
+        loop = asyncio.get_running_loop()
+        ctx = copy_context()
+        worker_done = worker_done or threading.Event()
+
+        def _run_sync_with_timeout_lifecycle():
+            try:
+                return func()
+            finally:
+                try:
+                    _finished_agent = agent_holder[0] if agent_holder else None
+                    if _finished_agent is not None:
+                        _finished_agent._gateway_turn_process_task_id = ""
+                        _finished_agent._gateway_turn_process_baseline = frozenset()
+                finally:
+                    # Replay ownership ends only after every final marker write.
+                    worker_done.set()
+                    self._unregister_turn_worker(session_key, worker_done)
+
+        self._register_turn_worker(session_key, worker_done)
+        try:
+            executor_task = loop.run_in_executor(
+                self._get_executor(),
+                ctx.run,
+                _run_sync_with_timeout_lifecycle,
+            )
+        except BaseException:
+            worker_done.set()
+            self._unregister_turn_worker(session_key, worker_done)
+            raise
+        return executor_task, worker_done
+
     def _turn_worker_state(self) -> tuple[threading.Lock, Dict[str, set[threading.Event]]]:
         lock = getattr(self, "_turn_worker_waiters_lock", None)
         if lock is None:
@@ -26348,28 +26388,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else (lambda: True)
             )
 
-            def _run_sync_with_timeout_lifecycle():
-                try:
-                    return run_sync()
-                finally:
-                    _turn_worker_done.set()
-                    self._unregister_turn_worker(session_key, _turn_worker_done)
-                    # `.turn.agent` on the session state is only reset to
-                    # _AGENT_PENDING_SENTINEL when the *next* turn is
-                    # claimed (see _session_state(...).turn.agent = ... at
-                    # claim time), so a stale reference to this exact agent
-                    # instance stays reachable from
-                    # _interrupt_and_clear_session() until then. Clearing
-                    # the ownership markers here — the instant this turn's
-                    # own worker finishes — closes that window: an
-                    # explicit /stop landing on the already-finished turn
-                    # no longer reaps background work the turn deliberately
-                    # left running (#76115).
-                    _finished_agent = agent_holder[0] if agent_holder else None
-                    if _finished_agent is not None:
-                        _finished_agent._gateway_turn_process_task_id = ""
-                        _finished_agent._gateway_turn_process_baseline = frozenset()
-
             if _agent_timeout is not None:
                 threading.Thread(
                     target=_watch_gateway_turn_inactivity,
@@ -26387,12 +26405,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     name=f"gateway-turn-watchdog-{_turn_task_id[:12]}",
                     daemon=True,
                 ).start()
-            _executor_task = asyncio.ensure_future(
-                self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
+            _executor_task, _turn_worker_done = self._start_turn_executor(
+                run_sync,
+                session_key=session_key,
+                agent_holder=agent_holder,
+                worker_done=_turn_worker_done,
             )
-            self._register_turn_worker(session_key, _turn_worker_done)
-            if _turn_worker_done.is_set():
-                self._unregister_turn_worker(session_key, _turn_worker_done)
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0

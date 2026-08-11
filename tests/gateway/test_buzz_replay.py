@@ -566,49 +566,46 @@ class ReplayLifecycleTests(unittest.TestCase):
 
     def test_timeout_waits_for_production_executor_worker_before_close(self):
         import threading
-        from concurrent.futures import ThreadPoolExecutor
-
+        from gateway.config import GatewayConfig
         import gateway.run as gateway_run
         import plugins.platforms.buzz.replay as replay_module
 
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp) / "hermes"
-            runner = object.__new__(gateway_run.GatewayRunner)
-            executor = ThreadPoolExecutor(max_workers=1)
-            runner._get_executor = lambda: executor
-            runner._turn_worker_waiters = {}
-            runner._turn_worker_waiters_lock = threading.Lock()
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                runner = gateway_run.GatewayRunner(
+                    GatewayConfig(sessions_dir=home / "sessions")
+                )
             adapter = type("ReplayAdapter", (), {})()
             adapter._channel_state = {}
             adapter._session_tasks = {}
             adapter.gateway_runner = runner
-            worker_started = threading.Event()
-            timeout_observed = threading.Event()
-            release_worker = threading.Event()
-            worker_done = threading.Event()
-            side_effects = []
+            marker_started = threading.Event()
+            release_marker = threading.Event()
+            marker_done = threading.Event()
+            session_wait_started = threading.Event()
             close_observation = {}
 
-            def worker():
-                try:
-                    worker_started.set()
-                    assert release_worker.wait(timeout=5)
-                    side_effects.append("late")
-                finally:
-                    worker_done.set()
-                    runner._unregister_turn_worker("executor-session", worker_done)
+            class MarkerAgent:
+                def __setattr__(self, name, value):
+                    if name == "_gateway_turn_process_task_id" and value == "":
+                        marker_started.set()
+                        if not release_marker.wait(timeout=5):
+                            raise AssertionError("replay did not hold ownership")
+                        marker_done.set()
+                    object.__setattr__(self, name, value)
+
+            agent_holder = [MarkerAgent()]
 
             async def handle_event(_channel, _state, _event):
-                async def session():
-                    try:
-                        await runner._run_in_executor_with_context(worker)
-                    except asyncio.CancelledError:
-                        timeout_observed.set()
-                        raise
+                executor_task, worker_done = runner._start_turn_executor(
+                    lambda: None,
+                    session_key="executor-session",
+                    agent_holder=agent_holder,
+                )
+                adapter._worker_done = worker_done
+                adapter._session_tasks["executor-session"] = executor_task
 
-                adapter._session_tasks["executor-session"] = asyncio.create_task(session())
-
-            runner._register_turn_worker("executor-session", worker_done)
             adapter._handle_event = handle_event
 
             async def prepare(_profile):
@@ -623,25 +620,40 @@ class ReplayLifecycleTests(unittest.TestCase):
             def validate(*_args, **_kwargs):
                 return {"channel": CHANNEL}
 
-            async def release_after_timeout():
-                await asyncio.to_thread(timeout_observed.wait)
-                self.assertTrue(worker_started.is_set())
-                release_worker.set()
+            original_close_runner = replay_module._close_runner
+            original_wait_for_session = replay_module._wait_for_session_quiescence
+
+            async def observed_wait_for_session(adapter_arg, session_key):
+                session_wait_started.set()
+                await original_wait_for_session(adapter_arg, session_key)
+
+            async def release_after_quiescence_wait_starts():
+                await asyncio.to_thread(session_wait_started.wait)
+                self.assertTrue(marker_started.is_set())
+                lock, waiters_by_session = runner._turn_worker_state()
+                with lock:
+                    self.assertIn(
+                        adapter._worker_done,
+                        waiters_by_session.get("executor-session", set()),
+                    )
+                release_marker.set()
 
             async def close_runner(_runner):
+                await original_close_runner(_runner)
                 close_observation.update(
-                    worker_done=worker_done.is_set(),
-                    side_effects=list(side_effects),
+                    marker_done=marker_done.is_set(),
+                    worker_done=adapter._worker_done.is_set(),
                     startup_lock_probe=self._probe_gateway_lock(home),
                 )
 
             async def exercise():
-                coordinator = asyncio.create_task(release_after_timeout())
+                coordinator = asyncio.create_task(release_after_quiescence_wait_starts())
                 with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False), \
                     patch.object(replay_module, "_prepare_adapter", new=AsyncMock(side_effect=prepare)), \
                     patch.object(replay_module, "_watched_channels", new=AsyncMock(side_effect=watched)), \
                     patch.object(replay_module, "fetch_event", new=AsyncMock(side_effect=fetch)), \
                     patch.object(replay_module, "validate_event", new=validate), \
+                    patch.object(replay_module, "_wait_for_session_quiescence", new=observed_wait_for_session), \
                     patch.object(replay_module, "_close_runner", new=close_runner):
                     result = await run_replay("omar", self.EVENT_ID, wait_timeout=2.0)
                 await coordinator
@@ -650,15 +662,79 @@ class ReplayLifecycleTests(unittest.TestCase):
             try:
                 result = asyncio.run(exercise())
             finally:
-                release_worker.set()
-                executor.shutdown(wait=True)
+                release_marker.set()
+                executor = getattr(runner, "_executor", None)
+                if executor is not None:
+                    executor.shutdown(wait=True)
 
             self.assertEqual(result["outcome"], {"status": CLAIMED, "code": "session_timeout"})
-            self.assertTrue(timeout_observed.is_set())
+            self.assertTrue(close_observation["marker_done"])
             self.assertTrue(close_observation["worker_done"])
-            self.assertEqual(close_observation["side_effects"], ["late"])
             self.assertEqual(close_observation["startup_lock_probe"], "False")
-            self.assertEqual(side_effects, ["late"])
+
+    def test_executor_acquisition_failure_releases_replay_ownership(self):
+        from gateway.config import GatewayConfig
+        import gateway.run as gateway_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                runner = gateway_run.GatewayRunner(
+                    GatewayConfig(sessions_dir=home / "sessions")
+                )
+
+            def fail_executor():
+                raise RuntimeError("executor unavailable")
+
+            runner._get_executor = fail_executor
+
+            async def submit():
+                return runner._start_turn_executor(
+                    lambda: None,
+                    session_key="executor-failure-session",
+                    agent_holder=[object()],
+                )
+
+            with self.assertRaisesRegex(RuntimeError, "executor unavailable"):
+                asyncio.run(submit())
+
+            lock, waiters_by_session = runner._turn_worker_state()
+            with lock:
+                self.assertEqual(waiters_by_session, {})
+            asyncio.run(runner.wait_for_all_session_quiescence())
+
+    def test_executor_marker_failure_still_releases_replay_ownership(self):
+        from gateway.config import GatewayConfig
+        import gateway.run as gateway_run
+
+        class FailingAgent:
+            def __setattr__(self, name, value):
+                if name == "_gateway_turn_process_task_id" and value == "":
+                    raise RuntimeError("marker write failed")
+                object.__setattr__(self, name, value)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                runner = gateway_run.GatewayRunner(
+                    GatewayConfig(sessions_dir=home / "sessions")
+                )
+
+            async def submit():
+                executor_task, worker_done = runner._start_turn_executor(
+                    lambda: None,
+                    session_key="executor-marker-failure-session",
+                    agent_holder=[FailingAgent()],
+                )
+                with self.assertRaisesRegex(RuntimeError, "marker write failed"):
+                    await executor_task
+                return worker_done
+
+            worker_done = asyncio.run(submit())
+            self.assertTrue(worker_done.is_set())
+            lock, waiters_by_session = runner._turn_worker_state()
+            with lock:
+                self.assertEqual(waiters_by_session, {})
 
     def test_transient_fetch_failure_leaves_no_row_and_controlled_retry_succeeds(self):
         import plugins.platforms.buzz.replay as replay_module
