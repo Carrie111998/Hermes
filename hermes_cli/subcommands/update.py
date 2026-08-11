@@ -73,4 +73,10 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
         default=False,
         help="Windows: mutate the venv even while other processes are running from its interpreter (desktop backend, gateway, terminals). Those processes keep native .pyd files locked, so the dependency sync will likely fail partway and strand the install half-updated. Use only if you know the detected holders are false positives.",
     )
+    update_parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        default=False,
+        help="Skip rebuilding the web dashboard UI (and any app builds) during this update. Use when an existing web_dist is already present and you want a faster update; the next `hermes serve`/`hermes dashboard` will fallback to a build if the dist is missing.",
+    )
     update_parser.set_defaults(func=cmd_update)
