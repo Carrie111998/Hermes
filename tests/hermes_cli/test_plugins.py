@@ -35,6 +35,10 @@ from hermes_cli.middleware import (
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 
+def test_codex_app_server_event_is_a_supported_observer_hook():
+    assert "codex_app_server_event" in VALID_HOOKS
+
+
 def test_portable_skill_namespace_is_ascii_safe():
     from agent.skill_utils import is_valid_namespace
 

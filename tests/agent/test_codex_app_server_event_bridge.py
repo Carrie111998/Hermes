@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.codex_runtime import (
+    _sanitize_codex_app_server_event,
     _codex_item_completion_payload,
     _codex_item_to_args,
     _codex_item_to_preview,
@@ -48,6 +49,196 @@ def _item_started(item: dict) -> dict:
 
 def _item_completed(item: dict) -> dict:
     return {"method": "item/completed", "params": {"item": item}}
+
+
+class TestCodexAppServerPluginObserver:
+    def test_sanitizer_keeps_lifecycle_identity_and_drops_sensitive_content(self):
+        event = _sanitize_codex_app_server_event({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "commandExecution",
+                    "status": "completed",
+                    "command": "curl -H 'Authorization: secret' example.test",
+                    "aggregatedOutput": "secret output",
+                    "arguments": {"token": "secret"},
+                    "text": "private model text",
+                    "exitCode": 0,
+                    "durationMs": 12,
+                    "changes": [
+                        {"path": "src/app.py", "kind": {"type": "update"}},
+                    ],
+                },
+            },
+        })
+
+        assert event == {
+            "schemaVersion": "hermes.codex_app_server_event.v1",
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "item-1",
+                    "type": "commandExecution",
+                    "status": "completed",
+                    "exitCode": 0,
+                    "durationMs": 12,
+                    "changes": [
+                        {"path": "src/app.py", "kind": {"type": "update"}},
+                    ],
+                },
+            },
+        }
+
+    @pytest.mark.parametrize(
+        "method",
+        [
+            "item/agentMessage/delta",
+            "item/reasoning/delta",
+            "thread/tokenUsage/updated",
+            "unknown/event",
+        ],
+    )
+    def test_sanitizer_rejects_high_volume_or_unsupported_events(self, method):
+        assert _sanitize_codex_app_server_event({
+            "method": method,
+            "params": {"delta": "secret"},
+        }) is None
+
+    def test_bridge_notifies_registered_plugin_with_runtime_correlation(
+        self, monkeypatch
+    ):
+        observed = []
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda name, **kwargs: observed.append((name, kwargs)) or [],
+        )
+        agent = _make_stub_agent()
+        agent.session_id = "hermes-session-1"
+        agent._current_task_id = "task-1"
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "inProgress"},
+            },
+        })
+
+        assert observed == [
+            (
+                "codex_app_server_event",
+                {
+                    "event": {
+                        "schemaVersion": "hermes.codex_app_server_event.v1",
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": "thread-1",
+                            "turn": {"id": "turn-1", "status": "inProgress"},
+                        },
+                    },
+                    "session_id": "hermes-session-1",
+                    "task_id": "task-1",
+                    "runtime": "codex_app_server",
+                    "process_id": __import__("os").getpid(),
+                },
+            )
+        ]
+
+    def test_bridge_observer_receives_the_bounded_lifecycle_in_wire_order(
+        self, monkeypatch
+    ):
+        observed = []
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda _name, **kwargs: observed.append(kwargs["event"]["method"])
+            or [],
+        )
+        bridge = make_codex_app_server_event_bridge(_make_stub_agent())
+
+        for note in (
+            {
+                "method": "thread/started",
+                "params": {"thread": {"id": "thread-1"}},
+            },
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1"},
+                },
+            },
+            _item_started({"id": "item-1", "type": "commandExecution"}),
+            _item_completed(
+                {
+                    "id": "item-1",
+                    "type": "commandExecution",
+                    "status": "completed",
+                }
+            ),
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            },
+        ):
+            bridge(note)
+
+        assert observed == [
+            "thread/started",
+            "turn/started",
+            "item/started",
+            "item/completed",
+            "turn/completed",
+        ]
+
+    def test_bridge_does_not_invoke_hook_when_no_observer_is_registered(
+        self, monkeypatch
+    ):
+        invoked = MagicMock()
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: False)
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoked)
+        bridge = make_codex_app_server_event_bridge(_make_stub_agent())
+
+        bridge({
+            "method": "thread/started",
+            "params": {"thread": {"id": "thread-1"}},
+        })
+
+        invoked.assert_not_called()
+
+    def test_observer_failure_does_not_interrupt_existing_bridge_callbacks(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda name: True)
+
+        def fail_observer(name, **kwargs):
+            raise RuntimeError("observer unavailable")
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", fail_observer)
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge(_item_started({
+            "type": "commandExecution",
+            "id": "exec-1",
+            "command": "printf secret",
+        }))
+
+        agent.tool_progress_callback.assert_called_once()
+        assert agent.tool_progress_callback.call_args.args[:2] == (
+            "tool.started",
+            "exec_command",
+        )
 
 
 # ---------- name / args / preview / result mapping ----------

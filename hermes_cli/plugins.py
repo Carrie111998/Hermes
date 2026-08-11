@@ -134,6 +134,10 @@ _install_plugin_debug_handler()
 # ---------------------------------------------------------------------------
 
 VALID_HOOKS: Set[str] = {
+    # Read-only, bounded Codex App Server lifecycle observations. The runtime
+    # strips prompts, model text, reasoning, commands, arguments, and tool
+    # output before invoking this hook. Return values are ignored.
+    "codex_app_server_event",
     "pre_tool_call",
     "post_tool_call",
     "transform_terminal_output",
