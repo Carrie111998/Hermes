@@ -96,6 +96,16 @@ def test_parse_finder_mapping_ignores_the_namespaces_block():
     assert parse_finder_mapping(source) == {"a": "/x", "b": "/y"}
 
 
+def test_parse_finder_mapping_returns_none_on_an_unhashable_key():
+    """The diagnosis layer must DEGRADE, never raise.
+
+    ast.literal_eval raises TypeError (not ValueError/SyntaxError) for a
+    dict literal with an unhashable key, and the regex cannot rule that out
+    — it only matches the braces.
+    """
+    assert parse_finder_mapping("MAPPING: dict[str, str] = {[1, 2]: 'x'}\n") is None
+
+
 def test_smoke_entrypoints_include_the_regression_chain():
     from hermes_cli.install_doctor import SMOKE_ENTRYPOINTS
 

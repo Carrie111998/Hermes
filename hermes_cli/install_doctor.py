@@ -90,6 +90,14 @@ def parse_finder_mapping(source: str) -> dict[str, str] | None:
         return None
     try:
         value = ast.literal_eval(match.group(1))
-    except (ValueError, SyntaxError):
+    except Exception:
+        # Any failure of ast.literal_eval must degrade to None, never raise.
+        # The regex only validates braces; it cannot rule out unhashable dict
+        # keys (which raise TypeError), malformed structures, or other parse
+        # errors. The diagnosis layer is coupled to setuptools' generated-file
+        # layout; failures here just mean "no explanation available", and the
+        # verdict comes from find_spec breadth and entrypoint import depth.
+        # BaseException (KeyboardInterrupt, SystemExit) is still allowed to
+        # propagate.
         return None
     return value if isinstance(value, dict) else None
