@@ -8717,7 +8717,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return removed
 
     def _goal_still_active_for_session(
-        self, session_id: str, prompt: Any = None
+        self,
+        session_id: str,
+        prompt: Any = None,
+        goal_token: Optional[str] = None,
     ) -> bool:
         """Best-effort fresh DB check before running a queued continuation."""
         if not session_id:
@@ -8727,7 +8730,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             mgr = GoalManager(session_id=session_id)
             return mgr.is_active() and (
                 prompt is None or mgr.next_continuation_prompt() == prompt
-            )
+            ) and (goal_token is None or mgr.continuation_token() == goal_token)
         except Exception as exc:
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
@@ -18879,6 +18882,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as e:
                 logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
 
+        # Synthetic continuation events can wait in adapter/FIFO storage while
+        # the user pauses and resumes the same goal. The text is identical
+        # across that cycle, so validate the persisted generation before this
+        # event can acquire a turn lease or write transcript state. Ordinary
+        # platform messages have no token and bypass this guard unchanged.
+        goal_token = getattr(event, "goal_token", None)
+        if goal_token is not None and not self._goal_still_active_for_session(
+            session_entry.session_id,
+            goal_token=goal_token,
+        ):
+            logger.info(
+                "Discarding stale goal continuation generation for session %s",
+                session_entry.session_key,
+            )
+            return
+
         # ── Turn lease (#64934) ────────────────────────────────────────
         # Session resolution is FINAL here (get_or_create → async-delegation
         # pinning → topic tip-walk switch_session are all above). Serialize
@@ -21368,6 +21387,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    goal_token=mgr.continuation_token(),
                 )
                 self._enqueue_fifo(
                     state_key,
@@ -29379,7 +29399,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._is_goal_continuation_event(
                         pending_event
                     ) and not self._goal_still_active_for_session(
-                        session_id, getattr(pending_event, "text", None)
+                        session_id,
+                        getattr(pending_event, "text", None),
+                        getattr(pending_event, "goal_token", None),
                     ):
                         logger.info(
                             "Discarding stale goal continuation for session %s — goal is no longer active",

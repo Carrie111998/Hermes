@@ -84,7 +84,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
       showUserMessage = true,
       displayText?: string,
       displayKindOrExpandOverride?: string | ((value: string) => string),
-      expandOverride?: (value: string) => string
+      expandOverride?: (value: string) => string,
+      goalToken?: string
     ) => {
       // Read tokens off the ref, not render state: a paste immediately followed
       // by Enter submits before React has re-rendered with the new token.
@@ -107,7 +108,8 @@ export function useSubmission(opts: UseSubmissionOptions) {
         },
         showUserMessage,
         displayText,
-        displayKind
+        displayKind,
+        goalToken
       )
     },
     [appendMessage, composerActions, composerRefs, gw, setLastUserMsg, sys]

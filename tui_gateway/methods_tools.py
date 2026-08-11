@@ -796,7 +796,11 @@ def _(rid, params: dict) -> dict:
             if state is None:
                 return _ok(rid, {"type": "exec", "output": "No goal to resume."})
             prompt = mgr.next_continuation_prompt() or state.goal
-            session["_pending_goal_resume_projection"] = prompt
+            goal_token = mgr.continuation_token()
+            session["_pending_goal_resume_projection"] = {
+                "prompt": prompt,
+                "goal_token": goal_token,
+            }
             return _ok(
                 rid,
                 {
@@ -805,6 +809,7 @@ def _(rid, params: dict) -> dict:
                     "message": prompt,
                     "display": "/goal resume",
                     "display_kind": "goal_resume",
+                    "goal_token": goal_token,
                 },
             )
         if lower in {"clear", "stop", "done"}:

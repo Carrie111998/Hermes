@@ -665,6 +665,8 @@ export interface SubmitTextOptions {
   displayText?: string
   /** Durable projection type paired with displayText for synthetic sends. */
   displayKind?: string
+  /** Persisted generation identity paired with a goal continuation dispatch. */
+  goalToken?: string
   fromQueue?: boolean
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground

@@ -43,12 +43,20 @@ from hermes_cli.browser_connect import (
 class PendingInputProjection:
     """Model-facing queued input with a separate durable display projection."""
 
-    __slots__ = ("display_kind", "display_text", "text")
+    __slots__ = ("display_kind", "display_text", "goal_token", "text")
 
-    def __init__(self, text: str, display_text: str, display_kind: str) -> None:
+    def __init__(
+        self,
+        text: str,
+        display_text: str,
+        display_kind: str,
+        *,
+        goal_token: str | None = None,
+    ) -> None:
         self.text = text
         self.display_text = display_text
         self.display_kind = display_kind
+        self.goal_token = goal_token
 
 
 class CLICommandsMixin:
@@ -2775,7 +2783,12 @@ class CLICommandsMixin:
                 prompt = mgr.next_continuation_prompt()
                 if prompt:
                     getattr(self, "_pending_input").put(
-                        PendingInputProjection(prompt, "/goal resume", "goal_resume")
+                        PendingInputProjection(
+                            prompt,
+                            "/goal resume",
+                            "goal_resume",
+                            goal_token=mgr.continuation_token(),
+                        )
                     )
             return
 

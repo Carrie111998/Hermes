@@ -208,7 +208,11 @@ def test_goal_resume_after_budget_exhaustion_dispatches_next_turn(server, sessio
     assert "Goal resumed: finish the release" in response["result"]["notice"]
     assert response["result"]["display"] == "/goal resume"
     assert response["result"]["display_kind"] == "goal_resume"
-    assert server._sessions[sid]["_pending_goal_resume_projection"] == response["result"]["message"]
+    assert response["result"]["goal_token"]
+    assert server._sessions[sid]["_pending_goal_resume_projection"] == {
+        "prompt": response["result"]["message"],
+        "goal_token": response["result"]["goal_token"],
+    }
     assert (
         response["result"]["message"]
         == goals.GoalManager(session_key).next_continuation_prompt()
@@ -225,6 +229,7 @@ def test_goal_resume_after_budget_exhaustion_dispatches_next_turn(server, sessio
         session_id=sid,
         text=response["result"]["message"],
         display_kind="goal_resume",
+        goal_token=response["result"]["goal_token"],
     )
     assert queued["result"]["status"] == "queued"
     assert server._sessions[sid]["queued_prompt"]["display_kind"] == "goal_resume"
@@ -247,6 +252,7 @@ def test_stale_goal_resume_is_rejected_after_goal_state_changes(
         server, "command.dispatch", name="goal", arg="resume", session_id=sid
     )
     stale_prompt = resume["result"]["message"]
+    stale_token = resume["result"]["goal_token"]
 
     _call(
         server,
@@ -261,6 +267,7 @@ def test_stale_goal_resume_is_rejected_after_goal_state_changes(
         session_id=sid,
         text=stale_prompt,
         display_kind="goal_resume",
+        goal_token=stale_token,
     )
 
     assert response["error"]["code"] == 4091
@@ -280,6 +287,7 @@ def test_goal_resume_projection_mismatch_is_not_downgraded_to_an_ordinary_prompt
         server, "command.dispatch", name="goal", arg="resume", session_id=sid
     )
     expected = resume["result"]["message"]
+    goal_token = resume["result"]["goal_token"]
 
     response = _call(
         server,
@@ -287,12 +295,61 @@ def test_goal_resume_projection_mismatch_is_not_downgraded_to_an_ordinary_prompt
         session_id=sid,
         text=f"{expected} (stale copy)",
         display_kind="goal_resume",
+        goal_token=goal_token,
     )
 
     assert response["error"]["code"] == 4091
-    assert s["_pending_goal_resume_projection"] == expected
+    assert s["_pending_goal_resume_projection"] == {
+        "prompt": expected,
+        "goal_token": goal_token,
+    }
     assert s["history"] == []
     assert s["running"] is False
+
+
+def test_stale_same_goal_resume_generation_is_rejected_without_consuming_current(
+    server, session
+):
+    """An old dispatch cannot impersonate a later resume with identical text."""
+    sid, _, s = session
+    _call(server, "command.dispatch", name="goal", arg="same goal", session_id=sid)
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    old = _call(server, "command.dispatch", name="goal", arg="resume", session_id=sid)[
+        "result"
+    ]
+    _call(server, "command.dispatch", name="goal", arg="pause", session_id=sid)
+    current = _call(
+        server, "command.dispatch", name="goal", arg="resume", session_id=sid
+    )["result"]
+
+    assert old["message"] == current["message"]
+    assert old["goal_token"] != current["goal_token"]
+
+    stale = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=old["message"],
+        display_kind="goal_resume",
+        goal_token=old["goal_token"],
+    )
+    assert stale["error"]["code"] == 4091
+    assert s["_pending_goal_resume_projection"] == {
+        "prompt": current["message"],
+        "goal_token": current["goal_token"],
+    }
+
+    s["running"] = True
+    accepted = _call(
+        server,
+        "prompt.submit",
+        session_id=sid,
+        text=current["message"],
+        display_kind="goal_resume",
+        goal_token=current["goal_token"],
+    )
+    assert accepted["result"]["status"] == "queued"
+    assert s["queued_prompt"]["goal_token"] == current["goal_token"]
 
 
 # ── slash.exec /goal routing ──────────────────────────────────────────

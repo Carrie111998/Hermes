@@ -335,7 +335,8 @@ export function parseCommandDispatch(raw: unknown): CommandDispatchResponse | nu
             message: row.message,
             notice: str(row.notice),
             display: str(row.display),
-            display_kind: str(row.display_kind)
+            display_kind: str(row.display_kind),
+            goal_token: str(row.goal_token)
           }
         : null
 

@@ -367,7 +367,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             sessionId,
             storedSessionId,
             displayText,
-            displayKind: dispatch.type === 'send' ? dispatch.display_kind : undefined
+            displayKind: dispatch.type === 'send' ? dispatch.display_kind : undefined,
+            goalToken: dispatch.type === 'send' ? dispatch.goal_token : undefined
           })
         }
 

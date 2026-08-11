@@ -145,6 +145,8 @@ export interface SendCommandDispatchResponse {
   display?: string
   /** Durable projection type for model-facing synthetic sends. */
   display_kind?: string
+  /** Persisted identity for a generation-specific goal continuation. */
+  goal_token?: string
 }
 
 export interface PrefillCommandDispatchResponse {

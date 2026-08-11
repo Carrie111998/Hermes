@@ -273,7 +273,10 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
     server._sessions["iso-sid"] = _session(history=list(seed_history))
     server._sessions["iso-sid"]["agent"] = None
     server._sessions["iso-sid"]["agent_ready"] = threading.Event()
-    server._sessions["iso-sid"]["_pending_goal_resume_projection"] = canonical
+    server._sessions["iso-sid"]["_pending_goal_resume_projection"] = {
+        "prompt": canonical,
+        "goal_token": "resume-generation",
+    }
     parent_writes = {"ensure_session": 0, "persist_seed": 0}
     monkeypatch.setattr(
         server,
@@ -305,6 +308,7 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
                     "session_id": "iso-sid",
                     "text": canonical,
                     "display_kind": "goal_resume",
+                    "goal_token": "resume-generation",
                 },
             }
         )

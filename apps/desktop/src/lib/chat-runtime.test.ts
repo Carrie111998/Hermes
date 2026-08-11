@@ -149,12 +149,14 @@ describe('parseCommandDispatch', () => {
         type: 'send',
         message: '[Continuing toward your standing goal]\nGoal: finish safely',
         display: '/goal resume',
-        display_kind: 'goal_resume'
+        display_kind: 'goal_resume',
+        goal_token: 'resume-generation'
       })
     ).toMatchObject({
       type: 'send',
       display: '/goal resume',
-      display_kind: 'goal_resume'
+      display_kind: 'goal_resume',
+      goal_token: 'resume-generation'
     })
   })
 

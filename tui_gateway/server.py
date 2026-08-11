@@ -1873,6 +1873,7 @@ def _submit_prompt_to_compute_host(
     *,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    goal_token: str | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -7901,6 +7902,7 @@ def _enqueue_prompt(
     *,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    goal_token: str | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7930,6 +7932,8 @@ def _enqueue_prompt(
     if display_kind:
         queued["display_kind"] = display_kind
         queued["display_metadata"] = display_metadata
+    if goal_token:
+        queued["goal_token"] = goal_token
 
     existing = session.get("queued_prompt")
     if existing:
@@ -7969,7 +7973,9 @@ def _clear_queued_goal_continuations(session: dict) -> bool:
         return True
 
 
-def _goal_continuation_active(session: dict, prompt: Any = None) -> bool:
+def _goal_continuation_active(
+    session: dict, prompt: Any = None, goal_token: str | None = None
+) -> bool:
     """Best-effort fresh state check before running synthetic goal work."""
     session_key = str(session.get("session_key") or "")
     if not session_key:
@@ -7980,7 +7986,7 @@ def _goal_continuation_active(session: dict, prompt: Any = None) -> bool:
         mgr = GoalManager(session_id=session_key)
         return mgr.is_active() and (
             prompt is None or mgr.next_continuation_prompt() == prompt
-        )
+        ) and (goal_token is None or mgr.continuation_token() == goal_token)
     except Exception:
         return False
 
@@ -8030,6 +8036,7 @@ def _handle_busy_submit(
     *,
     display_kind: str | None = None,
     display_metadata: dict | None = None,
+    goal_token: str | None = None,
 ) -> dict | None:
     """Apply the ``display.busy_input_mode`` policy to a prompt that lands while
     a turn is in flight, instead of rejecting it with ``session busy``.
@@ -8118,6 +8125,7 @@ def _handle_busy_submit(
             image_paths=image_paths,
             display_kind=display_kind,
             display_metadata=display_metadata,
+            goal_token=goal_token,
         )
         session["last_active"] = time.time()
 
@@ -8185,7 +8193,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         "goal_resume",
         "goal_continue",
     } or queued_text.startswith("[Continuing toward your standing goal]\nGoal:")
-    if is_goal_continuation and not _goal_continuation_active(session, queued.get("text")):
+    if is_goal_continuation and not _goal_continuation_active(
+        session, queued.get("text"), queued.get("goal_token")
+    ):
         with session["history_lock"]:
             session["running"] = False
             _clear_inflight_turn(session)
@@ -8197,6 +8207,8 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     if queued.get("display_kind"):
         dispatch_kwargs["display_kind"] = queued.get("display_kind")
         dispatch_kwargs["display_metadata"] = queued.get("display_metadata")
+    if queued.get("goal_token"):
+        dispatch_kwargs["goal_token"] = queued.get("goal_token")
 
     dispatch_failed = False
     try:
@@ -10487,9 +10499,10 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    goal_token: str | None = None,
 ) -> None:
     if display_kind in {"goal_resume", "goal_continue"} and not _goal_continuation_active(
-        session, text
+        session, text, goal_token
     ):
         with session["history_lock"]:
             session["running"] = False

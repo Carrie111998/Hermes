@@ -113,7 +113,7 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
     const { gw, request, resolveDrop } = makeDeferredGateway()
     const canonical = '[Continuing toward your standing goal]\nGoal: finish safely'
 
-    submitPrompt(canonical, makeDeps(gw), true, '/goal resume', 'goal_resume')
+    submitPrompt(canonical, makeDeps(gw), true, '/goal resume', 'goal_resume', 'resume-generation')
     resolveDrop({ matched: false })
     await Promise.resolve()
     await Promise.resolve()
@@ -121,7 +121,8 @@ describe('submissionCore.submitPrompt — synchronous busy (queue-race fix)', ()
     expect(request).toHaveBeenCalledWith('prompt.submit', {
       session_id: 'sess-1',
       text: canonical,
-      display_kind: 'goal_resume'
+      display_kind: 'goal_resume',
+      goal_token: 'resume-generation'
     })
   })
 })

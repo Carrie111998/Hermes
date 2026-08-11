@@ -2372,6 +2372,10 @@ class MessageEvent:
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
+    # Persisted identity for synthetic standing-goal continuations. Ordinary
+    # platform messages leave this unset and retain their historical behavior.
+    goal_token: Optional[str] = None
+
     # Free-form per-event metadata.  Adapters may set platform-specific
     # signals here (e.g. WhatsApp sets ``whatsapp_from_owner=True`` when
     # the bridge is configured to forward owner-typed messages).  Plugins

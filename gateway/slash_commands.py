@@ -2738,6 +2738,7 @@ class GatewaySlashCommandsMixin:
                         source=event.source,
                         message_id=None,
                         channel_prompt=None,
+                        goal_token=mgr.continuation_token(),
                     )
                     getattr(self, "_enqueue_fifo")(
                         state_key,

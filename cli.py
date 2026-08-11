@@ -4779,8 +4779,8 @@ class _VoiceInputMessage:
 def _unwrap_pending_input_projection(value):
     """Return model input plus any durable user-visible projection."""
     if isinstance(value, PendingInputProjection):
-        return value.text, value.display_kind, value.display_text
-    return value, None, None
+        return value.text, value.display_kind, value.display_text, value.goal_token
+    return value, None, None, None
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -12069,13 +12069,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self._heartbeat_watchdog_started = False
 
         threading.Thread(target=_loop, daemon=True, name="heartbeat-watchdog").start()
-    def _goal_continuation_is_current(self, prompt: str) -> bool:
+    def _goal_continuation_is_current(
+        self, prompt: str, goal_token: Optional[str] = None
+    ) -> bool:
         """Reject queued goal work after pause, clear, or replacement."""
         mgr = self._get_goal_manager()
         return bool(
             mgr is not None
             and mgr.is_active()
             and mgr.next_continuation_prompt() == prompt
+            and (goal_token is None or mgr.continuation_token() == goal_token)
         )
 
 
@@ -12425,6 +12428,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             prompt,
                             "Continuing standing goal…",
                             "goal_continue",
+                            goal_token=mgr.continuation_token(),
                         )
                     )
                 except Exception as exc:
@@ -19076,13 +19080,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
-                    user_input, display_kind, display_text = (
+                    user_input, display_kind, display_text, goal_token = (
                         _unwrap_pending_input_projection(user_input)
                     )
                     if (
                         display_kind in {"goal_resume", "goal_continue"}
                         and isinstance(user_input, str)
-                        and not self._goal_continuation_is_current(user_input)
+                        and not self._goal_continuation_is_current(
+                            user_input, goal_token
+                        )
                     ):
                         continue
 

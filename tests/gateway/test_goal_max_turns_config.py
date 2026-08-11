@@ -158,12 +158,50 @@ async def test_gateway_goal_resume_enqueues_canonical_continuation(
             adapter._pending_messages[session_key].text
             == goals.GoalManager("sid-gateway-goal-config").next_continuation_prompt()
         )
+        assert (
+            adapter._pending_messages[session_key].goal_token
+            == goals.GoalManager("sid-gateway-goal-config").continuation_token()
+        )
         resumed = goals.GoalManager("sid-gateway-goal-config").state
         assert resumed is not None
         assert resumed.status == "active"
         assert resumed.turns_used == 0
     finally:
         goals._DB_CACHE.clear()
+
+
+def test_gateway_message_event_rejects_stale_same_goal_generation(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    goals._DB_CACHE.clear()
+
+    runner = object.__new__(GatewayRunner)
+    mgr = goals.GoalManager("sid-gateway-same-goal")
+    mgr.set("same goal")
+    mgr.pause()
+    mgr.resume()
+    old = MessageEvent(
+        text=mgr.next_continuation_prompt(),
+        goal_token=mgr.continuation_token(),
+    )
+    mgr.pause()
+    mgr.resume()
+    current = MessageEvent(
+        text=mgr.next_continuation_prompt(),
+        goal_token=mgr.continuation_token(),
+    )
+
+    assert old.text == current.text
+    assert old.goal_token != current.goal_token
+    assert not runner._goal_still_active_for_session(
+        mgr.session_id, old.text, old.goal_token
+    )
+    assert runner._goal_still_active_for_session(
+        mgr.session_id, current.text, current.goal_token
+    )
 
 
 @pytest.mark.asyncio

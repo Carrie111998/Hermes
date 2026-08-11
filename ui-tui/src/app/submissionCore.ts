@@ -50,7 +50,8 @@ export function submitPrompt(
   deps: SubmitPromptDeps,
   showUserMessage = true,
   displayOverride?: string,
-  displayKind?: string
+  displayKind?: string,
+  goalToken?: string
 ): void {
   const sid = getUiState().sid
 
@@ -83,7 +84,8 @@ export function submitPrompt(
       .request<PromptSubmitResponse>('prompt.submit', {
         session_id: liveSid,
         text: submitText,
-        ...(displayKind ? { display_kind: displayKind } : {})
+        ...(displayKind ? { display_kind: displayKind } : {}),
+        ...(goalToken ? { goal_token: goalToken } : {})
       })
       .then(r => {
         // The gateway consumed a typed voice stop phrase server-side (voice

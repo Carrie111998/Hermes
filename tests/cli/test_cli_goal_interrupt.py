@@ -88,12 +88,19 @@ class TestInterruptAutoPause:
         assert queued.text == mgr.next_continuation_prompt()
         assert queued.display_text == "/goal resume"
         assert queued.display_kind == "goal_resume"
-        assert cli._goal_continuation_is_current(queued.text) is True
+        assert queued.goal_token == mgr.continuation_token()
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is True
 
         mgr.pause(reason="user-paused")
-        assert cli._goal_continuation_is_current(queued.text) is False
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is False
+        mgr.resume()
+        current_token = mgr.continuation_token()
+        assert mgr.next_continuation_prompt() == queued.text
+        assert current_token != queued.goal_token
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is False
+        assert cli._goal_continuation_is_current(queued.text, current_token) is True
         mgr.set("a replacement goal")
-        assert cli._goal_continuation_is_current(queued.text) is False
+        assert cli._goal_continuation_is_current(queued.text, queued.goal_token) is False
 
 
 
@@ -124,6 +131,7 @@ class TestHealthyTurnStillRuns:
         assert "Continuing toward your standing goal" in queued.text
         assert queued.display_text == "Continuing standing goal…"
         assert queued.display_kind == "goal_continue"
+        assert queued.goal_token == mgr.continuation_token()
         assert mgr.state.status == "active"
 
     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
@@ -151,8 +159,13 @@ class TestInterruptFlagLifecycle:
 
         canonical = "[Continuing toward your standing goal]\nGoal: finish safely"
         assert _unwrap_pending_input_projection(
-            PendingInputProjection(canonical, "/goal resume", "goal_resume")
-        ) == (canonical, "goal_resume", "/goal resume")
+            PendingInputProjection(
+                canonical,
+                "/goal resume",
+                "goal_resume",
+                goal_token="resume-generation",
+            )
+        ) == (canonical, "goal_resume", "/goal resume", "resume-generation")
 
     def test_chat_resets_flag_at_entry(self, hermes_home):
         """chat() must reset _last_turn_interrupted at the top of each turn.

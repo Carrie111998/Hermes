@@ -471,7 +471,8 @@ describe('usePromptActions slash session targeting', () => {
           message: canonical,
           notice: '▶ Goal resumed: finish safely',
           display: '/goal resume',
-          display_kind: 'goal_resume'
+          display_kind: 'goal_resume',
+          goal_token: 'resume-generation'
         } as never
       }
 
@@ -497,7 +498,8 @@ describe('usePromptActions slash session targeting', () => {
     expect(calls.find(call => call.method === 'prompt.submit')?.params).toMatchObject({
       session_id: RUNTIME_SESSION_ID,
       text: canonical,
-      display_kind: 'goal_resume'
+      display_kind: 'goal_resume',
+      goal_token: 'resume-generation'
     })
     const rendered = renderedSeedTexts(seeds).join('\n')
     expect(rendered).toContain('/goal resume')

@@ -323,13 +323,17 @@ def _(rid, params: dict) -> dict:
     session["client_surface"] = "hud" if params.get("surface") == "hud" else ""
     display_kind = None
     display_metadata = None
+    goal_token = None
     if params.get("display_kind") == "goal_resume":
         with session["history_lock"]:
             expected = session.get("_pending_goal_resume_projection")
+            submitted_token = params.get("goal_token")
             if (
                 not isinstance(text, str)
-                or not isinstance(expected, str)
-                or text != expected
+                or not isinstance(expected, dict)
+                or text != expected.get("prompt")
+                or not isinstance(submitted_token, str)
+                or submitted_token != expected.get("goal_token")
             ):
                 # command.dispatch and prompt.submit are separate RPCs. A
                 # pause, clear, or replacement goal can invalidate the resume
@@ -343,6 +347,7 @@ def _(rid, params: dict) -> dict:
             session.pop("_pending_goal_resume_projection", None)
             display_kind = "goal_resume"
             display_metadata = {"display_text": "/goal resume"}
+            goal_token = submitted_token
     if truncate_user_ordinal is not None and isinstance(text, str):
         # A rewind/regenerate replays a turn from what the transcript shows. A
         # skill turn shows its invocation, so re-expand it here — otherwise
@@ -374,6 +379,7 @@ def _(rid, params: dict) -> dict:
             queued=bool(params.get("queued")),
             display_kind=display_kind,
             display_metadata=display_metadata,
+            goal_token=goal_token,
         )
         if busy_response is not None:
             return busy_response
@@ -834,6 +840,7 @@ def _(rid, params: dict) -> dict:
                 text,
                 display_kind=display_kind,
                 display_metadata=display_metadata,
+                goal_token=goal_token,
             )
         else:
             run_prompt_submit(rid, sid, session, text)
