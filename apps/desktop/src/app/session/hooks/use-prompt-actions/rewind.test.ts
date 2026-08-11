@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { truncateSubmitParams } from './rewind'
+import { finalizeInterruptedMessages, truncateSubmitParams } from './rewind'
 
 describe('truncateSubmitParams', () => {
   it('omits truncation fields when no ordinal is set', () => {
@@ -29,5 +29,56 @@ describe('truncateSubmitParams', () => {
       expect(params.truncate_before_user_ordinal).toBe(ordinal)
       expect(params.confirm_truncate).toBe(true)
     }
+  })
+})
+
+describe('finalizeInterruptedMessages', () => {
+  it('records when a stopped assistant turn and its active part ended', () => {
+    const [message] = finalizeInterruptedMessages(
+      [
+        {
+          id: 'assistant-live',
+          role: 'assistant',
+          parts: [{ type: 'text', text: 'partial answer', timestamp: 10 }],
+          pending: true,
+          timestamp: 10
+        }
+      ],
+      'assistant-live',
+      11.25
+    )
+
+    expect(message.completedAt).toBe(11.25)
+    expect(message.parts[0].completedAt).toBe(11.25)
+    expect(message.pending).toBe(false)
+  })
+
+  it('keeps and closes a tool-only assistant turn when it is stopped', () => {
+    const [message] = finalizeInterruptedMessages(
+      [
+        {
+          id: 'assistant-tool',
+          role: 'assistant',
+          parts: [
+            {
+              args: {} as never,
+              argsText: '{}',
+              timestamp: 10,
+              toolCallId: 'call-1',
+              toolName: 'terminal',
+              type: 'tool-call'
+            }
+          ],
+          pending: true,
+          timestamp: 10
+        }
+      ],
+      'assistant-tool',
+      11.25
+    )
+
+    expect(message.parts).toHaveLength(1)
+    expect(message.parts[0].completedAt).toBe(11.25)
+    expect(message.completedAt).toBe(11.25)
   })
 })
