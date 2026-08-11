@@ -39,6 +39,14 @@ def test_agent_browser_native_binary_names_cover_linux_x64(monkeypatch):
     )
 
 
+def test_find_node_executable_on_path_accepts_explicit_path(tmp_path):
+    node = tmp_path / "node"
+    node.write_text("#!/bin/sh\nexit 0\n")
+    node.chmod(node.stat().st_mode | stat.S_IXUSR)
+
+    assert hermes_constants.find_node_executable_on_path("node", str(tmp_path)) == str(node)
+
+
 def test_agent_browser_candidate_presence_mode_does_not_execute(tmp_path, monkeypatch):
     candidate = tmp_path / "agent-browser"
     candidate.write_text("#!/bin/sh\nexit 0\n")

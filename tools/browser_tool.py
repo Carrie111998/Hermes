@@ -69,6 +69,7 @@ from hermes_constants import (
     agent_browser_native_binary_names,
     agent_browser_native_sibling_candidates,
     agent_browser_runnable,
+    find_node_executable_on_path,
     get_hermes_home,
     get_hermes_home_override,
     prepare_agent_browser_native_candidate,
@@ -2300,10 +2301,7 @@ def _agent_browser_candidate_present(path: str | None) -> bool:
 
 
 def _browser_node_available(extended_path: str = "") -> bool:
-    return bool(
-        shutil.which("node")
-        or (extended_path and shutil.which("node", path=extended_path))
-    )
+    return bool(find_node_executable_on_path("node", extended_path or None))
 
 
 def _agent_browser_shim_requires_node(path: str) -> bool:

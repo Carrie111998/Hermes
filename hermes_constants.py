@@ -623,16 +623,20 @@ def find_hermes_node_executable(command: str) -> str | None:
     return resolved
 
 
-def find_node_executable_on_path(command: str) -> str | None:
+def find_node_executable_on_path(command: str, path: str | None = None) -> str | None:
     """Return a Node/npm executable from PATH with Windows shim ordering.
 
     ``shutil.which("npm")`` can resolve an extensionless npm shim before the
     ``.cmd`` shim on Windows. Python's CreateProcess cannot execute that shim
     directly, so prefer the launchable variants explicitly for Hermes-owned
     subprocesses.
+
+    *path* optionally overrides the ambient PATH for callers probing a
+    constructed environment without mutating process-global state.
     """
+    search_path = os.environ.get("PATH", "") if path is None else path
     if sys.platform != "win32":
-        return shutil.which(command)
+        return shutil.which(command, path=search_path)
 
     command_str = str(command)
     has_path_separator = any(
@@ -642,7 +646,7 @@ def find_node_executable_on_path(command: str) -> str | None:
         return command_str if Path(command_str).is_file() else None
 
     for name in _candidate_node_command_names(command_str):
-        for directory in os.environ.get("PATH", "").split(os.pathsep):
+        for directory in search_path.split(os.pathsep):
             if not directory:
                 continue
             candidate = Path(directory) / name
