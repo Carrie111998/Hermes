@@ -131,6 +131,62 @@ class TestInPlaceCompaction:
             assert active_count == 8
             assert agent._test_external_protected_tail is True
 
+    def test_in_place_same_role_seam_keeps_first_protected_message_verbatim(self):
+        """A user-role summary must never absorb the first protected user row."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260811_partial_tail_seam"
+            _seed(db, sid, "partial-tail-seam")
+            agent = _make_agent(db, sid, in_place=True)
+
+            def _user_summary_only(messages, **kwargs):
+                agent._test_external_protected_tail = kwargs.get(
+                    "external_protected_tail", False
+                )
+                return [{"role": "user", "content": "summary of older head"}]
+
+            agent.context_compressor.compress = _user_summary_only
+            head = [
+                {"role": "user", "content": "older question"},
+                {"role": "assistant", "content": "older answer"},
+            ]
+            protected_tail = [
+                {"role": "user", "content": "first protected question", "timestamp": 1_786_000_001.0},
+                {"role": "assistant", "content": "first protected answer", "timestamp": 1_786_000_002.0},
+                {"role": "user", "content": "second protected question", "timestamp": 1_786_000_003.0},
+                {"role": "assistant", "content": "second protected answer", "timestamp": 1_786_000_004.0},
+                {"role": "user", "content": "third protected question", "timestamp": 1_786_000_005.0},
+                {"role": "assistant", "content": "third protected answer", "timestamp": 1_786_000_006.0},
+            ]
+
+            compressed_head, _ = compress_context(
+                agent,
+                head,
+                "sys",
+                approx_tokens=100_000,
+                protected_tail=protected_tail,
+            )
+            reloaded = db.get_messages_as_conversation(sid)
+            active_count = db.get_session(sid)["message_count"]
+            db.close()
+
+            assert compressed_head == [{"role": "user", "content": "summary of older head"}]
+            assert reloaded[0]["content"] == "summary of older head"
+            assert reloaded[1]["role"] == "assistant"
+            assert reloaded[1]["display_kind"] == "compression_bridge"
+            assert [
+                {key: message.get(key) for key in ("role", "content", "timestamp")}
+                for message in reloaded[-len(protected_tail):]
+            ] == [
+                {key: message.get(key) for key in ("role", "content", "timestamp")}
+                for message in protected_tail
+            ]
+            assert active_count == 2 + len(protected_tail)
+            assert agent._test_external_protected_tail is True
+
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB

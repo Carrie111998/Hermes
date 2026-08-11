@@ -273,17 +273,13 @@ def rejoin_compressed_head_and_tail(
     """Concatenate a compressed head with the verbatim tail, defending
     the seam against an illegal user→user / assistant→assistant adjacency.
 
-    In normal operation the compressed head ends with the head's own
-    protected verbatim tail (the ``ContextCompressor`` always preserves a
-    recent window), which terminates on an ``assistant``/``tool`` turn —
-    so ``assistant → user`` at the seam is already valid. But the head
-    compressor's exact output shape is not contractually guaranteed (a
-    plugin context engine could return something that ends on a ``user``
-    turn, or a degenerate single-summary message). Rather than trust the
-    seam, this helper inspects the boundary and, if the last head message
-    and the first tail message share a ``user``/``assistant`` role, folds
-    the tail's first message content onto the head's last message so the
-    rejoined list never violates provider role-alternation rules.
+    The compressed head's exact output shape is not contractually
+    guaranteed (a plugin context engine can end on a ``user`` turn, or a
+    degenerate single-summary message). Rather than trust the seam, this
+    helper inspects the boundary. If the last head message and first tail
+    message share a ``user``/``assistant`` role, it appends a neutral bridge
+    to the *compressed head*. It never folds, edits, or removes the first
+    protected message: ``tail`` remains field-for-field verbatim.
 
     ``tool`` messages are left alone — consecutive ``tool`` entries are
     the one legal repetition (parallel tool results).
@@ -293,8 +289,10 @@ def rejoin_compressed_head_and_tail(
     if not compressed_head:
         return list(tail)
 
-    head = list(compressed_head)
-    rest = list(tail)
+    # Clone the top-level dicts so seam handling cannot mutate either caller's
+    # list. Nested values are never modified here.
+    head = [dict(message) for message in compressed_head]
+    rest = [dict(message) for message in tail]
 
     last = head[-1]
     first = rest[0]
@@ -302,23 +300,19 @@ def rejoin_compressed_head_and_tail(
     first_role = first.get("role")
 
     if last_role == first_role and last_role in ("user", "assistant"):
-        # Illegal adjacency. Merge the tail's first message text into the
-        # head's last message so alternation is preserved. Only string
-        # contents are merged inline; structured/multimodal contents fall
-        # back to dropping the redundant standalone (the content is
-        # preserved by concatenation when both are strings).
-        last_content = last.get("content")
-        first_content = first.get("content")
-        if isinstance(last_content, str) and isinstance(first_content, str):
-            merged = dict(last)
-            merged["content"] = f"{last_content}\n\n{first_content}"
-            head[-1] = merged
-            rest = rest[1:]
-        else:
-            # Can't safely string-merge multimodal content. Insert a
-            # minimal bridging turn so the seam alternates rather than
-            # losing data.
-            bridge_role = "assistant" if first_role == "user" else "user"
-            head.append({"role": bridge_role, "content": ""})
+        # The selected tail is immutable. Put the alternation bridge on the
+        # compressed side of the boundary instead of merging the first
+        # protected user message into older head content (the historical bug).
+        bridge_role = "assistant" if first_role == "user" else "user"
+        head.append(
+            {
+                "role": bridge_role,
+                "content": (
+                    "[Compression handoff complete. The following recent "
+                    "turns are preserved verbatim.]"
+                ),
+                "display_kind": "compression_bridge",
+            }
+        )
 
     return head + rest

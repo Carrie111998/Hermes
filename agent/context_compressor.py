@@ -6551,9 +6551,15 @@ This compaction should PRIORITISE preserving all information related to the focu
             n_messages = len(messages)
         latest_actionable_idx = self._find_last_user_message_idx(messages, 0)
 
-        # Phase 2: Determine boundaries
-        compress_start = self._protect_head_size(messages)
-        compress_start = self._align_boundary_forward(messages, compress_start)
+        # Phase 2: Determine boundaries. A user-selected external tail is the
+        # *only* verbatim boundary: even the ordinary protected head belongs to
+        # the older material the user asked us to summarize. Keeping those first
+        # rows can leak an old user message into the tail seam.
+        if external_protected_tail:
+            compress_start = 0
+        else:
+            compress_start = self._protect_head_size(messages)
+            compress_start = self._align_boundary_forward(messages, compress_start)
 
         # A boundary-aware caller already owns the exact recent tail. Applying
         # the ordinary token-budget tail here creates a nested protected tail,

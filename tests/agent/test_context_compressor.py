@@ -3385,8 +3385,8 @@ class TestExternalProtectedTail:
         Without ``external_protected_tail``, this transcript fits inside the
         ordinary token-budget tail and cannot shrink. A boundary-aware manual
         compression already holds the selected exchanges outside this list, so
-        the complete older head (apart from the configured two-row head) must be
-        summarized instead of protecting a second large suffix.
+        the complete older head must be summarized instead of protecting either
+        a second large suffix or the ordinary configured head rows.
         """
         messages = self._older_head()
 
@@ -3420,8 +3420,9 @@ class TestExternalProtectedTail:
         assert "old request 29" in str(ordinary_result)
         assert "old reply 29" in str(ordinary_result)
         external_summary.assert_called_once()
-        assert external_result[:2] == messages[:2]
-        assert len(external_result) == 3
-        assert "external protected-tail summary" in external_result[-1]["content"]
+        assert len(external_result) == 1
+        assert "external protected-tail summary" in external_result[0]["content"]
+        assert "old request 0" not in str(external_result)
+        assert "old reply 0" not in str(external_result)
         assert "old request 29" not in str(external_result)
         assert "old reply 29" not in str(external_result)

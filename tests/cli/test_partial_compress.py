@@ -115,26 +115,33 @@ def test_rejoin_valid_seam_assistant_then_user():
     assert _no_consecutive_dupes(out)
 
 
-def test_rejoin_user_user_seam_merges():
+def test_rejoin_user_user_seam_bridges_without_mutating_tail():
     # Degenerate head ending on a user summary; tail starts on user.
     head = [{"role": "user", "content": "[summary of head]"}]
-    tail = [{"role": "user", "content": "latest question"},
+    tail = [{"role": "user", "content": "latest question", "timestamp": "original"},
             {"role": "assistant", "content": "answer"}]
+    original_tail = [dict(message) for message in tail]
     out = rejoin_compressed_head_and_tail(head, tail)
     assert _no_consecutive_dupes(out), out
-    # The two user messages were merged into one.
-    assert out[0]["content"] == "[summary of head]\n\nlatest question"
-    assert out[1] == {"role": "assistant", "content": "answer"}
+    assert out[0] == head[0]
+    assert out[1]["role"] == "assistant"
+    assert out[1]["display_kind"] == "compression_bridge"
+    assert out[2:] == original_tail
+    assert tail == original_tail
 
 
-def test_rejoin_assistant_assistant_seam_merges():
+def test_rejoin_assistant_assistant_seam_bridges_without_mutating_tail():
     head = [{"role": "user", "content": "q"},
             {"role": "assistant", "content": "head end"}]
     tail = [{"role": "assistant", "content": "tail start"},
             {"role": "user", "content": "u"}]
+    original_tail = [dict(message) for message in tail]
     out = rejoin_compressed_head_and_tail(head, tail)
     assert _no_consecutive_dupes(out), out
-    assert out[-2]["content"] == "head end\n\ntail start"
+    assert out[-2:] == original_tail
+    assert out[-3]["role"] == "user"
+    assert out[-3]["display_kind"] == "compression_bridge"
+    assert tail == original_tail
 
 
 
