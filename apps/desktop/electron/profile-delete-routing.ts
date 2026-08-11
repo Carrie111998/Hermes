@@ -127,9 +127,11 @@ export async function applyProfileRenameLifecycle<T>(
 export function createProfileRevocationGuard() {
   const revoked = new Set<string>()
   const pendingDeletes = new Map<string, number>()
+  const pendingCreates = new Map<string, Set<number>>()
   const latestMutations = new Map<string, ProfileMutationToken>()
   const successfulCreates = new Set<number>()
   const successfulDeletes = new Set<number>()
+  const deletesOvertakenByOlderCreates = new Set<number>()
   const retirableDeletes = new Set<number>()
   let nextEpoch = 0
 
@@ -139,6 +141,7 @@ export function createProfileRevocationGuard() {
     if (previous) {
       successfulCreates.delete(previous.epoch)
       successfulDeletes.delete(previous.epoch)
+      deletesOvertakenByOlderCreates.delete(previous.epoch)
       retirableDeletes.delete(previous.epoch)
     }
 
@@ -155,6 +158,7 @@ export function createProfileRevocationGuard() {
     if (latest) {
       successfulCreates.delete(latest.epoch)
       successfulDeletes.delete(latest.epoch)
+      deletesOvertakenByOlderCreates.delete(latest.epoch)
       retirableDeletes.delete(latest.epoch)
     }
 
@@ -183,10 +187,17 @@ export function createProfileRevocationGuard() {
 
   const retireLatestSuccessfulDelete = (profile: string): boolean => {
     const latest = latestMutations.get(profile)
+    const pending = pendingCreates.get(profile)
+
+    const hasOlderPendingCreate = pending
+      ? [...pending].some(createEpoch => createEpoch < (latest?.epoch || 0))
+      : false
 
     if (
       latest?.kind === 'delete' &&
       successfulDeletes.has(latest.epoch) &&
+      !deletesOvertakenByOlderCreates.has(latest.epoch) &&
+      !hasOlderPendingCreate &&
       !pendingDeletes.has(profile)
     ) {
       const canRetire = retirableDeletes.has(latest.epoch)
@@ -207,7 +218,13 @@ export function createProfileRevocationGuard() {
       return latestMutations.get(mutation.profile)?.epoch === mutation.epoch
     },
     startCreation(profile: string): ProfileMutationToken {
-      return startMutation(profile, 'create')
+      const mutation = startMutation(profile, 'create')
+      const pending = pendingCreates.get(profile) || new Set<number>()
+
+      pending.add(mutation.epoch)
+      pendingCreates.set(profile, pending)
+
+      return mutation
     },
     revoke(profile: string): ProfileMutationToken {
       const mutation = startMutation(profile, 'delete')
@@ -264,16 +281,39 @@ export function createProfileRevocationGuard() {
         }
       }
 
-      if (succeeded && latestMutations.get(profile)?.epoch === epoch) {
+      const pending = pendingCreates.get(profile)
+
+      pending?.delete(epoch)
+
+      if (pending?.size === 0) {
+        pendingCreates.delete(profile)
+      }
+
+      const latest = latestMutations.get(profile)
+
+      if (
+        succeeded &&
+        latest?.kind === 'delete' &&
+        latest.epoch > epoch &&
+        successfulDeletes.has(latest.epoch)
+      ) {
+        // This older request completed after the newer delete and may have
+        // recreated the profile. Keep the delete tombstone fail-closed.
+        deletesOvertakenByOlderCreates.add(latest.epoch)
+      }
+
+      if (succeeded && latest?.epoch === epoch) {
         successfulCreates.add(epoch)
         restoreLatestSuccessfulCreate(profile)
-      } else if (!succeeded && latestMutations.get(profile)?.epoch === epoch && !pendingDeletes.has(profile)) {
+      } else if (!succeeded && latest?.epoch === epoch && !pendingDeletes.has(profile)) {
         // A failed standalone create needs no tombstone and must not retain its
         // mutation token. Preserve any earlier deletion revocation.
         forgetLatestMutation(profile, false)
       }
 
-      return { retiredProfile: null }
+      return {
+        retiredProfile: retireLatestSuccessfulDelete(profile) ? profile : null
+      }
     }
   }
 }

@@ -202,9 +202,41 @@ test('a create that started before a later delete cannot clear the newer tombsto
   const deletion = guard.revoke('worker')
 
   assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: true }), {
+    retiredProfile: null
+  })
+  assert.deepEqual(guard.completeMutation({ mutation: staleCreate, succeeded: true }), {
+    retiredProfile: null
+  })
+
+  assert.equal(guard.isRevoked('worker'), true)
+})
+
+test('a failed older create lets the newer successful delete retire after it drains', () => {
+  const guard = createProfileRevocationGuard()
+  const staleCreate = guard.startCreation('worker')
+  const deletion = guard.revoke('worker')
+
+  assert.deepEqual(guard.completeMutation({ mutation: deletion, succeeded: true }), {
+    retiredProfile: null
+  })
+  assert.deepEqual(guard.completeMutation({ mutation: staleCreate, succeeded: false }), {
     retiredProfile: 'worker'
   })
+
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('a newer successful create restores after an older create overtakes deletion', () => {
+  const guard = createProfileRevocationGuard()
+  const staleCreate = guard.startCreation('worker')
+  const deletion = guard.revoke('worker')
+
+  guard.completeMutation({ mutation: deletion, succeeded: true })
   guard.completeMutation({ mutation: staleCreate, succeeded: true })
+  assert.equal(guard.isRevoked('worker'), true)
+
+  const recreation = guard.startCreation('worker')
+  guard.completeMutation({ mutation: recreation, succeeded: true })
 
   assert.equal(guard.isRevoked('worker'), false)
 })
