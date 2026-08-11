@@ -988,11 +988,11 @@ class Task:
     # relying on tenant + time-window heuristics.
     session_id: Optional[str] = None
     # Typed block reason (one of VALID_BLOCK_KINDS) or None for legacy/un-typed
-    # blocks. Set by ``block_task``; preserved across unblock so a re-block for
-    # the same kind is recognisable as an unblock↔re-block loop.
+    # blocks. Set by ``block_task``; preserved across unblock and paired with
+    # the reason fingerprint so a same-cause re-block is recognisable.
     block_kind: Optional[str] = None
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
-    # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
+    # ``BLOCK_RECURRENCE_LIMIT``. Reset on completion or material specification.
     block_recurrences: int = 0
 
     @classmethod
@@ -1276,9 +1276,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
     -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
-    -- successful completion — NOT on unblock (resetting on unblock is exactly
-    -- the amnesia that let the loop run unbounded).
+    -- ``blocked`` so a cron can't spin it forever. Reset to 0 on successful
+    -- completion or material human specification — NOT on a bare unblock
+    -- (that amnesia let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
@@ -5948,8 +5948,9 @@ def block_task(
 
     * ``needs_input`` / ``capability`` / ``None`` — "truly blocked" (Dale's
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
-      is re-blocked for the SAME kind after having been unblocked, the
-      unblock-loop counter (``block_recurrences``) increments. When it reaches
+      is re-blocked for the same normalized cause after having been unblocked,
+      the unblock-loop counter (``block_recurrences``) increments. When it
+      reaches
       :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
       of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
       forcing a human-in-the-loop triage decision.
@@ -6631,8 +6632,9 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             if landing_status == "ready" and resume_status == "review"
             else landing_status
         )
-        # NOTE: deliberately does NOT touch ``block_recurrences`` or
-        # ``block_kind``. Resetting the recurrence counter on unblock is exactly
+        # NOTE: deliberately does NOT touch ``block_recurrences``,
+        # ``block_kind``, or ``block_reason_fingerprint``. Resetting recurrence
+        # identity on a bare unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
         # unbounded (Dale's report). The counter survives the unblock so that a
         # subsequent same-cause ``block_task`` can detect the loop and route to
@@ -6671,9 +6673,9 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
     ``review_reopened`` event.
 
     Deliberately does NOT touch ``block_recurrences``/``block_kind``: review is
-    not a block, so there is no loop counter to reset. (A stale counter from a
-    genuine block *before* review is left intact — only :func:`complete_task`
-    clears it.) Returns False when the task is missing or not in ``review``.
+    not a block, so there is no loop counter to reset. A stale counter from a
+    genuine block *before* review is left intact until completion or material
+    specification. Returns False when the task is missing or not in ``review``.
     """
     now = int(time.time())
     with write_txn(conn):
