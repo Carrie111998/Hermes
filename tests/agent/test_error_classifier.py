@@ -274,6 +274,37 @@ class TestClassifyApiError:
         result = classify_api_error(e)
         assert result.reason == FailoverReason.overloaded
 
+    def test_503_retries_and_falls_back(self):
+        """An overloaded provider must advance the chain, not just retry.
+
+        ``should_fallback`` defaults to False, so a 503 burned all three
+        retries against the same saturated pool and never tried the next
+        rung. Retrying stays correct — unlike a 404, a 503 genuinely
+        recovers (30 of 39 observed NVIDIA 503s never reached attempt 2) —
+        but the fallback has to happen once retries are spent.
+        """
+        e = MockAPIError("Service Unavailable", status_code=503)
+        result = classify_api_error(e)
+        assert result.retryable is True
+        assert result.should_fallback is True
+
+    def test_nvidia_resource_exhausted_is_overload(self):
+        """NVIDIA NIM's saturated-pool phrasing must read as overload.
+
+        NIM reports a full shared worker pool as
+        ``ResourceExhausted: Worker local total request limit reached
+        (33/32)`` — semantically "at capacity", but it matched none of the
+        overload wordings, so it fell through to the generic branch.
+        """
+        msg = "ResourceExhausted: Worker local total request limit reached (351/32)"
+        e = MockAPIError(msg, status_code=503, body={"error": {"message": msg}})
+        result = classify_api_error(
+            e, provider="nvidia", model="nvidia/nemotron-3-ultra-550b-a55b"
+        )
+        assert result.reason == FailoverReason.overloaded
+        assert result.retryable is True
+        assert result.should_fallback is True
+
 
     def test_408_request_timeout_is_retryable_timeout(self):
         """HTTP 408 Request Timeout is a transient timing failure the server

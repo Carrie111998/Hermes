@@ -192,6 +192,14 @@ _OVERLOADED_PATTERNS = [
     "currently overloaded",
     "at capacity",
     "over capacity",
+    # NVIDIA NIM phrases a saturated shared worker pool as
+    # "ResourceExhausted: Worker local total request limit reached (33/32)"
+    # — semantically "at capacity", but matching none of the wordings above,
+    # so it fell through to the generic branch instead of being recognised as
+    # transient overload.
+    "resource exhausted",
+    "resourceexhausted",
+    "request limit reached",
 ]
 
 # Usage-limit patterns that need disambiguation (could be billing OR rate_limit)
@@ -1241,7 +1249,17 @@ def _classify_by_status(
                 retryable=True,
                 should_compress=True,
             )
-        return result_fn(FailoverReason.overloaded, retryable=True)
+        # Retry AND fall back. `should_fallback` defaults to False, so an
+        # overloaded provider previously burned all three retries against the
+        # same saturated pool and never advanced the chain. Retrying is still
+        # right — unlike a 404, a 503 genuinely recovers (30 of 39 observed
+        # NVIDIA 503s never reached attempt 2) — but when the retries are
+        # exhausted the next rung should be tried rather than failing the turn.
+        return result_fn(
+            FailoverReason.overloaded,
+            retryable=True,
+            should_fallback=True,
+        )
 
     # 408 Request Timeout — a transient timing failure the server itself flags
     # as safe to retry (RFC 9110 §15.5.9), not a malformed request. Commonly
