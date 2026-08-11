@@ -91,6 +91,12 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
+from hermes_cli.kanban_product_outcomes import (
+    OutcomeValidationError,
+    ProductOutcomeError,
+    TerminalOutcome,
+    validate_terminal_outcome,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -10025,38 +10031,120 @@ def _validate_product_workflow_outcome(
     outcome: Any,
     current_step: str,
 ) -> tuple[str, Optional[str], list[str]]:
-    if not isinstance(outcome, dict):
-        raise ValueError("workflow_outcome must be an object")
-    verdict = outcome.get("verdict")
-    positive = PRODUCT_POSITIVE_OUTCOMES.get(current_step)
-    if verdict in {"passed", "approved"}:
-        if set(outcome) != {"verdict"} or verdict != positive:
-            raise ValueError(
-                f"invalid workflow_outcome for {current_step}: verdict={verdict!r}"
-            )
-        return str(verdict), None, []
+    try:
+        validated = validate_terminal_outcome(
+            task_id="<direct>",
+            run_id=0,
+            phase=current_step,
+            summary=None,
+            result=None,
+            metadata={"workflow_outcome": outcome},
+        )
+    except OutcomeValidationError as exc:
+        raise ValueError(
+            f"invalid workflow_outcome for {current_step}: {exc.code}"
+        ) from exc
+    return validated.verdict, validated.target_step, list(validated.findings)
 
-    if set(outcome) != {"verdict", "target_step", "findings"}:
-        raise ValueError(
-            "rework workflow_outcome must contain exactly verdict, target_step, and findings"
+
+def _record_product_outcome_rejection(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    phase: str,
+    error: OutcomeValidationError,
+) -> None:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "phase": phase,
+        "code": error.code,
+    }
+    if error.qualifier is not None:
+        payload["qualifier"] = error.qualifier
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "completion_rejected_outcome",
+            payload,
+            run_id=run_id,
         )
-    target_step = outcome.get("target_step")
-    expected_target = PRODUCT_REWORK_ROUTES.get((current_step, verdict))
-    if expected_target is None or target_step != expected_target:
-        raise ValueError(
-            f"invalid workflow_outcome for {current_step}: verdict={verdict!r}, "
-            f"target_step={target_step!r}"
+
+
+def _record_product_outcome_observations(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    run_id: Optional[int],
+    phase: str,
+    outcome: Optional[TerminalOutcome],
+) -> None:
+    if outcome is None or "serialized_parameter_leak" not in outcome.observations:
+        return
+    with write_txn(conn):
+        _append_event(
+            conn,
+            task_id,
+            "serialized_parameter_leak",
+            {"run_id": run_id, "phase": phase},
+            run_id=run_id,
         )
-    raw_findings = outcome.get("findings")
-    if (
-        not isinstance(raw_findings, list)
-        or not raw_findings
-        or not all(isinstance(item, str) and item.strip() for item in raw_findings)
-    ):
-        raise ValueError(
-            "workflow_outcome findings must be a non-empty list of non-empty strings"
+
+
+def _validate_ordinary_product_outcome(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    summary: Optional[str],
+    result: Optional[str],
+    metadata: Optional[dict],
+    expected_run_id: Optional[int],
+) -> tuple[Optional[TerminalOutcome], Optional[str], Optional[int]]:
+    """Validate an active Test/Review envelope before any completion write."""
+    row = conn.execute(
+        "SELECT current_step_key, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None, None, None
+    phase = str(row["current_step_key"] or "").strip()
+    if phase not in PRODUCT_POSITIVE_OUTCOME_STEPS.values():
+        return None, None, None
+    if _latest_unresolved_product_preflight(conn, task_id):
+        # Resolver completion is a separate structural path. It never obtains
+        # authority from a worker-supplied terminal outcome envelope.
+        return None, None, None
+    run_id = (
+        int(row["current_run_id"])
+        if row["current_run_id"] is not None
+        else (int(expected_run_id) if expected_run_id is not None else None)
+    )
+    try:
+        outcome = validate_terminal_outcome(
+            task_id=task_id,
+            run_id=run_id or 0,
+            phase=phase,
+            summary=summary,
+            result=result,
+            metadata=metadata,
         )
-    return str(verdict), str(target_step), [item.strip() for item in raw_findings]
+    except OutcomeValidationError as exc:
+        _record_product_outcome_rejection(
+            conn,
+            task_id,
+            run_id=run_id,
+            phase=phase,
+            error=exc,
+        )
+        raise ProductOutcomeError(
+            task_id,
+            run_id or 0,
+            phase,
+            exc.code,
+            exc.qualifier,
+        ) from exc
+    return outcome, phase, run_id
 
 
 def _route_product_rework_if_requested(
@@ -10068,6 +10156,7 @@ def _route_product_rework_if_requested(
     summary: Optional[str],
     expected_run_id: Optional[int],
     product_role_assignees: Optional[dict[str, str]],
+    validated_outcome: Optional[TerminalOutcome] = None,
 ) -> Optional[bool]:
     outcome = metadata.get("workflow_outcome") if isinstance(metadata, dict) else None
     if outcome is None:
@@ -10099,9 +10188,14 @@ def _route_product_rework_if_requested(
                 )
                 or ""
             )
-        verdict, target_step, findings = _validate_product_workflow_outcome(
-            outcome, current_step
-        )
+        if validated_outcome is None:
+            verdict, target_step, findings = _validate_product_workflow_outcome(
+                outcome, current_step
+            )
+        else:
+            verdict = validated_outcome.verdict
+            target_step = validated_outcome.target_step
+            findings = list(validated_outcome.findings)
         if verdict in {"passed", "approved"}:
             return None
         if expected_run_id is None:
@@ -10171,6 +10265,17 @@ def _route_product_rework_if_requested(
             },
             run_id=run_id,
         )
+        if (
+            validated_outcome is not None
+            and "serialized_parameter_leak" in validated_outcome.observations
+        ):
+            _append_event(
+                conn,
+                task_id,
+                "serialized_parameter_leak",
+                {"run_id": run_id, "phase": current_step},
+                run_id=run_id,
+            )
         if limit_reached:
             _append_event(
                 conn,
@@ -10242,6 +10347,26 @@ def complete_task(
     """
     board = board or _board_slug_for_connection(conn)
     now = int(time.time())
+    validated_terminal_outcome: Optional[TerminalOutcome] = None
+    validated_outcome_phase: Optional[str] = None
+    validated_outcome_run_id: Optional[int] = None
+    if product_workflow_enabled:
+        outcome_meta = (
+            board_meta if board_meta is not None else product_board_metadata(board)
+        )
+        if outcome_meta is not None and _handoff_v2_enabled(outcome_meta):
+            (
+                validated_terminal_outcome,
+                validated_outcome_phase,
+                validated_outcome_run_id,
+            ) = _validate_ordinary_product_outcome(
+                conn,
+                task_id,
+                summary=summary,
+                result=result,
+                metadata=metadata,
+                expected_run_id=expected_run_id,
+            )
 
     task_kind_row = conn.execute(
         "SELECT work_item_kind FROM tasks WHERE id = ?", (task_id,)
@@ -10314,6 +10439,7 @@ def complete_task(
                 summary=summary if summary is not None else result,
                 expected_run_id=expected_run_id,
                 product_role_assignees=product_role_assignees,
+                validated_outcome=validated_terminal_outcome,
             )
             if rework_routed is not None:
                 return rework_routed
@@ -10367,6 +10493,13 @@ def complete_task(
                     # -- do NOT fall through to the terminal-done UPDATE,
                     # which would wrongly mark an uncommitted card done.
                     return False
+                _record_product_outcome_observations(
+                    conn,
+                    task_id,
+                    run_id=validated_outcome_run_id,
+                    phase=validated_outcome_phase or str(step_key or ""),
+                    outcome=validated_terminal_outcome,
+                )
                 return True
             # Terminal / non-advancing v2 step (e.g. release_measure, or no
             # transition at all): fall through to the existing legacy path

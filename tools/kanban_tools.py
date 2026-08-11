@@ -1665,6 +1665,17 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"scratch workspace was kept. Fix the artifact path or "
                     f"storage error, then retry kanban_complete with the same handoff."
                 )
+            except kb.ProductOutcomeError as outcome_err:
+                qualifier = (
+                    f" ({outcome_err.qualifier})"
+                    if outcome_err.qualifier
+                    else ""
+                )
+                return tool_error(
+                    "kanban_complete blocked by canonical outcome validation: "
+                    f"{outcome_err.code}{qualifier}. Your task is still in-flight "
+                    "(no state change). Retry with a structured terminal outcome."
+                )
             except kb.HallucinatedCardsError as hall_err:
                 # Structured rejection — surface the phantom ids so the
                 # worker can retry with a corrected list or drop the

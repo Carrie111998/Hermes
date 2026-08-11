@@ -496,7 +496,7 @@ def test_product_rework_requires_nonempty_string_findings(kanban_home, findings)
             board=board,
         )
         claimed = kb.claim_task(conn, tid)
-        with pytest.raises(ValueError, match="findings"):
+        with pytest.raises(kb.ProductOutcomeError) as raised:
             kb.complete_task(
                 conn,
                 tid,
@@ -511,6 +511,7 @@ def test_product_rework_requires_nonempty_string_findings(kanban_home, findings)
                 expected_run_id=claimed.current_run_id,
                 board=board,
             )
+        assert raised.value.code == "invalid_findings"
         task = kb.get_task(conn, tid)
     assert task is not None and task.current_step_key == "test"
 
@@ -643,7 +644,7 @@ def test_product_positive_rework_verdict_must_match_phase(
         )
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None and claimed.current_run_id is not None
-        with pytest.raises(ValueError, match="invalid workflow_outcome"):
+        with pytest.raises(kb.ProductOutcomeError) as raised:
             kb.complete_task(
                 conn,
                 tid,
@@ -655,6 +656,7 @@ def test_product_positive_rework_verdict_must_match_phase(
                 expected_run_id=claimed.current_run_id,
                 board=board,
             )
+        assert raised.value.code == "phase_mismatch"
         task = kb.get_task(conn, tid)
     assert task is not None
     assert task.current_step_key == step
@@ -4505,7 +4507,10 @@ def test_complete_task_v2_clean_test_evidence_advances_without_commit(kanban_hom
             tid,
             summary="Tests passed",
             board=board,
-            metadata={"ai_provenance": {"tester": {"agent": "hermes", "result": "passed"}}},
+            metadata={
+                "workflow_outcome": {"verdict": "passed"},
+                "ai_provenance": {"tester": {"agent": "hermes", "result": "passed"}},
+            },
         )
 
         card = _card_snapshot(conn, tid)
@@ -4560,6 +4565,7 @@ def test_complete_task_v2_clean_review_evidence_advances_without_commit(kanban_h
             summary="Independent review passed",
             board=board,
             metadata={
+                "workflow_outcome": {"verdict": "approved"},
                 "ai_provenance": {
                     "writer": {"agent": "claude-code"},
                     "reviewer": {"agent": "codex"},
