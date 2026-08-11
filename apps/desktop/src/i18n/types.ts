@@ -1871,6 +1871,16 @@ export interface Translations {
     errorTitle: string
     errorBody: string
     notNow: string
+    /** Changelog group headers in the update dialog. `commit-changelog.ts`
+     *  keeps English defaults in GROUP_META/FALLBACK_GROUP; the overlay
+     *  passes these localized values through buildCommitChangelog options. */
+    changeLogNew: string
+    changeLogFixed: string
+    changeLogFaster: string
+    changeLogImproved: string
+    changeLogOther: string
+    changeLogFallbackLabel: string
+    changeLogFallbackItem: string
     applyStatus: {
       preparing: string
       pulling: string

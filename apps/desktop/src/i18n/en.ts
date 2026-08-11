@@ -2243,6 +2243,13 @@ export const en: Translations = {
     errorTitle: 'Update didn’t finish',
     errorBody: 'No worries — nothing was lost. You can try again now.',
     notNow: 'Not now',
+    changeLogNew: "What's new",
+    changeLogFixed: 'Fixed',
+    changeLogFaster: 'Faster',
+    changeLogImproved: 'Improved',
+    changeLogOther: 'Other improvements',
+    changeLogFallbackLabel: 'In this update',
+    changeLogFallbackItem: 'Improvements and fixes',
     applyStatus: {
       preparing: 'Updating backend…',
       pulling: 'Backend updating…',

@@ -1998,6 +1998,13 @@ export const zhHant = defineLocale({
     errorTitle: '更新未完成',
     errorBody: '沒有資料遺失。您可以現在重試。',
     notNow: '暫不',
+    changeLogNew: '新增功能',
+    changeLogFixed: '修復',
+    changeLogFaster: '更快',
+    changeLogImproved: '改進',
+    changeLogOther: '其他改進',
+    changeLogFallbackLabel: '本次更新',
+    changeLogFallbackItem: '改進與修復',
     applyStatus: {
       preparing: '正在更新後端…',
       pulling: '後端更新中…',

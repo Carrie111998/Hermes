@@ -1880,6 +1880,13 @@ export const ar = defineLocale({
     errorTitle: 'لم يكتمل التحديث',
     errorBody: 'لا داعي للقلق — لم يُفقد شيء. يمكنك إعادة المحاولة الآن.',
     notNow: 'ليس الآن',
+    changeLogNew: 'جديد',
+    changeLogFixed: 'إصلاحات',
+    changeLogFaster: 'أسرع',
+    changeLogImproved: 'تحسينات',
+    changeLogOther: 'تحسينات أخرى',
+    changeLogFallbackLabel: 'في هذا التحديث',
+    changeLogFallbackItem: 'تحسينات وإصلاحات',
     applyStatus: {
       preparing: 'جار تحديث الواجهة الخلفية...',
       pulling: 'جار تحديث الواجهة الخلفية...',
