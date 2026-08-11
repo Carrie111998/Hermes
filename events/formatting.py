@@ -106,28 +106,34 @@ EVENT_TYPE_EMOJI = {
     EventType.DEVFLOW_BUILD_STARTED:    "🔨",
     EventType.DEVFLOW_BUILD_SUCCEEDED:  "🟢",
     EventType.DEVFLOW_BUILD_FAILED:     "🧨",
-    # DevFlow work-intake + merge/deploy lifecycle. These 12 members were
-    # registered in events/schema.py (f911b6090) so the routing table would be
-    # total, but no icon was paired at the same time — which is exactly what
-    # EVENT_TYPE_EMOJI's completeness test exists to catch, and it has been
-    # failing on main ever since. Paired here 2026-08-11.
-    # The merge/deploy members land in Stage 2/3 and are not emitted yet; the
-    # entries keep test_event_icons_cover_all_types honest and give a sane
-    # fallback render the moment a producer starts emitting them.
-    EventType.DEVFLOW_WORK_REQUESTED:   "📥",
+    # DevFlow Delegation Plane lifecycle (2026-08-06) — the DDP enum block
+    # (schema.py) and its routing specs (routing_policy.py DEVFLOW/ALERTS)
+    # both landed total, but this table was missed, so all twelve members
+    # rendered with event_icon() == "" and a double-space gap in the header.
+    # Spec: docs/superpowers/specs/2026-08-06-devflow-delegation-plane-design.md.
+    # Icons are deliberately disjoint from the PR/build set above so an
+    # operator scanning devflow_firehose can tell a *delegation* signal from
+    # an *SDLC* one: 🎫 work arrives, 🏷️ triaged, 🗺️ planned. The two
+    # flood-control outcomes read as "nothing new" (👯 dupe, 🔇 suppressed)
+    # and stay visually quieter than 🙅, which is a real decision.
+    EventType.DEVFLOW_WORK_REQUESTED:   "🎫",
     EventType.DEVFLOW_WORK_TRIAGED:     "🏷️",
     EventType.DEVFLOW_WORK_PLANNED:     "🗺️",
     EventType.DEVFLOW_WORK_DUPLICATE:   "👯",
     EventType.DEVFLOW_WORK_DECLINED:    "🙅",
-    EventType.DEVFLOW_WORK_SUPPRESSED:  "🔕",
-    EventType.DEVFLOW_MERGE_PENDING:    "⏳",
-    # Distinct from DEVFLOW_PR_MERGED's 🟣: that is a GitHub PR merging,
-    # these are the devflow pipeline's own merge outcomes.
-    EventType.DEVFLOW_MERGED:           "🔀",
+    EventType.DEVFLOW_WORK_SUPPRESSED:  "🔇",
+    # Merge/deploy (Stage 2/3). 🚦 = gated waiting for green; 🧩 = the pieces
+    # fit (distinct from 🟣 devflow.pr_merged, which is the *PR* event, and
+    # from 🔀 CODE_DRIFT); 🤖 marks the merge that happened with no human
+    # gate, which is why routing_policy gives it WARN and not INFO.
+    EventType.DEVFLOW_MERGE_PENDING:    "🚦",
+    EventType.DEVFLOW_MERGED:           "🧩",
     EventType.DEVFLOW_AUTO_MERGED:      "🤖",
-    EventType.DEVFLOW_DEPLOY_STARTED:   "🚀",
-    EventType.DEVFLOW_DEPLOYED:         "🛰️",
-    EventType.DEVFLOW_DEPLOY_FAILED:    "💔",
+    EventType.DEVFLOW_DEPLOY_STARTED:   "🛫",
+    EventType.DEVFLOW_DEPLOYED:         "🛬",
+    # Siren, not 🧨/💥/❌ — those are build/cron/application failures; a failed
+    # deploy is the one that escalates to WhatsApp (WA_URGENT).
+    EventType.DEVFLOW_DEPLOY_FAILED:    "🚨",
     # Notification delivery reverse-signal (2026-04-30) — visibility
     # for whether a notification reached the user. Distinct from generic
     # green/red so an operator scanning watchdog_alerts can tell a
