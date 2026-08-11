@@ -139,6 +139,7 @@ def create_swarm(
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
+    not_before: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
@@ -161,6 +162,7 @@ def create_swarm(
             created_by=created_by,
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
+            not_before=not_before,
             priority=priority,
             idempotency_key=idempotency_key,
         )
@@ -210,6 +212,7 @@ def _create_swarm_uncommitted(
     created_by: str = "swarm-orchestrator",
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
+    not_before: Optional[str] = None,
     priority: int = 0,
     idempotency_key: Optional[str] = None,
 ) -> SwarmCreated:
@@ -279,6 +282,7 @@ def _create_swarm_uncommitted(
             priority=spec.priority or priority,
             workspace_kind=workspace_kind,
             workspace_path=workspace_path,
+            not_before=not_before,
             skills=spec.skills or None,
             max_runtime_seconds=spec.max_runtime_seconds,
         )
