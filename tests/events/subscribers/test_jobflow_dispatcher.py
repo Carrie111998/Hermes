@@ -10,6 +10,8 @@ operator opts in via HERMES_JOBFLOW_EVENT_DISPATCH.
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from events.schema import Event, EventType, Priority
@@ -288,3 +290,80 @@ class TestShadowNeverTouchesTheLedger:
         d._dispatch(_event())  # must not raise, and must not reach a write
 
         assert woken == []
+
+class _ReleaseFails:
+    """Claims succeed, releases do not — an orphan claim, manufactured."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.lease_seconds = inner.lease_seconds
+
+    def get(self, message_key, activity_id):
+        return self._inner.get(message_key, activity_id)
+
+    def claim(self, *a, **kw):
+        return self._inner.claim(*a, **kw)
+
+    def release(self, *a, **kw):
+        raise sqlite3.OperationalError("database is locked")
+
+
+class TestOrphanClaimIsLoud:
+    """A failed release is the one dispatcher fault that costs work, not latency.
+
+    Everywhere else the reconciler is the safety net, so a dropped wake is just
+    a delay. Not here: the claim committed, so the reconciler SKIPS the message,
+    and no worker was woken. It stays invisible for a full lease. Swallowing the
+    exception is right for loop stability; swallowing it quietly is not.
+    """
+
+    def test_the_failure_is_greppable_by_a_stable_marker(self, store, woken, caplog):
+        import logging
+
+        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
+        with caplog.at_level(logging.ERROR):
+            d.handle(_event())
+
+        assert JobFlowDispatcher.ORPHAN_MARKER in caplog.text
+
+    def test_it_names_the_work_and_the_cost(self, store, woken, caplog):
+        """Which message, which activity, and how long it is invisible."""
+        import logging
+
+        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
+        with caplog.at_level(logging.ERROR):
+            d.handle(_event())
+
+        assert "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json" in caplog.text
+        assert "jobflow.tailor.generate" in caplog.text
+        assert "900" in caplog.text, "the lease is how long the work stays hidden"
+
+    def test_it_is_logged_at_error_not_warning(self, store, woken, caplog):
+        """Warning is for a wake that was merely refused; this one loses work."""
+        import logging
+
+        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
+        with caplog.at_level(logging.DEBUG):
+            d.handle(_event())
+
+        orphan = [r for r in caplog.records
+                  if JobFlowDispatcher.ORPHAN_MARKER in r.getMessage()]
+        assert orphan and all(r.levelno >= logging.ERROR for r in orphan)
+
+    def test_a_release_fault_still_never_stalls_the_loop(self, store, woken):
+        """Loudness must not come at the cost of the fail-closed guarantee."""
+        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
+
+        d._dispatch(_event())  # must not raise
+
+        assert woken == []
+
+    def test_a_successful_release_says_nothing(self, store, woken, caplog):
+        """No marker on the happy path, or grepping for it finds noise."""
+        import logging
+
+        d = _dispatcher(store, woken, resolver=lambda a: None)
+        with caplog.at_level(logging.DEBUG):
+            d.handle(_event())
+
+        assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text

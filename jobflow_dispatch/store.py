@@ -108,11 +108,41 @@ def _timestamp(value: Any) -> float:
     return float(value)
 
 
+def _lease(value: Any) -> int | float:
+    """Reject a lease that cannot do its job, at construction.
+
+    A bad lease does not fail where you would look for it. A string fails as a
+    TypeError deep inside ``claim``'s comparison; ``True`` silently becomes a
+    one-second lease and every redelivery re-dispatches. Both read as "dedupe is
+    behaving oddly" rather than as a config error.
+
+    The upper bound is the load-bearing one. A claim is invisible to
+    ``scan_actionable`` until its lease lapses, so a lease that reaches
+    ``RECONCILER_PERIOD_SECONDS`` can hide genuinely stranded work across an
+    entire recovery window — the safety net stops being a safety net, silently.
+
+    This guard is 1x the window (reject only the provably broken); the 2x margin
+    asserted in tests applies to the SHIPPED DEFAULT, a stricter question than
+    what any ad-hoc store may be built with. The mismatch is deliberate.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("lease_seconds must be a positive number")
+    if value <= 0:
+        raise ValueError(f"lease_seconds must be positive, got {value}")
+    if value >= RECONCILER_PERIOD_SECONDS:
+        raise ValueError(
+            f"lease_seconds {value} >= the reconciler period "
+            f"{RECONCILER_PERIOD_SECONDS}s: a claim could hide stranded work "
+            "across a full recovery window"
+        )
+    return value
+
+
 class ActivationStore:
     def __init__(self, db_path: Path, lease_seconds: int = DEFAULT_LEASE_SECONDS) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.lease_seconds = lease_seconds
+        self.lease_seconds = _lease(lease_seconds)
         self._local = threading.local()
         self._write_lock = threading.Lock()
         conn = self._get_conn()

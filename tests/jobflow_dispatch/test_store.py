@@ -303,3 +303,57 @@ class TestIsAvailableIsTheOnlyPredicate:
 
         assert reconcile.is_available is is_available
         assert not hasattr(reconcile, "_is_available")
+
+class TestLeaseIsValidatedAtConstruction:
+    """The lease was the one unvalidated input in a module that checks everything.
+
+    A bad value does not fail loudly here — it fails as a wrong comparison
+    inside claim(), which reads as "dedupe is behaving oddly" rather than as a
+    config error. And an oversized one silently blinds the reconciler, which is
+    the failure this whole guard exists to prevent.
+    """
+
+    def test_the_shipped_default_is_accepted(self, tmp_path):
+        from jobflow_dispatch.store import DEFAULT_LEASE_SECONDS
+
+        store = ActivationStore(tmp_path / "d.db")
+        assert store.lease_seconds == DEFAULT_LEASE_SECONDS
+
+    @pytest.mark.parametrize("bad", [0, -1, -900])
+    def test_non_positive_is_rejected(self, tmp_path, bad):
+        with pytest.raises(ValueError, match="lease_seconds"):
+            ActivationStore(tmp_path / "d.db", lease_seconds=bad)
+
+    @pytest.mark.parametrize("bad", ["900", None, True, False])
+    def test_non_numeric_is_rejected(self, tmp_path, bad):
+        """True would otherwise pass as 1 — a one-second lease on every claim."""
+        with pytest.raises(ValueError, match="lease_seconds"):
+            ActivationStore(tmp_path / "d.db", lease_seconds=bad)
+
+    def test_a_lease_that_can_span_a_recovery_window_is_rejected(self, tmp_path):
+        from jobflow_dispatch.store import RECONCILER_PERIOD_SECONDS
+
+        with pytest.raises(ValueError, match="reconciler"):
+            ActivationStore(tmp_path / "d.db",
+                            lease_seconds=RECONCILER_PERIOD_SECONDS)
+
+    def test_the_runtime_guard_is_1x_while_the_default_policy_is_2x(self, tmp_path):
+        """Deliberate mismatch — do not "fix" it by tightening this to 2x.
+
+        The runtime guard rejects only the PROVABLY broken: a lease that can
+        hide work across a full reconciler window. The 2x margin in
+        TestLeaseFitsInsideTheRecoveryWindow is a policy on the SHIPPED DEFAULT,
+        which is a stricter question than what any ad-hoc store may be built
+        with. A near-boundary value must stay constructible so tests can
+        exercise the boundary.
+        """
+        from jobflow_dispatch.store import RECONCILER_PERIOD_SECONDS
+
+        store = ActivationStore(tmp_path / "d.db",
+                                lease_seconds=RECONCILER_PERIOD_SECONDS - 1)
+        assert store.lease_seconds == RECONCILER_PERIOD_SECONDS - 1
+
+    def test_a_float_lease_is_accepted(self, tmp_path):
+        """Only bool is special-cased; the value is used in numeric comparison."""
+        store = ActivationStore(tmp_path / "d.db", lease_seconds=900.5)
+        assert store.lease_seconds == 900.5

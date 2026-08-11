@@ -91,6 +91,13 @@ class JobFlowDispatcher(BaseSubscriber):
     poll_interval_seconds = 5
     event_types = [EventType.MAILBOX_MESSAGE]
 
+    #: Grep marker for a claim that committed but could not be handed back.
+    #: Distinct from every other dispatcher failure because it is the only one
+    #: that strands real work: the message is invisible to BOTH activation paths
+    #: until its lease lapses. Nothing else reports it, so this string is the
+    #: only trace it leaves.
+    ORPHAN_MARKER = "ORPHAN_CLAIM"
+
     def __init__(
         self,
         bus: Any,
@@ -205,4 +212,17 @@ class JobFlowDispatcher(BaseSubscriber):
         try:
             self.store.release(key, activity_id)
         except Exception:
-            logger.exception("dispatch: releasing claim %s/%s failed", key, activity_id)
+            # Swallowed to keep the subscriber loop alive — but this is the ONE
+            # dispatcher fault that costs work rather than latency. Everywhere
+            # else a dropped wake just waits for the reconciler; here the claim
+            # committed, so the reconciler SKIPS the message and nothing woke
+            # it. Logged with a stable marker so the stranded work can be found
+            # afterwards, since nothing else will report it.
+            logger.exception(
+                "dispatch: %s %s (%s) — claim committed but could not be "
+                "released; invisible to the reconciler for up to %ss",
+                self.ORPHAN_MARKER,
+                key,
+                activity_id,
+                getattr(self.store, "lease_seconds", "?"),
+            )
