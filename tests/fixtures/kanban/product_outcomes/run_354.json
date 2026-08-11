@@ -1,0 +1,27 @@
+{
+  "id": 354,
+  "task_id": "t_922b1d08",
+  "epic_id": "t_a0c4e8c9",
+  "step_key": "test",
+  "status": "completed",
+  "outcome": "preflight_repaired",
+  "summary": "Apply the explicitly authorized smallest task-local repair: route this same card back to Development so its candidate can be refreshed onto the current epic tip and the additive test changes can be preserved as a union. The Work Contract, project, workspace, branch, relationships, and prior evidence remain unchanged; a new immutable SHA must subsequently pass independent Test and Review.",
+  "metadata": {
+    "resolver": {
+      "profile": "resolver",
+      "model": null
+    },
+    "fault_domain": "task_state",
+    "diagnosis": "The recorded candidate SHA 7c5bead38c600a77cb6aa4dffbe26f10b6c0e4c7 was cut from stale base 2d9dc9a and conflicts with the current epic integration in tests/test_paperclip_client.py, so the existing Test phase cannot validly continue against that immutable candidate.",
+    "reason": "Apply the explicitly authorized smallest task-local repair: route this same card back to Development so its candidate can be refreshed onto the current epic tip and the additive test changes can be preserved as a union. The Work Contract, project, workspace, branch, relationships, and prior evidence remain unchanged; a new immutable SHA must subsequently pass independent Test and Review.",
+    "executor": {
+      "profile": "resolver",
+      "provider": "openai-codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "surface": "hermes-primary",
+      "source": "dispatcher",
+      "version": 1
+    }
+  }
+}

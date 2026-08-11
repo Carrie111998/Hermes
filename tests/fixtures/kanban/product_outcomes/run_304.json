@@ -1,0 +1,74 @@
+{
+  "id": 304,
+  "task_id": "t_a67e6506",
+  "epic_id": "t_4cccacd1",
+  "step_key": "review",
+  "status": "completed",
+  "outcome": "advanced",
+  "summary": "Independent Review of candidate 8a87ba9 (base 48fc638): the ledger retirement itself is correct and verified — no company-view key reaches a retired ledger, the Paperclip mapper's residual local_* parameters are inert, research-domain reads are preserved, and the poison-ledger/no-fallback regressions are real. Returned to Development for two defects inside this card's own delta: dashboard.py:1899 still tells the user the org panel is loaded from config/company_structure.json (a claim this card made false by deleting that reader, with no source/degraded indicator on the section), and the parent's named fail-closed test test_unconfigured_paperclip_is_explicitly_degraded_without_local_fallback was absorbed into tests/test_truthful_paperclip_states.py:139-203 so its assertions now only run if an unrelated scenario passes first. Full findings in comment 324.</summary>\n<parameter name=\"workflow_outcome\">{\"verdict\": \"changes_requested\", \"target_step\": \"development\", \"findings\": [\"trading_company/dashboard.py:1899 renders \\\"Org chart, departments, routines, gates, and goal-to-artifact hierarchy loaded from config/company_structure.json\\\" for the #org-control section. This card deleted _company_structure_view(), so company_structure now comes only from Paperclip and that sentence is unconditionally false; _org_control_html() (:1054-1093) shows no source or degraded indicator, so an unreachable-Paperclip cockpit renders an empty org panel that blames a local config file instead of showing the visible Paperclip failure parent t_e83e0e13 delivered. Fix: name Paperclip as the source and surface company_view[\\\"status\\\"]/reason.code in that section, and assert the rendered section no longer names config/company_structure.json.\", \"tests/test_truthful_paperclip_states.py:139-203 removed the named test test_unconfigured_paperclip_is_explicitly_degraded_without_local_fallback and appended its body to the new test_reachable_paperclip_never_consults_retired_company_readers. Dropping the mock.patch guards for the now-deleted _company_structure_view/_handoff_board_view/_operating_cadence_view/_build_work_board was necessary, but fusing the scenarios means the unconfigured/degraded path, client_class.assert_not_called(), the zero-state assertions at :192-199 and the research-preservation assertion at :203 only execute if the reachable-Paperclip scenario at :140-169 passes first, and failures report under a name that does not describe them. Fix: split :171-203 back into its own test method under the original name; no assertion changes needed.\"]}",
+  "metadata": {
+    "ai_provenance": {
+      "reviewer": {
+        "agent": "claude-cli",
+        "provider": "claude-cli",
+        "model": "opus",
+        "profile": "reviewer",
+        "effort": "high",
+        "surface": "claude-cli",
+        "verdict": "changes_requested",
+        "reviewed_branch": "the-trading-company/t_a67e6506-retire-company-view-ledger-reads",
+        "reviewed_commit": "8a87ba9178d9eebbde4759f1cd5b92edfc9ea10d"
+      },
+      "writer": {
+        "agent": "openai-codex",
+        "provider": "openai-codex",
+        "model": "gpt-5.6-sol",
+        "profile": "resolver",
+        "effort": "high",
+        "surface": "hermes-primary"
+      }
+    },
+    "reviewed_commit": "8a87ba9178d9eebbde4759f1cd5b92edfc9ea10d",
+    "base_commit": "48fc638b32acce2a4b11fabd1e56907c8b3c986d",
+    "merge_parents": [
+      "83b4104036a573fd57188ed7cc7178bbfad8ab88",
+      "48fc638b32acce2a4b11fabd1e56907c8b3c986d"
+    ],
+    "branch": "the-trading-company/t_a67e6506-retire-company-view-ledger-reads",
+    "worktree": "/Users/cloudadvisor/.hermes/projects/The Trading Company/.worktrees/t_a67e6506",
+    "verdict": "changes_requested",
+    "review_comment_id": 324,
+    "changed_files_reviewed": 26,
+    "source_files_reviewed": [
+      "trading_company/dashboard.py",
+      "tests/test_truthful_paperclip_states.py",
+      "tests/test_trading_company.py",
+      "tests/test_paperclip_company_view.py"
+    ],
+    "acceptance_criteria_verified": {
+      "ac2_no_company_key_reaches_retired_ledger": "pass",
+      "ac3_no_counterpart_blocks_explicit_zero_state": "pass",
+      "ac4_research_domain_preserved": "pass",
+      "ac5_poison_ledger_regression": "pass",
+      "ac6_no_fallback_regression": "pass",
+      "ac7_search_evidence": "pass",
+      "ac1_reconciled_onto_epic_base": "pass"
+    },
+    "tests_run": 0,
+    "tests_status": "not re-run; read-only Reviewer. Tester evidence (32/32 focused, 188/188 full, 9/9 AGENTS.md commands exit 0) inspected and found consistent with the diff.",
+    "source_edits_by_review": 0,
+    "findings_count": 2,
+    "independence": "reviewer provider claude-cli differs from writer provider openai-codex",
+    "review_base_sha": "48fc638b32acce2a4b11fabd1e56907c8b3c986d",
+    "review_head_sha": "8a87ba9178d9eebbde4759f1cd5b92edfc9ea10d",
+    "executor": {
+      "effort": "high",
+      "model": "opus",
+      "profile": "reviewer",
+      "provider": "claude-cli",
+      "source": "dispatcher",
+      "surface": "claude-cli",
+      "version": 1
+    }
+  }
+}

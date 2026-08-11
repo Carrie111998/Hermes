@@ -1,0 +1,27 @@
+{
+  "id": 369,
+  "task_id": "t_922b1d08",
+  "epic_id": "t_a0c4e8c9",
+  "step_key": "test",
+  "status": "completed",
+  "outcome": "preflight_repaired",
+  "summary": "Apply the smallest task-local workflow repair: return the existing card to Development so it can refresh onto the current Epic tip, preserve the union of additive client tests, ensure every unavailable daily_brief has a typed reason, and fail loudly with routine_id_not_found when any configured beat routine lacks a same-day issue. A new immutable SHA must then receive independent Test and Review; no push or deployment is authorized.",
+  "metadata": {
+    "resolver": {
+      "profile": "resolver",
+      "model": null
+    },
+    "fault_domain": "task_state",
+    "diagnosis": "The Test preflight is correctly blocking candidate 10737af3f7f2b5be5baeb002473ce35591532940: recorded evidence says it remains based on stale pre-Epic history and does not address the two repeated Review findings. Ole explicitly authorized routing this same card back to Development while preserving its contract and identity.",
+    "reason": "Apply the smallest task-local workflow repair: return the existing card to Development so it can refresh onto the current Epic tip, preserve the union of additive client tests, ensure every unavailable daily_brief has a typed reason, and fail loudly with routine_id_not_found when any configured beat routine lacks a same-day issue. A new immutable SHA must then receive independent Test and Review; no push or deployment is authorized.",
+    "executor": {
+      "profile": "resolver",
+      "provider": "openai-codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high",
+      "surface": "hermes-primary",
+      "source": "dispatcher",
+      "version": 1
+    }
+  }
+}
