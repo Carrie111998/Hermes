@@ -2398,6 +2398,9 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
+        _cache_read_tokens = getattr(child, "session_cache_read_tokens", 0)
+        _cache_write_tokens = getattr(child, "session_cache_write_tokens", 0)
+        _reasoning_tokens = getattr(child, "session_reasoning_tokens", 0)
         _model = getattr(child, "model", None)
 
         entry: Dict[str, Any] = {
@@ -2416,6 +2419,21 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
+            "cache_read_tokens": (
+                _cache_read_tokens
+                if isinstance(_cache_read_tokens, (int, float))
+                else 0
+            ),
+            "cache_write_tokens": (
+                _cache_write_tokens
+                if isinstance(_cache_write_tokens, (int, float))
+                else 0
+            ),
+            "reasoning_tokens": (
+                _reasoning_tokens
+                if isinstance(_reasoning_tokens, (int, float))
+                else 0
+            ),
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
@@ -2477,7 +2495,6 @@ def _run_single_child(
         # pane + accordion rollups (features 1, 2, 4).  All fields are
         # optional — missing data degrades gracefully on the client.
         _cost_usd = getattr(child, "session_estimated_cost_usd", None)
-        _reasoning_tokens = getattr(child, "session_reasoning_tokens", 0)
         try:
             _files_read = list(file_state.known_reads(child_task_id))[:40]
         except Exception:
@@ -2751,6 +2768,73 @@ def _finalize_child_results(
                     parent_agent.session_cost_status = "estimated"
             except Exception:
                 logger.debug("Subagent cost rollup failed", exc_info=True)
+
+        # ── Token rollup: fold child token spend into the parent's session
+        # accumulators ──────────────────────────────────────────────────────
+        # Same idea as the cost rollup above, for tokens. The parent's
+        # session_* counters are the single source of truth for turn totals
+        # (run_stats in cron/scheduler.py, /insights, TUI), so children must
+        # be folded in here at completion time. Previously the cron stats
+        # layer tried to re-parse delegate results back out of the parent's
+        # message history — a design that silently dropped children whenever
+        # context compression summarized/truncated the (large) delegate tool
+        # result JSON in place, undercounting subagent-heavy runs by ~2/3.
+        #
+        # Field mapping mirrors agent/conversation_loop.py's per-call
+        # accumulation on the child, so the parent's totals read exactly as
+        # if the child's API calls had been the parent's own:
+        #   prompt_tokens (cache-inclusive)  <- child session_prompt_tokens
+        #   completion_tokens                <- child session_completion_tokens
+        #   total_tokens                     <- prompt + completion
+        #   input_tokens (canonical, cache-excluded) <- prompt - cache
+        #   output_tokens                    <- completion
+        #   cache_read/write, reasoning      <- child's own counters
+        # Entries without a ``tokens`` dict (interrupted/fabricated) fold
+        # zero, matching the old parser's behavior.
+        if parent_agent is not None:
+            try:
+                for _entry in results:
+                    if not isinstance(_entry, dict):
+                        continue
+                    _tok = _entry.get("tokens")
+                    if not isinstance(_tok, dict):
+                        continue
+                    try:
+                        _in = int(_tok.get("input", 0) or 0)
+                        _out = int(_tok.get("output", 0) or 0)
+                    except (TypeError, ValueError):
+                        _in = 0
+                        _out = 0
+                    _cache_read = int(_entry.get("cache_read_tokens", 0) or 0)
+                    _cache_write = int(_entry.get("cache_write_tokens", 0) or 0)
+                    _reasoning = int(_entry.get("reasoning_tokens", 0) or 0)
+                    _in_canonical = max(0, _in - _cache_read - _cache_write)
+                    parent_agent.session_prompt_tokens = int(
+                        getattr(parent_agent, "session_prompt_tokens", 0) or 0
+                    ) + _in
+                    parent_agent.session_completion_tokens = int(
+                        getattr(parent_agent, "session_completion_tokens", 0) or 0
+                    ) + _out
+                    parent_agent.session_total_tokens = int(
+                        getattr(parent_agent, "session_total_tokens", 0) or 0
+                    ) + _in + _out
+                    parent_agent.session_input_tokens = int(
+                        getattr(parent_agent, "session_input_tokens", 0) or 0
+                    ) + _in_canonical
+                    parent_agent.session_output_tokens = int(
+                        getattr(parent_agent, "session_output_tokens", 0) or 0
+                    ) + _out
+                    parent_agent.session_cache_read_tokens = int(
+                        getattr(parent_agent, "session_cache_read_tokens", 0) or 0
+                    ) + _cache_read
+                    parent_agent.session_cache_write_tokens = int(
+                        getattr(parent_agent, "session_cache_write_tokens", 0) or 0
+                    ) + _cache_write
+                    parent_agent.session_reasoning_tokens = int(
+                        getattr(parent_agent, "session_reasoning_tokens", 0) or 0
+                    ) + _reasoning
+            except Exception:
+                logger.debug("Subagent token rollup failed", exc_info=True)
 
 
 def _run_child_lifecycle(
