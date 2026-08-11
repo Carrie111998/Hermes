@@ -6,6 +6,8 @@ Usage:
     result = transport.normalize_response(raw_response)
 """
 
+import threading
+
 from agent.transports.types import (
     NormalizedResponse,
     ToolCall,
@@ -16,6 +18,7 @@ from agent.transports.types import (
 
 _REGISTRY: dict = {}
 _discovered: bool = False
+_DISCOVERY_LOCK = threading.Lock()
 
 
 def register_transport(api_mode: str, transport_cls: type) -> None:
@@ -30,7 +33,6 @@ def get_transport(api_mode: str):
     This allows gradual migration — call sites can check for None
     and fall back to the legacy code path.
     """
-    global _discovered
     if not _discovered:
         _discover_transports()
     cls = _REGISTRY.get(api_mode)
@@ -49,20 +51,32 @@ def get_transport(api_mode: str):
 def _discover_transports() -> None:
     """Import all transport modules to trigger auto-registration."""
     global _discovered
-    _discovered = True
-    try:
-        import agent.transports.anthropic  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.codex  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.chat_completions  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.bedrock  # noqa: F401
-    except ImportError:
-        pass
+
+    if _discovered:
+        return
+
+    with _DISCOVERY_LOCK:
+        if _discovered:
+            return
+
+        try:
+            import agent.transports.anthropic  # noqa: F401
+        except ImportError:
+            pass
+        try:
+            import agent.transports.codex  # noqa: F401
+        except ImportError:
+            pass
+        try:
+            import agent.transports.chat_completions  # noqa: F401
+        except ImportError:
+            pass
+        try:
+            import agent.transports.bedrock  # noqa: F401
+        except ImportError:
+            pass
+
+        # Mark discovery complete only after all registration imports finish.
+        # This prevents concurrent callers from observing a partially populated
+        # registry and is safe on both GIL and free-threaded Python builds.
+        _discovered = True
