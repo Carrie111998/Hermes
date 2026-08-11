@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -492,12 +493,47 @@ class GatewayKanbanWatchersMixin:
                             # first-class review lane. Wake the origin thread
                             # and surface Approve/Reject buttons.
                             needs_review_buttons = True
-                            handoff = ""
-                            if ev.payload and ev.payload.get("summary"):
-                                handoff = f"\n{str(ev.payload['summary'])[:200]}"
+                            review_metadata = (
+                                ev.payload.get("metadata", {})
+                                if isinstance(ev.payload, dict)
+                                else {}
+                            )
+                            if not isinstance(review_metadata, dict):
+                                review_metadata = {}
+
+                            def review_value(*keys: str) -> str:
+                                for key in keys:
+                                    value = review_metadata.get(key)
+                                    if value is None or value == "":
+                                        continue
+                                    if isinstance(value, (list, tuple)):
+                                        return "\n".join(f"- {item}" for item in value)
+                                    if isinstance(value, dict):
+                                        return json.dumps(value, sort_keys=True)
+                                    return str(value)
+                                return "Not supplied — do not approve until this is provided."
+
+                            handoff = review_value("summary")
+                            if handoff.startswith("Not supplied") and ev.payload and ev.payload.get("summary"):
+                                handoff = str(ev.payload["summary"])
+                            owner = task.assignee if task and task.assignee else "unassigned"
+                            location_id = str(sub.get("thread_id") or sub["chat_id"])
                             msg = (
-                                f"👀 {board_tag}{tag}Kanban {sub['task_id']} ready for review"
-                                f" — {title}{handoff}"
+                                "👀 Kanban review\n"
+                                f"Card: {sub['task_id']}\n"
+                                f"Run: {getattr(ev, 'run_id', None) or 'unknown'}\n"
+                                f"Status: review\n"
+                                f"Owner: {owner}\n"
+                                "Current step: Awaiting decision\n"
+                                f"Last update: {getattr(ev, 'created_at', 'unknown')}\n"
+                                "Blocker: none\n"
+                                "Next action: Click Approve or Reject\n"
+                                f"Location: this message in <#{location_id}>\n\n"
+                                f"Summary:\n{handoff}\n\n"
+                                f"Proposed change:\n{review_value('proposed_change', 'change', 'diff')}\n\n"
+                                f"Tests:\n{review_value('tests', 'tests_run', 'verification')}\n\n"
+                                f"Risks:\n{review_value('risks')}\n\n"
+                                f"Rollback:\n{review_value('rollback')}"
                             )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the

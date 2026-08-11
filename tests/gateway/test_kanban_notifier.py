@@ -535,7 +535,16 @@ def test_notifier_review_requested_carries_kanban_review_metadata(tmp_path, monk
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         # request_review emits a review_requested event with a run_id
         assert kb.request_review(
-            conn, tid, summary="ready for eyes", force=True,
+            conn,
+            tid,
+            summary="ready for eyes",
+            metadata={
+                "proposed_change": "Replace the old approval path with exact-run buttons.",
+                "tests": ["pytest -q tests/gateway/test_kanban_notifier.py"],
+                "risks": ["A stale button must not change a later review."],
+                "rollback": "Revert the feature commit.",
+            },
+            force=True,
         )
     finally:
         conn.close()
@@ -552,6 +561,15 @@ def test_notifier_review_requested_carries_kanban_review_metadata(tmp_path, monk
     text = adapter.sent[0]["text"]
     assert tid in text
     assert "review" in text.lower()
+    assert "Card:" in text
+    assert "Run:" in text
+    assert "Status: review" in text
+    assert "Current step: Awaiting decision" in text
+    assert "Next action: Click Approve or Reject" in text
+    assert "Replace the old approval path" in text
+    assert "pytest -q tests/gateway/test_kanban_notifier.py" in text
+    assert "A stale button" in text
+    assert "Revert the feature commit" in text
 
     kanban_review = adapter.sent[0]["metadata"].get("kanban_review")
     assert isinstance(kanban_review, dict), (

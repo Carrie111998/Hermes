@@ -6290,6 +6290,7 @@ def request_review(
             "review_requested",
             {
                 "summary": event_summary or None,
+                "metadata": metadata or {},
                 "implementer": implementer,
                 "reviewer": reviewer,
             },
