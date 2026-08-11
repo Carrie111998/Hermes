@@ -8,11 +8,13 @@ import {
   desktopFsCacheKey,
   desktopGitRoot,
   readDesktopDir,
+  readDesktopDrawingFileText,
   readDesktopFileDataUrl,
   readDesktopFileDataUrlLocalFirst,
   readDesktopFileText,
   selectDesktopPaths,
-  setDesktopFsRemotePicker
+  setDesktopFsRemotePicker,
+  writeDesktopDrawingFileText
 } from './desktop-fs'
 
 const readDir = vi.fn(async () => ({ entries: [{ name: 'local', path: '/local', isDirectory: true }] }))
@@ -27,7 +29,7 @@ const api = vi.fn(async ({ path }: { path: string }) => {
   }
 
   if (path.startsWith('/api/fs/read-text?')) {
-    return { path: '/remote/file.txt', text: 'remote', byteSize: 6 }
+    return { path: '/remote/file.txt', text: 'remote', byteSize: 6, fingerprint: 'remote-fingerprint' }
   }
 
   if (path.startsWith('/api/fs/read-data-url?')) {
@@ -40,6 +42,10 @@ const api = vi.fn(async ({ path }: { path: string }) => {
 
   if (path === '/api/fs/default-cwd') {
     return { cwd: '/backend/project', branch: 'main' }
+  }
+
+  if (path === '/api/fs/write-text') {
+    return { fingerprint: 'written-fingerprint', ok: true, path: '/remote/file.txt' }
   }
 
   if (path.startsWith('/api/git/file-diff?')) {
@@ -142,6 +148,87 @@ describe('desktop filesystem facade', () => {
 
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/list?path=%2Fsrv%2Fproject', profile: 'remote-docker' })
     expect(api).toHaveBeenCalledWith({ path: '/api/fs/default-cwd', profile: 'remote-docker' })
+  })
+
+  it('routes drawing reads and compare-and-swap writes through the identity backend', async () => {
+    const drawing = {
+      path: '/srv/project/design.excalidraw',
+      profile: 'remote-docker',
+      runtime: 'remote:ssh:remote-docker:owner-a'
+    }
+    $connection.set({
+      mode: 'remote',
+      profile: 'remote-docker',
+      remoteIdentity: 'owner-a',
+      remoteKind: 'ssh'
+    } as never)
+
+    await expect(readDesktopDrawingFileText(drawing)).resolves.toMatchObject({
+      fingerprint: 'remote-fingerprint',
+      text: 'remote'
+    })
+    await expect(writeDesktopDrawingFileText(drawing, '{"type":"excalidraw"}', 'remote-fingerprint')).resolves.toMatchObject({
+      fingerprint: 'written-fingerprint',
+      path: '/remote/file.txt'
+    })
+
+    expect(api).toHaveBeenCalledWith({
+      path: '/api/fs/read-text?path=%2Fsrv%2Fproject%2Fdesign.excalidraw',
+      profile: 'remote-docker'
+    })
+    expect(api).toHaveBeenCalledWith({
+      body: {
+        content: '{"type":"excalidraw"}',
+        expected_fingerprint: 'remote-fingerprint',
+        path: '/srv/project/design.excalidraw'
+      },
+      method: 'POST',
+      path: '/api/fs/write-text',
+      profile: 'remote-docker'
+    })
+    expect(readFileText).not.toHaveBeenCalled()
+  })
+
+  it('keeps local drawing writes on the backend compare-and-swap boundary', async () => {
+    const drawing = { path: '/work/design.excalidraw', profile: 'default', runtime: 'local' }
+    $connection.set({ mode: 'local' } as never)
+
+    await expect(
+      writeDesktopDrawingFileText(drawing, '{"type":"excalidraw"}', 'local-fingerprint')
+    ).resolves.toMatchObject({
+      fingerprint: 'written-fingerprint'
+    })
+
+    expect(api).toHaveBeenCalledWith({
+      body: {
+        content: '{"type":"excalidraw"}',
+        expected_fingerprint: 'local-fingerprint',
+        path: '/work/design.excalidraw'
+      },
+      method: 'POST',
+      path: '/api/fs/write-text',
+      profile: 'default'
+    })
+    expect(readFileText).not.toHaveBeenCalled()
+  })
+
+  it('blocks an inactive drawing identity instead of routing it through another filesystem connection', async () => {
+    const drawing = {
+      path: '/srv/project/design.excalidraw',
+      profile: 'remote-docker',
+      runtime: 'remote:ssh:remote-docker:owner-a'
+    }
+    $connection.set({
+      mode: 'remote',
+      profile: 'other-profile',
+      remoteIdentity: 'owner-b',
+      remoteKind: 'ssh'
+    } as never)
+
+    await expect(writeDesktopDrawingFileText(drawing, '{"type":"excalidraw"}', 'remote-fingerprint')).rejects.toThrow(
+      'Drawing filesystem is no longer active'
+    )
+    expect(api).not.toHaveBeenCalled()
   })
 
   it('keys SSH filesystem caches by stable host identity instead of the forwarded port', () => {

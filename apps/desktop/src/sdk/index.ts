@@ -470,6 +470,7 @@ export { type GrabScroll, useGrabScroll } from '@/hooks/use-grab-scroll'
  *  `ctx.i18n.register` let a plugin ship its OWN locale bundles, scoped like
  *  `ctx.storage` and resolved against the app's active locale — no core edit. */
 export {
+  type Locale,
   type PluginI18n,
   type PluginLocaleBundles,
   type PluginMessages,

@@ -1,4 +1,10 @@
-import { isDesktopFsRemoteMode, readDesktopFileText, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
+import {
+  isDesktopFsRemoteMode,
+  isDesktopFsWriteConflict,
+  readDesktopDrawingFileText,
+  selectDesktopPaths,
+  writeDesktopDrawingFileText
+} from '@/lib/desktop-fs'
 
 import type { ExcalidrawDocumentIdentity } from './identity'
 
@@ -29,7 +35,9 @@ function parseDrawing(text: string): Omit<LoadedDrawing, 'fingerprint' | 'identi
     throw new Error('Invalid Excalidraw document')
   }
 
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {throw new Error('Invalid Excalidraw document')}
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('Invalid Excalidraw document')
+  }
   const envelope = parsed as Record<string, unknown>
 
   if (envelope.type !== 'excalidraw' || envelope.version !== 2 || !Array.isArray(envelope.elements)) {
@@ -39,17 +47,29 @@ function parseDrawing(text: string): Omit<LoadedDrawing, 'fingerprint' | 'identi
   const appState = envelope.appState === undefined ? {} : envelope.appState
   const files = envelope.files === undefined ? {} : envelope.files
 
-  if (!appState || typeof appState !== 'object' || Array.isArray(appState) || !files || typeof files !== 'object' || Array.isArray(files)) {
+  if (
+    !appState ||
+    typeof appState !== 'object' ||
+    Array.isArray(appState) ||
+    !files ||
+    typeof files !== 'object' ||
+    Array.isArray(files)
+  ) {
     throw new Error('Invalid Excalidraw document')
   }
 
-  return { appState: appState as Record<string, unknown>, elements: envelope.elements, envelope, files: files as Record<string, unknown> }
+  return {
+    appState: appState as Record<string, unknown>,
+    elements: envelope.elements,
+    envelope,
+    files: files as Record<string, unknown>
+  }
 }
 
 export async function loadDrawing(identity: ExcalidrawDocumentIdentity): Promise<LoadedDrawing> {
-  const result = await readDesktopFileText(identity.path)
+  const result = await readDesktopDrawingFileText(identity)
 
-  return { ...parseDrawing(result.text), fingerprint: result.text, identity }
+  return { ...parseDrawing(result.text), fingerprint: result.fingerprint, identity }
 }
 
 export class DrawingController {
@@ -74,7 +94,11 @@ export class DrawingController {
     return () => this.listeners.delete(listener)
   }
 
-  onSceneChange(elements: unknown[], appState: Record<string, unknown>, files: Record<string, unknown> = this.state.files): void {
+  onSceneChange(
+    elements: unknown[],
+    appState: Record<string, unknown>,
+    files: Record<string, unknown> = this.state.files
+  ): void {
     this.state = { ...this.state, elements, appState, error: undefined, files, status: 'ready' }
     this.pending = true
     this.scheduleSave()
@@ -100,9 +124,11 @@ export class DrawingController {
     this.emit('external')
   }
 
-  async waitForSave(): Promise<void> {
+  async waitForSave(): Promise<boolean> {
     clearTimeout(this.debounce)
     await this.savePending()
+
+    return this.canCloseCleanly()
   }
 
   canCloseCleanly(): boolean {
@@ -119,12 +145,21 @@ export class DrawingController {
 
   async keepPaneVersion(): Promise<void> {
     try {
-      const current = await readDesktopFileText(this.state.identity.path)
-      this.state = { ...this.state, fingerprint: current.text, error: undefined, status: 'saving' }
+      const current = await readDesktopDrawingFileText(this.state.identity)
+      this.state = { ...this.state, fingerprint: current.fingerprint, error: undefined, status: 'saving' }
       this.emit('external')
       await this.writeCurrent()
     } catch (error) {
-      this.state = { ...this.state, error: error instanceof Error ? error : new Error(String(error)), status: 'error' }
+      if (isDesktopFsWriteConflict(error)) {
+        this.externalConflict = true
+        this.state = { ...this.state, error: undefined, status: 'conflict' }
+      } else {
+        this.state = {
+          ...this.state,
+          error: error instanceof Error ? error : new Error(String(error)),
+          status: 'error'
+        }
+      }
       this.emit('external')
     }
   }
@@ -140,16 +175,21 @@ export class DrawingController {
       title: 'Save Excalidraw drawing as'
     })
 
-    if (!selection) {return null}
+    if (!selection) {
+      return null
+    }
     const path = remote ? `${selection.replace(/\/$/, '')}/${this.state.identity.path.split('/').at(-1)}` : selection
-    await writeDesktopFileText(path, this.serialize())
+    const identity = { ...this.state.identity, path }
+    await writeDesktopDrawingFileText(identity, this.serialize(), undefined)
 
-    return { ...this.state.identity, path }
+    return identity
   }
 
-  dispose(): void {
-    clearTimeout(this.debounce)
+  async dispose(): Promise<boolean> {
+    const clean = await this.waitForSave()
     this.listeners.clear()
+
+    return clean
   }
 
   private scheduleSave(): void {
@@ -161,18 +201,28 @@ export class DrawingController {
     if (this.inFlight) {
       await this.inFlight
 
+      if (this.pending) {
+        await this.savePending()
+      }
+
       return
     }
 
-    if (!this.pending || this.externalConflict) {return}
+    if (!this.pending || this.externalConflict) {
+      return
+    }
     this.pending = false
     const inFlight = this.save()
     this.inFlight = inFlight
     const saved = await inFlight
 
-    if (this.inFlight === inFlight) {this.inFlight = undefined}
+    if (this.inFlight === inFlight) {
+      this.inFlight = undefined
+    }
 
-    if (saved && this.pending) {await this.savePending()}
+    if (saved && this.pending) {
+      await this.savePending()
+    }
   }
 
   private async save(): Promise<boolean> {
@@ -180,19 +230,18 @@ export class DrawingController {
     this.emit('editor')
 
     try {
-      const current = await readDesktopFileText(this.state.identity.path)
+      await this.writeCurrent()
 
-      if (this.externalConflict || current.text !== this.state.fingerprint) {
-        this.state = { ...this.state, status: 'conflict' }
+      return true
+    } catch (error) {
+      if (isDesktopFsWriteConflict(error)) {
+        this.externalConflict = true
+        this.state = { ...this.state, error: undefined, status: 'conflict' }
         this.emit('external')
 
         return false
       }
 
-      await this.writeCurrent()
-
-      return true
-    } catch (error) {
       this.pending = true
       this.state = { ...this.state, error: error instanceof Error ? error : new Error(String(error)), status: 'error' }
       this.emit('editor')
@@ -203,14 +252,19 @@ export class DrawingController {
 
   private async writeCurrent(): Promise<void> {
     const content = this.serialize()
-    await writeDesktopFileText(this.state.identity.path, content)
+    const result = await writeDesktopDrawingFileText(this.state.identity, content, this.state.fingerprint)
     this.externalConflict = false
-    this.state = { ...this.state, error: undefined, fingerprint: content, status: 'saved' }
+    this.state = { ...this.state, error: undefined, fingerprint: result.fingerprint, status: 'saved' }
     this.emit('editor')
   }
 
   private serialize(): string {
-    return JSON.stringify({ ...this.state.envelope, appState: this.state.appState, elements: this.state.elements, files: this.state.files })
+    return JSON.stringify({
+      ...this.state.envelope,
+      appState: this.state.appState,
+      elements: this.state.elements,
+      files: this.state.files
+    })
   }
 
   private emit(origin: DrawingChangeOrigin): void {

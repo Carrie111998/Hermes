@@ -37,9 +37,11 @@ def _resolve_path(path: Any, *, session_id: str | None, profile: str) -> str:
         raise ExcalidrawDocumentError('path is required: no focused Desktop drawing is available')
     raise ExcalidrawDocumentError('path is required: exactly one focused Desktop drawing is required')
 def _context(kw: dict[str, Any]) -> tuple[str, str, str]:
+    """Resolve tool identity from explicit overrides or the live session."""
+    profile = kw.get('profile') or get_session_env('HERMES_SESSION_PROFILE', '') or 'default'
     return (
         str(kw.get('task_id') or 'default'),
-        str(kw.get('profile') or 'default'),
+        str(profile),
         str(kw.get('runtime') or 'local'),
     )
 
