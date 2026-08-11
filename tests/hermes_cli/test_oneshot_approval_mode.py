@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -148,6 +149,60 @@ def test_oneshot_invocation_suppresses_opt_in_with_user_config_disabled(
     assert observed["execute_target_exists"] is False
 
 
+@pytest.mark.parametrize(
+    ("configured_value", "expected_approved"),
+    [("false", False), ("true", True)],
+    ids=["fail-closed", "exact-true"],
+)
+def test_oneshot_policy_reaches_both_sinks_in_plain_worker(
+    monkeypatch, tmp_path, configured_value, expected_approved
+):
+    """An unwrapped plugin worker cannot fall back to inherited YOLO state."""
+    home = tmp_path / "hermes-home"
+    _write_config(
+        home,
+        f"approvals:\n  oneshot_yolo: {configured_value}\n",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_YOLO_MODE", "1")
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+    from hermes_cli.oneshot_policy import (
+        configure_oneshot_approval_policy,
+        current_oneshot_yolo_policy,
+        reset_oneshot_approval_policy,
+    )
+    from tools import approval
+
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True)
+    observed = {}
+
+    def worker():
+        observed["policy"] = current_oneshot_yolo_policy()
+        observed["terminal"] = approval.check_all_command_guards(
+            "rm -rf ./worker-target", "local"
+        )
+        observed["execute_code"] = approval.check_execute_code_guard(
+            "from pathlib import Path; Path('worker-target').unlink()", "local"
+        )
+
+    policy_token = configure_oneshot_approval_policy()
+    assert policy_token is not None
+    try:
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+    finally:
+        reset_oneshot_approval_policy(policy_token)
+
+    assert observed["policy"] is expected_approved
+    assert observed["terminal"]["approved"] is expected_approved
+    assert observed["execute_code"]["approved"] is expected_approved
+
+
 @pytest.mark.parametrize("termux", [False, True], ids=["normal", "termux"])
 def test_oneshot_policy_is_resolved_before_agent_startup(
     monkeypatch, tmp_path, termux
@@ -174,6 +229,7 @@ def test_oneshot_policy_is_resolved_before_agent_startup(
     monkeypatch.setattr(sys, "argv", ["hermes", "-z", "hello"])
 
     context_token = oneshot_policy._ONESHOT_YOLO_POLICY.set(None)
+    monkeypatch.setattr(oneshot_policy, "_PROCESS_ONESHOT_YOLO_POLICY", None)
     try:
         with pytest.raises(SystemExit, match="0"):
             main_mod.main()
@@ -215,6 +271,7 @@ def test_oneshot_startup_options_suppress_config_opt_in_before_discovery(
     monkeypatch.setattr(sys, "argv", ["hermes", "-z", "hello", option])
 
     context_token = oneshot_policy._ONESHOT_YOLO_POLICY.set(None)
+    monkeypatch.setattr(oneshot_policy, "_PROCESS_ONESHOT_YOLO_POLICY", None)
     try:
         with pytest.raises(SystemExit, match="0"):
             main_mod.main()
