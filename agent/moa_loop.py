@@ -2642,11 +2642,34 @@ class MoAChatCompletions:
         elif joined or degraded:
             if degraded:
                 joined = f"{joined}\n\n{degraded}" if joined else degraded
+            # Freshness framing (upstream #82541): under user_turn/every_n
+            # cadence the SAME guidance is re-attached on every tool
+            # iteration. Without a marker the aggregator reads each replay as
+            # a new injection — observed: an aggregator re-flagging one stale
+            # advisory as live "drift" five times in a single turn. Label
+            # replays as replays, and fresh advice as blind to later work.
+            if _refs_from_cache:
+                freshness = (
+                    "Freshness: REPLAYED — this advice was gathered earlier in "
+                    f"this user turn (fanout cadence: {fanout_mode}) and has NOT "
+                    "been refreshed against your tool activity since. It is the "
+                    "same advice you already saw, re-attached for context. Treat "
+                    "it as a replay, not a new message; do not re-evaluate or "
+                    "re-flag it."
+                )
+            else:
+                freshness = (
+                    "Freshness: FRESH — gathered at this iteration, from a digest "
+                    "of the conversation so far. Advisors cannot see any tool "
+                    "activity that happens after this point "
+                    f"(fanout cadence: {fanout_mode})."
+                )
             guidance = (
                 "[Mixture of Agents reference context]\n"
                 f"Preset: {self.preset_name}\n"
                 f"Aggregator/acting model: {_slot_label(aggregator)}\n"
-                f"References: {', '.join(label for label, _, _ in _agg_refs)}\n\n"
+                f"References: {', '.join(label for label, _, _ in _agg_refs)}\n"
+                f"{freshness}\n\n"
                 "Use the reference responses below as private context. You are the aggregator and acting model: "
                 "answer the user directly or call tools as needed.\n\n"
                 f"{joined}"
