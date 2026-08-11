@@ -2494,3 +2494,167 @@ class TestJobsJsonUtf8Bom:
         loaded = load_jobs()
         assert [j["id"] for j in loaded] == ["ctrlbom01"]
         assert "newline" in loaded[0]["name"]
+
+
+# =========================================================================
+# request_run — the non-enabling trigger
+#
+# Spec: docs/superpowers/specs/2026-08-10-jobflow-reconcile-enabled-guard-design.md
+# Why it exists: trigger_job sets enabled=True, so the JobFlow reconciler
+# triggering a mis-resolved job would silently revive a worker an operator
+# disabled. request_run refuses instead.
+# =========================================================================
+
+class TestRequestRun:
+    def test_schedules_an_enabled_job_without_touching_lifecycle_fields(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """It advances next_run_at and writes NOTHING else."""
+        from cron.jobs import create_job, get_job, request_run
+        from events.bus import EventBus
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = request_run(
+            job["id"], caller="cron:jobflow-reconcile", reason="reconcile"
+        )
+
+        assert result is not None
+        assert result["next_run_at"] != job["next_run_at"]
+        assert result["enabled"] is True
+        assert result["state"] == job["state"]
+        assert result["paused_at"] == job["paused_at"]
+
+        stored = get_job(job["id"])
+        assert stored["next_run_at"] == result["next_run_at"]
+
+    def test_disabled_job_is_not_revived_and_the_store_is_byte_identical(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """THE load-bearing regression. A refused request must not write."""
+        from cron.jobs import JOBS_FILE, create_job, pause_job, request_run
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        pause_job(job["id"])
+        before = JOBS_FILE.read_bytes()
+
+        assert request_run(job["id"], caller="test", reason="r") is None
+
+        assert JOBS_FILE.read_bytes() == before
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
+
+    def test_refuses_a_job_disabled_without_being_paused(self, tmp_cron_dir, monkeypatch):
+        """`enabled` is the gate, not `state`.
+
+        pause_job sets both, but a job disabled directly through update_job has
+        enabled=False with state="scheduled". Gating on state would activate it.
+        """
+        from cron.jobs import create_job, request_run, update_job
+        from events.bus import EventBus
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        disabled = update_job(job["id"], {"enabled": False})
+        assert disabled["state"] == "scheduled"
+
+        assert request_run(job["id"], caller="test") is None
+
+    def test_trigger_job_still_revives_a_disabled_job(self, tmp_cron_dir, monkeypatch):
+        """Deliberate contrast, pinned on purpose.
+
+        The operator paths (CLI `cron run`, api_server, web_server) rely on
+        trigger_job reviving. A refactor that converges the two functions must
+        fail HERE rather than silently removing that behavior.
+        """
+        from cron.jobs import create_job, pause_job, trigger_job
+        from events.bus import EventBus
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        pause_job(job["id"])
+        result = trigger_job(job["id"], caller="test")
+
+        assert result is not None
+        assert result["enabled"] is True
+        assert result["state"] == "scheduled"
+
+    def test_requires_a_non_empty_caller(self, tmp_cron_dir):
+        """A new API with no back-compat debt takes the stricter contract."""
+        from cron.jobs import create_job, request_run
+
+        job = create_job(prompt="x", schedule="every 1h")
+        with pytest.raises(ValueError, match="caller"):
+            request_run(job["id"], caller="")
+        with pytest.raises(ValueError, match="caller"):
+            request_run(job["id"], caller="   ")
+
+    def test_returns_none_for_unknown_job(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import request_run
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        assert request_run("nonexistent", caller="test") is None
+        assert bus.query(event_type=EventType.CRON_TRIGGERED) == []
+
+    def test_emits_cron_triggered_with_caller_and_reason(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import create_job, request_run
+        from events.bus import EventBus
+        from events.schema import EventType
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = request_run(
+            job["id"], caller="cron:jobflow-reconcile", reason="reconcile"
+        )
+
+        events = bus.query(event_type=EventType.CRON_TRIGGERED)
+        assert len(events) == 1
+        e = events[0]
+        assert e.payload["caller"] == "cron:jobflow-reconcile"
+        assert e.payload["reason"] == "reconcile"
+        assert e.payload["job_id"] == job["id"]
+        assert e.payload["previous_next_run_at"] == job["next_run_at"]
+        assert e.payload["new_next_run_at"] == result["next_run_at"]
+
+    def test_emit_failure_does_not_break_the_write(self, tmp_cron_dir, monkeypatch):
+        """An unhealthy bus must never cost the activation."""
+        from cron.jobs import create_job, get_job, request_run
+
+        def broken_bus():
+            raise RuntimeError("bus broken")
+
+        monkeypatch.setattr("cron.jobs._get_event_bus", broken_bus)
+
+        job = create_job(prompt="x", schedule="every 1h")
+        result = request_run(job["id"], caller="test")
+
+        assert result is not None
+        assert get_job(job["id"])["next_run_at"] == result["next_run_at"]
+
+    def test_ambiguous_name_raises(self, tmp_cron_dir, monkeypatch):
+        from cron.jobs import AmbiguousJobReference, create_job, request_run
+        from events.bus import EventBus
+
+        bus = EventBus(db_path=tmp_cron_dir / "events.db")
+        monkeypatch.setattr("cron.jobs._get_event_bus", lambda: bus)
+
+        create_job(prompt="a", schedule="every 1h", name="dup")
+        create_job(prompt="b", schedule="every 1h", name="dup")
+        with pytest.raises(AmbiguousJobReference):
+            request_run("dup", caller="test")
