@@ -77,6 +77,14 @@ def _setup_scopes(tmp_path, monkeypatch):
         "GBRAIN_TOKEN=jane-managed-token\n",
         encoding="utf-8",
     )
+    (jane / ".env").write_text(
+        "PROFILE_MCP_TOKEN=jane-profile-token\n",
+        encoding="utf-8",
+    )
+    (louis / ".env").write_text(
+        "PROFILE_MCP_TOKEN=louis-profile-token\n",
+        encoding="utf-8",
+    )
     _write_yaml(louis_managed / "config.yaml", {"display": {"skin": "managed"}})
 
     monkeypatch.setenv("HERMES_HOME", str(base))
@@ -135,7 +143,11 @@ def test_multiplex_sessions_discover_managed_mcp_per_profile(
     tmp_path, monkeypatch
 ):
     """Each session home gets one isolated lazy discovery slot."""
-    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from agent.secret_scope import (
+        current_secret_scope,
+        is_multiplex_active,
+        set_multiplex_active,
+    )
     from hermes_cli import mcp_startup
     from hermes_constants import get_hermes_home
     from tools import mcp_tool
@@ -153,11 +165,16 @@ def test_multiplex_sessions_discover_managed_mcp_per_profile(
     previous_multiplex = is_multiplex_active()
     previous_enabled = entry._mcp_discovery_enabled
     seen = []
+    seen_secret_scopes = []
     added_state_keys = []
 
     def _fake_discover():
         home = str(get_hermes_home().resolve())
         seen.append(home)
+        scope = current_secret_scope()
+        seen_secret_scopes.append(
+            (home, (scope or {}).get("PROFILE_MCP_TOKEN"))
+        )
         for server_name in mcp_tool._load_mcp_config():
             tool_name = f"mcp__{server_name}__whoami"
             fresh_registry.register(
@@ -241,6 +258,10 @@ def test_multiplex_sessions_discover_managed_mcp_per_profile(
             assert fresh_registry.get_entry("mcp__gbrain__whoami") is not None
 
         assert seen == [str(jane.resolve()), str(louis.resolve())]
+        assert seen_secret_scopes == [
+            (str(jane.resolve()), "jane-profile-token"),
+            (str(louis.resolve()), "louis-profile-token"),
+        ]
         assert set(mcp_startup._mcp_discovery_started_scopes) == {
             str(jane.resolve()),
             str(louis.resolve()),

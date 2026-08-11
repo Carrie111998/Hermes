@@ -132,15 +132,33 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             home_override = get_hermes_home_override()
         except Exception:
             home_override = None
+        try:
+            from agent.secret_scope import current_secret_scope
+
+            active_secret_scope = current_secret_scope()
+            secret_scope = (
+                dict(active_secret_scope)
+                if active_secret_scope is not None
+                else None
+            )
+        except Exception:
+            secret_scope = None
 
         def _discover() -> None:
-            token = None
+            home_token = None
+            secret_token = None
             try:
                 from hermes_constants import set_hermes_home_override
 
-                token = set_hermes_home_override(home_override)
+                home_token = set_hermes_home_override(home_override)
             except Exception:
-                token = None
+                home_token = None
+            try:
+                from agent.secret_scope import set_secret_scope
+
+                secret_token = set_secret_scope(secret_scope)
+            except Exception:
+                secret_token = None
             try:
                 _discover_mcp_tools_without_interactive_oauth()
                 try:
@@ -155,11 +173,18 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
             except Exception:
                 logger.debug("Background MCP tool discovery failed", exc_info=True)
             finally:
-                if token is not None:
+                if secret_token is not None:
+                    try:
+                        from agent.secret_scope import reset_secret_scope
+
+                        reset_secret_scope(secret_token)
+                    except Exception:
+                        pass
+                if home_token is not None:
                     try:
                         from hermes_constants import reset_hermes_home_override
 
-                        reset_hermes_home_override(token)
+                        reset_hermes_home_override(home_token)
                     except Exception:
                         pass
                 with _mcp_discovery_lock:
