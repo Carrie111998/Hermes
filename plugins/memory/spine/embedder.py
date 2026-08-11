@@ -24,6 +24,28 @@ _model_name: str = "all-MiniLM-L6-v2"
 _available: Optional[bool] = None
 
 
+def _model_dim(model: object) -> int:
+    """Read the model's output dimension, whatever sentence-transformers calls it today.
+
+    This accessor has now been renamed in both directions across library
+    versions: `get_embedding_dimension` -> `get_sentence_embedding_dimension`
+    (which broke semantic search silently for ~8 days, because the exception
+    was swallowed and search degraded politely to keyword-only) and then back
+    again — as of the current install, `get_sentence_embedding_dimension`
+    emits a FutureWarning saying it has been renamed to
+    `get_embedding_dimension`. Try each name rather than betting on one.
+    """
+    for attr in ("get_embedding_dimension", "get_sentence_embedding_dimension"):
+        fn = getattr(model, attr, None)
+        if callable(fn):
+            try:
+                return int(fn())
+            except Exception:  # noqa: BLE001 — try the next spelling
+                continue
+    cfg_dim = getattr(model, "embedding_dimension", None)
+    return int(cfg_dim) if cfg_dim else 0
+
+
 def _load_model() -> Optional[object]:
     """Load MiniLM via sentence-transformers. Returns model or None on failure."""
     global _model
@@ -33,11 +55,7 @@ def _load_model() -> Optional[object]:
         from sentence_transformers import SentenceTransformer
 
         _model = SentenceTransformer(_model_name)
-        logger.info(
-            "Embedder loaded: %s (dim=%d)",
-            _model_name,
-            _model.get_embedding_dimension(),
-        )
+        logger.info("Embedder loaded: %s (dim=%d)", _model_name, _model_dim(_model))
         return _model
     except Exception as e:
         logger.error("Failed to load embedder %s: %s", _model_name, e)
@@ -64,7 +82,7 @@ def get_embedding_dim() -> int:
     model = _load_model()
     if model is None:
         return 0
-    return model.get_embedding_dimension()
+    return _model_dim(model)
 
 
 def embed(texts: List[str]) -> List[List[float]]:

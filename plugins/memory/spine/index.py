@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover — falls back to the pure-Python path
+    np = None
+
 logger = logging.getLogger(__name__)
 
 EMBEDDING_DIM = 384  # MiniLM-L6-v2
@@ -90,8 +95,19 @@ def _entity_match_boost(query_words: set, row: Dict[str, Any], boost: float = 1.
             return boost
     return 1.0
 
-EMBEDDING_DIM = 384  # MiniLM-L6-v2
 MAX_BYTES_PER_VEC = EMBEDDING_DIM * 4  # 4 bytes per float32
+
+# Statuses that recall is allowed to return.
+#
+# 'promoted' used to be excluded here, on the theory that a promoted
+# observation already lives in MEMORY.md and therefore doesn't need to be
+# searchable. That was backwards: promotion is applied to the *highest*
+# confidence observations, so excluding them removed the best material from
+# search — 90 of 158 rows at the time this was fixed. 'demoted' is the state
+# an observation lands in when it gets pushed back out of MEMORY.md for space;
+# it must stay searchable too, or demotion becomes deletion.
+SEARCHABLE_STATUSES = ("active", "promoted", "demoted")
+_STATUS_PLACEHOLDERS = ",".join("?" * len(SEARCHABLE_STATUSES))
 
 
 def _vector_to_blob(vector: List[float]) -> bytes:
@@ -105,14 +121,78 @@ def _blob_to_vector(blob: bytes) -> List[float]:
     return list(struct.unpack(f"<{n}f", blob))
 
 
+def _json_field(value: Any) -> str:
+    """Serialize a list-ish column without double-encoding.
+
+    upsert_observation used to call json.dumps() unconditionally. When the
+    caller passed a value that was ALREADY a JSON string — which happens on
+    any round-trip through the index — you got '"[\\"#11\\"]"'. That
+    deserializes to a str, not a list, and _entity_match_boost requires a
+    list: it silently returned the neutral 1.0 for every affected row, so
+    entity matching was dead on exactly the observations that had been
+    re-indexed. Present in live data when this was found.
+    """
+    if value is None:
+        return "[]"
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return "[]"
+        if s[0] in "[{":
+            try:
+                json.loads(s)
+                return s  # already valid JSON — store verbatim
+            except json.JSONDecodeError:
+                pass
+        return json.dumps([value])  # bare string -> single-element list
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value))
+    return json.dumps(value)
+
+
+def _normalize(vector: List[float]) -> List[float]:
+    """Scale to unit length so cosine similarity is a plain dot product."""
+    norm = math.sqrt(sum(x * x for x in vector))
+    if norm == 0:
+        return list(vector)
+    return [x / norm for x in vector]
+
+
 def _serialize_vector(vector: List[float]) -> bytes:
-    """JSON-serialize vector for text-column storage (FTS5 virtual table limitation)."""
-    return json.dumps(vector).encode("utf-8")
+    """Pack a vector for storage: pre-normalized little-endian float32.
+
+    Was JSON text (~8.4KB per 384-dim vector, and json.loads dominated query
+    time at ~65% of runtime). Packed float32 is 1,536 bytes and decodes with
+    a zero-copy numpy view. Vectors are normalized on the way in so the search
+    path never has to compute magnitudes.
+    """
+    return _vector_to_blob(_normalize(vector))
 
 
-def _deserialize_vector(data: bytes) -> List[float]:
-    """Deserialize vector from JSON text storage."""
-    return json.loads(data.decode("utf-8"))
+def _deserialize_vector(data: Any) -> Optional[List[float]]:
+    """Decode a stored vector, accepting both the packed and legacy formats.
+
+    Discriminate on LENGTH, not on a leading '[' byte. A packed vector is
+    always exactly EMBEDDING_DIM*4 bytes; the legacy JSON encoding of a
+    384-dim vector runs ~8.4KB and can never hit that size. Sniffing the first
+    byte instead looks right but is wrong: 0x5B ('[') is a perfectly ordinary
+    low mantissa byte, so roughly 1 packed vector in 256 starts with it. That
+    misread cost a full silent fallback to the scalar path here once already.
+    """
+    if not data:
+        return None
+    if isinstance(data, str):
+        data = data.encode("utf-8")
+    if len(data) == MAX_BYTES_PER_VEC:
+        return _blob_to_vector(data)
+    if data[:1] == b"[":
+        try:
+            return json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None
+    if len(data) % 4 != 0:
+        return None
+    return _blob_to_vector(data)
 
 
 class MemoryIndex:
@@ -121,6 +201,8 @@ class MemoryIndex:
     def __init__(self, db_path: str):
         self._db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
+        # (signature, ids, blobs, stacked_matrix) — see _wiki_vectors
+        self._wiki_cache: Optional[Tuple[Any, List[str], List[Any], Any]] = None
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -263,9 +345,9 @@ class MemoryIndex:
                 obs.get("confidence", 0.5),
                 obs.get("confirmations", 1),
                 obs.get("status", "active"),
-                json.dumps(obs.get("topics", [])),
-                json.dumps(obs.get("contradicts", [])),
-                json.dumps(obs.get("evidence", [])),
+                _json_field(obs.get("topics", [])),
+                _json_field(obs.get("contradicts", [])),
+                _json_field(obs.get("evidence", [])),
                 obs.get("created_at", ""),
                 obs.get("last_confirmed", ""),
                 obs.get("last_retrieved", ""),
@@ -317,14 +399,14 @@ class MemoryIndex:
 
         # Observations
         obs_rows = self.conn.execute(
-            """SELECT o.*, 'observation' AS source FROM observations o
+            f"""SELECT o.* FROM observations o
                JOIN observations_fts fts ON o.rowid = fts.rowid
                WHERE observations_fts MATCH ?
-                 AND o.status = 'active'
+                 AND o.status IN ({_STATUS_PLACEHOLDERS})
                  AND o.profile IN (?, 'shared')
                ORDER BY rank
                LIMIT ?""",
-            (fts_query, profile, limit),
+            (fts_query, *SEARCHABLE_STATUSES, profile, limit),
         ).fetchall()
 
         # Wiki chunks
@@ -396,49 +478,94 @@ class MemoryIndex:
         ranked = sorted(merged.items(), key=lambda item: scores.get(item[0], 0), reverse=True)
         return [row for _, row in ranked[:k]]
 
+    def _wiki_vectors(self) -> Tuple[List[str], List[Any]]:
+        """Wiki chunk ids + vectors, with the stacked matrix cached per connection.
+
+        The wiki table only changes on a reindex, but the vectors were being
+        re-read and re-stacked on every query — a ~4MB copy each time. The
+        cache is invalidated by a cheap (count, max rowid) signature, so a
+        reindex is picked up without any explicit cache-busting call.
+        """
+        sig = self.conn.execute(
+            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM wiki_chunks WHERE embedding IS NOT NULL"
+        ).fetchone()
+        if self._wiki_cache and self._wiki_cache[0] == sig:
+            return self._wiki_cache[1], self._wiki_cache[2]
+
+        rows = self.conn.execute(
+            "SELECT id, embedding FROM wiki_chunks WHERE embedding IS NOT NULL"
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        blobs = [r[1] for r in rows]
+        self._wiki_cache = (sig, ids, blobs, _stack(blobs))
+        return ids, blobs
+
     def _vector_search(self, embedding: List[float], profile: str, limit: int = 20) -> List[Dict[str, Any]]:
         """Brute-force cosine similarity over observations AND wiki chunks."""
         results: List[Tuple[float, Dict[str, Any]]] = []
 
         # Observations
         obs_rows = self.conn.execute(
-            """SELECT id, profile, type, epistemic, content, confidence, confirmations,
+            f"""SELECT id, profile, type, epistemic, content, confidence, confirmations,
                       status, topics, contradicts, evidence, created_at, last_confirmed,
                       last_retrieved, embedding
                FROM observations
-               WHERE status = 'active' AND profile IN (?, 'shared') AND embedding IS NOT NULL""",
-            (profile,),
+               WHERE status IN ({_STATUS_PLACEHOLDERS})
+                 AND profile IN (?, 'shared')
+                 AND embedding IS NOT NULL""",
+            (*SEARCHABLE_STATUSES, profile),
         ).fetchall()
 
-        for row in obs_rows:
-            d = _row_to_dict(row, self.conn)
-            stored_vec = _deserialize_vector(row[-1]) if row[-1] else None
-            if stored_vec is None:
-                continue
-            sim = _cosine_similarity(embedding, stored_vec)
-            results.append((sim, d))
+        if obs_rows:
+            sims = _similarities(embedding, [r[-1] for r in obs_rows])
+            for row, sim in zip(obs_rows, sims):
+                if sim <= -1.0:
+                    continue  # undecodable vector
+                results.append((sim, _row_to_dict(row, self.conn)))
 
-        # Wiki chunks with embeddings
-        wiki_rows = self.conn.execute(
-            """SELECT id, path, title, content, chunk_index, embedding
-               FROM wiki_chunks WHERE embedding IS NOT NULL LIMIT ?""",
-            (limit * 2,),
-        ).fetchall()
-
-        for row in wiki_rows:
-            stored_vec = _deserialize_vector(row[5]) if row[5] else None
-            if stored_vec is None:
-                continue
-            sim = _cosine_similarity(embedding, stored_vec)
-            d = {
-                "id": row[0], "profile": "shared", "type": "fact", "epistemic": "extracted",
-                "content": f"{row[2]}: {row[3]}",
-                "confidence": 1.0, "confirmations": 1, "status": "active",
-                "topics": "", "contradicts": "", "evidence": "",
-                "created_at": "", "last_confirmed": "", "last_retrieved": "",
-                "source": "wiki", "path": row[1],
-            }
-            results.append((sim, d))
+        # Wiki chunks with embeddings.
+        #
+        # This query used to end `LIMIT ?` bound to limit*2 — with the default
+        # k=6 that read 6*3*2 = 36 of 2,643 chunks, and not the best 36: there
+        # was no ORDER BY, so SQLite returned the first 36 by rowid, i.e. an
+        # arbitrary slice of insertion order with no relevance criterion at
+        # all. 98.6% of the wiki was unreachable by semantic search. Keyword
+        # search always covered the full set, which is why this stayed hidden.
+        # Removing the cap is only affordable because scoring is now a single
+        # numpy matmul over packed float32 rather than a per-row Python loop.
+        #
+        # Scoring is deliberately split into two passes: rank on (id, vector)
+        # alone, then fetch title/content for the survivors only. Selecting the
+        # text alongside the vectors pulled several MB of chunk bodies out of
+        # SQLite on every single query to build rows that were then discarded.
+        wiki_ids, wiki_blobs = self._wiki_vectors()
+        if wiki_ids:
+            cached_matrix = self._wiki_cache[3] if self._wiki_cache else None
+            sims = _similarities(embedding, wiki_blobs, matrix=cached_matrix)
+            top = sorted(range(len(sims)), key=lambda i: sims[i], reverse=True)[:limit]
+            top = [i for i in top if sims[i] > -1.0]
+            if top:
+                ids = [wiki_ids[i] for i in top]
+                placeholders = ",".join("?" * len(ids))
+                fetched = {
+                    r[0]: r for r in self.conn.execute(
+                        f"""SELECT id, path, title, content
+                            FROM wiki_chunks WHERE id IN ({placeholders})""", ids
+                    ).fetchall()
+                }
+                for i in top:
+                    row = fetched.get(wiki_ids[i])
+                    if row is None:
+                        continue
+                    results.append((sims[i], {
+                        "id": row[0], "profile": "shared", "type": "fact",
+                        "epistemic": "extracted",
+                        "content": f"{row[2]}: {row[3]}",
+                        "confidence": 1.0, "confirmations": 1, "status": "active",
+                        "topics": "", "contradicts": "", "evidence": "",
+                        "created_at": "", "last_confirmed": "", "last_retrieved": "",
+                        "source": "wiki", "path": row[1],
+                    }))
 
         results.sort(key=lambda x: x[0], reverse=True)
         return [r[1] for r in results[:limit]]
@@ -469,13 +596,66 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-import math
+def _stack(blobs: List[Any]) -> Optional["np.ndarray"]:
+    """Stack packed float32 blobs into an (N, dim) matrix.
+
+    Returns None if numpy is missing or any row isn't in the packed format —
+    which happens mid-migration, when legacy JSON vectors are still present.
+    """
+    if np is None or not blobs:
+        return None
+    # Length alone identifies the packed format — see _deserialize_vector for
+    # why a leading-byte check is actively wrong here.
+    for b in blobs:
+        if not isinstance(b, (bytes, memoryview)) or len(b) != MAX_BYTES_PER_VEC:
+            return None
+    return np.frombuffer(b"".join(bytes(b) for b in blobs),
+                         dtype="<f4").reshape(len(blobs), EMBEDDING_DIM)
+
+
+def _similarities(query: List[float], blobs: List[Any],
+                  matrix: Optional["np.ndarray"] = None) -> List[float]:
+    """Cosine similarity of `query` against every stored vector.
+
+    Uses one numpy matmul over a stacked (N, dim) matrix — replacing a per-row
+    Python loop that was the dominant cost once the wiki scan stopped being
+    artificially capped at 36 rows. Pass `matrix` to reuse a cached stack and
+    skip rebuilding it per query. Falls back to the scalar path when numpy is
+    unavailable or the rows are ragged.
+    """
+    if matrix is None and not blobs:
+        return []
+
+    m = matrix if matrix is not None else _stack(blobs)
+    if m is not None:
+        q = np.asarray(query, dtype="<f4")
+        qnorm = float(np.linalg.norm(q))
+        if qnorm:
+            q = q / qnorm
+        # Stored vectors are pre-normalized by _serialize_vector, so a dot
+        # product IS the cosine. Re-normalizing here would cost a second pass
+        # over the matrix for no gain.
+        return m.dot(q).tolist()
+
+    out: List[float] = []
+    for blob in blobs:
+        vec = _deserialize_vector(blob)
+        out.append(_cosine_similarity(query, vec) if vec else -1.0)
+    return out
+
+
+_OBS_COLUMNS: Optional[List[str]] = None
 
 
 def _row_to_dict(row: tuple, conn: sqlite3.Connection) -> Dict[str, Any]:
     """Convert a SQLite row to a dict, parsing JSON fields."""
-    cols = [desc[0] for desc in conn.execute("SELECT * FROM observations LIMIT 0").description]
-    d = dict(zip(cols, row))
+    global _OBS_COLUMNS
+    if _OBS_COLUMNS is None:
+        # Cached: this used to run a fresh SELECT per row purely to read
+        # column names, which meant one extra query per search result.
+        _OBS_COLUMNS = [d[0] for d in
+                        conn.execute("SELECT * FROM observations LIMIT 0").description]
+    d = dict(zip(_OBS_COLUMNS, row))
     # Parse JSON fields safely
     for field in ["topics", "contradicts", "evidence"]:
         if field in d and isinstance(d[field], str):

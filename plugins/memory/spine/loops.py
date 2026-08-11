@@ -80,12 +80,17 @@ def run_observer(messages: List[Dict[str, Any]], config: SpineConfig) -> None:
     stored = 0
     for obs in observations:
         try:
+            quote = (obs.get("quote") or "").strip()
             result = handle_remember({
                 "content": obs.get("content", ""),
                 "type": obs.get("type", "fact"),
                 "epistemic": obs.get("epistemic", "extracted"),
                 "confidence": obs.get("confidence", 0.5),
                 "topics": obs.get("entities", []),
+                # The extraction prompt asks for a verbatim supporting snippet
+                # and always returned one; it was never read. This is the
+                # provenance trail behind every stored observation.
+                "evidence": [quote] if quote else [],
             }, config)
             resp = json.loads(result)
             if resp.get("success") or resp.get("deduplicated"):
@@ -510,6 +515,44 @@ def _word_in(term: str, text: str) -> bool:
     return re.search(r"\b" + re.escape(term) + r"\b", text) is not None
 
 
+_CONTEXT_STOPWORDS = frozenset({
+    "about", "after", "again", "also", "and", "any", "are", "because", "been",
+    "before", "being", "both", "but", "can", "could", "did", "does", "doing",
+    "down", "during", "each", "few", "for", "from", "further", "had", "has",
+    "have", "having", "her", "here", "hers", "herself", "him", "himself", "his",
+    "how", "into", "its", "itself", "just", "like", "more", "most", "much",
+    "must", "not", "now", "only", "other", "our", "ours", "out", "over", "own",
+    "same", "she", "should", "some", "such", "than", "that", "the", "their",
+    "them", "themselves", "then", "there", "these", "they", "this", "those",
+    "through", "to", "too", "under", "until", "very", "was", "were", "what",
+    "when", "where", "which", "while", "who", "whom", "why", "will", "with",
+    "would", "you", "your", "yours", "yourself", "yourselves",
+})
+
+
+def _shared_context(a_topics: str, b_topics: str, a_lower: str, b_lower: str) -> bool:
+    """True if two observations plausibly discuss the same subject.
+
+    Context is shared when (1) they carry at least one common topic tag, or
+    (2) their content shares at least one meaningful token (>=4 chars, not a
+    stopword). Guards the opposition detector against flagging keyword
+    opposites in unrelated observations (false positives).
+    """
+    try:
+        ta = set(json.loads(a_topics)) if a_topics else set()
+    except (json.JSONDecodeError, TypeError):
+        ta = set()
+    try:
+        tb = set(json.loads(b_topics)) if b_topics else set()
+    except (json.JSONDecodeError, TypeError):
+        tb = set()
+    if ta & tb:
+        return True
+    tok_a = {w for w in re.findall(r"[a-z]{4,}", a_lower) if w not in _CONTEXT_STOPWORDS}
+    tok_b = {w for w in re.findall(r"[a-z]{4,}", b_lower) if w not in _CONTEXT_STOPWORDS}
+    return bool(tok_a & tok_b)
+
+
 def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
     """Detect potential contradictions between active observations (spec §5.2.2).
 
@@ -522,6 +565,13 @@ def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
     decay pass, never immediately. This is a proportional nudge, not a Bayesian
     belief engine — full auto-resolution stays out of scope for a single-user system.
 
+    Pairs are gated on shared context (topic tag or meaningful content-token
+    overlap) before opposition keywords are compared, so unrelated observations
+    (e.g. a cron-hygiene note containing "never" vs a research-dossier note
+    containing "requires") are never flagged. Added 2026-08-04 after a false
+    positive paired "cron prompts should not contain stale metadata" with
+    "user evaluates tools via Instagram-sourced dossiers".
+
     Returns list of {a_id, a_content, b_id, b_content, reason, resolution}.
     """
     opposition_pairs = [
@@ -533,7 +583,7 @@ def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
     ]
 
     rows = idx.conn.execute(
-        """SELECT id, type, content, confidence, last_confirmed FROM observations
+        """SELECT id, type, content, confidence, last_confirmed, topics FROM observations
            WHERE status='active' ORDER BY type"""
     ).fetchall()
 
@@ -543,12 +593,16 @@ def _detect_contradictions(idx: MemoryIndex) -> List[Dict[str, Any]]:
     contradictions: List[Dict[str, Any]] = []
     for i in range(len(rows)):
         for j in range(i + 1, len(rows)):
-            a_id, a_type, a_content, a_conf, a_last = rows[i]
-            b_id, b_type, b_content, b_conf, b_last = rows[j]
+            a_id, a_type, a_content, a_conf, a_last, a_topics = rows[i]
+            b_id, b_type, b_content, b_conf, b_last, b_topics = rows[j]
             if a_type != b_type:
                 continue
             a_lower = a_content.lower()
             b_lower = b_content.lower()
+            # Context gate: skip pairs that don't plausibly discuss the same
+            # subject — prevents keyword-opposition false positives.
+            if not _shared_context(a_topics, b_topics, a_lower, b_lower):
+                continue
             for pos_terms, neg_terms in opposition_pairs:
                 a_pos = any(_word_in(t, a_lower) for t in pos_terms)
                 a_neg = any(_word_in(t, a_lower) for t in neg_terms)

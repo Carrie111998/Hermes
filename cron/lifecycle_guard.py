@@ -171,7 +171,14 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    try:
+        path = Path(candidate).expanduser()
+    except ValueError:
+        # Embedded NUL byte in the candidate (tokenized from a binary's
+        # decoded contents). A NUL path cannot reference a real file, so
+        # return an obviously-unresolvable path rather than crashing the
+        # guard (#76762).
+        return Path("/__nul_byte_path__")
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
@@ -258,7 +265,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte in the
+        # path itself (tokenized from a binary's decoded contents). A guarded
+        # path must never crash the guard — and a NUL path cannot reference a
+        # real file, so fail open (nothing to scan) is safe (#76762 follow-up).
         return None, False
     try:
         metadata = os.fstat(descriptor)

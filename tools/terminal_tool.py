@@ -2545,6 +2545,13 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # Mirrors lifecycle_guard._read_referenced_script: a
+                                # NUL byte means this is a binary (Mach-O/ELF/PE),
+                                # not a shell script. Decoding it would tokenize
+                                # machine code into junk paths and crash the guard
+                                # with ValueError: embedded null byte (#76762).
+                                if b"\x00" in data:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
@@ -2552,7 +2559,12 @@ def terminal_tool(
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        # Same binary guard as the local branch: cat on a binary
+                        # yields NUL-laden text that would crash the guard.
+                        if "\x00" in output:
+                            return None
+                        return output
                 except Exception:
                     pass
                 return None

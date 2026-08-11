@@ -43,7 +43,7 @@ def main() -> None:
 
     print(f"Consolidation starting at {datetime.now(timezone.utc).isoformat()}...")
     report = run_consolidation(config)
-    print(json.dumps(report, indent=2))
+    print(format_report(report))
 
     # Save report to wiki
     report_dir = Path(config.canonical_root).parent / "_system"
@@ -57,6 +57,55 @@ def main() -> None:
     print(f"\nReport saved: {report_path}")
     print(f"Active observations: {report.get('active_count', 0)}")
     print("Done.")
+
+
+def format_report(report: Dict[str, Any]) -> str:
+    """Human-readable summary for Telegram delivery (cron no_agent stdout).
+
+    Replaces the raw JSON dict dump — the nightly delivery goes verbatim to
+    topic #11, and a wall of JSON is noise. Report JSON is still saved to wiki.
+    """
+    passes = report.get("passes", {})
+    ts = report.get("ts") or datetime.now(timezone.utc).isoformat()
+    when = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d %H:%M %Z")
+
+    lines = [
+        f"🧠 Spine Consolidation — {when}",
+        "Memory hygiene pass complete:",
+    ]
+    for key, label in [
+        ("decay", "Decay"),
+        ("merge", "Merge"),
+        ("semantic_merge", "Semantic merge"),
+        ("contradict", "Contradictions"),
+        ("promote", "Promoted"),
+        ("demote", "Demoted"),
+    ]:
+        if key in passes:
+            lines.append(f"• {label}: {passes[key]}")
+
+    contradictions = report.get("contradictions") or []
+    if contradictions:
+        lines.append("")
+        lines.append("⚠️ Contradictions flagged:")
+        for c in contradictions[:5]:
+            lines.append(f"• [{c.get('a_id')}] vs [{c.get('b_id')}] — {c.get('reason', 'opposition')}")
+            resolution = c.get("resolution", "")
+            if resolution:
+                lines.append(f"  {resolution}")
+        if len(contradictions) > 5:
+            lines.append(f"  …and {len(contradictions) - 5} more")
+
+    promoted = report.get("promoted_items") or []
+    if promoted:
+        lines.append("")
+        lines.append(f"Promoted to MEMORY.md ({len(promoted)}):")
+        for item in promoted[:5]:
+            lines.append(f"• {item}")
+        if len(promoted) > 5:
+            lines.append(f"  …and {len(promoted) - 5} more (revert via forget() if wrong)")
+
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

@@ -121,6 +121,17 @@ EXPLAIN_SCHEMA = {
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════
 
+def _as_list(value: Any) -> List[Any]:
+    """Coerce a scalar / None / list into a list, for list-typed record fields."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [v for v in value if v not in (None, "")]
+    if isinstance(value, (tuple, set)):
+        return [v for v in value if v not in (None, "")]
+    return [value] if value != "" else []
+
+
 def _now_iso() -> str:
     """ISO 8601 timestamp in SGT."""
     return datetime.now(timezone.utc).isoformat()
@@ -205,7 +216,11 @@ def handle_remember(args: Dict[str, Any], config: SpineConfig) -> str:
         "content": content,
         "confidence": confidence,
         "confirmations": 1,
-        "evidence": [],
+        # Was hardcoded to []. The observer LLM returns a verbatim `quote`
+        # supporting every observation and it was being dropped on the floor,
+        # leaving the evidence column permanently empty — so nothing could
+        # answer "why do we believe this?". handle_explain already reads it.
+        "evidence": _as_list(args.get("evidence")),
         "status": "active",
         "supersedes": None,
         "contradicts": [],
