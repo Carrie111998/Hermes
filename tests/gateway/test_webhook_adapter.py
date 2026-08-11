@@ -348,6 +348,33 @@ class TestEventFilter:
             )
             assert resp.status == 202
 
+    @pytest.mark.parametrize(
+        "header_name",
+        ["X-Gitea-Event", "X-Forgejo-Event"],
+    )
+    @pytest.mark.asyncio
+    async def test_event_filter_accepts_gitea_and_forgejo_headers(self, header_name):
+        """Forgejo/Gitea deliver events via their own headers, not X-GitHub-Event."""
+        routes = {
+            "gh": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["pull_request"],
+                "prompt": "PR: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        # Stub handle_message to avoid running the agent
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/gh",
+                json={"action": "opened"},
+                headers={header_name: "pull_request"},
+            )
+            assert resp.status == 202
+
 
 # ===================================================================
 # Payload filters
