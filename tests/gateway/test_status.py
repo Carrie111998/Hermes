@@ -990,8 +990,110 @@ class TestTerminatePid:
         from hermes_cli._subprocess_compat import windows_hide_flags
 
         assert calls == [
-            (["taskkill", "/PID", "123", "/T", "/F"], True, True, 10, windows_hide_flags())
+            (
+                ["taskkill", "/PID", "123", "/T", "/F"],
+                True,
+                True,
+                status._TASKKILL_TIMEOUT_S,
+                windows_hide_flags(),
+            )
         ]
+
+    def test_taskkill_timeout_is_generous_enough_for_a_loaded_box(self):
+        """The taskkill budget must survive a heavily-loaded Windows host.
+
+        The original 10s cap was exceeded on 2026-08-11 at ~12:00Z while the
+        box sat at 87.8% commit with six concurrent pytest runs — the kill
+        SUCCEEDED and the timeout fired anyway. The sibling ``pid_exists``
+        tasklist probe already carries 30s for exactly this reason (its spawn
+        alone measures 3.4-4.0s idle on this machine); keep the kill at least
+        as patient as the probe.
+        """
+        assert status._TASKKILL_TIMEOUT_S >= 30
+
+    def test_taskkill_timeout_on_dead_target_is_not_fatal(self, monkeypatch):
+        """A timed-out taskkill whose target actually died must NOT raise.
+
+        ``subprocess.TimeoutExpired`` says nothing about whether the target
+        process died — only that we stopped waiting for taskkill to report.
+        Process liveness is the source of truth. Regression for the
+        2026-08-11 outage: the exception propagated through
+        ``_force_terminate_known_gateway_pids`` -> ``stop()`` -> ``restart()``
+        (it is a ``SubprocessError``, not an ``OSError``, so every handler in
+        that chain missed it) and killed the restart before it could spawn a
+        replacement, leaving :8642 with no listener for ~5 minutes.
+        """
+        import subprocess
+
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 10))
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+        # The kill landed: the target is gone by the time we look.
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: False)
+
+        # Must not raise — neither TimeoutExpired nor OSError.
+        status.terminate_pid(47264, force=True)
+
+    def test_taskkill_timeout_on_live_target_raises_oserror(self, monkeypatch):
+        """A timed-out taskkill whose target survived is a real failure.
+
+        It must surface as ``OSError`` — the type every caller in the kill
+        path already handles — rather than the raw ``TimeoutExpired`` that
+        slips through ``except OSError`` / ``except CalledProcessError``.
+        """
+        import subprocess
+
+        import pytest
+
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 10))
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+        monkeypatch.setattr(status, "_pid_exists", lambda pid: True)
+        # Don't burn the real verification window in a unit test: patching
+        # sleep alone would busy-spin against a real 10s monotonic deadline.
+        monkeypatch.setattr(status, "_TASKKILL_VERIFY_TIMEOUT_S", 0.0)
+        monkeypatch.setattr(status.time, "sleep", lambda _s: None)
+
+        with pytest.raises(OSError) as excinfo:
+            status.terminate_pid(47264, force=True)
+
+        assert not isinstance(excinfo.value, subprocess.TimeoutExpired)
+        assert "47264" in str(excinfo.value)
+
+    def test_taskkill_timeout_polls_until_the_target_disappears(self, monkeypatch):
+        """Verification polls rather than sampling liveness exactly once.
+
+        A force-kill under load can take a beat to be reaped; a single probe
+        immediately after the timeout would call a dying process alive and
+        raise a spurious OSError.
+        """
+        import subprocess
+
+        monkeypatch.setattr(status, "_IS_WINDOWS", True)
+
+        def fake_run(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 10))
+
+        probes = [True, True, False]
+        seen = []
+
+        def fake_pid_exists(pid):
+            seen.append(pid)
+            return probes[min(len(seen) - 1, len(probes) - 1)]
+
+        monkeypatch.setattr(status.subprocess, "run", fake_run)
+        monkeypatch.setattr(status, "_pid_exists", fake_pid_exists)
+        monkeypatch.setattr(status.time, "sleep", lambda _s: None)
+
+        status.terminate_pid(47264, force=True)
+
+        assert len(seen) >= 3, f"expected repeated liveness probes, got {seen}"
 
     def test_force_falls_back_to_sigterm_when_taskkill_missing(self, monkeypatch):
         calls = []

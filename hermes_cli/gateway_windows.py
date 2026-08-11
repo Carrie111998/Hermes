@@ -1616,6 +1616,17 @@ def _force_terminate_known_gateway_pids(pids: list[int]) -> int:
             continue
         except PermissionError:
             print(f"⚠ Permission denied to kill PID {pid}")
+        except subprocess.TimeoutExpired:
+            # Defence in depth: terminate_pid already converts an indeterminate
+            # taskkill timeout into a liveness check, but this arm must exist
+            # regardless. TimeoutExpired is a SubprocessError, NOT an OSError,
+            # so the handler below can never catch it — and letting it escape
+            # aborts stop() mid-sweep, skipping every remaining PID and taking
+            # restart() down with it (2026-08-11 outage).
+            print(
+                f"⚠ Kill of PID {pid} timed out; could not confirm it died "
+                "(continuing)"
+            )
         except OSError as exc:
             print(f"Failed to kill PID {pid}: {exc}")
     return killed
@@ -1710,10 +1721,26 @@ def restart() -> None:
     otherwise the replacement process could fail to bind the listening port or
     race the old process's shutdown. Fails loudly if the process can't be cleared
     or the relaunch doesn't produce a running gateway.
+
+    A failure inside ``stop()`` is deliberately NOT fatal here. By the time stop
+    raises, the old gateway is usually already dead -- so propagating leaves
+    :8642 with no listener and no replacement, which is strictly worse than any
+    error stop was trying to report. The error is carried forward and only
+    re-raised if the relaunch also fails to produce a running gateway. Liveness,
+    not the exit status of a kill, decides whether this restart succeeded.
     """
     _assert_windows()
 
-    stop()
+    stop_error: BaseException | None = None
+    try:
+        stop()
+    except Exception as exc:
+        # 2026-08-11: taskkill exceeded its timeout on a loaded box while the
+        # kill itself succeeded; the TimeoutExpired propagated out of stop()
+        # and restart() died before the spawn. Gateway was down ~5 minutes.
+        stop_error = exc
+        print(f"⚠ Gateway stop reported an error: {exc}")
+        print("  Continuing with the relaunch — a stopped gateway is the worse outcome.")
 
     if not _wait_for_gateway_absent(timeout_s=30.0):
         print("⚠ Gateway still present after stop; forcing termination before restart...")
@@ -1722,7 +1749,7 @@ def restart() -> None:
             raise RuntimeError(
                 "Gateway process still detected after force kill; refusing to "
                 "start a duplicate. Investigate stray PIDs before retrying."
-            )
+            ) from stop_error
 
     # Give Windows a moment to release the listening port.
     time.sleep(1.0)
@@ -1752,4 +1779,10 @@ def restart() -> None:
         raise RuntimeError(
             "Gateway restart did not produce a running gateway process. "
             "Check logs/gateway.log and run `hermes gateway status`."
+        ) from stop_error
+
+    if stop_error is not None:
+        print(
+            "✓ Gateway is running again despite the stop-phase error above "
+            "(the kill had already landed)"
         )

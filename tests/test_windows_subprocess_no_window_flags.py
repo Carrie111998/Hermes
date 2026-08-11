@@ -254,7 +254,7 @@ def test_gateway_force_kill_hides_taskkill_window(monkeypatch):
             {
                 "capture_output": True,
                 "text": True,
-                "timeout": 10,
+                "timeout": status._TASKKILL_TIMEOUT_S,
                 "creationflags": _CREATE_NO_WINDOW,
             },
         )

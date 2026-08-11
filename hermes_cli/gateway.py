@@ -7348,7 +7348,13 @@ def _gateway_command_inner(args):
             try:
                 gateway_windows.restart()
                 return
-            except (subprocess.CalledProcessError, RuntimeError, OSError):
+            except (subprocess.SubprocessError, RuntimeError, OSError):
+                # SubprocessError, not CalledProcessError: subprocess.
+                # TimeoutExpired is a SIBLING of CalledProcessError, not a
+                # subclass, so a taskkill that blew its budget escaped this
+                # recovery arm entirely and reached the user as a traceback
+                # with the gateway down (2026-08-11).
+                #
                 # restart() spawns the replacement BEFORE it waits for
                 # readiness, so a slow boot makes it raise while a perfectly
                 # healthy gateway is still coming up. The generic path below
