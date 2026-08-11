@@ -20,6 +20,14 @@ name: Desktop install (Windows)
 #     `desktop-electron-pin.test.ts` asserts the dependency, the lockfile and
 #     `build.electronVersion` all agree, which is what keeps electron-builder
 #     from packaging a different Electron than `npm ci` installed.
+#   * The `scripts/*.test.mjs` build guards, which gate `prebuilder` and
+#     `postbuild` and therefore run on Windows during a real packaging run.
+#
+# It deliberately does NOT run the whole `electron` vitest project: that also
+# holds POSIX-only suites (ssh-connection asserts ControlMaster multiplexing,
+# which Windows OpenSSH lacks — the product runs a no-mux path there instead).
+# Making those cross-platform is a separate change from proving the install
+# path, and is tracked as follow-up rather than bolted on here.
 #
 # ── What this does NOT catch, deliberately stated ───────────────────────────
 #
@@ -106,7 +114,21 @@ jobs:
         run: node scripts/assert-win-vcruntime.mjs
         working-directory: apps/desktop
 
-      # The `electron` vitest project: desktop-electron-pin.test.ts plus the
-      # scripts/*.test.mjs build guards.
-      - name: Desktop platform tests
-        run: npm run --prefix apps/desktop check:test:desktop:platforms
+      # Named files, not the whole `electron` vitest project. The project also
+      # contains suites that are POSIX-only by construction — ssh-connection
+      # asserts OpenSSH ControlMaster multiplexing, which Windows OpenSSH never
+      # implemented, so `ssh-connection.ts` deliberately runs a no-mux path
+      # there (see its `this._mux = opts.mux ?? process.platform !== 'win32'`)
+      # and the mux assertions cannot hold. Adopting that suite here would mean
+      # rewriting it, which is a separate change from proving the install path.
+      #
+      # What is left is what belongs on Windows: the pin contract that keeps
+      # electron-builder and `npm ci` on the same Electron, and the build
+      # guards that run in `prebuilder`/`postbuild` during real packaging.
+      # Named explicitly in `test:desktop:win-install` rather than filtered by
+      # directory here: a path filter would have to survive backslash
+      # separators, and an explicit list makes "what runs on Windows" reviewable
+      # in package.json. Deliberately not a `check:` script — the js-tests
+      # matrix auto-discovers those and would run it on ubuntu as well.
+      - name: Pin contract + build guards
+        run: npm run --prefix apps/desktop test:desktop:win-install
