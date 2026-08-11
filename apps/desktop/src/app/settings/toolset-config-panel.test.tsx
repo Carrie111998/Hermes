@@ -858,6 +858,44 @@ describe('ToolsetConfigPanel', () => {
     })
   })
 
+  describe('provider expansion', () => {
+    /** Poll raw macrotasks for a provider row. Deliberately not `findBy*`:
+     *  waitFor's trailing `setTimeout(0)` usually lets React flush the pending
+     *  passive effects first, which hides the race this test exists to pin. */
+    async function pollForRow(name: RegExp): Promise<HTMLElement> {
+      for (let attempt = 0; attempt < 2000; attempt += 1) {
+        const hit = screen
+          .queryAllByRole('button')
+          .find(b => b.hasAttribute('aria-pressed') && name.test(b.textContent ?? ''))
+
+        if (hit) {
+          return hit
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 0))
+      }
+
+      throw new Error(`provider row ${name} never appeared`)
+    }
+
+    it('keeps the clicked provider expanded when the row is clicked the instant it paints', async () => {
+      // Regression: the default expanded provider used to be assigned by a
+      // useEffect running a commit *after* the rows first painted. A click
+      // landing in that window enqueued setActiveProvider(clicked) first and
+      // the pending effect's setActiveProvider(default) second — last write
+      // won, so the click was silently discarded, the row never expanded, and
+      // nothing re-ran to recover it (the effect self-guards on activeProvider).
+      // Under full-suite load that window is wide enough to hit for real.
+      render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)
+
+      const row = await pollForRow(/ElevenLabs/)
+      fireEvent.click(row)
+
+      expect(await screen.findByRole('button', { name: /Actions for ELEVENLABS_API_KEY/ })).toBeTruthy()
+      expect(row.getAttribute('aria-pressed')).toBe('true')
+    })
+  })
+
   describe('API key deep link', () => {
     it('offers "Manage in API Keys" on a set key and navigates to Settings → Keys', async () => {
       getToolsetConfig.mockResolvedValue(

@@ -55,6 +55,29 @@ function providerConfigured(provider: ToolProvider, envState: Record<string, boo
 }
 
 /**
+ * The provider row to expand once a config lands: the one actually active in
+ * config (`is_active` / `active_provider`, mirroring the CLI picker), then the
+ * first fully-configured provider, else the first provider. Without this the
+ * panel highlighted the first keyless provider (e.g. Nous Portal) even when the
+ * user had already selected another (e.g. DuckDuckGo).
+ */
+function defaultExpandedProvider(cfg: ToolsetConfig, envState: Record<string, boolean>): string | null {
+  const { providers } = cfg
+
+  if (providers.length === 0) {
+    return null
+  }
+
+  const selected =
+    providers.find(p => p.is_active) ??
+    (cfg.active_provider ? providers.find(p => p.name === cfg.active_provider) : undefined) ??
+    providers.find(p => providerConfigured(p, envState)) ??
+    providers[0]
+
+  return selected.name
+}
+
+/**
  * Resolve the readiness pill state for a provider row. Prefers the honest
  * server-computed `status` (keys ∧ Nous entitlement ∧ post-setup install
  * state). Older backends don't send `status` — fall back to the legacy
@@ -506,7 +529,6 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
 
     try {
       const next = await getToolsetConfig(toolset)
-      setCfg(next)
       const seeded: Record<string, boolean> = {}
 
       for (const provider of next.providers) {
@@ -515,7 +537,17 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
         }
       }
 
+      setCfg(next)
       setEnvState(seeded)
+      // Seed the expanded row in the same batched update that first paints the
+      // rows. Deferring this to an effect left a committed frame where every
+      // row was collapsed and a setActiveProvider(default) was still queued:
+      // a click landing in that window enqueued its own setActiveProvider
+      // first, the pending effect's ran second, and last-write-wins silently
+      // discarded the user's pick with nothing left to recover it.
+      // `current ?? …` keeps the "only ever seed once" contract, so a later
+      // refresh (e.g. after Nous sign-in) can't yank the open row shut.
+      setActiveProvider(current => current ?? defaultExpandedProvider(next, seeded))
     } catch (err) {
       notifyError(err, copy.failedLoad)
     } finally {
@@ -528,25 +560,6 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
   }, [refresh])
 
   const providers = useMemo(() => cfg?.providers ?? [], [cfg])
-
-  // Default the expanded provider to the one actually active in config
-  // (`is_active` / `cfg.active_provider`, mirroring the CLI picker), then the
-  // first fully-configured provider, else the first provider. Without this the
-  // panel highlighted the first keyless provider (e.g. Nous Portal) even when
-  // the user had already selected another (e.g. DuckDuckGo).
-  useEffect(() => {
-    if (activeProvider || providers.length === 0) {
-      return
-    }
-
-    const selected =
-      providers.find(p => p.is_active) ??
-      (cfg?.active_provider ? providers.find(p => p.name === cfg.active_provider) : undefined) ??
-      providers.find(p => providerConfigured(p, envState)) ??
-      providers[0]
-
-    setActiveProvider(selected.name)
-  }, [activeProvider, providers, envState, cfg])
 
   async function handleSelect(provider: ToolProvider) {
     setActiveProvider(provider.name)
