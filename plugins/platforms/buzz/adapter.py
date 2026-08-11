@@ -686,34 +686,49 @@ class BuzzAdapter(BasePlatformAdapter):
         member name we find keeps genuine mentions notifying (p-tags intact)
         while downgrading everything unresolvable to presentation-only text.
 
-        Matching is mention-token semantics, not substring: the name must be
-        followed by a non-word character or end-of-text ("@Riley!!" tags
-        Riley; "@FizzBuzz" does NOT tag a member named Fizz).  Longer names
-        match first and consume their span, so "@Hermes Matt" prefers the
-        member "Hermes Matt" over a member "Hermes".
+        Matching is mention-token semantics, not substring, bounded on both
+        sides: the ``@`` must start a token ("email@Fizz", "x@Fizz", and
+        "@@Fizz" do NOT wake Fizz) and the name must be followed by a
+        non-word character or end-of-text ("@Riley!!" tags Riley;
+        "@FizzBuzz" does NOT tag a member named Fizz).  Longer names match
+        first and consume their span, so "@Hermes Matt" prefers the member
+        "Hermes Matt" over a member "Hermes".
+
+        Duplicate display names are ambiguous: the span is consumed but no
+        one is tagged (presentation-only), mirroring how Buzz treats
+        ambiguous names — never pick an arbitrary member.
         """
         if "@" not in content:
             return []
-        entries: List[Tuple[str, str]] = []
+        by_name: Dict[str, List[str]] = {}
+        display: Dict[str, str] = {}
         self_pk = getattr(self, "_self_pubkey", None)
         for pk in await self._channel_member_pubkeys(chat_id):
             if pk == self_pk:
                 continue
             name = await self._profile_display_name(pk)
-            if name:
-                entries.append((name, pk))
-        entries.sort(key=lambda e: len(e[0]), reverse=True)
+            if not name:
+                continue
+            key = name.lower()
+            by_name.setdefault(key, [])
+            if pk not in by_name[key]:
+                by_name[key].append(pk)
+            display.setdefault(key, name)
         found: List[str] = []
         text = content
-        for name, pk in entries:
+        for key in sorted(by_name, key=len, reverse=True):
             pattern = re.compile(
-                "@" + re.escape(name) + r"(?![0-9A-Za-z_])", re.IGNORECASE
+                r"(?<![0-9A-Za-z_@])@" + re.escape(display[key]) + r"(?![0-9A-Za-z_])",
+                re.IGNORECASE,
             )
             if pattern.search(text):
-                if pk not in found:
-                    found.append(pk)
-                # Consume the span so a shorter member name that is a prefix
-                # of this one cannot double-match the same mention.
+                pks = by_name[key]
+                if len(pks) == 1 and pks[0] not in found:
+                    found.append(pks[0])
+                # Consume the span either way: a shorter member name that is
+                # a prefix of this one must not double-match, and an
+                # ambiguous name must stay presentation-only rather than
+                # falling through to a partial match.
                 text = pattern.sub("\x00", text)
         return found
 
