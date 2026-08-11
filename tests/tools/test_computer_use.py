@@ -1012,6 +1012,9 @@ class TestRunAgentMultimodalHelpers:
         from run_agent import AIAgent
 
         agent = object.__new__(AIAgent)
+        agent.provider = "verified-vision-provider"
+        agent.model = "verified-vision-model"
+        agent._runtime_tool_result_image_mode = "embed_data_url"
         result = {
             "_multimodal": True,
             "content": [
