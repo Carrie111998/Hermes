@@ -929,9 +929,9 @@ export function useSessionActions({
         // keeps it from surfacing as unhandled while the prefetch settles.
         resumePromise.catch(() => undefined)
 
-        // Keep both requests concurrent, but do not paint the REST result until
-        // the runtime resume has also settled. An eager prefetch paint followed
-        // by the runtime projection rebuilds large transcripts during resume.
+        // Keep both requests concurrent. A successful REST result can paint the
+        // persisted baseline before the runtime binding settles; final resume
+        // reconciliation below reuses that view unless it adds real projection.
         let prefetchedResult: { messages: SessionMessage[]; session_id?: string } | null = null
 
         try {
@@ -942,20 +942,33 @@ export function useSessionActions({
           // Non-fatal: gateway resume below can still hydrate the session.
         }
 
-        const resumed = await resumePromise
-
         if (!isCurrentResume()) {
           return
         }
 
         if (prefetchedResult) {
+          const currentMessages = $messages.get()
           const previousMessages = resumedSameSelectedSession
-            ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-            : $messages.get()
+            ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
+            : currentMessages
 
-          localSnapshot = reconcileAuthoritativeMessages(prefetchedResult.messages, previousMessages)
+          const prefetchedMessages = reconcileAuthoritativeMessages(prefetchedResult.messages, previousMessages)
+
+          localSnapshot = chatMessageArraysEquivalent(currentMessages, prefetchedMessages)
+            ? currentMessages
+            : prefetchedMessages
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
+
+          if (localSnapshot !== currentMessages) {
+            setMessages(localSnapshot)
+          }
+        }
+
+        const resumed = await resumePromise
+
+        if (!isCurrentResume()) {
+          return
         }
 
         const currentMessages = $messages.get()
@@ -974,7 +987,7 @@ export function useSessionActions({
 
         const preferredMessages =
           prefetchApplied && prefetchMatchesResumedSession && !hasLiveProjection
-            ? localSnapshot
+            ? currentMessages
             : (() => {
                 const previousMessages = resumedSameSelectedSession
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
@@ -987,7 +1000,7 @@ export function useSessionActions({
                 // on, so the projection alone remains the degraded fallback.)
                 const resumedMessages =
                   resumed.messages_omitted && prefetchApplied && prefetchMatchesResumedSession
-                    ? appendLiveSessionProjection(localSnapshot, resumed)
+                    ? appendLiveSessionProjection(currentMessages, resumed)
                     : reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
 
                 return chatMessageArraysEquivalent(currentMessages, resumedMessages) ? currentMessages : resumedMessages
