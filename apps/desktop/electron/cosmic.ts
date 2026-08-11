@@ -29,6 +29,7 @@
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
 import path from 'node:path'
+import { existsSync } from 'node:fs'
 import type { EnumeratedWindow } from './window-below'
 
 const execFileAsync = promisify(execFile)
@@ -64,15 +65,30 @@ function toEnumerated(w: CosmicToplevel): EnumeratedWindow {
 }
 
 function resolveCosmicHelperPath(): string {
-  // electron-builder extraResources place the binary in process.resourcesPath
-  // (e.g. <app>/resources/cosmic-toplevel-list on Linux). Prefer that so a
-  // stock `hermes desktop` produced by this repo's own build finds it; fall
-  // back to a bare name resolved via PATH for dev builds and manual installs.
+  // electron-builder extraResources ships the staged binary into
+  // process.resourcesPath. The exact on-disk location depends on whether the
+  // extraResources `from` entry is treated as a file or a directory, so we
+  // probe both shapes and fall back to a bare name (PATH) for dev builds and
+  // manual installs. Returns the first candidate that exists on disk.
   const name = 'cosmic-toplevel-list'
+  const candidates: string[] = []
   if (typeof process !== 'undefined' && process.resourcesPath) {
-    return path.join(process.resourcesPath, name)
+    // Directory entry: <resources>/cosmic-toplevel-list/cosmic-toplevel-list
+    candidates.push(path.join(process.resourcesPath, name, name))
+    // File entry: <resources>/cosmic-toplevel-list
+    candidates.push(path.join(process.resourcesPath, name))
   }
-  return name
+  candidates.push(name) // bare name → resolved via PATH
+
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate
+    } catch {
+      // ignore and try the next candidate
+    }
+  }
+  // None exist; return the most likely path so the exec error is actionable.
+  return candidates[0]
 }
 
 function hashString(s: string): number {
