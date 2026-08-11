@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -1842,6 +1843,25 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
+def _validated_model_attempt(done: Any) -> bool:
+    """Validate legacy completion evidence without coercion.
+
+    ``model_attempted`` is accepted only as the literal bool ``True``.
+    ``api_calls`` accepts only a built-in int/float that is finite, integral,
+    and positive.  Strings, bools, subclasses, and malformed numeric values
+    fail closed.
+    """
+    attempted = done.get("model_attempted") if isinstance(done, dict) else None
+    if type(attempted) is bool and attempted:
+        return True
+    calls = done.get("api_calls") if isinstance(done, dict) else None
+    if type(calls) is int:
+        return calls > 0
+    if type(calls) is float:
+        return math.isfinite(calls) and calls.is_integer() and calls > 0
+    return False
+
+
 def _submit_prompt_to_compute_host(
     rid: str,
     sid: str,
@@ -1883,13 +1903,18 @@ def _submit_prompt_to_compute_host(
                 )
             return
         if refresh_reservation and not dispatch_state["attempted"]:
-            attempted = bool(done.get("model_attempted")) or int(
-                done.get("api_calls") or 0
-            ) > 0
             _finish_pending_refresh_note(
-                session, refresh_reservation["token"], attempted=attempted
+                session,
+                refresh_reservation["token"],
+                attempted=_validated_model_attempt(done),
             )
-        _on_compute_host_turn_done(rid, sid, session, done)
+        try:
+            _on_compute_host_turn_done(rid, sid, session, done)
+        finally:
+            if refresh_reservation and not dispatch_state["attempted"]:
+                _finish_pending_refresh_note(
+                    session, refresh_reservation["token"], attempted=False
+                )
 
     try:
         supervisor = _get_compute_host_supervisor(cfg)
@@ -9996,6 +10021,23 @@ def _run_prompt_submit(
 
     def run():
         refresh_committed = False
+        refresh_commit_lock = threading.Lock()
+
+        def _on_model_attempt() -> None:
+            nonlocal refresh_committed
+            with refresh_commit_lock:
+                if refresh_committed:
+                    return
+                if refresh_reservation:
+                    _finish_pending_refresh_note(
+                        session, refresh_reservation["token"], attempted=True
+                    )
+                refresh_committed = True
+                if on_model_dispatch is not None:
+                    try:
+                        on_model_dispatch()
+                    except Exception:
+                        logger.warning("model dispatch callback failed", exc_info=True)
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -10273,6 +10315,9 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            supports_attempt_callback = "on_model_attempt" in _run_params
+            if supports_attempt_callback:
+                run_kwargs["on_model_attempt"] = _on_model_attempt
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -10281,14 +10326,9 @@ def _run_prompt_submit(
             agent._on_session_title = lambda t, _src, _k=_title_key: _emit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
-            if refresh_reservation:
-                _finish_pending_refresh_note(
-                    session, refresh_reservation["token"], attempted=True
-                )
-            if on_model_dispatch is not None:
-                on_model_dispatch()
-            refresh_committed = True
             result = agent.run_conversation(run_message, **run_kwargs)
+            if not supports_attempt_callback and _validated_model_attempt(result):
+                _on_model_attempt()
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")

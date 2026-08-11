@@ -490,3 +490,36 @@ def test_legacy_compute_host_send_failure_rolls_back_refresh(monkeypatch):
                                                      refresh_reservation=reservation)
     assert response["error"]["code"] == 5019
     assert server._claim_pending_refresh_note(session) == reservation
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"api_calls": "1"},
+        {"api_calls": float("nan")},
+        {"api_calls": float("inf")},
+        {"api_calls": object()},
+        {"model_attempted": "true"},
+        {"model_attempted": 1},
+    ],
+)
+def test_legacy_compute_host_malformed_attempt_metadata_rolls_back(monkeypatch, metadata):
+    import tui_gateway.server as server
+
+    session = {"history_lock": threading.Lock(), "history": [], "history_version": 0,
+               "session_key": "key", "attached_images": [], "cols": 80}
+    server._queue_pending_refresh_note(session, "NOTE")
+    reservation = server._claim_pending_refresh_note(session)
+
+    class LegacySupervisor:
+        def submit_turn(self, frame, *, on_complete):
+            on_complete({"type": "turn.end", "request_id": frame["request_id"], **metadata})
+
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda cfg=None: LegacySupervisor())
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_on_compute_host_turn_done", lambda *a, **k: None)
+
+    server._submit_prompt_to_compute_host("rid", "sid", session, "hello",
+                                          refresh_reservation=reservation)
+
+    assert server._claim_pending_refresh_note(session) == reservation

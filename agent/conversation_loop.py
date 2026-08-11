@@ -2679,8 +2679,6 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
-                    if on_model_attempt is not None:
-                        on_model_attempt()
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2689,14 +2687,21 @@ def run_conversation(
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
+                        if on_model_attempt is not None:
+                            on_model_attempt()
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
                     from agent import relay_llm
 
+                    def _call_provider(final_api_kwargs):
+                        if on_model_attempt is not None:
+                            on_model_attempt()
+                        return agent._interruptible_api_call(final_api_kwargs)
+
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _call_provider,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),

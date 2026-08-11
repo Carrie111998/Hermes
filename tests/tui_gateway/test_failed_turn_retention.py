@@ -194,15 +194,17 @@ def test_refresh_reservation_rolls_back_on_context_rejection_and_retry_dispatche
     monkeypatch, emits, turn_env
 ):
     calls = []
+    def run_conversation(prompt, *, on_model_attempt, **kwargs):
+        on_model_attempt()
+        calls.append(prompt)
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
     agent = types.SimpleNamespace(
         session_id="session-key",
         model="test/model",
         base_url="",
         api_key="",
-        run_conversation=lambda prompt, **kwargs: (
-            calls.append(prompt)
-            or {"final_response": "ok", "messages": []}
-        ),
+        run_conversation=run_conversation,
         clear_interrupt=lambda: None,
     )
     session = _session(agent=agent, running=True)
@@ -239,14 +241,16 @@ def test_refresh_reservation_rolls_back_on_image_preprocessing_failure_then_retr
     monkeypatch, emits, turn_env
 ):
     calls = []
+    def run_conversation(prompt, *, on_model_attempt, **kwargs):
+        on_model_attempt()
+        calls.append(prompt)
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
     agent = types.SimpleNamespace(
         session_id="session-key",
         model="text-only",
         provider="test",
-        run_conversation=lambda prompt, **kwargs: (
-            calls.append(prompt)
-            or {"final_response": "ok", "messages": []}
-        ),
+        run_conversation=run_conversation,
         clear_interrupt=lambda: None,
     )
     session = _session(agent=agent, running=True)

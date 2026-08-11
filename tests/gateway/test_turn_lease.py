@@ -250,15 +250,16 @@ async def test_full_dispatch_lease_rejection_rolls_back_refresh_for_exactly_one_
     assert runner._pending_refresh_notes[session_key][0]["reserved_by"] is None
 
     assert runner._turn_leases.release(holder)
-    runner._run_agent = AsyncMock(
-        return_value={
+    async def run_attempted(**kwargs):
+        kwargs["on_model_attempt"]()
+        return {
             "final_response": "done",
             "messages": [],
             "tools": [],
             "history_offset": 0,
             "last_prompt_tokens": 0,
         }
-    )
+    runner._run_agent = AsyncMock(side_effect=run_attempted)
     resend = _event()
     resend.message_id = "msg-resend"
     await runner._handle_message(resend)

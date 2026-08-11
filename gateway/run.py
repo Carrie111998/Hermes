@@ -3642,6 +3642,21 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _validated_actual_model_attempt(result: Any) -> bool:
+    """Fail-closed validator for legacy agent completion metadata."""
+    if not isinstance(result, dict):
+        return False
+    attempted = result.get("model_attempted")
+    if type(attempted) is bool and attempted:
+        return True
+    calls = result.get("api_calls")
+    if type(calls) is int:
+        return calls > 0
+    if type(calls) is float:
+        return math.isfinite(calls) and calls.is_integer() and calls > 0
+    return False
+
+
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     """Detect retry-exhausted turns with hidden reasoning but no visible answer.
 
@@ -5608,7 +5623,20 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            try:
+                _run_params = inspect.signature(agent.run_conversation).parameters
+            except (TypeError, ValueError):
+                _run_params = {}
+            _supports_attempt_callback = "on_model_attempt" in _run_params
+            if _supports_attempt_callback and ctx.on_model_attempt is not None:
+                _conversation_kwargs["on_model_attempt"] = ctx.on_model_attempt
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if (
+                not _supports_attempt_callback
+                and ctx.on_model_attempt is not None
+                and _validated_actual_model_attempt(result)
+            ):
+                ctx.on_model_attempt()
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -18167,17 +18195,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if refresh_context_note
                 else message_text
             )
-            # This is the authoritative model-dispatch boundary. Everything
-            # above it is rollback-safe; once _run_agent is invoked the note is
-            # consumed exactly once even if the provider later fails.
-            if refresh_context_note:
-                self._finish_refresh_context_note(
-                    session_key,
-                    str(event.metadata.get("refresh_context_token") or ""),
-                    run_generation,
-                    attempted=True,
-                )
-                event.metadata["refresh_context_note_committed"] = True
+            _attempt_lock = threading.Lock()
+
+            def _on_model_attempt() -> None:
+                with _attempt_lock:
+                    if event.metadata.get("refresh_context_note_committed"):
+                        return
+                    if refresh_context_note:
+                        self._finish_refresh_context_note(
+                            session_key,
+                            str(event.metadata.get("refresh_context_token") or ""),
+                            run_generation,
+                            attempted=True,
+                        )
+                    event.metadata["refresh_context_note_committed"] = True
+
             agent_result = await self._run_agent(
                 message=agent_message_text,
                 context_prompt=context_prompt,
@@ -18192,6 +18224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                on_model_attempt=_on_model_attempt,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -24836,6 +24869,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        on_model_attempt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -24987,6 +25021,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _timeout = ClientTimeout(total=0, sock_read=1800)
             async with _AioClientSession(timeout=_timeout) as session:
+                if on_model_attempt is not None:
+                    on_model_attempt()
                 async with session.post(
                     f"{proxy_url}/v1/chat/completions",
                     json=body,
@@ -25127,6 +25163,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        on_model_attempt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25145,7 +25182,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
+                message_type=message_type, on_model_attempt=on_model_attempt,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25157,7 +25194,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
+                message_type=message_type, on_model_attempt=on_model_attempt,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -25280,6 +25317,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        on_model_attempt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25304,6 +25342,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                on_model_attempt=on_model_attempt,
             )
 
         from run_agent import AIAgent
@@ -25564,6 +25603,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            on_model_attempt=on_model_attempt,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

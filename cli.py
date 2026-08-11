@@ -3147,10 +3147,26 @@ def _cprint(text: str):
     """
     _record_output_history(text)
 
+    # Redirected/captured output has no prompt_toolkit input area to protect
+    # and no ANSI terminal to render. Write directly to the live stream so a
+    # process-global prompt_toolkit/thread-routing cache cannot swallow it.
+    try:
+        if not sys.stdout.isatty():
+            print(text)
+            return
+    except Exception:
+        pass
+
+    def _write() -> None:
+        # Bind prompt_toolkit to the stream active at emission time. Its
+        # process-global output cache may otherwise retain pytest's collection
+        # capture (and similarly stale redirected streams in embedders).
+        _pt_print(_PT_ANSI(text), file=sys.stdout)
+
     try:
         from prompt_toolkit.application import get_app_or_none, run_in_terminal
     except Exception:
-        _pt_print(_PT_ANSI(text))
+        _write()
         return
 
     app = None
@@ -3164,7 +3180,7 @@ def _cprint(text: str):
     # (spinner frames, streamed tokens, tool activity prefixes, …).
     if app is None or not getattr(app, "_is_running", False):
         try:
-            _pt_print(_PT_ANSI(text))
+            _write()
         except Exception:
             # Fallback when stdout is not a real console (e.g. subprocess
             # worker logging to a file). prompt_toolkit raises
@@ -3180,7 +3196,7 @@ def _cprint(text: str):
     except Exception:
         loop = None
     if loop is None:
-        _pt_print(_PT_ANSI(text))
+        _write()
         return
 
     import asyncio as _asyncio
@@ -3196,7 +3212,7 @@ def _cprint(text: str):
         current_loop = None
     # Same thread as the app's loop → safe to print directly.
     if current_loop is loop and loop.is_running():
-        _pt_print(_PT_ANSI(text))
+        _write()
         return
 
     # Cross-thread emission: ask the app's event loop to schedule a
@@ -3217,7 +3233,7 @@ def _cprint(text: str):
         try:
             import asyncio as _aio
             import inspect as _inspect
-            coro = run_in_terminal(lambda: _pt_print(_PT_ANSI(text)))
+            coro = run_in_terminal(_write)
             if coro is not None and (_inspect.isawaitable(coro) or _inspect.iscoroutine(coro)):
                 _aio.ensure_future(coro)
             # else: run_in_terminal ran the lambda synchronously; nothing more

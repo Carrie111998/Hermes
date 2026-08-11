@@ -10,13 +10,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-_original_stdout = sys.stdout
-
-
 @pytest.fixture(autouse=True)
 def _restore_stdout():
+    original_stdout = sys.stdout
     yield
-    sys.stdout = _original_stdout
+    sys.stdout = original_stdout
 
 
 @pytest.fixture()
@@ -40,7 +38,6 @@ def server():
     # ("slash.exec", "fast.ping", ...) directly in the module-level dict,
     # which is shared with every other test file in the process.
     methods = dict(mod._methods)
-    real_stdout = mod._real_stdout
     yield mod
     # Reset module-level state without re-importing. importlib.reload
     # would re-register the module's atexit hooks (ThreadPoolExecutor
@@ -50,7 +47,9 @@ def server():
     # test a clean slate.
     mod._methods.clear()
     mod._methods.update(methods)
-    mod._real_stdout = real_stdout
+    # Never restore a capture stream retained from module import/collection;
+    # pytest installs a fresh stream for each test phase.
+    mod._real_stdout = sys.stdout
     for sid in list(mod._sessions):
         mod._close_session_by_id(sid, end_reason="test_cleanup")
     mod._pending.clear()
