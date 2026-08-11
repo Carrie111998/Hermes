@@ -1,0 +1,10 @@
+# Deploy to ~/.config/systemd/user/hermes-mcp-health-guard.service
+# T0138: periodic MCP klib connection health check + alert (see
+# scripts/mcp_health_check.sh for detection logic/rationale).
+[Unit]
+Description=Hermes MCP server health guard (klib connection watchdog)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/cwliao/.hermes/hermes-agent
+ExecStart=/home/cwliao/.hermes/hermes-agent/scripts/mcp_health_check.sh

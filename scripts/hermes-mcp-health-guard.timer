@@ -1,0 +1,11 @@
+# Deploy to ~/.config/systemd/user/hermes-mcp-health-guard.timer
+[Unit]
+Description=Hermes MCP server health guard schedule
+
+[Timer]
+OnActiveSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
