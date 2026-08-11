@@ -50,6 +50,7 @@ class TraceState:
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
     last_updated_at: float = field(default_factory=time.time)
+    session_id: str = ""
 
 
 _STATE_LOCK = threading.Lock()
@@ -67,6 +68,7 @@ _LANGFUSE_CLIENT = None
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
+_API_ERROR_SUMMARY_MAX_CHARS = 512
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
 # the prefix is baked into the server-side issuance flow, not a UI hint).
@@ -292,6 +294,25 @@ def _truncate_text(value: str, max_chars: int) -> Any:
     if len(value) <= max_chars:
         return value
     return value[:max_chars] + f"... [truncated {len(value) - max_chars} chars]"
+
+
+def _redact_api_error_text(value: Any, *, limit: int = _API_ERROR_SUMMARY_MAX_CHARS) -> str:
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    try:
+        from agent.redact import redact_sensitive_text
+
+        text = redact_sensitive_text(
+            text,
+            force=True,
+            redact_url_credentials=True,
+        )
+    except Exception:
+        text = "<api error redacted>"
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"... [truncated {len(text) - limit} chars]"
 
 
 def _maybe_parse_json_string(value: str) -> Any:
@@ -664,7 +685,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         pass
 
     _debug(f"started trace {trace_id} for {task_key}")
-    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span)
+    return TraceState(trace_id=trace_id, root_ctx=root_ctx, root_span=root_span, session_id=session_id)
 
 
 def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, as_type: str,
@@ -681,7 +702,8 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
-                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
+                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
+                     level: Optional[str] = None, status_message: Optional[str] = None) -> None:
     if observation is None:
         return
     try:
@@ -694,6 +716,10 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
             update_kwargs["usage_details"] = usage_details
         if cost_details:
             update_kwargs["cost_details"] = cost_details
+        if level:
+            update_kwargs["level"] = level
+        if status_message:
+            update_kwargs["status_message"] = status_message
         if update_kwargs:
             observation.update(**update_kwargs)
         observation.end()
@@ -764,6 +790,23 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
             client.flush()
         except Exception:
             pass
+
+
+def _finish_traces_for_session(session_id: str) -> None:
+    if not session_id:
+        return
+    if _get_langfuse() is None:
+        return
+
+    with _STATE_LOCK:
+        task_keys = [
+            task_key
+            for task_key, state in _TRACE_STATE.items()
+            if state.session_id == session_id
+        ]
+
+    for task_key in task_keys:
+        _finish_trace(task_key)
 
 
 def _assistant_has_tool_calls(message: Any) -> bool:
@@ -903,6 +946,123 @@ def on_pre_llm_request(
             model=model,
             model_parameters={"api_mode": api_mode, "provider": provider},
         )
+
+
+def on_api_request_error(
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    api_call_count: int = 0,
+    api_duration: float = 0.0,
+    status_code: Optional[int] = None,
+    retry_count: Optional[int] = None,
+    max_retries: Optional[int] = None,
+    retryable: Optional[bool] = None,
+    reason: Optional[str] = None,
+    error: Any = None,
+    turn_id: str = "",
+    api_request_id: str = "",
+    **_: Any,
+) -> None:
+    if _get_langfuse() is None:
+        return
+
+    task_key = _trace_key(
+        task_id,
+        session_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+    )
+    req_key = _request_key(api_call_count)
+
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        if state is not None:
+            state.last_updated_at = time.time()
+            generation = state.generations.pop(req_key, None)
+        else:
+            generation = None
+    if state is None or generation is None:
+        return
+
+    error_type: Optional[str] = None
+    error_message: Any = None
+    if isinstance(error, dict):
+        raw_type = error.get("type")
+        if raw_type is not None:
+            error_type = str(raw_type)
+        error_message = error.get("message") or error.get("error") or error.get("detail")
+    elif error is not None:
+        error_type = type(error).__name__
+        error_message = str(error)
+
+    summary_parts: list[str] = []
+    if status_code is not None:
+        summary_parts.append(f"HTTP {status_code}")
+    if reason:
+        summary_parts.append(str(reason))
+    if error_type and error_message:
+        summary_parts.append(f"{error_type}: {error_message}")
+    elif error_type:
+        summary_parts.append(error_type)
+    elif error_message:
+        summary_parts.append(str(error_message))
+
+    status_message = _redact_api_error_text(
+        " | ".join(summary_parts) or "API request failed"
+    )
+    metadata: Dict[str, Any] = {
+        "status_code": status_code,
+        "retry_count": retry_count,
+        "max_retries": max_retries,
+        "retryable": retryable,
+        "reason": _redact_api_error_text(reason) if reason is not None else None,
+        "error_type": error_type,
+        "error_summary": status_message,
+    }
+    try:
+        metadata["api_duration_s"] = round(float(api_duration), 3)
+    except (TypeError, ValueError):
+        pass
+    metadata = {key: value for key, value in metadata.items() if value is not None}
+
+    _end_observation(
+        generation,
+        metadata=metadata,
+        level="ERROR",
+        status_message=status_message,
+    )
+
+
+def on_session_end(
+    *,
+    task_id: str = "",
+    session_id: str = "",
+    turn_id: str = "",
+    api_request_id: str = "",
+    **_: Any,
+) -> None:
+    client = _get_langfuse()
+    if client is None:
+        return
+
+    task_key = _trace_key(
+        task_id,
+        session_id,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+    )
+    _finish_trace(task_key)
+
+
+def on_session_finalize(
+    *,
+    session_id: Any = "",
+    old_session_id: Any = "",
+    **_: Any,
+) -> None:
+    session_key = str(session_id or old_session_id or "")
+    _finish_traces_for_session(session_key)
 
 
 def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
@@ -1131,6 +1291,9 @@ def register(ctx) -> None:
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
     ctx.register_hook("pre_api_request", on_pre_llm_request)
     ctx.register_hook("post_api_request", on_post_llm_call)
+    ctx.register_hook("api_request_error", on_api_request_error)
+    ctx.register_hook("on_session_end", on_session_end)
+    ctx.register_hook("on_session_finalize", on_session_finalize)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)

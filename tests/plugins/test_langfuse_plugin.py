@@ -25,9 +25,12 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # All nine hooks the plugin implements.
         assert set(data["hooks"]) == {
             "pre_api_request", "post_api_request",
+            "api_request_error",
+            "on_session_end",
+            "on_session_finalize",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
         }
@@ -128,7 +131,7 @@ class TestRuntimeGate:
 
 class TestHooksInert:
     def test_hooks_noop_without_client(self, monkeypatch):
-        """All 6 hooks must return without raising when _get_langfuse() is None."""
+        """All hooks must return without raising when _get_langfuse() is None."""
         for k in (
             "HERMES_LANGFUSE_PUBLIC_KEY", "HERMES_LANGFUSE_SECRET_KEY",
             "LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY",
@@ -143,8 +146,28 @@ class TestHooksInert:
         mod.on_pre_llm_call(task_id="t", session_id="s", messages=[{"role": "user", "content": "hi"}])
         mod.on_pre_llm_request(task_id="t", session_id="s", api_call_count=1, request_messages=[])
         mod.on_post_llm_call(task_id="t", session_id="s", api_call_count=1)
+        mod.on_api_request_error(task_id="t", session_id="s", api_call_count=1)
+        mod.on_session_end(task_id="t", session_id="s", turn_id="turn", api_request_id="req")
+        mod.on_session_finalize(session_id="s")
         mod.on_pre_tool_call(tool_name="read_file", args={}, task_id="t", session_id="s")
         mod.on_post_tool_call(tool_name="read_file", args={}, result="ok", task_id="t", session_id="s")
+
+
+class TestRegistration:
+    def test_register_includes_api_request_error_hook(self):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        registered = {}
+
+        class _Ctx:
+            def register_hook(self, name, fn):
+                registered[name] = fn
+
+        mod.register(_Ctx())
+
+        assert registered["api_request_error"] is mod.on_api_request_error
+        assert registered["on_session_end"] is mod.on_session_end
+        assert registered["on_session_finalize"] is mod.on_session_finalize
 
 
 class TestPayloadSanitization:
@@ -779,3 +802,177 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+class TestApiRequestError:
+    def test_error_hook_marks_generation_errored_and_clears_state(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Obs:
+            def __init__(self):
+                self.updates = []
+                self.ended = False
+
+            def update(self, **kw):
+                self.updates.append(kw)
+
+            def end(self, **kw):
+                self.ended = True
+
+        observation = _Obs()
+        state = mod.TraceState(trace_id="trace-1", root_ctx=None, root_span=None)
+        state.generations[mod._request_key(1)] = observation
+        task_key = mod._trace_key("task-1", "session-1", turn_id="turn-1", api_request_id="api-1")
+        monkeypatch.setitem(mod._TRACE_STATE, task_key, state)
+
+        mod.on_api_request_error(
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            api_request_id="api-1",
+            api_call_count=1,
+            api_duration=1.23456,
+            status_code=429,
+            retry_count=2,
+            max_retries=3,
+            retryable=True,
+            reason="rate_limit",
+            error={
+                "type": "RateLimitError",
+                "message": "provider rejected sk-test-secret-token-1234567890",
+            },
+        )
+
+        assert observation.ended is True
+        assert len(observation.updates) == 1
+        update = observation.updates[0]
+        assert update["level"] == "ERROR"
+        assert "429" in update["status_message"]
+        assert "rate_limit" in update["status_message"]
+        assert "sk-test-secret-token" not in update["status_message"]
+        assert update["metadata"] == {
+            "status_code": 429,
+            "retry_count": 2,
+            "max_retries": 3,
+            "retryable": True,
+            "reason": "rate_limit",
+            "api_duration_s": 1.235,
+            "error_type": "RateLimitError",
+            "error_summary": update["status_message"],
+        }
+        assert mod._request_key(1) not in state.generations
+
+
+class TestSessionEndCleanup:
+    def test_session_end_flushes_remaining_state(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Obs:
+            def __init__(self):
+                self.updated = []
+                self.ended = False
+
+            def update(self, **kw):
+                self.updated.append(kw)
+
+            def end(self, **kw):
+                self.ended = True
+
+        class _Root:
+            def __init__(self):
+                self.ended = False
+                self.trace_io = []
+                self.updates = []
+
+            def set_trace_io(self, **kw):
+                self.trace_io.append(kw)
+
+            def update(self, **kw):
+                self.updates.append(kw)
+
+            def end(self, **kw):
+                self.ended = True
+
+        state = mod.TraceState(trace_id="trace-1", root_ctx=None, root_span=_Root())
+        obs = _Obs()
+        state.generations[mod._request_key(1)] = obs
+        task_key = mod._trace_key("task-1", "session-1", turn_id="turn-1", api_request_id="api-1")
+        monkeypatch.setitem(mod._TRACE_STATE, task_key, state)
+
+        mod.on_session_end(
+            task_id="task-1",
+            session_id="session-1",
+            turn_id="turn-1",
+            completed=True,
+            failed=False,
+            interrupted=False,
+            turn_exit_reason="text_response(stop)",
+            model="gpt-4",
+            platform="cli",
+        )
+
+        assert obs.ended is True
+        assert state.root_span.ended is True
+        assert task_key not in mod._TRACE_STATE
+
+    def test_session_finalize_flushes_all_state_for_session(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Obs:
+            def __init__(self):
+                self.ended = False
+
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                self.ended = True
+
+        class _Root:
+            def __init__(self):
+                self.ended = False
+
+            def set_trace_io(self, **kw):
+                pass
+
+            def update(self, **kw):
+                pass
+
+            def end(self, **kw):
+                self.ended = True
+
+        def seed(task_id, session_id, turn_id):
+            root = _Root()
+            obs = _Obs()
+            state = mod.TraceState(
+                trace_id=f"trace-{task_id}",
+                root_ctx=None,
+                root_span=root,
+                session_id=session_id,
+            )
+            state.generations[mod._request_key(1)] = obs
+            task_key = mod._trace_key(task_id, session_id, turn_id=turn_id)
+            monkeypatch.setitem(mod._TRACE_STATE, task_key, state)
+            return task_key, state, obs
+
+        key_a, state_a, obs_a = seed("task-a", "session-1", "turn-a")
+        key_b, state_b, obs_b = seed("task-b", "session-1", "turn-b")
+        key_other, state_other, obs_other = seed("task-c", "session-2", "turn-c")
+
+        mod.on_session_finalize(session_id="session-1")
+
+        assert obs_a.ended is True
+        assert obs_b.ended is True
+        assert state_a.root_span.ended is True
+        assert state_b.root_span.ended is True
+        assert key_a not in mod._TRACE_STATE
+        assert key_b not in mod._TRACE_STATE
+        assert obs_other.ended is False
+        assert state_other.root_span.ended is False
+        assert key_other in mod._TRACE_STATE
