@@ -250,6 +250,12 @@ _LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
 _RAW_CONFIG_CACHE: Dict[str, Tuple[int, int, Dict[str, Any]]] = {}
+# Security-policy reads must distinguish a missing file from parse/I/O/type
+# failures and must notice permission-only changes. Keep their stronger cache
+# separate from read_raw_config()'s backward-compatible fail-open cache.
+_STRICT_RAW_CONFIG_CACHE: Dict[
+    str, Tuple[Tuple[int, int, int, int], Dict[str, Any]]
+] = {}
 # Serializes all config read/write paths. libyaml's C extension is not
 # thread-safe for concurrent safe_load() on the same file, and multiple
 # tool threads (approval.py, browser_tool.py, setup flows) hit
@@ -3003,6 +3009,37 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def read_raw_config_strict() -> Optional[Dict[str, Any]]:
+    """Read raw config without collapsing security-relevant failures.
+
+    Returns ``None`` only when the active config file is absent. Valid empty
+    configuration returns ``{}``. Parse errors, I/O errors, and non-mapping
+    YAML roots raise so fail-closed policy callers cannot mistake them for an
+    absent policy. The cache includes ctime and mode to invalidate on
+    permission-only changes.
+    """
+    with _CONFIG_LOCK:
+        config_path = get_config_path()
+        try:
+            st = config_path.stat()
+        except FileNotFoundError:
+            return None
+        cache_key = (st.st_mtime_ns, st.st_ctime_ns, st.st_size, st.st_mode)
+        path_key = str(config_path)
+        cached = _STRICT_RAW_CONFIG_CACHE.get(path_key)
+        if cached is not None and cached[0] == cache_key:
+            return copy.deepcopy(cached[1])
+
+        with open(config_path, encoding="utf-8") as handle:
+            data = fast_safe_load(handle)
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ValueError("Hermes config root must be a mapping")
+        _STRICT_RAW_CONFIG_CACHE[path_key] = (cache_key, copy.deepcopy(data))
+        return data
+
+
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
@@ -3674,6 +3711,7 @@ def save_config(
         )
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
+        _STRICT_RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
 
 

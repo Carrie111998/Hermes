@@ -209,6 +209,29 @@ If you want this profile to work in a specific project by default, also set its 
 coder config set terminal.cwd /absolute/path/to/project
 ```
 
+### Credentialless profiles
+
+Named profiles normally inherit provider credentials from the global Hermes
+auth store when they have no profile-local entry. To create a fail-closed
+profile that must not inherit or materialize authentication state, add:
+
+```yaml
+auth:
+  inherit_global: false
+```
+
+With this setting, Hermes does not read global-root credential pools or
+provider/OAuth singletons, does not seed ambient credentials into the profile,
+and refuses writes that would create or update the profile's `auth.json`.
+Inspection commands such as `hermes -p <name> auth list` remain read-only. The
+setting is deliberately fail-closed: if `inherit_global` is present, only the
+boolean value `true` enables inheritance and auth materialization. Omitting the
+setting preserves the standard profile behavior.
+
+This protects Hermes provider auth state only. External tools can still use the
+OS user's `HOME`; combine it with `terminal.home_mode: profile` and an explicit
+tool allowlist when external CLI credential isolation is also required.
+
 ### From the dashboard
 
 The [web dashboard](features/web-dashboard.md#managing-multiple-profiles)

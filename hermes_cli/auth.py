@@ -85,6 +85,7 @@ from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
     read_raw_config,
+    read_raw_config_strict,
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
@@ -1057,6 +1058,31 @@ def _auth_file_path() -> Path:
     return path
 
 
+def profile_auth_materialization_enabled() -> bool:
+    """Return whether the active profile may inherit or persist auth state.
+
+    ``auth.inherit_global`` is intentionally a fail-closed profile boundary.
+    The setting is backward-compatible when absent, but once present only the
+    boolean value ``true`` permits global-root fallback, ambient credential
+    seeding, or auth.json writes. Invalid values and unreadable configuration
+    deny those paths rather than silently restoring credential authority.
+    """
+    try:
+        config = read_raw_config_strict()
+    except Exception:
+        return False
+    if config is None:
+        return True
+    auth_config = config.get("auth")
+    if "auth" not in config:
+        return True
+    if not isinstance(auth_config, dict):
+        return False
+    if "inherit_global" not in auth_config:
+        return True
+    return auth_config.get("inherit_global") is True
+
+
 def _global_auth_file_path() -> Optional[Path]:
     """Return the global-root auth.json when the process is in profile mode.
 
@@ -1067,6 +1093,8 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
+    if not profile_auth_materialization_enabled():
+        return None
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
@@ -1325,6 +1353,10 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
+    if not profile_auth_materialization_enabled():
+        raise AuthError(
+            "Profile auth materialization is disabled by auth.inherit_global"
+        )
     auth_file = target_path if target_path is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
@@ -1709,6 +1741,10 @@ def write_credential_pool(
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
     """
+    if not profile_auth_materialization_enabled():
+        raise AuthError(
+            "Profile auth materialization is disabled by auth.inherit_global"
+        )
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()

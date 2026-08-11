@@ -52,10 +52,80 @@ def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def _disable_global_auth_inheritance(profile: Path, value: object = False) -> None:
+    _write(profile / "config.yaml", {"auth": {"inherit_global": value}})
+
+
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
 
+
+def test_profile_can_fail_closed_against_all_global_pool_fallback(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [_pool_entry(id="global-codex", access_token="synthetic-global")],
+        "xai-oauth": [_pool_entry(id="global-xai", access_token="synthetic-global")],
+    }))
+
+    assert read_credential_pool("openai-codex") == []
+    assert read_credential_pool("xai-oauth") == []
+    assert read_credential_pool() == {}
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_invalid_inherit_global_value_fails_closed(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    _disable_global_auth_inheritance(profile_env["profile"], value="false")
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="global-openrouter", access_token="synthetic-global")],
+    }))
+
+    assert read_credential_pool("openrouter") == []
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_malformed_profile_config_fails_closed(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    (profile_env["profile"] / "config.yaml").write_text("auth: [\n")
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="global-openrouter", access_token="synthetic-global")],
+    }))
+
+    assert read_credential_pool("openrouter") == []
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_unreadable_profile_config_fails_closed(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    config_path = profile_env["profile"] / "config.yaml"
+    _disable_global_auth_inheritance(profile_env["profile"])
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="global-openrouter", access_token="synthetic-global")],
+    }))
+    config_path.chmod(0)
+    try:
+        assert read_credential_pool("openrouter") == []
+    finally:
+        config_path.chmod(0o600)
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_non_mapping_auth_policy_fails_closed(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["profile"] / "config.yaml", {"auth": "invalid"})
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(id="global-openrouter", access_token="synthetic-global")],
+    }))
+
+    assert read_credential_pool("openrouter") == []
+    assert not (profile_env["profile"] / "auth.json").exists()
 
 
 
@@ -114,6 +184,20 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
 # ---------------------------------------------------------------------------
 
 
+def test_profile_can_fail_closed_against_global_singleton_fallback(profile_env):
+    from hermes_cli.auth import get_provider_auth_state
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "synthetic-global", "refresh_token": "synthetic-refresh"},
+        "xai-oauth": {"access_token": "synthetic-global"},
+    }))
+
+    assert get_provider_auth_state("nous") is None
+    assert get_provider_auth_state("xai-oauth") is None
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
 def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_env):
     from hermes_cli.auth import get_provider_auth_state
 
@@ -163,6 +247,43 @@ def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
 # ---------------------------------------------------------------------------
 # Writes stay scoped to the profile
 # ---------------------------------------------------------------------------
+
+
+def test_inheritance_disabled_refuses_profile_auth_materialization(profile_env):
+    from hermes_cli.auth import AuthError, write_credential_pool
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+
+    with pytest.raises(AuthError, match="auth materialization is disabled"):
+        write_credential_pool("openrouter", [_pool_entry(access_token="synthetic-local")])
+
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_inheritance_disabled_refuses_singleton_auth_materialization(profile_env):
+    from hermes_cli.auth import AuthError, _save_auth_store
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+
+    with pytest.raises(AuthError, match="auth materialization is disabled"):
+        _save_auth_store({
+            "version": 1,
+            "providers": {"nous": {"access_token": "synthetic-local"}},
+        })
+
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_inheritance_disabled_skips_ambient_pool_seeding(profile_env, monkeypatch):
+    from agent.credential_pool import load_pool
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-ambient")
+
+    pool = load_pool("openrouter")
+
+    assert pool.entries() == []
+    assert not (profile_env["profile"] / "auth.json").exists()
 
 
 def test_write_credential_pool_targets_profile_not_global(profile_env):

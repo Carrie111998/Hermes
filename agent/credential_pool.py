@@ -3126,6 +3126,11 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    if not auth_mod.profile_auth_materialization_enabled():
+        # Credentialless profiles must remain read-only and empty when they
+        # start without local auth state. In particular, inspection commands
+        # must not seed ambient env/singleton credentials into auth.json.
+        return CredentialPool(provider, entries)
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(
