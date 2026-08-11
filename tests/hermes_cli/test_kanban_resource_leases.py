@@ -9,6 +9,7 @@ import time
 import json
 import os
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -440,11 +441,12 @@ def test_live_pid_claim_extension_renews_resource_lease_under_same_lock(kanban_h
             conn, holder, board="default", claimer=claimer, ttl_seconds=1
         )
         assert claimed is not None
+        kb._set_worker_pid(conn, holder, os.getpid())
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET worker_pid = ?, claim_expires = ?, "
+                "UPDATE tasks SET claim_expires = ?, "
                 "last_heartbeat_at = ? WHERE id = ?",
-                (os.getpid(), expired, int(time.time()), holder),
+                (expired, int(time.time()), holder),
             )
         with kb._resource_lease_connect() as leases, kb.write_txn(leases):
             leases.execute(
@@ -461,6 +463,122 @@ def test_live_pid_claim_extension_renews_resource_lease_under_same_lock(kanban_h
     assert lease.claim_expires == renewed.claim_expires
     with kb.connect_closing(board="other") as conn:
         assert kb.claim_task(conn, contender, board="other") is None
+
+
+def test_reused_pid_generation_does_not_extend_or_signal_stale_holder(
+    kanban_home, monkeypatch
+):
+    holder = _create("default", "holder", ["gpu:0"])
+    contender = _create("other", "contender", ["gpu:0"])
+    expired = int(time.time()) - 1
+    signalled: list[int] = []
+
+    monkeypatch.setattr(kb, "_process_start_time", lambda _pid: 100)
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    with kb.connect_closing(board="default") as conn:
+        claimed = kb.claim_task(conn, holder, board="default", ttl_seconds=1)
+        assert claimed is not None
+        kb._set_worker_pid(conn, holder, 4242)
+
+        # The original process generation remains authoritative even when the
+        # board and registry TTLs lag behind a heartbeat.
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = ? "
+                "WHERE id = ?",
+                (expired, int(time.time()), holder),
+            )
+        with kb._resource_lease_connect() as leases, kb.write_txn(leases):
+            leases.execute(
+                "UPDATE resource_leases SET claim_expires = ? "
+                "WHERE holder_task_id = ?",
+                (expired, holder),
+            )
+        assert kb.release_stale_claims(conn) == 0
+
+    with kb.connect_closing(board="other") as conn:
+        assert kb.claim_task(conn, contender, board="other") is None
+
+    # The worker exits and the OS recycles its PID. PID existence alone must
+    # neither renew the dead holder nor signal the unrelated successor process.
+    monkeypatch.setattr(kb, "_process_start_time", lambda _pid: 200)
+    with kb.connect_closing(board="default") as conn:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = NULL "
+                "WHERE id = ?",
+                (expired, holder),
+            )
+        with kb._resource_lease_connect() as leases, kb.write_txn(leases):
+            leases.execute(
+                "UPDATE resource_leases SET claim_expires = ? "
+                "WHERE holder_task_id = ?",
+                (expired, holder),
+            )
+        assert kb.release_stale_claims(
+            conn, signal_fn=lambda pid, _sig: signalled.append(pid)
+        ) == 1
+        assert kb.get_task(conn, holder).status == "ready"
+
+    assert signalled == []
+    with kb.connect_closing(board="other") as conn:
+        assert kb.claim_task(conn, contender, board="other") is not None
+
+
+def test_expired_legacy_pid_row_is_reclaimed_without_signalling(kanban_home, monkeypatch):
+    holder = _create("default", "legacy holder", ["gpu:0"])
+    expired = int(time.time()) - 1
+    signalled: list[int] = []
+
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+    with kb.connect_closing(board="default") as conn:
+        assert kb.claim_task(conn, holder, board="default", ttl_seconds=1) is not None
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_start_time = NULL, "
+                "claim_expires = ?, last_heartbeat_at = NULL WHERE id = ?",
+                (4242, expired, holder),
+            )
+        with kb._resource_lease_connect() as leases, kb.write_txn(leases):
+            leases.execute(
+                "UPDATE resource_leases SET claim_expires = ? "
+                "WHERE holder_task_id = ?",
+                (expired, holder),
+            )
+
+        assert kb.release_stale_claims(
+            conn, signal_fn=lambda pid, _sig: signalled.append(pid)
+        ) == 1
+        reclaimed = kb.get_task(conn, holder)
+        assert reclaimed is not None
+        assert reclaimed.status == "ready"
+
+    assert signalled == []
+    assert kb.list_resource_leases() == []
+
+
+def test_worker_start_time_columns_are_added_to_existing_boards(kanban_home):
+    db_path = kb.kanban_db_path("default")
+    with kb.connect_closing(board="default"):
+        pass
+
+    with sqlite3.connect(str(db_path)) as raw:
+        raw.execute("ALTER TABLE tasks DROP COLUMN worker_start_time")
+        raw.execute("ALTER TABLE task_runs DROP COLUMN worker_start_time")
+
+    # Simulate the next process start; initialized paths are intentionally
+    # cached for the lifetime of one process.
+    kb._INITIALIZED_PATHS.clear()
+    with kb.connect_closing(board="default") as conn:
+        task_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        run_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+
+    assert "worker_start_time" in task_columns
+    assert "worker_start_time" in run_columns
 
 
 def test_surviving_worker_reclaim_deferral_renews_resource_lease(kanban_home):
