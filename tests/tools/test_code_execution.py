@@ -18,6 +18,8 @@ import pytest
 import json
 import os
 import socket
+import subprocess
+import tempfile
 import time
 
 os.environ["TERMINAL_ENV"] = "local"
@@ -114,6 +116,40 @@ class TestHermesToolsGeneration(unittest.TestCase):
         src = generate_hermes_tools_module(["terminal"], transport="file")
         self.assertIn("_seq_lock = threading.Lock()", src)
         self.assertIn("with _seq_lock:", src)
+
+    def test_convenience_helpers_import_and_execute_for_each_transport(self):
+        """Both generated transports must expose working helper imports."""
+        probe = """
+import json
+from hermes_tools import json_parse, retry, shell_quote
+print(json.dumps({
+    "parsed": json_parse('{"value": 7}')["value"],
+    "quoted": shell_quote("two words"),
+    "retried": retry(lambda: "ok"),
+}, sort_keys=True))
+"""
+        for transport in ("uds", "file"):
+            with (
+                self.subTest(transport=transport),
+                tempfile.TemporaryDirectory() as tmpdir,
+            ):
+                module_path = os.path.join(tmpdir, "hermes_tools.py")
+                with open(module_path, "w", encoding="utf-8") as handle:
+                    handle.write(generate_hermes_tools_module([], transport=transport))
+                completed = subprocess.run(
+                    [sys.executable, "-c", probe],
+                    cwd=tmpdir,
+                    env=os.environ.copy(),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertEqual(json.loads(completed.stdout), {
+                    "parsed": 7,
+                    "quoted": "'two words'",
+                    "retried": "ok",
+                })
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):

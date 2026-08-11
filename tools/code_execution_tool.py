@@ -379,10 +379,10 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
 
     Production mining (state.db): the top execute_code failure classes are
     hermes_tools import misuse (importing tools that aren't in the sandbox,
-    23x in one window), calling the built-in helpers via import, treating
-    tool results as strings instead of dicts, and importing third-party
-    packages that don't exist in the sandbox interpreter. Bounded scan,
-    first match wins, never raises.
+    23x in one window), calling convenience helpers without importing them,
+    treating tool results as strings instead of dicts, and importing
+    third-party packages that don't exist in the sandbox interpreter.
+    Bounded scan, first match wins, never raises.
     """
     if not stderr_text:
         return None
