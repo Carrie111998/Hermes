@@ -82,6 +82,32 @@ def _prompt_parts(agent):
         return build_system_prompt_parts(agent)
 
 
+class TestSteerChannelNote:
+    def test_excluded_from_cron_sessions_that_cannot_receive_user_steers(
+        self, monkeypatch
+    ):
+        import agent.system_prompt as system_prompt
+
+        monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+
+        stable = _stable_prompt(
+            _make_agent(valid_tool_names=["read_file"], platform="cron")
+        )
+
+        assert "STEER" not in stable
+
+    def test_preserved_for_interactive_sessions(self, monkeypatch):
+        import agent.system_prompt as system_prompt
+
+        monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
+
+        stable = _stable_prompt(
+            _make_agent(valid_tool_names=["read_file"], platform="telegram")
+        )
+
+        assert "STEER" in stable
+
+
 def _init_code_repo(path):
     """A git repo that actually holds code — the coding posture requires a source
     file (or manifest), not a bare ``.git`` (a prose/notes repo stays general)."""
