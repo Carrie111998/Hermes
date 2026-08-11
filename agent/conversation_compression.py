@@ -3216,7 +3216,20 @@ def compress_context(
                     "content": todo_snapshot,
                     "_todo_snapshot_synthetic": True,
                 })
-        _ensure_compressed_has_user_turn(messages, compressed)
+        # Boundary-aware manual compression holds the real current user turns
+        # in ``protected_tail`` until the atomic rejoin below. Looking only at
+        # the compressed head makes its reference-only handoff appear to have
+        # no actionable user turn, so the ordinary safety pass re-appends the
+        # fourth-most-recent user message from the old head. That both violates
+        # the selected exchange boundary and can create user→user adjacency.
+        # The externally protected tail is part of the durable transcript, so a
+        # genuine user turn there satisfies the invariant without leaking one
+        # from the summarized head.
+        _protected_tail_has_real_user = bool(protected_tail) and any(
+            _is_real_user_message(message) for message in protected_tail
+        )
+        if not _protected_tail_has_real_user:
+            _ensure_compressed_has_user_turn(messages, compressed)
 
         # Boundary-aware manual compression is orchestrated outside this low-
         # level compressor: the caller summarizes ``messages`` (the head) and

@@ -146,7 +146,13 @@ class TestInPlaceCompaction:
                 agent._test_external_protected_tail = kwargs.get(
                     "external_protected_tail", False
                 )
-                return [{"role": "user", "content": "summary of older head"}]
+                return [{
+                    "role": "user",
+                    "content": (
+                        "[CONTEXT COMPACTION — REFERENCE ONLY] summary of older head"
+                    ),
+                    "_context_summary": True,
+                }]
 
             agent.context_compressor.compress = _user_summary_only
             head = [
@@ -173,8 +179,10 @@ class TestInPlaceCompaction:
             active_count = db.get_session(sid)["message_count"]
             db.close()
 
-            assert compressed_head == [{"role": "user", "content": "summary of older head"}]
-            assert reloaded[0]["content"] == "summary of older head"
+            assert len(compressed_head) == 1
+            assert compressed_head[0]["content"].startswith("[CONTEXT COMPACTION")
+            assert "older question" not in str(compressed_head)
+            assert reloaded[0]["content"].startswith("[CONTEXT COMPACTION")
             assert reloaded[1]["role"] == "assistant"
             assert reloaded[1]["display_kind"] == "compression_bridge"
             assert [
