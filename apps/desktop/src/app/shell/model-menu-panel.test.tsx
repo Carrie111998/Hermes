@@ -247,15 +247,15 @@ describe('ModelMenuPanel search', () => {
   it('filters MoA presets by the query instead of leaving them as phantom first matches', async () => {
     const { content, onSelectModel } = renderPanel()
 
-    await content.findByText('MoA: BeastMode')
+    await content.findByText('BeastMode')
 
     const input = screen.getByRole('textbox', { name: 'Search models' })
     fireEvent.change(input, { target: { value: 'beast' } })
 
     await vi.waitFor(() => {
-      expect(rowWithText(content, /MoA: BeastMode/)).not.toBeNull()
+      expect(rowWithText(content, /^BeastMode$/)).not.toBeNull()
     })
-    expect(rowWithText(content, /MoA: default/)).toBeNull()
+    expect(rowWithText(content, /^default$/)).toBeNull()
 
     // The surviving preset IS the first row, so Enter commits it.
     fireEvent.keyDown(input, { key: 'Enter' })
