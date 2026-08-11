@@ -33,6 +33,20 @@ def register_cli(ctx: Any, runtime: Any) -> None:
         mode.add_argument("--dry-run", action="store_true")
         mode.add_argument("--apply", action="store_true")
 
+        subs.add_parser(
+            "cognitive-status",
+            help="Show Ebbinghaus bridge and projection status",
+        )
+        for name, help_text in (
+            ("cognitive-sync", "Explicitly sync Ebbinghaus memories to the graph"),
+            ("cognitive-repair", "Retry pending Ebbinghaus bridge events"),
+        ):
+            operation = subs.add_parser(name, help=help_text)
+            operation.add_argument("--limit", type=_positive_int, required=True)
+            operation_mode = operation.add_mutually_exclusive_group(required=True)
+            operation_mode.add_argument("--dry-run", action="store_true")
+            operation_mode.add_argument("--apply", action="store_true")
+
         search = subs.add_parser("search", help="Search graph nodes")
         search.add_argument("query")
         search.add_argument("--limit", type=int, default=8)
@@ -76,6 +90,20 @@ def register_cli(ctx: Any, runtime: Any) -> None:
                     }
                 )
             )
+            return 0
+        if cmd == "cognitive-status":
+            print(runtime.handle_cognitive_status({}))
+            return 0
+        if cmd in {"cognitive-sync", "cognitive-repair"}:
+            payload = {
+                "limit": int(args.limit),
+                "dry_run": bool(args.dry_run),
+                "apply": bool(args.apply),
+            }
+            if cmd == "cognitive-sync":
+                print(runtime.handle_cognitive_sync(payload))
+            else:
+                print(runtime.handle_cognitive_repair(payload))
             return 0
         if cmd == "search":
             print(

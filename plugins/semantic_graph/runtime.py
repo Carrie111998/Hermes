@@ -47,6 +47,7 @@ class SemanticGraphRuntime:
         self._embedding_backend: EmbeddingBackend | None = None
         self._embedding_backend_initialized = False
         self._embedding_backend_error = ""
+        self._cognitive_bridge: Any = None
 
     def check_available(self) -> bool:
         return True
@@ -82,6 +83,17 @@ class SemanticGraphRuntime:
             self._embedding_backend_error = str(exc)
             logger.warning("semantic-graph embedding backend unavailable: %s", exc)
         return self._embedding_backend
+
+    def _get_cognitive_bridge(self) -> Any:
+        if self._cognitive_bridge is None:
+            from plugins.memory.ebbinghaus.semantic_graph_bridge import (
+                EbbinghausSemanticGraphBridge,
+            )
+
+            if self._store is None:
+                self._store = SemanticGraphStore(self._config.db_path())
+            self._cognitive_bridge = EbbinghausSemanticGraphBridge(self._store)
+        return self._cognitive_bridge
 
     # ------------------------------------------------------------------ tools
 
@@ -269,6 +281,87 @@ class SemanticGraphRuntime:
                 failed_node_ids
             )
         return _json(result)
+
+    def handle_cognitive_status(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        del args
+        config = self._config.cognitive_memory
+        try:
+            status = self._get_cognitive_bridge().status()
+            return _json(
+                {
+                    **status,
+                    "bridge_enabled": config.bridge_enabled,
+                    "rerank_enabled": config.rerank_enabled,
+                    "mode": config.mode,
+                    "abstention_enabled": config.abstention_enabled,
+                }
+            )
+        except Exception as exc:
+            return _json(
+                {
+                    "success": False,
+                    "bridge_enabled": config.bridge_enabled,
+                    "error": str(exc),
+                }
+            )
+
+    def handle_cognitive_sync(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        args = args or {}
+        if not self._config.cognitive_memory.bridge_enabled:
+            return _json({"success": False, "error": "cognitive bridge is disabled"})
+        try:
+            limit = int(args.get("limit"))
+        except (TypeError, ValueError):
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        if limit <= 0:
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        dry_run = bool(args.get("dry_run"))
+        apply = bool(args.get("apply"))
+        if dry_run == apply:
+            return _json(
+                {"success": False, "error": "choose exactly one of dry_run or apply"}
+            )
+        try:
+            return _json(
+                self._get_cognitive_bridge().sync(
+                    limit=limit,
+                    dry_run=dry_run,
+                )
+            )
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
+
+    def handle_cognitive_repair(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        args = args or {}
+        if not self._config.cognitive_memory.bridge_enabled:
+            return _json({"success": False, "error": "cognitive bridge is disabled"})
+        try:
+            limit = int(args.get("limit"))
+        except (TypeError, ValueError):
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        if limit <= 0:
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        dry_run = bool(args.get("dry_run"))
+        apply = bool(args.get("apply"))
+        if dry_run == apply:
+            return _json(
+                {"success": False, "error": "choose exactly one of dry_run or apply"}
+            )
+        try:
+            return _json(
+                self._get_cognitive_bridge().repair(
+                    limit=limit,
+                    dry_run=dry_run,
+                )
+            )
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
 
     def handle_begin_run(self, args: Optional[dict] = None, **kw: Any) -> str:
         args = args or {}

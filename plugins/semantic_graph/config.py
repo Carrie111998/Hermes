@@ -18,6 +18,7 @@ logger = logging.getLogger("hermes.plugins.semantic_graph")
 PLUGIN_ID = "semantic-graph"
 DB_FILENAME = "semantic_graph.db"
 _AUTO_EXTRACT_ALLOWED = frozenset({"off", "explicit", "all"})
+_COGNITIVE_MEMORY_MODES = frozenset({"shadow", "production"})
 
 _warn_lock = threading.Lock()
 _auto_extract_warned = False
@@ -53,6 +54,22 @@ class SemanticGraphEmbeddingConfig:
 
 
 @dataclass(frozen=True)
+class SemanticGraphCognitiveMemoryConfig:
+    """Operator-owned cognitive-memory rollout switches."""
+
+    bridge_enabled: bool = False
+    rerank_enabled: bool = False
+    mode: str = "shadow"
+    abstention_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in _COGNITIVE_MEMORY_MODES:
+            raise ValueError(
+                "cognitive_memory.mode must be shadow or production"
+            )
+
+
+@dataclass(frozen=True)
 class SemanticGraphConfig:
     db_subdir: str = "semantic-graph"
     capture_turns: bool = True
@@ -73,6 +90,9 @@ class SemanticGraphConfig:
     )
     embedding: SemanticGraphEmbeddingConfig = field(
         default_factory=SemanticGraphEmbeddingConfig
+    )
+    cognitive_memory: SemanticGraphCognitiveMemoryConfig = field(
+        default_factory=SemanticGraphCognitiveMemoryConfig
     )
 
     def db_path(self) -> Path:
@@ -208,6 +228,26 @@ def load_config(overrides: dict[str, Any] | None = None) -> SemanticGraphConfig:
         allow_remote=_coerce_bool(embedding_raw.get("allow_remote"), False),
     )
 
+    cognitive_raw = raw.get("cognitive_memory") or {}
+    if not isinstance(cognitive_raw, dict):
+        raise ValueError("cognitive_memory must be a mapping")
+    cognitive_mode = str(cognitive_raw.get("mode") or "shadow").strip().lower()
+    cognitive_memory = SemanticGraphCognitiveMemoryConfig(
+        bridge_enabled=_coerce_bool(
+            cognitive_raw.get("bridge_enabled"),
+            False,
+        ),
+        rerank_enabled=_coerce_bool(
+            cognitive_raw.get("rerank_enabled"),
+            False,
+        ),
+        mode=cognitive_mode,
+        abstention_enabled=_coerce_bool(
+            cognitive_raw.get("abstention_enabled"),
+            False,
+        ),
+    )
+
     return SemanticGraphConfig(
         db_subdir=str(raw.get("db_subdir") or "semantic-graph"),
         capture_turns=_coerce_bool(raw.get("capture_turns"), True),
@@ -229,4 +269,5 @@ def load_config(overrides: dict[str, Any] | None = None) -> SemanticGraphConfig:
         full_tool_result_allowlist=frozenset(str(x) for x in allowlist),
         tool_capture_denylist=frozenset(denylist),
         embedding=embedding,
+        cognitive_memory=cognitive_memory,
     )
