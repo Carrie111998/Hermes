@@ -2,12 +2,13 @@
 
 import type { ReactNode } from 'react'
 import * as React from 'react'
-import { useShikiHighlighter } from 'react-shiki'
-import { type BundledLanguage, codeToTokens, type ShikiTransformer, type ThemedToken } from 'shiki'
+import { useShikiHighlighter } from 'react-shiki/core'
+import { type ShikiTransformer, type ThemedToken } from 'shiki'
 
 import { chunkLines, type LineChunk, useFixedRowWindow } from '@/components/chat/fixed-row-window'
 import { exceedsHighlightBudget, SHIKI_THEME } from '@/components/chat/shiki-highlighter'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
+import { type CuratedHighlighter, normalizeShikiLang, useCuratedHighlighter } from '@/lib/shiki-core'
 import { cn } from '@/lib/utils'
 
 /**
@@ -377,28 +378,24 @@ function TokenizedDiffBody({
 }) {
   const code = React.useMemo(() => lines.map(line => line.text).join('\n'), [lines])
   const theme = useThemeName()
+  const highlighter = useCuratedHighlighter()
   const [tokens, setTokens] = React.useState<ThemedToken[][] | null>(null)
 
   React.useEffect(() => {
-    let cancelled = false
+    // Not resolved yet, or a language the curated core doesn't carry: keep
+    // tokens null so the plain (color-only) rows render.
+    if (!highlighter) {
+      setTokens(null)
 
-    setTokens(null)
-    void codeToTokens(code, { lang: language as BundledLanguage, theme })
-      .then(result => {
-        if (!cancelled) {
-          setTokens(result.tokens)
-        }
-      })
-      .catch(() => {
-        if (!cancelled) {
-          setTokens([])
-        }
-      })
-
-    return () => {
-      cancelled = true
+      return
     }
-  }, [code, language, theme])
+
+    try {
+      setTokens(highlighter.codeToTokens(code, { lang: normalizeShikiLang(language), theme }).tokens)
+    } catch {
+      setTokens([])
+    }
+  }, [code, language, theme, highlighter])
 
   if (!tokens) {
     return chunked ? (
@@ -462,12 +459,34 @@ function diffLineTransformer(kinds: DiffKind[]): ShikiTransformer {
   }
 }
 
+// `useShikiHighlighter` (react-shiki/core) throws without a resolved
+// highlighter, and hook order must stay stable — so gate here and only mount
+// the highlighting hook once the curated core is ready.
 function SyntaxDiff({ language, lines }: { language: string; lines: DiffLine[] }) {
+  const highlighter = useCuratedHighlighter()
+
+  if (!highlighter) {
+    return <DiffBody lines={lines} />
+  }
+
+  return <SyntaxDiffReady highlighter={highlighter} language={language} lines={lines} />
+}
+
+function SyntaxDiffReady({
+  highlighter,
+  language,
+  lines
+}: {
+  highlighter: CuratedHighlighter
+  language: string
+  lines: DiffLine[]
+}) {
   const code = React.useMemo(() => lines.map(line => line.text).join('\n'), [lines])
   const transformers = React.useMemo(() => [diffLineTransformer(lines.map(line => line.kind))], [lines])
 
-  const highlighted = useShikiHighlighter(code, language, SHIKI_THEME, {
+  const highlighted = useShikiHighlighter(code, normalizeShikiLang(language), SHIKI_THEME, {
     defaultColor: 'light-dark()',
+    highlighter,
     transformers
   })
 

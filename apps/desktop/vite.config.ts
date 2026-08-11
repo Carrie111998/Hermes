@@ -45,10 +45,14 @@ export default defineConfig({
     // Keep desktop packaging stable: Shiki ships many dynamic chunks by
     // default, and electron-builder can OOM scanning thousands of files.
     // Collapsing to a single chunk is intentional, so the renderer bundle is
-    // large by design (~22 MB). Raise the warning ceiling above that so the
-    // cosmetic "chunk larger than 500 kB" nag stays quiet, while still acting
-    // as a regression alarm if the bundle balloons well past today's size.
-    chunkSizeWarningLimit: 25000,
+    // large by design (~22.6 MB as of 2026-07-24, measured `vite build`). Shiki
+    // is highlighted over a curated language allowlist (see lib/shiki-core.ts),
+    // not its full ~300-grammar bundle, which trimmed ~5.6 MB off the chunk.
+    // Keep this ceiling just above today's size: high enough that the cosmetic
+    // "chunk larger than 500 kB" nag stays quiet, low enough that it fires as a
+    // regression alarm if the bundle balloons (e.g. the full Shiki bundle
+    // sneaking back in via `react-shiki`/`shiki` instead of `react-shiki/core`).
+    chunkSizeWarningLimit: 24000,
     rolldownOptions: {
       output: {
         codeSplitting: false

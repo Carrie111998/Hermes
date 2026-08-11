@@ -7,7 +7,7 @@ import type {
   ReactNode
 } from 'react'
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import ShikiHighlighter from 'react-shiki'
+import { ShikiHighlighter } from 'react-shiki/core'
 import { Streamdown } from 'streamdown'
 
 import { requestComposerFocus, requestComposerInsertRefs } from '@/app/chat/composer/focus'
@@ -30,6 +30,7 @@ import {
 } from '@/lib/desktop-fs'
 import { Check, Pencil, X } from '@/lib/icons'
 import { shikiLanguageForFilename } from '@/lib/markdown-code'
+import { normalizeShikiLang, useCuratedHighlighter } from '@/lib/shiki-core'
 import { cn } from '@/lib/utils'
 import type { PreviewTarget } from '@/store/preview'
 import { setPreviewDirty } from '@/store/preview-edit'
@@ -277,6 +278,7 @@ function tagged<T extends keyof typeof MD_TAG_CLASSES>(Tag: T) {
 }
 
 function MarkdownCode({ className, children, ...props }: ComponentProps<'code'>) {
+  const highlighter = useCuratedHighlighter()
   const language = /language-([^\s]+)/.exec(className || '')?.[1]
 
   if (!language) {
@@ -295,18 +297,23 @@ function MarkdownCode({ className, children, ...props }: ComponentProps<'code'>)
 
   const code = String(children).replace(/\n$/, '')
 
-  const highlighted = (
+  // Until the curated core resolves, render plain text (same transition
+  // react-shiki's own async init produced before).
+  const highlighted = highlighter ? (
     <ShikiHighlighter
       addDefaultStyles={false}
       as="div"
       defaultColor="light-dark()"
       delay={80}
-      language={language}
+      highlighter={highlighter}
+      language={normalizeShikiLang(language)}
       showLanguage={false}
       theme={SHIKI_THEME}
     >
       {code}
     </ShikiHighlighter>
+  ) : (
+    <pre className="whitespace-pre-wrap">{code}</pre>
   )
 
   // ```mermaid / ```svg fences route to the shared lazy renderers (same
@@ -441,6 +448,7 @@ function startLineDrag(event: ReactDragEvent<HTMLElement>, filePath: string, { e
 
 function SourceView({ filePath, language, text }: { filePath: string; language: string; text: string }) {
   const { t } = useI18n()
+  const highlighter = useCuratedHighlighter()
   const chunks = useMemo(() => chunkTextLines(text, SOURCE_CHUNK_LINES), [text])
   const lastChunk = chunks.at(-1)
   const totalLines = lastChunk ? lastChunk.start + lastChunk.lines.length : 0
@@ -541,17 +549,22 @@ function SourceView({ filePath, language, text }: { filePath: string; language: 
               })}
             </div>
             <div className="preview-source-code min-w-0 [&_pre]:m-0" data-selectable-text="true">
-              <ShikiHighlighter
-                addDefaultStyles={false}
-                as="div"
-                defaultColor="light-dark()"
-                delay={80}
-                language={language || 'text'}
-                showLanguage={false}
-                theme={SHIKI_THEME}
-              >
-                {chunk.text}
-              </ShikiHighlighter>
+              {highlighter ? (
+                <ShikiHighlighter
+                  addDefaultStyles={false}
+                  as="div"
+                  defaultColor="light-dark()"
+                  delay={80}
+                  highlighter={highlighter}
+                  language={normalizeShikiLang(language)}
+                  showLanguage={false}
+                  theme={SHIKI_THEME}
+                >
+                  {chunk.text}
+                </ShikiHighlighter>
+              ) : (
+                <pre className="m-0 whitespace-pre">{chunk.text}</pre>
+              )}
             </div>
           </Fragment>
         ))}
