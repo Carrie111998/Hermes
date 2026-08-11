@@ -1,4 +1,27 @@
-"""Seam tests for the in-file post_api_request hook extraction."""
+"""Seam tests for the in-file post_api_request hook extraction.
+
+Byte-fidelity contract (corrected wording):
+
+The module-level helper ``_emit_post_api_request_hook`` body is the 41-line
+extraction window (agent/conversation_loop.py lines 6103-6143 inclusive at
+pin ee4bb75b532e932a1055d9a710802a7435163b6a) dedented by exactly 8 leading
+spaces per line. That dedent is the ONLY transformation and it is
+structurally mandatory: the window sits at 12-space interior indentation
+inside ``run_conversation``, and a module-level function body cannot carry
+12-space base indentation (Python raises IndentationError). The dedented
+helper body is therefore the only faithful module-level representation of
+the window.
+
+Fidelity anchors (sha256 over the 41 lines joined with "\\n", no trailing
+newline):
+  * pre-move golden — RAW window bytes at the pin (2016 bytes):
+    c93bedb8362e40fad1dc85e1840f5c3eaab196e3be0c00e426021a8f76b7feec
+  * post-move helper body — window dedented by exactly 8 (1688 bytes):
+    627e0970858c8a387030f5f984cc5433ca58c873d00c6fa941f29ababfac181f
+  * line fidelity: 41/41 lines identical after window-line l[8:] (0
+    mismatches; no added/removed/reordered lines, no comment drift, no
+    whitespace beyond the leading 8 spaces).
+"""
 
 import ast
 import importlib
