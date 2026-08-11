@@ -2075,6 +2075,26 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
+
+        # DEV-0133: integrity check — compute the SHA-256 of __init__.py
+        # before execution and compare against the stored value from
+        # the first load.  A mismatch means the plugin source was
+        # tampered with since Hermes installed/recorded it.
+        _current = hashlib.sha256(init_file.read_bytes()).hexdigest()
+        _stored_path = plugin_dir / ".plugin_digest"
+        if _stored_path.exists():
+            _stored = _stored_path.read_text().strip()
+            if _current != _stored:
+                logger.warning(
+                    "Plugin integrity check FAILED for '%s': "
+                    "the __init__.py SHA-256 has changed since install. "
+                    "Revert the modification or re-install the plugin.",
+                    manifest.key or manifest.name,
+                )
+        else:
+            # First load — record the digest as trusted
+            _stored_path.write_text(_current)
+
         spec.loader.exec_module(module)
         return module
 
