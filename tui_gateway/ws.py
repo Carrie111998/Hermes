@@ -268,6 +268,22 @@ class WSTransport:
         if handle is not None:
             handle.cancel()
             self._token_flush_handle = None
+        # Cancelling that timer removed the only thing that would ever have
+        # drained the coalesce buffer, so drop what is still queued in it rather
+        # than pinning frames on a transport that can no longer send them.
+        with self._token_lock:
+            self._pending_tokens = []
+        # Release the anchored batch sends. Latching _closed above is not enough
+        # on its own: _safe_send_many only re-checks it between frames, so a
+        # send already suspended inside ws.send_text() on a wedged socket never
+        # observes it — and now that the transport holds a strong reference to
+        # that task, the two keep each other alive after handle_ws has returned.
+        # close() is synchronous and runs on the loop thread, so it cannot await
+        # the drain the way GatewayPlatform.cancel_background_tasks does;
+        # cancelling without awaiting is the bounded half of the same contract,
+        # and each task's done callback removes it from the set as it unwinds.
+        for task in [t for t in self._background_tasks if not t.done()]:
+            task.cancel()
 
 
 def _ws_peer_label(ws: Any) -> str:
