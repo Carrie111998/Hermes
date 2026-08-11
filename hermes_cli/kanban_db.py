@@ -78,6 +78,7 @@ import re
 import random
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1275,6 +1276,23 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Gate-epoch table for stage-gate authorization CAS (AION-CORE-PR6).
+-- Each row binds a *gate* (a namespace like ``repo:pr:stage``) to a
+-- monotonic epoch counter, a canonical decision, and a bound head SHA.
+-- HOLD / REQUEST_CHANGES / changed-fact increment the epoch and invalidate
+-- all prior intent tokens.  At the merge-write boundary, the queued intent
+-- must match the current epoch + decision + head exactly — stale intent
+-- from an older epoch is rejected atomically.  No real GitHub merge occurs
+-- in this table; it lives entirely inside the native Kanban DB.
+CREATE TABLE IF NOT EXISTS gate_epochs (
+    gate_id         TEXT PRIMARY KEY,
+    epoch           INTEGER NOT NULL DEFAULT 1,
+    last_decision   TEXT,
+    last_head       TEXT,
+    last_bound_by   TEXT,
+    last_bound_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -5294,6 +5312,8 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # Close owned workspace processes (AION-CORE-PR6).
+    _cleanup_workspace_on_completion(conn, task_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -5919,6 +5939,15 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    # Read workspace_path before entering the transaction so we can
+    # clean up owned children after the block commits (AION-CORE-PR6).
+    _wp_row = conn.execute(
+        "SELECT workspace_path, workspace_kind FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    _block_workspace_path: Optional[str] = (
+        _wp_row["workspace_path"] if _wp_row else None
+    )
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6104,6 +6133,25 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    # After blocking, close owned child processes in the task's workspace
+    # so no in-flight effects survive the block (AION-CORE-PR6: write-after-stop).
+    if _block_workspace_path:
+        try:
+            _wp = Path(_block_workspace_path).expanduser().resolve()
+            if _wp.is_dir():
+                _evidence = close_workspace_processes(_wp)
+                _log.info(
+                    "block_task workspace cleanup: task=%s path=%s "
+                    "signalled=%s self_pgid_excluded=%s",
+                    task_id, str(_wp),
+                    _evidence.get("signalled", 0),
+                    _evidence.get("self_pgid_excluded", False),
+                )
+        except Exception as _exc:
+            _log.warning(
+                "block_task workspace cleanup failed for task=%s: %s",
+                task_id, _exc,
+            )
     return True
 
 
@@ -11318,3 +11366,343 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Workspace process cleanup (AION-RL2-CORE-01 / AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def close_workspace_processes(
+    workspace_path: Path, *, dry_run: bool = False,
+) -> dict:
+    """Close process groups whose cwd is inside ``workspace_path``.
+
+    Only signals process groups whose working directory resolves inside the
+    exact workspace — never broad-kill, never touches processes outside the
+    workspace, never touches gateway/self/external cwd.  Excludes the
+    caller's own process group to prevent self-kill.
+
+    Args:
+        workspace_path: Absolute path to the workspace directory.
+        dry_run: When True, report what WOULD be signalled without killing.
+
+    Returns a dict with cleanup evidence:
+        - ``workspace``: str — resolved workspace path
+        - ``signalled``: int — count of process groups signalled (0 in dry_run)
+        - ``would_signal``: int — count that WOULD be signalled (dry_run only)
+        - ``self_pgid_excluded``: bool — True when caller's own PGID was
+          detected inside the workspace and excluded
+        - ``skipped_outside``: int — processes inside workspace-descendant dirs
+          but whose cwd didn't match (negative canary)
+        - ``dry_run``: bool — True if dry-run mode
+        - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
+    """
+    wp = Path(workspace_path).resolve()
+    self_pgid = os.getpgid(0)
+    result: dict = {
+        "workspace": str(wp),
+        "signalled": 0,
+        "would_signal": 0,
+        "self_pgid_excluded": False,
+        "skipped_outside": 0,
+        "dry_run": dry_run,
+        "pids": [],
+    }
+
+    if not wp.is_dir():
+        return result
+
+    # Walk /proc to find processes whose cwd is inside the workspace.
+    wp_str = str(wp)
+    signalled_pgids: set[int] = set()
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            cwd_link = Path(f"/proc/{pid}/cwd")
+            cwd = cwd_link.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        cwd_str = str(cwd)
+        # Exact workspace check: cwd must be equal to wp or a descendant.
+        if cwd_str == wp_str or cwd_str.startswith(wp_str + "/"):
+            try:
+                pgid = os.getpgid(pid)
+            except OSError:
+                continue
+
+            # Exclude caller's own process group — prevents self-kill
+            # (AION-CORE-PR6).
+            if pgid == self_pgid:
+                result["self_pgid_excluded"] = True
+                continue
+
+            if pgid in signalled_pgids:
+                continue
+
+            if dry_run:
+                result["would_signal"] += 1
+                result["pids"].append((pgid, pid, cwd_str))
+                signalled_pgids.add(pgid)
+            else:
+                try:
+                    os.killpg(pgid, signal.SIGTERM)
+                    signalled_pgids.add(pgid)
+                    result["signalled"] += 1
+                    result["pids"].append((pgid, pid, cwd_str))
+                except OSError:
+                    # Process group already gone — count it as cleaned.
+                    signalled_pgids.add(pgid)
+                    result["signalled"] += 1
+        else:
+            result["skipped_outside"] += 1
+
+    return result
+
+
+def _cleanup_workspace_on_completion(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    """Close processes whose cwd is inside the task's workspace.
+
+    Called after a successful completion. Reads the task's workspace_path
+    from the DB, then calls :func:`close_workspace_processes`. Best-effort —
+    any error is logged and swallowed so completion is never blocked.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_path, workspace_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        wp = row["workspace_path"]
+        wk = row["workspace_kind"]
+        if not wp:
+            return
+        path = Path(wp).expanduser().resolve()
+        if not path.is_dir():
+            return
+        evidence = close_workspace_processes(path)
+        _log.info(
+            "complete_task workspace cleanup: task=%s kind=%s path=%s "
+            "signalled=%s self_pgid_excluded=%s dry_run=%s",
+            task_id, wk, str(path),
+            evidence.get("signalled", 0),
+            evidence.get("self_pgid_excluded", False),
+            evidence.get("dry_run", False),
+        )
+    except Exception as exc:
+        _log.warning(
+            "complete_task workspace cleanup failed for task=%s: %s",
+            task_id, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate-epoch CAS (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _gate_id(repo: str, pr_number: int, stage: str = "merge") -> str:
+    """Canonical gate identifier: ``repo:PR:stage``."""
+    return f"{repo}:{pr_number}:{stage}"
+
+
+def set_gate_decision(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    decision: str,
+    head: str,
+    bound_by: str = "kanban",
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Set a gate decision, atomically incrementing the epoch.
+
+    A new HOLD / REQUEST_CHANGES / changed-fact always increments the epoch,
+    which invalidates all prior intent tokens from older epochs.  APPROVE
+    also increments to bind the new approval epoch.  The write boundary
+    consumer must compare-epoch to ensure no intervening HOLD occurred.
+
+    Returns a dict with ``gate_id``, ``old_epoch``, ``new_epoch``,
+    ``decision``, ``head``, and whether the epoch changed.
+    """
+    gid = _gate_id(repo, pr_number, stage)
+    now = int(time.time())
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT epoch, last_decision, last_head FROM gate_epochs "
+            "WHERE gate_id = ?",
+            (gid,),
+        ).fetchone()
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO gate_epochs "
+                "(gate_id, epoch, last_decision, last_head, last_bound_by, last_bound_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (gid, decision, head, bound_by, now),
+            )
+            return {
+                "gate_id": gid,
+                "old_epoch": 0,
+                "new_epoch": 1,
+                "decision": decision,
+                "head": head,
+                "epoch_changed": True,
+            }
+
+        old_epoch = existing["epoch"]
+        new_epoch = old_epoch + 1
+        conn.execute(
+            "UPDATE gate_epochs "
+            "SET epoch = ?, last_decision = ?, last_head = ?, "
+            "    last_bound_by = ?, last_bound_at = ? "
+            "WHERE gate_id = ?",
+            (new_epoch, decision, head, bound_by, now, gid),
+        )
+        return {
+            "gate_id": gid,
+            "old_epoch": old_epoch,
+            "new_epoch": new_epoch,
+            "decision": decision,
+            "head": head,
+            "epoch_changed": True,
+        }
+
+
+def get_gate_epoch(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Read the current gate epoch and decision without mutating."""
+    gid = _gate_id(repo, pr_number, stage)
+    row = conn.execute(
+        "SELECT epoch, last_decision, last_head, last_bound_by, last_bound_at "
+        "FROM gate_epochs WHERE gate_id = ?",
+        (gid,),
+    ).fetchone()
+    if row is None:
+        return {
+            "gate_id": gid,
+            "epoch": 0,
+            "decision": None,
+            "head": None,
+        }
+    return {
+        "gate_id": gid,
+        "epoch": row["epoch"],
+        "decision": row["last_decision"],
+        "head": row["last_head"],
+        "bound_by": row["last_bound_by"],
+        "bound_at": row["last_bound_at"],
+    }
+
+
+def validate_gate_intent(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    intent_epoch: int,
+    intent_decision: str,
+    intent_head: str,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Atomically compare-and-swap at the merge-write boundary.
+
+    An intent from epoch N is valid ONLY if the current gate epoch is
+    still N AND the current decision is APPROVE AND the current head
+    matches.  Any drift (newer epoch, non-APPROVE decision, head mismatch)
+    fails closed.
+
+    Returns a dict with ``valid`` (bool), ``gate_id``, ``current`` (the
+    live state), and ``mismatch_reason`` when invalid.  Does NOT mutate
+    the gate — this is a pure read-and-validate operation.
+    """
+    current = get_gate_epoch(conn, repo, pr_number, stage=stage)
+    gid = current["gate_id"]
+
+    if current["epoch"] == 0:
+        # Gate never initialised — no prior decision exists to validate.
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": "no_gate_initialised",
+        }
+
+    if current["epoch"] != intent_epoch:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"epoch_mismatch: intent={intent_epoch} "
+                f"current={current['epoch']}"
+            ),
+        }
+
+    if current["decision"] != intent_decision:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"decision_mismatch: intent={intent_decision!r} "
+                f"current={current['decision']!r}"
+            ),
+        }
+
+    if intent_head is not None and current["head"] != intent_head:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"head_mismatch: intent={intent_head[:12]} "
+                f"current={current['head'][:12] if current['head'] else 'None'}"
+            ),
+        }
+
+    return {
+        "valid": True,
+        "gate_id": gid,
+        "current": current,
+    }
+
+
+def _classify_failure(error: str) -> str:
+    """Classify a failure error message as 'platform_resource' or 'task'.
+
+    Platform-resource failures are shared-infra problems the task does not
+    own: subprocess-spawn EAGAIN/ENOMEM (pid exhaustion, cgroup limits),
+    temporary fs errors, etc. These are recorded with ``failure_category``
+    in event evidence so operators can distinguish "the task is broken"
+    from "the host is overloaded" without opening logs.
+
+    Returns 'platform_resource' when the error matches known platform-level
+    signals; 'task' for everything else.
+    """
+    lower = error.lower()
+    if "errno 11" in lower or "eagain" in lower:
+        return "platform_resource"
+    if "resource temporarily unavailable" in lower:
+        return "platform_resource"
+    if "errno 12" in lower or "enomem" in lower:
+        return "platform_resource"
+    if "cannot allocate memory" in lower:
+        return "platform_resource"
+    if "errno 28" in lower or "enospc" in lower:
+        return "platform_resource"
+    return "task"

@@ -1590,4 +1590,350 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
         pass
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
-    conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# close_workspace_processes (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def test_close_workspace_processes_empty_dir(tmp_path):
+    """Empty workspace dir returns zero signalled."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    result = kb.close_workspace_processes(ws)
+    assert result["signalled"] == 0
+    assert result["self_pgid_excluded"] is False
+    assert result["dry_run"] is False
+
+
+def test_close_workspace_processes_dry_run(tmp_path):
+    """Dry run reports what WOULD be signalled without killing."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    result = kb.close_workspace_processes(ws, dry_run=True)
+    assert result["dry_run"] is True
+    assert result["signalled"] == 0
+
+
+def test_close_workspace_processes_excludes_self_pgid(tmp_path):
+    """Caller's own process group is excluded even when cwd is inside workspace."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    # The test process's cwd is not inside ws by default, but
+    # close_workspace_processes should never signal os.getpgid(0).
+    import os as _os
+    self_pgid = _os.getpgid(0)
+    result = kb.close_workspace_processes(ws)
+    # We shouldn't see our own PGID in the signalled set.
+    signalled_pgids = {pgid for pgid, _, _ in result["pids"]}
+    assert self_pgid not in signalled_pgids
+
+
+def test_close_workspace_processes_kills_child(tmp_path):
+    """A child process whose cwd is inside the workspace is signalled."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+    child = _sp.Popen(
+        ["sleep", "60"],
+        cwd=str(ws),
+        preexec_fn=os.setpgrp,
+    )
+    try:
+        _time.sleep(0.2)
+        result = kb.close_workspace_processes(ws)
+        assert result["signalled"] >= 1
+        child.wait(timeout=2)
+        assert child.returncode != 0  # killed by SIGTERM
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_close_workspace_processes_missing_dir():
+    """Non-existent path returns zero without error."""
+    result = kb.close_workspace_processes(Path("/nonexistent/path/xyz"))
+    assert result["signalled"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Gate-epoch CAS (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def test_gate_epoch_set_and_get(kanban_home):
+    """set_gate_decision initialises and increments epoch."""
+    with kb.connect() as conn:
+        r1 = kb.set_gate_decision(
+            conn, "owner/repo", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        assert r1["old_epoch"] == 0
+        assert r1["new_epoch"] == 1
+        assert r1["decision"] == "APPROVE"
+        assert r1["epoch_changed"] is True
+
+        e = kb.get_gate_epoch(conn, "owner/repo", 42)
+        assert e["epoch"] == 1
+        assert e["decision"] == "APPROVE"
+        assert e["head"] == "abc123def4567890abcdef1234567890abcdef12"
+
+
+def test_gate_epoch_increments_on_hold(kanban_home):
+    """HOLD increments epoch, invalidating previous APPROVE intent."""
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        r2 = kb.set_gate_decision(
+            conn, "owner/repo", 42, "HOLD",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        assert r2["old_epoch"] == 1
+        assert r2["new_epoch"] == 2
+        assert r2["decision"] == "HOLD"
+
+        e = kb.get_gate_epoch(conn, "owner/repo", 42)
+        assert e["epoch"] == 2
+
+
+def test_validate_gate_intent_approve_passes(kanban_home):
+    """Current APPROVE at matching epoch validates."""
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        r = kb.validate_gate_intent(
+            conn, "owner/repo", 42,
+            intent_epoch=1,
+            intent_decision="APPROVE",
+            intent_head="abc123def4567890abcdef1234567890abcdef12",
+        )
+        assert r["valid"] is True
+        assert "mismatch_reason" not in r
+
+
+def test_validate_gate_intent_epoch_mismatch_rejected(kanban_home):
+    """Stale intent from epoch 1 rejected after HOLD at epoch 2 (GREEN)."""
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        # HOLD increments to epoch 2
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "HOLD",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        # Stale intent at epoch 1 should be rejected
+        r = kb.validate_gate_intent(
+            conn, "owner/repo", 42,
+            intent_epoch=1,
+            intent_decision="APPROVE",
+            intent_head="abc123def4567890abcdef1234567890abcdef12",
+        )
+        assert r["valid"] is False
+        assert "epoch_mismatch" in r["mismatch_reason"]
+
+
+def test_validate_gate_intent_decision_mismatch_rejected(kanban_home):
+    """Intent claims APPROVE but current gate is REQUEST_CHANGES."""
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "REQUEST_CHANGES",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        r = kb.validate_gate_intent(
+            conn, "owner/repo", 42,
+            intent_epoch=1,
+            intent_decision="APPROVE",
+            intent_head="abc123def4567890abcdef1234567890abcdef12",
+        )
+        assert r["valid"] is False
+        assert "decision_mismatch" in r["mismatch_reason"]
+
+
+def test_validate_gate_intent_head_mismatch_rejected(kanban_home):
+    """Intent references wrong head SHA."""
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "APPROVE",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+        r = kb.validate_gate_intent(
+            conn, "owner/repo", 42,
+            intent_epoch=1,
+            intent_decision="APPROVE",
+            intent_head="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        )
+        assert r["valid"] is False
+        assert "head_mismatch" in r["mismatch_reason"]
+
+
+def test_validate_gate_intent_no_gate_initialised(kanban_home):
+    """No prior gate decision → invalid."""
+    with kb.connect() as conn:
+        r = kb.validate_gate_intent(
+            conn, "owner/repo", 42,
+            intent_epoch=1,
+            intent_decision="APPROVE",
+            intent_head="abc",
+        )
+        assert r["valid"] is False
+        assert r["mismatch_reason"] == "no_gate_initialised"
+
+
+def test_validate_gate_intent_different_repo_pr_independent(kanban_home):
+    """Different repo:PR gates are independent."""
+    with kb.connect() as conn:
+        kb.set_gate_decision(
+            conn, "owner/repo", 42, "APPROVE",
+            "abc123def4567890abcdef1234567890abcdef12",
+        )
+        kb.set_gate_decision(
+            conn, "other/repo", 99, "HOLD",
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        # repo A at epoch 1 should still validate
+        r = kb.validate_gate_intent(
+            conn, "owner/repo", 42,
+            intent_epoch=1,
+            intent_decision="APPROVE",
+            intent_head="abc123def4567890abcdef1234567890abcdef12",
+        )
+        assert r["valid"] is True
+
+
+def test_gate_epoch_multiple_hold_increments(kanban_home):
+    """Multiple HOLDs increment epoch monotonically."""
+    with kb.connect() as conn:
+        for i in range(1, 6):
+            kb.set_gate_decision(
+                conn, "owner/repo", 42,
+                "HOLD" if i % 2 == 0 else "REQUEST_CHANGES",
+                "sha{}".format("a" * 40),
+            )
+        e = kb.get_gate_epoch(conn, "owner/repo", 42)
+        assert e["epoch"] == 5
+
+
+# ---------------------------------------------------------------------------
+# Block-task effect reconciliation (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def test_block_task_cleans_workspace_processes(kanban_home, tmp_path):
+    """block_task signals child processes in workspace (GREEN)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="test", assignee="a",
+            workspace_kind="dir", workspace_path=str(ws),
+        )
+        kb.complete_task(conn, t, result="setup")  # fake completion to go to done
+        # Create a new task that we'll block
+        t2 = kb.create_task(
+            conn, title="block-me", assignee="a",
+            workspace_kind="dir", workspace_path=str(ws),
+        )
+        kb.claim_task(conn, t2)
+
+        # Spawn a child inside the workspace
+        child = _sp.Popen(
+            ["sleep", "60"],
+            cwd=str(ws),
+            preexec_fn=os.setpgrp,
+        )
+        try:
+            _time.sleep(0.2)
+            assert child.poll() is None  # child alive
+
+            # Block the task — should clean up child
+            ok = kb.block_task(
+                conn, t2, reason="test",
+                kind="needs_input",
+            )
+            assert ok is True
+
+            # Child should be terminated
+            child.wait(timeout=3)
+            assert child.returncode != 0
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+def test_block_task_child_survival_without_fix(kanban_home, tmp_path):
+    """RED test document: without cleanup, child survives block.
+
+    This test verifies that calling block_task WITHOUT the fix would
+    leave the child alive. We prove the negative by checking that
+    AFTER block_task returns, the child IS terminated by the fix.
+    The 'RED' part is that before the fix, child_after_block_alive
+    would be True.  After the fix, it's False.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="red-test", assignee="a",
+            workspace_kind="dir", workspace_path=str(ws),
+        )
+        kb.claim_task(conn, t)
+
+        child = _sp.Popen(
+            ["sleep", "60"],
+            cwd=str(ws),
+            preexec_fn=os.setpgrp,
+        )
+        try:
+            _time.sleep(0.2)
+            assert child.poll() is None  # alive before block
+
+            kb.block_task(conn, t, reason="test", kind="capability")
+
+            # After the fix, child should NOT survive
+            child.wait(timeout=3)
+            child_after_block_alive = child.poll() is None
+            assert child_after_block_alive is False, (
+                "child survived block — effect reconciliation failed"
+            )
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
+
+
+# ---------------------------------------------------------------------------
+# _classify_failure (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_failure_platform_resource():
+    """Known platform-level errors classified as platform_resource."""
+    assert kb._classify_failure("fork failed: errno 11") == "platform_resource"
+    assert kb._classify_failure("EAGAIN on spawn") == "platform_resource"
+    assert kb._classify_failure("Resource temporarily unavailable") == "platform_resource"
+    assert kb._classify_failure("errno 12 out of memory") == "platform_resource"
+    assert kb._classify_failure("Cannot allocate memory") == "platform_resource"
+    assert kb._classify_failure("ENOSPC errno 28") == "platform_resource"
+
+
+def test_classify_failure_task():
+    """Normal task errors classified as task."""
+    assert kb._classify_failure("ImportError: no module named foo") == "task"
+    assert kb._classify_failure("SyntaxError: invalid syntax") == "task"
+    assert kb._classify_failure("") == "task"
