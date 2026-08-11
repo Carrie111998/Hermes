@@ -7099,11 +7099,25 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(reason_display) > reason_budget:
                 reason_display = reason_display[: reason_budget - 15] + "... [truncated]"
 
-            prompt_prefix = (
-                "⚠️ **Command Approval Required**\n\n"
-                "Do you want Hermes to run this command?\n\n"
-                "**Requested command:**\n```bash\n"
-            )
+            protected_paths = list((metadata or {}).get("protected_paths") or [])
+            proposed_diff = str((metadata or {}).get("proposed_diff") or "")
+            protected_instruction = bool(protected_paths or proposed_diff)
+            content_cmd_display = str(command or "")
+            if protected_instruction:
+                prompt_prefix = (
+                    "⚠️ **Protected instruction-file approval required**\n\n"
+                    "This write can change future Hermes behavior. Approve this one operation?\n\n"
+                    "**Exact file(s):**\n"
+                    + "\n".join(f"`{path}`" for path in protected_paths)
+                    + "\n\n**Proposed diff:**\n```diff\n"
+                )
+                content_cmd_display = proposed_diff or "(no textual diff supplied)"
+            else:
+                prompt_prefix = (
+                    "⚠️ **Command Approval Required**\n\n"
+                    "Do you want Hermes to run this command?\n\n"
+                    "**Requested command:**\n```bash\n"
+                )
             if smart_denied:
                 prompt_prefix += "**Smart DENY:** owner override applies to this one operation only.\n\n"
             mention_content = self._approval_mention_content()
@@ -7112,7 +7126,8 @@ class DiscordAdapter(BasePlatformAdapter):
             prompt_tail = f"\n```\n**Reason:** {reason_display}"
             truncated_suffix = "\n... [truncated]"
             command_budget = max(0, self.MAX_MESSAGE_LENGTH - len(prompt_prefix) - len(prompt_tail))
-            content_cmd_display = str(command or "")
+            if not protected_instruction:
+                content_cmd_display = str(command or "")
             if len(content_cmd_display) > command_budget:
                 content_cmd_display = (
                     content_cmd_display[: max(0, command_budget - len(truncated_suffix))]
@@ -7145,6 +7160,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
+                approve_once_label="Approve once" if protected_instruction else "Allow Once",
             )
 
             send_kwargs: Dict[str, Any] = {"content": content, "embed": embed, "view": view}
@@ -8504,6 +8520,7 @@ def _define_discord_view_classes() -> None:
             allow_permanent: bool = True,
             allow_session: bool = True,
             smart_denied: bool = False,
+            approve_once_label: str = "Allow Once",
         ):
             super().__init__(timeout=_read_discord_prompt_timeout())
             self.session_key = session_key
@@ -8516,6 +8533,7 @@ def _define_discord_view_classes() -> None:
             self.admin_user_ids = {
                 str(a).strip() for a in (admin_user_ids or set()) if str(a).strip()
             }
+            self.allow_once.label = approve_once_label
             self.resolved = False
             if smart_denied or not allow_session:
                 self.remove_item(self.allow_session)

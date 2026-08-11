@@ -2,6 +2,7 @@
 """File Tools Module - LLM agent file manipulation tools."""
 
 import base64
+import difflib
 import errno
 import json
 import logging
@@ -833,7 +834,9 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
 
 def _request_protected_instruction_approval(
-        reasons: list[str], task_id: str = "default") -> str | None:
+        reasons: list[str], task_id: str = "default", *,
+        protected_paths: list[str] | None = None,
+        proposed_diff: str = "") -> str | None:
     """Ask the human to approve a write to protected instruction file(s).
 
     Returns ``None`` when approved, or a BLOCKED error string. This gate
@@ -843,6 +846,7 @@ def _request_protected_instruction_approval(
     and no yolo bypass. Fail-closed when no human channel exists.
     """
     targets = ", ".join(dict.fromkeys(reasons))
+    exact_paths = list(dict.fromkeys(str(p) for p in (protected_paths or []) if p))
     description = (
         f"Write to protected agent-instruction file(s): {targets}. "
         "These files steer future agent behavior; approval is always "
@@ -882,6 +886,10 @@ def _request_protected_instruction_approval(
             "allow_permanent": False,
             "allow_session": False,
         }
+        if exact_paths:
+            approval_data["protected_paths"] = exact_paths
+        if proposed_diff:
+            approval_data["proposed_diff"] = proposed_diff
         decision = _approval._await_gateway_decision(
             session_key, notify_cb, approval_data, surface="gateway",
         )
@@ -931,7 +939,8 @@ def _request_protected_instruction_approval(
 
 
 def _check_protected_instruction_write(paths: list[str],
-                                       task_id: str = "default") -> str | None:
+                                       task_id: str = "default", *,
+                                       proposed_diff: str = "") -> str | None:
     """Gate a write/patch touching protected instruction files.
 
     Returns ``None`` when no target is protected or the human approved;
@@ -952,7 +961,34 @@ def _check_protected_instruction_write(paths: list[str],
             reasons.append(reason)
     if not reasons:
         return None
-    return _request_protected_instruction_approval(reasons, task_id)
+    exact_paths = []
+    for path in paths:
+        try:
+            exact_paths.append(str(_resolve_path_for_task(path, task_id)))
+        except Exception:
+            exact_paths.append(os.path.abspath(_expand_tilde(path)))
+    return _request_protected_instruction_approval(
+        reasons, task_id, protected_paths=exact_paths,
+        proposed_diff=proposed_diff,
+    )
+
+
+def _protected_write_diff(path: str, content: str, task_id: str = "default") -> str:
+    """Build the exact unified diff shown before a protected write."""
+    try:
+        resolved = str(_resolve_path_for_task(path, task_id))
+    except Exception:
+        resolved = os.path.abspath(_expand_tilde(path))
+    try:
+        before = Path(resolved).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        before = ""
+    return "".join(difflib.unified_diff(
+        before.splitlines(keepends=True),
+        str(content).splitlines(keepends=True),
+        fromfile=resolved if os.path.exists(resolved) else "/dev/null",
+        tofile=resolved,
+    )) or f"--- {resolved}\n+++ {resolved}\n@@\n"
 
 
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
@@ -2114,7 +2150,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
-    protected_err = _check_protected_instruction_write([path], task_id)
+    protected_err = _check_protected_instruction_write(
+        [path], task_id, proposed_diff=_protected_write_diff(path, content, task_id)
+    )
     if protected_err:
         return tool_error(protected_err)
     if not cross_profile:
@@ -2251,7 +2289,19 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 return tool_error(cross_warning)
     # One approval prompt for the whole patch: a single protected file gates
     # the ENTIRE patch (deny applies nothing — see the helper's docstring).
-    protected_err = _check_protected_instruction_write(_paths_to_check, task_id)
+    if mode == "patch":
+        protected_diff = patch or ""
+    elif path:
+        protected_diff = "".join(difflib.unified_diff(
+            str(old_string or "").splitlines(keepends=True),
+            str(new_string or "").splitlines(keepends=True),
+            fromfile=f"{path} (matched text)", tofile=f"{path} (replacement)",
+        ))
+    else:
+        protected_diff = ""
+    protected_err = _check_protected_instruction_write(
+        _paths_to_check, task_id, proposed_diff=protected_diff
+    )
     if protected_err:
         return tool_error(protected_err)
     try:

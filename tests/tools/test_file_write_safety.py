@@ -588,6 +588,9 @@ class TestProtectedInstructionFiles:
                 # Buttons must not offer persistent scopes for this gate.
                 assert approval_data.get("allow_permanent") is False
                 assert approval_data.get("allow_session") is False
+                assert approval_data["protected_paths"] == [str(tmp_path / "AGENTS.md")]
+                assert "+++" in approval_data["proposed_diff"]
+                assert "gateway approved" in approval_data["proposed_diff"]
                 A.resolve_gateway_approval(session_key, "once")
 
             A.register_gateway_notify(session_key, notify)

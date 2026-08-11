@@ -48,3 +48,32 @@ async def test_exec_approval_prompt_uses_visible_content_with_command_and_reason
     assert "script execution via -c flag" in prompt_text
 
 
+@pytest.mark.asyncio
+async def test_protected_instruction_prompt_shows_path_diff_and_one_time_button():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    sent = _capture_channel(adapter)
+
+    result = await adapter.send_exec_approval(
+        chat_id="555",
+        command="<write to AGENTS.md>",
+        session_key="discord:555",
+        description="Protected instruction files require approval.",
+        metadata={
+            "protected_paths": ["/work/project/AGENTS.md"],
+            "proposed_diff": "--- /dev/null\n+++ /work/project/AGENTS.md\n+allow one task\n",
+        },
+        allow_permanent=False,
+        allow_session=False,
+    )
+
+    assert result.success is True
+    assert "Protected instruction-file approval required" in sent["content"]
+    assert "/work/project/AGENTS.md" in sent["content"]
+    assert "+allow one task" in sent["content"]
+    labels = {getattr(child, "label", "") for child in sent["view"].children}
+    assert "Approve once" in labels
+    assert "Deny" in labels
+    assert "Allow Session" not in labels
+    assert "Always Allow" not in labels
+
+

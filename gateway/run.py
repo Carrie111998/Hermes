@@ -5354,6 +5354,15 @@ class TurnRunner:
 
             cmd = approval_data.get("command", "")
             desc = approval_data.get("description", "dangerous command")
+            button_desc = desc
+            if approval_data.get("protected_paths") or approval_data.get("proposed_diff"):
+                exact_paths = "\n".join(
+                    str(path) for path in (approval_data.get("protected_paths") or [])
+                )
+                desc = (
+                    f"{desc} Exact file(s): {exact_paths or '(not supplied)'}. "
+                    f"Proposed diff:\n{approval_data.get('proposed_diff') or '(not supplied)'}"
+                )
 
             # Redact credentials from the command before displaying it in
             # the approval prompt — Tirith's findings are already redacted,
@@ -5373,8 +5382,15 @@ class TurnRunner:
                             chat_id=ctx._status_chat_id,
                             command=cmd,
                             session_key=_approval_session_key,
-                            description=desc,
-                            metadata=ctx._status_thread_metadata,
+                            description=button_desc,
+                            metadata={
+                                **(ctx._status_thread_metadata or {}),
+                                **{
+                                    key: approval_data[key]
+                                    for key in ("protected_paths", "proposed_diff")
+                                    if key in approval_data
+                                },
+                            },
                             allow_permanent=approval_data.get("allow_permanent", True),
                             allow_session=approval_data.get("allow_session", True),
                             smart_denied=approval_data.get("smart_denied", False),
