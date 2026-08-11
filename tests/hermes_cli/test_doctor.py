@@ -18,6 +18,104 @@ import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
+# ``run_doctor`` imports ``model_tools`` lazily, and importing it runs
+# ``discover_builtin_tools()`` -- the whole builtin tool registry, which
+# transitively pulls in asyncio/websockets/openai and constructs the
+# module-scope ``tools.process_registry.ProcessRegistry`` singleton. Cold on
+# Windows that single import measures ~66s (`python -X importtime -c "import
+# model_tools"`), and warm it is still ~13s.
+#
+# It is a session-shared cost, but a lazy import inside ``run_doctor`` charges
+# all of it to whichever test happens to call ``run_doctor`` first -- which
+# pushed that one test past the repo's 30s `--timeout` cap whenever this file
+# is run on its own. Importing it here moves the cost into module collection,
+# which pytest-timeout does not cover, so no single test is billed for it.
+# Ten other test modules already import model_tools at module scope for the
+# same reason.
+import model_tools  # noqa: F401,E402
+
+
+def _fake_install_probe(names, entrypoints, python=None, env=None):
+    """Stand in for ``install_doctor.probe`` without spawning an interpreter.
+
+    The real probe launches ``sys.executable -c <script>`` which imports every
+    declared package from a neutral cwd. On this host that single spawn costs
+    ~16s per call, and ``run_doctor`` calls it once per invocation -- it was
+    the largest slice of the ~60s each ``run_doctor`` test used to take. It
+    also makes the result depend on whatever happens to be installed in the
+    developer's venv, so the doctor section it feeds was never deterministic.
+
+    Returning an all-clean result keeps the real ``_collect``/``analyze``/
+    render path under test and only removes the subprocess.
+    """
+    return {
+        "resolved": {n: {"ok": True, "origin": f"<stub>/{n}", "error": None} for n in names},
+        "imports": {n: {"ok": True, "error": None} for n in entrypoints},
+        "executable": sys.executable,
+    }
+
+
+def _fast_agent_browser_runnable(path):
+    """``hermes_constants.agent_browser_runnable`` minus the ``--version`` spawn.
+
+    The real helper execs the resolved binary to reject dangling symlinks;
+    on Windows that npm ``.CMD`` shim costs ~4s per call. The cheap checks it
+    performs first (npx form, exists, executable) are kept verbatim so the
+    dangling-symlink semantics the callers rely on still hold.
+    """
+    if not path:
+        return False
+    if " " in path and path.split()[0].endswith("npx"):
+        return True
+    return os.path.exists(path) and os.access(path, os.X_OK)
+
+
+@pytest.fixture(autouse=True)
+def _stub_doctor_externals(monkeypatch):
+    """Keep ``run_doctor`` off the three slowest host probes.
+
+    Measured on Windows, each ``run_doctor(...)`` test spent ~31s of its ~39s
+    inside three subprocesses that none of these tests assert on:
+
+      * ``install_doctor.probe``            ~16.6s
+      * ``gh auth status --json ...``       ~10.7s
+      * ``agent-browser --version``          ~3.9s
+
+    That put every one of them over the repo's 30s ``--timeout`` cap from
+    ``pyproject.toml``, so they could only pass under an explicit
+    ``--timeout=600`` -- i.e. they were silently red in a default run. The
+    probes are also host state, not behaviour under test, so stubbing them
+    makes the tests deterministic as well as fast.
+
+    This is autouse and runs *before* each test's own ``monkeypatch`` calls,
+    so a test that installs its own ``subprocess.run`` (see
+    ``TestGitHubTokenCheck``) still wins.
+    """
+    import subprocess as _subprocess
+
+    from hermes_cli import install_doctor as _install_doctor
+
+    _real_section_lines = _install_doctor.doctor_section_lines
+
+    def _stubbed_section_lines(probe_fn=None, root=None):
+        return _real_section_lines(probe_fn=_fake_install_probe, root=root)
+
+    monkeypatch.setattr(_install_doctor, "doctor_section_lines", _stubbed_section_lines)
+    monkeypatch.setattr(doctor_mod, "agent_browser_runnable", _fast_agent_browser_runnable)
+
+    # ``_gh_authenticated`` is a closure inside ``run_doctor``, so it can only
+    # be reached through ``subprocess.run``. Intercept just that one argv and
+    # delegate everything else to whatever is currently installed (the
+    # conftest live-system guard wraps ``run`` too, and must stay in the chain).
+    _real_run = _subprocess.run
+
+    def _run(cmd, *args, **kwargs):
+        if isinstance(cmd, (list, tuple)) and list(cmd[:3]) == ["gh", "auth", "status"]:
+            return SimpleNamespace(returncode=1, stdout="", stderr="")
+        return _real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(_subprocess, "run", _run)
+
 
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
