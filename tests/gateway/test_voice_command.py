@@ -1742,6 +1742,32 @@ class TestVoiceTTSPlayback:
         assert result.success is True
         assert played == [(111, "/tmp/tts.ogg")]
 
+    @pytest.mark.asyncio
+    async def test_play_tts_logs_false_vc_playback_without_attachment_fallback(self, caplog):
+        """A failed connected-VC attempt remains attachment-free but observable."""
+        adapter = self._make_discord_adapter()
+        mock_vc = MagicMock()
+        mock_vc.is_connected.return_value = True
+        mock_vc.is_playing.return_value = False
+        adapter._voice_clients[111] = mock_vc
+        adapter._voice_text_channels[111] = 123
+        adapter.play_in_voice_channel = AsyncMock(return_value=False)
+        adapter.send_voice = AsyncMock()
+
+        result = await adapter.play_tts(chat_id="123", audio_path="/tmp/tts.ogg")
+
+        assert result.success is False
+        adapter.send_voice.assert_not_awaited()
+        assert any(
+            "Discord voice playback returned False" in record.getMessage()
+            and "guild=111" in record.getMessage()
+            and "chat=123" in record.getMessage()
+            and "connected=True" in record.getMessage()
+            and "playing=False" in record.getMessage()
+            and "audio=tts.ogg" in record.getMessage()
+            for record in caplog.records
+        )
+
 
     # -- Runner dedup --
 

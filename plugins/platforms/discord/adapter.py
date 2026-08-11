@@ -3761,6 +3761,18 @@ class DiscordAdapter(BasePlatformAdapter):
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
                 logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
                 success = await self.play_in_voice_channel(gid, audio_path)
+                if not success:
+                    vc = self._voice_clients.get(gid)
+                    logger.warning(
+                        "[%s] Discord voice playback returned False "
+                        "(guild=%s chat=%s connected=%s playing=%s audio=%s)",
+                        self.name,
+                        gid,
+                        chat_id,
+                        vc.is_connected() if vc else False,
+                        vc.is_playing() if vc else False,
+                        os.path.basename(audio_path),
+                    )
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
