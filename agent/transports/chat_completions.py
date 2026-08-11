@@ -272,6 +272,14 @@ class ChatCompletionsTransport(ProviderTransport):
                 break
             tool_calls = msg.get("tool_calls")
             if isinstance(tool_calls, list):
+                # Empty tool_calls arrays are rejected by strict
+                # OpenAI-compatible providers (DeepSeek v4 returns HTTP 400
+                # "empty array").  The pre-send sanitizer strips them, but
+                # downstream passes (thinking-only drop, repair merge) can
+                # reintroduce the key.  Catch at the wire boundary. (#83312)
+                if not tool_calls and msg.get("role") == "assistant":
+                    needs_sanitize = True
+                    break
                 for tc in tool_calls:
                     if isinstance(tc, dict) and (
                         "call_id" in tc
@@ -347,6 +355,18 @@ class ChatCompletionsTransport(ProviderTransport):
                             copied_tool_calls[tc_idx] = copied_tc
                 if copied_tool_calls is not None:
                     mutable_msg()["tool_calls"] = copied_tool_calls
+            # Defense-in-depth: drop tool_calls key entirely when the
+            # array is empty (or non-list).  Strict OpenAI-compatible
+            # providers reject "tool_calls": [] with HTTP 400.  The
+            # pre-send sanitizer strips these, but downstream passes
+            # can reintroduce the key on the per-call copy. (#83312)
+            if (
+                isinstance(msg, dict)
+                and msg.get("role") == "assistant"
+                and "tool_calls" in msg
+                and not (isinstance(msg["tool_calls"], list) and msg["tool_calls"])
+            ):
+                mutable_msg().pop("tool_calls", None)
         return sanitized
 
     def convert_tools(self, tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
