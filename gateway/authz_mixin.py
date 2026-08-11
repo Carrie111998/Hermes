@@ -99,7 +99,7 @@ class GatewayAuthorizationMixin:
 
         In multiplex mode, secondary-profile adapters live in
         ``_profile_adapters[profile]`` while the default/active profile uses
-        ``self.adapters``. ``SessionSource.profile`` selects which map to consult.
+        ``self._ctx.adapters``. ``SessionSource.profile`` selects which map to consult.
         When a stamped profile has its own adapter registry entry, the default
         profile's same-platform adapter must not be consulted as a fallback.
         """

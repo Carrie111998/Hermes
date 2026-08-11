@@ -207,7 +207,7 @@ class GatewayKanbanWatchersMixin:
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
-        while self._running:
+        while self._ctx._running:
             try:
                 def _collect():
                     deliveries: list[dict] = []
@@ -220,7 +220,7 @@ class GatewayKanbanWatchersMixin:
                     )
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
-                        for platform in self.adapters.keys()
+                        for platform in self._ctx.adapters.keys()
                     }
                     # Widen to every platform any secondary profile has live,
                     # not just the default profile's. This is only a coarse
@@ -794,7 +794,7 @@ class GatewayKanbanWatchersMixin:
                 logger.warning("kanban notifier tick failed: %s", exc)
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
-                if not self._running:
+                if not self._ctx._running:
                     return
                 await asyncio.sleep(1)
 
@@ -979,7 +979,7 @@ class GatewayKanbanWatchersMixin:
         event loop. Failures in one tick don't stop subsequent ticks —
         same pattern as `_kanban_notifier_watcher`.
 
-        Shutdown: the loop checks ``self._running`` between ticks; gateway
+        Shutdown: the loop checks ``self._ctx._running`` between ticks; gateway
         stop() flips it to False and cancels pending tasks, and the
         in-flight ``to_thread`` returns on its own after the current
         ``dispatch_once`` call finishes (typically <1ms on an idle board).
@@ -1443,7 +1443,7 @@ class GatewayKanbanWatchersMixin:
         logger.info(
             "kanban dispatcher: embedded in gateway (interval=%.1fs)", interval
         )
-        while self._running:
+        while self._ctx._running:
             try:
                 # Reap zombie children before per-board work so a board DB
                 # failure cannot block cleanup of unrelated workers.
@@ -1516,7 +1516,7 @@ class GatewayKanbanWatchersMixin:
             # Sleep in 1s slices so shutdown is snappy — otherwise a stop()
             # waits up to `interval` seconds for the current sleep to finish.
             slept = 0.0
-            while slept < interval and self._running:
+            while slept < interval and self._ctx._running:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
