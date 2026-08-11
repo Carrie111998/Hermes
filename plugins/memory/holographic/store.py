@@ -48,7 +48,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_name  ON entities(name);
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
     USING fts5(
         content, tags, content=facts, content_rowid=fact_id,
-        tokenize='trigram'
+        tokenize='trigram remove_diacritics 1'
     );
 
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
@@ -200,7 +200,7 @@ class MemoryStore:
                 """
                 CREATE VIRTUAL TABLE facts_fts USING fts5(
                     content, tags, content=facts, content_rowid=fact_id,
-                    tokenize='trigram'
+                    tokenize='trigram remove_diacritics 1'
                 )
                 """
             )

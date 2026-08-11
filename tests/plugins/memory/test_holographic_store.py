@@ -130,6 +130,14 @@ class TestSharedConnection:
 
         assert [result["fact_id"] for result in results] == [fact_id]
 
+    def test_trigram_search_preserves_diacritic_folding(self, db_path):
+        with MemoryStore(db_path) as store:
+            fact_id = store.add_fact("café deployment notes")
+
+            results = store.search_facts("cafe")
+
+        assert [result["fact_id"] for result in results] == [fact_id]
+
 
 class TestCloseSemantics:
     def test_closing_one_instance_keeps_sibling_alive(self, db_path):
