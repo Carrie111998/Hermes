@@ -190,3 +190,17 @@ def test_run_variant_emits_observation_schema_for_lexical_variant(tmp_path: Path
         "top1_rrf_score", "top2_rrf_score", "rrf_top_margin",
         "lexical_dense_top1_agreement", "lexical_dense_expected_overlap",
     }
+
+
+def test_benchmark_results_persist_fixture_ids_not_query_text(tmp_path: Path) -> None:
+    fixture = load_fixture()
+    store, run_a, _run_b = make_store(tmp_path / "benchmark.db")
+
+    summary = run_variant(store, fixture, run_a, dense=False, client=None)
+
+    results = summary["query_results"]
+    assert len(results) == 90
+    assert [row["fixture_id"] for row in results] == [
+        f"q-{index:03d}" for index in range(1, 91)
+    ]
+    assert all("query" not in row for row in results)

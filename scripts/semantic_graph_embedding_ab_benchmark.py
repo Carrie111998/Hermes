@@ -274,7 +274,7 @@ def run_variant(
     )}
     before = {row["node_id"]: (row["status"], row["authority"], row["confidence"])
               for row in store.list_nodes(limit=5000)}
-    for query in fixture["queries"]:
+    for query_index, query in enumerate(fixture["queries"], start=1):
         started = time.perf_counter()
         query_vector = None
         if dense:
@@ -342,7 +342,7 @@ def run_variant(
         cross_run += sum(int(row.get("node_id") == "run-b-only") for row in rows)
         secret_recall += sum(int("opaque-secret" in json.dumps(row, ensure_ascii=False)) for row in rows)
         results.append({
-            "query": query["query"],
+            "fixture_id": f"q-{query_index:03d}",
             "group": query["group"], "expected": query["expected"],
             "returned": [row["identity_key"] for row in rows], "hit": rank is not None,
             "returned_any": bool(rows), "reciprocal_rank": 1.0 / rank if rank else 0.0,
