@@ -13,6 +13,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -1527,7 +1528,16 @@ class LocalEnvironment(BaseEnvironment):
 
         _popen_cwd = self.cwd
 
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        _popen_kwargs: dict[str, Any] = (
+            {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        )
+        if not _IS_WINDOWS:
+            # Heavy foreground jobs inherit the kernel-lock FD through a
+            # task-local context set by terminal_tool. The lock therefore stays
+            # held if Hermes crashes while the command tree is still alive.
+            from tools.heavy_work_guard import current_heavy_work_child_fds
+
+            _popen_kwargs["pass_fds"] = current_heavy_work_child_fds()
 
         proc = subprocess.Popen(
             args,
@@ -1544,7 +1554,7 @@ class LocalEnvironment(BaseEnvironment):
         )
         if not _IS_WINDOWS:
             try:
-                proc._hermes_pgid = os.getpgid(proc.pid)
+                setattr(proc, "_hermes_pgid", os.getpgid(proc.pid))
             except ProcessLookupError:
                 pass
 
