@@ -4,6 +4,7 @@ description: Build and evaluate typed memory and output graphs.
 version: 0.1.0
 author: Ryo Minegishi (@zapabob), Hermes Agent
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags:

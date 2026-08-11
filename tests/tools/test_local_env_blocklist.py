@@ -682,9 +682,10 @@ class TestHermesBinDirOnPath:
         from tools.environments.local import _make_run_env
         self._reset_cache()
         local_mod._HERMES_BIN_DIR = "/opt/hermes/bin"
-        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=True):
+        path_sep = local_mod._env_path_sep()
+        with patch.dict(os.environ, {"PATH": path_sep.join(["/usr/bin", "/bin"])}, clear=True):
             result = _make_run_env({})
-        entries = result["PATH"].split(":")
+        entries = result["PATH"].split(path_sep)
         assert entries[0] == "/opt/hermes/bin"
         assert "/usr/bin" in entries
 

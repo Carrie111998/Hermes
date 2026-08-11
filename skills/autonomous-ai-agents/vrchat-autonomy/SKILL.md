@@ -3,6 +3,7 @@ name: vrchat-autonomy
 description: Autonomous VRChat chatbox, loop, and movement.
 version: 0.1.0
 author: Hermes Agent
+license: MIT
 platforms: [windows, linux, macos]
 metadata:
   hermes:

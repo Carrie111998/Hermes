@@ -9,7 +9,7 @@ metadata:
   hermes:
     tags: [osint, investigation, public-records, sec, sanctions, corporate-registry, property, courts, due-diligence, journalism]
     category: research
-    related_skills: [domain-intel, arxiv]
+    related_skills: [domain-intel]
 ---
 
 # OSINT Investigation — Public Records Cross-Reference

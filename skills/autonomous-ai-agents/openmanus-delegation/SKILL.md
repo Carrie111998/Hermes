@@ -1,6 +1,6 @@
 ---
 name: openmanus-delegation
-description: "Use the OpenManus Hermes plugin for bounded delegated tasks and parallel research workers."
+description: Delegate bounded tasks through the OpenManus plugin.
 version: 1.0.0
 author: Hermes Agent
 license: MIT

@@ -8,7 +8,7 @@ platforms: [linux, macos]
 metadata:
   hermes:
     tags: [Coding-Agent, OpenHands, Model-Agnostic, LiteLLM]
-    related_skills: [claude-code, codex, opencode, hermes-agent]
+    related_skills: [claude-code, codex, hermes-agent]
 ---
 
 # OpenHands CLI

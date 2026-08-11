@@ -721,17 +721,6 @@ def _looks_like_linter_unusable(base_cmd: str, output: str) -> bool:
     return any(p in lower for p in patterns)
 
 
-def _is_windows_wsl_bash(bash_path: str) -> bool:
-    """Return True for Windows WSL bash launchers."""
-    if not _IS_WINDOWS or not bash_path:
-        return False
-    normalized = os.path.normcase(os.path.normpath(bash_path))
-    return (
-        normalized.endswith(r"\windows\system32\bash.exe")
-        or normalized.endswith(r"\microsoft\windowsapps\bash.exe")
-    )
-
-
 def _windows_drive_path_for_bash(path: str, path_style: str = "msys") -> str:
     """Convert native Windows drive paths to bash drive path syntax."""
     if not _IS_WINDOWS or not path:
@@ -983,20 +972,6 @@ class ShellFileOperations(FileOperations):
         """Return True when this backend expects MSYS-style drive paths."""
         return bool(getattr(self.env, "uses_msys_paths", False))
 
-    def _windows_bash_path_style(self) -> str:
-        """Return the POSIX drive-prefix style expected by this Windows shell."""
-        explicit = getattr(self.env, "windows_bash_path_style", None)
-        if explicit in {"msys", "wsl"}:
-            return explicit
-        try:
-            from tools.environments.local import _find_bash
-        except Exception:
-            return "msys"
-        try:
-            return "wsl" if _is_windows_wsl_bash(_find_bash()) else "msys"
-        except Exception:
-            return "msys"
-    
     def _exec(self, command: str, cwd: str = None, timeout: int = None,
               stdin_data: str = None) -> ExecuteResult:
         """Execute command via terminal backend.
@@ -1205,7 +1180,7 @@ class ShellFileOperations(FileOperations):
                         return user_home + suffix
         
         if self._uses_msys_paths():
-            return _windows_drive_path_for_bash(path, self._windows_bash_path_style())
+            return _windows_drive_path_for_bash(path)
         return path
     
     def _escape_shell_arg(self, arg: str) -> str:

@@ -1,0 +1,819 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "identity": "frontend.language",
+      "label": "Frontend language",
+      "summary": "The user prefers TypeScript for frontend development.",
+      "key": "TypeScript"
+    },
+    {
+      "identity": "analysis.language",
+      "label": "Analysis language",
+      "summary": "The user prefers Python for data analysis.",
+      "key": "Python"
+    },
+    {
+      "identity": "editor.primary",
+      "label": "Primary editor",
+      "summary": "The user primarily uses Neovim.",
+      "key": "Neovim"
+    },
+    {
+      "identity": "shell.default",
+      "label": "Default shell",
+      "summary": "The default shell is Bash.",
+      "key": "Bash"
+    },
+    {
+      "identity": "os.primary",
+      "label": "Primary operating system",
+      "summary": "The user primarily works on Windows.",
+      "key": "Windows"
+    },
+    {
+      "identity": "database.primary",
+      "label": "Primary database",
+      "summary": "The project uses SQLite as its primary database.",
+      "key": "SQLite"
+    },
+    {
+      "identity": "transport.mcp",
+      "label": "MCP transport",
+      "summary": "The MCP server uses streamable HTTP transport.",
+      "key": "streamable HTTP"
+    },
+    {
+      "identity": "workspace.scope",
+      "label": "Workspace scope",
+      "summary": "The coding workspace is limited to a task-specific subdirectory.",
+      "key": "task-specific subdirectory"
+    },
+    {
+      "identity": "memory.external",
+      "label": "External memory",
+      "summary": "Obsidian is used as the external long-term memory.",
+      "key": "Obsidian"
+    },
+    {
+      "identity": "memory.identity",
+      "label": "Memory identity",
+      "summary": "Memory is treated as continuity of identity.",
+      "key": "continuity of identity"
+    },
+    {
+      "identity": "tts.voice",
+      "label": "Preferred voice layer",
+      "summary": "VOICEVOX is used as the vocal layer.",
+      "key": "VOICEVOX"
+    },
+    {
+      "identity": "vrchat.body",
+      "label": "VRChat body layer",
+      "summary": "The VRChat harness provides the embodied reflex layer.",
+      "key": "VRChat harness"
+    },
+    {
+      "identity": "agent.kernel",
+      "label": "Agency kernel",
+      "summary": "Hermes Agent is the central agency kernel.",
+      "key": "Hermes Agent"
+    },
+    {
+      "identity": "policy.guard",
+      "label": "Policy guard",
+      "summary": "Policy Guard defines the safe autonomy boundary.",
+      "key": "Policy Guard"
+    },
+    {
+      "identity": "audit.log",
+      "label": "Audit log",
+      "summary": "The audit log records reflective memory for operations.",
+      "key": "audit log"
+    },
+    {
+      "identity": "test.runner",
+      "label": "Canonical test runner",
+      "summary": "The project uses scripts/run_tests.sh as the canonical test runner.",
+      "key": "scripts/run_tests.sh"
+    },
+    {
+      "identity": "embedding.mode",
+      "label": "Embedding mode",
+      "summary": "Dense embedding is an optional candidate generator.",
+      "key": "candidate generator"
+    },
+    {
+      "identity": "retrieval.hybrid",
+      "label": "Hybrid retrieval",
+      "summary": "Hybrid retrieval combines lexical and dense candidate search.",
+      "key": "lexical and dense"
+    },
+    {
+      "identity": "fusion.rrf",
+      "label": "RRF fusion",
+      "summary": "Reciprocal Rank Fusion combines ranked retrieval lists.",
+      "key": "Reciprocal Rank Fusion"
+    },
+    {
+      "identity": "graph.expansion",
+      "label": "Graph expansion",
+      "summary": "Graph expansion is bounded to one hop for retrieval.",
+      "key": "one hop"
+    }
+  ],
+  "correction_nodes": [
+    {
+      "old_identity": "obsolete.preference.1",
+      "old_summary": "Historical preference 1 is obsolete near maple.",
+      "new_identity": "current.preference.1",
+      "new_summary": "Current preference 1 is authoritative for maple."
+    },
+    {
+      "old_identity": "obsolete.preference.2",
+      "old_summary": "Historical preference 2 is obsolete near cobalt.",
+      "new_identity": "current.preference.2",
+      "new_summary": "Current preference 2 is authoritative for cobalt."
+    },
+    {
+      "old_identity": "obsolete.preference.3",
+      "old_summary": "Historical preference 3 is obsolete near linen.",
+      "new_identity": "current.preference.3",
+      "new_summary": "Current preference 3 is authoritative for linen."
+    },
+    {
+      "old_identity": "obsolete.preference.4",
+      "old_summary": "Historical preference 4 is obsolete near orbit.",
+      "new_identity": "current.preference.4",
+      "new_summary": "Current preference 4 is authoritative for orbit."
+    },
+    {
+      "old_identity": "obsolete.preference.5",
+      "old_summary": "Historical preference 5 is obsolete near harbor.",
+      "new_identity": "current.preference.5",
+      "new_summary": "Current preference 5 is authoritative for harbor."
+    },
+    {
+      "old_identity": "obsolete.preference.6",
+      "old_summary": "Historical preference 6 is obsolete near pixel.",
+      "new_identity": "current.preference.6",
+      "new_summary": "Current preference 6 is authoritative for pixel."
+    },
+    {
+      "old_identity": "obsolete.preference.7",
+      "old_summary": "Historical preference 7 is obsolete near quartz.",
+      "new_identity": "current.preference.7",
+      "new_summary": "Current preference 7 is authoritative for quartz."
+    },
+    {
+      "old_identity": "obsolete.preference.8",
+      "old_summary": "Historical preference 8 is obsolete near raven.",
+      "new_identity": "current.preference.8",
+      "new_summary": "Current preference 8 is authoritative for raven."
+    },
+    {
+      "old_identity": "obsolete.preference.9",
+      "old_summary": "Historical preference 9 is obsolete near solar.",
+      "new_identity": "current.preference.9",
+      "new_summary": "Current preference 9 is authoritative for solar."
+    },
+    {
+      "old_identity": "obsolete.preference.10",
+      "old_summary": "Historical preference 10 is obsolete near violet.",
+      "new_identity": "current.preference.10",
+      "new_summary": "Current preference 10 is authoritative for violet."
+    }
+  ],
+  "queries": [
+    {
+      "query": "frontend.language",
+      "expected": [
+        "frontend.language"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "analysis.language",
+      "expected": [
+        "analysis.language"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "editor.primary",
+      "expected": [
+        "editor.primary"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "shell.default",
+      "expected": [
+        "shell.default"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "os.primary",
+      "expected": [
+        "os.primary"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "database.primary",
+      "expected": [
+        "database.primary"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "transport.mcp",
+      "expected": [
+        "transport.mcp"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "workspace.scope",
+      "expected": [
+        "workspace.scope"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "memory.external",
+      "expected": [
+        "memory.external"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "memory.identity",
+      "expected": [
+        "memory.identity"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "tts.voice",
+      "expected": [
+        "tts.voice"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "vrchat.body",
+      "expected": [
+        "vrchat.body"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "agent.kernel",
+      "expected": [
+        "agent.kernel"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "policy.guard",
+      "expected": [
+        "policy.guard"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "audit.log",
+      "expected": [
+        "audit.log"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "test.runner",
+      "expected": [
+        "test.runner"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "embedding.mode",
+      "expected": [
+        "embedding.mode"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "retrieval.hybrid",
+      "expected": [
+        "retrieval.hybrid"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "fusion.rrf",
+      "expected": [
+        "fusion.rrf"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "graph.expansion",
+      "expected": [
+        "graph.expansion"
+      ],
+      "group": "exact_identifier"
+    },
+    {
+      "query": "What is the preferred frontend language?",
+      "expected": [
+        "frontend.language"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred analysis language?",
+      "expected": [
+        "analysis.language"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred primary editor?",
+      "expected": [
+        "editor.primary"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred default shell?",
+      "expected": [
+        "shell.default"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred primary operating system?",
+      "expected": [
+        "os.primary"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred primary database?",
+      "expected": [
+        "database.primary"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred mcp transport?",
+      "expected": [
+        "transport.mcp"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred workspace scope?",
+      "expected": [
+        "workspace.scope"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred external memory?",
+      "expected": [
+        "memory.external"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred memory identity?",
+      "expected": [
+        "memory.identity"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred preferred voice layer?",
+      "expected": [
+        "tts.voice"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred vrchat body layer?",
+      "expected": [
+        "vrchat.body"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred agency kernel?",
+      "expected": [
+        "agent.kernel"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred policy guard?",
+      "expected": [
+        "policy.guard"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred audit log?",
+      "expected": [
+        "audit.log"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred canonical test runner?",
+      "expected": [
+        "test.runner"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred embedding mode?",
+      "expected": [
+        "embedding.mode"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred hybrid retrieval?",
+      "expected": [
+        "retrieval.hybrid"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred rrf fusion?",
+      "expected": [
+        "fusion.rrf"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "What is the preferred graph expansion?",
+      "expected": [
+        "graph.expansion"
+      ],
+      "group": "english_paraphrase"
+    },
+    {
+      "query": "Frontend languageについて教えてください。",
+      "expected": [
+        "frontend.language"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Analysis languageについて教えてください。",
+      "expected": [
+        "analysis.language"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Primary editorについて教えてください。",
+      "expected": [
+        "editor.primary"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Default shellについて教えてください。",
+      "expected": [
+        "shell.default"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Primary operating systemについて教えてください。",
+      "expected": [
+        "os.primary"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Primary databaseについて教えてください。",
+      "expected": [
+        "database.primary"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "MCP transportについて教えてください。",
+      "expected": [
+        "transport.mcp"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Workspace scopeについて教えてください。",
+      "expected": [
+        "workspace.scope"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "External memoryについて教えてください。",
+      "expected": [
+        "memory.external"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Memory identityについて教えてください。",
+      "expected": [
+        "memory.identity"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Preferred voice layerについて教えてください。",
+      "expected": [
+        "tts.voice"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "VRChat body layerについて教えてください。",
+      "expected": [
+        "vrchat.body"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Agency kernelについて教えてください。",
+      "expected": [
+        "agent.kernel"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Policy guardについて教えてください。",
+      "expected": [
+        "policy.guard"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Audit logについて教えてください。",
+      "expected": [
+        "audit.log"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Canonical test runnerについて教えてください。",
+      "expected": [
+        "test.runner"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Embedding modeについて教えてください。",
+      "expected": [
+        "embedding.mode"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Hybrid retrievalについて教えてください。",
+      "expected": [
+        "retrieval.hybrid"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "RRF fusionについて教えてください。",
+      "expected": [
+        "fusion.rrf"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "Graph expansionについて教えてください。",
+      "expected": [
+        "graph.expansion"
+      ],
+      "group": "japanese_paraphrase"
+    },
+    {
+      "query": "TypeScriptに関する設定は？",
+      "expected": [
+        "frontend.language"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "Pythonに関する設定は？",
+      "expected": [
+        "analysis.language"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "Neovimに関する設定は？",
+      "expected": [
+        "editor.primary"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "Bashに関する設定は？",
+      "expected": [
+        "shell.default"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "Windowsに関する設定は？",
+      "expected": [
+        "os.primary"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "SQLiteに関する設定は？",
+      "expected": [
+        "database.primary"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "streamable HTTPに関する設定は？",
+      "expected": [
+        "transport.mcp"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "task-specific subdirectoryに関する設定は？",
+      "expected": [
+        "workspace.scope"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "Obsidianに関する設定は？",
+      "expected": [
+        "memory.external"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "continuity of identityに関する設定は？",
+      "expected": [
+        "memory.identity"
+      ],
+      "group": "japanese_to_english"
+    },
+    {
+      "query": "maple",
+      "expected": [
+        "current.preference.1"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "cobalt",
+      "expected": [
+        "current.preference.2"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "linen",
+      "expected": [
+        "current.preference.3"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "orbit",
+      "expected": [
+        "current.preference.4"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "harbor",
+      "expected": [
+        "current.preference.5"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "pixel",
+      "expected": [
+        "current.preference.6"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "quartz",
+      "expected": [
+        "current.preference.7"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "raven",
+      "expected": [
+        "current.preference.8"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "solar",
+      "expected": [
+        "current.preference.9"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "violet",
+      "expected": [
+        "current.preference.10"
+      ],
+      "group": "correction_history",
+      "history": true
+    },
+    {
+      "query": "What is the user’s quantum violin model?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "Which lavender submarine did the user book?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "What is the user’s antarctic telescope serial?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "Which meteorite recipe did the user save?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "What is the user’s cobalt parachute size?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "Which imaginary glacier hotel did the user visit?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "What is the user’s ziggurat passport number?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "Which nocturnal octopus did the user adopt?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "What is the user’s saffron spacecraft?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    },
+    {
+      "query": "Which fictional nebula camera did the user use?",
+      "expected": [],
+      "group": "negative",
+      "negative": true
+    }
+  ]
+}
