@@ -142,6 +142,39 @@ async def test_status_command_includes_live_agent_model_and_context():
 
 
 @pytest.mark.asyncio
+async def test_status_command_exposes_redacted_fallback_diagnostic():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="fallback-model",
+        provider="fallback-provider",
+        base_url="https://secret-token@fallback.example/v1",
+        api_mode="openai",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+        ),
+        _fallback_activated=True,
+        _rate_limited_until=time.monotonic() + 30,
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**fallback-provider/fallback-model@fallback.example:** FALLBACK" in result
+    assert "T-" in result
+    assert "secret-token" not in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(
@@ -486,5 +519,3 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-
-
