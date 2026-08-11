@@ -34,18 +34,27 @@ function makeTimers() {
 
 function makeWindow() {
   const calls: boolean[] = []
-  const listeners = new Map<string, () => void>()
+  const listeners = new Map<string, Array<() => void>>()
   let destroyed = false
 
   const win = {
     calls,
     close() {
       destroyed = true
-      listeners.get('closed')?.()
+      for (const fn of listeners.get('closed') ?? []) {
+        fn()
+      }
+    },
+    emit(event: string) {
+      for (const fn of listeners.get(event) ?? []) {
+        fn()
+      }
     },
     isDestroyed: () => destroyed,
     on(event: string, fn: () => void) {
-      listeners.set(event, fn)
+      const list = listeners.get(event) ?? []
+      list.push(fn)
+      listeners.set(event, list)
     },
     webContents: {
       isDestroyed: () => destroyed,
@@ -57,7 +66,6 @@ function makeWindow() {
 
   return win
 }
-
 test('registering a window applies the current throttle state immediately', () => {
   const timers = makeTimers()
   const throttle = createStreamThrottle(timers)
@@ -149,4 +157,53 @@ test('closed and destroyed windows drop out without throwing', () => {
   throttle.update(true)
   // Only the registration-time call landed; nothing after close.
   assert.deepEqual(closedWin.calls, [true])
+})
+
+test('wake pulses unthrottled then schedules the trailing re-throttle when idle', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const win = makeWindow()
+  throttle.register(win)
+  win.calls.length = 0
+
+  throttle.wake()
+  assert.deepEqual(win.calls, [false])
+  assert.equal(throttle.isUnthrottled(), true)
+  assert.equal(timers.pendingCount, 1)
+
+  timers.fire()
+  assert.deepEqual(win.calls, [false, true])
+  assert.equal(throttle.isUnthrottled(), false)
+})
+
+test('show/restore/focus events wake an idle registered window', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const win = makeWindow()
+  throttle.register(win)
+  win.calls.length = 0
+
+  win.emit('restore')
+  assert.deepEqual(win.calls, [false])
+  assert.equal(throttle.isUnthrottled(), true)
+
+  win.emit('show')
+  // Already unthrottled with a trailing timer — no stacked apply.
+  assert.deepEqual(win.calls, [false])
+  assert.equal(timers.pendingCount, 1)
+})
+
+test('wake during a live turn stays unthrottled without starting a re-throttle', () => {
+  const timers = makeTimers()
+  const throttle = createStreamThrottle(timers)
+  const win = makeWindow()
+  throttle.register(win)
+
+  throttle.update(true)
+  win.calls.length = 0
+  throttle.wake()
+
+  assert.deepEqual(win.calls, [])
+  assert.equal(throttle.isUnthrottled(), true)
+  assert.equal(timers.pendingCount, 0)
 })
