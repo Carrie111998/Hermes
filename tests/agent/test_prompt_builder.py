@@ -5,6 +5,7 @@ import importlib
 import logging
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -514,6 +515,28 @@ class TestBuildContextFilesPrompt:
         from agent.prompt_builder import _load_agents_md
 
         assert _load_agents_md(sub) == ""
+
+    def test_unreadable_cwd_does_not_abort_prompt_build(self, tmp_path, monkeypatch):
+        """An unreadable cwd must degrade to no project context, not raise.
+
+        A resumed session or a service started from another user's directory
+        makes even Path.exists() raise PermissionError; that must not abort
+        construction of the system prompt.
+        """
+        blocked_cwd = tmp_path / "other-user-home"
+        blocked_cwd.mkdir()
+        original_exists = Path.exists
+
+        def permission_denied_for_blocked_tree(path):
+            if path == blocked_cwd or blocked_cwd in path.parents:
+                raise PermissionError(13, "Permission denied", str(path))
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", permission_denied_for_blocked_tree)
+
+        result = build_context_files_prompt(cwd=str(blocked_cwd), skip_soul=True)
+
+        assert result == ""
 
     def test_skips_agents_md_in_install_tree_on_fallback(self, monkeypatch, tmp_path):
         # A backend that FALLS BACK into the install tree (cwd=None → getcwd,

@@ -2326,13 +2326,26 @@ def build_context_files_prompt(
         )
         project_context = ""
     else:
-        # Priority-based project context: first match wins
-        project_context = (
-            _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
-        )
+        # Priority-based project context: first match wins. Project context is
+        # optional, but a cwd the process cannot read is not: a resumed session
+        # or a service invoked from another user's directory makes even
+        # Path.exists() raise PermissionError, which aborts the whole system
+        # prompt and kills the turn. Degrade to no project context instead.
+        try:
+            project_context = (
+                _load_hermes_md(cwd_path, context_length)
+                or _load_agents_md(cwd_path, context_length)
+                or _load_claude_md(cwd_path, context_length)
+                or _load_cursorrules(cwd_path, context_length)
+            )
+        except OSError as exc:
+            logger.warning(
+                "skipping project-context discovery: working directory %s is "
+                "not readable (%s)",
+                cwd_path,
+                exc,
+            )
+            project_context = ""
     if project_context:
         sections.append(project_context)
 
