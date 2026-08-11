@@ -135,6 +135,27 @@ def test_find_editable_finder_returns_none_when_absent(tmp_path):
     assert find_editable_finder([tmp_path]) is None
 
 
+def test_find_editable_finder_picks_the_highest_version_not_lexicographically_last(tmp_path):
+    """Finding E: string-sorting filenames ranks 0_9_0 after 0_10_0.
+
+    A leftover older finder would win once a double-digit minor version
+    exists (the next minor is 0.20.0, so this is close). Selection must be
+    by parsed numeric version, not lexicographic string order.
+    """
+    from hermes_cli.install_doctor import find_editable_finder
+
+    (tmp_path / "__editable___hermes_agent_0_9_0_finder.py").write_text(
+        "x = 1\n", encoding="utf-8"
+    )
+    (tmp_path / "__editable___hermes_agent_0_10_0_finder.py").write_text(
+        "x = 1\n", encoding="utf-8"
+    )
+
+    found = find_editable_finder([tmp_path])
+    assert found is not None
+    assert found.name == "__editable___hermes_agent_0_10_0_finder.py"
+
+
 def test_resolve_install_root_uses_the_common_parent_of_mapping_targets(tmp_path):
     from hermes_cli.install_doctor import resolve_install_root
 
@@ -172,15 +193,54 @@ def test_resolve_install_root_handles_a_single_mapping_entry(tmp_path):
 
 
 def test_resolve_install_root_reports_an_unparseable_finder(tmp_path):
+    """A parse failure degrades the diagnosis only, never the verdict.
+
+    `path` must still resolve (falling back to the running module's repo,
+    same as the no-finder branch) so `declared` is not silently dropped to
+    None -- that used to make breadth SKIP and `ok` come back True. Only
+    `mapping` and the provenance wording are allowed to reflect the failure.
+    """
     from hermes_cli.install_doctor import resolve_install_root
 
     finder = tmp_path / "__editable___hermes_agent_0_19_0_finder.py"
     finder.write_text("garbage, no mapping here\n", encoding="utf-8")
 
     resolved = resolve_install_root(finder)
-    assert resolved.path is None
+    assert resolved.path is not None
     assert resolved.mapping is None
     assert "did not parse" in resolved.provenance
+
+
+def test_unparseable_mapping_still_produces_a_breadth_verdict(tmp_path):
+    """A diagnosis-layer failure must not disable the verdict.
+
+    resolve_install_root uses the MAPPING parse for the install root as well
+    as the diagnosis, so a parse failure used to leave `declared` None ->
+    breadth SKIPPED -> ok=True -> exit 0: a silent no-op reporting success,
+    which is the exact failure mode this guard exists to catch.
+    """
+    import hermes_cli.install_doctor as mod
+
+    finder = tmp_path / "__editable___hermes_agent_0_19_0_finder.py"
+    finder.write_text("garbage, no mapping here\n", encoding="utf-8")
+
+    root = mod.resolve_install_root(finder)
+    assert root.mapping is None            # diagnosis degraded
+    assert root.path is not None           # but declarations still resolvable
+
+    declared = mod.declared_names(root.path / "pyproject.toml")
+
+    def fake_probe(names, entrypoints, python=None, env=None):
+        # Nothing resolves -> real drift that must be reported.
+        return _probe_result([], list(names))
+
+    probe_result = fake_probe(sorted(declared), ())
+    findings = mod.analyze(declared, probe_result, root)
+
+    assert findings.checked_breadth is True
+    assert findings.missing
+    assert findings.ok is False
+    assert findings.finder_is_stale is None   # undetermined, not "not stale"
 
 
 def test_resolve_install_root_falls_back_when_no_finder_exists(monkeypatch):
@@ -432,6 +492,96 @@ def test_doctor_section_lines_remediation_excludes_reinstall_when_finder_not_sta
     assert "pip install -e . --no-deps" not in remediation
 
 
+def test_doctor_section_lines_remediation_does_not_contradict_not_stale(tmp_path):
+    """Finding B: 'has drifted' must not lead a remedy that says nothing drifted.
+
+    When finder_is_stale is False, the editable finder already lists every
+    missing name -- the remedy that follows says reinstalling will NOT fix
+    this. A hardcoded "Editable install has drifted." prefix contradicts
+    that, which is the same defect commit 50edfc58e removed at a different
+    surface (remedy_lines) -- it survived here because the fix threaded the
+    flag into remedy_lines but left doctor_section_lines' prefix hardcoded.
+    """
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\n"
+        'include = ["events", "jobflow_dispatch"]\n',
+        encoding="utf-8",
+    )
+    mapping = {"events": "x", "jobflow_dispatch": "y"}
+    root = InstallRoot(path=root_dir, provenance="test", mapping=mapping)
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result([], ["events", "jobflow_dispatch"])
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert remediation is not None
+    assert "has drifted" not in remediation.lower()
+    assert "not" in remediation.lower()  # "not loaded" / "will not fix"
+
+
+def test_doctor_section_lines_remediation_is_a_short_one_liner_when_stale(tmp_path):
+    """Finding C: the doctor summary item must not be a ~1140-char paragraph.
+
+    Joining all of remedy_lines with spaces collapses a ~20-line formatted
+    block into one line that doctor renders as a summary item wrapping to
+    ~14 terminal lines among one-line neighbours. The remediation must stay
+    a short, actionable one-liner that names the concrete next action and
+    points at the standalone tool for the full text.
+    """
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\n"
+        'include = ["events", "jobflow_dispatch"]\n',
+        encoding="utf-8",
+    )
+    root = InstallRoot(path=root_dir, provenance="test", mapping={"events": "x"})
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result(["events"], ["jobflow_dispatch"])
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert remediation is not None
+    assert len(remediation) < 250
+    assert "pip install -e . --no-deps" in remediation
+    assert "install_doctor" in remediation
+
+
+def test_doctor_section_lines_remediation_is_a_short_one_liner_when_not_stale(tmp_path):
+    """Finding C, mirrored for the not-stale remedy."""
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\n"
+        'include = ["events", "jobflow_dispatch"]\n',
+        encoding="utf-8",
+    )
+    mapping = {"events": "x", "jobflow_dispatch": "y"}
+    root = InstallRoot(path=root_dir, provenance="test", mapping=mapping)
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result([], ["events", "jobflow_dispatch"])
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert remediation is not None
+    # Bound is generous because this wording names sys.executable, which on
+    # a WindowsApps install can itself run ~150+ chars; the wording around
+    # it stays a concise one-liner, not a reproduction of the full block.
+    assert len(remediation) < 350
+    assert "install_doctor" in remediation
+
+
 def test_analyze_skips_breadth_without_declarations_and_says_so():
     """A sealed wheel install has no source tree to diff against."""
     from hermes_cli.install_doctor import analyze
@@ -505,6 +655,23 @@ def test_render_never_claims_a_pass_when_breadth_was_skipped():
     assert "every declared package resolves" not in text
 
 
+def test_render_never_claims_a_pass_when_breadth_was_skipped_for_empty_declarations():
+    """Finding F: the declared=set() skip path is only covered up through
+    analyze()'s notes today; drive it through render() too, mirroring the
+    existing declared=None render coverage above.
+    """
+    from hermes_cli.install_doctor import analyze, render
+
+    root = _install_root_with({}, root=None)
+    result = _probe_result([])
+    findings = analyze(set(), result, root)
+
+    text = "\n".join(render(findings, root, result))
+
+    assert "declared no top-level names" in text
+    assert "every declared package resolves" not in text
+
+
 def test_render_reports_a_broken_import_even_when_breadth_was_skipped():
     from hermes_cli.install_doctor import analyze, render
 
@@ -525,6 +692,13 @@ def test_render_reports_a_broken_import_even_when_breadth_was_skipped():
 
 
 def test_run_returns_zero_when_clean(tmp_path):
+    """Finding D: pin that breadth was actually CHECKED, not merely exit 0.
+
+    Exit 0 alone is also true in the skipped-breadth world (Finding A's
+    bug): `ok` is True whenever nothing was found wrong, including when
+    breadth never ran. Assert on the rendered output so this test cannot
+    pass against that regression.
+    """
     from hermes_cli.install_doctor import InstallRoot, run
 
     root_dir = tmp_path / "agent-src"
@@ -538,7 +712,10 @@ def test_run_returns_zero_when_clean(tmp_path):
     def fake_probe(names, entrypoints, python=None):
         return _probe_result(list(names), imports={e: {"ok": True, "error": None} for e in entrypoints})
 
-    assert run(probe_fn=fake_probe, root=root, stream=[]) == 0
+    out = []
+    assert run(probe_fn=fake_probe, root=root, stream=out) == 0
+    text = "\n".join(out)
+    assert "every declared package resolves" in text
 
 
 def test_run_returns_one_on_drift_and_prints_the_remedy(tmp_path):
@@ -585,6 +762,10 @@ def test_doctor_section_lines_yields_a_remediation_on_drift(tmp_path):
 
 
 def test_doctor_section_lines_is_ok_when_clean(tmp_path):
+    """Finding D: `all(status != "fail")` is also satisfied by an all-warn
+    row set (the skipped-breadth world). Pin that the row set is exactly
+    the single "ok" row, so this cannot pass against that regression.
+    """
     from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
 
     root_dir = tmp_path / "agent-src"
@@ -600,7 +781,7 @@ def test_doctor_section_lines_is_ok_when_clean(tmp_path):
     rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
 
     assert remediation is None
-    assert all(status != "fail" for status, _, _ in rows)
+    assert [s for s, _, _ in rows] == ["ok"]
 
 
 def test_doctor_section_lines_warns_instead_of_ok_when_breadth_was_skipped(tmp_path):

@@ -127,6 +127,18 @@ class InstallRoot:
     mapping: dict[str, str] | None
 
 
+def _finder_version_key(path: Path) -> tuple[int, ...]:
+    """Numeric version from a generated finder filename, for ordering.
+
+    Sorting these as strings ranks 0_9_0 after 0_10_0, which would select a
+    stale older finder once a double-digit minor exists.
+    """
+    match = re.search(r"__editable___hermes_agent_(.+?)_finder\.py$", path.name)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("_") if part.isdigit())
+
+
 def find_editable_finder(search_roots: list[Path] | None = None) -> Path | None:
     """Locate the hermes-agent editable finder in site-packages.
 
@@ -147,11 +159,11 @@ def find_editable_finder(search_roots: list[Path] | None = None) -> Path | None:
 
     for root in search_roots:
         try:
-            matches = sorted(root.glob("__editable___hermes_agent_*_finder.py"))
+            matches = list(root.glob("__editable___hermes_agent_*_finder.py"))
         except OSError:
             continue
         if matches:
-            return matches[-1]
+            return max(matches, key=_finder_version_key)
     return None
 
 
@@ -182,11 +194,21 @@ def resolve_install_root(finder: Path | None = None) -> InstallRoot:
 
     mapping = parse_finder_mapping(finder.read_text(encoding="utf-8"))
     if not mapping:
+        # `if not mapping` (not `is None`) on purpose: os.path.commonpath([])
+        # raises ValueError on an empty dict, so an empty mapping must also
+        # take this branch. Only the DIAGNOSIS degrades here -- `path` still
+        # falls back to the running module's repo root, same as the
+        # no-finder branch, so `declared` stays resolvable and the breadth
+        # verdict is never silently skipped just because the MAPPING parse
+        # failed. See Finding A in the 2026-08-10 final-review report.
+        fallback = Path(__file__).resolve().parents[1]
+        has_pyproject = (fallback / "pyproject.toml").is_file()
         return InstallRoot(
-            path=None,
+            path=fallback if has_pyproject else None,
             provenance=(
                 f"editable finder {finder.name} found, but its MAPPING did not "
-                "parse — setuptools' generated format may have changed"
+                "parse (setuptools' generated format may have changed) — "
+                f"falling back to {fallback} for declarations"
             ),
             mapping=None,
         )
@@ -563,12 +585,34 @@ def doctor_section_lines(probe_fn=probe, root: InstallRoot | None = None):
 
     remediation = None
     if not findings.ok:
-        remediation = "Editable install has drifted. " + " ".join(
-            line.strip()
-            for line in remedy_lines(root, findings.finder_is_stale)
-            if line.strip()
-        )
+        remediation = _remediation_one_liner(root, findings.finder_is_stale)
     return rows, remediation
+
+
+def _remediation_one_liner(install_root: InstallRoot, finder_is_stale: bool | None) -> str:
+    """A short, actionable remediation for the doctor summary block.
+
+    `doctor_section_lines` used to join the entire `remedy_lines` block
+    (bullets, blank lines, an indented command) with spaces into one
+    ~1140-character line, which doctor renders as a numbered summary item
+    that wraps to ~14 terminal lines among one-line neighbours. This stays
+    a one-liner and points at the standalone tool for the full remedy.
+
+    It must also not contradict `finder_is_stale`: when the finder is
+    already complete (False), nothing "drifted" -- the problem is that this
+    interpreter never loads it.
+    """
+    if finder_is_stale is False:
+        return (
+            f"Editable finder is complete but not loaded by this interpreter "
+            f"({sys.executable}) — reinstalling will not fix this. Full "
+            "remedy: python -m hermes_cli.install_doctor"
+        )
+    where = str(install_root.path) if install_root.path else "the agent-src checkout"
+    return (
+        f"Editable install has drifted: run `pip install -e . --no-deps` from "
+        f"{where}. Full remedy: python -m hermes_cli.install_doctor"
+    )
 
 
 def _cli() -> None:
