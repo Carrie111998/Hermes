@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from hermes_cli import kanban_db
 from hermes_cli import kanban_diagnostics as kd
+from hermes_cli.kanban_body_guard import BlankBodyError, validate_body
 
 log = logging.getLogger(__name__)
 
@@ -623,12 +624,18 @@ class CreateTaskBody(BaseModel):
 @router.post("/tasks")
 def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
+    try:
+        validated_body = validate_body(
+            payload.body, allow_missing=payload.triage
+        )
+    except BlankBodyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     conn = _conn(board=board)
     try:
         task_id = kanban_db.create_task(
             conn,
             title=payload.title,
-            body=payload.body,
+            body=validated_body,
             assignee=payload.assignee,
             created_by="dashboard",
             workspace_kind=payload.workspace_kind,

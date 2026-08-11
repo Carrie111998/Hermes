@@ -52,7 +52,10 @@ def _fake_resp(content: str, model: str = "aux-mini"):
 
 
 def test_estimate_parses_model_json(client, monkeypatch):
-    task_id = client.post("/api/plugins/kanban/tasks", json={"title": "big refactor"}).json()["task"]["id"]
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "big refactor", "body": "Estimate the big refactor."},
+    ).json()["task"]["id"]
 
     import agent.auxiliary_client as aux
 
@@ -71,7 +74,10 @@ def test_estimate_parses_model_json(client, monkeypatch):
 
 
 def test_estimate_tolerates_unparseable_reply(client, monkeypatch):
-    task_id = client.post("/api/plugins/kanban/tasks", json={"title": "vague"}).json()["task"]["id"]
+    task_id = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "vague", "body": "Estimate this intentionally vague task."},
+    ).json()["task"]["id"]
 
     import agent.auxiliary_client as aux
     monkeypatch.setattr(aux, "call_llm", lambda **kw: _fake_resp("I cannot estimate this, sorry."))
