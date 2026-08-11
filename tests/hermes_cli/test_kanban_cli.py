@@ -154,6 +154,32 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+def test_kanban_show_non_json_does_not_crash_on_closed_connection(kanban_home):
+    """Regression guard: ``_cmd_show``'s non-JSON path used to reuse ``conn``
+    after the ``with kb.connect_closing()`` block that opened it had already
+    exited, raising ``sqlite3.ProgrammingError: Cannot operate on a closed
+    database`` from the diagnostics section (``kb.task_graph_context``).
+
+    The ``--json`` path never hit this because it returns from inside the
+    ``with`` block. ``run_slash`` catches the exception and reports it via
+    stderr rather than raising, so a naive substring check on early output
+    (e.g. "ready" appears in the status line printed *before* the crash)
+    does not catch this — assert the error text is absent instead.
+    """
+    import re
+
+    out = kc.run_slash("create 'diag repro task'")
+    m = re.search(r"(t_[a-f0-9]+)", out)
+    assert m, out
+    tid = m.group(1)
+
+    shown = kc.run_slash(f"show {tid}")
+    assert "ProgrammingError" not in shown, shown
+    assert "closed database" not in shown, shown
+    assert "Diagnostics" not in shown  # no active diagnostics on a fresh task
+    assert f"Task {tid}" in shown
+
+
 
 
 # ---------------------------------------------------------------------------
