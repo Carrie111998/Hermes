@@ -30,6 +30,9 @@ _TRUSTED_SIGNED_CONTROL_PLANE_FIELDS = {
     "execution_evidence": frozenset(
         {"attestation_payload", "attestation_signature"}
     ),
+    "execute_feature_command": frozenset(
+        {"command_result_payload", "command_result_signature"}
+    ),
 }
 _MISSING = object()
 

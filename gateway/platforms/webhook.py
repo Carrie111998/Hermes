@@ -10,6 +10,7 @@ Each route defines:
   - events: which event types to accept (header-based filtering)
   - secret: HMAC secret for signature validation (REQUIRED)
   - prompt: template string formatted with the webhook payload
+  - system_prompt_file: optional tracked Markdown file under the Hermes project
   - skills: optional list of skills to load for the agent
   - deliver: where to send the response (github_comment, telegram, etc.)
   - deliver_extra: additional delivery config (repo, pr_number, chat_id)
@@ -42,6 +43,7 @@ import subprocess
 import sys
 import time
 from collections import deque
+from pathlib import Path
 from typing import Any, Deque, Dict, Optional
 
 try:
@@ -73,6 +75,47 @@ from tools.github_pr_evidence import (
 )
 
 logger = logging.getLogger(__name__)
+
+_HERMES_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_MAX_ROUTE_SYSTEM_PROMPT_BYTES = 64 * 1024
+
+
+def _load_route_system_prompt(route_config: dict) -> Optional[str]:
+    """Load one trusted, tracked Markdown prompt for a static route.
+
+    The file path comes only from startup configuration, never webhook data.
+    Relative paths are rooted at the Hermes checkout and confinement keeps the
+    prompt from becoming a generic host-file reader. A route may use this
+    system prompt or skill injection, but not both: one operational contract
+    must remain the editable source of truth.
+    """
+    configured = route_config.get("system_prompt_file")
+    if configured is None:
+        return None
+    if route_config.get("skills"):
+        raise ValueError("system_prompt_file and skills are mutually exclusive")
+    if not isinstance(configured, str) or not configured.strip():
+        raise ValueError("system_prompt_file must be a non-empty path")
+
+    raw_path = Path(configured.strip()).expanduser()
+    unresolved = raw_path if raw_path.is_absolute() else _HERMES_PROJECT_ROOT / raw_path
+    if unresolved.suffix.lower() != ".md" or unresolved.is_symlink():
+        raise ValueError("system_prompt_file must be a regular Markdown file")
+    try:
+        resolved = unresolved.resolve(strict=True)
+        resolved.relative_to(_HERMES_PROJECT_ROOT.resolve())
+        metadata = resolved.stat()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("system_prompt_file is unavailable or outside Hermes") from exc
+    if not resolved.is_file() or not 0 < metadata.st_size <= _MAX_ROUTE_SYSTEM_PROMPT_BYTES:
+        raise ValueError("system_prompt_file has an invalid size or type")
+    try:
+        content = resolved.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("system_prompt_file is not readable UTF-8") from exc
+    if not content:
+        raise ValueError("system_prompt_file is empty")
+    return content
 
 
 def _is_webhook_silence_response(content: Any) -> bool:
@@ -826,6 +869,19 @@ class WebhookAdapter(BasePlatformAdapter):
                 "route": route_name,
             })
 
+        try:
+            route_system_prompt = _load_route_system_prompt(route_config)
+        except ValueError as exc:
+            logger.error(
+                "[webhook] Route '%s' system prompt is invalid: %s",
+                route_name,
+                exc,
+            )
+            return web.json_response(
+                {"status": "unavailable", "error": "System prompt unavailable"},
+                status=503,
+            )
+
         if route_config.get("script"):
             # run_route_script shells out (subprocess.run, up to its timeout);
             # run it in a worker thread so it can't block the gateway event loop.
@@ -1048,6 +1104,7 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            channel_prompt=route_system_prompt,
         )
 
         if evidence is not None and not await self._mark_github_review_started(
@@ -1321,6 +1378,14 @@ class WebhookAdapter(BasePlatformAdapter):
         payload = recovered["payload"]
         event_type = recovered["event_type"]
         delivery_id = recovered["delivery_id"]
+        try:
+            route_system_prompt = _load_route_system_prompt(route_config)
+        except ValueError:
+            logger.exception(
+                "[webhook] Recovery system prompt failed for route '%s'",
+                route_name,
+            )
+            return False
         if not self._route_processor.route_filters_match(
             route_config, payload, event_type, {}
         ):
@@ -1452,6 +1517,7 @@ class WebhookAdapter(BasePlatformAdapter):
             source=source,
             raw_message=payload,
             message_id=delivery_id,
+            channel_prompt=route_system_prompt,
         )
         if evidence is not None:
             with evidence_scope(evidence):

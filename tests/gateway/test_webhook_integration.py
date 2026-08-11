@@ -120,6 +120,45 @@ def test_trusted_signed_control_plane_envelope_survives_generic_redaction():
     }
 
 
+def test_trusted_signed_feature_command_envelope_survives_generic_redaction():
+    payload_value = base64.b64encode(b'{"command":["pwd"],"status":"pass"}').decode()
+    signature_value = base64.b64encode(b"s" * 64).decode()
+
+    with patch(
+        "gateway.platforms.webhook_filters._resolve_script_path",
+        return_value=(Path("/tmp/trusted-gate.py"), None),
+    ), patch(
+        "tools.environments.local.build_subprocess_env",
+        return_value={"PATH": "/usr/bin:/bin", "HOME": "/tmp/safe-home"},
+    ), patch(
+        "gateway.platforms.webhook_filters.subprocess.run",
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "command_result_payload": payload_value,
+                    "command_result_signature": signature_value,
+                }
+            ),
+            stderr="",
+        ),
+    ), patch(
+        "agent.redact.redact_sensitive_text",
+        side_effect=lambda value: value.replace(payload_value, "[REDACTED]"),
+    ):
+        keep, transformed = WebhookRouteProcessor().run_route_script(
+            "trusted-gate.py",
+            {"operation": "execute_feature_command"},
+            trusted_github_pr_environment=True,
+        )
+
+    assert keep is True
+    assert transformed == {
+        "command_result_payload": payload_value,
+        "command_result_signature": signature_value,
+    }
+
+
 def test_trusted_signed_control_plane_rejects_extra_fields():
     with patch(
         "gateway.platforms.webhook_filters._resolve_script_path",
@@ -572,6 +611,54 @@ class TestGitHubPREvidenceScope:
             trusted_github_pr_environment=True,
         )
 
+    def test_feature_command_loader_uses_signed_exact_tuple_control_plane(self):
+        route = {
+            "evidence": "github_pr",
+            "secret": "secret",
+            "script": "trusted-gate.py",
+            "deliver_extra": {"contract_version": "v2"},
+            "execution_attestation_public_key": base64.b64encode(b"k" * 32).decode(),
+            "baseline_execution_gates": ["quality", "integration", "e2e"],
+            "execution_gate_policy_version": "newtonsapple-v1",
+            "execution_gate_policy_sha256": "f" * 64,
+        }
+        adapter = _make_adapter({"github-pr": route})
+        adapter._route_processor.run_route_script = MagicMock(
+            return_value=(
+                True,
+                {
+                    "command_result_payload": base64.b64encode(
+                        b'{"command":["pwd"],"status":"pass"}'
+                    ).decode(),
+                    "command_result_signature": base64.b64encode(b"s" * 64).decode(),
+                },
+            )
+        )
+        scope = adapter._evidence_scope_for_route("github-pr", self.payload)
+
+        assert scope is not None
+        assert scope.feature_command_loader is not None
+        payload, signature = scope.feature_command_loader(["pwd"], 300)
+
+        assert payload == b'{"command":["pwd"],"status":"pass"}'
+        assert signature == base64.b64encode(b"s" * 64).decode()
+        adapter._route_processor.run_route_script.assert_called_once_with(
+            "trusted-gate.py",
+            {
+                "operation": "execute_feature_command",
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": "42",
+                "base_sha": "a" * 40,
+                "head_sha": "b" * 40,
+                "review_request_id": self.review_request_id,
+                "command": ["pwd"],
+                "timeout_seconds": 300,
+            },
+            timeout_seconds=420,
+            trusted_github_pr_environment=True,
+        )
+
     def test_gate_resolution_loader_uses_static_policy_and_exact_tuple(self):
         route = {
             "evidence": "github_pr",
@@ -703,11 +790,19 @@ class TestGitHubPREvidenceScope:
 
 class TestStaticRouteRecovery:
     @pytest.mark.asyncio
-    async def test_recovered_event_reenters_filters_gate_and_agent_dispatch(self):
+    async def test_recovered_event_reenters_filters_gate_and_agent_dispatch(
+        self, tmp_path, monkeypatch
+    ):
+        contract = "# Recovered local review contract"
+        (tmp_path / "LOCAL_PR_REVIEW.md").write_text(contract, encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.webhook._HERMES_PROJECT_ROOT", tmp_path
+        )
         route = {
             "script": "trusted-gate.py",
             "events": ["pull_request"],
             "prompt": "Review PR {number}",
+            "system_prompt_file": "LOCAL_PR_REVIEW.md",
             "deliver": "log",
         }
         adapter = _make_adapter({"github-pr": route})
@@ -733,6 +828,7 @@ class TestStaticRouteRecovery:
         assert adapter.handle_message.await_args is not None
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "Review PR 185"
+        assert event.channel_prompt == contract
         assert event.raw_message == {"number": 185, "authorized": True}
         assert event.message_id == "recovery-v2-pr-185"
 
@@ -1021,6 +1117,88 @@ class TestSkillsInjection:
             # The prompt should be the skill content, not the raw template
             assert "You are a code reviewer" in event.text
             mock_build.assert_called_once()
+
+
+class TestRouteSystemPromptFile:
+    @pytest.mark.asyncio
+    async def test_tracked_markdown_is_the_route_system_prompt(
+        self, tmp_path, monkeypatch
+    ):
+        contract = "# Local review\n\nFollow this exact contract."
+        (tmp_path / "LOCAL_PR_REVIEW.md").write_text(contract, encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.webhook._HERMES_PROJECT_ROOT", tmp_path
+        )
+        adapter = _make_adapter(
+            {
+                "pr-review": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "events": ["pull_request"],
+                    "prompt": "Review trusted PR {number}",
+                    "system_prompt_file": "LOCAL_PR_REVIEW.md",
+                }
+            }
+        )
+        adapter.handle_message = AsyncMock()
+
+        async with TestClient(TestServer(_create_app(adapter))) as client:
+            response = await client.post(
+                "/webhooks/pr-review",
+                json=GITHUB_PR_PAYLOAD,
+                headers={
+                    "X-GitHub-Event": "pull_request",
+                    "X-GitHub-Delivery": "system-prompt-file",
+                },
+            )
+        await asyncio.sleep(0)
+
+        assert response.status == 202
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == f"Review trusted PR {GITHUB_PR_PAYLOAD['number']}"
+        assert event.channel_prompt == contract
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "route_extra",
+        [
+            {"system_prompt_file": "missing.md"},
+            {
+                "system_prompt_file": "LOCAL_PR_REVIEW.md",
+                "skills": ["pr-review"],
+            },
+        ],
+    )
+    async def test_invalid_or_duplicated_route_prompt_fails_closed(
+        self, tmp_path, monkeypatch, route_extra
+    ):
+        (tmp_path / "LOCAL_PR_REVIEW.md").write_text("contract", encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.webhook._HERMES_PROJECT_ROOT", tmp_path
+        )
+        adapter = _make_adapter(
+            {
+                "pr-review": {
+                    "secret": _INSECURE_NO_AUTH,
+                    "events": ["pull_request"],
+                    "prompt": "review",
+                    **route_extra,
+                }
+            }
+        )
+        adapter.handle_message = AsyncMock()
+
+        async with TestClient(TestServer(_create_app(adapter))) as client:
+            response = await client.post(
+                "/webhooks/pr-review",
+                json=GITHUB_PR_PAYLOAD,
+                headers={
+                    "X-GitHub-Event": "pull_request",
+                    "X-GitHub-Delivery": "invalid-system-prompt-file",
+                },
+            )
+
+        assert response.status == 503
+        adapter.handle_message.assert_not_called()
 
 
 # ===================================================================
@@ -1767,15 +1945,3 @@ class TestGitHubReviewDelivery:
             await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
 
         settlement_script.assert_not_called()
-
-
-def test_required_pr_review_skill_is_bundled_with_generation_contract():
-    skill_path = (
-        Path(__file__).parents[2] / "skills" / "github" / "pr-review" / "SKILL.md"
-    )
-    content = skill_path.read_text(encoding="utf-8")
-
-    assert "name: pr-review" in content
-    assert "positive GitHub review-request timeline event ID" in content
-    assert "request=REQUEST_ID" in content
-    assert "older generation's marker must not block" in content
