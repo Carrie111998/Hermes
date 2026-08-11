@@ -4427,6 +4427,10 @@ class APIServerAdapter(BasePlatformAdapter):
             await response.write(_sse_frame(role_chunk))
             last_activity = time.monotonic()
 
+            # Track tool-call indices so repeated chunks for the same tool
+            # call keep a stable ``index`` (OpenAI stream contract).
+            _tool_call_indices: dict[str, int] = {}
+
             # Helper — route a queue item to the correct SSE event.
             async def _emit(item):
                 """Write a single queue item to the SSE stream.
@@ -4437,9 +4441,42 @@ class APIServerAdapter(BasePlatformAdapter):
                 frontends can display them without storing the markers in
                 conversation history.  See #6972 for the original event,
                 #16588 for the ``toolCallId``/``status`` lifecycle fields.
+
+                Additionally (local patch, branch local-owui): each tool
+                progress event also emits a standard OpenAI
+                ``chat.completion.chunk`` carrying ``delta.tool_calls``
+                so strict OpenAI clients (e.g. Open WebUI) can render the
+                tool step.  Additive only — the custom event above is kept
+                for #6972 frontends.  ``finish_reason`` stays None because
+                the agent runs tools server-side; a ``tool_calls`` finish
+                would make the client try to answer with tool results.
                 """
                 if isinstance(item, tuple) and len(item) == 2 and item[0] == "__tool_progress__":
                     await response.write(_sse_frame(item[1], event="hermes.tool.progress"))
+                    payload = item[1]
+                    tool_call_id = payload.get("toolCallId")
+                    if tool_call_id:
+                        idx = _tool_call_indices.get(tool_call_id)
+                        if idx is None:
+                            idx = len(_tool_call_indices)
+                            _tool_call_indices[tool_call_id] = idx
+                        tool_calls_delta = {
+                            "index": idx, "id": tool_call_id, "type": "function",
+                        }
+                        if payload.get("status") == "running":
+                            tool_calls_delta["function"] = {
+                                "name": payload.get("tool", ""), "arguments": "",
+                            }
+                        else:  # completed
+                            tool_calls_delta["function"] = {"arguments": ""}
+                        tool_chunk = {
+                            "id": completion_id, "object": "chat.completion.chunk",
+                            "created": created, "model": model,
+                            "choices": [{"index": 0,
+                                         "delta": {"tool_calls": [tool_calls_delta]},
+                                         "finish_reason": None}],
+                        }
+                        await response.write(_sse_frame(tool_chunk))
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
