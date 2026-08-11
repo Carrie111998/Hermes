@@ -628,7 +628,7 @@ def summarize_background_review_actions(
         if is_skill:
             label = "Skill"
         elif target:
-            label = "Memory" if target == "memory" else "User profile" if target == "user" else target
+            label = "Memory" if target in ("memory", "user") else target
         else:
             continue
 
