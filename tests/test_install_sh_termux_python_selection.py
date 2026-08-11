@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -19,11 +20,11 @@ def _fake_python(path: Path, version: str, supported: bool, probe_log: Path) -> 
         path,
         f"""case "${{1:-}}" in
   -c)
-    echo "$(basename "$0") -c" >> {probe_log!s}
+    echo "{path.name} -c" >> {probe_log!s}
     exit {0 if supported else 1}
     ;;
   --version)
-    echo "$(basename "$0") --version" >> {probe_log!s}
+    echo "{path.name} --version" >> {probe_log!s}
     echo "Python {version}"
     exit 0
     ;;
@@ -51,6 +52,14 @@ def _run_termux_prerequisites(
         bin_dir / "pkg",
         f'echo "$*" >> {pkg_log!s}\nexit 0',
     )
+    # Keep PATH hermetic so a host-installed python3.11/3.12/3.13 cannot
+    # preempt the simulated Termux candidates. Link only non-Python utilities
+    # exercised by the public prerequisites stage.
+    for tool in ("awk", "head", "mktemp", "rm", "sed", "tr"):
+        target = shutil.which(tool)
+        assert target is not None
+        (bin_dir / tool).symlink_to(target)
+
     _write_executable(bin_dir / "uname", 'echo "Linux"')
     _write_executable(bin_dir / "git", 'echo "git version 2.50.0"')
     _write_executable(bin_dir / "node", 'echo "v22.22.0"')
@@ -67,7 +76,7 @@ def _run_termux_prerequisites(
     env.update({
         "HOME": str(home),
         "HERMES_HOME": str(home / ".hermes"),
-        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "PATH": str(bin_dir),
         "PREFIX": str(prefix),
         "TERMUX_VERSION": "0.118.2",
     })
