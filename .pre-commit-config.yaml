@@ -11,3 +11,25 @@ repos:
       - id: gitleaks
         args:
           - --config=C:/Users/diego/.config/gitleaks/gitleaks.toml
+
+  # EventType / sibling-lookup-table drift guard.
+  #
+  # Adding a member to events/schema.py EventType requires a paired entry in
+  # every table contracted to be total over the enum (EVENT_TYPE_EMOJI,
+  # routing_policy._POLICY). That pairing has broken four times on record
+  # (2026-04-27 x2, 2026-05-29, 2026-08-11) and ruff structurally cannot catch
+  # it -- the keys are attribute accesses, which F601/F602 do not reach.
+  #
+  # This runs at ADD time, which the coverage tests do not: they only fail on a
+  # later `pytest tests/events/` that nobody ran at the four recurrences. It is
+  # a read-only import + dict comparison, no I/O, well under a second warm.
+  # See events/coverage.py for what it checks and why an import-time assertion
+  # in the gateway would be the wrong trade.
+  - repo: local
+    hooks:
+      - id: event-type-coverage
+        name: EventType lookup-table coverage
+        entry: python -m events.coverage
+        language: system
+        pass_filenames: false
+        files: ^events/.*\.py$

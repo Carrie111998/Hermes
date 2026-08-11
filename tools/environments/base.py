@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import IO, Callable, Protocol
 
 from hermes_constants import get_hermes_home
-from hermes_cli._subprocess_compat import windows_hide_flags
+from hermes_cli._subprocess_compat import (
+    windows_hide_flags,
+    windows_pipe_readable_bytes,
+)
 from tools.interrupt import is_interrupted
 
 logger = logging.getLogger(__name__)
@@ -785,16 +788,49 @@ class BaseEnvironment(ABC):
             if not isinstance(fd, int) or fd < 0:
                 _drain_iterable(stream)
                 return
-            # select.select does NOT work on pipe fds on Windows (only sockets).
-            # Use blocking os.read in a daemon thread instead — safe because
-            # EOF arrives promptly when bash exits.
+            # select.select does NOT work on pipe fds on Windows (only sockets),
+            # so poll PeekNamedPipe instead — os.read is only ever called when
+            # bytes are already buffered, so it never blocks.
+            #
+            # The previous blocking ``os.read`` here assumed "EOF arrives
+            # promptly when bash exits".  That is false for exactly the #8340
+            # scenario this drain exists for: a backgrounded grandchild
+            # inherits the pipe write-end, so no EOF arrives until *it* dies.
+            # The damage wasn't confined to the drain thread — the blocked
+            # ``ReadFile`` also made the ``proc.stdout.close()`` below block
+            # (Windows waits for a pending read on the handle), so
+            # ``_wait_for_process`` returned only after the grandchild exited
+            # and the caller's ``timeout`` was never enforced.  Measured on
+            # Windows before this fix: ``execute(bg_child, timeout=15)``
+            # returned in 20.2s / 40.6s / 68.9s for a child sleeping
+            # 10s / 30s / 60s — elapsed tracked the child, not the timeout.
             if os.name == "nt":
+                idle_after_exit = 0
                 try:
                     while True:
-                        chunk = os.read(fd, 4096)
-                        if not chunk:
-                            break
-                        output.append(decoder.decode(chunk))
+                        avail = windows_pipe_readable_bytes(fd)
+                        if avail is None:
+                            break  # broken pipe / fd gone — the EOF equivalent
+                        if avail:
+                            try:
+                                chunk = os.read(fd, min(avail, 4096))
+                            except (ValueError, OSError):
+                                break
+                            if not chunk:
+                                break  # true EOF — all writers closed
+                            output.append(decoder.decode(chunk))
+                            idle_after_exit = 0
+                            continue
+                        if proc.poll() is not None:
+                            # bash is gone and the pipe was idle for ~100ms.
+                            # Give it two more cycles to catch any buffered
+                            # tail, then stop — otherwise we wait forever on
+                            # a grandchild's copy of the pipe.  Mirrors the
+                            # POSIX branch's idle-after-exit grace exactly.
+                            idle_after_exit += 1
+                            if idle_after_exit >= 3:
+                                break
+                        time.sleep(0.1)
                 except (ValueError, OSError):
                     pass
                 finally:
