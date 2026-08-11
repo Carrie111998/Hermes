@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -36,32 +35,24 @@ def _write_secret(path, value: str):
 
 def _source(tmp_path, *, app_slug="google_sheets", profile_key="profile-a"):
     broker = tmp_path / "broker"
-    grants = tmp_path / "grants.json"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(
-        grants,
-        json.dumps(
-            {
-                "google_sheets": "grant_google_sheets_123456",
-                "google_drive": "grant_google_drive_12345678",
-            }
-        ),
-    )
     values = {
         "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
             "https://example.supabase.co/functions/v1/desktop-runtime-session"
         ),
         "PIPEDREAM_AGENT_BROKER_SECRET_FILE": str(broker),
-        "PIPEDREAM_PROVIDER_GRANT_FILE": str(grants),
     }
     source = EvaosLeaseSource(
         profile_key=profile_key,
+        customer_id="customer-fixture",
+        agent_runtime="hermes",
+        agent_id="agent-fixture",
         app_slug=app_slug,
         secret_reader=values.get,
         profile_resolver=lambda: profile_key,
         root_uid=os.getuid(),
     )
-    return source, broker, grants
+    return source, broker
 
 
 def _lease_payload(expires_at: datetime, token="lease-token-1"):
@@ -73,7 +64,7 @@ def _lease_payload(expires_at: datetime, token="lease-token-1"):
             "x-pd-environment": "production",
             "x-pd-external-user-id": "server-derived",
             "x-pd-app-slug": "google_sheets",
-            "x-pd-account-id": "server-resolved",
+            "x-pd-account-id": "apn_server_resolved",
         },
         "expires_at": expires_at.isoformat(),
     }
@@ -86,6 +77,9 @@ def test_source_defaults_service_uid_to_root_uid_without_geteuid(
 
     source = EvaosLeaseSource(
         profile_key="profile-a",
+        customer_id="customer-fixture",
+        agent_runtime="hermes",
+        agent_id="agent-fixture",
         app_slug="google_sheets",
         secret_reader=lambda _name: None,
         profile_resolver=lambda: "profile-a",
@@ -96,10 +90,15 @@ def test_source_defaults_service_uid_to_root_uid_without_geteuid(
 
 
 @pytest.mark.asyncio
-async def test_lease_request_body_contains_only_action_and_app_slug(tmp_path):
+async def test_lease_request_uses_only_root_configured_profile_route(tmp_path):
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     calls = []
+    settings_read = []
+    original_reader = source._secret_reader
+    source._secret_reader = lambda name: (
+        settings_read.append(name) or original_reader(name)
+    )
 
     async def transport(url, headers, payload):
         calls.append((url, headers, payload))
@@ -115,25 +114,27 @@ async def test_lease_request_body_contains_only_action_and_app_slug(tmp_path):
     assert lease.mcp_url == "https://remote.mcp.pipedream.net/v3"
     assert calls[0][2] == {
         "action": "pipedream_mcp_lease",
+        "customer_id": "customer-fixture",
+        "agent_runtime": "hermes",
+        "agent_id": "agent-fixture",
         "app_slug": "google_sheets",
     }
-    assert calls[0][1]["X-Evaos-Provider-Grant"] == (
-        "grant_google_sheets_123456"
-    )
+    assert "X-Evaos-Provider-Grant" not in calls[0][1]
+    assert "PIPEDREAM_PROVIDER_GRANT_FILE" not in settings_read
     assert not {
-        "customer_id",
         "account_id",
         "profile",
         "profile_id",
         "external_user_id",
-        "agent_id",
+        "project_id",
+        "environment",
     } & calls[0][2].keys()
 
 
 @pytest.mark.asyncio
 async def test_expiry_refreshes_before_skew(tmp_path):
     clock = [datetime(2026, 8, 8, tzinfo=timezone.utc)]
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     calls = 0
 
     async def transport(url, headers, payload):
@@ -164,7 +165,7 @@ async def test_expiry_refreshes_before_skew(tmp_path):
 @pytest.mark.asyncio
 async def test_concurrent_refresh_is_single_flight(tmp_path):
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     entered = asyncio.Event()
     release = asyncio.Event()
     calls = 0
@@ -193,14 +194,13 @@ async def test_concurrent_refresh_is_single_flight(tmp_path):
 @pytest.mark.asyncio
 async def test_http_auth_refreshes_and_retries_exactly_once_after_401(tmp_path):
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)
-    source, _, grants = _source(tmp_path)
+    source, _ = _source(tmp_path)
     calls = 0
-    grants_seen = []
 
     async def transport(url, headers, payload):
         nonlocal calls
         calls += 1
-        grants_seen.append(headers["X-Evaos-Provider-Grant"])
+        assert "X-Evaos-Provider-Grant" not in headers
         return _Response(
             200,
             _lease_payload(
@@ -224,30 +224,22 @@ async def test_http_auth_refreshes_and_retries_exactly_once_after_401(tmp_path):
 
     first = await anext(flow)
     assert first.headers["Authorization"] == "Bearer lease-token-1"
-    _write_secret(
-        grants,
-        json.dumps({"google_sheets": "grant_rotated_1234567890"}),
-    )
     second = await flow.asend(httpx.Response(401, request=first))
     assert second.headers["Authorization"] == "Bearer lease-token-2"
     assert calls == 2
     with pytest.raises(StopAsyncIteration):
         await flow.asend(httpx.Response(401, request=second))
     assert calls == 2
-    assert grants_seen == [
-        "grant_google_sheets_123456",
-        "grant_rotated_1234567890",
-    ]
 
 
 def test_source_rejects_cross_profile_and_unsafe_files(tmp_path):
-    source, _, grants = _source(tmp_path)
+    source, broker = _source(tmp_path)
     source._profile_resolver = lambda: "profile-b"
     with pytest.raises(EvaosLeaseError, match="profile authority"):
         source.read()
 
     source._profile_resolver = lambda: "profile-a"
-    grants.chmod(0o644)
+    broker.chmod(0o644)
     with pytest.raises(EvaosLeaseError, match="secure managed credential"):
         source.read()
 
@@ -261,24 +253,20 @@ def test_source_accepts_systemd_loadcredential_copy(
     credentials = tmp_path / "credentials"
     credentials.mkdir(mode=0o700)
     broker = credentials / "pipedream_broker"
-    grants = credentials / "pipedream_provider_grants"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(
-        grants,
-        json.dumps({"google_sheets": "grant_google_sheets_123456"}),
-    )
     broker.chmod(mode)
-    grants.chmod(mode)
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
     values = {
         "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
             "https://example.supabase.co/functions/v1/desktop-runtime-session"
         ),
         "PIPEDREAM_AGENT_BROKER_SECRET_FILE": str(broker),
-        "PIPEDREAM_PROVIDER_GRANT_FILE": str(grants),
     }
     source = EvaosLeaseSource(
         profile_key="profile-a",
+        customer_id="customer-fixture",
+        agent_runtime="hermes",
+        agent_id="agent-fixture",
         app_slug="google_sheets",
         secret_reader=values.get,
         profile_resolver=lambda: "profile-a",
@@ -298,26 +286,20 @@ def test_source_accepts_service_owned_0400_systemd_copy(
     credentials = tmp_path / "credentials"
     credentials.mkdir(mode=0o700)
     broker = credentials / "pipedream_broker"
-    grants = credentials / "pipedream_provider_grants"
     _write_secret(broker, "broker-secret-under-test\n")
-    _write_secret(
-        grants,
-        json.dumps({"google_sheets": "grant_google_sheets_123456"}),
-    )
     broker.chmod(0o400)
-    grants.chmod(0o400)
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(credentials))
     values = {
         "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
             "https://example.supabase.co/functions/v1/desktop-runtime-session"
         ),
         "PIPEDREAM_AGENT_BROKER_SECRET_FILE": "%d/pipedream_broker",
-        "PIPEDREAM_PROVIDER_GRANT_FILE": (
-            "%d/pipedream_provider_grants"
-        ),
     }
     source = EvaosLeaseSource(
         profile_key="profile-a",
+        customer_id="customer-fixture",
+        agent_runtime="hermes",
+        agent_id="agent-fixture",
         app_slug="google_sheets",
         secret_reader=values.get,
         profile_resolver=lambda: "profile-a",
@@ -331,21 +313,20 @@ def test_source_accepts_service_owned_0400_systemd_copy(
 
 
 def test_source_rejects_0400_outside_systemd_credential_directory(tmp_path):
-    source, broker, grants = _source(tmp_path)
+    source, broker = _source(tmp_path)
     broker.chmod(0o400)
-    grants.chmod(0o400)
 
     with pytest.raises(EvaosLeaseError, match="secure managed credential"):
         source.read()
 
 
 def test_source_rejects_unsafe_systemd_credential_pointer(tmp_path, monkeypatch):
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     monkeypatch.setenv("CREDENTIALS_DIRECTORY", str(tmp_path))
     original_reader = source._secret_reader
     source._secret_reader = lambda name: (
-        "%d/../provider-grants"
-        if name == "PIPEDREAM_PROVIDER_GRANT_FILE"
+        "%d/../broker-secret"
+        if name == "PIPEDREAM_AGENT_BROKER_SECRET_FILE"
         else original_reader(name)
     )
 
@@ -354,7 +335,7 @@ def test_source_rejects_unsafe_systemd_credential_pointer(tmp_path, monkeypatch)
 
 
 def test_source_rejects_symlinked_secret_file(tmp_path):
-    source, broker, _ = _source(tmp_path)
+    source, broker = _source(tmp_path)
     target = tmp_path / "broker-target"
     broker.rename(target)
     broker.symlink_to(target)
@@ -363,9 +344,7 @@ def test_source_rejects_symlinked_secret_file(tmp_path):
         source.read()
 
 
-def test_runtime_endpoint_and_broker_path_are_global_but_grant_path_is_scoped(
-    monkeypatch,
-):
+def test_runtime_endpoint_and_broker_path_stay_global(monkeypatch):
     from agent import secret_scope
 
     monkeypatch.setenv(
@@ -377,16 +356,11 @@ def test_runtime_endpoint_and_broker_path_are_global_but_grant_path_is_scoped(
         "/global/broker",
     )
     monkeypatch.setenv(
-        "PIPEDREAM_PROVIDER_GRANT_FILE",
-        "/wrong-cross-profile-grants",
-    )
-    monkeypatch.setenv(
         "CREDENTIALS_DIRECTORY",
         "/run/credentials/evaos-shared-gateway.service",
     )
     token = secret_scope.set_secret_scope(
         {
-            "PIPEDREAM_PROVIDER_GRANT_FILE": "/profile/grants",
             "CREDENTIALS_DIRECTORY": "/wrong/profile/credentials",
         }
     )
@@ -398,9 +372,6 @@ def test_runtime_endpoint_and_broker_path_are_global_but_grant_path_is_scoped(
         assert secret_scope.get_secret(
             "PIPEDREAM_AGENT_BROKER_SECRET_FILE"
         ) == "/global/broker"
-        assert secret_scope.get_secret(
-            "PIPEDREAM_PROVIDER_GRANT_FILE"
-        ) == "/profile/grants"
         assert secret_scope.get_secret("CREDENTIALS_DIRECTORY") == (
             "/run/credentials/evaos-shared-gateway.service"
         )
@@ -410,7 +381,7 @@ def test_runtime_endpoint_and_broker_path_are_global_but_grant_path_is_scoped(
 
 
 def test_source_rejects_non_supabase_lease_endpoint(tmp_path):
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     original_reader = source._secret_reader
     source._secret_reader = lambda name: (
         "https://attacker.example/functions/v1/desktop-runtime-session"
@@ -422,29 +393,10 @@ def test_source_rejects_non_supabase_lease_endpoint(tmp_path):
         source.read()
 
 
-@pytest.mark.parametrize(
-    "raw",
-    [
-        '{"google_sheets":"grant_1234567890123456","google_sheets":"other_1234567890123456"}',
-        '{"google_sheets":{"grant":"nested"}}',
-        '{"Google Sheets":"grant_1234567890123456"}',
-        '{"google_sheets":"short"}',
-    ],
-)
-def test_grant_map_rejects_duplicates_nested_values_and_unsafe_entries(
-    tmp_path,
-    raw,
-):
-    source, _, grants = _source(tmp_path)
-    _write_secret(grants, raw)
-    with pytest.raises(EvaosLeaseError, match="provider grant"):
-        source.read()
-
-
 @pytest.mark.asyncio
 async def test_errors_and_repr_never_expose_tokens(tmp_path, caplog):
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     secret = "server-body-secret-that-must-not-escape"
 
     async def transport(url, headers, payload):
@@ -461,7 +413,6 @@ async def test_errors_and_repr_never_expose_tokens(tmp_path, caplog):
     rendered = str(caught.value) + caplog.text + repr(manager)
     assert secret not in rendered
     assert "broker-secret-under-test" not in rendered
-    assert "grant_google_sheets_123456" not in rendered
 
 
 @pytest.mark.asyncio
@@ -478,6 +429,9 @@ async def test_errors_and_repr_never_expose_tokens(tmp_path, caplog):
             {"x-pd-app-slug": "google_drive"}
         ),
         lambda payload, now: payload["headers"].update(
+            {"x-pd-account-id": "legacy_account"}
+        ),
+        lambda payload, now: payload["headers"].update(
             {"Authorization": "Bearer injected\r\nX-Leak: value"}
         ),
         lambda payload, now: payload.update(
@@ -488,7 +442,7 @@ async def test_errors_and_repr_never_expose_tokens(tmp_path, caplog):
 )
 async def test_lease_response_is_strictly_validated(tmp_path, mutate):
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)
-    source, _, _ = _source(tmp_path)
+    source, _ = _source(tmp_path)
     payload = _lease_payload(now + timedelta(minutes=10))
     mutate(payload, now)
 
@@ -509,6 +463,9 @@ def test_managed_lease_config_is_http_without_a_static_url():
     task = MCPServerTask("pipedream-google-sheets")
     task._config = {
         "auth": "evaos_lease",
+        "customer_id": "customer-fixture",
+        "agent_runtime": "hermes",
+        "agent_id": "agent-fixture",
         "app_slug": "google_sheets",
         "lazy": True,
     }
@@ -528,6 +485,9 @@ def test_managed_lease_config_is_http_without_a_static_url():
         {"transport": "sse"},
         {"ssl_verify": False},
         {"app_slug": "Google Sheets"},
+        {"customer_id": ""},
+        {"agent_runtime": "openclaw"},
+        {"agent_id": "agent with spaces"},
     ],
 )
 def test_managed_lease_config_rejects_connection_and_auth_overrides(override):
@@ -535,6 +495,9 @@ def test_managed_lease_config_rejects_connection_and_auth_overrides(override):
     task._auth_type = "evaos_lease"
     config = {
         "auth": "evaos_lease",
+        "customer_id": "customer-fixture",
+        "agent_runtime": "hermes",
+        "agent_id": "agent-fixture",
         "app_slug": "google_sheets",
         **override,
     }
@@ -545,10 +508,22 @@ def test_managed_lease_config_rejects_connection_and_auth_overrides(override):
 
 def test_schema_cache_fingerprint_includes_managed_app_identity():
     sheets = config_fingerprint(
-        {"auth": "evaos_lease", "app_slug": "google_sheets"}
+        {
+            "auth": "evaos_lease",
+            "customer_id": "customer-fixture",
+            "agent_runtime": "hermes",
+            "agent_id": "agent-fixture",
+            "app_slug": "google_sheets",
+        }
     )
     drive = config_fingerprint(
-        {"auth": "evaos_lease", "app_slug": "google_drive"}
+        {
+            "auth": "evaos_lease",
+            "customer_id": "customer-fixture",
+            "agent_runtime": "hermes",
+            "agent_id": "agent-fixture",
+            "app_slug": "google_drive",
+        }
     )
     static = config_fingerprint(
         {

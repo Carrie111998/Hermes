@@ -44,6 +44,9 @@ Example config::
                               # MCP over POST. Default: false.
       pipedream_google_sheets:
         auth: evaos_lease     # managed in-memory evaOS lease; no static URL
+        customer_id: customer-fixture
+        agent_runtime: hermes
+        agent_id: profile-agent
         app_slug: google_sheets
       searxng:
         url: "http://localhost:8000/sse"
@@ -1931,8 +1934,8 @@ class MCPServerTask:
         self._was_parked: bool = False
         self._auth_type: str = ""
         # Managed Pipedream credentials remain in this in-memory lease manager
-        # across transport reconnects.  Neither the broker secret nor provider
-        # grant is retained here; the source rereads them only for a mint.
+        # across transport reconnects. The broker secret is never retained
+        # here; the source rereads it only for a mint.
         self._evaos_lease_manager: Optional[Any] = None
         self._evaos_lease_auth: Optional[Any] = None
         self._refresh_lock = asyncio.Lock()
@@ -1995,9 +1998,33 @@ class MCPServerTask:
             from tools.evaos_mcp_lease import EvaosLeaseError
 
             raise EvaosLeaseError(
-                "managed MCP config may specify only app identity and "
-                "non-credential runtime options"
+                "managed MCP config may specify only root-configured "
+                "customer, agent, and app identity plus non-credential "
+                "runtime options"
             )
+        customer_id = config.get("customer_id")
+        if (
+            not isinstance(customer_id, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", customer_id
+            )
+            is None
+        ):
+            from tools.evaos_mcp_lease import EvaosLeaseError
+
+            raise EvaosLeaseError("managed MCP customer identity is invalid")
+        if config.get("agent_runtime") != "hermes":
+            from tools.evaos_mcp_lease import EvaosLeaseError
+
+            raise EvaosLeaseError("managed MCP agent runtime is invalid")
+        agent_id = config.get("agent_id")
+        if (
+            not isinstance(agent_id, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{1,120}", agent_id) is None
+        ):
+            from tools.evaos_mcp_lease import EvaosLeaseError
+
+            raise EvaosLeaseError("managed MCP agent identity is invalid")
         app_slug = config.get("app_slug")
         if (
             not isinstance(app_slug, str)
@@ -2859,6 +2886,9 @@ class MCPServerTask:
             if self._evaos_lease_manager is None:
                 source = EvaosLeaseSource(
                     profile_key=self.registration_home,
+                    customer_id=config["customer_id"],
+                    agent_runtime=config["agent_runtime"],
+                    agent_id=config["agent_id"],
                     app_slug=config["app_slug"],
                 )
                 self._evaos_lease_manager = EvaosLeaseManager(source=source)
@@ -4208,7 +4238,7 @@ def _handle_auth_error_and_retry(
     if not _is_auth_error(exc):
         return None
 
-    # EvaOS lease auth already refreshed the per-app grant and replayed the
+    # EvaOS lease auth already refreshed the profile-scoped token and replayed the
     # HTTP request once inside EvaosLeaseHttpAuth.  A second 401 is terminal
     # for this tool call; routing it through OAuth recovery would add another
     # credential control and violate the exactly-once retry contract.
@@ -4222,7 +4252,7 @@ def _handle_auth_error_and_retry(
         return tool_error(
             f"MCP server '{server_name}' rejected managed authorization "
             "after one lease refresh. Do NOT retry this tool; the managed "
-            "provider grant or profile authority must be repaired.",
+            "profile binding or connected account must be repaired.",
             needs_reauth=True,
             server=server_name,
         )
