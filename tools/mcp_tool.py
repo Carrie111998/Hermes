@@ -3827,17 +3827,15 @@ def _mcp_tool_approval_check(
     registration_home: Optional[str] = None,
 ) -> Optional[str]:
     """Run one MCP approval check in the owning profile's config scope."""
-    approval_home = (
-        state_key[0]
-        if isinstance(state_key, tuple)
-        else registration_home
+    approval_home = _mcp_approval_home(
+        server_name,
+        state_key=state_key,
+        registration_home=registration_home,
     )
     if approval_home is None:
-        return _mcp_tool_approval_check_scoped(
-            server_name,
-            tool_name,
-            args,
-            state_key,
+        return tool_error(
+            f"MCP tool '{tool_name}' was blocked because its profile approval "
+            "scope could not be resolved"
         )
 
     from hermes_constants import (
@@ -3855,6 +3853,46 @@ def _mcp_tool_approval_check(
         )
     finally:
         reset_hermes_home_override(token)
+
+
+def _mcp_approval_home(
+    server_name: str,
+    *,
+    state_key: Optional[_ServerStateKey],
+    registration_home: Optional[str],
+) -> Optional[str]:
+    """Resolve one MCP server's owning home without using process-global policy."""
+    if isinstance(state_key, tuple):
+        return state_key[0]
+    if registration_home:
+        return str(Path(registration_home).expanduser().resolve())
+
+    lookup_key = state_key if state_key is not None else _server_state_key(server_name)
+    with _lock:
+        server = _servers.get(lookup_key)
+        server_home = getattr(server, "registration_home", None)
+        if server_home:
+            return str(Path(server_home).expanduser().resolve())
+
+        profile_homes = {
+            key[0]
+            for owner_map in (
+                _servers,
+                _lazy_server_configs,
+                _tool_read_only_hints,
+            )
+            for key in owner_map
+            if isinstance(key, tuple) and key[1] == server_name
+        }
+    if len(profile_homes) == 1:
+        return next(iter(profile_homes))
+
+    from agent.secret_scope import is_multiplex_active
+    if is_multiplex_active():
+        return None
+
+    from hermes_constants import get_hermes_home
+    return str(Path(get_hermes_home()).expanduser().resolve())
 
 
 def _mcp_tool_approval_check_scoped(
