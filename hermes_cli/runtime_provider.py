@@ -123,6 +123,18 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
     - Kimi Code's ``api.kimi.com/coding`` endpoint also speaks the
       Anthropic Messages protocol (the /coding route accepts Claude
       Code's native request shape).
+    - MiniMax (international + China) exposes an OpenAI-compatible
+      ``/v1`` endpoint alongside its Anthropic-Messages ``/anthropic``
+      endpoint. The MiniMax overlay defaults to ``anthropic_messages``,
+      so without this carve-out a user pointing ``MINIMAX_CN_BASE_URL``
+      (or ``model.base_url``) at the OpenAI-compatible ``/v1`` route
+      would land on the wrong wire because the URL detection has no
+      opinion and the overlay wins. The ``/v1`` path on the two known
+      MiniMax hosts is documented as the OpenAI-compat surface — see
+      the ``MiniMaxProfile`` reasoning-controls hook in
+      ``plugins/model-providers/minimax/__init__.py``, which is only
+      wired up for that route. Mirrors the matching rule in
+      ``providers.host_mandated_api_mode``.
     """
     normalized = (base_url or "").strip().lower().rstrip("/")
     hostname = base_url_hostname(base_url)
@@ -147,6 +159,16 @@ def _detect_api_mode_for_url(base_url: str) -> Optional[str]:
         return "anthropic_messages"
     if hostname == "api.kimi.com" and "/coding" in normalized:
         return "anthropic_messages"
+    # MiniMax OpenAI-compatible endpoint (sibling of the matching rule in
+    # providers.host_mandated_api_mode — kept in lockstep so URL detection
+    # and the overlay-precedence path agree on the wire for this host).
+    # Hostname match is exact (no bare substring) so lookalike subdomains
+    # (api.minimaxi.com.attacker.test/v1) are NOT treated as MiniMax.
+    if (
+        hostname in {"api.minimax.io", "api.minimaxi.com"}
+        and (normalized.endswith("/v1") or "/v1/" in normalized)
+    ):
+        return "chat_completions"
     return None
 
 
