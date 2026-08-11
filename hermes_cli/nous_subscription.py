@@ -159,33 +159,28 @@ def _toolset_enabled(config: Dict[str, object], toolset_key: str) -> bool:
 def _has_agent_browser() -> bool:
     import shutil
 
-    from hermes_constants import agent_browser_runnable, with_hermes_node_path
+    from hermes_constants import (
+        agent_browser_managed_shim_candidates,
+        get_hermes_home,
+        resolve_agent_browser_candidate,
+        with_hermes_node_path,
+    )
+
+    probe_env = with_hermes_node_path()
+    candidates = (
+        shutil.which("agent-browser"),
+        *(str(path) for path in agent_browser_managed_shim_candidates(get_hermes_home())),
+    )
+    if any(resolve_agent_browser_candidate(candidate, env=probe_env) for candidate in candidates):
+        return True
 
     # Validate the resolved binary actually runs — a dangling global symlink
     # (issue #48521) is reported by ``which`` but fails at exec. Fall through to
     # the local node_modules copy, which the validator also checks.
-    if agent_browser_runnable(shutil.which("agent-browser")):
-        return True
-
-    # Hermes-managed Node dirs (Windows installer / POSIX $HERMES_HOME/node)
-    # are prepended to PATH at runtime but usually absent from the *probe*
-    # process's PATH — the same rung `_find_agent_browser` searches. Without
-    # it a successful install keeps reporting "needs setup" on Windows.
-    managed_path = with_hermes_node_path().get("PATH", "")
-    if managed_path:
-        managed_hit = shutil.which("agent-browser", path=managed_path)
-        if managed_hit and agent_browser_runnable(managed_hit):
-            return True
-
-    # Local node_modules/.bin: resolve via PATHEXT-aware ``shutil.which`` so
-    # Windows picks the executable ``.cmd`` shim. Probing the extensionless
-    # POSIX shim directly fails exec (WinError 193) even right after a
-    # successful ``npm install`` — the bug that pinned every browser row on
-    # "Setup required" in the desktop GUI.
     local_bin_dir = Path(__file__).parent.parent / "node_modules" / ".bin"
     if local_bin_dir.is_dir():
         local_which = shutil.which("agent-browser", path=str(local_bin_dir))
-        if local_which and agent_browser_runnable(local_which):
+        if local_which and resolve_agent_browser_candidate(local_which, env=probe_env):
             return True
     return False
 

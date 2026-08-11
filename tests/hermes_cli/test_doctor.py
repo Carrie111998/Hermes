@@ -710,11 +710,10 @@ def _run_doctor_with_managed_agent_browser(monkeypatch, tmp_path, runnable):
         return "/usr/bin/node" if cmd in {"node", "npm"} else None
 
     monkeypatch.setattr(doctor_mod.shutil, "which", _fake_which)
-    # agent_browser_runnable is imported into doctor's namespace
     monkeypatch.setattr(
         doctor_mod,
-        "agent_browser_runnable",
-        lambda path: runnable and str(path) == str(managed_ab),
+        "resolve_agent_browser_candidate",
+        lambda path: str(managed_ab) if runnable and str(path) == str(managed_ab) else None,
     )
 
     fake_model_tools = types.SimpleNamespace(
