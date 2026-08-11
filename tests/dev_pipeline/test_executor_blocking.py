@@ -55,6 +55,8 @@ def _setup_pipeline_task(
                 "logs_root": str(logs),
                 "base_commit": "aaa",
                 "candidate_commit": "bbb",
+                "verified_candidate": "bbb",
+                "reviewed_candidate": "bbb",
                 "mechanical_pass": True,
             },
         ),
@@ -77,20 +79,31 @@ def test_review_unavailable_blocks_after_attempt_end(kanban_home, tmp_path):
     })
     executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_REVIEWING)
 
-    with patch.object(ex, "unified_diff", return_value="safe diff"):
-        with patch.object(ex, "hermes_chat_review") as mock_kimi:
-            mock_kimi.return_value = type(
-                "P", (), {"stdout": "garbage", "stderr": ""}
-            )()
-            with patch.object(ex, "resolve_cursor_agent_binary", return_value=None):
-                executor._phase_reviewing(
-                    conn, task_id, run_id, meta, ex.pipeline_state(meta)
-                )
+    with patch.object(ex, "git_head_sha", return_value="bbb"):
+        with patch.object(ex, "unified_diff", return_value="safe diff"):
+            with patch.object(ex, "hermes_chat_review") as mock_kimi:
+                mock_kimi.return_value = type(
+                    "P", (), {"stdout": "garbage", "stderr": ""}
+                )()
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value=None
+                ):
+                    executor._phase_reviewing(
+                        conn, task_id, run_id, meta, ex.pipeline_state(meta)
+                    )
 
     task = kb.get_task(conn, task_id)
     assert task is not None
     assert task.status == "blocked"
     conn.close()
+
+
+def _ghp_pat() -> str:
+    return "ghp_" + "abcdefghijklmnopqrstuvwxyz1234567890"
+
+
+def _ghp_secret_leak() -> str:
+    return "ghp_" + "secretleak123456789012345678901234"
 
 
 def test_secret_in_diff_blocks_after_attempt_end(kanban_home, tmp_path):
@@ -108,11 +121,14 @@ def test_secret_in_diff_blocks_after_attempt_end(kanban_home, tmp_path):
     })
     executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_PUBLISHING)
 
-    secret_diff = "+token ghp_abcdefghijklmnopqrstuvwxyz1234567890\n"
-    with patch.object(
-        ex, "publish_pr", return_value=(False, "findings", "secret_in_diff")
-    ):
-        executor._phase_publishing(conn, task_id, run_id, meta, ex.pipeline_state(meta))
+    secret_diff = "+token " + _ghp_pat() + "\n"
+    with patch.object(ex, "git_head_sha", return_value="bbb"):
+        with patch.object(
+            ex, "publish_pr", return_value=(False, "findings", "secret_in_diff")
+        ):
+            executor._phase_publishing(
+                conn, task_id, run_id, meta, ex.pipeline_state(meta)
+            )
 
     task = kb.get_task(conn, task_id)
     assert task is not None
@@ -136,14 +152,15 @@ def test_reviewing_secret_scan_before_writing_artifacts(kanban_home, tmp_path):
     })
     executor._active[task_id] = ex.ActiveTask(task_id, run_id, ex.PHASE_REVIEWING)
 
-    with patch.object(
-        ex, "unified_diff", return_value="+ghp_secretleak123456789012345678901234\n"
-    ):
-        with patch.object(ex, "hermes_chat_review") as mock_kimi:
-            executor._phase_reviewing(
-                conn, task_id, run_id, meta, ex.pipeline_state(meta)
-            )
-            mock_kimi.assert_not_called()
+    with patch.object(ex, "git_head_sha", return_value="bbb"):
+        with patch.object(
+            ex, "unified_diff", return_value="+" + _ghp_secret_leak() + "\n"
+        ):
+            with patch.object(ex, "hermes_chat_review") as mock_kimi:
+                executor._phase_reviewing(
+                    conn, task_id, run_id, meta, ex.pipeline_state(meta)
+                )
+                mock_kimi.assert_not_called()
 
     assert (logs / "secret-scan-quarantine.json").is_file()
     assert not (logs / "review-kimi.raw").exists()

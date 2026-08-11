@@ -61,9 +61,11 @@ def test_publish_pr_all_gh_calls_pass_cwd(tmp_path):
             )()
         return type("P", (), {"returncode": 1, "stdout": "", "stderr": "unexpected"})()
 
-    git_ok = lambda *_a, **_k: type(
-        "P", (), {"returncode": 0, "stdout": "", "stderr": ""}
-    )()
+    git_calls: list[list[str]] = []
+
+    def git_ok(args, **_kwargs):
+        git_calls.append(list(args))
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
     common = dict(
         task_id="t1",
         task_text="task",
@@ -76,6 +78,7 @@ def test_publish_pr_all_gh_calls_pass_cwd(tmp_path):
         reviews={},
         evidence_paths=[],
         diff_text="safe diff",
+        expected_commit="bbb",
         gh_fn=gh,
         git_fn=git_ok,
     )
@@ -96,6 +99,10 @@ def test_publish_pr_all_gh_calls_pass_cwd(tmp_path):
 
     for _args, kwargs in existing_calls + create_calls:
         assert kwargs.get("cwd") == repo
+    assert git_calls == [
+        ["push", "origin", "bbb:refs/heads/hermes-dev/t1"],
+        ["push", "origin", "bbb:refs/heads/hermes-dev/t1"],
+    ]
 
 
 def test_find_existing_pr_returns_number_legacy():
@@ -144,6 +151,7 @@ def test_publish_pr_existing_comments_instead_of_create(tmp_path):
         reviews={},
         evidence_paths=[],
         diff_text="safe diff",
+        expected_commit="bbb",
         gh_fn=gh,
         git_fn=lambda *_a, **_k: type(
             "P", (), {"returncode": 0, "stdout": "", "stderr": ""}
@@ -184,6 +192,7 @@ def test_publish_pr_creates_when_missing(tmp_path):
         reviews={},
         evidence_paths=[],
         diff_text="safe diff",
+        expected_commit="bbb",
         gh_fn=gh,
         git_fn=lambda *_a, **_k: type(
             "P", (), {"returncode": 0, "stdout": "", "stderr": ""}

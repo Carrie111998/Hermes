@@ -378,18 +378,26 @@ _ATTEMPT_ENV_ALLOWLIST_EXACT = frozenset(
         "GIT_COMMITTER_NAME",
         "GIT_COMMITTER_EMAIL",
         "XDG_CONFIG_HOME",
+        "CURSOR_CONFIG_DIR",
+        "LC_ADDRESS",
+        "LC_ALL",
+        "LC_COLLATE",
+        "LC_CTYPE",
+        "LC_IDENTIFICATION",
+        "LC_MEASUREMENT",
+        "LC_MESSAGES",
+        "LC_MONETARY",
+        "LC_NAME",
+        "LC_NUMERIC",
+        "LC_PAPER",
+        "LC_TELEPHONE",
+        "LC_TIME",
     }
 )
 
 
 def _attempt_env_key_allowed(key: str) -> bool:
-    if key in _ATTEMPT_ENV_ALLOWLIST_EXACT:
-        return True
-    if key.startswith("LC_"):
-        return True
-    if key.startswith("CURSOR_"):
-        return True
-    return False
+    return key in _ATTEMPT_ENV_ALLOWLIST_EXACT
 
 
 def _attempt_env_key_stripped(key: str) -> bool:

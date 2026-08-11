@@ -10,6 +10,7 @@ import pytest
 
 from hermes_cli import dev_executor as ex
 from hermes_cli import kanban_db as kb
+from tests.dev_pipeline.conftest import git_command_success
 
 
 @pytest.fixture
@@ -93,7 +94,10 @@ def test_repair_budget_one_attempt_plus_pipeline_allows_one_repair(
     executor._active[task_id] = ex.ActiveTask(task_id, pipeline_run, ex.PHASE_VERIFYING)
     meta = ex.load_run_metadata(conn, pipeline_run)
 
-    with patch.object(ex, "git_command") as mock_git:
+    with (
+        patch.object(ex, "git_head_sha", return_value="bbb"),
+        patch.object(ex, "git_command", side_effect=git_command_success),
+    ):
         with patch.object(ex, "run_verification", return_value=_regression_results()):
             with patch.object(ex, "classify_verification", return_value="regression"):
                 with patch.object(ex, "unified_diff", return_value="diff"):
@@ -179,7 +183,10 @@ def test_repair_budget_second_regression_does_not_spawn(kanban_home, tmp_path):
     executor._active[task_id] = ex.ActiveTask(task_id, pipeline_run, ex.PHASE_VERIFYING)
     meta = ex.load_run_metadata(conn, pipeline_run)
 
-    with patch.object(ex, "git_command"):
+    with (
+        patch.object(ex, "git_head_sha", return_value="bbb"),
+        patch.object(ex, "git_command", side_effect=git_command_success),
+    ):
         with patch.object(ex, "run_verification", return_value=_regression_results()):
             with patch.object(ex, "classify_verification", return_value="regression"):
                 with patch.object(executor, "_spawn_attempt") as mock_spawn:

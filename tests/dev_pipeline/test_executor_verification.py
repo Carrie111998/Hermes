@@ -11,6 +11,7 @@ import pytest
 
 from hermes_cli import dev_executor as ex
 from hermes_cli import kanban_db as kb
+from tests.dev_pipeline.conftest import git_command_success
 
 
 def _executor_cfg() -> dict:
@@ -166,7 +167,7 @@ def test_verifying_acceptance_timeout_classified(kanban_home, tmp_path):
     def track_heartbeat(*args, **kwargs):
         heartbeat_calls.append((args, kwargs))
 
-    with patch.object(ex, "git_command"):
+    with patch.object(ex, "git_command", side_effect=git_command_success):
         with patch.object(ex, "git_head_sha", return_value="bbb"):
             with patch.object(ex, "run_verification", side_effect=fake_verification):
                 with patch.object(kb, "heartbeat_claim", side_effect=track_heartbeat):
@@ -255,16 +256,19 @@ def test_verifying_exhausted_regression_emits_typed_dev_blocked_event(
         output_path=Path("/tmp/log"),
         output_preview="fail",
     )
-    with patch.object(ex, "git_command"):
-        with patch.object(ex, "run_verification", return_value=[fail]):
-            with patch.object(ex, "classify_verification", return_value="regression"):
-                executor._phase_verifying(
-                    conn,
-                    task_id,
-                    pipeline_run,
-                    meta,
-                    ex.pipeline_state(meta),
-                )
+    with patch.object(ex, "git_head_sha", return_value="bbb"):
+        with patch.object(ex, "git_command", side_effect=git_command_success):
+            with patch.object(ex, "run_verification", return_value=[fail]):
+                with patch.object(
+                    ex, "classify_verification", return_value="regression"
+                ):
+                    executor._phase_verifying(
+                        conn,
+                        task_id,
+                        pipeline_run,
+                        meta,
+                        ex.pipeline_state(meta),
+                    )
 
     assert "verification_regression" in _dev_block_kinds(conn, task_id)
     conn.close()
@@ -339,7 +343,7 @@ def test_verifying_base_timeout_forces_regression_not_baseline_failure(
             return cand_fail
         raise base_timeout
 
-    with patch.object(ex, "git_command"):
+    with patch.object(ex, "git_command", side_effect=git_command_success):
         with patch.object(ex, "git_head_sha", return_value="bbb"):
             with patch.object(ex, "run_verification", side_effect=fake_verification):
                 with patch.object(ex, "unified_diff", return_value="diff"):
@@ -424,22 +428,27 @@ def test_verification_repair_prompt_not_double_wrapped(kanban_home, tmp_path):
         output_path=Path("/tmp/base.log"),
     )
 
-    with patch.object(ex, "git_command"):
-        with patch.object(ex, "run_verification", side_effect=[[fail], [pass_result]]):
-            with patch.object(ex, "unified_diff", return_value="diff"):
-                with patch.object(executor, "_is_active", return_value=(False, "")):
+    with patch.object(ex, "git_head_sha", return_value="bbb"):
+        with patch.object(ex, "git_command", side_effect=git_command_success):
+            with patch.object(
+                ex, "run_verification", side_effect=[[fail], [pass_result]]
+            ):
+                with patch.object(ex, "unified_diff", return_value="diff"):
                     with patch.object(
-                        ex,
-                        "systemd_run_attempt",
-                        return_value=(True, 9999, 1_700_000_000),
+                        executor, "_is_active", return_value=(False, "")
                     ):
-                        executor._phase_verifying(
-                            conn,
-                            task_id,
-                            pipeline_run,
-                            meta,
-                            ex.pipeline_state(meta),
-                        )
+                        with patch.object(
+                            ex,
+                            "systemd_run_attempt",
+                            return_value=(True, 9999, 1_700_000_000),
+                        ):
+                            executor._phase_verifying(
+                                conn,
+                                task_id,
+                                pipeline_run,
+                                meta,
+                                ex.pipeline_state(meta),
+                            )
 
     new_run_id = executor._active[task_id].run_id
     new_meta = ex.load_run_metadata(conn, new_run_id)

@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -26,6 +27,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, MutableMapping, Optional, Sequence
+from urllib.parse import unquote, urlsplit
 
 from hermes_cli import kanban_db as kb
 from hermes_cli.dev_pipeline import (
@@ -111,6 +113,108 @@ _ASSETS_AGENTS_DIR = (
 # ---------------------------------------------------------------------------
 
 
+def _kill_process_tree(proc: subprocess.Popen[str]) -> None:
+    """Kill *proc* and its process group (POSIX) or direct child (Windows)."""
+    if os.name != "nt" and hasattr(os, "killpg"):
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            if proc.poll() is None:
+                proc.kill()
+            return
+        except PermissionError:
+            if proc.poll() is None:
+                proc.kill()
+            return
+        else:
+            # The group leader may already have exited while a descendant still
+            # owns the capture pipes.  ``proc.poll()`` therefore cannot prove
+            # that the process group is gone.  Give every remaining member a
+            # short TERM grace period, then kill the group unconditionally.
+            time.sleep(0.2)
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            if proc.poll() is None:
+                proc.kill()
+        return
+    if proc.poll() is None:
+        proc.kill()
+
+
+def _normalize_output_chunk(
+    chunk: str | bytes | None, *, text: bool
+) -> str | bytes | None:
+    if chunk is None:
+        return None
+    if text:
+        if isinstance(chunk, bytes):
+            return chunk.decode("utf-8", errors="replace")
+        return chunk
+    if isinstance(chunk, str):
+        return chunk.encode("utf-8", errors="replace")
+    return chunk
+
+
+def _run_with_group_kill(
+    args: str | Sequence[str],
+    *,
+    shell: bool = False,
+    cwd: Optional[str | Path] = None,
+    env: Optional[Mapping[str, str]] = None,
+    timeout: Optional[float] = None,
+    capture_output: bool = True,
+    text: bool = True,
+    input_text: Optional[str] = None,
+) -> subprocess.CompletedProcess[str]:
+    popen_kwargs: dict[str, Any] = {
+        "shell": shell,
+        "text": text,
+    }
+    if cwd is not None:
+        popen_kwargs["cwd"] = str(cwd)
+    if env is not None:
+        popen_kwargs["env"] = dict(env)
+    if capture_output:
+        popen_kwargs["stdout"] = subprocess.PIPE
+        popen_kwargs["stderr"] = subprocess.PIPE
+
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    elif hasattr(subprocess, "CREATE_NEW_PROCESS_GROUP"):
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+    proc = subprocess.Popen(args, **popen_kwargs)
+    try:
+        stdout, stderr = proc.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        _kill_process_tree(proc)
+        try:
+            stdout2, stderr2 = proc.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout2, stderr2 = proc.communicate()
+
+        out_stdout = _normalize_output_chunk(stdout2, text=text)
+        if out_stdout is None:
+            out_stdout = _normalize_output_chunk(exc.stdout, text=text)
+        if out_stdout is None:
+            out_stdout = _normalize_output_chunk(exc.output, text=text)
+        out_stderr = _normalize_output_chunk(stderr2, text=text)
+        if out_stderr is None:
+            out_stderr = _normalize_output_chunk(exc.stderr, text=text)
+
+        raise subprocess.TimeoutExpired(
+            cmd=exc.cmd,
+            timeout=exc.timeout,
+            output=out_stdout,
+            stderr=out_stderr,
+        ) from None
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+
 def run_subprocess(
     args: Sequence[str],
     *,
@@ -122,14 +226,15 @@ def run_subprocess(
     input_text: Optional[str] = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a subprocess; tests patch this boundary."""
-    return subprocess.run(
+    return _run_with_group_kill(
         list(args),
-        cwd=str(cwd) if cwd else None,
-        env=dict(env) if env is not None else None,
+        shell=False,
+        cwd=cwd,
+        env=env,
         timeout=timeout,
         capture_output=capture_output,
         text=text,
-        input=input_text,
+        input_text=input_text,
     )
 
 
@@ -778,6 +883,36 @@ def _balanced_verdict_candidates(text: str) -> Iterator[str]:
             i += 1
 
 
+def _iter_json_strings(value: Any) -> Iterator[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _iter_json_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _iter_json_strings(item)
+
+
+def _review_candidate_sources(text: str) -> Iterator[str]:
+    """Yield raw review text plus strings decoded from JSON/JSONL envelopes."""
+    yield text
+    parsed_values: list[Any] = []
+    try:
+        parsed_values.append(json.loads(text))
+    except json.JSONDecodeError:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed_values.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    for value in parsed_values:
+        yield from _iter_json_strings(value)
+
+
 def _validate_verdict(data: Any) -> Optional[dict[str, Any]]:
     if not isinstance(data, dict):
         return None
@@ -786,7 +921,12 @@ def _validate_verdict(data: Any) -> Optional[dict[str, Any]]:
         return None
     blocking = data.get("blocking_findings")
     notes = data.get("notes")
-    if not isinstance(blocking, list) or not isinstance(notes, list):
+    if (
+        not isinstance(blocking, list)
+        or not isinstance(notes, list)
+        or not all(isinstance(item, str) for item in blocking)
+        or not all(isinstance(item, str) for item in notes)
+    ):
         return None
     return {
         "verdict": verdict,
@@ -795,23 +935,54 @@ def _validate_verdict(data: Any) -> Optional[dict[str, Any]]:
     }
 
 
+def _dedupe_preserve_order(items: list[Any]) -> list[Any]:
+    seen: set[Any] = set()
+    merged: list[Any] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            merged.append(item)
+    return merged
+
+
+def _merge_review_verdicts(
+    valid_verdicts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Merge multiple valid verdict objects; any fail dominates pass."""
+    if any(v["verdict"] == "fail" for v in valid_verdicts):
+        fail_verdicts = [v for v in valid_verdicts if v["verdict"] == "fail"]
+        blocking = _dedupe_preserve_order(
+            finding
+            for v in fail_verdicts
+            for finding in v["blocking_findings"]
+        )
+        notes = _dedupe_preserve_order(
+            note for v in valid_verdicts for note in v["notes"]
+        )
+        return {"verdict": "fail", "blocking_findings": blocking, "notes": notes}
+    return valid_verdicts[-1]
+
+
 def parse_review_verdict(text: str) -> Optional[dict[str, Any]]:
     """Parse strict JSON review verdict; fail-closed on garbage."""
     if not text:
         return None
-    # Reviewers may echo an example/template verdict before their real one;
-    # the authoritative verdict is the last verdict-shaped JSON object.
-    data: Optional[dict[str, Any]] = None
-    for candidate in _balanced_verdict_candidates(text):
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        validated = _validate_verdict(parsed)
-        if validated is not None:
-            data = validated
-    if data is not None:
-        return data
+    valid_verdicts: list[dict[str, Any]] = []
+    seen_candidates: set[str] = set()
+    for source in _review_candidate_sources(text):
+        for candidate in _balanced_verdict_candidates(source):
+            if candidate in seen_candidates:
+                continue
+            seen_candidates.add(candidate)
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            validated = _validate_verdict(parsed)
+            if validated is not None:
+                valid_verdicts.append(validated)
+    if valid_verdicts:
+        return _merge_review_verdicts(valid_verdicts)
     return _validate_verdict(extract_json_object(text))
 
 
@@ -847,6 +1018,46 @@ def workspace_paths(task_id: str, board: str) -> tuple[Path, Path]:
     return ws_root, logs_root
 
 
+def _normalized_repo_identity(
+    repo: str, *, relative_to: Path
+) -> tuple[str, ...] | None:
+    raw = repo.strip()
+    if is_https_repo_url(raw):
+        try:
+            parsed = urlsplit(raw)
+            port = parsed.port
+        except ValueError:
+            return None
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            return None
+        path = parsed.path.rstrip("/")
+        if path.lower().endswith(".git"):
+            path = path[:-4]
+        return (
+            "https",
+            parsed.hostname.lower().rstrip("."),
+            str(None if port in {None, 443} else port),
+            path,
+        )
+
+    if raw.lower().startswith("file://"):
+        parsed = urlsplit(raw)
+        if parsed.netloc not in {"", "localhost"} or parsed.query or parsed.fragment:
+            return None
+        path = Path(unquote(parsed.path))
+    else:
+        path = Path(raw).expanduser()
+        if not path.is_absolute():
+            path = relative_to / path
+    return ("local", str(path.resolve(strict=False)))
+
+
 def clone_repo(
     repo: str,
     dest: Path,
@@ -854,10 +1065,26 @@ def clone_repo(
     *,
     git_fn: Callable[..., subprocess.CompletedProcess[str]] = git_command,
 ) -> tuple[bool, str]:
+    https_repo = is_https_repo_url(repo)
+    local_repo = is_local_git_repo(repo)
+    if not https_repo and not local_repo:
+        return False, f"unsupported repo: {repo}"
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
+        probe = git_fn(["rev-parse", "--is-inside-work-tree"], cwd=dest)
+        if probe.returncode != 0 or (probe.stdout or "").strip().lower() != "true":
+            return False, "existing workspace is not a git worktree"
+        origin = git_fn(["remote", "get-url", "origin"], cwd=dest)
+        if origin.returncode != 0 or not (origin.stdout or "").strip():
+            return False, "existing workspace has no readable origin"
+        expected = _normalized_repo_identity(repo, relative_to=dest.parent)
+        actual = _normalized_repo_identity(
+            (origin.stdout or "").strip(), relative_to=dest.parent
+        )
+        if expected is None or actual != expected:
+            return False, "existing workspace origin does not match requested repository"
         return True, str(dest)
-    if is_https_repo_url(repo):
+    if https_repo:
         proc = git_fn(
             ["clone", "--branch", branch, repo, str(dest)],
             cwd=dest.parent,
@@ -865,31 +1092,46 @@ def clone_repo(
         if proc.returncode != 0 and branch != "main":
             proc = git_fn(["clone", repo, str(dest)], cwd=dest.parent)
             if proc.returncode == 0:
-                git_fn(["checkout", branch], cwd=dest)
+                co = git_fn(["checkout", branch], cwd=dest)
+                if co.returncode != 0:
+                    detail = co.stderr or co.stdout or "checkout failed"
+                    return False, detail
         if proc.returncode != 0:
             return False, proc.stderr or proc.stdout or "clone failed"
         return True, str(dest)
-    if is_local_git_repo(repo):
+    if local_repo:
         proc = git_fn(["clone", repo, str(dest)], cwd=dest.parent)
         if proc.returncode != 0:
             return False, proc.stderr or proc.stdout or "clone failed"
-        git_fn(["checkout", branch], cwd=dest)
+        co = git_fn(["checkout", branch], cwd=dest)
+        if co.returncode != 0:
+            detail = co.stderr or co.stdout or "checkout failed"
+            return False, detail
         return True, str(dest)
     return False, f"unsupported repo: {repo}"
 
 
 def ensure_dev_branch(
     repo_dir: Path, task_id: str, base_branch: str
-) -> tuple[str, str]:
+) -> tuple[Optional[tuple[str, str]], str]:
     """Checkout *base_branch*, record its SHA, reset job branch from it.
 
-    Returns ``(dev_branch_name, base_commit_sha)``.
+    Returns ``((dev_branch_name, base_commit_sha), "")`` on success or
+    ``(None, error_detail)`` on failure.
     """
-    git_command(["checkout", base_branch], cwd=repo_dir)
-    base_sha = git_head_sha(repo_dir) or ""
+    proc = git_command(["checkout", base_branch], cwd=repo_dir)
+    if proc.returncode != 0:
+        detail = proc.stderr or proc.stdout or f"checkout {base_branch} failed"
+        return None, detail.strip()
+    base_sha = git_head_sha(repo_dir)
+    if not base_sha:
+        return None, f"could not resolve HEAD after checkout {base_branch}"
     branch = f"hermes-dev/{task_id}"
-    git_command(["checkout", "-B", branch], cwd=repo_dir)
-    return branch, base_sha
+    proc = git_command(["checkout", "-B", branch], cwd=repo_dir)
+    if proc.returncode != 0:
+        detail = proc.stderr or proc.stdout or f"checkout -B {branch} failed"
+        return None, detail.strip()
+    return (branch, base_sha), ""
 
 
 def git_head_sha(repo_dir: Path) -> Optional[str]:
@@ -907,8 +1149,28 @@ def git_log_oneline(repo_dir: Path, base: Optional[str] = None) -> str:
     return (proc.stdout or "").strip()
 
 
-def unified_diff(repo_dir: Path, base: str, head: str) -> str:
-    proc = git_command(["diff", f"{base}..{head}"], cwd=repo_dir, timeout=120)
+def bound_candidate_commit(
+    repo_dir: Path, state: Mapping[str, Any]
+) -> tuple[Optional[str], str]:
+    """Bind post-attempt phases to the durable candidate and live workspace HEAD."""
+    candidate = str(state.get("candidate_commit") or "").strip()
+    if not candidate:
+        return None, "no durable candidate commit"
+    head = git_head_sha(repo_dir)
+    if not head:
+        return None, "could not resolve writer workspace HEAD"
+    if head != candidate:
+        return (
+            None,
+            "writer workspace HEAD does not match durable candidate commit",
+        )
+    return candidate, ""
+
+
+def unified_diff(repo_dir: Path, base_sha: str, head_sha: str) -> str:
+    proc = git_command(
+        ["diff", f"{base_sha}..{head_sha}"], cwd=repo_dir, timeout=120
+    )
     return proc.stdout or ""
 
 
@@ -969,11 +1231,11 @@ def _shell_runner(
     env: Mapping[str, str],
     timeout: int,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    return _run_with_group_kill(
         command,
         shell=True,
-        cwd=str(cwd),
-        env=dict(env),
+        cwd=cwd,
+        env=env,
         timeout=timeout,
         capture_output=True,
         text=True,
@@ -1144,6 +1406,7 @@ def publish_pr(
     reviews: Mapping[str, Any],
     evidence_paths: Sequence[str],
     diff_text: str,
+    expected_commit: str,
     gh_fn: Callable = gh_command,
     git_fn: Callable[..., subprocess.CompletedProcess[str]] = git_command,
 ) -> tuple[bool, str, str]:
@@ -1152,7 +1415,13 @@ def publish_pr(
     if findings:
         return False, json.dumps(findings), "secret_in_diff"
 
-    push = git_fn(["push", "-u", "origin", branch], cwd=repo_dir, timeout=300)
+    if not expected_commit:
+        return False, "missing durable candidate commit", "infra_broken"
+    push = git_fn(
+        ["push", "origin", f"{expected_commit}:refs/heads/{branch}"],
+        cwd=repo_dir,
+        timeout=300,
+    )
     if push.returncode != 0:
         return False, push.stderr or push.stdout or "git push failed", "infra_broken"
 
@@ -1856,7 +2125,18 @@ class DevExecutor:
             block_dev_task(conn, task_id, "infra_broken", err, run_id=run_id)
             self._active.pop(task_id, None)
             return
-        dev_branch, base_commit = ensure_dev_branch(repo_dir, task_id, branch)
+        dev_branch_info, branch_err = ensure_dev_branch(repo_dir, task_id, branch)
+        if dev_branch_info is None:
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                branch_err or f"failed to prepare dev branch from {branch}",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        dev_branch, base_commit = dev_branch_info
         agents_source = install_pinned_agents(repo_dir)
         meta = merge_pipeline_state(
             meta,
@@ -2197,18 +2477,52 @@ class DevExecutor:
         commands = contract.get("acceptance_commands") or []
         repo_dir = Path(str(st.get("repo_path") or ""))
         logs_root = Path(str(st.get("logs_root") or ""))
-        head = git_head_sha(repo_dir)
-        candidate = head or st.get("candidate_commit")
+        candidate, binding_error = bound_candidate_commit(repo_dir, st)
         base = st.get("base_commit") or ""
         verify_dir = repo_dir.parent / "verify"
         verify_base_dir = repo_dir.parent / "verify-base"
+
+        if binding_error or not candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                binding_error or "no candidate commit for verification",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
 
         if verify_dir.exists():
             import shutil
 
             shutil.rmtree(verify_dir, ignore_errors=True)
-        git_command(["clone", str(repo_dir), str(verify_dir)], cwd=verify_dir.parent)
-        git_command(["checkout", str(candidate)], cwd=verify_dir)
+        clone_proc = git_command(
+            ["clone", str(repo_dir), str(verify_dir)], cwd=verify_dir.parent
+        )
+        if clone_proc.returncode != 0:
+            detail = clone_proc.stderr or clone_proc.stdout or "clone failed"
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                f"verify candidate clone failed: {detail}",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        checkout_proc = git_command(["checkout", str(candidate)], cwd=verify_dir)
+        if checkout_proc.returncode != 0:
+            detail = checkout_proc.stderr or checkout_proc.stdout or "checkout failed"
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                f"verify candidate checkout failed: {detail}",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
 
         timeout = int(self.cfg.get("verify_command_timeout") or 600)
         env = build_attempt_env(os.environ, lane="cursor-bounded")
@@ -2251,11 +2565,35 @@ class DevExecutor:
                     import shutil
 
                     shutil.rmtree(verify_base_dir, ignore_errors=True)
-                git_command(
+                base_clone = git_command(
                     ["clone", str(repo_dir), str(verify_base_dir)],
                     cwd=verify_base_dir.parent,
                 )
-                git_command(["checkout", str(base)], cwd=verify_base_dir)
+                if base_clone.returncode != 0:
+                    detail = base_clone.stderr or base_clone.stdout or "clone failed"
+                    block_dev_task(
+                        conn,
+                        task_id,
+                        "infra_broken",
+                        f"verify baseline clone failed: {detail}",
+                        run_id=run_id,
+                    )
+                    self._active.pop(task_id, None)
+                    return
+                base_checkout = git_command(["checkout", str(base)], cwd=verify_base_dir)
+                if base_checkout.returncode != 0:
+                    detail = (
+                        base_checkout.stderr or base_checkout.stdout or "checkout failed"
+                    )
+                    block_dev_task(
+                        conn,
+                        task_id,
+                        "infra_broken",
+                        f"verify baseline checkout failed: {detail}",
+                        run_id=run_id,
+                    )
+                    self._active.pop(task_id, None)
+                    return
                 base_evidence = logs_root / "verify-base"
                 base_timed_out = False
                 try:
@@ -2294,8 +2632,14 @@ class DevExecutor:
                     outcome = classify_verification(cand_results, base_results)
                 verification["outcome"] = outcome
 
+        mechanical_pass = outcome in {"pass", "baseline_failure"}
         meta = merge_pipeline_state(
-            meta, {"verification": verification, "mechanical_pass": outcome == "pass"}
+            meta,
+            {
+                "verification": verification,
+                "mechanical_pass": mechanical_pass,
+                "verified_candidate": candidate if mechanical_pass else "",
+            },
         )
         if outcome == "regression":
             attempts = count_attempt_runs(conn, task_id)
@@ -2330,8 +2674,6 @@ class DevExecutor:
             )
             self._active.pop(task_id, None)
             return
-        if outcome == "baseline_failure":
-            meta = merge_pipeline_state(meta, {"mechanical_pass": True})
         save_run_metadata(conn, run_id, meta)
         self._set_phase(conn, task_id, run_id, meta, PHASE_REVIEWING)
 
@@ -2364,8 +2706,27 @@ class DevExecutor:
         logs_root = Path(str(st.get("logs_root") or ""))
         logs_root.mkdir(parents=True, exist_ok=True)
         base = str(st.get("base_commit") or "")
-        head = git_head_sha(repo_dir)
-        candidate = str(head or st.get("candidate_commit") or "")
+        candidate, binding_error = bound_candidate_commit(repo_dir, st)
+        if binding_error or not candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                binding_error or "no candidate commit for review",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        if str(st.get("verified_candidate") or "") != candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "acceptance_unverifiable",
+                "verification evidence is not bound to durable candidate commit",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
         full_diff = unified_diff(repo_dir, base, candidate)
         if self._scan_and_quarantine_diff(full_diff, logs_root):
             block_dev_task(
@@ -2457,6 +2818,18 @@ class DevExecutor:
                     grok_jsonl.write_text(grok_raw[:500_000], encoding="utf-8")
                     grok_verdict = parse_review_verdict(grok_raw)
 
+        current_candidate, binding_error = bound_candidate_commit(repo_dir, st)
+        if binding_error or current_candidate != candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                binding_error or "writer workspace changed during review",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+
         reviews = {
             "kimi": kimi_verdict,
             "grok": grok_verdict,
@@ -2478,7 +2851,9 @@ class DevExecutor:
 
         mechanical_pass = bool(st.get("mechanical_pass", True))
         proceed, needs_repair = review_gate(mechanical_pass, kimi_verdict, grok_verdict)
-        meta = merge_pipeline_state(meta, {"reviews": reviews})
+        meta = merge_pipeline_state(
+            meta, {"reviews": reviews, "reviewed_candidate": candidate}
+        )
         save_run_metadata(conn, run_id, meta)
 
         if proceed:
@@ -2527,8 +2902,37 @@ class DevExecutor:
         logs_root.mkdir(parents=True, exist_ok=True)
         branch = str(st.get("dev_branch") or f"hermes-dev/{task_id}")
         base = str(st.get("base_commit") or "")
-        head = git_head_sha(repo_dir)
-        candidate = str(head or st.get("candidate_commit") or "")
+        candidate, binding_error = bound_candidate_commit(repo_dir, st)
+        if binding_error or not candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "infra_broken",
+                binding_error or "no candidate commit for publishing",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        if str(st.get("verified_candidate") or "") != candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "acceptance_unverifiable",
+                "verification evidence is not bound to durable candidate commit",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
+        if str(st.get("reviewed_candidate") or "") != candidate:
+            block_dev_task(
+                conn,
+                task_id,
+                "review_failed",
+                "review evidence is not bound to durable candidate commit",
+                run_id=run_id,
+            )
+            self._active.pop(task_id, None)
+            return
         diff = unified_diff(repo_dir, base, candidate)
         task = kb.get_task(conn, task_id)
         body = parse_task_body(task.body if task else None)
@@ -2550,6 +2954,7 @@ class DevExecutor:
                     str(logs_root / "reviews.json"),
                 ],
                 diff_text=diff,
+                expected_commit=candidate,
             )
         if not ok:
             if block_kind == "secret_in_diff":

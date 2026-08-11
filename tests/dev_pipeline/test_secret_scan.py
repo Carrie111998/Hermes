@@ -2,24 +2,44 @@
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from hermes_cli.dev_pipeline import scan_diff_for_secrets
 
-PRIVATE_KEY_DIFF = """\
+
+def _ghp_pat() -> str:
+    return "ghp_" + "abcdefghijklmnopqrstuvwxyz1234567890"
+
+
+def _sk_live_key() -> str:
+    return "sk-" + "live-" + "abcdefghijklmnopqrstuv"
+
+
+def _aws_access_key() -> str:
+    return "AKIA" + "IOSFODNN7EXAMPLE"
+
+
+def _private_key_header() -> str:
+    return "-----BEGIN " + "RSA PRIVATE KEY-----"
+
+
+PRIVATE_KEY_DIFF = f"""\
 diff --git a/key.pem b/key.pem
 +++ b/key.pem
-+-----BEGIN RSA PRIVATE KEY-----
++{_private_key_header()}
 +MIIEpAIBAAKCAQEAsecretmaterial
 +-----END RSA PRIVATE KEY-----
 """
 
-GHP_DIFF = """\
+GHP_DIFF = f"""\
 diff --git a/config.py b/config.py
 +++ b/config.py
-+TOKEN = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
++TOKEN = "{_ghp_pat()}"
 """
 
-SK_DIFF = """\
-+api_key = "sk-live-abcdefghijklmnopqrstuv"
+SK_DIFF = f"""\
++api_key = "{_sk_live_key()}"
 """
 
 XOXB_DIFF = (
@@ -30,8 +50,8 @@ XOXB_DIFF = (
     + '"\n'
 )
 
-AWS_DIFF = """\
-+AWS_KEY = "AKIAIOSFODNN7EXAMPLE"
+AWS_DIFF = f"""\
++AWS_KEY = "{_aws_access_key()}"
 """
 
 ENV_DIFF = """\
@@ -77,8 +97,8 @@ def test_findings_never_contain_secret_values():
     diff = GHP_DIFF + SK_DIFF + ENV_DIFF
     findings = scan_diff_for_secrets(diff)
     blob = str(findings)
-    assert "ghp_abcdefghijklmnopqrstuvwxyz1234567890" not in blob
-    assert "sk-live-abcdefghijklmnopqrstuv" not in blob
+    assert _ghp_pat() not in blob
+    assert _sk_live_key() not in blob
     assert "supersecretvalue" not in blob
 
 
@@ -99,3 +119,42 @@ def test_env_var_names_without_values_are_negative():
     diff = "+# Set PASSWORD and API_KEY in your environment\n"
     findings = scan_diff_for_secrets(diff)
     assert findings == []
+
+
+def _secret_guard_patterns() -> list[re.Pattern[str]]:
+    ghp_prefix = "ghp_"
+    ghp_body = "[A-Za-z0-9]{20,}"
+    pem_begin = "-----BEGIN "
+    pem_kind = "[A-Z ]*PRIVATE KEY-----"
+    sk_prefix = "sk-(live|prod)-"
+    sk_body = "[A-Za-z0-9-]{8,}"
+    aws_prefix = "AKIA"
+    aws_body = "[0-9A-Z]{16}"
+    return [
+        re.compile(ghp_prefix + ghp_body),
+        re.compile(pem_begin + pem_kind),
+        re.compile(sk_prefix + sk_body),
+        re.compile(aws_prefix + aws_body),
+    ]
+
+
+def test_changed_dev_pipeline_test_sources_have_no_full_secret_literals():
+    repo_root = Path(__file__).resolve().parents[2]
+    scan_paths = [
+        repo_root / "tests" / "dev_pipeline",
+        repo_root / "tests" / "tools" / "test_moa_tool.py",
+    ]
+    patterns = _secret_guard_patterns()
+    offenders: list[str] = []
+    for scan_path in scan_paths:
+        files = (
+            [scan_path]
+            if scan_path.is_file()
+            else sorted(scan_path.glob("*.py"))
+        )
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            for pattern in patterns:
+                if pattern.search(text):
+                    offenders.append(f"{path.relative_to(repo_root)}:{pattern.pattern}")
+    assert offenders == []

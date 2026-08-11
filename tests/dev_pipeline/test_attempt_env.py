@@ -30,13 +30,50 @@ def test_strips_github_and_api_key_vars():
 def test_preserves_lc_and_cursor_vars():
     base = {
         "LC_ALL": "C.UTF-8",
+        "LC_CTYPE": "en_AU.UTF-8",
+        "LC_TIME": "en_AU.UTF-8",
         "CURSOR_CONFIG_DIR": "/root/.cursor",
         "RANDOM_SECRET": "drop-me",
     }
     env = build_attempt_env(base, lane="cursor-bounded")
     assert env["LC_ALL"] == "C.UTF-8"
+    assert env["LC_CTYPE"] == "en_AU.UTF-8"
+    assert env["LC_TIME"] == "en_AU.UTF-8"
     assert env["CURSOR_CONFIG_DIR"] == "/root/.cursor"
     assert "RANDOM_SECRET" not in env
+
+
+def test_cursor_secret_vars_not_forwarded():
+    base = {
+        "CURSOR_CONFIG_DIR": "/root/.cursor",
+        "CURSOR_TOKEN": "secret",
+        "CURSOR_PASSWORD": "secret",
+        "CURSOR_API_KEY": "secret",
+        "CURSOR_OAUTH_TOKEN": "secret",
+        "CURSOR_CLIENT_SECRET": "secret",
+        "CURSOR_FOO": "not-allowed",
+    }
+    env = build_attempt_env(base, lane="cursor-bounded")
+    assert env["CURSOR_CONFIG_DIR"] == "/root/.cursor"
+    for key in (
+        "CURSOR_TOKEN",
+        "CURSOR_PASSWORD",
+        "CURSOR_API_KEY",
+        "CURSOR_OAUTH_TOKEN",
+        "CURSOR_CLIENT_SECRET",
+        "CURSOR_FOO",
+    ):
+        assert key not in env
+
+
+def test_secret_like_lc_vars_not_forwarded():
+    env = build_attempt_env({
+        "LC_ALL": "C.UTF-8",
+        "LC_PASSWORD": "secret",
+        "LC_SECRET": "secret",
+        "LC_TOKEN": "secret",
+    })
+    assert env == {"LC_ALL": "C.UTF-8"}
 
 
 def test_glm_endurance_raises_not_implemented():

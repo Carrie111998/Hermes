@@ -194,6 +194,7 @@ def test_review_unavailable_blocks(kanban_home, tmp_path):
     )
     kb.claim_task(conn, task_id, claimer="dev-executor")
     run = kb.latest_run(conn, task_id)
+    assert run is not None
     repo = tmp_path / "repo"
     repo.mkdir()
     logs = tmp_path / "logs"
@@ -205,6 +206,7 @@ def test_review_unavailable_blocks(kanban_home, tmp_path):
             "logs_root": str(logs),
             "base_commit": "aaa",
             "candidate_commit": "bbb",
+            "verified_candidate": "bbb",
             "mechanical_pass": True,
         },
     )
@@ -219,18 +221,25 @@ def test_review_unavailable_blocks(kanban_home, tmp_path):
     })
     executor._active[task_id] = ex.ActiveTask(task_id, run.id, ex.PHASE_REVIEWING)
 
-    with patch.object(ex, "unified_diff", return_value="diff"):
-        with patch.object(ex, "hermes_chat_review") as mock_kimi:
-            mock_kimi.return_value = type(
-                "P", (), {"stdout": "not json", "stderr": ""}
-            )()
-            with patch.object(ex, "resolve_cursor_agent_binary", return_value=None):
-                executor._phase_reviewing(
-                    conn, task_id, run.id, meta, ex.pipeline_state(meta)
-                )
+    with patch.object(ex, "git_head_sha", return_value="bbb"):
+        with patch.object(ex, "unified_diff", return_value="diff"):
+            with patch.object(ex, "hermes_chat_review") as mock_kimi:
+                mock_kimi.return_value = type(
+                    "P", (), {"stdout": "not json", "stderr": ""}
+                )()
+                with patch.object(
+                    ex, "resolve_cursor_agent_binary", return_value=None
+                ):
+                    executor._phase_reviewing(
+                        conn, task_id, run.id, meta, ex.pipeline_state(meta)
+                    )
 
     assert "review_unavailable" in _dev_block_kinds(conn, task_id)
     conn.close()
+
+
+def _ghp_pat() -> str:
+    return "ghp_" + "abcdefghijklmnopqrstuvwxyz1234567890"
 
 
 def test_secret_in_diff_blocks(kanban_home, tmp_path):
@@ -260,7 +269,8 @@ def test_secret_in_diff_blocks(kanban_home, tmp_path):
         verification={},
         reviews={},
         evidence_paths=[],
-        diff_text="token ghp_abcdefghijklmnopqrstuvwxyz1234567890",
+        diff_text="token " + _ghp_pat(),
+        expected_commit="b",
         gh_fn=lambda *_a, **_k: ex.run_subprocess(["true"]),
         git_fn=lambda *_a, **_k: type(
             "P", (), {"returncode": 0, "stdout": "", "stderr": ""}

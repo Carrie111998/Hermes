@@ -11,6 +11,7 @@ import pytest
 
 from hermes_cli import dev_executor as ex
 from hermes_cli import kanban_db as kb
+from tests.dev_pipeline.conftest import git_command_success
 
 
 @pytest.fixture
@@ -111,7 +112,7 @@ def test_heartbeat_scope_fires_during_blocking_verify(kanban_home, tmp_path):
         block_release.set()
         return [fail]
 
-    with patch.object(ex, "git_command"):
+    with patch.object(ex, "git_command", side_effect=git_command_success):
         with patch.object(ex, "git_head_sha", return_value="bbb"):
             with patch.object(
                 ex, "run_verification", side_effect=blocking_verification

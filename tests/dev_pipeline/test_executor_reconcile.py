@@ -391,7 +391,7 @@ def test_reconcile_preparing_reruns_prepare_not_spawn(kanban_home_fixture):
     with patch.object(ex, "start_new_run") as mock_new_run:
         with patch.object(ex, "clone_repo", return_value=(True, "/tmp/r")):
             with patch.object(
-                ex, "ensure_dev_branch", return_value=("hermes-dev/t", "abc")
+                ex, "ensure_dev_branch", return_value=(("hermes-dev/t", "abc"), "")
             ):
                 with patch.object(ex, "install_pinned_agents", return_value="pinned"):
                     with patch.object(
