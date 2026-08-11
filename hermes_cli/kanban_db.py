@@ -94,7 +94,10 @@ from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
 from hermes_cli.kanban_repository import (
     RepositoryConfigurationError,
     RepositoryContract,
+    RefreshRequest,
+    RefreshResult,
     load_repository_contract,
+    refresh_story_branch,
     resolve_commit,
 )
 from hermes_cli.kanban_product_outcomes import (
@@ -16057,6 +16060,244 @@ def _pin_test_target_or_block(
         return False
 
 
+def _story_refresh_preflight(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str],
+) -> tuple[Optional[RefreshRequest], Optional[RefreshResult]]:
+    """Build and execute the dispatcher-owned story refresh preflight."""
+
+    meta = product_board_metadata(board)
+    if (
+        meta is None
+        or not _handoff_v2_enabled(meta)
+        or task.workflow_template_id != "product"
+        or task.current_step_key not in {"architecture", "development"}
+        or epic_id_for_task(conn, task.id) is None
+    ):
+        return None, None
+    if task.workspace_kind != "worktree":
+        return None, RefreshResult(
+            "error", error="product story refresh requires a worktree workspace"
+        )
+
+    try:
+        workspace, resolved_branch = _resolve_worktree_workspace(
+            task,
+            board=board,
+            base_branch=_story_base_branch(conn, task.id, board=board),
+            conn=conn,
+        )
+        branch = (
+            str(resolved_branch or task.branch_name or "").strip()
+            or _git_current_branch(workspace)
+        )
+        repo_root = _git_toplevel(workspace)
+        if repo_root is None or not branch:
+            return None, RefreshResult("error", error="story_repository_unresolved")
+        story_sha = _git_ref_sha(repo_root, branch)
+        epic_id = epic_id_for_task(conn, task.id)
+        epic_branch = epic_branch_for(epic_id) if epic_id else ""
+        epic_tip_sha = _git_ref_sha(repo_root, epic_branch) if epic_branch else None
+        if story_sha is None or epic_tip_sha is None:
+            return None, RefreshResult("error", error="story_refresh_source_missing")
+
+        # Materialization is part of preflight, so the first Architecture
+        # dispatch and every later Development dispatch inspect the same
+        # durable story worktree rather than the board's repository root.
+        if task.workspace_path != str(workspace):
+            set_workspace_path(conn, task.id, str(workspace))
+        if task.branch_name != branch:
+            set_branch_name(conn, task.id, branch)
+        request = RefreshRequest(
+            repo_root=repo_root,
+            story_id=task.id,
+            story_branch=branch,
+            story_worktree=workspace,
+            story_sha=story_sha,
+            epic_branch=epic_branch,
+            epic_tip_sha=epic_tip_sha,
+        )
+        return request, refresh_story_branch(request)
+    except Exception as exc:
+        _log.warning(
+            "kanban story refresh preflight failed for %s: %s",
+            task.id,
+            exc,
+        )
+        return None, RefreshResult("error", error="story_refresh_preflight_failed")
+
+
+def _route_story_refresh_rework(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    request: RefreshRequest,
+    refresh: RefreshResult,
+) -> bool:
+    """Route an isolated refresh conflict to the Development lane."""
+
+    meta = product_board_metadata(board) or {}
+    workflow = meta.get("product_workflow") if isinstance(meta, dict) else {}
+    try:
+        max_cycles = max(1, int((workflow or {}).get("max_rework_cycles", 3)))
+    except (TypeError, ValueError):
+        max_cycles = 3
+    findings = [
+        "isolated story refresh found merge conflicts in: "
+        + ", ".join(refresh.conflict_paths),
+        "retained conflict worktree: "
+        + str(refresh.conflict_worktree or "(unavailable)"),
+        f"story source SHA: {request.story_sha}",
+        f"Epic tip SHA: {request.epic_tip_sha}",
+    ]
+    with authorized_governance_write(), write_txn(conn):
+        row = conn.execute(
+            "SELECT current_step_key, status, claim_lock, rework_count "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if (
+            row is None
+            or row["status"] != "ready"
+            or row["claim_lock"] is not None
+        ):
+            return False
+        origin_phase = str(row["current_step_key"] or "development")
+        observed_count = int(row["rework_count"] or 0)
+        next_count = observed_count + 1
+        limit_reached = next_count > max_cycles
+        target_phase = "development"
+        next_status = (
+            "blocked"
+            if limit_reached
+            else _column_status_for_step(meta, target_phase)
+        )
+        next_assignee = (
+            "default"
+            if limit_reached
+            else _product_role_assignee(meta, "developer")
+        )
+        updated = conn.execute(
+            "UPDATE tasks SET rework_count = ?, current_step_key = ?, "
+            "status = ?, assignee = ?, running = 0, blocked = ?, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+            "workflow_template_id = 'product' "
+            "WHERE id = ? AND status = 'ready' AND claim_lock IS NULL "
+            "AND current_step_key IS ? AND rework_count = ?",
+            (
+                next_count,
+                target_phase,
+                next_status,
+                next_assignee,
+                1 if limit_reached else 0,
+                task_id,
+                row["current_step_key"],
+                observed_count,
+            ),
+        )
+        if updated.rowcount != 1:
+            return False
+        directive = create_rework_directive(
+            conn,
+            task_id,
+            origin_kind="refresh",
+            origin_phase=origin_phase,
+            target_phase=target_phase,
+            rejected_branch=request.story_branch,
+            rejected_sha=request.story_sha,
+            epic_tip_sha=request.epic_tip_sha,
+            findings=findings,
+        )
+        _append_event(
+            conn,
+            task_id,
+            "story_refresh_rework_routed",
+            {
+                "from_step": origin_phase,
+                "target_step": target_phase,
+                "directive_id": directive.id,
+                "findings": findings,
+                "rework_count": next_count,
+                "max_rework_cycles": max_cycles,
+                "conflict_worktree": str(refresh.conflict_worktree or ""),
+            },
+        )
+        if limit_reached:
+            _append_event(
+                conn,
+                task_id,
+                "rework_limit_reached",
+                {
+                    "reason": "maximum product rework cycles exceeded",
+                    "kind": "rework_limit",
+                    "rework_count": next_count,
+                },
+            )
+    return True
+
+
+def _consume_story_refresh_preflight(
+    conn: sqlite3.Connection,
+    task: Task,
+    *,
+    board: Optional[str],
+    request: Optional[RefreshRequest],
+    refresh: Optional[RefreshResult],
+) -> bool:
+    """Record preflight evidence and say whether the task may be claimed."""
+
+    if refresh is None:
+        return True
+    payload: dict[str, Any] = {"kind": refresh.kind}
+    if request is not None:
+        payload.update(
+            {
+                "story_branch": request.story_branch,
+                "story_sha": request.story_sha,
+                "epic_branch": request.epic_branch,
+                "epic_tip_sha": request.epic_tip_sha,
+            }
+        )
+    if refresh.after_sha:
+        payload["after_sha"] = refresh.after_sha
+    if refresh.current_sha:
+        payload["current_sha"] = refresh.current_sha
+    if refresh.current_epic_tip_sha:
+        payload["current_epic_tip_sha"] = refresh.current_epic_tip_sha
+    if refresh.dirty_paths:
+        payload["dirty_paths"] = list(refresh.dirty_paths)
+    if refresh.conflict_paths:
+        payload["conflict_paths"] = list(refresh.conflict_paths)
+    if refresh.conflict_worktree is not None:
+        payload["conflict_worktree"] = str(refresh.conflict_worktree)
+    if refresh.error:
+        payload["error"] = refresh.error
+
+    if refresh.kind == "unchanged":
+        with write_txn(conn):
+            _append_event(conn, task.id, "story_refresh_checked", payload)
+        return True
+    if refresh.kind == "refreshed":
+        payload["authority_invalidated"] = True
+        with write_txn(conn):
+            _append_event(conn, task.id, "story_refreshed", payload)
+        return True
+    if refresh.kind == "conflict" and request is not None:
+        with write_txn(conn):
+            _append_event(conn, task.id, "story_refresh_conflict", payload)
+        _route_story_refresh_rework(
+            conn, task.id, board=board, request=request, refresh=refresh
+        )
+        return False
+
+    with write_txn(conn):
+        _append_event(conn, task.id, "story_refresh_attention_required", payload)
+    return False
+
+
 def _spawn_one_v2(
     conn: sqlite3.Connection,
     task_id: str,
@@ -16084,6 +16325,19 @@ def _spawn_one_v2(
     longer ready) or the spawn attempt failed (a spawn failure is recorded
     via :func:`_record_spawn_failure` in that case).
     """
+    refresh_task = get_task(conn, task_id)
+    if refresh_task is not None:
+        refresh_request, refresh_result = _story_refresh_preflight(
+            conn, refresh_task, board=board
+        )
+        if not _consume_story_refresh_preflight(
+            conn,
+            refresh_task,
+            board=board,
+            request=refresh_request,
+            refresh=refresh_result,
+        ):
+            return None
     claimed = claim_task(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         # Already claimed (or no longer ready) -- the CAS fire-once
@@ -16632,6 +16886,15 @@ class DispatchResult:
     Reasons: ``"blocker_auth"`` (quota/auth error — also auto-blocked),
     ``"recent_success"`` (completed run within guard window),
     ``"active_pr"`` (GitHub PR URL in a recent comment)."""
+    story_refresh_attention_required: list[str] = field(default_factory=list)
+    """Product story ids held before dispatch because their source checkout
+    needs operator/developer attention (dirty, source moved, or refresh I/O)."""
+    story_refresh_conflicts: list[str] = field(default_factory=list)
+    """Product story ids routed to a Development rework directive after an
+    isolated refresh reported merge conflicts."""
+    story_refresh_refreshed: list[str] = field(default_factory=list)
+    """Product story ids whose clean branch advanced from the Epic tip before
+    the worker was claimed."""
     rate_limited: list[str] = field(default_factory=list)
     """Task ids whose workers bailed on a provider rate-limit / quota wall
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
@@ -18469,6 +18732,26 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
+        refresh_task = get_task(conn, row["id"])
+        if refresh_task is not None:
+            refresh_request, refresh_result = _story_refresh_preflight(
+                conn, refresh_task, board=board
+            )
+            if refresh_result is not None:
+                if refresh_result.kind == "conflict":
+                    result.story_refresh_conflicts.append(row["id"])
+                elif refresh_result.kind == "refreshed":
+                    result.story_refresh_refreshed.append(row["id"])
+                elif refresh_result.kind not in {"unchanged"}:
+                    result.story_refresh_attention_required.append(row["id"])
+            if not _consume_story_refresh_preflight(
+                conn,
+                refresh_task,
+                board=board,
+                request=refresh_request,
+                refresh=refresh_result,
+            ):
+                continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
             continue

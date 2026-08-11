@@ -5,9 +5,12 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import hermes_cli.kanban_repository as repository_module
 from hermes_cli.kanban_repository import (
     RepositoryConfigurationError,
+    RefreshRequest,
     load_repository_contract,
+    refresh_story_branch,
     resolve_commit,
 )
 
@@ -220,3 +223,183 @@ def test_resolve_commit_rejects_ambiguous_ref(repository: Path):
         resolve_commit(repository, "shared")
 
     assert exc_info.value.code == "missing_ref"
+
+
+def _git(repo: Path, *args: str) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout.strip()
+
+
+def _commit(repo: Path, name: str, content: str, message: str) -> str:
+    (repo / name).write_text(content, encoding="utf-8")
+    _git(repo, "add", name)
+    _git(repo, "commit", "-m", message)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _refresh_fixture(repository: Path) -> tuple[Path, Path]:
+    _git(repository, "branch", "story")
+    _git(repository, "branch", "epic")
+    return repository, repository
+
+
+def _refresh_request(
+    story: Path,
+    epic: Path,
+    *,
+    story_sha: str | None = None,
+    epic_tip_sha: str | None = None,
+) -> RefreshRequest:
+    return RefreshRequest(
+        repo_root=story,
+        story_id="story-fixture",
+        story_worktree=story,
+        story_branch="story",
+        story_sha=story_sha or _git(story, "rev-parse", "story"),
+        epic_branch="epic",
+        epic_tip_sha=epic_tip_sha or _git(epic, "rev-parse", "epic"),
+    )
+
+
+def test_refresh_story_branch_advances_clean_story_by_isolated_cas(repository: Path, tmp_path: Path):
+    story, epic = _refresh_fixture(repository)
+    _git(repository, "checkout", "epic")
+    _commit(epic, "epic.txt", "epic\n", "epic change")
+    _git(repository, "checkout", "story")
+    before = _git(story, "rev-parse", "story")
+
+    result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
+
+    assert result.kind == "refreshed"
+    assert result.before_sha == before
+    assert result.after_sha == _git(story, "rev-parse", "story")
+    assert result.after_sha != before
+    assert (story / "epic.txt").read_text(encoding="utf-8") == "epic\n"
+    assert _git(story, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_refresh_story_branch_returns_dirty_evidence_without_touching_story(repository: Path, tmp_path: Path):
+    story, epic = _refresh_fixture(repository)
+    _git(repository, "checkout", "epic")
+    _commit(epic, "epic.txt", "epic\n", "epic change")
+    _git(repository, "checkout", "story")
+    dirty = story / "operator-note.txt"
+    dirty.write_text("keep me\n", encoding="utf-8")
+    before = _git(story, "rev-parse", "story")
+
+    result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
+
+    assert result.kind == "dirty"
+    assert result.before_sha == before
+    assert result.after_sha is None
+    assert result.dirty_paths == ("operator-note.txt",)
+    assert _git(story, "rev-parse", "story") == before
+    assert dirty.read_text(encoding="utf-8") == "keep me\n"
+
+
+def test_refresh_story_branch_returns_conflict_and_retains_isolated_evidence(
+    repository: Path, tmp_path: Path
+):
+    story, epic = _refresh_fixture(repository)
+    _git(repository, "checkout", "story")
+    _commit(story, "shared.txt", "story\n", "story change")
+    _git(repository, "checkout", "epic")
+    _commit(epic, "shared.txt", "epic\n", "epic change")
+    _git(repository, "checkout", "story")
+    before = _git(story, "rev-parse", "story")
+
+    result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
+
+    assert result.kind == "conflict"
+    assert result.before_sha == before
+    assert result.after_sha is None
+    assert result.conflict_worktree is not None
+    assert result.conflict_worktree.is_dir()
+    assert result.conflict_paths == ("shared.txt",)
+    assert _git(story, "rev-parse", "story") == before
+    assert _git(story, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_refresh_story_branch_returns_source_moved_evidence(repository: Path, tmp_path: Path):
+    story, epic = _refresh_fixture(repository)
+    _git(repository, "checkout", "epic")
+    _commit(epic, "epic.txt", "epic\n", "epic change")
+    _git(repository, "checkout", "story")
+    pinned_story_sha = _git(story, "rev-parse", "story")
+    _commit(story, "story.txt", "moved\n", "move story source")
+    moved_story_sha = _git(story, "rev-parse", "story")
+
+    result = refresh_story_branch(
+        _refresh_request(story, epic, story_sha=pinned_story_sha)
+    )
+
+    assert result.kind == "source_moved"
+    assert result.before_sha == pinned_story_sha
+    assert result.current_sha == moved_story_sha
+    assert _git(story, "rev-parse", "story") == moved_story_sha
+
+
+def test_refresh_story_branch_detects_source_move_between_merge_and_cas(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    story, epic = _refresh_fixture(repository)
+    _git(repository, "checkout", "epic")
+    _commit(epic, "epic.txt", "epic\n", "epic change")
+    _git(repository, "checkout", "story")
+    before = _git(story, "rev-parse", "story")
+    original_refresh_git = repository_module._refresh_git
+    moved = False
+
+    def move_story_before_cas(path: Path, *args: str, **kwargs):
+        nonlocal moved
+        if args[:1] == ("update-ref",) and not moved:
+            moved = True
+            _commit(story, "story-late.txt", "late\n", "story moved during refresh")
+        return original_refresh_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module, "_refresh_git", move_story_before_cas)
+    result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
+
+    moved_story_sha = _git(story, "rev-parse", "story")
+    assert result.kind == "source_moved"
+    assert result.before_sha == before
+    assert result.current_sha == moved_story_sha
+    assert moved_story_sha != before
+    assert _git(story, "status", "--porcelain", "--untracked-files=all") == ""
+
+
+def test_refresh_story_branch_rechecks_dirty_worktree_before_cas(
+    repository: Path, monkeypatch: pytest.MonkeyPatch
+):
+    story, epic = _refresh_fixture(repository)
+    _git(repository, "checkout", "epic")
+    _commit(epic, "epic.txt", "epic\n", "epic change")
+    _git(repository, "checkout", "story")
+    before = _git(story, "rev-parse", "story")
+    original_refresh_git = repository_module._refresh_git
+    status_checks = 0
+    dirtied = False
+
+    def dirty_story_before_cas(path: Path, *args: str, **kwargs):
+        nonlocal dirtied, status_checks
+        if args[:1] == ("status",):
+            status_checks += 1
+        if args[:1] == ("status",) and status_checks == 2 and not dirtied:
+            dirtied = True
+            (story / "README.md").write_text("operator edit\n", encoding="utf-8")
+        return original_refresh_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(repository_module, "_refresh_git", dirty_story_before_cas)
+    result = refresh_story_branch(_refresh_request(story, epic, story_sha=before))
+
+    assert result.kind == "dirty"
+    assert result.before_sha == before
+    assert result.after_sha is None
+    assert result.dirty_paths == ("README.md",)
+    assert _git(story, "rev-parse", "story") == before
+    assert (story / "README.md").read_text(encoding="utf-8") == "operator edit\n"

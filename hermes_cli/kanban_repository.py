@@ -10,9 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
+import tempfile
+import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any
@@ -73,6 +76,50 @@ class RepositoryContract:
     generated_paths: tuple[PurePosixPath, ...]
     ci_workflows: tuple[str, ...]
     digest: str
+
+
+@dataclass(frozen=True)
+class RefreshRequest:
+    """Pinned inputs for one dispatcher-owned story refresh attempt."""
+
+    repo_root: Path
+    story_id: str
+    story_branch: str
+    story_worktree: Path
+    story_sha: str
+    epic_branch: str
+    epic_tip_sha: str
+
+
+@dataclass(frozen=True)
+class RefreshResult:
+    """Typed result of an isolated story refresh attempt.
+
+    ``conflict_worktree`` is intentionally retained for a conflict.  It is a
+    disposable detached checkout, never the user's story worktree, and gives a
+    later Development worker the exact files that need attention.
+    """
+
+    kind: str
+    before_sha: str | None = None
+    after_sha: str | None = None
+    current_sha: str | None = None
+    current_epic_tip_sha: str | None = None
+    dirty_paths: tuple[str, ...] = ()
+    conflict_paths: tuple[str, ...] = ()
+    conflict_worktree: Path | None = None
+    error: str | None = None
+    story_id: str | None = None
+    story_branch: str | None = None
+    story_sha: str | None = None
+    epic_branch: str | None = None
+    epic_tip_sha: str | None = None
+
+    @property
+    def retained_worktree(self) -> Path | None:
+        """Compatibility name for the retained conflict evidence checkout."""
+
+        return self.conflict_worktree
 
 
 def _error(code: str, detail: str | None = None) -> RepositoryConfigurationError:
@@ -449,3 +496,242 @@ def resolve_commit(repo_root: Path, ref: str) -> str:
     ):
         raise _error("missing_ref", ref)
     return sha
+
+
+def _refresh_git(
+    path: Path, *args: str, check: bool = False
+) -> subprocess.CompletedProcess[str]:
+    """Run one bounded Git operation without invoking a shell."""
+
+    return subprocess.run(
+        ["git", "-C", str(path), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=check,
+    )
+
+
+def _refresh_sha(path: Path, ref: str) -> str | None:
+    completed = _refresh_git(path, "rev-parse", "--verify", f"{ref}^{{commit}}")
+    value = (completed.stdout or "").strip()
+    return value if completed.returncode == 0 and FULL_SHA.fullmatch(value) else None
+
+
+def _refresh_status_paths(path: Path) -> tuple[str, ...] | None:
+    completed = _refresh_git(
+        path,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    if completed.returncode != 0:
+        return None
+    paths: list[str] = []
+    for line in (completed.stdout or "").splitlines():
+        if len(line) >= 4:
+            paths.append(line[3:])
+    return tuple(paths)
+
+
+def _refresh_conflict_paths(path: Path) -> tuple[str, ...]:
+    completed = _refresh_git(path, "diff", "--name-only", "--diff-filter=U")
+    return tuple(
+        line.strip()
+        for line in (completed.stdout or "").splitlines()
+        if line.strip()
+    )
+
+
+def _remove_refresh_worktree(repo_root: Path, worktree: Path, parent: Path) -> None:
+    """Best-effort cleanup for a successful or failed disposable checkout."""
+
+    try:
+        _refresh_git(repo_root, "worktree", "remove", "--force", str(worktree))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if worktree.exists():
+        try:
+            shutil.rmtree(worktree)
+        except OSError:
+            pass
+    try:
+        parent.rmdir()
+    except OSError:
+        pass
+
+
+def _refresh_story_branch(request: RefreshRequest) -> RefreshResult:
+    """Refresh a clean story branch from a pinned Epic tip in isolation.
+
+    The caller pins both source refs immediately before dispatch.  This
+    function rechecks both refs, refuses dirty user work, builds the merge in a
+    detached disposable worktree, and only then advances the story ref with
+    ``git update-ref <new> <old>``.  A conflict leaves that disposable worktree
+    in place as evidence; the original story checkout and branch are untouched.
+    """
+
+    repo_root = Path(request.repo_root).expanduser().resolve(strict=False)
+    story_worktree = Path(request.story_worktree).expanduser().resolve(strict=False)
+    before_sha = str(request.story_sha or "").strip()
+    pinned_epic_sha = str(request.epic_tip_sha or "").strip()
+    if not FULL_SHA.fullmatch(before_sha):
+        return RefreshResult("error", error="invalid_story_sha")
+    if not FULL_SHA.fullmatch(pinned_epic_sha):
+        return RefreshResult("error", error="invalid_epic_tip_sha")
+
+    root = _refresh_git(story_worktree, "rev-parse", "--show-toplevel")
+    resolved_root = (root.stdout or "").strip()
+    if root.returncode != 0 or not resolved_root:
+        return RefreshResult("error", before_sha=before_sha, error="story_worktree_not_git")
+    if Path(resolved_root).expanduser().resolve(strict=False) != repo_root:
+        return RefreshResult("error", before_sha=before_sha, error="repository_mismatch")
+
+    current_story_sha = _refresh_sha(
+        repo_root, f"refs/heads/{request.story_branch}"
+    )
+    current_epic_sha = _refresh_sha(repo_root, f"refs/heads/{request.epic_branch}")
+    if current_story_sha is None or current_epic_sha is None:
+        return RefreshResult("error", before_sha=before_sha, error="source_ref_missing")
+    if current_story_sha != before_sha or current_epic_sha != pinned_epic_sha:
+        return RefreshResult(
+            "source_moved",
+            before_sha=before_sha,
+            current_sha=current_story_sha,
+            current_epic_tip_sha=current_epic_sha,
+        )
+
+    dirty_paths = _refresh_status_paths(story_worktree)
+    if dirty_paths is None:
+        return RefreshResult("error", before_sha=before_sha, error="status_failed")
+    if dirty_paths:
+        return RefreshResult(
+            "dirty",
+            before_sha=before_sha,
+            current_sha=current_story_sha,
+            dirty_paths=dirty_paths,
+        )
+
+    ancestry = _refresh_git(
+        repo_root,
+        "merge-base",
+        "--is-ancestor",
+        pinned_epic_sha,
+        before_sha,
+    )
+    if ancestry.returncode == 0:
+        return RefreshResult("unchanged", before_sha=before_sha, after_sha=before_sha)
+    if ancestry.returncode != 1:
+        return RefreshResult("error", before_sha=before_sha, error="ancestry_check_failed")
+
+    parent = Path(tempfile.mkdtemp(prefix="hermes-story-refresh-"))
+    candidate = parent / f"candidate-{uuid.uuid4().hex[:12]}"
+    try:
+        parent.rmdir()
+    except OSError:
+        pass
+    added = _refresh_git(
+        repo_root,
+        "worktree",
+        "add",
+        "--detach",
+        str(candidate),
+        before_sha,
+    )
+    if added.returncode != 0:
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult("error", before_sha=before_sha, error="candidate_create_failed")
+
+    merged = _refresh_git(candidate, "merge", "--no-ff", "--no-edit", pinned_epic_sha)
+    if merged.returncode != 0:
+        conflict_paths = _refresh_conflict_paths(candidate)
+        if conflict_paths:
+            return RefreshResult(
+                "conflict",
+                before_sha=before_sha,
+                conflict_paths=conflict_paths,
+                conflict_worktree=candidate,
+            )
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult("error", before_sha=before_sha, error="candidate_merge_failed")
+
+    candidate_sha = _refresh_sha(candidate, "HEAD")
+    if candidate_sha is None:
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult("error", before_sha=before_sha, error="candidate_head_missing")
+
+    # Recheck both pins immediately before the CAS.  A source move never
+    # overwrites the story branch and never leaves a disposable checkout behind.
+    current_story_sha = _refresh_sha(
+        repo_root, f"refs/heads/{request.story_branch}"
+    )
+    current_epic_sha = _refresh_sha(repo_root, f"refs/heads/{request.epic_branch}")
+    if current_story_sha != before_sha or current_epic_sha != pinned_epic_sha:
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult(
+            "source_moved",
+            before_sha=before_sha,
+            current_sha=current_story_sha,
+            current_epic_tip_sha=current_epic_sha,
+        )
+
+    # The isolated merge can take long enough for an operator to edit the
+    # original checkout after the first clean-status check.  Recheck immediately
+    # before the branch CAS so read-tree can never overwrite newly-created user
+    # work, and leave the story branch untouched when it does.
+    latest_dirty_paths = _refresh_status_paths(story_worktree)
+    if latest_dirty_paths is None:
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult("error", before_sha=before_sha, error="status_failed")
+    if latest_dirty_paths:
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult(
+            "dirty",
+            before_sha=before_sha,
+            current_sha=current_story_sha,
+            dirty_paths=latest_dirty_paths,
+        )
+
+    updated = _refresh_git(
+        repo_root,
+        "update-ref",
+        f"refs/heads/{request.story_branch}",
+        candidate_sha,
+        before_sha,
+    )
+    if updated.returncode != 0:
+        current_story_sha = _refresh_sha(
+            repo_root, f"refs/heads/{request.story_branch}"
+        )
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult(
+            "source_moved",
+            before_sha=before_sha,
+            current_sha=current_story_sha,
+            current_epic_tip_sha=current_epic_sha,
+        )
+
+    # ``update-ref`` changes the branch atomically, while ``read-tree`` brings
+    # the already-verified clean checkout along without reset/clean/stash.
+    checked_out = _refresh_git(story_worktree, "read-tree", "-mu", candidate_sha)
+    if checked_out.returncode != 0:
+        _remove_refresh_worktree(repo_root, candidate, parent)
+        return RefreshResult("error", before_sha=before_sha, after_sha=candidate_sha, error="story_checkout_update_failed")
+    _remove_refresh_worktree(repo_root, candidate, parent)
+    return RefreshResult("refreshed", before_sha=before_sha, after_sha=candidate_sha)
+
+
+def refresh_story_branch(request: RefreshRequest) -> RefreshResult:
+    """Run :func:`_refresh_story_branch` and attach the pinned lineage facts."""
+
+    result = _refresh_story_branch(request)
+    return replace(
+        result,
+        story_id=request.story_id,
+        story_branch=request.story_branch,
+        story_sha=result.after_sha or result.before_sha,
+        epic_branch=request.epic_branch,
+        epic_tip_sha=request.epic_tip_sha,
+    )
