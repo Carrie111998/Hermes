@@ -3551,6 +3551,58 @@ def _strip_leaked_bracketed_paste_wrappers(text: str) -> str:
     return strip_leaked_bracketed_paste_wrappers(text)
 
 
+def _hermes_call_output_screen_diff(
+    orig_osd,
+    app,
+    output,
+    screen,
+    current_pos,
+    color_depth,
+    previous_screen,
+    last_style,
+    is_done,
+    full_screen,
+    attrs_for_style_string,
+    style_string_has_style,
+    size,
+    previous_width,
+):
+    """Call prompt_toolkit ``_output_screen_diff`` with Hermes resize guards.
+
+    1. Inflate ``previous_screen.height`` when the new screen is taller so pt
+       skips the reserve-vertical-space cursor move that stamps chrome into
+       scrollback (pt #29 / Hermes #26137).
+    2. On AttributeError/TypeError from a corrupt previous paint buffer
+       (classic after tmux attach with same width), retry once with
+       ``previous_screen=None`` so pt first-paints cleanly instead of crashing
+       the event loop with ``'cell' object has no attribute 'char'``.
+    """
+    try:
+        if previous_screen is not None and hasattr(previous_screen, "height"):
+            if previous_screen.height < screen.height:
+                previous_screen.height = screen.height
+    except Exception:
+        pass
+
+    try:
+        return orig_osd(
+            app, output, screen, current_pos, color_depth,
+            previous_screen, last_style, is_done, full_screen,
+            attrs_for_style_string, style_string_has_style,
+            size, previous_width,
+        )
+    except (AttributeError, TypeError):
+        # Corrupt previous_screen / row cells after client reattach.
+        return orig_osd(
+            app, output, screen, current_pos, color_depth,
+            None,  # previous_screen → first-paint erase path
+            None,  # last_style
+            is_done, full_screen,
+            attrs_for_style_string, style_string_has_style,
+            size, 0,  # previous_width → treat as changed
+        )
+
+
 def _apply_bracketed_paste_timeout_patch() -> None:
     """Patch prompt_toolkit to recover from torn bracketed-paste sequences.
 
@@ -5038,15 +5090,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         at the input loop remains as a fast path.
         """
         self._status_bar_suppressed_after_resize = True
-        # On a WIDTH change the terminal has already reflowed the old full-width
-        # chrome into extra physical rows that prompt_toolkit's stale-cursor
-        # erase (cursor_up(_cursor_pos.y) cached at the OLD width) will not
-        # reach, leaving a duplicated status bar stranded above the live origin.
-        # Ctrl+L / /redraw clears it cleanly, so route the resize path through
-        # the SAME recovery: wipe the visible viewport (banner-safe — CSI 2J
-        # only, never CSI 3J) and replay the transcript so nothing is lost.
-        # Row-count-only changes skip this (no reflow → no ghost) to avoid an
-        # unnecessary full repaint.
+        # Always wipe the visible viewport before prompt_toolkit's resize path.
+        # Width changes reflow old full-width chrome into extra physical rows
+        # that pt's stale-cursor erase cannot reach (duplicated status bar —
+        # #19280/#5474). Same-width SIGWINCH is also common: tmux attach /
+        # client reattach often keeps columns identical while the client PTY
+        # and prompt_toolkit previous_screen cache are stale, which crashed
+        # redraw with AttributeError "'cell' object has no attribute 'char'".
+        # Banner-safe: CSI 2J only (never CSI 3J scrollback wipe).
         try:
             new_width = self._get_tui_terminal_width()
         except Exception:
@@ -5055,12 +5106,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # First resize of the session has no prior width to compare against;
         # treat it as a change so an initial maximize/restore is covered too.
         width_changed = new_width is not None and new_width != prev_width
-        if width_changed:
-            try:
-                self._clear_prompt_toolkit_screen(app, rebuild_scrollback=False)
+        try:
+            self._clear_prompt_toolkit_screen(app, rebuild_scrollback=False)
+            # Replay transcript only when columns changed — reflow can push
+            # history out of the viewport. Same-width attach does not need it
+            # and avoids double-stamping scrollback.
+            if width_changed:
                 _replay_output_history()
-            except Exception:
-                pass
+        except Exception:
+            pass
         if new_width is not None:
             self._last_resize_width = new_width
         original_on_resize()
@@ -17617,20 +17671,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     other code path's behavior.
 
                     Critical: do NOT replace a None previous_screen with
-                    a fresh Screen() — that would skip the proper
-                    reset_attributes()+erase_down() at L178-185 which
-                    fires when previous_screen is None (first-paint /
+                    a fresh Screen() on the happy path — that would skip
+                    the proper reset_attributes()+erase_down() at L178-185
+                    which fires when previous_screen is None (first-paint /
                     width-change).  Without that reset, ANSI styles
                     leak between renders.
-                    """
-                    try:
-                        if previous_screen is not None and hasattr(previous_screen, "height"):
-                            if previous_screen.height < screen.height:
-                                previous_screen.height = screen.height
-                    except Exception:
-                        pass
 
-                    return _orig_osd(
+                    Safety net: if the diff crashes with AttributeError /
+                    TypeError (corrupt previous_screen after tmux attach —
+                    "'cell' object has no attribute 'char'"), retry once
+                    with previous_screen=None so pt takes the first-paint
+                    erase path instead of wedging the event loop.
+                    """
+                    return _hermes_call_output_screen_diff(
+                        _orig_osd,
                         app, output, screen, current_pos, color_depth,
                         previous_screen, last_style, is_done, full_screen,
                         attrs_for_style_string, style_string_has_style,
