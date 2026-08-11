@@ -25,7 +25,7 @@ const KEYS = [
 ] as const
 
 test('every supported renderer locale yields a complete, non-empty label set', () => {
-  for (const locale of ['en', 'zh', 'zh-hant', 'ja']) {
+  for (const locale of ['en', 'zh', 'zh-hant', 'ja', 'ar']) {
     const labels = getContextMenuLabels(locale)
 
     for (const key of KEYS) {
@@ -38,7 +38,7 @@ test('every supported renderer locale yields a complete, non-empty label set', (
 test('localized sets actually differ from English (not silently falling back)', () => {
   const en = getContextMenuLabels('en')
 
-  for (const locale of ['zh', 'zh-hant', 'ja']) {
+  for (const locale of ['zh', 'zh-hant', 'ja', 'ar']) {
     assert.notEqual(getContextMenuLabels(locale).paste, en.paste, locale)
   }
 })

@@ -73,6 +73,19 @@ const LABELS: Record<string, ContextMenuLabels> = {
     copy: 'コピー',
     paste: '貼り付け',
     selectAll: 'すべて選択'
+  },
+  ar: {
+    openImage: 'فتح الصورة',
+    copyImage: 'نسخ الصورة',
+    copyImageAddress: 'نسخ عنوان الصورة',
+    saveImageAs: 'حفظ الصورة باسم...',
+    openLink: 'فتح الرابط',
+    copyLink: 'نسخ الرابط',
+    addToDictionary: 'إضافة إلى القاموس',
+    cut: 'قص',
+    copy: 'نسخ',
+    paste: 'لصق',
+    selectAll: 'تحديد الكل'
   }
 }
 
