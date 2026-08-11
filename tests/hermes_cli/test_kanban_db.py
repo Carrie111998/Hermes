@@ -1447,6 +1447,54 @@ def test_complete_task_refuses_unresolved_preflight_without_mutation(kanban_home
         assert _resolver_state(conn, tid) == before
 
 
+@pytest.mark.parametrize(
+    ("step", "metadata", "code"),
+    [
+        ("test", None, "missing"),
+        (
+            "review",
+            {"workflow_outcome": {"verdict": "approved", "unexpected": True}},
+            "invalid_shape",
+        ),
+    ],
+)
+def test_complete_task_rejects_unresolved_test_review_without_mutation(
+    kanban_home, step, metadata, code
+):
+    """Ordinary completion validates Test/Review before the Resolver path."""
+    board = f"resolver-complete-outcome-{step}"
+    _v2_product_board(board)
+    with kb.connect(board=board) as conn:
+        tid, run_id = _route_task_to_resolver(conn, board, step=step)
+        before = _resolver_state(conn, tid)
+        with pytest.raises(kb.ProductOutcomeError) as raised:
+            kb.complete_task(
+                conn,
+                tid,
+                summary="Ordinary completion without a canonical outcome",
+                metadata=metadata,
+                expected_run_id=run_id,
+                board=board,
+            )
+        after = _resolver_state(conn, tid)
+
+    assert raised.value.code == code
+    assert after["task"] == before["task"]
+    assert after["runs"] == before["runs"]
+    assert after["links"] == before["links"]
+    assert after["events"][:-1] == before["events"]
+    rejection = [
+        event for event in after["events"]
+        if event[3] == "completion_rejected_outcome"
+    ]
+    assert len(rejection) == 1
+    assert json.loads(rejection[0][4]) == {
+        "run_id": run_id,
+        "phase": step,
+        "code": code,
+    }
+
+
 def test_resolve_product_preflight_resume_uses_complete_snapshot(kanban_home):
     board = "resolver-entry-resume"
     _v2_product_board(board)

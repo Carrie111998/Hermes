@@ -10342,10 +10342,6 @@ def _validate_ordinary_product_outcome(
     phase = str(row["current_step_key"] or "").strip()
     if phase not in PRODUCT_POSITIVE_OUTCOME_STEPS.values():
         return None, None, None
-    if _latest_unresolved_product_preflight(conn, task_id):
-        # Resolver completion is a separate structural path. It never obtains
-        # authority from a worker-supplied terminal outcome envelope.
-        return None, None, None
     run_id = (
         int(row["current_run_id"])
         if row["current_run_id"] is not None
