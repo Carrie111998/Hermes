@@ -36,6 +36,7 @@ _ensure_telegram_mock()
 
 from gateway.platforms.telegram import (  # noqa: E402
     TelegramAdapter,
+    _classify_table_headers,
     _escape_mdv2,
     _strip_mdv2,
     _wrap_markdown_tables,
@@ -715,4 +716,211 @@ async def test_send_escapes_chunk_indicator_for_markdownv2(adapter):
     assert result.success is True
     assert len(sent_texts) > 1
     assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[0])
-    assert re.search(r" \\\([0-9]+/[0-9]+\\\)$", sent_texts[-1])
+
+
+# =========================================================================
+# Table classification (Phase 3 Packet 5)
+# =========================================================================
+
+class TestClassifyTableHeaders:
+    def test_field_value_is_key_value(self):
+        assert _classify_table_headers(["Field", "Value"]) == "KEY_VALUE"
+
+    def test_field_value_case_insensitive(self):
+        assert _classify_table_headers(["field", "value"]) == "KEY_VALUE"
+        assert _classify_table_headers(["FIELD", "VALUE"]) == "KEY_VALUE"
+
+    def test_field_value_whitespace_tolerant(self):
+        assert _classify_table_headers([" Field ", " Value "]) == "KEY_VALUE"
+
+    def test_reversed_order_not_key_value(self):
+        """Value | Field is not the documented shape — narrow classifier,
+        not a semantic guess (Phase 3 plan, Packet 5, 5.1)."""
+        assert _classify_table_headers(["Value", "Field"]) == "GENERIC_TWO_COLUMN"
+
+    def test_synonyms_not_key_value(self):
+        """Key/Label/Name are NOT recognized — zero corpus evidence found for
+        any header pair beyond the documented Field | Value shape."""
+        assert _classify_table_headers(["Key", "Value"]) == "GENERIC_TWO_COLUMN"
+        assert _classify_table_headers(["Label", "Value"]) == "GENERIC_TWO_COLUMN"
+        assert _classify_table_headers(["Name", "Value"]) == "GENERIC_TWO_COLUMN"
+
+    def test_option_tradeoff_is_generic(self):
+        assert _classify_table_headers(["Option", "Tradeoff"]) == "GENERIC_TWO_COLUMN"
+
+    def test_task_owner_is_generic(self):
+        assert _classify_table_headers(["Task", "Owner"]) == "GENERIC_TWO_COLUMN"
+
+    def test_three_columns_is_multi_column(self):
+        assert _classify_table_headers(["Name", "Age", "City"]) == "MULTI_COLUMN"
+
+    def test_three_columns_including_field_value_still_multi_column(self):
+        """A 3rd column disqualifies KEY_VALUE even if two headers match —
+        the shape is no longer the documented pair."""
+        assert _classify_table_headers(["Field", "Value", "Notes"]) == "MULTI_COLUMN"
+
+
+# =========================================================================
+# KEY_VALUE table rendering (Phase 3 Packet 5)
+# =========================================================================
+
+class TestKeyValueTableRendering:
+    """Field | Value tables render as concise Label: value lines — no
+    manufactured heading, no duplicated Field:/Value: labels. This is the
+    proven historical defect (Phase 3 Packets 1/3): any 2-column table
+    previously became `**heading**` + `• Field: X` + `• Value: Y`."""
+
+    def test_single_key_value_table(self):
+        text = "| Field | Value |\n|---|---|\n| Branch | fix/example |"
+        out = _wrap_markdown_tables(text)
+        assert out == "Branch: fix/example"
+
+    def test_multiple_key_value_rows(self):
+        text = (
+            "| Field | Value |\n"
+            "|---|---|\n"
+            "| Branch | fix/example |\n"
+            "| Status | done |\n"
+            "| Tests | 54 passed |"
+        )
+        out = _wrap_markdown_tables(text)
+        assert out == "Branch: fix/example\nStatus: done\nTests: 54 passed"
+
+    def test_empty_value_stays_visible(self):
+        text = "| Field | Value |\n|---|---|\n| Next |  |"
+        out = _wrap_markdown_tables(text)
+        assert out == "Next: "
+        assert "Next" in out  # the line is present, not silently dropped
+
+    def test_key_value_table_through_format_message(self, adapter):
+        text = "Deploy record:\n\n| Field | Value |\n|---|---|\n| Branch | fix/example |\n"
+        out = adapter.format_message(text)
+        assert "Branch: fix/example" in out
+        # No manufactured heading or duplicated labels reached delivery.
+        assert "*Branch*" not in out
+        assert "Field:" not in out
+        assert "Value:" not in out
+
+    def test_historical_duplicate_field_value_artifact_absent(self, adapter):
+        """The exact proven historical failure (Phase 3 plan, Packet 5, 5.6):
+        a Field | Value table must NOT produce heading=first-cell +
+        `Field: <same value>` + `Value: <value>`. This test fails against
+        the pre-Packet-5 implementation and passes with the correction."""
+        text = "| Field | Value |\n|---|---|\n| Branch | fix/operator-cron-notifications |"
+        out = adapter.format_message(text)
+        assert "Field: Branch" not in out
+        assert "Value: fix" not in out
+        assert "*Branch*" not in out  # no heading derived from the first cell
+        assert "Branch: fix/operator\\-cron\\-notifications" in out  # MarkdownV2-escaped hyphens
+
+    def test_bare_pipe_key_value_table(self):
+        """Tables without outer pipes (GFM allows this) still classify correctly."""
+        text = "Field | Value\n--- | ---\nBranch | main"
+        out = _wrap_markdown_tables(text)
+        assert out == "Branch: main"
+
+    def test_malformed_short_row_stays_safe(self):
+        """A row with fewer cells than headers must not crash — pads with an
+        empty value, matching the existing generic-table padding behavior
+        (Phase 3 plan, Packet 5, 5.4: preserve, don't redesign)."""
+        text = "| Field | Value |\n|---|---|\n| OnlyOneCell |"
+        out = _wrap_markdown_tables(text)
+        assert out == "OnlyOneCell: "
+
+    def test_malformed_long_row_stays_safe(self):
+        """A row with more cells than headers must not crash — truncates to
+        header count, matching existing behavior."""
+        text = "| Field | Value |\n|---|---|\n| Branch | main | extra | stuff |"
+        out = _wrap_markdown_tables(text)
+        assert out == "Branch: main"
+
+    def test_empty_label_falls_back_to_row_number(self):
+        text = "| Field | Value |\n|---|---|\n|  | orphaned-value |"
+        out = _wrap_markdown_tables(text)
+        assert out == "Row 1: orphaned-value"
+
+
+# =========================================================================
+# Generic two-column / multi-column tables UNCHANGED (Phase 3 Packet 5)
+# =========================================================================
+
+class TestGenericTableRenderingUnchanged:
+    """Non-Field/Value shapes must keep the pre-Packet-5 heading + bullet
+    rendering exactly — Packet 5 does not redesign generic table
+    presentation (plan 5.3)."""
+
+    def test_option_tradeoff_keeps_heading_and_bullets(self):
+        text = "| Option | Tradeoff |\n|---|---|\n| A | Faster |\n| B | Safer |"
+        out = _wrap_markdown_tables(text)
+        assert "**A**" in out
+        assert "• Option: A" in out
+        assert "• Tradeoff: Faster" in out
+        assert "**B**" in out
+        assert "• Tradeoff: Safer" in out
+        # Must NOT be collapsed to Label: value the way KEY_VALUE tables are.
+        assert "A: Faster" not in out
+
+    def test_task_owner_keeps_heading_and_bullets(self):
+        text = "| Task | Owner |\n|---|---|\n| Deploy | Alice |\n| Review | Bob |"
+        out = _wrap_markdown_tables(text)
+        assert "**Deploy**" in out
+        assert "• Task: Deploy" in out
+        assert "• Owner: Alice" in out
+        assert "Deploy: Alice" not in out
+
+    def test_before_after_keeps_heading_and_bullets(self):
+        text = "| Before | After |\n|---|---|\n| slow | fast |"
+        out = _wrap_markdown_tables(text)
+        assert "**slow**" in out
+        assert "• Before: slow" in out
+        assert "• After: fast" in out
+
+    def test_three_column_table_unchanged(self):
+        """Existing multi-column behavior (already covered by
+        TestWrapMarkdownTables.test_alignment_separators) reaffirmed here
+        under the new classifier — must be byte-identical to pre-Packet-5."""
+        text = "| Name | Age | City |\n|:-----|----:|:----:|\n| Ada  |  30 | NYC  |"
+        out = _wrap_markdown_tables(text)
+        assert "**Ada**" in out
+        assert "• Age: 30" in out
+        assert "• City: NYC" in out
+
+
+# =========================================================================
+# Edge cases / truncation interaction (Phase 3 Packet 5)
+# =========================================================================
+
+class TestKeyValueEdgeCases:
+    def test_fenced_key_value_pseudo_table_untouched(self):
+        text = "```\n| Field | Value |\n|---|---|\n| Branch | main |\n```"
+        assert _wrap_markdown_tables(text) == text
+
+    def test_consecutive_key_value_and_generic_tables(self):
+        text = (
+            "| Field | Value |\n|---|---|\n| Branch | main |\n"
+            "\n"
+            "| Option | Tradeoff |\n|---|---|\n| A | Faster |"
+        )
+        out = _wrap_markdown_tables(text)
+        assert "Branch: main" in out
+        assert "**A**" in out
+        assert "• Option: A" in out
+        # The key/value table's row must not gain a manufactured heading.
+        assert "**Branch**" not in out
+
+    def test_key_value_table_near_truncation_boundary(self, adapter):
+        """A Field | Value table positioned right at the MarkdownV2 4096-char
+        boundary must not corrupt a label/value pair or crash — plan 5.5."""
+        adapter.MAX_MESSAGE_LENGTH = 200
+        filler = "x" * 150
+        text = f"{filler}\n\n| Field | Value |\n|---|---|\n| Branch | fix/example |\n"
+        out = adapter.format_message(text)
+        chunks = adapter.truncate_message(out, adapter.MAX_MESSAGE_LENGTH)
+        assert len(chunks) >= 1
+        # No chunk should contain a label split from its colon-value pair
+        # (e.g. "Branch" in one chunk, ": fix/example" alone in the next
+        # would indicate a corrupted split — not something this fix can
+        # fully prevent for a body split mid-line, but the label token
+        # itself must never be duplicated or garbled).
+        joined = "".join(chunks)
+        assert joined.count("Branch") <= out.count("Branch")

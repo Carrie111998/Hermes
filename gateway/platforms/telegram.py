@@ -155,14 +155,59 @@ def _split_markdown_table_row(line: str) -> list[str]:
     return [cell.strip() for cell in stripped.split("|")]
 
 
+# Table classification for rendering purposes (Phase 3 Packet 5). Evidence-
+# bound: a repo-wide search of production cron output found zero real
+# two-column table header pairs of any kind — the only concrete evidence for
+# a "key/value" shape is the documented `Field | Value` example
+# (technical-message-style/SOUL.md), which is also the exact shape whose
+# *old* rendering (heading + duplicated `Field:`/`Value:` bullets) was the
+# proven defect. Absent broader evidence, KEY_VALUE recognition is kept to
+# that exact header pair rather than a semantic guess at synonyms like
+# Key/Label/Name — see the Phase 3 plan, Packet 5, for the narrower-
+# classifier-over-heuristic-guessing rationale.
+_KEY_VALUE_HEADER_PAIRS = {("field", "value")}
+
+
+def _classify_table_headers(headers: list[str]) -> str:
+    """Classify a table by its header row: KEY_VALUE, GENERIC_TWO_COLUMN, or
+    MULTI_COLUMN. Only exact 2-column tables can be KEY_VALUE or
+    GENERIC_TWO_COLUMN; 3+ columns are always MULTI_COLUMN."""
+    if len(headers) == 2:
+        normalized = tuple(h.strip().lower() for h in headers)
+        if normalized in _KEY_VALUE_HEADER_PAIRS:
+            return "KEY_VALUE"
+        return "GENERIC_TWO_COLUMN"
+    return "MULTI_COLUMN"
+
+
 def _render_table_block_for_telegram(table_block: list[str]) -> str:
-    """Render a detected GFM table as Telegram-friendly row groups."""
+    """Render a detected GFM table as Telegram-friendly text.
+
+    KEY_VALUE tables (exact `Field | Value` header pair) render as concise
+    `Label: value` lines — no manufactured row heading, no duplicated
+    `Field:`/`Value:` labels. Every other shape (GENERIC_TWO_COLUMN,
+    MULTI_COLUMN — e.g. `Option | Tradeoff`, `Name | Age | City`) keeps the
+    existing heading + bullet-per-column rendering unchanged.
+    """
     if len(table_block) < 3:
         return "\n".join(table_block)
 
     headers = _split_markdown_table_row(table_block[0])
     if len(headers) < 2:
         return "\n".join(table_block)
+
+    if _classify_table_headers(headers) == "KEY_VALUE":
+        rendered_lines: list[str] = []
+        for index, row in enumerate(table_block[2:], start=1):
+            cells = _split_markdown_table_row(row)
+            if len(cells) < len(headers):
+                cells.extend([""] * (len(headers) - len(cells)))
+            elif len(cells) > len(headers):
+                cells = cells[: len(headers)]
+            label = cells[0] if cells[0] else f"Row {index}"
+            value = cells[1]
+            rendered_lines.append(f"{label}: {value}")
+        return "\n".join(rendered_lines)
 
     rendered_rows: list[str] = []
     for index, row in enumerate(table_block[2:], start=1):
