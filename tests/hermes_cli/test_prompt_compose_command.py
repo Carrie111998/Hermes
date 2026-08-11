@@ -23,7 +23,27 @@ class _Stub(CLICommandsMixin):
 
 
 def _fake_editor(body: str, mode: str = "append") -> str:
-    """Write a tiny shell 'editor' that mutates the file it is handed."""
+    """Write a tiny script 'editor' that mutates the file it is handed.
+
+    On Windows this must be a ``.cmd`` batch file: a ``#!``-shebang script is
+    not an executable format there, so the product code's direct
+    ``subprocess.call`` fails and the shell fallback blocks forever waiting on
+    cmd.exe's file-association handler — hanging the whole pytest session.
+    """
+    if os.name == "nt":
+        f = tempfile.NamedTemporaryFile(
+            "w", suffix=".cmd", delete=False, newline=""
+        )
+        f.write("@echo off\r\n")
+        if mode == "append":
+            for line in body.split("\n"):
+                # `echo(` emits empty lines without printing "ECHO is off."
+                f.write(f'(echo({line})>>"%~1"\r\n')
+        else:  # clear
+            f.write('type nul >"%~1"\r\n')
+        f.close()
+        return f.name
+
     f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
     if mode == "append":
         f.write("#!/usr/bin/env bash\n")
@@ -67,6 +87,29 @@ def test_initial_text_is_seeded(monkeypatch):
     monkeypatch.setenv("EDITOR", _fake_editor("rest of prompt"))
     out = _Stub()._compose_in_editor("DRAFT: ")
     assert out.startswith("DRAFT:")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="cmd.exe association hang is Windows-only")
+def test_non_executable_editor_fails_fast_on_windows(monkeypatch):
+    """A $EDITOR cmd.exe cannot run must raise, not block in the shell fallback.
+
+    Before this guard, the `shell=True` fallback handed cmd.exe a file with an
+    unregistered extension and hung in `p.wait()` forever — with pytest's
+    thread timeout method that killed the entire session.
+    """
+    f = tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False)
+    f.write("#!/usr/bin/env bash\n: > \"$1\"\n")
+    f.close()
+    os.chmod(f.name, os.stat(f.name).st_mode | stat.S_IEXEC)
+    monkeypatch.setenv("EDITOR", f.name)
+
+    with pytest.raises(RuntimeError, match="not an executable program"):
+        _Stub()._compose_in_editor("")
+
+    # …and the /prompt handler turns that into a message, not a traceback.
+    s = _Stub()
+    s._handle_prompt_compose_command("/prompt")
+    assert s._pending_agent_seed is None
 
 
 def test_empty_buffer_does_not_seed(monkeypatch):
