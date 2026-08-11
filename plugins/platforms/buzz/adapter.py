@@ -599,26 +599,32 @@ class BuzzAdapter(BasePlatformAdapter):
 
     # ── Sending ───────────────────────────────────────────────────────────
 
-    async def _mention_pubkeys_for(self, chat_id: str, content: str) -> List[str]:
-        """Resolve ``@Name`` references in *content* to member pubkeys.
+    async def _channel_member_pubkeys(self, chat_id: str) -> List[str]:
+        """Candidate pubkeys for mention resolution, membership-accurate.
 
-        The CLI hard-fails a publish when any @token fails to resolve to a
-        current member, and LLM prose is full of @-shaped tokens — including
-        real mentions with trailing punctuation ("@Riley!!") the CLI's own
-        parser rejects.  Passing explicit ``--mention`` pubkeys for every
-        member name we find keeps genuine mentions notifying (p-tags intact)
-        while downgrading everything unresolvable to presentation-only text.
-
-        Bare ``users get`` may return only our own profile (relay-dependent),
-        so candidate pubkeys are harvested from recent channel traffic
-        (authors plus prior mention tags) and resolved to display names one
-        at a time via ``users get --pubkey``, cached for the process
-        lifetime.
+        Primary source is ``channels members`` — the relay's membership
+        contract — because a ``--mention`` for a non-member makes the CLI
+        reject the whole publish.  CLIs without that subcommand fall back
+        to harvesting recent channel traffic (authors plus prior mention
+        tags), which can over-approximate; ``send()`` recovers from any
+        resulting non-member mention by retrying without mention flags.
         """
-        if "@" not in content:
-            return []
-        cache: Dict[str, str] = getattr(self, "_profile_name_cache", {})
-        self._profile_name_cache = cache
+        code, out, _err = await self._run_cli(
+            ["channels", "members", "--channel", str(chat_id)]
+        )
+        if code == 0:
+            pks: List[str] = []
+            try:
+                rows = json.loads(out or "[]")
+            except ValueError:
+                rows = []
+            for row in rows:
+                pk = row.get("pubkey") if isinstance(row, dict) else row
+                pk = str(pk or "").lower()
+                if pk and pk not in pks:
+                    pks.append(pk)
+            if pks:
+                return pks
         candidates: List[str] = []
         code, out, _err = await self._run_cli(
             ["messages", "get", "--channel", str(chat_id), "--limit", "50"]
@@ -636,33 +642,79 @@ class BuzzAdapter(BasePlatformAdapter):
                                 candidates.append(tpk)
             except ValueError:
                 pass
-        low = content.lower()
-        found: List[str] = []
+        return candidates
+
+    async def _profile_display_name(self, pubkey: str) -> str:
+        """Display name for *pubkey* via ``users get --pubkey``, cached.
+
+        Bare ``users get`` may return only our own profile
+        (relay-dependent), so lookups are per-pubkey.
+        """
+        cache: Dict[str, str] = getattr(self, "_profile_name_cache", {})
+        self._profile_name_cache = cache
+        name = cache.get(pubkey)
+        if name is not None:
+            return name
+        name = ""
+        code, out, _err = await self._run_cli(["users", "get", "--pubkey", pubkey])
+        if code == 0:
+            try:
+                profiles = json.loads(out or "[]")
+            except ValueError:
+                profiles = []
+            if profiles and isinstance(profiles[0], dict):
+                p0 = profiles[0]
+                name = str(p0.get("display_name") or p0.get("name") or "").strip()
+                if not name and p0.get("content"):
+                    try:
+                        prof = json.loads(p0["content"])
+                        name = str(
+                            prof.get("display_name") or prof.get("name") or ""
+                        ).strip()
+                    except ValueError:
+                        pass
+        cache[pubkey] = name
+        return name
+
+    async def _mention_pubkeys_for(self, chat_id: str, content: str) -> List[str]:
+        """Resolve ``@Name`` references in *content* to member pubkeys.
+
+        The CLI hard-fails a publish when any @token fails to resolve to a
+        current member, and LLM prose is full of @-shaped tokens — including
+        real mentions with trailing punctuation ("@Riley!!") the CLI's own
+        parser rejects.  Passing explicit ``--mention`` pubkeys for every
+        member name we find keeps genuine mentions notifying (p-tags intact)
+        while downgrading everything unresolvable to presentation-only text.
+
+        Matching is mention-token semantics, not substring: the name must be
+        followed by a non-word character or end-of-text ("@Riley!!" tags
+        Riley; "@FizzBuzz" does NOT tag a member named Fizz).  Longer names
+        match first and consume their span, so "@Hermes Matt" prefers the
+        member "Hermes Matt" over a member "Hermes".
+        """
+        if "@" not in content:
+            return []
+        entries: List[Tuple[str, str]] = []
         self_pk = getattr(self, "_self_pubkey", None)
-        for pk in candidates:
+        for pk in await self._channel_member_pubkeys(chat_id):
             if pk == self_pk:
                 continue
-            name = cache.get(pk)
-            if name is None:
-                name = ""
-                code, out, _err = await self._run_cli(["users", "get", "--pubkey", pk])
-                if code == 0:
-                    try:
-                        profiles = json.loads(out or "[]")
-                    except ValueError:
-                        profiles = []
-                    if profiles and isinstance(profiles[0], dict):
-                        p0 = profiles[0]
-                        name = str(p0.get("display_name") or p0.get("name") or "").strip()
-                        if not name and p0.get("content"):
-                            try:
-                                prof = json.loads(p0["content"])
-                                name = str(prof.get("display_name") or prof.get("name") or "").strip()
-                            except ValueError:
-                                pass
-                cache[pk] = name
-            if name and ("@" + name.lower()) in low and pk not in found:
-                found.append(pk)
+            name = await self._profile_display_name(pk)
+            if name:
+                entries.append((name, pk))
+        entries.sort(key=lambda e: len(e[0]), reverse=True)
+        found: List[str] = []
+        text = content
+        for name, pk in entries:
+            pattern = re.compile(
+                "@" + re.escape(name) + r"(?![0-9A-Za-z_])", re.IGNORECASE
+            )
+            if pattern.search(text):
+                if pk not in found:
+                    found.append(pk)
+                # Consume the span so a shorter member name that is a prefix
+                # of this one cannot double-match the same mention.
+                text = pattern.sub("\x00", text)
         return found
 
     async def send(
@@ -678,9 +730,20 @@ class BuzzAdapter(BasePlatformAdapter):
         reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
             args += ["--reply-to", str(reply_target)]
+        mention_args: List[str] = []
         for pk in await self._mention_pubkeys_for(chat_id, content):
-            args += ["--mention", pk]
-        code, out, err = await self._run_cli(args, input_text=content)
+            mention_args += ["--mention", pk]
+        code, out, err = await self._run_cli(args + mention_args, input_text=content)
+        if (
+            code != 0
+            and mention_args
+            and "not channel members" in (err or "")
+        ):
+            # Membership drifted between resolution and publish (or the
+            # fallback candidate source over-approximated): never let a
+            # stale mention kill the message — deliver it without the
+            # explicit mentions rather than not at all.
+            code, out, err = await self._run_cli(args, input_text=content)
         if code != 0 and "does not match a current channel member" in (err or ""):
             # Even with resolved mentions attached, prose can still contain
             # @-shaped tokens that resolve to nothing ("just @-mention me").
