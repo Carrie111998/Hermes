@@ -718,9 +718,7 @@ def _managed_websocket_profile(
     )
 
     principal = principal_from_headers(ws.headers)
-    if principal is None:
-        return requested_profile
-    if admin_required and not principal.admin:
+    if admin_required and principal is not None and not principal.admin:
         raise PermissionError("administrator access required")
     with managed_profile_context(principal):
         return require_profile(requested_profile)
@@ -740,19 +738,27 @@ async def evaos_managed_profile_scope_middleware(request: Request, call_next):
     except ValueError:
         return JSONResponse({"detail": "invalid managed profile scope"}, status_code=403)
     if principal is None:
+        try:
+            require_profile(None)
+        except PermissionError:
+            return JSONResponse({"detail": "profile is not authorized"}, status_code=403)
         return await call_next(request)
 
     with managed_profile_context(principal):
         try:
             requested_profile = (request.query_params.get("profile") or "").strip()
+            effective_profile = principal.primary_profile
             if requested_profile:
-                require_profile(requested_profile, allow_selectors={"all"})
+                selected = require_profile(requested_profile, allow_selectors={"all"})
+                if selected != "all":
+                    effective_profile = selected
             profile_route = re.match(r"^/api/profiles/([^/]+)", request.url.path)
             if profile_route and profile_route.group(1) not in {"active", "sessions"}:
-                require_profile(profile_route.group(1))
+                effective_profile = require_profile(profile_route.group(1))
         except PermissionError:
             return JSONResponse({"detail": "profile is not authorized"}, status_code=403)
 
+    with managed_profile_context(principal, effective_profile=effective_profile):
         if not principal.admin:
             path = request.url.path
             manages_profiles = (

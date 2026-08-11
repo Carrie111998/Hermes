@@ -447,6 +447,55 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
+    def test_managed_session_detail_refuses_profile_conflict_and_allows_match(self):
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=get_hermes_home() / "state.db")
+        try:
+            db.create_session(
+                "conflicting-session",
+                source="tui",
+                profile_name="louis",
+            )
+            db.create_session(
+                "owned-session",
+                source="tui",
+                profile_name="jane",
+            )
+        finally:
+            db.close()
+
+        headers = {
+            "x-evaos-allowed-profiles": "jane,louis",
+            "x-evaos-primary-profile": "jane",
+            "x-evaos-profile-admin": "1",
+            "x-evaos-principal-user": "admin-1",
+        }
+
+        refused = self.client.get(
+            "/api/sessions/conflicting-session",
+            headers=headers,
+        )
+        allowed = self.client.get(
+            "/api/sessions/owned-session",
+            headers=headers,
+        )
+
+        assert refused.status_code == 403
+        assert allowed.status_code == 200
+        assert allowed.json()["id"] == "owned-session"
+
+    def test_multiplex_http_rejects_unassigned_token(self, monkeypatch):
+        from agent import secret_scope
+
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+
+        response = self.client.get("/api/sessions?limit=1")
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == "profile is not authorized"
+
     def test_concurrent_first_load_reads_all_succeed_on_fresh_store(self):
         from concurrent.futures import ThreadPoolExecutor
 

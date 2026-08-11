@@ -12308,6 +12308,51 @@ def test_managed_session_registry_hides_and_refuses_other_profile(monkeypatch, t
     assert denied["error"]["code"] == 4001
 
 
+@pytest.mark.parametrize("recorded_profile", [None, "louis"])
+def test_managed_session_resume_refuses_unassigned_or_conflicting_profile(
+    monkeypatch,
+    recorded_profile,
+):
+    from hermes_cli.profile_scope import managed_profile_context, principal_from_headers
+
+    class _DB:
+        def get_session(self, session_id):
+            assert session_id == "target"
+            return {"id": session_id, "profile_name": recorded_profile}
+
+        def get_session_by_title(self, title):
+            return None
+
+        def reopen_session(self, session_id):
+            raise AssertionError("refused resume must not write")
+
+    db = _DB()
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    principal = principal_from_headers(
+        {
+            "x-evaos-allowed-profiles": "jane,louis",
+            "x-evaos-primary-profile": "jane",
+            "x-evaos-profile-admin": "1",
+            "x-evaos-principal-user": "user-1",
+        }
+    )
+
+    with managed_profile_context(principal, effective_profile="jane"):
+        response = server.handle_request(
+            {
+                "id": "resume",
+                "method": "session.resume",
+                "params": {"session_id": "target"},
+            }
+        )
+
+    assert response["error"] == {
+        "code": 4003,
+        "message": "session profile is not authorized",
+    }
+
+
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
     """Switching into a still-running live session must hydrate partial output.

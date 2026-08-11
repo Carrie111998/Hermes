@@ -87,6 +87,19 @@ def test_console_ws_denies_managed_non_admin_before_accept(console_client):
     assert exc.value.code == 4403
 
 
+def test_console_ws_denies_unassigned_multiplex_token(
+    console_client, monkeypatch
+):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+
+    with pytest.raises(WebSocketDisconnect) as exc:
+        with console_client.websocket_connect(_url()):
+            pass
+    assert exc.value.code == 4403
+
+
 def test_console_ws_cancel_returns_to_prompt(console_client, monkeypatch):
     from hermes_cli.console_engine import ConsoleResult, HermesConsoleEngine
 
