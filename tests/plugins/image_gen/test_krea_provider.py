@@ -206,7 +206,9 @@ class TestGenerate:
             result = KreaImageGenProvider().generate(prompt="A cinematic lamp")
 
         assert result["success"] is True
-        assert result["image"] == "/tmp/krea_krea-2-medium_test.png"
+        # str(Path(...)) not the bare literal: the provider stringifies whatever
+        # the downloader saved, and Path renders "/" as "\" on Windows.
+        assert result["image"] == str(Path("/tmp/krea_krea-2-medium_test.png"))
         assert result["provider"] == "krea"
         assert result["model"] == "krea-2-medium"
         assert result["aspect_ratio"] == "landscape"
