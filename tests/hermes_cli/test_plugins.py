@@ -120,6 +120,38 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
 class TestPluginDiscovery:
     """Tests for plugin discovery from directories and entry points."""
 
+    def test_enabled_plugins_load_in_config_order(self, tmp_path, monkeypatch):
+        """Explicit enable order wins over alphabetical directory discovery."""
+        from hermes_cli import plugins as plugins_mod
+
+        home = tmp_path / "home"
+        plugins_dir = home / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "alpha",
+            register_body='import plugin_order_trace; plugin_order_trace.events.append("alpha")',
+            auto_enable=False,
+        )
+        _make_plugin_dir(
+            plugins_dir,
+            "zeta",
+            register_body='import plugin_order_trace; plugin_order_trace.events.append("zeta")',
+            auto_enable=False,
+        )
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"plugins": {"enabled": ["zeta", "alpha"]}})
+        )
+        bundled = tmp_path / "bundled"
+        bundled.mkdir()
+        trace = types.SimpleNamespace(events=[])
+        monkeypatch.setitem(sys.modules, "plugin_order_trace", trace)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
+
+        PluginManager().discover_and_load()
+
+        assert trace.events == ["zeta", "alpha"]
+
     def test_enabled_portable_plugin_registers_components(
         self, tmp_path, monkeypatch
     ):
