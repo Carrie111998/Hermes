@@ -23013,6 +23013,62 @@ async def _await_thread_exit(
     return not thread.is_alive()
 
 
+def _stop_nous_keepalive_quietly() -> None:
+    """Retire the nous auth keepalive thread; never raise out of a exit path."""
+    try:
+        from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
+
+        stop_nous_auth_keepalive()
+    except Exception:
+        pass
+
+
+def start_early_boot_heartbeat(
+    stop_event: threading.Event,
+    *,
+    interval_seconds: float = 30,
+    heartbeat_path: Optional[Path] = None,
+) -> threading.Thread:
+    """Keep the boot-time heartbeat fresh on a daemon thread.
+
+    The heartbeat path is captured HERE — at thread start — and carried into
+    every tick, rather than being re-resolved from ``HERMES_HOME`` per tick.
+
+    This thread routinely outlives the scope that started it: ``start_gateway``
+    only clears ``stop_event`` after ``runner.start()`` returns, and under
+    pytest it outlives the test's ``monkeypatch`` teardown regardless. A
+    per-tick resolve therefore writes into whatever home the env is *restored*
+    to — the real ``~/.hermes`` — which is the "resolved too late" bug class
+    (GBrain ``concepts/import-time-hermes-home-snapshot-bug``).
+
+    Capturing at start is the right moment here, not merely a proxy for it:
+    this runs inside ``start_gateway``, long after any profile override has
+    fixed ``HERMES_HOME``. (Contrast a column-0 ``atexit.register``, where
+    capturing at registration would bind the real home during test collection
+    and be strictly worse than resolving late.)
+    """
+    if heartbeat_path is None:
+        from events.paths import gateway_heartbeat_path
+
+        heartbeat_path = gateway_heartbeat_path()
+
+    def _early_boot_heartbeat() -> None:
+        from events.gateway_integration import _write_heartbeat
+
+        while not stop_event.is_set():
+            try:
+                _write_heartbeat(0, path=heartbeat_path)
+            except Exception:
+                pass
+            stop_event.wait(interval_seconds)
+
+    thread = threading.Thread(
+        target=_early_boot_heartbeat, name="early-boot-heartbeat", daemon=True
+    )
+    thread.start()
+    return thread
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
     """
     Start the gateway and run until interrupted.
@@ -23457,17 +23513,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # so the watchdog sees liveness throughout the boot. _write_heartbeat is
     # None-safe before EventBus startup (_registry/_startup_monotonic default).
     _early_hb_stop = threading.Event()
-    def _early_boot_heartbeat() -> None:
-        from events.gateway_integration import _write_heartbeat
-        while not _early_hb_stop.is_set():
-            try:
-                _write_heartbeat(0)
-            except Exception:
-                pass
-            _early_hb_stop.wait(30)
-    threading.Thread(
-        target=_early_boot_heartbeat, name="early-boot-heartbeat", daemon=True
-    ).start()
+    start_early_boot_heartbeat(_early_hb_stop)
     # GATEWAY_STOPPED defense-in-depth — added 2026-04-30 (M1). Three
     # independent paths can leave the gateway: graceful _stop_impl (most
     # informed), atexit fall-through, signal handlers. emit_gateway_stopped
@@ -23505,15 +23551,29 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.debug("MCP tool discovery failed: %s", e)
 
     # Start the gateway
-    success = await runner.start()
-    # runner.start() brings up the EventBus subscriber loop (the normal
-    # heartbeat writer), so retire the early-boot heartbeat thread now.
-    _early_hb_stop.set()
+    try:
+        success = await runner.start()
+    finally:
+        # runner.start() brings up the EventBus subscriber loop (the normal
+        # heartbeat writer), so retire the early-boot heartbeat thread now.
+        # In a `finally` because a raising start() used to leak the thread for
+        # the life of the process — and the tests that exercise start_gateway()
+        # are startup-FAILURE tests, so that is the path they take.
+        _early_hb_stop.set()
     if not success:
+        # The nous keepalive is started during boot but only stopped after
+        # wait_for_shutdown(), so every early return used to leave it running
+        # for the life of the process. It waits 60s, then re-resolves
+        # HERMES_HOME and touches the auth store — under pytest that lands
+        # long after the test that called start_gateway() has torn down.
+        _stop_nous_keepalive_quietly()
         return False
     if runner.should_exit_cleanly:
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
+        # Same reason as the `not success` path above — this branch returns
+        # (or raises SystemExit) without ever reaching wait_for_shutdown().
+        _stop_nous_keepalive_quietly()
         # A clean exit that carries an explicit exit code (e.g. a fatal
         # config error stamped with GATEWAY_FATAL_CONFIG_EXIT_CODE) must
         # propagate that code to the process so the s6 finish script can
