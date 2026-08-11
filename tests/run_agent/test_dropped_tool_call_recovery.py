@@ -66,7 +66,53 @@ def _dropped_tool_call_response(content: str):
     )
 
 
+def _textual_dsml_tool_call_response():
+    """A provider response that serializes a tool call into assistant text
+    and incorrectly finishes with ``stop`` instead of returning structured
+    ``tool_calls``."""
+    from tests.run_agent.test_run_agent import _mock_response
+
+    return _mock_response(
+        content=(
+            "<｜｜DSML｜｜tool_calls>"
+            "<｜｜DSML｜｜invoke name=\"skills_list\"/>"
+            "</｜｜DSML｜｜tool_calls>"
+        ),
+        finish_reason="stop",
+    )
+
+
 class TestDroppedToolCallRecovery:
+    def test_textual_dsml_tool_call_reprompts_without_replaying_markup(
+        self, loop_agent,
+    ):
+        """DSML tool markup emitted as plain assistant text must be treated
+        as an incomplete tool attempt, not as the final user-visible answer.
+        The leaked serialization must not be replayed to the provider."""
+        from tests.run_agent.test_run_agent import _mock_response
+
+        loop_agent.client.chat.completions.create.side_effect = [
+            _textual_dsml_tool_call_response(),
+            _mock_response(content="The profile contains config.yaml.", finish_reason="stop"),
+        ]
+
+        with (
+            patch.object(loop_agent, "_persist_session"),
+            patch.object(loop_agent, "_save_trajectory"),
+            patch.object(loop_agent, "_cleanup_task_resources"),
+        ):
+            result = loop_agent.run_conversation("inspect the profile folder")
+
+        assert loop_agent.client.chat.completions.create.call_count == 2
+        second_call = loop_agent.client.chat.completions.create.call_args_list[1]
+        messages = second_call.kwargs.get("messages") or second_call.args[0].get("messages")
+        replayed_content = "\n".join(
+            str(message.get("content") or "") for message in messages
+        )
+        assert "DSML" not in replayed_content
+        assert "actual tool call" in replayed_content.lower()
+        assert result["final_response"] == "The profile contains config.yaml."
+
     def test_dropped_tool_call_reprompts_instead_of_exiting(self, loop_agent):
         """finish_reason=tool_calls with an empty tool_calls array must
         re-prompt the model to emit the call rather than exiting the loop
@@ -191,4 +237,3 @@ class TestDroppedToolCallRecovery:
             "_dropped_toolcall_nudge messages must be classified as "
             "ephemeral scaffolding so they are never persisted."
         )
-

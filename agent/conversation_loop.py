@@ -113,6 +113,16 @@ _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
 
+# DeepSeek-family endpoints can occasionally serialize their internal DSML
+# tool protocol into ordinary assistant text while also reporting a clean
+# ``finish_reason="stop"``.  Treat only the distinctive DSML envelope as a
+# dropped tool call.  Never parse or execute text as a tool call: doing so
+# would let untrusted file or web content manufacture executable actions.
+_TEXTUAL_DSML_TOOL_CALL_PATTERN = re.compile(
+    r"<\s*(?:\|\||｜｜)DSML(?:\|\||｜｜)(?:tool_calls|invoke)\b",
+    re.IGNORECASE,
+)
+
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
@@ -6871,9 +6881,29 @@ def run_conversation(
                     truncated_response_parts = []
                     length_continue_retries = 0
                 
-                final_response = agent._strip_think_blocks(final_response).strip()
+                _textual_dsml_tool_call_leak = bool(
+                    not assistant_message.tool_calls
+                    and isinstance(final_response, str)
+                    and _TEXTUAL_DSML_TOOL_CALL_PATTERN.search(final_response)
+                )
+                if _textual_dsml_tool_call_leak:
+                    logger.warning(
+                        "Assistant content contained textual DSML tool markup "
+                        "without a structured tool call; re-prompting safely "
+                        "(model=%s provider=%s)",
+                        agent.model,
+                        agent.provider,
+                    )
+                    # Do not replay, persist, display, or speak the leaked
+                    # serialization.  A neutral assistant checkpoint preserves
+                    # provider role alternation for the bounded recovery nudge.
+                    final_response = "A tool call was emitted in an invalid text format."
+                else:
+                    final_response = agent._strip_think_blocks(final_response).strip()
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
+                if _textual_dsml_tool_call_leak:
+                    final_msg["content"] = final_response
 
                 # ── Dropped tool-call recovery (copilot/Claude) ────────
                 # Some providers (observed: claude-opus-4.8 / claude-sonnet-4.5
@@ -6888,14 +6918,17 @@ def run_conversation(
                 # model emit the call instead of exiting. finish_reason="stop"
                 # text finishes never enter this guard.
                 if (
-                    finish_reason == "tool_calls"
+                    (
+                        finish_reason == "tool_calls"
+                        or _textual_dsml_tool_call_leak
+                    )
                     and not assistant_message.tool_calls
                     and getattr(agent, "_dropped_toolcall_retries", 0) < 3
                 ):
                     agent._dropped_toolcall_retries = getattr(agent, "_dropped_toolcall_retries", 0) + 1
                     logger.warning(
-                        "finish_reason=tool_calls with empty tool_calls array "
-                        "(narration only) — re-prompting to emit the call "
+                        "Dropped or text-serialized tool call "
+                        "(no structured calls) — re-prompting to emit the call "
                         "(retry %d/3, model=%s provider=%s)",
                         agent._dropped_toolcall_retries, agent.model, agent.provider,
                     )
