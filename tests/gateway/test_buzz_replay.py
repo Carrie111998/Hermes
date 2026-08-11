@@ -703,6 +703,60 @@ class ReplayLifecycleTests(unittest.TestCase):
                 self.assertEqual(waiters_by_session, {})
             asyncio.run(runner.wait_for_all_session_quiescence())
 
+    def test_executor_submit_thread_start_failure_aborts_queued_work(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from gateway.config import GatewayConfig
+        import gateway.run as gateway_run
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False):
+                runner = gateway_run.GatewayRunner(
+                    GatewayConfig(sessions_dir=home / "sessions")
+                )
+
+            executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-gateway")
+            runner._executor = executor
+            blocker_started = threading.Event()
+            release_blocker = threading.Event()
+            blocker_future = executor.submit(
+                lambda: (blocker_started.set(), release_blocker.wait(timeout=5))
+            )
+            self.assertTrue(blocker_started.wait(timeout=5))
+            blocker_thread = next(iter(executor._threads))
+            executor._threads.clear()
+            target_ran = threading.Event()
+            def fail_replacement(thread):
+                raise RuntimeError("replacement start failed")
+
+            try:
+                async def submit():
+                    with patch.object(threading.Thread, "start", new=fail_replacement):
+                        with self.assertRaisesRegex(RuntimeError, "replacement start failed"):
+                            runner._start_turn_executor(
+                                target_ran.set,
+                                session_key="executor-submit-failure-session",
+                                agent_holder=[object()],
+                            )
+
+                asyncio.run(submit())
+                lock, waiters_by_session = runner._turn_worker_state()
+                with lock:
+                    self.assertEqual(waiters_by_session, {})
+
+                executor._threads.add(blocker_thread)
+                release_blocker.set()
+                sentinel_done = threading.Event()
+                executor.submit(sentinel_done.set)
+                self.assertTrue(sentinel_done.wait(timeout=5))
+                self.assertFalse(target_ran.is_set())
+                blocker_future.result(timeout=5)
+            finally:
+                release_blocker.set()
+                executor._threads.add(blocker_thread)
+                executor.shutdown(wait=True)
+
     def test_executor_marker_failure_still_releases_replay_ownership(self):
         from gateway.config import GatewayConfig
         import gateway.run as gateway_run

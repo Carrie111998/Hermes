@@ -22267,6 +22267,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         loop = asyncio.get_running_loop()
         ctx = copy_context()
         worker_done = worker_done or threading.Event()
+        submission_gate = threading.Event()
+        submission_state = {"accepted": False}
+
+        def _publish_submission(accepted: bool) -> None:
+            submission_state["accepted"] = accepted
+            submission_gate.set()
 
         def _run_sync_with_timeout_lifecycle():
             try:
@@ -22282,17 +22288,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     worker_done.set()
                     self._unregister_turn_worker(session_key, worker_done)
 
+        def _gated_worker():
+            submission_gate.wait()
+            if not submission_state["accepted"]:
+                return None
+            return _run_sync_with_timeout_lifecycle()
+
         self._register_turn_worker(session_key, worker_done)
         try:
             executor_task = loop.run_in_executor(
                 self._get_executor(),
                 ctx.run,
-                _run_sync_with_timeout_lifecycle,
+                _gated_worker,
             )
         except BaseException:
+            # ThreadPoolExecutor can queue the work item before a replacement
+            # Thread.start failure escapes submit(). Make queued work inert
+            # before releasing replay ownership.
+            _publish_submission(False)
             worker_done.set()
             self._unregister_turn_worker(session_key, worker_done)
             raise
+        _publish_submission(True)
         return executor_task, worker_done
 
     def _turn_worker_state(self) -> tuple[threading.Lock, Dict[str, set[threading.Event]]]:
