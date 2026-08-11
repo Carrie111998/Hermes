@@ -7,6 +7,7 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -18,6 +19,7 @@ from hermes_cli import kanban_human_review as human_review
 from hermes_cli import kanban_linear as linear
 from hermes_cli import kanban_reconciliation as reconciliation
 from hermes_cli import kanban_review_migration as migration
+from hermes_cli import kanban_review_runner as review_runner
 from hermes_cli import kanban_slack as slack
 
 
@@ -50,8 +52,65 @@ class FakeSnapshotProvider:
         return self.snapshots.get((repository, pr_number))
 
 
+def test_configured_snapshot_provider_builds_read_only_github_mcp_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = FakeSnapshotProvider({})
+    captured: dict[str, review_runner.ReviewRunnerConfig] = {}
+
+    def fake_build(config: review_runner.ReviewRunnerConfig):
+        captured["config"] = config
+        return review_runner.ReviewRunnerAdapters(
+            provider_timeout_seconds=1,
+            github_snapshot_provider=cast(github.GitHubSnapshotProvider, provider),
+        )
+
+    monkeypatch.setattr(
+        review_runner,
+        "_build_configured_mcp_adapters",
+        fake_build,
+    )
+
+    result = migration.build_configured_snapshot_provider(
+        {
+            "providers": {
+                "github": {
+                    "enabled": True,
+                    "delivery_enabled": True,
+                    "adapter": "mcp",
+                    "repositories": [REPO],
+                },
+                "slack": {
+                    "enabled": True,
+                    "delivery_enabled": True,
+                    "adapter": "mcp",
+                    "channel_ids": [CHANNEL],
+                    "acknowledgement_user_ids": ["U_REVIEWER"],
+                },
+            }
+        }
+    )
+
+    assert result is provider
+    assert captured["config"].github_provider_enabled is True
+    assert captured["config"].github_delivery_enabled is False
+    assert captured["config"].slack_provider_enabled is False
+    assert captured["config"].slack_delivery_enabled is False
+
+
 def _digest(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _payload_digest(payload: dict[str, str]) -> str:
+    return _digest(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    )
 
 
 def _snapshot(
@@ -142,15 +201,21 @@ def _delivery(channel: str) -> human_review.ReviewGateDelivery:
 
 
 def _github_intent(
-    intent_id: str,
     operation: github.GitHubOperation,
 ) -> github.GitHubOutboxIntent:
     surface: github.GitHubSurface = (
         "pull_request_comments" if operation == "create_comment" else "review_requests"
     )
     payload = {"gate_id": GATE_ID, "body": f"fixture {operation}"}
+    idempotency_key = github._idempotency_key(
+        REPO,
+        PR_NUMBER,
+        HEAD_A,
+        surface,
+        operation,
+    )
     return github.GitHubOutboxIntent(
-        id=intent_id,
+        id=github._intent_id(idempotency_key),
         gate_id=GATE_ID,
         repository=REPO,
         pr_number=PR_NUMBER,
@@ -158,8 +223,8 @@ def _github_intent(
         surface=surface,
         operation=operation,
         payload=payload,
-        payload_sha256=_digest(json.dumps(payload, sort_keys=True)),
-        idempotency_key=f"github:{GATE_ID}:{operation}:{HEAD_A}",
+        payload_sha256=_payload_digest(payload),
+        idempotency_key=idempotency_key,
         state="pending",
         attempt_count=0,
         max_attempts=3,
@@ -177,8 +242,17 @@ def _github_intent(
 
 def _slack_intent() -> slack.SlackOutboxIntent:
     payload = {"gate_id": GATE_ID, "body": "fixture Slack notification"}
+    idempotency_key = slack._idempotency_key(
+        CHANNEL,
+        "",
+        REPO,
+        PR_NUMBER,
+        HEAD_A,
+        "channel",
+        "notify_human_review",
+    )
     return slack.SlackOutboxIntent(
-        id="slo_review_migration",
+        id=slack._intent_id(idempotency_key),
         gate_id=GATE_ID,
         source_intent_id=None,
         repository=REPO,
@@ -189,8 +263,8 @@ def _slack_intent() -> slack.SlackOutboxIntent:
         surface="channel",
         operation="notify_human_review",
         payload=payload,
-        payload_sha256=_digest(json.dumps(payload, sort_keys=True)),
-        idempotency_key=f"slack:{GATE_ID}:{CHANNEL}:{HEAD_A}",
+        payload_sha256=_payload_digest(payload),
+        idempotency_key=idempotency_key,
         state="pending",
         attempt_count=0,
         max_attempts=3,
@@ -285,8 +359,8 @@ def _healthy_inputs() -> reconciliation.ReconciliationInputs:
             _delivery(channel) for channel in human_review.DEFAULT_DELIVERY_CHANNELS
         ),
         github_intents=(
-            _github_intent("gho_migration_comment", "create_comment"),
-            _github_intent("gho_migration_reviewer", "request_reviewer"),
+            _github_intent("create_comment"),
+            _github_intent("request_reviewer"),
         ),
         slack_intents=(_slack_intent(),),
     )
@@ -539,6 +613,57 @@ def test_default_cli_plan_writes_report_but_not_board_database(
             conn.execute("SELECT COUNT(*) FROM review_migration_plans").fetchone()[0]
             == 0
         )
+
+
+def test_cli_plan_consumes_configured_authoritative_snapshot_provider(
+    db_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = _healthy_inputs()
+    provider = FakeSnapshotProvider({(REPO, PR_NUMBER): _snapshot()})
+    with kb.connect_closing(db_path) as conn:
+        _seed_gate_bundle(conn, source)
+
+    review_config = {
+        "providers": {
+            "github": {
+                "enabled": True,
+                "adapter": "mcp",
+                "repositories": [REPO],
+            }
+        }
+    }
+    captured: dict[str, object] = {}
+
+    def fake_build(value):
+        captured["config"] = value
+        return provider
+
+    monkeypatch.setattr(migration, "_MIGRATION_SNAPSHOT_PROVIDER", None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"review_runner": review_config}},
+    )
+    monkeypatch.setattr(migration, "build_configured_snapshot_provider", fake_build)
+    args = argparse.Namespace(
+        kanban_action="review-migration",
+        migration_action="plan",
+        linear_issue_id=None,
+        plan_id=None,
+        confirm=None,
+        operator=None,
+        max_actions=None,
+        report=None,
+        json=True,
+    )
+
+    assert kanban_cli.kanban_command(args) == 0
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["plan_id"]
+    assert captured["config"] == review_config
+    assert provider.calls == [(REPO, PR_NUMBER)]
 
 
 @pytest.mark.parametrize(

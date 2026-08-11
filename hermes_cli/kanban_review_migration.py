@@ -16,7 +16,7 @@ import json
 import re
 import sqlite3
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator, Literal, Mapping, Optional, Protocol, Sequence
 
@@ -127,6 +127,40 @@ def register_migration_snapshot_provider(
 
 def migration_snapshot_provider() -> Optional[MigrationSnapshotProvider]:
     return _MIGRATION_SNAPSHOT_PROVIDER
+
+
+def build_configured_snapshot_provider(
+    value: Optional[Mapping[str, Any]],
+) -> Optional[MigrationSnapshotProvider]:
+    """Build the configured GitHub MCP reader without any write transports.
+
+    Review migration is an explicit operator command, so it may use the same
+    authoritative GitHub read boundary as the review runner even while the
+    scheduled runner itself remains disabled. Delivery and Slack adapters are
+    forcibly disabled here: planning and checkpoint revalidation require only
+    exact-head GitHub reads and must never acquire provider-write capability.
+    """
+
+    from hermes_cli import kanban_review_runner as runner
+
+    config = runner.ReviewRunnerConfig.from_mapping(value)
+    if not config.github_provider_enabled or config.github_adapter != "mcp":
+        return None
+    read_only_config = replace(
+        config,
+        github_delivery_enabled=False,
+        slack_provider_enabled=False,
+        slack_delivery_enabled=False,
+    )
+    try:
+        adapters = runner._build_configured_mcp_adapters(read_only_config)
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        raise MigrationBoundaryError(
+            "configured authoritative snapshot adapter could not be initialized"
+        ) from exc
+    return adapters.github_snapshot_provider
 
 
 def _canonical_json(value: Any) -> str:

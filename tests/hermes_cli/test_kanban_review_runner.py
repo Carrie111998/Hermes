@@ -237,6 +237,21 @@ def _registered_adapters() -> runner.ReviewRunnerAdapters:
     )
 
 
+def _force_healthy_reconciliation(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_reconcile(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(
+            report=SimpleNamespace(
+                status="healthy",
+                input_sha256="2" * 64,
+                findings=(),
+            ),
+            persisted_run=None,
+        )
+
+    monkeypatch.setattr(runner.reconciliation, "reconcile", fake_reconcile)
+
+
 def test_default_config_is_dry_run_and_every_mutating_surface_is_disabled():
     from hermes_cli.config import DEFAULT_CONFIG
 
@@ -484,6 +499,75 @@ def test_kanban_parser_rejects_abbreviated_global_options() -> None:
         parser.parse_args(["kanban", "--boa", "default", "review-runner", "health"])
 
 
+def test_health_command_exits_nonzero_when_readiness_is_blocked(
+    kanban_home,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    args = argparse.Namespace(
+        runner_action="health",
+        mode=None,
+        timeout_seconds=None,
+        lease_seconds=None,
+        max_items=None,
+        retry_ceiling=None,
+        json=True,
+    )
+
+    assert kc._cmd_review_runner(args) == 1
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["readiness"]["production_ready"] is False
+    assert "runner_disabled" in payload["readiness"]["blockers"]
+
+
+@pytest.mark.parametrize("reconciliation_status", ("needs_attention", "blocked"))
+def test_live_runner_refuses_delivery_when_reconciliation_requires_repair(
+    kanban_home,
+    monkeypatch: pytest.MonkeyPatch,
+    reconciliation_status: str,
+) -> None:
+    calls: list[str] = []
+
+    def fake_reconcile(*args, **kwargs):
+        del args, kwargs
+        return SimpleNamespace(
+            report=SimpleNamespace(
+                status=reconciliation_status,
+                input_sha256="1" * 64,
+                findings=(SimpleNamespace(severity="error"),),
+            ),
+            persisted_run=None,
+        )
+
+    def fake_process(conn, candidate, **kwargs):
+        del conn, kwargs
+        calls.append(candidate.intent_id)
+        return {"intent_id": candidate.intent_id, "state": "sent"}, None
+
+    monkeypatch.setattr(runner.reconciliation, "reconcile", fake_reconcile)
+    monkeypatch.setattr(runner, "_process_candidate", fake_process)
+    with kb.connect_closing() as conn:
+        _insert_github_intent(conn, "gho_reconciliation_blocked")
+        receipt = runner.run_review_runner(
+            conn,
+            config=_live_config(),
+            adapters=_registered_adapters(),
+            now=NOW,
+        )
+        state = conn.execute(
+            "SELECT state FROM github_human_review_outbox WHERE id=?",
+            ("gho_reconciliation_blocked",),
+        ).fetchone()[0]
+
+    assert receipt.status == "failed"
+    assert receipt.reconciliation_status == reconciliation_status
+    assert receipt.errors == (
+        f"reconciliation_not_healthy:{reconciliation_status}",
+    )
+    assert calls == []
+    assert state == "pending"
+
+
 def test_dry_run_is_deterministic_and_writes_neither_audit_nor_lease(kanban_home):
     with kb.connect_closing() as conn:
         before = conn.total_changes
@@ -581,6 +665,7 @@ def test_duplicate_live_invocation_processes_one_intent_once(
         return github.ProcessIntentResult(intent_id, "sent", "sent", sent=True)
 
     monkeypatch.setattr(github, "process_intent", fake_process)
+    _force_healthy_reconciliation(monkeypatch)
     with kb.connect_closing() as conn:
         _insert_github_intent(conn, "gho_once")
         first = runner.run_review_runner(
@@ -619,8 +704,9 @@ def test_timeout_stops_before_next_candidate_without_retry_storm(
         conn.commit()
         return github.ProcessIntentResult(intent_id, "sent", "sent", sent=True)
 
-    ticks = iter((0.0, 0.0, 0.0, 0.0, 0.0, 6.0))
+    ticks = iter((0.0, 0.0, 0.0, 6.0))
     monkeypatch.setattr(github, "process_intent", fake_process)
+    _force_healthy_reconciliation(monkeypatch)
     with kb.connect_closing() as conn:
         _insert_github_intent(conn, "gho_first", created_at=NOW - 20)
         _insert_github_intent(
@@ -649,7 +735,7 @@ def test_timeout_stops_before_next_candidate_without_retry_storm(
 
 def test_live_runner_renews_lease_with_elapsed_time(kanban_home, monkeypatch):
     renewals: list[int] = []
-    ticks = iter((0.0, 0.0, 0.0, 2.0))
+    ticks = iter((0.0, 0.0, 2.0))
 
     def fake_renew(conn, *, owner_id, now, lease_seconds):
         del conn, owner_id, lease_seconds
@@ -662,6 +748,7 @@ def test_live_runner_renews_lease_with_elapsed_time(kanban_home, monkeypatch):
 
     monkeypatch.setattr(runner, "renew_runner_lease", fake_renew)
     monkeypatch.setattr(github, "process_intent", fake_process)
+    _force_healthy_reconciliation(monkeypatch)
     with kb.connect_closing() as conn:
         _insert_github_intent(conn, "gho_elapsed_lease")
         receipt = runner.run_review_runner(
@@ -929,7 +1016,7 @@ def test_cli_health_json_and_quiet_noop(kanban_home, capsys):
     kc.build_parser(sub)
 
     health_args = parser.parse_args(["kanban", "review-runner", "health", "--json"])
-    assert kc.kanban_command(health_args) == 0
+    assert kc.kanban_command(health_args) == 1
     health = json.loads(capsys.readouterr().out)
     assert health["readiness"]["dry_run_ready"] is True
 
@@ -964,7 +1051,7 @@ def test_cli_health_human_output_uses_read_and_write_registration_keys(
     kc.build_parser(sub)
 
     args = parser.parse_args(["kanban", "review-runner", "health"])
-    assert kc.kanban_command(args) == 0
+    assert kc.kanban_command(args) == 1
     output = capsys.readouterr().out
 
     assert "github enabled=False read_registered=False write_registered=False" in output
@@ -1009,7 +1096,7 @@ def test_cli_health_redacts_adapter_setup_failure(
     kc.build_parser(sub)
 
     args = parser.parse_args(["kanban", "review-runner", "health", "--json"])
-    assert kc.kanban_command(args) == 0
+    assert kc.kanban_command(args) == 1
     output = capsys.readouterr().out
     payload = json.loads(output)
 
@@ -1059,7 +1146,7 @@ def test_cli_health_normalizes_untrusted_failure_kind(
     kc.build_parser(sub)
 
     args = parser.parse_args(["kanban", "review-runner", "health", "--json"])
-    assert kc.kanban_command(args) == 0
+    assert kc.kanban_command(args) == 1
     output = capsys.readouterr().out
     payload = json.loads(output)
 

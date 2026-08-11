@@ -2293,7 +2293,7 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
                         "Blockers: "
                         + ", ".join(payload["readiness"]["blockers"])
                     )
-            return 0
+            return 0 if not payload["readiness"]["blockers"] else 1
 
         receipt = runner.run_review_runner(
             conn,
@@ -2418,14 +2418,22 @@ def _cmd_linear_mcp(args: argparse.Namespace) -> int:
 def _cmd_review_migration(args: argparse.Namespace) -> int:
     """Plan by default; require exact plan confirmation before local writes."""
     from hermes_cli import kanban_review_migration as migration
+    from hermes_cli.config import load_config
 
     action = getattr(args, "migration_action", "plan")
     db_path = kb.kanban_db_path()
-    provider = (
-        migration.migration_snapshot_provider()
-        or migration.UnavailableSnapshotProvider()
-    )
     try:
+        registered_provider = migration.migration_snapshot_provider()
+        if registered_provider is None and action in {"plan", "apply"}:
+            runtime_config = load_config() or {}
+            kanban_config = runtime_config.get("kanban", {})
+            kanban_config = (
+                kanban_config if isinstance(kanban_config, dict) else {}
+            )
+            registered_provider = migration.build_configured_snapshot_provider(
+                kanban_config.get("review_runner")
+            )
+        provider = registered_provider or migration.UnavailableSnapshotProvider()
         if action == "plan":
             with migration.open_read_only_snapshot(db_path) as conn:
                 inputs = migration.collect_migration_inputs(
@@ -2491,7 +2499,7 @@ def _cmd_review_migration(args: argparse.Namespace) -> int:
         with kb.connect_closing(db_path=db_path) as conn:
             plan = migration.load_migration_plan(conn, plan_id)
             if action == "apply":
-                if migration.migration_snapshot_provider() is None:
+                if registered_provider is None:
                     print(
                         "kanban review-migration apply: no authoritative read-only "
                         "snapshot provider is registered; refusing write mode",

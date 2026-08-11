@@ -1547,6 +1547,30 @@ def run_review_runner(
         execution = completed_execution
         if monotonic() >= deadline:
             status = "timed_out"
+        elif (
+            mode == "live"
+            and completed_execution.report.status != "healthy"
+            and any(
+                _candidate_provider_call_count(
+                    candidate,
+                    config=config,
+                    adapters=effective_adapters,
+                )
+                for candidate in candidates
+            )
+        ):
+            reconciliation_status = completed_execution.report.status
+            errors.append(f"reconciliation_not_healthy:{reconciliation_status}")
+            skipped.extend(
+                {
+                    "reason": "reconciliation_not_healthy",
+                    "reconciliation_status": reconciliation_status,
+                    "surface": candidate.surface,
+                    "intent_id": candidate.intent_id,
+                }
+                for candidate in candidates
+            )
+            status = "failed"
         elif mode in {"dry-run", "shadow"}:
             status = (
                 "ok"
