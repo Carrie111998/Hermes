@@ -207,3 +207,68 @@ def test_secondary_open_policy_fails_startup_guard(monkeypatch):
     assert violation is not None
     assert "wecom" in violation
     assert "open policy" in violation
+
+
+def _stamped_source(profile: str) -> SessionSource:
+    return SessionSource(
+        platform=Platform.WECOM,
+        user_id="someone",
+        chat_id="dm-chat",
+        chat_type="dm",
+        profile=profile,
+    )
+
+
+def test_slash_access_denies_stamped_profile_with_no_registered_config(monkeypatch):
+    """Fail closed: a stamped secondary profile whose config never registered.
+
+    ``_start_one_profile_adapters`` is the only writer of
+    ``_profile_gateway_configs``. If it never completed for a profile, that
+    profile's stamped sources must not inherit the default profile's slash
+    authority.
+    """
+    import hermes_cli.profiles as _profiles
+
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "main")
+    runner._profile_gateway_configs = {}
+
+    denial = runner._check_slash_access(_stamped_source("coder"), "new")
+
+    assert denial is not None
+    assert "unavailable for this profile" in denial
+
+
+def test_slash_access_uses_registered_profile_config(monkeypatch):
+    """A registered secondary config is consulted instead of failing closed."""
+    import hermes_cli.profiles as _profiles
+
+    runner, _default_adapter, _secondary_adapter = _make_multiplex_runner(monkeypatch)
+    monkeypatch.setattr(_profiles, "get_active_profile_name", lambda: "main")
+    runner._profile_gateway_configs = {"coder": GatewayConfig()}
+
+    # No admin list configured for the scope => policy disabled => allowed.
+    assert runner._check_slash_access(_stamped_source("coder"), "new") is None
+
+
+def test_slash_access_allows_when_runner_has_no_gateway_config(monkeypatch):
+    """``config is None`` is gating-disabled, not "profile policy not loaded".
+
+    ``slash_access.policy_for_source`` documents a ``None`` config as an
+    allow-all/disabled policy. The fail-closed path must key off its own
+    sentinel so it cannot swallow this legitimate value.
+    """
+    from gateway.run import GatewayRunner
+
+    _clear_auth_env(monkeypatch)
+    runner = object.__new__(GatewayRunner)
+    runner.config = None
+
+    source = SessionSource(
+        platform=Platform.WECOM,
+        user_id="someone",
+        chat_id="dm-chat",
+        chat_type="dm",
+    )
+
+    assert runner._check_slash_access(source, "new") is None

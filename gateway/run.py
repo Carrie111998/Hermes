@@ -2081,6 +2081,12 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
 _UNSET = object()
 
+# Sentinel for "this stamped multiplex profile has no registered config" vs
+# "there is no gateway config at all". The latter is a legitimate value that
+# ``slash_access.policy_for_source`` documents as gating-disabled/allow-all,
+# so the fail-closed path must not piggyback on ``None``.
+_PROFILE_CONFIG_MISSING = object()
+
 
 def _resolve_runtime_agent_kwargs() -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
@@ -9882,6 +9888,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Keep the parsed config with the secondary adapters. Authorization
         # occurs after adapter construction and must not fall back to the
         # multiplexer default profile's policy for a stamped source.
+        # ``__init__`` seeds this map, but runners built via ``__new__``
+        # reach here without it — seed on demand, matching the tolerance the
+        # read sites already have.
+        if not hasattr(self, "_profile_gateway_configs"):
+            self._profile_gateway_configs = {}
         self._profile_gateway_configs[profile_name] = profile_cfg
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
@@ -14294,13 +14305,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
-    def _gateway_config_for_source(self, source: SessionSource) -> Optional[GatewayConfig]:
+    def _gateway_config_for_source(self, source: SessionSource) -> Any:
         """Return the config that owns a source's slash authority.
 
         A source stamped by a secondary multiplex adapter must never inherit
         default-profile command permissions. Missing secondary config fails
-        closed by returning None; unstamped sources retain normal default
-        profile behavior.
+        closed by returning :data:`_PROFILE_CONFIG_MISSING`; unstamped sources
+        retain normal default profile behavior, including a ``None`` config,
+        which ``policy_for_source`` treats as gating-disabled.
         """
         config = getattr(self, "config", None)
         if not getattr(config, "multiplex_profiles", False):
@@ -14316,7 +14328,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             active_profile = "default"
         if profile == active_profile:
             return config
-        return getattr(self, "_profile_gateway_configs", {}).get(profile)
+        return getattr(self, "_profile_gateway_configs", {}).get(
+            profile, _PROFILE_CONFIG_MISSING
+        )
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
@@ -14336,7 +14350,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not canonical_cmd:
             return None
         config = self._gateway_config_for_source(source)
-        if config is None:
+        if config is _PROFILE_CONFIG_MISSING:
             logger.warning(
                 "Slash command /%s denied for stamped source with no profile config: %s",
                 canonical_cmd,
