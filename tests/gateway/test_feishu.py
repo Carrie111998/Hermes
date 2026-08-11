@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from collections import OrderedDict
+from importlib.machinery import PathFinder
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
@@ -14,11 +15,47 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.platforms.base import ProcessingOutcome
 
+# Detect the SDK WITHOUT importing it. lark_oapi is ~10k modules; importing it
+# here cost 23.8s and 10,055 sys.modules entries at collection time — paid by
+# every run of this file, before a single test executed, purely to set the
+# boolean below. ``_HAS_LARK_OAPI`` is only ever read by ``skipUnless``
+# decorators, and the one test that needs the real symbols imports them itself
+# (``from lark_oapi.ws import Client``), so a spec probe is exactly equivalent:
+# with the SDK installed these tests still RUN rather than skip.
+# PathFinder, deliberately NOT ``importlib.util.find_spec``: the latter
+# consults ``sys.modules`` first and raises ``ValueError`` when the name is
+# already there without a ``__spec__`` — exactly what the ``MagicMock`` stub
+# ``test_feishu_approval_buttons.py`` injects looks like. That would silently
+# flip these tests to SKIPPED depending on collection order. PathFinder
+# searches ``sys.path``, so the answer describes the on-disk SDK. Same probe
+# as ``test_feishu_lazy_sdk_import._lark_installed``.
 try:
-    import lark_oapi
-    _HAS_LARK_OAPI = True
-except ImportError:
+    _HAS_LARK_OAPI = PathFinder.find_spec("lark_oapi") is not None
+except (ImportError, ValueError):
     _HAS_LARK_OAPI = False
+
+# Warm the SDK HERE, at collection, when it is installed.
+#
+# The probe above fixed what the boolean is derived from; it did not remove the
+# SDK load from this file.  ``FeishuAdapter.__init__`` calls
+# ``check_feishu_requirements()`` unconditionally and this module constructs a
+# real adapter 111 times, so the first such test loads lark_oapi regardless --
+# only now it happens inside the test body, where the per-test ``--timeout``
+# applies.  Measured 2026-08-11: that made
+# ``test_connect_acquires_scoped_lock_and_disconnect_releases_it`` a 49.6s
+# ``call`` and blew a 30s cap, killing the whole file mid-run (pytest-timeout's
+# thread method kills the process, so the 200+ tests after it never report).
+#
+# Collection is NOT covered by the per-test timeout, which is where this cost
+# used to sit as a bare ``import lark_oapi``.  Paying it here is therefore the
+# same one-time cost in an untimed place -- not a new one.  Kept separate from
+# the probe on purpose: a failure here must never flip tests to SKIPPED, so the
+# boolean stays derived from the on-disk spec and this is best-effort only.
+if _HAS_LARK_OAPI:
+    try:
+        import lark_oapi  # noqa: F401
+    except Exception:
+        pass
 
 
 class _FakeRequestContent:

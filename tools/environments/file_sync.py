@@ -350,13 +350,21 @@ class FileSyncManager:
         except Exception:
             file_mapping = []
 
-        with tempfile.NamedTemporaryFile(suffix=".tar") as tf:
-            self._bulk_download_fn(Path(tf.name))
+        # NOTE: deliberately NOT tempfile.NamedTemporaryFile.  Both the
+        # download callback and tarfile.open below reopen this path *by
+        # name*, and Windows forbids reopening a NamedTemporaryFile while
+        # its handle is live (PermissionError: [Errno 13]).  That made every
+        # sync_back attempt fail there, burn all its retries, and degrade to
+        # a silent no-op.  A plain file inside a TemporaryDirectory is
+        # reopenable on every platform and cleaned up just as reliably.
+        with tempfile.TemporaryDirectory(prefix="hermes-sync-back-dl-") as download_dir:
+            tar_path = os.path.join(download_dir, "remote.tar")
+            self._bulk_download_fn(Path(tar_path))
 
             # Defensive size cap: a misbehaving sandbox could produce an
             # arbitrarily large tar. Refuse to extract if it exceeds the cap.
             try:
-                tar_size = os.path.getsize(tf.name)
+                tar_size = os.path.getsize(tar_path)
             except OSError:
                 tar_size = 0
             if tar_size > _SYNC_BACK_MAX_BYTES:
@@ -367,7 +375,7 @@ class FileSyncManager:
                 return
 
             with tempfile.TemporaryDirectory(prefix="hermes-sync-back-") as staging:
-                with tarfile.open(tf.name) as tar:
+                with tarfile.open(tar_path) as tar:
                     tar.extractall(staging, filter="data")
 
                 applied = 0
@@ -377,7 +385,12 @@ class FileSyncManager:
                 for dirpath, _dirnames, filenames in os.walk(staging):
                     for fname in filenames:
                         staged_file = os.path.join(dirpath, fname)
-                        rel = os.path.relpath(staged_file, staging)
+                        # os.path.relpath uses the *host* separator, but we are
+                        # rebuilding a remote POSIX path to look up in the file
+                        # mapping.  Without this normalisation Windows produced
+                        # "/root\.hermes\skill.md", which matched nothing, so no
+                        # remote change was ever applied.
+                        rel = os.path.relpath(staged_file, staging).replace(os.sep, "/")
                         remote_path = "/" + rel
 
                         pushed_hash = self._pushed_hashes.get(remote_path)
@@ -457,11 +470,19 @@ class FileSyncManager:
         for host, remote in mapping:
             if self._is_upload_only_host_path(host, upload_only_host_paths):
                 continue
-            remote_dir = str(Path(remote).parent)
+            # Remote paths are POSIX whatever the host platform is, so parse
+            # them with posixpath.  A platform-flavoured ``Path`` renders
+            # "/root/.hermes/skills" as "\root\.hermes\skills" on Windows,
+            # so this prefix test never matched there and every newly
+            # created remote file was silently dropped.
+            remote_dir = posixpath.dirname(remote)
             if remote_path.startswith(remote_dir + "/"):
                 host_dir = str(Path(host).parent)
-                suffix = remote_path[len(remote_dir):]
-                return host_dir + suffix
+                # Re-join with the host separator — splicing the "/"-separated
+                # remainder straight on yields mixed separators like
+                # "C:\dir/b.py".
+                suffix_parts = remote_path[len(remote_dir) + 1:].split("/")
+                return os.path.join(host_dir, *suffix_parts)
         return None
 
     @staticmethod

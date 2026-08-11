@@ -2914,6 +2914,23 @@ Read-only commands are safe while an agent is running.\
 """
 
 
+def _split_slash_args(rest: str) -> list[str]:
+    """Tokenise a slash-command argument string without eating Windows paths.
+
+    ``shlex.split`` defaults to POSIX mode, where ``\\`` is an escape
+    character — so ``/kanban attach t_1 C:\\Users\\me\\upload.txt`` arrived as
+    ``C:Usersmeupload.txt`` and the attach failed with "no such file".  On
+    Windows we clear ``escape`` so backslash is literal; quoting still works,
+    and POSIX platforms keep their normal escaping semantics.
+    """
+    lex = shlex.shlex(rest, posix=True)
+    lex.whitespace_split = True
+    lex.commenters = ""  # as shlex.split() does — never treat "#" as a comment
+    if os.name == "nt":
+        lex.escape = ""
+    return list(lex)
+
+
 def run_slash(rest: str) -> str:
     """Execute a ``/kanban …`` string and return captured stdout/stderr.
 
@@ -2924,7 +2941,7 @@ def run_slash(rest: str) -> str:
     import io
     import contextlib
 
-    tokens = shlex.split(rest) if rest and rest.strip() else []
+    tokens = _split_slash_args(rest) if rest and rest.strip() else []
 
     # Bare ``/kanban`` or ``/kanban help`` / ``--help`` / ``-h`` / ``?``:
     # show the curated short-help block instead of dumping argparse's full

@@ -1400,9 +1400,13 @@ def load_gateway_config() -> GatewayConfig:
 
             _shared_loop_targets: list = list(Platform)
             if _pr is not None:
-                for _entry in _pr.plugin_entries():
+                # Names only — this loop never touches anything but
+                # ``entry.name``, so there is no reason to import a single
+                # platform SDK here.  ``plugin_entries()`` used to do exactly
+                # that via ``_resolve_all()``.
+                for _name in _platform_registry_names(_pr, plugin_only=True):
                     try:
-                        _plat = Platform(_entry.name)
+                        _plat = Platform(_name)
                     except (ValueError, KeyError):
                         continue
                     if _plat not in _shared_loop_targets:
@@ -1529,10 +1533,27 @@ def load_gateway_config() -> GatewayConfig:
             # blocks (below; no-op when a hook already set their env var) →
             # ``_apply_env_overrides()`` after ``GatewayConfig.from_dict``.
             if _pr is not None:
-                for entry in _pr.all_entries():
-                    if entry.apply_yaml_config_fn is None:
+                # Iterate by name and look for the platform's YAML block FIRST.
+                # The hook can only fire for a platform the user actually
+                # configured, and the no-block case already ``continue``d — so
+                # testing that before materializing the entry is behaviour-
+                # preserving, and it means an unconfigured platform's SDK is
+                # never imported just to discover it has no hook to run.
+                # Worklist, not a fixed list: resolving one platform can
+                # register SECONDARY platforms under names no manifest
+                # declared (wecom's loader also registers "wecom_callback").
+                # Those used to be covered because ``all_entries()`` resolved
+                # everything first.  None of them currently define
+                # ``apply_yaml_config_fn``, but re-scanning after each resolve
+                # costs nothing and keeps that from becoming a silent gap.
+                _pending = _platform_registry_names(_pr, plugin_only=False)
+                _seen_names: set = set()
+                while _pending:
+                    _name = _pending.pop(0)
+                    if _name in _seen_names:
                         continue
-                    platform_cfg = yaml_cfg.get(entry.name)
+                    _seen_names.add(_name)
+                    platform_cfg = yaml_cfg.get(_name)
                     # Fall back to the platform's block under ``platforms`` /
                     # ``gateway.platforms`` so adapter hooks still run when the
                     # user configured the platform only under those nested paths
@@ -1541,11 +1562,17 @@ def load_gateway_config() -> GatewayConfig:
                     if not isinstance(platform_cfg, dict):
                         for _src in (gateway_platforms, yaml_cfg.get("platforms")):
                             if isinstance(_src, dict):
-                                _candidate = _src.get(entry.name)
+                                _candidate = _src.get(_name)
                                 if isinstance(_candidate, dict):
                                     platform_cfg = _candidate
                                     break
                     if not isinstance(platform_cfg, dict):
+                        continue
+                    entry = _pr.get(_name)  # resolves only a configured platform
+                    for _extra in _platform_registry_names(_pr, plugin_only=False):
+                        if _extra not in _seen_names and _extra not in _pending:
+                            _pending.append(_extra)
+                    if entry is None or entry.apply_yaml_config_fn is None:
                         continue
                     try:
                         seeded = entry.apply_yaml_config_fn(yaml_cfg, platform_cfg)
@@ -1693,6 +1720,152 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
                     platform.value, env_name, token.strip()[:6] + "...",
                 )
                 pconfig.enabled = False
+
+
+# ── Lazy plugin-platform enumeration ─────────────────────────────────────────
+#
+# ``platform_registry.plugin_entries()`` / ``all_entries()`` call
+# ``_resolve_all()``, which imports EVERY bundled platform adapter — and those
+# modules import their platform SDKs.  Feishu's lark_oapi alone is ~10k modules.
+# The gateway config path called those accessors three times (shared-key
+# bridging, the apply_yaml_config_fn dispatch, and the env-enable pass), so
+# simply loading config imported ~20 platform SDKs the caller would never use.
+# Because ``GET /api/status`` awaits this path synchronously, that was a
+# production latency defect, not just a test-timeout one.
+#
+# Measured 2026-08-11 with HERMES_DISABLE_LAZY_INSTALLS=1 (pip out of the
+# picture), Feishu unconfigured: ``_apply_env_overrides`` left 1621 modules in
+# sys.modules eagerly vs 1032 lazily, resolving 2 platforms instead of 20+.
+# Wall-clock on this box swung from 24.4s (cold cache) to 8.0s (warm) for the
+# SAME eager run, so module count is the metric that actually holds still.
+#
+# The helpers below let the config path enumerate platforms by NAME (free) and
+# materialize only the ones that could actually matter.
+#
+# NOTE on lark_oapi: it is NOT imported by this path when Feishu is
+# unconfigured, because the Feishu adapter defers the SDK to
+# ``check_feishu_requirements()`` and the enable pass runs ``check_fn`` LAST,
+# only after ``is_connected`` passes.  Keep that ordering.
+
+# Operator escape hatch: restore the old resolve-everything behaviour without
+# shipping a revert, e.g. if a third-party plugin turns out to need it.
+_EAGER_PLATFORM_PLUGINS_ENV = "HERMES_EAGER_PLATFORM_PLUGINS"
+
+
+def _eager_platform_plugins() -> bool:
+    """True when the operator has opted back into eager platform resolution."""
+    return is_truthy_value(os.getenv(_EAGER_PLATFORM_PLUGINS_ENV, ""), default=False)
+
+
+def _platform_registry_names(registry: Any, *, plugin_only: bool) -> List[str]:
+    """Known platform names, WITHOUT importing a single adapter.
+
+    Combines entries already materialized with the names of pending deferred
+    loaders.  Deferred names come from the plugin manifest (``feishu-platform``
+    -> ``feishu``), which by convention matches the name the adapter registers;
+    ``tests/gateway/test_platform_registry_lazy.py`` pins that convention for
+    every bundled platform so this stays a safe substitute for the real entry.
+    """
+    names: List[str] = []
+    seen = set()
+    for entry in registry.loaded_entries():
+        if plugin_only and entry.source != "plugin":
+            continue
+        if entry.name not in seen:
+            seen.add(entry.name)
+            names.append(entry.name)
+    for name in registry.deferred_names():
+        # Every deferred loader is a bundled *platform* plugin, so it always
+        # qualifies under ``plugin_only``.
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _visible_env_keys() -> set:
+    """Env var names a platform plugin could actually see.
+
+    ``os.environ`` is NOT the whole story: plugin ``is_connected`` hooks read
+    credentials through ``hermes_cli.config.get_env_value``, which falls back
+    to the profile's ``.env`` FILE.  A token that lives only there never
+    appears in ``os.environ``, so gating on ``os.environ`` alone silently
+    stopped Telegram and WhatsApp from auto-enabling on a normal Hermes
+    install — caught by diffing enabled-platforms before/after, 2026-08-11.
+
+    ``load_env()`` is memoised on the .env mtime and ``hermes_cli.config`` is
+    already imported by this module, so this costs no extra import.
+    """
+    keys = set(os.environ)
+    try:
+        from hermes_cli.config import load_env
+
+        keys.update(load_env())
+    except Exception as e:
+        logger.debug("could not read .env while gating platforms: %s", e)
+    return keys
+
+
+def _deferred_platform_may_be_configured(
+    registry: Any, name: str, configured_names: set, env_keys: "set | None" = None
+) -> bool:
+    """Could *name* plausibly be configured, judged without importing it?
+
+    Answers from the env hints the plugin manifest declared at discovery time
+    (see ``PluginManager._platform_env_hints``).  Deliberately over-inclusive:
+    a false positive costs one import, a false negative silently stops a
+    platform from auto-enabling.  Fails OPEN on missing hints and on any error.
+    """
+    try:
+        if _eager_platform_plugins():
+            return True
+        # Already present in config (YAML / gateway.json / dashboard) — the
+        # user configured it somehow, so its real entry is needed.
+        if name in configured_names:
+            return True
+        hints = registry.deferred_env_hints(name)
+        if not hints:
+            # Manifest declared nothing we can gate on: behave as before.
+            return True
+        keys = _visible_env_keys() if env_keys is None else env_keys
+        for hint in hints:
+            if hint.endswith("_"):
+                if any(key.startswith(hint) for key in keys):
+                    return True
+            elif hint in keys:
+                return True
+        return False
+    except Exception as e:
+        logger.debug(
+            "deferred-platform gate failed for %r: %s — resolving eagerly", name, e
+        )
+        return True
+
+
+def _candidate_plugin_entries(registry: Any, config: "GatewayConfig") -> List[Any]:
+    """Plugin platform entries worth materializing for the env-enable pass.
+
+    Resolves each deferred platform individually, and only when
+    :func:`_deferred_platform_may_be_configured` says it could matter.  The
+    ones that stay deferred are exactly the ones the pass would have imported,
+    probed, and then skipped.
+    """
+    configured_names = {platform.value for platform in config.platforms}
+    env_keys = _visible_env_keys()  # read once, not per platform
+    # Snapshot: resolving mutates the registry's deferred map.
+    for name in registry.deferred_names():
+        if _deferred_platform_may_be_configured(
+            registry, name, configured_names, env_keys
+        ):
+            registry.get(name)  # resolves this ONE platform
+        else:
+            logger.debug(
+                "Platform '%s' left deferred: no matching env vars and not in "
+                "config (set %s=1 to resolve everything)",
+                name,
+                _EAGER_PLATFORM_PLUGINS_ENV,
+            )
+    return [e for e in registry.loaded_entries() if e.source == "plugin"]
 
 
 def _apply_env_overrides(config: GatewayConfig) -> None:
@@ -2389,7 +2562,9 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
+        # Materializes only platforms that could plausibly be configured —
+        # ``plugin_entries()`` would import every bundled platform SDK here.
+        for entry in _candidate_plugin_entries(platform_registry, config):
             try:
                 platform = Platform(entry.name)
             except Exception as e:
@@ -2488,11 +2663,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             # awaits this synchronously) — even when the user configured none
             # of them.  That blocked startup until every install finished and
             # caused the desktop app to time out and boot-loop (stuck at 94%).
+            #
+            # Prefer ``deps_available_fn`` when the plugin supplies one.  For
+            # adapters that defer a heavy SDK, ``check_fn`` *is* the loader --
+            # Feishu's ``check_feishu_requirements()`` imports lark_oapi
+            # (~10k modules; measured 413.9s cold here), and it fires for any
+            # user who actually configured Feishu.  We only need "are the deps
+            # installed?" to decide enablement; the real load still happens at
+            # adapter construction (``create_adapter``) and ``connect()``.
+            deps_probe = entry.deps_available_fn or entry.check_fn
             try:
-                if not entry.check_fn():
+                if not deps_probe():
                     continue
             except Exception as e:
-                logger.debug("check_fn for %s raised: %s", entry.name, e)
+                logger.debug("deps probe for %s raised: %s", entry.name, e)
                 continue
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()

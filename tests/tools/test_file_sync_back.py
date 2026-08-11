@@ -10,7 +10,20 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-fcntl = pytest.importorskip("fcntl")
+# ``file_sync`` is deliberately Windows-compatible: it imports fcntl
+# optionally and skips flock when it is unavailable.  Mirror that here
+# instead of skipping the whole module — a blanket
+# ``pytest.importorskip("fcntl")`` used to hide 17 of these 18 tests on
+# Windows, including the one asserting the no-fcntl fallback works, and it
+# concealed two real Windows defects in the code under test.
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None
+
+requires_fcntl = pytest.mark.skipif(
+    fcntl is None, reason="requires real fcntl (POSIX-only)"
+)
 
 from tools.environments.file_sync import (
     FileSyncManager,
@@ -51,6 +64,21 @@ def _write_file(path: Path, content: bytes) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return str(path)
+
+
+def _assert_sync_back_succeeded(caplog) -> None:
+    """Fail if sync_back swallowed an error instead of doing its job.
+
+    ``sync_back`` catches every exception, retries, and returns quietly.  A
+    test that only asserts "nothing raised" therefore passes even when the
+    sync failed completely — which is how a total Windows breakage stayed
+    invisible.  Assert on the retry/failure warnings instead.
+    """
+    swallowed = [
+        r.message for r in caplog.records
+        if "attempt" in r.message.lower() or "attempts failed" in r.message.lower()
+    ]
+    assert not swallowed, f"sync_back failed internally: {swallowed}"
 
 
 def _make_manager(
@@ -107,7 +135,7 @@ class TestSyncBackNoop:
 class TestSyncBackNoChanges:
     """When all remote files match pushed hashes, nothing is applied."""
 
-    def test_sync_back_no_changes(self, tmp_path):
+    def test_sync_back_no_changes(self, tmp_path, caplog):
         host_file = tmp_path / "host" / "cred.json"
         host_content = b'{"key": "val"}'
         _write_file(host_file, host_content)
@@ -124,8 +152,12 @@ class TestSyncBackNoChanges:
         # Simulate that we already pushed this file with this hash
         mgr._pushed_hashes[remote_path] = _sha256_bytes(host_content)
 
-        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+        with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+            mgr.sync_back(hermes_home=tmp_path / ".hermes")
 
+        # "Unchanged" must mean the sync ran and found nothing to do — not
+        # that it failed before it got as far as looking.
+        _assert_sync_back_succeeded(caplog)
         # Host file should be unchanged (same content, same bytes)
         assert host_file.read_bytes() == host_content
 
@@ -307,6 +339,7 @@ class TestPushedHashesPopulated:
 class TestSyncBackFileLock:
     """Verify that fcntl.flock is used during sync-back."""
 
+    @requires_fcntl
     @patch("tools.environments.file_sync.fcntl.flock")
     def test_sync_back_file_lock(self, mock_flock, tmp_path):
         download_fn = _make_download_fn({})
@@ -322,14 +355,27 @@ class TestSyncBackFileLock:
         assert fcntl.LOCK_EX in lock_ops
         assert fcntl.LOCK_UN in lock_ops
 
-    def test_sync_back_skips_flock_when_fcntl_none(self, tmp_path):
-        """On Windows (fcntl=None), sync_back should skip file locking."""
-        download_fn = _make_download_fn({})
-        mgr = _make_manager(tmp_path, bulk_download_fn=download_fn)
+    def test_sync_back_skips_flock_when_fcntl_none(self, tmp_path, caplog):
+        """On Windows (fcntl=None), sync_back should skip file locking.
+
+        It must still complete the sync — "did not raise" is not enough,
+        because sync_back swallows its own failures.
+        """
+        host_file = _write_file(tmp_path / "host" / "s.md", b"original")
+        download_fn = _make_download_fn({"root/.hermes/s.md": b"remote"})
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(host_file, "/root/.hermes/s.md")],
+            bulk_download_fn=download_fn,
+        )
 
         with patch("tools.environments.file_sync.fcntl", None):
-            # Should not raise — locking is skipped
-            mgr.sync_back(hermes_home=tmp_path / ".hermes")
+            with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+                # Should not raise — locking is skipped
+                mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        _assert_sync_back_succeeded(caplog)
+        assert Path(host_file).read_bytes() == b"remote"
 
 
 class TestInferHostPath:
@@ -381,25 +427,27 @@ class TestInferHostPath:
 class TestSyncBackSIGINT:
     """SIGINT deferral during sync-back."""
 
-    def test_sync_back_defers_sigint_on_main_thread(self, tmp_path):
+    def test_sync_back_defers_sigint_on_main_thread(self, tmp_path, caplog):
         """On the main thread, SIGINT handler should be swapped during sync."""
         download_fn = _make_download_fn({})
         mgr = _make_manager(tmp_path, bulk_download_fn=download_fn)
 
-        handlers_seen = []
         original_getsignal = signal.getsignal
 
-        with patch("tools.environments.file_sync.signal.getsignal",
+        with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"), \
+             patch("tools.environments.file_sync.signal.getsignal",
                     side_effect=original_getsignal) as mock_get, \
              patch("tools.environments.file_sync.signal.signal") as mock_set:
             mgr.sync_back(hermes_home=tmp_path / ".hermes")
 
+        # The handler swap is meaningless if the sync underneath it failed.
+        _assert_sync_back_succeeded(caplog)
         # signal.getsignal was called to save the original handler
         assert mock_get.called
         # signal.signal was called at least twice: install defer, restore original
         assert mock_set.call_count >= 2
 
-    def test_sync_back_skips_signal_on_worker_thread(self, tmp_path):
+    def test_sync_back_skips_signal_on_worker_thread(self, tmp_path, caplog):
         """From a non-main thread, signal.signal should NOT be called."""
         import threading
 
@@ -411,7 +459,8 @@ class TestSyncBackSIGINT:
         def tracking_signal(*args):
             signal_called.append(args)
 
-        with patch("tools.environments.file_sync.signal.signal", side_effect=tracking_signal):
+        with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"), \
+             patch("tools.environments.file_sync.signal.signal", side_effect=tracking_signal):
             # Run from a worker thread
             exc = []
             def run():
@@ -425,6 +474,8 @@ class TestSyncBackSIGINT:
             t.join(timeout=10)
 
         assert not exc, f"sync_back raised: {exc}"
+        # Skipping the signal swap must not mean skipping the work itself.
+        _assert_sync_back_succeeded(caplog)
         # signal.signal should NOT have been called from the worker thread
         assert len(signal_called) == 0
 
@@ -471,3 +522,92 @@ class TestSyncBackSizeCap:
         # Default cap (2 GiB) is far above our tiny tar; extraction should proceed
         mgr.sync_back(hermes_home=tmp_path / ".hermes")
         assert Path(host_file).read_bytes() == b"remote_version"
+
+
+class TestSyncBackPlatformPortability:
+    """Regressions for defects that only manifest on Windows.
+
+    Both were invisible for as long as this module carried a blanket
+    ``pytest.importorskip("fcntl")``: the tests that would have caught them
+    never ran on the one platform where they fail.
+    """
+
+    def test_sync_back_completes_without_retrying(self, tmp_path, caplog):
+        """sync_back must succeed on the first attempt on every platform.
+
+        Regression: ``_sync_back_impl`` passed an open
+        ``tempfile.NamedTemporaryFile``'s name to ``bulk_download_fn`` and
+        then reopened it with ``tarfile.open``.  Windows forbids reopening a
+        NamedTemporaryFile while its handle is live, so every attempt raised
+        ``PermissionError``, all retries burned, and sync_back degraded to a
+        silent no-op that never applied remote changes.
+        """
+        host_file = _write_file(tmp_path / "host" / "skill.md", b"original")
+        download_fn = _make_download_fn({"root/.hermes/skill.md": b"remote"})
+
+        mgr = _make_manager(
+            tmp_path,
+            file_mapping=[(host_file, "/root/.hermes/skill.md")],
+            bulk_download_fn=download_fn,
+        )
+
+        with caplog.at_level(logging.WARNING, logger="tools.environments.file_sync"):
+            mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        _assert_sync_back_succeeded(caplog)
+        assert Path(host_file).read_bytes() == b"remote"
+
+    def test_download_target_is_reopenable_by_name(self, tmp_path):
+        """The path handed to bulk_download_fn must be openable by name.
+
+        A real ``bulk_download_fn`` (docker cp, sandbox export) opens the
+        destination itself.  If the manager holds its own handle on that
+        path, the callback fails on Windows.
+        """
+        opened: list[bool] = []
+
+        def download(dest: Path):
+            with open(dest, "wb"):  # must not raise PermissionError
+                pass
+            opened.append(True)
+            _make_tar({}, dest)
+
+        mgr = _make_manager(tmp_path, bulk_download_fn=download)
+        mgr.sync_back(hermes_home=tmp_path / ".hermes")
+
+        assert opened == [True]
+
+    def test_infer_host_path_parses_remote_as_posix(self, tmp_path):
+        """Remote paths are POSIX no matter what the host platform is.
+
+        Regression: ``str(Path(remote).parent)`` yields
+        ``'\\\\root\\\\.hermes\\\\skills'`` under a Windows ``Path`` flavour, so
+        the prefix comparison against a ``/``-separated remote path never
+        matched and every newly created remote file was silently dropped.
+        """
+        host_file = tmp_path / "host" / "skills" / "a.py"
+        _write_file(host_file, b"content")
+        mapping = [(str(host_file), "/root/.hermes/skills/a.py")]
+
+        mgr = _make_manager(tmp_path, file_mapping=mapping)
+        result = mgr._infer_host_path("/root/.hermes/skills/b.py", file_mapping=mapping)
+
+        assert result is not None, "remote POSIX prefix failed to match on this platform"
+        # Compare as paths so the assertion is separator-agnostic.
+        assert Path(result) == tmp_path / "host" / "skills" / "b.py"
+
+    def test_infer_host_path_returns_native_separators(self, tmp_path):
+        """The inferred host path must use the host's own separator.
+
+        The suffix carved off the remote path is ``/``-separated; splicing it
+        straight onto a host directory produced mixed separators like
+        ``C:\\\\dir/b.py``.
+        """
+        host_file = tmp_path / "host" / "skills" / "a.py"
+        _write_file(host_file, b"content")
+        mapping = [(str(host_file), "/root/.hermes/skills/a.py")]
+
+        mgr = _make_manager(tmp_path, file_mapping=mapping)
+        result = mgr._infer_host_path("/root/.hermes/skills/b.py", file_mapping=mapping)
+
+        assert result == str(tmp_path / "host" / "skills" / "b.py")

@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -126,6 +127,107 @@ def test_subprocess_getoutput_systemctl_blocked():
 def test_subprocess_getstatusoutput_systemctl_blocked():
     with pytest.raises(RuntimeError, match="live-system guard"):
         subprocess.getstatusoutput("systemctl --user restart hermes-gateway")
+
+
+# ──────────────── direct gateway launch (no systemctl) ─────────
+#
+# The systemctl guard keys on ``systemctl`` appearing in the command, so it
+# never saw the direct spawn paths — which are the ONLY paths Windows uses,
+# and the ones every ``--detached`` flow takes. A test that stubbed part of
+# the launch surface but missed the branch the code actually took would
+# reach the real Popen and leave a background gateway running on the
+# developer's machine. That happened on every run of
+# ``test_gateway_restart_on_windows_preserves_failure_fallback`` until
+# 82b130b6e (two rogue gateways, PIDs 44560 + 43476, on 2026-08-10).
+
+
+def test_direct_hermes_gateway_run_blocked():
+    """``launch_gateway_detached`` builds exactly this argv."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["hermes", "gateway", "run"])
+
+
+def test_absolute_hermes_entrypoint_gateway_run_blocked():
+    """An absolute entrypoint must be caught as readily as the bare name.
+
+    ``launch_gateway_detached`` prefers ``sys.argv[0]`` when it looks like
+    the hermes CLI, so the real argv is usually a full path.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen([r"C:\Users\dev\.venv\Scripts\hermes.exe", "gateway", "run"])
+
+
+def test_pythonw_dash_m_gateway_run_blocked():
+    """``gateway_windows._spawn_detached`` builds this argv."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(
+            [r"C:\Python311\pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
+        )
+
+
+def test_gateway_run_with_replace_flag_blocked():
+    """``--replace`` is what the restart path passes; a flag must not hide the verb."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["hermes", "gateway", "run", "--replace"])
+
+
+def test_gateway_stop_blocked():
+    """Stopping the live gateway is as destructive as spawning over it."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["hermes", "gateway", "stop"])
+
+
+def test_gateway_restart_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["hermes", "gateway", "restart"])
+
+
+def test_python_dash_m_gateway_run_module_blocked():
+    """``python -m gateway.run`` has no ``gateway`` subcommand token at all."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["python", "-m", "gateway.run"])
+
+
+def test_gateway_run_py_script_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["python", "/opt/hermes/gateway/run.py"])
+
+
+# The allow-cases below must not spawn ``echo``/``true``: those are POSIX-only
+# and would land this file's Windows run red — the exact condition that hid the
+# rogue-gateway bug in the first place. ``sys.executable -c ""`` exists on every
+# platform, and the guard inspects the argv it is GIVEN, so passing the
+# gateway-shaped tokens as arguments exercises the matcher without running one.
+
+
+def _run_allowed(*extra_argv):
+    """Run a harmless real subprocess whose argv carries ``extra_argv``.
+
+    If the guard wrongly matched, this raises RuntimeError instead of
+    returning — which is precisely what the allow-case asserts against.
+    """
+    return subprocess.run(
+        [sys.executable, "-c", "", *extra_argv], capture_output=True, text=True
+    )
+
+
+def test_gateway_status_passes_through():
+    """Read-only gateway subcommands must NOT be blocked."""
+    assert _run_allowed("hermes", "gateway", "status").returncode == 0
+
+
+def test_gateway_logs_passes_through():
+    assert _run_allowed("hermes", "gateway", "logs", "--tail", "20").returncode == 0
+
+
+def test_gateway_install_passes_through():
+    """``install`` writes a service definition; it does not start a gateway."""
+    assert _run_allowed("hermes", "gateway", "install").returncode == 0
+
+
+def test_unrelated_command_containing_gateway_word_passes_through():
+    """The word "gateway" alone (e.g. an API gateway path) must not trip it."""
+    assert _run_allowed("deploying", "api-gateway", "to", "staging").returncode == 0
 
 
 # ──────────────────── os.system / os.popen ────────────────────
@@ -276,6 +378,108 @@ def test_normal_subprocess_run_passes_through():
     """Plain non-systemctl subprocess.run should work normally."""
     r = subprocess.run(["echo", "hello"], capture_output=True, text=True)
     assert r.stdout.strip() == "hello"
+
+
+# ──────────────────── package installs ─────────────────────────
+#
+# A test run must never mutate the developer's / gateway's venv.  The live
+# offender was ``tools/lazy_deps.py::_venv_pip_install``: any test that
+# enables a platform (e.g. setting FEISHU_APP_ID) reaches
+# ``gateway/config.py::_apply_env_overrides`` -> ``entry.check_fn()``, whose
+# own comment notes it "lazy-INSTALLS the platform SDK (pip) as a side
+# effect".  One ``pytest tests/gateway`` run installed lark_oapi 1.6.8
+# (101 MB, 21,169 files) into ~/.hermes/agent-src/.venv — the venv the
+# gateway runs from — and timed out mid-install.
+#
+# Installs that redirect somewhere disposable (``--target``/``--prefix``/
+# ``--root``, or a different interpreter) are still allowed: they cannot
+# touch the running environment.
+
+
+def test_uv_pip_install_into_live_venv_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["uv", "pip", "install", "lark-oapi==1.6.8"])
+
+
+def test_python_m_pip_install_into_live_venv_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "lark-oapi==1.6.8"])
+
+
+def test_bare_pip_install_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["pip", "install", "-e", "."])
+
+
+def test_pip_install_user_site_blocked():
+    """``--user`` mutates the developer's user site-packages, not a tmpdir."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "--user", "pyyaml"])
+
+
+def test_pip_uninstall_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "lark-oapi"])
+
+
+def test_ensurepip_blocked():
+    """``ensurepip --upgrade`` bootstraps pip INTO the live venv."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"])
+
+
+def test_shell_string_pip_install_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run("uv pip install lark-oapi==1.6.8", shell=True)
+
+
+def test_pip_install_with_target_passes_through(tmp_path):
+    """``--target <dir>`` cannot touch the live venv, so it is allowed.
+
+    ``tests/tools/test_lazy_deps_durable_target.py`` depends on this: its
+    opt-in real-install test exercises the durable-target wire end to end.
+    A nonexistent executable proves the guard handed the command to the
+    real subprocess machinery (FileNotFoundError) rather than blocking it.
+    """
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(
+            ["hermes-nonexistent-uv", "pip", "install", "--target", str(tmp_path), "isodate"]
+        )
+
+
+def test_pip_install_into_other_interpreter_passes_through():
+    """Installing into a throwaway venv's python is allowed.
+
+    ``tests/test_wheel_locales_e2e.py`` builds a wheel, creates a scratch
+    venv and pip-installs into it — that interpreter is not ours.
+    """
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(
+            ["/hermes/nonexistent/venv/bin/python", "-m", "pip", "install", "pyyaml"]
+        )
+
+
+def test_npm_install_passes_through():
+    """The guard protects the Python venv; ``npm install`` is unrelated."""
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["hermes-nonexistent-npm", "install"])
+
+
+def test_uv_tool_install_passes_through():
+    """``uv tool install`` targets uv's tool dir, not the active venv."""
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["hermes-nonexistent-uv", "tool", "install", "hermes-agent"])
+
+
+def test_pip_version_probe_passes_through():
+    """Read-only pip probes must still work — lazy_deps uses one."""
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r is not None
 
 
 # ──────────────────── bypass marker ─────────────────────────────

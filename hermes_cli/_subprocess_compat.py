@@ -42,11 +42,29 @@ __all__ = [
     "windows_detach_flags_without_breakaway",
     "windows_hide_flags",
     "windows_detach_popen_kwargs",
+    "windows_pipe_readable_bytes",
     "run_text_capture",
 ]
 
 
 IS_WINDOWS = sys.platform == "win32"
+
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _PeekNamedPipe = _kernel32.PeekNamedPipe
+    _PeekNamedPipe.argtypes = [
+        wintypes.HANDLE,                 # hNamedPipe
+        ctypes.c_void_p,                 # lpBuffer (NULL — we only want the count)
+        wintypes.DWORD,                  # nBufferSize
+        ctypes.POINTER(wintypes.DWORD),  # lpBytesRead
+        ctypes.POINTER(wintypes.DWORD),  # lpTotalBytesAvail
+        ctypes.POINTER(wintypes.DWORD),  # lpBytesLeftThisMessage
+    ]
+    _PeekNamedPipe.restype = wintypes.BOOL
 
 
 # -----------------------------------------------------------------------------
@@ -159,6 +177,46 @@ def resolve_windows_git_bash() -> Optional[str]:
     ):
         return None  # WSL launcher / Store stub — cannot see C:\ paths
     return found
+
+
+# -----------------------------------------------------------------------------
+# Pipe introspection (Windows)
+# -----------------------------------------------------------------------------
+
+
+def windows_pipe_readable_bytes(fd: int) -> Optional[int]:
+    """Return the bytes readable *right now* on a pipe fd, or ``None`` when the
+    pipe is broken / the fd is unusable (the EOF equivalent).
+
+    ``select.select()`` only works on sockets on Windows, so non-blocking pipe
+    drains poll this instead: ``os.read(fd, n)`` is guaranteed not to block
+    whenever this reports > 0 available bytes.
+
+    Built on ``PeekNamedPipe``, which works on anonymous pipes too — both
+    ``subprocess.PIPE`` and ``os.pipe()`` create them.  Pipe fds only; on a
+    non-pipe fd the underlying call fails and this reports ``None``.
+
+    Failure mapping: once every write handle is closed AND the buffer is
+    drained, ``PeekNamedPipe`` fails with ``ERROR_BROKEN_PIPE`` — exactly the
+    moment a POSIX ``read()`` would return ``b""``.  While data is still
+    buffered the call keeps succeeding, so no tail output is lost.  Any other
+    failure (handle closed under us, not a pipe) also returns ``None``: the
+    caller should stop reading in every such case.
+
+    Returns ``None`` on non-Windows hosts, keeping this module's "no-op on
+    POSIX" guarantee — callers there use ``select.select([fd], [], [], t)``.
+    """
+    if not IS_WINDOWS:
+        return None
+    try:
+        handle = msvcrt.get_osfhandle(fd)
+    except (OSError, ValueError):
+        return None  # fd already closed / not a CRT fd
+    avail = wintypes.DWORD(0)
+    ok = _PeekNamedPipe(handle, None, 0, None, ctypes.byref(avail), None)
+    if not ok:
+        return None  # broken pipe (all writers gone) or invalid handle
+    return avail.value
 
 
 # -----------------------------------------------------------------------------

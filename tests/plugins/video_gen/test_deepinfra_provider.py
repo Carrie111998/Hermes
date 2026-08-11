@@ -10,6 +10,7 @@ t2v vs i2v routing, download → save).
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -118,7 +119,10 @@ def test_generate_text_to_video_downloads_url_and_saves_locally():
         )
     assert result["success"] is True
     assert result["modality"] == "text"
-    assert result["video"].endswith(".mp4") and "cache/videos" in result["video"]
+    # as_posix() so the "/"-separated expectation holds on Windows too, where
+    # str(Path("/home/.../cache/videos/x.mp4")) renders with backslashes.
+    assert result["video"].endswith(".mp4")
+    assert "cache/videos" in Path(result["video"]).as_posix()
     assert captured["url"] == "https://cdn.example/out.mp4"
     assert "deepinfra" in captured["base_url"]
     assert captured["api_key"] == "test-key"

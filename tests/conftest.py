@@ -669,6 +669,19 @@ def _ensure_current_event_loop(request):
 #    ``check_output`` reject any ``systemctl ... <verb> hermes-gateway``
 #    invocation that would mutate the live unit. Read-only systemctl
 #    calls (``status``, ``show``, ``list-units``) still pass through.
+#  • The same wrappers reject ``pip``/``uv pip``/``ensurepip``
+#    install/uninstall commands aimed at the LIVE venv, so a test can
+#    never pip-install into the environment the gateway runs from.
+#    Installs redirected via ``--target``/``--prefix``/``--root``/
+#    ``--python``, or run against another interpreter, pass through.
+#  • The same wrappers reject a DIRECT gateway launch/stop —
+#    ``hermes gateway run``, ``pythonw -m hermes_cli.main gateway run``,
+#    ``python -m gateway.run``. This is the systemd guard's blind spot:
+#    it keys on ``systemctl`` being present, so every detached-spawn path
+#    (the only one Windows ever uses) went unchecked. A test that stubs
+#    part of the launch surface and misses the branch the code actually
+#    takes would silently leave a background gateway behind on the
+#    developer's machine — see _is_gateway_lifecycle_cmd for the history.
 #
 # We intentionally do NOT stub ``find_gateway_pids`` / ``_scan_gateway_pids``
 # here — tests of those functions themselves need the real implementation.
@@ -714,6 +727,9 @@ def _live_system_guard(request, monkeypatch):
       • os.system / os.popen
       • pty.spawn
       • asyncio.create_subprocess_exec / create_subprocess_shell
+    The same subprocess interception also blocks pip/uv/ensurepip
+    commands that would install or remove packages in the LIVE venv the
+    developer and the gateway run from (see ``_is_package_install``).
     Subprocess inspection looks at the WHOLE command string (not just
     tokens[0]), so ``bash -c "systemctl restart hermes-gateway"``,
     ``sudo systemctl ...``, ``env systemctl ...``, ``setsid systemctl ...``
@@ -725,6 +741,7 @@ def _live_system_guard(request, monkeypatch):
         return
 
     import os as _os
+    import re as _re
     import shlex as _shlex
     import subprocess as _subprocess
 
@@ -830,6 +847,79 @@ def _live_system_guard(request, monkeypatch):
         "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
+    # Verbs that, applied to the ``gateway`` subcommand, start or tear down a
+    # REAL gateway process. ``status`` / ``logs`` / ``health`` / ``install``
+    # are deliberately absent — they are read-only or config-only and several
+    # tests exercise them.
+    _GATEWAY_LIFECYCLE_VERBS = (
+        "run", "start", "restart", "replace", "stop", "kill",
+    )
+
+    # Package-installer tokens. ``pipx``/``uv tool`` deliberately absent:
+    # they install into their own isolated dirs, not the active venv.
+    _PIP_HEAD = _re.compile(r"^pip[0-9.]*$")
+    _INSTALL_VERBS = ("install", "uninstall")
+    # Flags that redirect the install away from the running interpreter's
+    # environment, so it cannot mutate the developer's / gateway's venv.
+    # ``--user`` is deliberately NOT here: it mutates the real user site.
+    _INSTALL_REDIRECT_FLAGS = (
+        "--target", "--prefix", "--root", "--python", "--dry-run",
+    )
+
+    def _exe_head(tok: str) -> str:
+        head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+        return head[:-4] if head.endswith(".exe") else head
+
+    def _is_foreign_interpreter(tok: str) -> bool:
+        """True if *tok* is a python executable other than the one we run."""
+        if not _exe_head(tok).startswith("python"):
+            return False
+        try:
+            return _os.path.normcase(_os.path.realpath(tok)) != _os.path.normcase(
+                _os.path.realpath(sys.executable)
+            )
+        except Exception:
+            return False
+
+    def _is_package_install(cmd) -> bool:
+        """True if *cmd* would install/remove packages in the LIVE venv.
+
+        A test run must never mutate the developer's / gateway's venv. The
+        live offender was ``tools/lazy_deps.py::_venv_pip_install``: any
+        test that enables a platform (e.g. by setting ``FEISHU_APP_ID``)
+        reaches ``gateway/config.py::_apply_env_overrides`` ->
+        ``entry.check_fn()``, which — per its own comment there — "lazy-
+        INSTALLS the platform SDK (pip) as a side effect". One
+        ``pytest tests/gateway`` run installed lark_oapi 1.6.8 (101 MB,
+        21,169 files) into ``~/.hermes/agent-src/.venv`` and timed out
+        mid-install.
+
+        Installs redirected somewhere disposable are still allowed: a
+        ``--target``/``--prefix``/``--root``/``--python`` install, or one
+        run against a different interpreter (a throwaway venv built by the
+        test), cannot touch the running environment.
+        """
+        cmd_str = _cmd_to_string(cmd)
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            tokens = cmd_str.split()
+        if not tokens:
+            return False
+
+        heads = [_exe_head(t) for t in tokens]
+        # ``ensurepip`` bootstraps pip INTO the venv — a mutation with no
+        # "install" verb of its own.
+        if "ensurepip" not in heads:
+            if not any(_PIP_HEAD.match(h) for h in heads):
+                return False
+            if not any(t in _INSTALL_VERBS for t in tokens):
+                return False
+
+        for tok in tokens:
+            if tok.split("=", 1)[0] in _INSTALL_REDIRECT_FLAGS:
+                return False
+        return not _is_foreign_interpreter(tokens[0])
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -887,7 +977,84 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _is_gateway_lifecycle_cmd(cmd) -> bool:
+        """True for a subprocess that would START or STOP a real gateway.
+
+        The systemctl guard above only fires when ``systemctl`` is in the
+        command, so the *direct* spawn paths — the ones actually used on
+        Windows and in every ``--detached`` flow — sailed straight through:
+
+            subprocess.Popen(["hermes", "gateway", "run"])                 # launch_gateway_detached
+            subprocess.Popen([pythonw, "-m", "hermes_cli.main", ...])      # gateway_windows._spawn_detached
+
+        A test that stubs *some* of the launch surface but not all of it
+        (e.g. stubs ``run_gateway`` but not ``launch_gateway_detached``,
+        then hits the Windows branch that defaults to detached) reaches the
+        real Popen and puts a background gateway on the developer's machine.
+        That is exactly what
+        ``test_gateway_restart_on_windows_preserves_failure_fallback`` did on
+        every run until 82b130b6e — invisibly, because the test asserted on a
+        ``calls`` list, so the unstubbed real spawn merely failed an
+        assertion instead of announcing that it had launched a process.
+
+        Detection is token-based rather than substring-based so that an
+        absolute entrypoint (``C:\\...\\hermes.exe gateway run``) is caught as
+        readily as the bare ``hermes gateway run``.
+        """
+        cmd_str = _cmd_to_string(cmd)
+        if not cmd_str:
+            return False
+        low = cmd_str.lower()
+        if "gateway" not in low:
+            return False
+        if "systemctl" in low:
+            return False  # already covered by _is_blocked_systemctl
+
+        # Normalise path separators so basenames are comparable, and avoid
+        # shlex here: on Windows it eats the backslashes in a real argv.
+        tokens = [t.strip("\"'") for t in low.replace("\\", "/").split()]
+        basenames = [t.rsplit("/", 1)[-1] for t in tokens]
+
+        # ``python -m gateway.run`` / ``gateway/run.py`` launch the gateway
+        # with no ``gateway`` subcommand token at all.
+        if "gateway/run.py" in low or "gateway.run" in basenames:
+            return True
+
+        # Otherwise require a Hermes entrypoint AND `gateway <lifecycle-verb>`.
+        has_entry = any(
+            b.startswith("hermes") or b in ("hermes_cli.main", "hermes_cli")
+            for b in basenames
+        )
+        if not has_entry:
+            return False
+        for idx, base in enumerate(basenames):
+            if base != "gateway":
+                continue
+            for nxt in basenames[idx + 1:]:
+                if nxt.startswith("-"):
+                    continue  # skip flags like --replace's leading dashes
+                return nxt in _GATEWAY_LIFECYCLE_VERBS
+        return False
+
     def _check_subprocess_cmd(name, cmd):
+        if _is_gateway_lifecycle_cmd(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this would start or stop a "
+                "REAL Hermes gateway process on this machine. The test "
+                "reached a genuine launch/stop path, which means part of "
+                "the spawn surface is unstubbed. Stub the specific "
+                "function the code path actually calls — e.g. "
+                "launch_gateway_detached, gateway_windows._spawn_detached, "
+                "_launch_detached_gateway, _spawn_gateway_restart_watcher, "
+                "launch_detached_profile_gateway_restart — and remember "
+                "that the Windows branch of _gateway_command_inner defaults "
+                "the recovery relaunch to DETACHED (`detached = "
+                "is_windows()` when args.detached is None), so stubbing "
+                "run_gateway alone is not enough. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if a real "
+                "gateway process is genuinely required."
+            )
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -903,6 +1070,24 @@ def _live_system_guard(request, monkeypatch):
                 "targeting hermes/python could hit the live gateway. "
                 "Mark with @pytest.mark.live_system_guard_bypass if "
                 "intentional."
+            )
+        if _is_package_install(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this would install or remove "
+                "packages in the LIVE venv that the developer and the "
+                "hermes-gateway run from. A `pytest tests/gateway` run "
+                "reached tools/lazy_deps.py::_venv_pip_install this way "
+                "(gateway/config.py::_apply_env_overrides -> entry.check_fn(), "
+                "which lazy-installs the platform SDK as a side effect) and "
+                "pulled lark_oapi 1.6.8 — 101 MB, 21,169 files — into "
+                "~/.hermes/agent-src/.venv, timing out mid-install. "
+                "Stub tools.lazy_deps._venv_pip_install (or whichever "
+                "installer the code under test calls). If the install is the "
+                "point, redirect it with --target/--prefix/--root/--python or "
+                "run it against a throwaway venv's interpreter — both pass "
+                "through this guard — or mark with "
+                "@pytest.mark.live_system_guard_bypass."
             )
         # Block any subprocess that would run `hermes update` (or the
         # equivalent `python -m hermes_cli.main update`).  These commands

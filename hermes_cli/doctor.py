@@ -201,6 +201,29 @@ def _fail_and_issue(text: str, detail: str, fix: str, issues: list[str]) -> None
     issues.append(fix)
 
 
+# Wall-clock budget for the state.db health probe. The probe ends in
+# ``PRAGMA integrity_check``, a page-by-page verification of the whole
+# database: on a 5.1 GB state.db it ran for over 12 minutes and made
+# `hermes doctor` never terminate. A diagnostic that cannot answer quickly
+# should say so rather than block, so the probe is bounded and a budget hit
+# renders a WARN. Raise it (or set 0/invalid to fall back to the default)
+# via HERMES_DOCTOR_DB_PROBE_TIMEOUT when you want the exhaustive scan.
+_STATE_DB_PROBE_TIMEOUT_ENV = "HERMES_DOCTOR_DB_PROBE_TIMEOUT"
+_STATE_DB_PROBE_TIMEOUT_DEFAULT = 5.0
+
+
+def _state_db_probe_budget() -> float:
+    """Return the state.db probe budget in seconds (env-overridable)."""
+    raw = os.getenv(_STATE_DB_PROBE_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _STATE_DB_PROBE_TIMEOUT_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _STATE_DB_PROBE_TIMEOUT_DEFAULT
+    return value if value > 0 else _STATE_DB_PROBE_TIMEOUT_DEFAULT
+
+
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
 # them as non-failing warnings with the modern replacement — it does not
 # auto-migrate or delete (migrations live in config.py version steps).
@@ -750,6 +773,24 @@ def run_doctor(args):
     # Detect drift between pyproject.toml and hermes_cli/__init__.py versions
     # (a git conflict resolution can silently revert one but not the other).
     _check_version_consistency(issues)
+
+    _section("Install Integrity")
+    try:
+        from hermes_cli.install_doctor import doctor_section_lines
+
+        rows, remediation = doctor_section_lines()
+        for status, text, detail in rows:
+            if status == "ok":
+                check_ok(text, detail)
+            elif status == "warn":
+                check_warn(text, detail)
+            else:
+                check_fail(text, detail)
+        if remediation:
+            manual_issues.append(remediation)
+    except Exception as e:
+        # Never let a bug in the install check block the rest of doctor.
+        check_warn(f"Install integrity check failed: {e}")
 
     _section("SSL / CA Certificates")
     check_certificates()
@@ -1375,9 +1416,33 @@ def run_doctor(args):
             # through the triggers. `_db_opens_cleanly` now drives a rolled-back
             # write so this otherwise-silent corruption class is surfaced (and
             # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+            from hermes_state import (
+                StateDbProbeTimeout,
+                _db_opens_cleanly,
+                repair_state_db_schema,
+            )
 
-            _write_reason = _db_opens_cleanly(state_db_path)
+            try:
+                _write_reason = _db_opens_cleanly(
+                    state_db_path, timeout_seconds=_state_db_probe_budget()
+                )
+            except StateDbProbeTimeout as _probe_timeout:
+                # Out of budget is NOT corruption: report and move on. Leaving
+                # _write_reason as None keeps --fix from "repairing" a database
+                # we never found anything wrong with.
+                _db_mb = state_db_path.stat().st_size // (1024 * 1024)
+                check_warn(
+                    f"{_DHH}/state.db health probe did not finish in budget",
+                    f"({_probe_timeout}; {_db_mb} MB database)",
+                )
+                check_info(
+                    "This is not a corruption report — the cheap checks passed and "
+                    "only the exhaustive scan was cut short."
+                )
+                check_info(
+                    "For the full check (no time limit): hermes sessions repair --check-only"
+                )
+                _write_reason = None
             if _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",

@@ -356,3 +356,97 @@ def test_select_cached_agent_history_prefers_longer_live_transcript():
     # No live transcript / not a list → no-op.
     assert _select_cached_agent_history(persisted, None) is persisted
     assert _select_cached_agent_history(persisted, "nope") is persisted
+
+
+# ---------------------------------------------------------------------------
+# Bounded health probe (#hermes-doctor-hang)
+#
+# `_db_opens_cleanly` runs `PRAGMA integrity_check`, a full page-by-page scan
+# of the whole database. On a real 5.1 GB state.db that took >12 minutes and
+# made `hermes doctor` never terminate. The probe now accepts a deadline, and
+# a deadline hit must be distinguishable from corruption — callers escalate to
+# destructive repair strategies on a reason string, so "we ran out of time"
+# must never be reported as "your database is broken".
+# ---------------------------------------------------------------------------
+
+
+def test_probe_deadline_interrupts_a_long_running_statement(tmp_path):
+    """The watchdog aborts an in-flight statement, not just between statements.
+
+    Uses a recursive CTE that would run for minutes so the test is
+    deterministic without needing a multi-gigabyte fixture.
+    """
+    import time as _time
+
+    from hermes_state import _arm_probe_deadline
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    conn = sqlite3.connect(str(db_path), isolation_level=None)
+    cancel, timed_out = _arm_probe_deadline(conn, 0.5)
+    started = _time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute(
+                "WITH RECURSIVE c(x) AS ("
+                "  SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1000000000"
+                ") SELECT COUNT(*) FROM c"
+            ).fetchall()
+    finally:
+        cancel()
+        conn.close()
+    elapsed = _time.monotonic() - started
+    assert timed_out.is_set()
+    assert elapsed < 15, f"watchdog did not abort the scan (took {elapsed:.1f}s)"
+
+
+def test_bounded_probe_raises_timeout_rather_than_reporting_corruption(tmp_path):
+    """An exhausted budget raises StateDbProbeTimeout, never a reason string."""
+    from hermes_state import StateDbProbeTimeout, _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    # A zero budget is exhausted before the exhaustive scan starts.
+    with pytest.raises(StateDbProbeTimeout):
+        _db_opens_cleanly(db_path, timeout_seconds=0)
+
+
+def test_bounded_probe_on_healthy_db_still_returns_none(tmp_path):
+    """A generous budget on a small DB behaves exactly like the unbounded probe."""
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    assert _db_opens_cleanly(db_path, timeout_seconds=30) is None
+
+
+def test_bounded_probe_still_detects_fts_write_corruption(tmp_path):
+    """Bounding the scan must not cost us the #50502 detection it exists for.
+
+    The cheap targeted probes run before the exhaustive scan, so corruption is
+    still reported on a database far too large to integrity-check in budget.
+    """
+    from hermes_state import _db_opens_cleanly
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    _corrupt_fts_index_data(db_path)
+
+    assert _db_opens_cleanly(db_path, timeout_seconds=30) is not None
+
+
+def test_unbounded_probe_is_the_default_and_never_times_out(tmp_path):
+    """Repair paths pass no deadline and keep their exact existing semantics."""
+    import inspect
+
+    from hermes_state import _db_opens_cleanly
+
+    sig = inspect.signature(_db_opens_cleanly)
+    assert sig.parameters["timeout_seconds"].default is None
+
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+    assert _db_opens_cleanly(db_path) is None

@@ -133,9 +133,13 @@ class TestTopicRouting:
     def test_all_event_types_have_routing(self):
         # v3: the event→topic table lives in events.routing_policy._POLICY
         # (single source of truth both delivery subscribers consult).
-        for et in EventType:
-            assert et in _POLICY, \
-                f"EventType {et.type_string} missing from routing_policy._POLICY"
+        # Collect-then-assert so the message reports the FULL drift; the
+        # in-loop form named only the first miss. See events/coverage.py.
+        missing = [et.type_string for et in EventType if et not in _POLICY]
+        assert not missing, (
+            f"{len(missing)} of {len(list(EventType))} EventType members "
+            f"missing from routing_policy._POLICY: {', '.join(missing)}"
+        )
 
 
 class TestAgentIterationRouting:

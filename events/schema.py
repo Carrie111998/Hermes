@@ -37,6 +37,22 @@ class EventType(Enum):
     """Catalog of all event types emitted by the Hermes Event Bus.
 
     Each member is a tuple of (event_type_string, default_priority).
+
+    ADDING A MEMBER IS NOT A ONE-FILE CHANGE. Every member also needs an entry
+    in the sibling tables contracted to be total over this enum:
+
+        events/formatting.py    EVENT_TYPE_EMOJI  (the notification icon)
+        events/routing_policy.py _POLICY          (topic + WhatsApp tier)
+
+    Nothing in the language enforces that, and it has silently broken four
+    times (2026-04-27 twice, 2026-05-29, 2026-08-11). ruff cannot catch it:
+    the keys are attribute accesses, which F601/F602 do not reach. Run
+
+        python -m events.coverage
+
+    which is also wired as a pre-commit hook, and see events/coverage.py for
+    the manifest of which tables must be total and which are deliberately
+    partial.
     """
 
     # Cron lifecycle

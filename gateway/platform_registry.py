@@ -51,7 +51,22 @@ class PlatformEntry:
     adapter_factory: Callable[[Any], Any]
 
     # Returns True when the platform's dependencies are available.
+    #
+    # NOTE: for adapter plugins that defer a heavy SDK (see the Feishu
+    # adapter's FEISHU_AVAILABLE block), ``check_fn`` is also the *loader* --
+    # calling it imports the SDK.  Paths that only need to know "are the deps
+    # present?" (rather than "load them now") must prefer
+    # ``deps_available_fn`` below.
     check_fn: Callable[[], bool]
+
+    # Optional: cheap "are this platform's dependencies installed?" probe that
+    # must NOT import the SDK.  ``check_fn`` answers the same question by
+    # doing the load, which for lark_oapi means ~10k module imports (measured
+    # 413.9s cold on a chronically-full disk) -- far too expensive for
+    # ``_apply_env_overrides``, which runs on every ``load_gateway_config()``
+    # including the synchronous ``GET /api/status`` readiness probe.
+    # When None, callers fall back to ``check_fn``.
+    deps_available_fn: Optional[Callable[[], bool]] = None
 
     # Optional: given a PlatformConfig, is it properly configured?
     # If None, the registry skips config validation and lets the adapter
@@ -181,10 +196,22 @@ class PlatformRegistry:
         # actually asks for that platform (gateway start, cron delivery,
         # `hermes setup`/`gateway status`, send_message).
         self._deferred: dict[str, Callable[[], None]] = {}
+        # Cheap, import-free env hints per deferred platform: the env var names
+        # and name prefixes that could plausibly configure it, derived from the
+        # plugin's ``plugin.yaml`` at discovery time.  Lets callers decide
+        # whether resolving a platform is worth the SDK import WITHOUT doing it.
+        # See ``deferred_env_hints``.
+        self._deferred_env_hints: dict[str, tuple[str, ...]] = {}
 
     # -- deferred loading ----------------------------------------------------
 
-    def register_deferred(self, name: str, loader: Callable[[], None]) -> None:
+    def register_deferred(
+        self,
+        name: str,
+        loader: Callable[[], None],
+        *,
+        env_hints: "tuple[str, ...] | list[str] | None" = None,
+    ) -> None:
         """Register a lazy loader for a platform that hasn't been imported yet.
 
         *loader* is a zero-arg callable that imports the owning plugin module,
@@ -193,15 +220,49 @@ class PlatformRegistry:
         up (or when the full entry list is materialized).  A real entry that is
         registered directly (e.g. a built-in) takes precedence -- the deferred
         loader is then dropped.
+
+        *env_hints* is an optional collection of env var names / name prefixes
+        that could configure this platform (e.g. ``("FEISHU_APP_ID",
+        "FEISHU_")``).  Callers that only want platforms the user could
+        plausibly have configured consult :meth:`deferred_env_hints` and skip
+        the resolve entirely when nothing matches.  An empty/omitted value
+        means "no hint available" -- callers must then fail OPEN and resolve,
+        so a plugin that cannot express hints never silently disappears.
         """
         if name in self._entries:
             # Already concretely registered; no need to defer.
             return
         self._deferred[name] = loader
+        self._deferred_env_hints[name] = tuple(env_hints or ())
+
+    def deferred_names(self) -> list[str]:
+        """Names of platforms with a pending deferred loader.
+
+        Resolves NOTHING -- this is the accessor for callers that need the set
+        of known platform names (or want to gate resolution themselves) without
+        paying for ~20 platform SDK imports.
+        """
+        return list(self._deferred)
+
+    def deferred_env_hints(self, name: str) -> tuple[str, ...]:
+        """Env var names / prefixes that could configure deferred *name*.
+
+        Empty tuple means "unknown" -- callers must fail open and resolve.
+        Resolves nothing.
+        """
+        return self._deferred_env_hints.get(name, ())
+
+    def loaded_entries(self) -> list[PlatformEntry]:
+        """Entries already materialized, without resolving anything pending.
+
+        The non-importing counterpart of :meth:`all_entries`.
+        """
+        return list(self._entries.values())
 
     def _resolve(self, name: str) -> None:
         """Run the deferred loader for *name* if one is pending."""
         loader = self._deferred.pop(name, None)
+        self._deferred_env_hints.pop(name, None)
         if loader is None:
             return
         try:
@@ -236,6 +297,7 @@ class PlatformRegistry:
         """
         # A concrete registration supersedes any pending deferred loader.
         self._deferred.pop(entry.name, None)
+        self._deferred_env_hints.pop(entry.name, None)
         if entry.name in self._entries:
             prev = self._entries[entry.name]
             logger.info(
@@ -250,6 +312,7 @@ class PlatformRegistry:
     def unregister(self, name: str) -> bool:
         """Remove a platform entry.  Returns True if it existed."""
         self._deferred.pop(name, None)
+        self._deferred_env_hints.pop(name, None)
         return self._entries.pop(name, None) is not None
 
     def get(self, name: str) -> Optional[PlatformEntry]:

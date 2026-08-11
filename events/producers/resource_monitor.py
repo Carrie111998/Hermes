@@ -48,12 +48,18 @@ source for the commit numbers this alert is about.
 
 Emission policy
 ---------------
-Edge-triggered with a re-arm cooldown (mirrors the gateway lag-alert pattern):
-fire once on the rising edge of "any trigger active", stay quiet while the
-episode persists, and re-ping every ``re_alert_cooldown_seconds`` if it drags
-on. A falling edge (pressure clears) resets the episode so the next rise fires
-immediately. This keeps a sustained 22-minute incident to a handful of alerts
-instead of one every poll.
+Edge-triggered with hysteresis and a re-alert cooldown (mirrors the gateway
+lag-alert pattern): fire once on the rising edge of "any trigger active",
+stay quiet while the episode persists, and re-ping every
+``re_alert_cooldown_seconds`` if it drags on. A breached axis stays latched
+until it is *comfortably* clear of its trigger — its disarm level, e.g.
+commit back below 80% against the 85% trigger — and the episode only ends
+once every latched axis has cleared; then the next rising edge fires
+immediately. The disarm gap exists because re-arming at the trigger itself
+let threshold hover storm: on 2026-06-11 22:52-23:21Z commit oscillated
+84.x<->85.x and fired six alerts in 29 minutes, each dip re-arming the edge
+and each re-cross sidestepping the cooldown. Genuine recovery keeps the
+immediate-fire property; hovering at the threshold does not.
 """
 
 from __future__ import annotations
@@ -64,7 +70,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Set, Tuple
 
 from events.bus import EventBus
 from events.schema import EventType
@@ -83,6 +89,21 @@ DEFAULT_RE_ALERT_COOLDOWN_SECONDS = 900.0    # re-ping a sustained episode every
 # services dying, laptop-monitor healthy-count collapsed twice) emitted zero
 # events because commit charge stayed at 50-73% the whole day.
 DEFAULT_PHYS_PCT_THRESHOLD = 92.0        # physical RAM used > this %
+
+# Hysteresis disarm levels — a breached axis re-arms only once comfortably
+# clear of its trigger. Re-arming at the trigger itself let threshold hover
+# storm (2026-06-11 22:52-23:21Z: six alerts in 29 min at commit 84.x<->85.x).
+DEFAULT_COMMIT_PCT_DISARM = 80.0             # commit back below this % clears
+DEFAULT_DISK_FREE_GB_DISARM = 20.0           # C: free back above this clears
+DEFAULT_PAGEFILE_GROWTH_GB_DISARM = 1.0      # in-window growth below this clears
+# The phys axis (2026-07-16) postdates the original disarm set (2026-06-12), so
+# it had no disarm level until these two landed together. Without one it can
+# enter ``_latched`` via ``reasons`` but never leave through
+# ``comfortably_clear``, so a single phys breach would latch the episode
+# FOREVER — ``was_in_episode`` stays True, no later rising edge ever fires, and
+# the monitor silently degrades to cooldown-only re-pings. Gap mirrors commit's
+# 5 points (92 -> 87).
+DEFAULT_PHYS_PCT_DISARM = 87.0               # phys back below this % clears
 
 
 @dataclass(frozen=True)
@@ -197,6 +218,10 @@ class ResourcePressureMonitor:
         growth_window_seconds: float = DEFAULT_GROWTH_WINDOW_SECONDS,
         re_alert_cooldown_seconds: float = DEFAULT_RE_ALERT_COOLDOWN_SECONDS,
         phys_pct_threshold: float = DEFAULT_PHYS_PCT_THRESHOLD,
+        commit_pct_disarm: float = DEFAULT_COMMIT_PCT_DISARM,
+        disk_free_gb_disarm: float = DEFAULT_DISK_FREE_GB_DISARM,
+        pagefile_growth_gb_disarm: float = DEFAULT_PAGEFILE_GROWTH_GB_DISARM,
+        phys_pct_disarm: float = DEFAULT_PHYS_PCT_DISARM,
     ):
         self.bus = bus
         self._sampler = sampler or sample_resources
@@ -207,11 +232,17 @@ class ResourcePressureMonitor:
         self.growth_window_seconds = growth_window_seconds
         self.re_alert_cooldown_seconds = re_alert_cooldown_seconds
         self.phys_pct_threshold = phys_pct_threshold
+        self.commit_pct_disarm = commit_pct_disarm
+        self.disk_free_gb_disarm = disk_free_gb_disarm
+        self.pagefile_growth_gb_disarm = pagefile_growth_gb_disarm
+        self.phys_pct_disarm = phys_pct_disarm
 
         # Rolling (monotonic_ts, pagefile_bytes) window for growth detection.
         self._pagefile_window: List[Tuple[float, int]] = []
-        # Edge-trigger state.
-        self._in_pressure: bool = False
+        # Edge-trigger state: per-axis hysteresis latches (reason strings). An
+        # axis latches when its trigger breaches and unlatches only once
+        # comfortably clear (its disarm level); episode = any axis latched.
+        self._latched: Set[str] = set()
         self._last_emit: Optional[float] = None
 
     def check(self) -> Optional[str]:
@@ -256,20 +287,36 @@ class ResourcePressureMonitor:
         if growth_bytes > self.pagefile_growth_gb_threshold * _GB:
             reasons.append("pagefile_growth")
 
+        # Hysteresis: an axis only unlatches once comfortably clear of its
+        # trigger (the disarm level). A dip into the band between disarm and
+        # trigger keeps the episode latched, so threshold hover cannot re-arm
+        # the rising edge and storm past the cooldown.
+        comfortably_clear: Set[str] = set()
+        if sample.commit_pct < self.commit_pct_disarm:
+            comfortably_clear.add("commit_high")
+        if sample.phys_pct < self.phys_pct_disarm:
+            comfortably_clear.add("phys_high")
+        if sample.disk_free_bytes > self.disk_free_gb_disarm * _GB:
+            comfortably_clear.add("disk_low")
+        if growth_bytes < self.pagefile_growth_gb_disarm * _GB:
+            comfortably_clear.add("pagefile_growth")
+
+        was_in_episode = bool(self._latched)
+        self._latched = (self._latched - comfortably_clear) | set(reasons)
+
         if not reasons:
-            # Pressure cleared (or never present): reset the episode so the
-            # next rising edge fires immediately rather than waiting a cooldown.
-            self._in_pressure = False
+            # Nothing breaching right now. If every latched axis also cleared
+            # comfortably, the episode is over and the next rising edge fires
+            # immediately rather than waiting a cooldown.
             return None
 
         # Pressure is active. Decide whether to emit: rising edge always; a
         # sustained episode re-pings only after the cooldown elapses.
-        rising_edge = not self._in_pressure
+        rising_edge = not was_in_episode
         cooldown_elapsed = (
             self._last_emit is None
             or (now - self._last_emit) >= self.re_alert_cooldown_seconds
         )
-        self._in_pressure = True
         if not (rising_edge or cooldown_elapsed):
             return None
 

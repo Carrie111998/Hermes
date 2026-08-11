@@ -9,18 +9,62 @@ NOT read `profiles/main/cron/jobs.json`, which is a per-deployment runtime file
 that `.gitignore` excludes and that is absent from a clean checkout. The live
 cron prompt carries the same contract, but enforcing it belongs to the deploy
 step against the shared runtime file, not to a clean-checkout unit test.
+
+Note that `profiles/` is tracked in the *outer* Hermes repo (`~/.hermes`), not
+in `agent-src` — so the anchor for both paths is the Hermes root, which is
+`agent-src`'s parent, not the `agent-src` repo root.
 """
 import re
 from pathlib import Path
 
+import pytest
+
 from cron.scheduler import AGENT_ITERATION_MARKER_RE, _extract_agent_iteration
 
-REPO = Path(__file__).resolve().parents[3]
-SOUL = REPO / "profiles" / "critic" / "SOUL.md"
-SKILL = (
-    REPO / "profiles" / "main" / "skills" / "orchestrator"
+# Both artifacts, relative to the Hermes root.
+_SOUL_REL = Path("profiles") / "critic" / "SOUL.md"
+_SKILL_REL = (
+    Path("profiles") / "main" / "skills" / "orchestrator"
     / "critic-daily-skill-ranking-pass" / "SKILL.md"
 )
+
+
+def _find_hermes_root() -> Path | None:
+    """Return the Hermes root (the checkout holding `profiles/`), or None.
+
+    Searches upward from this file for the directory containing the Critic
+    persona. Deliberately *not* a fixed count of `.parent` hops: this file sits
+    three levels deeper inside a git worktree
+    (`agent-src/.claude/worktrees/<name>/tests/cron/`) than in the main checkout
+    (`agent-src/tests/cron/`), so any fixed count is right in exactly one of the
+    two layouts. The previous `parents[3]` was correct only from the main
+    checkout and silently resolved to `agent-src/.claude/worktrees` otherwise.
+
+    Git cannot anchor this either: `rev-parse --show-toplevel` returns the
+    *worktree* path rather than `agent-src`, and `hermes_constants`'
+    `get_default_hermes_root()` reads `HERMES_HOME`, which the suite redirects
+    to a per-test tempdir (see `tests/conftest.py`). Searching for the artifact
+    itself is correct at any nesting depth and needs neither a subprocess nor
+    the environment.
+    """
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / _SOUL_REL).is_file():
+            return candidate
+    return None
+
+
+REPO = _find_hermes_root()
+if REPO is None:
+    pytest.skip(
+        f"Hermes root not found: no ancestor of {Path(__file__).resolve()} "
+        f"contains {_SOUL_REL.as_posix()}. The Critic persona and orchestrator "
+        "skill are tracked in the outer ~/.hermes checkout, which is absent "
+        "from this tree.",
+        allow_module_level=True,
+    )
+
+SOUL = REPO / _SOUL_REL
+SKILL = REPO / _SKILL_REL
 
 # The stable Mission Control brief header the Critic must lead every daily
 # skill-review brief with (renderer shows the brief verbatim).

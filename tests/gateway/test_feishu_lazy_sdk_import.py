@@ -25,7 +25,27 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _run(code: str, timeout: int = 300) -> subprocess.CompletedProcess:
+# pyproject's addopts set a global ``--timeout`` (30s; the nightly gate passes
+# 60s) which is FAR below the 300s these subprocess tests are written against,
+# so the author's budget was unreachable and pytest-timeout won every race.
+# That is not a slow-test annoyance: pytest-timeout's thread method HARD-EXITS
+# the whole pytest process, so one of these blowing its cap takes the entire
+# FILE down and every test in it reports as never having run. On 2026-08-11
+# that is exactly what happened to 8 feishu files plus test_matrix.py in the
+# nightly gate's per-file run.
+#
+# These tests each spawn a clean interpreter that imports lark_oapi -- 101 MB
+# across 21,169 files. Measured at 17.05s on an idle box (7th slowest in the
+# suite) but disk-bound, so it scales with contention and blows a 30-60s cap
+# under load. Give them a per-test cap that matches _run()'s own budget; the
+# marker overrides the global setting. Sized slightly ABOVE _run's timeout so
+# subprocess.TimeoutExpired fires first and reports WHICH command hung,
+# instead of pytest-timeout hard-exiting with a thread dump.
+_SUBPROCESS_TIMEOUT_S = 300
+slow_subprocess = pytest.mark.timeout(_SUBPROCESS_TIMEOUT_S + 30)
+
+
+def _run(code: str, timeout: int = _SUBPROCESS_TIMEOUT_S) -> subprocess.CompletedProcess:
     """Run *code* in a clean interpreter rooted at the repo under test.
 
     ``cwd=REPO_ROOT`` puts this checkout ahead of any installed copy on
@@ -84,6 +104,7 @@ def test_lark_installed_ignores_injected_sys_modules_stub(monkeypatch):
 
 
 @requires_lark
+@slow_subprocess
 def test_importing_feishu_adapter_does_not_import_lark_oapi():
     """Importing the adapter module must not pull in the SDK."""
     proc = _run(
@@ -101,6 +122,7 @@ def test_importing_feishu_adapter_does_not_import_lark_oapi():
 
 
 @requires_lark
+@slow_subprocess
 def test_platform_registry_resolve_all_does_not_import_lark_oapi():
     """The pre-bind resolve-all must not pay for the Feishu SDK.
 
@@ -125,6 +147,7 @@ def test_platform_registry_resolve_all_does_not_import_lark_oapi():
 
 
 @requires_lark
+@slow_subprocess
 def test_check_feishu_requirements_binds_sdk_on_first_use():
     """Deferring must not break real Feishu use.
 
