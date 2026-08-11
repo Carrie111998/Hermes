@@ -451,6 +451,16 @@ def _reset_module_state():
     Keeps state from leaking across tests on the same xdist worker. Modules
     that don't exist yet (test collection before production import) are
     skipped silently — production import later creates fresh empty state.
+
+    Every block below therefore looks the module up in ``sys.modules`` instead
+    of importing it. A module that was never imported has no leaked state to
+    clear, so the ``KeyError`` is the "skipped silently" path above; importing
+    it here would *create* the very state this fixture exists to clear, and
+    charge the module's full import cost to fixture setup. That matters
+    because ``--timeout=30`` (pyproject addopts) covers setup: the old
+    ``from agent import auxiliary_client`` pulled ~950 modules (the whole
+    ``openai`` type tree) and burned 22s before the first test's body ran.
+    Pinned by tests/test_conftest_import_cost.py.
     """
     # --- logging — quiet/one-shot paths mutate process-global logger state ---
     logging.disable(logging.NOTSET)
@@ -462,7 +472,7 @@ def _reset_module_state():
 
     # --- tools.approval — the single biggest source of cross-test pollution ---
     try:
-        from tools import approval as _approval_mod
+        _approval_mod = sys.modules["tools.approval"]
         _approval_mod._session_approved.clear()
         _approval_mod._session_yolo.clear()
         _approval_mod._permanent_approved.clear()
@@ -478,7 +488,7 @@ def _reset_module_state():
 
     # --- tools.interrupt — per-thread interrupt flag set ---
     try:
-        from tools import interrupt as _interrupt_mod
+        _interrupt_mod = sys.modules["tools.interrupt"]
         with _interrupt_mod._lock:
             _interrupt_mod._interrupted_threads.clear()
     except Exception:
@@ -488,7 +498,7 @@ def _reset_module_state():
     #     gateway session. If set in one test and not reset, the next
     #     test's get_session_env() reads stale values.
     try:
-        from gateway import session_context as _sc_mod
+        _sc_mod = sys.modules["gateway.session_context"]
         for _cv in (
             _sc_mod._SESSION_PLATFORM,
             _sc_mod._SESSION_CHAT_ID,
@@ -507,7 +517,7 @@ def _reset_module_state():
 
     # --- tools.env_passthrough — ContextVar<set[str]> with no default ---
     try:
-        from tools import env_passthrough as _envp_mod
+        _envp_mod = sys.modules["tools.env_passthrough"]
         _envp_mod._allowed_env_vars_var.set(set())
     except Exception:
         pass
@@ -517,7 +527,7 @@ def _reset_module_state():
     # Clear terminal environments between tests so a prior terminal call can't
     # override TERMINAL_CWD in path-resolution tests.
     try:
-        from tools import terminal_tool as _term_mod
+        _term_mod = sys.modules["tools.terminal_tool"]
         _envs_to_cleanup = []
         with _term_mod._env_lock:
             _envs_to_cleanup = list(_term_mod._active_environments.values())
@@ -534,7 +544,7 @@ def _reset_module_state():
 
     # --- tools.credential_files — ContextVar<dict> ---
     try:
-        from tools import credential_files as _credf_mod
+        _credf_mod = sys.modules["tools.credential_files"]
         _credf_mod._registered_files_var.set({})
     except Exception:
         pass
@@ -544,7 +554,7 @@ def _reset_module_state():
     #     reset them per test so one worker's fallback/402 test does not make
     #     later auxiliary-client tests skip otherwise-available providers.
     try:
-        from agent import auxiliary_client as _aux_mod
+        _aux_mod = sys.modules["agent.auxiliary_client"]
         _aux_mod.clear_runtime_main()
         _aux_mod._reset_aux_unhealthy_cache()
     except Exception:
@@ -552,7 +562,7 @@ def _reset_module_state():
 
     # --- tools.file_tools — per-task read history + file-ops cache ---
     try:
-        from tools import file_tools as _ft_mod
+        _ft_mod = sys.modules["tools.file_tools"]
         with _ft_mod._read_tracker_lock:
             _ft_mod._read_tracker.clear()
         with _ft_mod._file_ops_lock:
