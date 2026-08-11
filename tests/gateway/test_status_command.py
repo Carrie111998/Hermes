@@ -175,6 +175,70 @@ async def test_status_command_exposes_redacted_fallback_diagnostic():
 
 
 @pytest.mark.asyncio
+async def test_status_command_omits_route_diagnostic_when_healthy():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="primary-model",
+        provider="primary-provider",
+        base_url="https://primary.example/v1",
+        api_mode="openai",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+        ),
+        _fallback_activated=False,
+        _rate_limited_until=0,
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "primary-provider/primary-model@primary.example" not in result
+    assert "FALLBACK" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_omits_degraded_route_without_identity():
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="",
+        provider="",
+        base_url="",
+        api_mode="openai",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+        ),
+        _fallback_activated=True,
+        _rate_limited_until=time.monotonic() + 30,
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**/:**" not in result
+    assert "FALLBACK" not in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(

@@ -678,7 +678,9 @@ class GatewaySlashCommandsMixin:
                     status_agent,
                     captured_at_monotonic=time.monotonic(),
                 )
-                if route.fallback_active or route.cooldown_remaining_s > 0:
+                if (
+                    route.provider or route.model
+                ) and (route.fallback_active or route.cooldown_remaining_s > 0):
                     identity = f"{route.provider}/{route.model}"
                     if route.base_url_host:
                         identity += f"@{route.base_url_host}"
