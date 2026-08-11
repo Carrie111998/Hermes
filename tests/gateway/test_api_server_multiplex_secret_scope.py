@@ -182,7 +182,7 @@ async def test_profile_aliases_and_credentials_partition_adapter_idempotency(
     )()
     monkeypatch.setattr(
         "hermes_cli.profiles.profiles_to_serve",
-        lambda multiplex: [("default", tmp_path), ("worker", worker_home)],
+        lambda multiplex, profile_allowlist=None: [("default", tmp_path), ("worker", worker_home)],
     )
     monkeypatch.setattr(
         "hermes_cli.profiles.get_profile_dir",
@@ -226,5 +226,4 @@ async def test_profile_aliases_and_credentials_partition_adapter_idempotency(
     assert mock_run.call_count == 2
     assert first.headers["X-Hermes-Session-Id"] == default_alias.headers["X-Hermes-Session-Id"]
     assert worker.headers["X-Hermes-Session-Id"] != first.headers["X-Hermes-Session-Id"]
-
 
