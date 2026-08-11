@@ -177,8 +177,40 @@ def clear_session_context() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Record factory — injects session_tag into every LogRecord at creation
+# Record factory — injects session_tag and normalizes owned retry severity
 # ---------------------------------------------------------------------------
+
+
+def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> None:
+    """Demote SDK-internal retry records whose failure is owned by an adapter.
+
+    discord.py and python-telegram-bot emit selected, self-recovering transport
+    retries at ERROR even though Hermes keeps the adapter alive and independently
+    detects unrecovered/stale connections.  Preserve those records and tracebacks
+    as WARNINGs; adapter exhaustion, authentication failures, and every unknown
+    SDK error remain ERROR.
+    """
+    if record.levelno != logging.ERROR:
+        return
+    message = record.getMessage()
+    recovered_retry = (
+        record.name == "discord.client"
+        and message.startswith("Attempting a reconnect in ")
+    ) or (
+        record.name == "telegram.ext"
+        and message.startswith("Network Retry Loop (Bootstrap delete Webhook):")
+        and message.endswith("Failed run number 0 of 0. Aborting.")
+    ) or (
+        record.name == "telegram.ext.Updater"
+        and message.startswith(
+            "Error while calling `get_updates` one more time to mark all fetched updates."
+        )
+        and "Suppressing error to ensure graceful shutdown." in message
+    )
+    if recovered_retry:
+        record.levelno = logging.WARNING
+        record.levelname = "WARNING"
+
 
 def _install_session_record_factory() -> None:
     """Replace the global LogRecord factory with one that adds ``session_tag``.
@@ -199,6 +231,7 @@ def _install_session_record_factory() -> None:
 
     def _session_record_factory(*args, **kwargs):
         record = current_factory(*args, **kwargs)
+        _normalize_recovered_transport_retry_severity(record)
         sid = getattr(_session_context, "session_id", None)
         record.session_tag = f" [{sid}]" if sid else ""  # type: ignore[attr-defined]
         return record

@@ -253,6 +253,51 @@ class TestSessionContext:
 
 
 
+class TestRecoveredTransportRetrySeverity:
+    """SDK retry noise is warning-level; adapter-owned failures stay errors."""
+
+    @pytest.mark.parametrize(
+        ("logger_name", "message"),
+        [
+            ("discord.client", "Attempting a reconnect in 1.44s"),
+            (
+                "telegram.ext",
+                "Network Retry Loop (Bootstrap delete Webhook): Failed run number 0 of 0. Aborting.",
+            ),
+            (
+                "telegram.ext.Updater",
+                "Error while calling `get_updates` one more time to mark all fetched updates. "
+                "Suppressing error to ensure graceful shutdown.",
+            ),
+        ],
+    )
+    def test_exact_sdk_recovery_records_are_downgraded(self, caplog, logger_name, message):
+        caplog.set_level(logging.WARNING)
+        logging.getLogger(logger_name).error(message)
+        record = caplog.records[-1]
+        assert record.levelno == logging.WARNING
+        assert record.levelname == "WARNING"
+        assert record.getMessage() == message
+
+    @pytest.mark.parametrize(
+        ("logger_name", "message"),
+        [
+            ("discord.client", "Authentication failed while connecting"),
+            ("telegram.ext", "Network Retry Loop for outbound delivery aborted"),
+            (
+                "hermes_plugins.discord_platform.adapter",
+                "[Discord] Discord Gateway WebSocket remained unhealthy; forcing reconnect",
+            ),
+        ],
+    )
+    def test_other_transport_errors_remain_errors(self, caplog, logger_name, message):
+        caplog.set_level(logging.WARNING)
+        logging.getLogger(logger_name).error(message)
+        record = caplog.records[-1]
+        assert record.levelno == logging.ERROR
+        assert record.levelname == "ERROR"
+
+
 class TestComponentFilter:
     """Unit tests for _ComponentFilter."""
 
