@@ -59,6 +59,17 @@ fi
 PYTHON_VERSION="3.11"
 NODE_VERSION="22"
 
+# Keep this in lockstep with [options].exclude-newer in uv.lock. UV_NO_CONFIG
+# strips pyproject.toml's [tool.uv] settings, so pass the cutoff explicitly to
+# every uv package-resolution command below.
+UV_EXCLUDE_NEWER="2026-08-11T21:47:48.879648000Z"
+# UV_NO_CONFIG also hides the package-specific exceptions mirrored in uv.lock.
+UV_EXCLUDE_NEWER_PACKAGE_ARGS=(
+    --exclude-newer-package nemo-relay=false
+    --exclude-newer-package vercel=false
+    --exclude-newer-package huggingface-hub=false
+)
+
 # FHS-style root install layout (set by resolve_install_layout when applicable):
 #   code at /usr/local/lib/hermes-agent, command at /usr/local/bin/hermes,
 #   data still at /root/.hermes (HERMES_HOME).  Matches Claude Code / Codex CLI
@@ -1578,7 +1589,7 @@ install_deps() {
         #                  This respects the curation in pyproject.toml.
         # uv's own progress UI handles TTY detection and downgrades
         # gracefully when stdout/stderr aren't terminals.
-        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked; then
+        if UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" $UV_CMD sync --extra all --locked --exclude-newer "$UV_EXCLUDE_NEWER" "${UV_EXCLUDE_NEWER_PACKAGE_ARGS[@]}"; then
             log_success "Main package installed (hash-verified via uv.lock)"
             log_success "All dependencies installed"
             return 0
@@ -1659,7 +1670,7 @@ PY
     install_tier() {
         local name="$1"; local spec="$2"
         log_info "Trying tier: $name ..."
-        if $UV_CMD pip install -e "$spec" 2>"$ALL_INSTALL_LOG"; then
+        if $UV_CMD pip install --exclude-newer "$UV_EXCLUDE_NEWER" "${UV_EXCLUDE_NEWER_PACKAGE_ARGS[@]}" -e "$spec" 2>"$ALL_INSTALL_LOG"; then
             log_success "Main package installed ($name)"
             _installed=true
             _tier_name="$name"
@@ -2938,7 +2949,7 @@ install_desktop_voice_deps() {
         return 0
     fi
     log_info "Installing voice + wake-word dependencies (onnxruntime, faster-whisper — 1-3min)..."
-    if (cd "$INSTALL_DIR" && $UV_CMD pip install -e ".[wake,voice]") ; then
+    if (cd "$INSTALL_DIR" && $UV_CMD pip install --exclude-newer "$UV_EXCLUDE_NEWER" "${UV_EXCLUDE_NEWER_PACKAGE_ARGS[@]}" -e ".[wake,voice]") ; then
         log_success "Voice + wake-word dependencies installed"
     else
         log_warn "Voice/wake dependency install failed — they will lazy-install at first use"
