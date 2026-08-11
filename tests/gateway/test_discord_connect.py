@@ -470,6 +470,11 @@ async def test_connect_does_not_wait_for_slash_sync(monkeypatch):
 
     monkeypatch.setattr(discord_platform.commands, "Bot", fake_bot_factory)
     monkeypatch.setattr(adapter, "_resolve_allowed_usernames", AsyncMock())
+    # Command definition registration is synchronous setup unrelated to the
+    # readiness boundary exercised here. Avoid importing and registering the
+    # whole gateway command catalog so the one-second deadline measures only
+    # ready-versus-post-connect-sync behavior.
+    monkeypatch.setattr(adapter, "_register_slash_commands", lambda: None)
 
     ok = await asyncio.wait_for(adapter.connect(), timeout=1.0)
 
