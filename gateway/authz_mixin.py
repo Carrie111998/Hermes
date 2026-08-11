@@ -529,6 +529,11 @@ class GatewayAuthorizationMixin:
         }
         platform_group_chat_env_map = {
             Platform.TELEGRAM: "TELEGRAM_GROUP_ALLOWED_CHATS",
+            # Authorize any sender only inside explicitly listed Slack channels.
+            # This is intentionally separate from SLACK_ALLOWED_USERS, which also
+            # grants DM access, and from SLACK_ALLOWED_CHANNELS, which controls
+            # where an already-authorized user may trigger the bot.
+            Platform.SLACK: "SLACK_GROUP_ALLOWED_CHATS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
         platform_allow_all_map = {
@@ -690,10 +695,10 @@ class GatewayAuthorizationMixin:
             # No allowlists configured -- check global allow-all flag
             return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
-        # Telegram can optionally authorize group traffic by chat ID.
-        # Keep this separate from TELEGRAM_GROUP_ALLOWED_USERS, which gates
-        # the sender user ID for group/forum messages.
-        if group_chat_allowlist and source.chat_type in {"group", "forum"} and source.chat_id:
+        # Telegram and Slack can optionally authorize group traffic by chat ID.
+        # Keep this separate from sender allowlists: a listed Slack channel may
+        # accept community contributors without granting those users DM access.
+        if group_chat_allowlist and source.chat_type in {"group", "forum", "channel"} and source.chat_id:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_chat_allowlist.split(",") if chat_id.strip()
             }

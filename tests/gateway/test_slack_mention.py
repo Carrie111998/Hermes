@@ -333,13 +333,16 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
         "  require_mention: false\n"
         "  free_response_channels:\n"
         "    - C0AQWDLHY9M\n"
-        "    - C9999999999\n",
+        "    - C9999999999\n"
+        "  group_allowed_chats:\n"
+        "    - C0AQWDLHY9M\n",
         encoding="utf-8",
     )
 
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.delenv("SLACK_REQUIRE_MENTION", raising=False)
     monkeypatch.delenv("SLACK_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("SLACK_GROUP_ALLOWED_CHATS", raising=False)
 
     config = load_gateway_config()
 
@@ -351,8 +354,10 @@ def test_config_bridges_slack_free_response_channels(monkeypatch, tmp_path):
     import os as _os
     assert _os.environ["SLACK_REQUIRE_MENTION"] == "false"
     assert _os.environ["SLACK_FREE_RESPONSE_CHANNELS"] == "C0AQWDLHY9M,C9999999999"
+    assert _os.environ["SLACK_GROUP_ALLOWED_CHATS"] == "C0AQWDLHY9M"
     _os.environ.pop("SLACK_REQUIRE_MENTION", None)
     _os.environ.pop("SLACK_FREE_RESPONSE_CHANNELS", None)
+    _os.environ.pop("SLACK_GROUP_ALLOWED_CHATS", None)
 
 
 def test_top_level_slack_settings_do_not_disable_env_token_setup(monkeypatch, tmp_path):

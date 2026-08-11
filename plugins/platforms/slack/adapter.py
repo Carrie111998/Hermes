@@ -9022,6 +9022,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         if isinstance(ac, list):
             ac = ",".join(str(v) for v in ac)
         os.environ["SLACK_ALLOWED_CHANNELS"] = str(ac)
+    gac = slack_cfg.get("group_allowed_chats")
+    if gac is not None and not os.getenv("SLACK_GROUP_ALLOWED_CHATS"):
+        if isinstance(gac, list):
+            gac = ",".join(str(v) for v in gac)
+        os.environ["SLACK_GROUP_ALLOWED_CHATS"] = str(gac)
     # ignored_channels: blacklist channels where Slack must never respond.
     ic = slack_cfg.get("ignored_channels")
     if ic is not None and not os.getenv("SLACK_IGNORED_CHANNELS"):
@@ -9065,7 +9070,8 @@ def register(ctx) -> None:
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, ignore_other_user_mentions,
         # thread_require_mention, allow_bots, free_response_channels,
-        # reactions, disable_dms, allowed_channels, ignored_channels) into
+        # reactions, disable_dms, allowed_channels, group_allowed_chats,
+        # ignored_channels) into
         # SLACK_* env vars that
         # the adapter reads via os.getenv(). Replaces the
         # hardcoded block in gateway/config.py. Hook contract: #24849.

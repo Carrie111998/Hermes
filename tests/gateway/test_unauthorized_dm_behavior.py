@@ -18,6 +18,7 @@ def _clear_auth_env(monkeypatch) -> None:
         "SIGNAL_ALLOWED_USERS",
         "SIGNAL_GROUP_ALLOWED_USERS",
         "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "SLACK_GROUP_ALLOWED_CHATS",
         "EMAIL_ALLOWED_USERS",
         "SMS_ALLOWED_USERS",
         "MATTERMOST_ALLOWED_USERS",
@@ -210,6 +211,43 @@ def test_telegram_group_users_mixed_sender_and_legacy_chat(monkeypatch):
         chat_type="group",
     )
     assert runner._is_user_authorized(sender_source) is True
+
+
+def test_slack_group_allowed_chat_authorizes_unlisted_sender_only_in_that_channel(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("SLACK_GROUP_ALLOWED_CHATS", "C_COMMUNITY")
+
+    runner, _adapter = _make_runner(
+        Platform.SLACK,
+        GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="t")}),
+    )
+
+    community_source = SessionSource(
+        platform=Platform.SLACK,
+        user_id="U_EXTERNAL",
+        chat_id="C_COMMUNITY",
+        user_name="contributor",
+        chat_type="group",
+    )
+    assert runner._is_user_authorized(community_source) is True
+
+    other_channel_source = SessionSource(
+        platform=Platform.SLACK,
+        user_id="U_EXTERNAL",
+        chat_id="C_INTERNAL",
+        user_name="contributor",
+        chat_type="group",
+    )
+    assert runner._is_user_authorized(other_channel_source) is False
+
+    dm_source = SessionSource(
+        platform=Platform.SLACK,
+        user_id="U_EXTERNAL",
+        chat_id="D_EXTERNAL",
+        user_name="contributor",
+        chat_type="dm",
+    )
+    assert runner._is_user_authorized(dm_source) is False
 
 
 @pytest.mark.asyncio
