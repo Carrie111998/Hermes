@@ -9,6 +9,41 @@ interface EffectivePrimaryProfileOptions {
   readFile?: (file: string, encoding: BufferEncoding) => string
 }
 
+function resolveConfiguredProfile(value: unknown, source: string): null | string {
+  if (value == null) {
+    return null
+  }
+
+  if (typeof value !== 'string') {
+    throw new Error(`Invalid profile name in ${source}: ${JSON.stringify(value)}`)
+  }
+
+  const raw = value.trim()
+
+  if (!raw) {
+    return null
+  }
+
+  const profile = normalizeDesktopProfile(raw)
+
+  if (!profile) {
+    throw new Error(`Invalid profile name in ${source}: ${JSON.stringify(raw)}`)
+  }
+
+  return profile
+}
+
+/** Parse the persisted Desktop preference without hiding malformed state. */
+export function parseDesktopProfilePreference(raw: string): null | string {
+  const parsed: unknown = JSON.parse(raw)
+
+  if (!parsed || typeof parsed !== 'object' || !('profile' in parsed)) {
+    return null
+  }
+
+  return resolveConfiguredProfile((parsed as { profile: unknown }).profile, 'Desktop preference')
+}
+
 /** Keep the resolved owner stable until the primary backend is torn down. */
 export function createPrimaryProfileOwner(resolve: () => string) {
   let current: null | string = null
@@ -31,7 +66,7 @@ export function resolveEffectivePrimaryProfile({
   hermesHome,
   readFile = (file, encoding) => fs.readFileSync(file, encoding)
 }: EffectivePrimaryProfileOptions): string {
-  const explicit = normalizeDesktopProfile(desktopProfile)
+  const explicit = resolveConfiguredProfile(desktopProfile, 'Desktop preference')
 
   if (explicit) {
     return explicit
@@ -40,12 +75,19 @@ export function resolveEffectivePrimaryProfile({
   const resolvedHome = path.resolve(hermesHome)
 
   if (path.basename(path.dirname(resolvedHome)) === 'profiles') {
-    return normalizeDesktopProfile(path.basename(resolvedHome)) ?? 'default'
+    return resolveConfiguredProfile(path.basename(resolvedHome), 'HERMES_HOME') ?? 'default'
   }
 
   try {
-    return normalizeDesktopProfile(readFile(path.join(resolvedHome, 'active_profile'), 'utf8')) ?? 'default'
-  } catch {
-    return 'default'
+    return (
+      resolveConfiguredProfile(readFile(path.join(resolvedHome, 'active_profile'), 'utf8'), 'active_profile') ??
+      'default'
+    )
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return 'default'
+    }
+
+    throw error
   }
 }

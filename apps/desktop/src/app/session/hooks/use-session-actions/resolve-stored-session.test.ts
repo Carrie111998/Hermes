@@ -127,6 +127,20 @@ describe('resolveStoredSession profile ownership', () => {
     ])
   })
 
+  it('prefers the active owner when an unhinted id exists in multiple profiles', async () => {
+    $activeGatewayProfile.set('default')
+    $sessions.set([
+      session({ id: 's1', profile: 'meta', title: 'Meta copy' }),
+      session({ id: 's1', profile: 'default', title: 'Default copy' })
+    ])
+
+    await expect(resolveStoredSession('s1')).resolves.toMatchObject({
+      profile: 'default',
+      title: 'Default copy'
+    })
+    expect(mockGetSession).not.toHaveBeenCalled()
+  })
+
   it('resolveSessionProfile routes a default-profile session from a non-default gateway', async () => {
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
     mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))

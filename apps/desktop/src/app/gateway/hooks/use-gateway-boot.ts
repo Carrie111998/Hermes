@@ -95,6 +95,7 @@ export function useGatewayBoot({
   useEffect(() => {
     let cancelled = false
     let connectionProfile: null | string = null
+    let primaryConnection: HermesConnection | null = null
     const desktop = window.hermesDesktop
     const profileOverride = windowProfileOverride()
 
@@ -180,6 +181,7 @@ export function useGatewayBoot({
           return
         }
 
+        primaryConnection = conn
         publish(conn)
         // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
         // with a short TTL, so the ticket baked into the cached conn.wsUrl is
@@ -293,6 +295,7 @@ export function useGatewayBoot({
       )
 
       connectionProfile = key
+      primaryConnection = connection
       $activeGatewayProfile.set(key)
       setPrimaryGateway(gateway, key)
     }
@@ -420,6 +423,11 @@ export function useGatewayBoot({
     const survivor = import.meta.hot ? takeGatewaySurvivor() : null
     const adoptedFromHmr = Boolean(survivor && !survivorIsStale(survivor))
 
+    if (adoptedFromHmr) {
+      connectionProfile = normalizeProfileKey(survivor!.profile)
+      primaryConnection = survivor!.connection
+    }
+
     if (survivor && !adoptedFromHmr) {
       // Parked socket died between edits (e.g. backend restart) — release it.
       try {
@@ -432,7 +440,7 @@ export function useGatewayBoot({
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(gateway, connectionProfile ?? normalizeProfileKey($activeGatewayProfile.get()))
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
@@ -639,11 +647,14 @@ export function useGatewayBoot({
       bootCompleted = true
       completeDesktopBoot()
 
-      if (survivor?.connection) {
-        publish(survivor.connection)
+      const profile = connectionProfile ?? normalizeProfileKey(survivor?.profile ?? $activeGatewayProfile.get())
+      connectionProfile = profile
+      primaryConnection = survivor?.connection ?? primaryConnection
+
+      if (primaryConnection) {
+        publish(primaryConnection)
       }
 
-      const profile = survivor?.profile ?? $activeGatewayProfile.get()
       $activeGatewayProfile.set(profile)
       void ensureGatewayForProfile(profile)
 
@@ -694,8 +705,8 @@ export function useGatewayBoot({
       if (import.meta.hot && gateway.connectionState === 'open') {
         stashGatewaySurvivor({
           gateway,
-          profile: survivor?.profile ?? $activeGatewayProfile.get(),
-          connection: $connection.get()
+          profile: connectionProfile ?? survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()),
+          connection: primaryConnection ?? survivor?.connection ?? null
         })
 
         return

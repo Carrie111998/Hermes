@@ -1,3 +1,5 @@
+import { normalizeDesktopProfile } from '@/lib/profile-name'
+
 import { notifyError } from './notifications'
 
 // Window flag set by the Electron main process when it opens a standalone
@@ -91,13 +93,11 @@ export const isAuxiliaryWindow = (): boolean => isSecondaryWindow() || isHudWind
 // before, so ordinary windows and single-profile users are untouched.
 // Not cached: it is read a handful of times per boot and staying cache-free
 // keeps it honest under test.
-const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
-
 export function windowProfileOverride(): null | string {
   try {
     const profile = new URLSearchParams(window.location.search).get('profile')?.trim() ?? ''
 
-    return PROFILE_NAME_RE.test(profile) ? profile : null
+    return normalizeDesktopProfile(profile)
   } catch {
     return null
   }

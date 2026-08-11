@@ -48,10 +48,23 @@ describe('windowProfileOverride', () => {
     expect(windowProfileOverride()).toBe('life_2')
   })
 
+  it('canonicalizes mixed-case profile hints like the CLI', () => {
+    window.history.replaceState({}, '', '/?profile=Life_2')
+
+    expect(windowProfileOverride()).toBe('life_2')
+  })
+
   it('treats malformed profile hints as absent', () => {
     window.history.replaceState({}, '', '/?profile=..%2Flife')
 
     expect(windowProfileOverride()).toBeNull()
+  })
+
+  it('treats every non-default CLI reserved profile hint as absent', () => {
+    for (const profile of ['hermes', 'test', 'tmp', 'root', 'sudo']) {
+      window.history.replaceState({}, '', `/?profile=${profile}`)
+      expect(windowProfileOverride(), profile).toBeNull()
+    }
   })
 })
 

@@ -3,9 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $currentCwd, $gatewayState } from '@/store/session'
+import { $connection, $currentCwd, $gatewayState, setConnection } from '@/store/session'
 
-import { takeGatewaySurvivor } from './gateway-hmr-survivor'
+import { stashGatewaySurvivor, takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
 
 // End-to-end-ish repro of the "remote VPS → stuck on CONNECTING, no Settings"
@@ -117,6 +117,20 @@ function fakeDesktop(profile: null | string = 'default', storedProfile = profile
     onWindowStateChanged: vi.fn(() => () => undefined),
     touchBackend: vi.fn(async () => undefined),
     profile: { get: vi.fn(async () => ({ profile: storedProfile })) }
+  }
+}
+
+function storedConnection(profile: string) {
+  return {
+    baseUrl: `https://${profile}.example.com`,
+    isFullscreen: false,
+    logs: [],
+    mode: 'remote' as const,
+    nativeOverlayWidth: 0,
+    profile,
+    token: `${profile}-token`,
+    windowButtonPosition: null,
+    wsUrl: `wss://${profile}.example.com/api/ws?token=${profile}-token`
   }
 }
 
@@ -290,6 +304,48 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
 
     expect($gatewayState.get()).toBe('open')
     $activeGatewayProfile.set('other')
+    act(() => FakeWebSocket.instances[0].drop())
+    await flushAsync()
+    await advanceBackoff()
+
+    expect(desktop.getConnection).toHaveBeenLastCalledWith('life')
+  })
+
+  it('parks and re-adopts the primary owner across HMR after a secondary profile becomes active', async () => {
+    const desktop = fakeDesktop('life')
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    const first = render(<Harness />)
+    await flushAsync()
+
+    expect($gatewayState.get()).toBe('open')
+    const primaryConnection = $connection.get()
+    expect(primaryConnection?.profile).toBe('life')
+
+    $activeGatewayProfile.set('other')
+    setConnection(storedConnection('other'))
+
+    first.unmount()
+    const survivor = takeGatewaySurvivor()
+
+    expect(survivor?.profile).toBe('life')
+    expect(survivor?.connection).toBe(primaryConnection)
+
+    if (!survivor) {
+      throw new Error('expected HMR survivor')
+    }
+
+    stashGatewaySurvivor(survivor)
+    const handleGatewayEvent = vi.fn()
+    render(<Harness handleGatewayEvent={handleGatewayEvent} />)
+    await flushAsync()
+
+    expect($activeGatewayProfile.get()).toBe('life')
+    FakeWebSocket.instances[0].sendEvent({ type: 'session.updated' })
+    expect(handleGatewayEvent).toHaveBeenCalledWith(expect.objectContaining({ profile: 'life' }))
+
+    $activeGatewayProfile.set('other')
+    setConnection(storedConnection('other'))
     act(() => FakeWebSocket.instances[0].drop())
     await flushAsync()
     await advanceBackoff()

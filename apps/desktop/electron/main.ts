@@ -163,9 +163,13 @@ import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
 import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
-import { createPrimaryProfileOwner, resolveEffectivePrimaryProfile } from './primary-profile'
+import {
+  createPrimaryProfileOwner,
+  parseDesktopProfilePreference,
+  resolveEffectivePrimaryProfile
+} from './primary-profile'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
-import { normalizeDesktopProfile, PROFILE_NAME_RE } from './profile-name'
+import { normalizeDesktopProfile } from './profile-name'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
@@ -6916,7 +6920,9 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
       continue
     }
 
-    if (name !== 'default' && !PROFILE_NAME_RE.test(name)) {
+    const profile = normalizeDesktopProfile(name)
+
+    if (!profile) {
       continue
     }
 
@@ -6928,7 +6934,7 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
           ssh.token = entry.token
         }
 
-        out[name] = ssh
+        out[profile] = ssh
       }
 
       continue
@@ -6975,7 +6981,7 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
       }
     }
 
-    out[name] = cleaned
+    out[profile] = cleaned
   }
 
   return out
@@ -7041,30 +7047,31 @@ function writeDesktopConnectionConfig(config) {
 function readActiveDesktopProfile() {
   try {
     const raw = fs.readFileSync(DESKTOP_PROFILE_CONFIG_PATH, 'utf8')
-    const parsed = JSON.parse(raw)
-    const name = parsed && typeof parsed.profile === 'string' ? parsed.profile.trim() : ''
 
-    if (name && (name === 'default' || PROFILE_NAME_RE.test(name))) {
-      return name
+    return parseDesktopProfilePreference(raw)
+  } catch (error) {
+    // A missing file means no preference. Malformed persisted state must fail
+    // visibly rather than retargeting the primary backend to another profile.
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      return null
     }
-  } catch {
-    // Missing or malformed → no preference.
-  }
 
-  return null
+    throw error
+  }
 }
 
 function writeActiveDesktopProfile(name) {
   const value = typeof name === 'string' ? name.trim() : ''
+  const profile = value ? normalizeDesktopProfile(value) : null
 
-  if (value && value !== 'default' && !PROFILE_NAME_RE.test(value)) {
+  if (value && !profile) {
     throw new Error(`Invalid profile name: ${value}`)
   }
 
   fs.mkdirSync(path.dirname(DESKTOP_PROFILE_CONFIG_PATH), { recursive: true })
-  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile: value || null }, null, 2))
+  writeFileAtomic(DESKTOP_PROFILE_CONFIG_PATH, JSON.stringify({ profile }, null, 2))
 
-  return value || null
+  return profile
 }
 
 // Sanitize a connection config into the renderer-facing shape. With no
@@ -8466,7 +8473,7 @@ async function prepareProfileDeleteRequest(request) {
 
   const decision = decideProfileDeleteAction(profile, {
     isDefaultProfile: p => p === 'default',
-    isValidProfileName: p => PROFILE_NAME_RE.test(p),
+    isValidProfileName: p => normalizeDesktopProfile(p) !== null,
     primaryProfileKey
   })
 
@@ -9572,7 +9579,12 @@ function restoreMainWindowFromHud() {
 }
 
 function openHudWindow(sessionId, profile) {
-  const profileKey = typeof profile === 'string' && profile.trim() ? profile.trim() : null
+  const rawProfile = typeof profile === 'string' ? profile.trim() : ''
+  const profileKey = rawProfile ? normalizeDesktopProfile(rawProfile) : null
+
+  if (rawProfile && !profileKey) {
+    throw new Error(`Invalid profile name: ${rawProfile}`)
+  }
 
   if (hudWindow && !hudWindow.isDestroyed()) {
     // Pointed at another PROFILE: the live renderer is bound to the old
@@ -10305,10 +10317,14 @@ ipcMain.on('hermes:pet-overlay:control', (_event, payload) => {
 
 // --- HUD mode (chrome-free floating chat) -----------------------------------
 ipcMain.handle('hermes:hud:open', async (_event, request) => {
-  openHudWindow(
-    typeof request?.sessionId === 'string' ? request.sessionId : null,
-    typeof request?.profile === 'string' ? request.profile : null
-  )
+  const rawProfile = typeof request?.profile === 'string' ? request.profile.trim() : ''
+  const profile = rawProfile ? normalizeDesktopProfile(rawProfile) : null
+
+  if (rawProfile && !profile) {
+    return { ok: false, error: 'invalid-profile' }
+  }
+
+  openHudWindow(typeof request?.sessionId === 'string' ? request.sessionId : null, profile)
 
   return { ok: true }
 })

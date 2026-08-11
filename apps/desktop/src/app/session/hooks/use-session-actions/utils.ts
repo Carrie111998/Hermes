@@ -852,14 +852,14 @@ export async function resolveStoredSession(
   profileHint?: null | string
 ): Promise<SessionInfo | undefined> {
   const hintedProfile = profileHint?.trim() ? normalizeProfileKey(profileHint) : null
+  const activeKey = normalizeProfileKey($activeGatewayProfile.get())
+  const cachedMatches = $sessions.get().filter(session => sessionMatchesStoredId(session, storedSessionId))
+  const ownedMatches = cachedMatches.filter(session => session.profile?.trim())
 
-  const cached = $sessions
-    .get()
-    .find(
-      session =>
-        sessionMatchesStoredId(session, storedSessionId) &&
-        (!hintedProfile || normalizeProfileKey(session.profile) === hintedProfile)
-    )
+  const cached = hintedProfile
+    ? ownedMatches.find(session => normalizeProfileKey(session.profile) === hintedProfile)
+    : (ownedMatches.find(session => normalizeProfileKey(session.profile) === activeKey) ??
+      (ownedMatches.length === 1 ? ownedMatches[0] : cachedMatches.length === 1 ? cachedMatches[0] : undefined))
 
   // A row with no owning profile can't route a resume when more than one
   // profile exists — a resume without a profile lands on whichever gateway is
@@ -909,8 +909,6 @@ export async function resolveStoredSession(
   // Multi-profile only: probe each other profile by id (still one cheap lookup
   // each) rather than pulling every profile's recent sessions. The first hit
   // carries its owning `profile`, which routes the resume to the right backend.
-  const activeKey = normalizeProfileKey($activeGatewayProfile.get())
-
   let profiles = $profiles.get()
 
   // The profile rail is loaded lazily and can also be stale after an external
