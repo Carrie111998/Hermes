@@ -2709,30 +2709,110 @@ print(','.join(scripts))
     Write-Success "All dependencies installed"
 }
 
+# Keep the Hermes command surface global without putting python.exe on the
+# user PATH.
+#
+# Background: installers before 2026-08 made `hermes` globally available by
+# prepending the venv Scripts dir (`<install>\venv\Scripts`) to the persisted
+# User PATH. That dir also contains python.exe/pip.exe, so every new shell
+# resolved `python` to the Hermes runtime instead of the user's own
+# interpreter (#83797). The fix ships `hermes`/`hermes-acp` as .cmd shims in
+# the Hermes-owned bin dir (`$HermesHome\bin`, which holds only
+# Hermes-specific commands like uv) and migrates existing installs by
+# dropping the stale venv\Scripts entry from the User PATH.
+function New-HermesShims {
+    param(
+        [string]$ShimDir,
+        [string]$VenvScripts
+    )
+
+    if (-not $ShimDir -or -not $VenvScripts) { return }
+    New-Item -ItemType Directory -Path $ShimDir -Force | Out-Null
+
+    foreach ($name in @('hermes', 'hermes-acp')) {
+        $target = Join-Path $VenvScripts "$name.exe"
+        if (-not (Test-Path -LiteralPath $target)) { continue }
+        $shim = Join-Path $ShimDir "$name.cmd"
+        $content = "@echo off`r`n@`"$target`" %*`r`n"
+        try {
+            if (-not (Test-Path -LiteralPath $shim) -or
+                (Get-Content -LiteralPath $shim -Raw) -ne $content) {
+                Set-Content -LiteralPath $shim -Value $content -Encoding ASCII
+            }
+        } catch {
+            Write-Warn "Could not write shim $shim : $_"
+        }
+    }
+}
+
+# Ensure the Hermes shim dir is on the persisted User PATH and drop the
+# legacy venv\Scripts entry.  Pure PATH logic (registry calls swapped for an
+# in-memory store by the CI behavior test).
+#
+# Unrelated entries keep their relative order, including empty segments (a
+# trailing ';' is legal and common in a real User PATH; Install-Git's
+# splitting preserves them too, so this must not quietly rewrite them).
+# PowerShell's -ne is case-insensitive for strings, which is the right
+# comparison on Windows.  Persists only when the resulting string differs,
+# so an already-correct PATH costs one registry read and no write.
+function Update-UserPathForHermes {
+    param(
+        [string]$ShimDir,
+        [string]$LegacyVenvScripts
+    )
+
+    if (-not $ShimDir) { return }
+
+    $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+    $items = if ($userPath) { @($userPath -split ";") } else { @() }
+
+    $kept = @($items)
+    if ($LegacyVenvScripts) {
+        $legacy = $LegacyVenvScripts.TrimEnd('\')
+        $kept = @($items | Where-Object { $_.TrimEnd('\') -ne $legacy })
+    }
+
+    $updated = @($kept)
+    if ($kept -notcontains $ShimDir) {
+        $updated = @($ShimDir) + $kept
+    }
+
+    $joined = $updated -join ";"
+    if ($joined -ne $userPath) {
+        [Environment]::SetEnvironmentVariable("Path", $joined, "User")
+    }
+}
+
 function Set-PathVariable {
     Write-Info "Setting up hermes command..."
-    
+
     if ($NoVenv) {
+        # Legacy no-venv layout: the install dir itself holds the commands.
         $hermesBin = "$InstallDir"
+        $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
+        if ($currentPath -notlike "*$hermesBin*") {
+            [Environment]::SetEnvironmentVariable(
+                "Path",
+                "$hermesBin;$currentPath",
+                "User"
+            )
+            Write-Success "Added to user PATH: $hermesBin"
+        } else {
+            Write-Info "PATH already configured"
+        }
     } else {
-        $hermesBin = "$InstallDir\venv\Scripts"
+        # `hermes` / `hermes-acp` become globally available via .cmd shims
+        # in the Hermes-owned bin dir.  The venv Scripts dir (which also
+        # contains python.exe/pip.exe) is deliberately NOT put on the user
+        # PATH so it cannot hijack the user's own `python` command
+        # (#83797).  On Windows the hermes.exe in venv\Scripts\ has the
+        # venv Python baked in, and the shims delegate to it by absolute
+        # path, so they survive `hermes update` venv rebuilds.
+        $hermesBin = "$HermesHome\bin"
+        New-HermesShims -ShimDir $hermesBin -VenvScripts "$InstallDir\venv\Scripts"
+        Update-UserPathForHermes -ShimDir $hermesBin -LegacyVenvScripts "$InstallDir\venv\Scripts"
     }
-    
-    # Add the venv Scripts dir to user PATH so hermes is globally available
-    # On Windows, the hermes.exe in venv\Scripts\ has the venv Python baked in
-    $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
-    
-    if ($currentPath -notlike "*$hermesBin*") {
-        [Environment]::SetEnvironmentVariable(
-            "Path",
-            "$hermesBin;$currentPath",
-            "User"
-        )
-        Write-Success "Added to user PATH: $hermesBin"
-    } else {
-        Write-Info "PATH already configured"
-    }
-    
+
     # Set HERMES_HOME so the Python code finds config/data in the right place.
     # Only needed on Windows where we install to %LOCALAPPDATA%\hermes instead
     # of the Unix default ~/.hermes
@@ -2742,10 +2822,10 @@ function Set-PathVariable {
         Write-Success "Set HERMES_HOME=$HermesHome"
     }
     $env:HERMES_HOME = $HermesHome
-    
+
     # Update current session
     $env:Path = "$hermesBin;$env:Path"
-    
+
     Write-Success "hermes command ready"
 }
 

@@ -2507,6 +2507,39 @@ def _ensure_fhs_path_guard() -> None:
     if wrote_any:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
 
+def _ensure_windows_acp_shim() -> None:
+    """Self-heal the ``hermes-acp`` command on Windows.
+
+    install.ps1 ships ``hermes``/``hermes-acp`` as .cmd shims in
+    ``%LOCALAPPDATA%\\hermes\\bin`` and deliberately keeps the venv Scripts
+    dir off the user PATH (it contains python.exe/pip.exe — see #83797).
+    ``hermes update`` does not re-run install.ps1, so re-ensure the acp shim
+    here for installs that predate the shim layout (their venv Scripts entry
+    may still be on the user PATH, or may already have been migrated).
+    """
+    local_appdata = os.environ.get("LOCALAPPDATA", "")
+    if not local_appdata:
+        return
+    bin_dir = Path(local_appdata) / "hermes" / "bin"
+    target = (
+        Path(local_appdata) / "hermes" / "hermes-agent" / "venv" / "Scripts"
+        / "hermes-acp.exe"
+    )
+    if not target.is_file():
+        return
+    shim = bin_dir / "hermes-acp.cmd"
+    # Text-mode write_text/read_text translate newlines on Windows, which
+    # would double the CRLF; go through bytes so the shim is verbatim.
+    encoding = "mbcs" if os.name == "nt" else "utf-8"
+    payload = ("@echo off\r\n@\"{}\" %*\r\n".format(target)).encode(encoding)
+    try:
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        if not shim.exists() or shim.read_bytes() != payload:
+            shim.write_bytes(payload)
+    except (OSError, UnicodeError):
+        return
+
+
 def _ensure_acp_launcher() -> None:
     """Self-heal: install a ``hermes-acp`` launcher next to the ``hermes`` one.
 
@@ -2522,12 +2555,16 @@ def _ensure_acp_launcher() -> None:
     (venv wrapper, FHS symlink, pipx/pip console script) without having to
     reconstruct interpreter/entrypoint paths.
 
-    No-op on Windows (install.ps1 puts ``venv\\Scripts`` on the user PATH, so
-    ``hermes-acp.exe`` already resolves) and wherever a ``hermes-acp`` is
-    already present next to the ``hermes`` command.  Unwritable directories
+    On Windows, ``hermes-acp.exe`` resolves because install.ps1 puts a
+    forwarding .cmd shim in ``%LOCALAPPDATA%\\hermes\\bin`` (which is on the
+    user PATH) — the venv Scripts dir is intentionally not on that PATH since
+    it also hosts python.exe (#83797). ``_ensure_windows_acp_shim`` keeps the
+    shim in place across updates; everywhere else this function installs a
+    shell shim next to the ``hermes`` command.  Unwritable directories
     (e.g. ``/usr/local/bin`` as non-root) are skipped silently.  Idempotent.
     """
     if _m().sys.platform == "win32":
+        _ensure_windows_acp_shim()
         return
     for bin_dir in (Path.home() / ".local" / "bin", Path("/usr/local/bin")):
         hermes_cmd = bin_dir / "hermes"
