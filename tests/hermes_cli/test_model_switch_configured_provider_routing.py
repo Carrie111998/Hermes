@@ -122,3 +122,87 @@ def test_xai_oauth_soft_accept_preserved_when_no_match():
     )
     assert result.success is True, result.error_message
     assert result.target_provider == "xai-oauth"
+
+
+# ---------------------------------------------------------------------------
+# Regression: providers_dict_to_custom_providers() derives a custom_providers
+# entry from every ``providers:`` key.  _configured_provider_matches must not
+# count the same provider twice (once as the user_providers key, once as the
+# derived custom: entry) — otherwise /model <name> fails with "declared by
+# multiple configured providers" for any model declared under ``providers:``.
+# ---------------------------------------------------------------------------
+
+def test_configured_provider_matches_dedups_user_and_custom():
+    """A provider declared under ``providers:`` that also appears in the
+    derived custom_providers list must be counted once, not twice."""
+    from hermes_cli.config import providers_dict_to_custom_providers
+    from hermes_cli.model_switch import _configured_provider_matches
+
+    user_providers = {
+        "my-zai": {
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+            "models": {"glm-5.2": {"context_length": 262144}},
+        }
+    }
+    # This is the real derivation path — providers_dict_to_custom_providers
+    # is called by get_compatible_custom_providers() which feeds the picker.
+    custom_providers = providers_dict_to_custom_providers(user_providers)
+
+    matches = _configured_provider_matches("glm-5.2", user_providers, custom_providers)
+    assert len(matches) == 1, (
+        f"Same provider counted twice: {matches}. "
+        "providers_dict_to_custom_providers() derives a custom: entry from "
+        "every providers: key — _configured_provider_matches must dedup by "
+        "provider_key so it is not mistaken for two separate declarations."
+    )
+    assert "my-zai" in matches
+
+
+def test_configured_provider_matches_truly_different_providers():
+    """Two genuinely different providers (not derived from the same key) both
+    declaring the same model must still be reported as multiple matches."""
+    from hermes_cli.model_switch import _configured_provider_matches
+
+    matches = _configured_provider_matches(
+        "shared-model",
+        user_providers={"provider-a": {"models": ["shared-model"]}},
+        custom_providers=[
+            {"name": "provider-b", "models": ["shared-model"]},
+        ],
+    )
+    assert len(matches) == 2
+    assert "provider-a" in matches
+    assert "custom:provider-b" in matches
+
+
+def test_switch_model_no_multiple_providers_error(tmp_path, monkeypatch):
+    """End-to-end: ``/model glm-5.2`` while already on the zai provider must
+    succeed, not error with 'declared by multiple configured providers'.
+
+    Repro: a provider declared under ``providers:`` in config.yaml is
+    simultaneously present in ``user_providers`` (key ``zai``) and in the
+    derived ``custom_providers`` list (key ``custom:zai``).  Before the fix,
+    _configured_provider_matches returned both slugs and switch_model refused
+    with an ambiguous-provider error.
+    """
+    from hermes_cli.config import providers_dict_to_custom_providers
+
+    user_providers = {
+        "zai": {
+            "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+            "models": {"glm-5.2": {"context_length": 262144}},
+        }
+    }
+    custom_providers = providers_dict_to_custom_providers(user_providers)
+
+    result = _run_switch(
+        raw_input="glm-5.2",
+        current_provider="zai",
+        current_model="glm-5.2",
+        current_base_url="https://open.bigmodel.cn/api/coding/paas/v4",
+        user_providers=user_providers,
+        custom_providers=custom_providers,
+    )
+    assert result.success is True, result.error_message
+    assert result.target_provider == "zai"
+    assert result.new_model == "glm-5.2"
