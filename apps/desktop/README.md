@@ -64,6 +64,13 @@ cd apps/desktop
 npm run dev          # Vite renderer + Electron, which boots the Python backend
 ```
 
+> **Windows also needs the [Visual C++ 2015-2022 Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe)**
+> ([arm64](https://aka.ms/vs/17/release/vc_redist.arm64.exe)). Electron is
+> unpacked by a native addon that links against `VCRUNTIME140.dll`, which a
+> clean Windows install does not have. Without it `npm install` fails during
+> Electron's postinstall with `ERR_DLOPEN_FAILED`. macOS and Linux need
+> nothing extra.
+
 Point the app at a specific source checkout, or sandbox it away from your real config:
 
 ```bash
@@ -198,6 +205,20 @@ Remove-Item -Recurse -Force "$env:LOCALAPPDATA\hermes\hermes-agent\venv"
 ```
 
 > The default Hermes home on Windows is `%LOCALAPPDATA%\hermes`. Set the `HERMES_HOME` env var if you've relocated it.
+
+**`ERR_DLOPEN_FAILED loading index.win32-x64-msvc.node` (Windows, building from source):**
+
+The Electron unpacker's native addon needs the Visual C++ 2015-2022
+Redistributable, which is not installed by default. The error names the addon
+but not the missing runtime, so it is easy to misread as a corrupt download.
+
+```powershell
+# x64 (or vc_redist.arm64.exe on an arm64 device), then re-run npm install
+winget install --id Microsoft.VCRedist.2015+.x64
+```
+
+This affects machines that *build* Hermes Desktop, not people running a
+prebuilt installer — the installers bundle everything they need.
 
 ---
 
