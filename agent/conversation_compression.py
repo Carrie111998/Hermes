@@ -1371,6 +1371,7 @@ def _supported_compression_kwargs(
     focus_topic: Optional[str],
     force: bool,
     memory_context: str,
+    external_protected_tail: bool = False,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1386,6 +1387,8 @@ def _supported_compression_kwargs(
     }
     if memory_context:
         candidates["memory_context"] = memory_context
+    if external_protected_tail:
+        candidates["external_protected_tail"] = True
     try:
         parameters = inspect.signature(compress_fn).parameters
     except (TypeError, ValueError):
@@ -2850,6 +2853,7 @@ def compress_context(
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            external_protected_tail=bool(protected_tail),
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(

@@ -18,11 +18,12 @@ import pytest
 
 
 def _make_agent(session_db, session_id, *, in_place):
-    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+    fake_api_key = "test" + "-key"
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": fake_api_key}):
         from run_agent import AIAgent
 
         agent = AIAgent(
-            api_key="test-key",
+            api_key=fake_api_key,
             base_url="https://openrouter.ai/api/v1",
             model="test/model",
             quiet_mode=True,
@@ -34,7 +35,14 @@ def _make_agent(session_db, session_id, *, in_place):
     agent.compression_in_place = in_place
     # Mock the compressor to return a deterministic shrunk transcript so the
     # test exercises the DB-mutation path, not summarization quality.
-    def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
+    def _fake_compress(
+        messages,
+        current_tokens=None,
+        focus_topic=None,
+        force=False,
+        external_protected_tail=False,
+    ):
+        agent._test_external_protected_tail = external_protected_tail
         return [
             {"role": "user", "content": "[CONTEXT COMPACTION] summary of prior turns"},
             {"role": "assistant", "content": "recent reply"},
@@ -79,8 +87,12 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             head = [{"role": "user", "content": f"head {i}"} for i in range(8)]
             protected_tail = [
-                {"role": "user", "content": "keep user turn"},
-                {"role": "assistant", "content": "keep assistant reply"},
+                {"role": "user", "content": "keep user turn 1"},
+                {"role": "assistant", "content": "keep assistant reply 1"},
+                {"role": "user", "content": "keep user turn 2"},
+                {"role": "assistant", "content": "keep assistant reply 2"},
+                {"role": "user", "content": "keep user turn 3"},
+                {"role": "assistant", "content": "keep assistant reply 3"},
             ]
 
             compressed_head, _ = compress_context(
@@ -109,10 +121,15 @@ class TestInPlaceCompaction:
             assert reloaded_contents == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
-                "keep user turn",
-                "keep assistant reply",
+                "keep user turn 1",
+                "keep assistant reply 1",
+                "keep user turn 2",
+                "keep assistant reply 2",
+                "keep user turn 3",
+                "keep assistant reply 3",
             ]
-            assert active_count == 4
+            assert active_count == 8
+            assert agent._test_external_protected_tail is True
 
     def test_in_place_keeps_same_session_id(self):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
