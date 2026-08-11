@@ -112,8 +112,39 @@ These hooks frame the user turn, not individual provider API attempts:
 | `post_llm_call` | After the turn completes with final assistant output. |
 
 Common `pre_llm_call` fields include `session_id`, `turn_id`,
-`user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`,
-and `sender_id`.
+`user_message`, `conversation_history`, `todos`, `todo_snapshot`,
+`is_first_turn`, `model`, `platform`, and `sender_id`. `todos` preserves the
+existing list-only shape. `todo_snapshot` contains the same list plus the
+machine-owned timing envelope returned by the todo tool.
+
+Todo timing is additive and versioned. `todo_snapshot["timing"]` records the
+current cycle and per-item timing under `schema_version = 1`. Hermes, not the
+model, owns these values: cycle elapsed time is wall time from cycle start to
+completion (or now), while item `active_seconds` accumulates only while the
+item status is `in_progress`. Each item also carries a machine-owned `cycle_id`.
+Terminal items retained in a later full todo list keep their prior cycle ID, so
+observers can exclude them from the new cycle without mutating the model-owned
+todo list. The timing envelope is serialized in canonical todo tool results,
+preserved as one bounded paired call/result across repeated context compression,
+and restored on resume. A cleared list still preserves a closed cycle snapshot,
+so post-restart work advances to a new cycle ID. `source = "live_runtime"`
+identifies timing generated in
+the current process; `source = "paired_history"` identifies structurally
+validated replay. Pairing is not authentication because API callers can supply
+history, so this timing is UI/observability data and must not drive billing,
+security, or SLA enforcement. Legacy results without the envelope hydrate with
+`known = false`; consumers must display an unknown value rather than fabricating
+zero. `finished_at` covers both `completed` and `cancelled`. `active_seconds`
+and cycle `elapsed_seconds` are convenience values derived at `observed_at`;
+hydration ignores them and restores only timestamps plus
+`accumulated_active_seconds`. Timestamps are Unix seconds in UTC.
+
+Todo inputs are bounded to 256 items, 128 characters per ID, and 4,000
+characters per description. Hermes normalizes long-form JSON control escapes
+and derives the result limit from those accepted maxima, so compression never
+drops an otherwise valid store solely because its serialized timing envelope is
+large. Hydration degrades cycle/status, cycle-membership, or active-window
+contradictions to unknown.
 
 Common `post_llm_call` fields include `session_id`, `turn_id`,
 `user_message`, `assistant_response`, `conversation_history`, `model`, and

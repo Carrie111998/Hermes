@@ -14,8 +14,11 @@ Design:
 - Behavioral guidance lives entirely in the tool schema description
 """
 
+import hashlib
 import json
-from typing import Dict, Any, List, Optional
+from typing import Callable, Dict, Any, List, Optional
+
+from tools.todo_timing import TodoTimingState
 
 
 # Valid status values for todo items
@@ -30,12 +33,24 @@ VALID_STATUSES = {"pending", "in_progress", "completed", "cancelled"}
 # task description, and active lists are a handful of items, not hundreds.
 MAX_TODO_CONTENT_CHARS = 4000
 MAX_TODO_ITEMS = 256
+MAX_TODO_ID_CHARS = 128
 # Upper bound on a single todo tool-result payload accepted during history
 # hydration. The gateway/API server replays caller-supplied conversation
 # history to rebuild the store, so an oversized forged result is dropped
 # before it is parsed and re-injected (see AIAgent._hydrate_todo_store).
-MAX_TODO_RESULT_CHARS = 512_000
+# Covers the maximum validated 256 x 4000-character todo list plus the
+# bounded timing envelope. Hydration and compression both enforce this cap
+# before parsing or replaying caller-supplied content.
+# Validated text contains no long-form JSON control escapes, so each input
+# character expands to at most two output characters (quote/backslash and the
+# short control escapes). Reserve 2 KiB per item for timing and JSON structure.
+MAX_TODO_RESULT_CHARS = (
+    MAX_TODO_ITEMS
+    * (2 * MAX_TODO_CONTENT_CHARS + 4 * MAX_TODO_ID_CHARS + 2048)
+    + 4096
+)
 _TRUNCATION_MARKER = "… [truncated]"
+_SHORT_JSON_CONTROLS = {"\b", "\f", "\n", "\r", "\t"}
 # Persisted as ordinary message content. ContextCompressor uses this stable
 # header to distinguish the synthetic post-compaction row from a real user.
 TODO_INJECTION_HEADER = (
@@ -53,8 +68,9 @@ class TodoStore:
       - status: pending | in_progress | completed | cancelled
     """
 
-    def __init__(self):
+    def __init__(self, clock: Optional[Callable[[], float]] = None):
         self._items: List[Dict[str, str]] = []
+        self._timing = TodoTimingState(clock=clock)
 
     def write(self, todos: List[Dict[str, Any]], merge: bool = False) -> List[Dict[str, str]]:
         """
@@ -65,6 +81,7 @@ class TodoStore:
             merge: if False, replace the entire list. If True, update
                    existing items by id and append new ones.
         """
+        previous = self.read()
         if not merge:
             # Replace mode: new list entirely
             self._items = [self._validate(t) for t in self._dedupe_by_id(todos)]
@@ -72,7 +89,7 @@ class TodoStore:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
             for t in self._dedupe_by_id(todos):
-                item_id = str(t.get("id", "")).strip()
+                item_id = self._cap_id(str(t.get("id", "")).strip())
                 if not item_id:
                     continue  # Can't merge without an id
 
@@ -103,15 +120,37 @@ class TodoStore:
         # (list order is priority).
         if len(self._items) > MAX_TODO_ITEMS:
             self._items = self._items[:MAX_TODO_ITEMS]
+        self._timing.apply(previous, self._items)
         return self.read()
 
     def read(self) -> List[Dict[str, str]]:
         """Return a copy of the current list."""
         return [item.copy() for item in self._items]
 
+    def snapshot(self) -> Dict[str, Any]:
+        """Return todos plus machine-owned durable timing metadata."""
+        items = self.read()
+        return {"todos": items, "timing": self._timing.snapshot(items)}
+
+    def hydrate(self, snapshot: Dict[str, Any]) -> List[Dict[str, str]]:
+        """Restore state from a canonical paired todo tool result."""
+        raw_items = snapshot.get("todos") if isinstance(snapshot, dict) else None
+        if not isinstance(raw_items, list):
+            return self.read()
+        self._items = [self._validate(t) for t in self._dedupe_by_id(raw_items)]
+        if len(self._items) > MAX_TODO_ITEMS:
+            self._items = self._items[:MAX_TODO_ITEMS]
+        timing = snapshot.get("timing") if isinstance(snapshot, dict) else None
+        self._timing.hydrate(self._items, timing)
+        return self.read()
+
     def has_items(self) -> bool:
         """Check if there are any items in the list."""
         return bool(self._items)
+
+    def has_durable_state(self) -> bool:
+        """Return whether compression must preserve Todo items or cycle timing."""
+        return self.has_items() or self._timing.has_state()
 
     def format_for_injection(self) -> Optional[str]:
         """
@@ -155,10 +194,29 @@ class TodoStore:
         re-injection block (format_for_injection) without bound. Keep the
         head — the actionable part of a task description — plus a marker.
         """
+        content = TodoStore._sanitize_text(content)
         if len(content) > MAX_TODO_CONTENT_CHARS:
             keep = MAX_TODO_CONTENT_CHARS - len(_TRUNCATION_MARKER)
             return content[:keep] + _TRUNCATION_MARKER
         return content
+
+    @staticmethod
+    def _sanitize_text(value: str) -> str:
+        """Replace control characters that JSON expands to six-character escapes."""
+        return "".join(
+            char if ord(char) >= 32 or char in _SHORT_JSON_CONTROLS else " "
+            for char in value
+        )
+
+    @staticmethod
+    def _cap_id(item_id: str) -> str:
+        """Bound identifiers while retaining a deterministic uniqueness suffix."""
+        item_id = TodoStore._sanitize_text(item_id)
+        if len(item_id) <= MAX_TODO_ID_CHARS:
+            return item_id
+        digest = hashlib.sha256(item_id.encode("utf-8", "surrogatepass")).hexdigest()[:16]
+        keep = MAX_TODO_ID_CHARS - len(digest) - 1
+        return f"{item_id[:keep]}#{digest}"
 
     @staticmethod
     def _validate(item: Dict[str, Any]) -> Dict[str, str]:
@@ -171,7 +229,7 @@ class TodoStore:
         if not isinstance(item, dict):
             return {"id": "?", "content": "(invalid item)", "status": "pending"}
 
-        item_id = str(item.get("id", "")).strip()
+        item_id = TodoStore._cap_id(str(item.get("id", "")).strip())
         if not item_id:
             item_id = "?"
 
@@ -196,7 +254,7 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = str(item.get("id", "")).strip() or "?"
+            item_id = TodoStore._cap_id(str(item.get("id", "")).strip()) or "?"
             last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 
@@ -241,8 +299,10 @@ def todo_tool(
     completed = sum(1 for i in items if i["status"] == "completed")
     cancelled = sum(1 for i in items if i["status"] == "cancelled")
 
+    snapshot = store.snapshot()
     return json.dumps({
-        "todos": items,
+        "todos": snapshot["todos"],
+        "timing": snapshot["timing"],
         "summary": {
             "total": len(items),
             "pending": pending,
@@ -287,15 +347,18 @@ TODO_SCHEMA = {
             "todos": {
                 "type": "array",
                 "description": "Task items to write. Omit to read current list.",
+                "maxItems": MAX_TODO_ITEMS,
                 "items": {
                     "type": "object",
                     "properties": {
                         "id": {
                             "type": "string",
+                            "maxLength": MAX_TODO_ID_CHARS,
                             "description": "Unique item identifier"
                         },
                         "content": {
                             "type": "string",
+                            "maxLength": MAX_TODO_CONTENT_CHARS,
                             "description": "Task description"
                         },
                         "status": {

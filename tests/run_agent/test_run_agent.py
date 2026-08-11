@@ -873,6 +873,51 @@ class TestHydrateTodoStore:
             agent._hydrate_todo_store(history)
         assert not agent._todo_store.has_items()
 
+    def test_paired_todo_result_restores_durable_timing(self, agent):
+        snapshot = {
+            "todos": [
+                {"id": "task", "content": "work", "status": "completed"}
+            ],
+            "timing": {
+                "schema_version": 1,
+                "cycle": {
+                    "id": 4,
+                    "known": True,
+                    "started_at": 100.0,
+                    "finished_at": 130.0,
+                    "elapsed_seconds": 30,
+                },
+                "items": {
+                    "task": {
+                        "known": True,
+                        "cycle_id": 4,
+                        "created_at": 100.0,
+                        "started_at": 110.0,
+                        "finished_at": 130.0,
+                        "accumulated_active_seconds": 20,
+                        "active_seconds": 20,
+                        "active_since": None,
+                    }
+                },
+            },
+        }
+        history = [
+            self._assistant_todo_call("c1"),
+            {
+                "role": "tool",
+                "tool_call_id": "c1",
+                "content": json.dumps(snapshot),
+            },
+        ]
+
+        with patch("run_agent._set_interrupt"):
+            agent._hydrate_todo_store(history)
+
+        restored = agent._todo_store.snapshot()["timing"]
+        assert restored["cycle"]["id"] == 4
+        assert restored["cycle"]["elapsed_seconds"] == 30
+        assert restored["items"]["task"]["active_seconds"] == 20
+
 
 
 
