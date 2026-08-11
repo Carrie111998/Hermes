@@ -203,3 +203,58 @@ class TestActivatePending:
         report = activate_pending([], resolve=lambda a: "job-1", request_run=_Recorder())
         assert report == ActivationReport(0, 0, (), (), (), ())
         assert report.needs_agent is False
+
+
+import json
+
+from jobflow_dispatch.activate import render_report
+
+
+def _last_line(text):
+    return [ln for ln in text.splitlines() if ln.strip()][-1]
+
+
+class TestRenderReport:
+    def test_clean_pass_gates_the_agent_off(self):
+        """Activating workers is not, by itself, a reason to spend a session."""
+        report = ActivationReport(3, 2, ("job-1", "job-2"), (), (), ())
+        out = render_report(report)
+
+        assert json.loads(_last_line(out)) == {"wakeAgent": False}
+        assert "activated=2" in out
+
+    def test_unresolved_gates_the_agent_on(self):
+        report = ActivationReport(1, 1, (), ("a.one",), (), ())
+        assert json.loads(_last_line(render_report(report))) == {"wakeAgent": True}
+
+    def test_refused_gates_the_agent_on(self):
+        report = ActivationReport(1, 1, (), (), ("a.one",), ())
+        assert json.loads(_last_line(render_report(report))) == {"wakeAgent": True}
+
+    def test_errors_gate_the_agent_on(self):
+        report = ActivationReport(1, 1, (), (), (), ("a.one",))
+        assert json.loads(_last_line(render_report(report))) == {"wakeAgent": True}
+
+    def test_the_gate_is_always_the_last_non_empty_line(self):
+        """The cron script slot reads exactly this line. If a detail line ever
+        lands after it, the gate silently stops working."""
+        report = ActivationReport(4, 3, ("job-1",), ("a.two",), ("a.three",), ("a.four",))
+        out = render_report(report)
+
+        assert json.loads(_last_line(out)) == {"wakeAgent": True}
+        assert out.splitlines()[-1] == _last_line(out)
+
+    def test_failing_activities_are_named_so_the_agent_can_diagnose(self):
+        report = ActivationReport(2, 2, (), ("a.one",), ("a.two",), ())
+        out = render_report(report)
+
+        assert "a.one" in out
+        assert "a.two" in out
+
+    def test_no_message_bodies_or_paths_leak(self):
+        """Only activity IDs, job IDs and counts reach stdout."""
+        report = ActivationReport(1, 1, ("job-1",), (), (), ())
+        out = render_report(report)
+
+        assert "inbox" not in out
+        assert ".json" not in out

@@ -15,6 +15,7 @@ belongs in that set.
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
@@ -175,3 +176,43 @@ def activate_pending(
         refused=tuple(refused),
         errors=tuple(errors),
     )
+
+
+def render_report(report: ActivationReport) -> str:
+    """Format one pass for the cron script slot's stdout.
+
+    The LAST non-empty line MUST be the wake gate — the scheduler parses only
+    that line and treats anything unparseable as "wake the agent". Keeping the
+    gate here, rather than in the wrapper script, is what lets a unit test hold
+    that invariant.
+
+    Only activity IDs, job IDs and counts appear. Message bodies and mailbox
+    paths never reach stdout: for an agent-path job this text is injected into
+    the prompt verbatim.
+    """
+    lines = [
+        "jobflow-reconcile: "
+        f"activations={report.activations} "
+        f"activities={report.activities} "
+        f"activated={len(report.activated)} "
+        f"unresolved={len(report.unresolved)} "
+        f"refused={len(report.refused)} "
+        f"errors={len(report.errors)}"
+    ]
+    for job_id in report.activated:
+        lines.append(f"- activated: {job_id}")
+    for activity_id in report.unresolved:
+        lines.append(
+            f"- UNRESOLVED: {activity_id} did not map to exactly one enabled job"
+        )
+    for activity_id in report.refused:
+        lines.append(
+            f"- REFUSED: {activity_id} resolved to a job that was not enabled "
+            "at activation time"
+        )
+    for activity_id in report.errors:
+        lines.append(f"- ERROR: {activity_id} raised during activation")
+
+    # MUST be last.
+    lines.append(json.dumps({"wakeAgent": report.needs_agent}))
+    return "\n".join(lines)
