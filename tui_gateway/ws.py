@@ -280,10 +280,19 @@ class WSTransport:
         # that task, the two keep each other alive after handle_ws has returned.
         # close() is synchronous and runs on the loop thread, so it cannot await
         # the drain the way GatewayPlatform.cancel_background_tasks does;
-        # cancelling without awaiting is the bounded half of the same contract,
-        # and each task's done callback removes it from the set as it unwinds.
+        # cancelling without awaiting is the bounded half of the same contract.
         for task in [t for t in self._background_tasks if not t.done()]:
             task.cancel()
+        # Then drop the tracking outright, as cancel_background_tasks does after
+        # its own drain. Waiting for each done callback to discard its task
+        # would leave transport -> _background_tasks -> task -> bound
+        # _safe_send_many -> transport intact until the loop next runs, so the
+        # pair would only be reclaimable by the cycle collector rather than by
+        # refcount — and on a wedged send_text() that wait is unbounded.
+        # Clearing is terminal here: _flush_tokens returns early once _closed is
+        # latched, so nothing repopulates the set, and set.discard on an
+        # already-removed task is a no-op.
+        self._background_tasks.clear()
 
 
 def _ws_peer_label(ws: Any) -> str:

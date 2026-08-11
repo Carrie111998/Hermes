@@ -305,6 +305,11 @@ def test_ws_transport_close_cancels_in_flight_batch_send():
 
         transport.close()
 
+        # Tracking is dropped synchronously rather than one done callback at a
+        # time, so close() leaves no transport -> set -> task -> transport cycle
+        # behind for the loop to unpick later.
+        assert not transport._background_tasks
+
         _done, pending = await asyncio.wait({task}, timeout=5)
         assert not pending, "close() left an in-flight batch send pending"
         assert task.cancelled()
