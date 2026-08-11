@@ -19,8 +19,11 @@ from hermes_cli.config import (
     recommended_update_command_for_method,
 )
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_constants import display_hermes_home
-from hermes_constants import agent_browser_runnable
+from hermes_constants import (
+    agent_browser_managed_shim_candidates,
+    display_hermes_home,
+    resolve_agent_browser_candidate,
+)
 
 PROJECT_ROOT = get_project_root()
 HERMES_HOME = get_hermes_home()
@@ -2108,7 +2111,6 @@ def run_doctor(args):
     if _safe_which("node"):
         check_ok("Node.js")
         # Check if agent-browser is installed
-        agent_browser_path = PROJECT_ROOT / "node_modules" / "agent-browser"
         agent_browser_ok = False
         _which_ab = shutil.which("agent-browser")
         # `hermes acp --setup-browser` installs agent-browser into the
@@ -2126,21 +2128,16 @@ def run_doctor(args):
             except Exception:
                 return None
 
-        _managed_ab = (
-            _which_in(HERMES_HOME / "node" / "bin")
-            or _which_in(HERMES_HOME / "node")
+        candidates = (
+            _which_ab,
+            *(str(path) for path in agent_browser_managed_shim_candidates(HERMES_HOME)),
+            _which_in(PROJECT_ROOT / "node_modules" / ".bin"),
         )
-        _legacy_ab = _which_in(HERMES_HOME / "node_modules" / ".bin")
-        if agent_browser_path.exists():
-            check_ok("agent-browser (Node.js)", "(browser automation)")
-            agent_browser_ok = True
-        elif _which_ab and agent_browser_runnable(_which_ab):
-            check_ok("agent-browser", "(browser automation)")
-            agent_browser_ok = True
-        elif _managed_ab and agent_browser_runnable(_managed_ab):
-            check_ok("agent-browser", "(browser automation)")
-            agent_browser_ok = True
-        elif _legacy_ab and agent_browser_runnable(_legacy_ab):
+        resolved_ab = next(
+            (resolve_agent_browser_candidate(candidate) for candidate in candidates if candidate),
+            None,
+        )
+        if resolved_ab:
             check_ok("agent-browser", "(browser automation)")
             agent_browser_ok = True
         elif _which_ab:
