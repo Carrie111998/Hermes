@@ -421,6 +421,11 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
     ...(message.reactions?.length ? { reactions: message.reactions } : {})
   }
 
+  const timelineMeta =
+    typeof message.timestamp === 'number' && Number.isFinite(message.timestamp) && message.timestamp > 0
+      ? { timelineTimestamp: message.timestamp }
+      : {}
+
   if (role === 'user') {
     return {
       id: message.id,
@@ -428,7 +433,7 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       content: message.parts.filter((part): part is Extract<ChatMessagePart, { type: 'text' }> => part.type === 'text'),
       attachments: [],
       createdAt,
-      metadata: { custom: { attachmentRefs: message.attachmentRefs ?? [], ...reactionMeta } }
+      metadata: { custom: { attachmentRefs: message.attachmentRefs ?? [], ...reactionMeta, ...timelineMeta } }
     } as ThreadMessage
   }
 
@@ -440,7 +445,7 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       role,
       content: [textPart(text)],
       createdAt,
-      metadata: { custom: {} }
+      metadata: { custom: timelineMeta }
     } as ThreadMessage
   }
 
@@ -460,7 +465,12 @@ export function toRuntimeMessage(message: ChatMessage): ThreadMessage {
       unstable_data: [],
       steps: [],
       // Carries ChatMessage.interim to AssistantMessage's footer gate.
-      custom: { ...(message.interim ? { interim: true } : {}), ...reactionMeta }
+      custom: {
+        ...(message.interim ? { interim: true } : {}),
+        ...timelineMeta,
+        ...(message.completedAt !== undefined ? { timelineCompletedAt: message.completedAt } : {}),
+        ...reactionMeta
+      }
     }
   } as ThreadMessage
 }
@@ -509,7 +519,13 @@ export function coalesceToolOnlyAssistants(messages: ChatMessage[], cache: ToolM
       const merged =
         cached && cached.prev === prev && cached.prevParts === prev.parts && cached.parts === message.parts
           ? cached.merged
-          : { ...prev, parts: [...prev.parts, ...message.parts] }
+          : {
+              ...prev,
+              completedAt: [prev.completedAt, message.completedAt, ...message.parts.map(part => part.completedAt)]
+                .filter((value): value is number => value !== undefined)
+                .reduce<number | undefined>((latest, value) => (latest === undefined ? value : Math.max(latest, value)), undefined),
+              parts: [...prev.parts, ...message.parts]
+            }
 
       cache.set(message, { merged, parts: message.parts, prev, prevParts: prev.parts })
       out[out.length - 1] = merged
