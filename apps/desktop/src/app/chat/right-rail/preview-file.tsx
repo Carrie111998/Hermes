@@ -1056,16 +1056,17 @@ export function LocalFilePreview({ annotating, onExitAnnotation, reloadKey, targ
     const mode = userMode && modes.includes(userMode) ? userMode : autoMode
 
     return (
-      <div
-        className="flex h-full flex-col overflow-hidden bg-transparent"
-        onMouseEnter={() => {
-          hoverRef.current = true
-        }}
-        onMouseLeave={() => {
-          hoverRef.current = false
-        }}
-        ref={readViewRef}
-      >
+      <>
+        <div
+          className="flex h-full flex-col overflow-hidden bg-transparent"
+          onMouseEnter={() => {
+            hoverRef.current = true
+          }}
+          onMouseLeave={() => {
+            hoverRef.current = false
+          }}
+          ref={readViewRef}
+        >
         {state.truncated && (
           <div className="border-b border-border/60 bg-muted/35 px-3 py-1.5 text-[0.68rem] text-muted-foreground">
             {t.preview.truncated}
@@ -1117,6 +1118,7 @@ export function LocalFilePreview({ annotating, onExitAnnotation, reloadKey, targ
           onExit={onExitAnnotation}
         />
       )}
+      </>
     )
   }
 
