@@ -8,6 +8,8 @@ docs/superpowers/specs/2026-08-10-editable-finder-drift-guard-design.md.
 
 from pathlib import Path
 
+import pytest
+
 from hermes_cli.install_doctor import (
     declared_names,
     parse_finder_mapping,
@@ -236,3 +238,22 @@ def test_probe_runs_from_a_directory_that_is_not_the_repo(tmp_path):
         "probe resolved a module from the caller's cwd — the neutral-cwd "
         "guarantee is broken and the guard would report false clean"
     )
+
+
+def test_probe_translates_a_timeout_into_probe_error(monkeypatch):
+    """Every probe failure mode must surface as ProbeError.
+
+    A caller that catches ProbeError would otherwise be blindsided by a raw
+    TimeoutExpired from a hung entrypoint import.
+    """
+    import subprocess
+
+    import hermes_cli.install_doctor as mod
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="python", timeout=120)
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+
+    with pytest.raises(mod.ProbeError):
+        mod.probe(["json"], [])

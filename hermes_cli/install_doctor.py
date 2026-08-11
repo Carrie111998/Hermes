@@ -268,20 +268,26 @@ def probe(names, entrypoints, python: str | None = None, env: dict | None = None
     """
     python = python or sys.executable
     with tempfile.TemporaryDirectory(prefix="hermes-install-doctor-") as neutral:
-        proc = subprocess.run(
-            [
-                python,
-                "-c",
-                _PROBE_SRC,
-                json.dumps(sorted(names)),
-                json.dumps(list(entrypoints)),
-            ],
-            cwd=neutral,
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
+        try:
+            proc = subprocess.run(
+                [
+                    python,
+                    "-c",
+                    _PROBE_SRC,
+                    json.dumps(sorted(names)),
+                    json.dumps(list(entrypoints)),
+                ],
+                cwd=neutral,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ProbeError(
+                f"probe subprocess timed out after {exc.timeout} seconds"
+            ) from exc
 
     if proc.returncode != 0 or not proc.stdout.strip():
         raise ProbeError(
