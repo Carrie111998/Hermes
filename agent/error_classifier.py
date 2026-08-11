@@ -1099,6 +1099,25 @@ def _classify_by_status(
                 retryable=False,
                 should_fallback=True,
             )
+        # An OpenRouter-aggregator 404 means the *upstream* provider serving
+        # this model answered 404: the model id is valid and the key is
+        # healthy, but no endpoint is currently serving it. Retrying the same
+        # id cannot recover — observed on mfc1 as three retries against
+        # ``nvidia/nemotron-3-ultra-550b-a55b:free`` followed by three more
+        # against its NVIDIA twin, six dead calls per auxiliary task,
+        # sustained for hours. Fall back to another model and leave the
+        # credential alone (mirrors the 429 branch below, which already
+        # unwraps this same envelope).
+        if _is_openrouter_upstream_error(body, provider):
+            upstream_provider = _extract_upstream_provider_name(body)
+            ctx = {"upstream_provider": upstream_provider} if upstream_provider else {}
+            return result_fn(
+                FailoverReason.model_not_found,
+                retryable=False,
+                should_rotate_credential=False,
+                should_fallback=True,
+                error_context=ctx,
+            )
         # Generic 404 with no "model not found" signal — could be a wrong
         # endpoint path (common with local llama.cpp / Ollama / vLLM when
         # the URL is slightly misconfigured), a proxy routing glitch, or

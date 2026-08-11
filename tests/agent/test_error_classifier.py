@@ -935,6 +935,51 @@ class TestOpenRouterUpstreamRateLimit:
         assert result.error_context.get("upstream_provider") == "DeepSeek"
 
 
+    def test_openrouter_upstream_404_falls_back_without_retrying(self):
+        """OpenRouter 404 with 'Provider returned error' → fall back, no retry.
+
+        The model id is valid and the key is healthy — the upstream provider
+        serving it answered 404, so no endpoint is currently available.
+        Retrying the same id cannot recover: on mfc1 this burned three
+        retries against ``…-a55b:free`` plus three more against its NVIDIA
+        twin, six dead calls per auxiliary task, sustained for hours.
+        """
+        e = MockAPIError(
+            "Provider returned error",
+            status_code=404,
+            body={
+                "error": {
+                    "message": "Provider returned error",
+                    "code": 404,
+                    "metadata": {
+                        "provider_name": "NVIDIA",
+                        "raw": '{"error":{"message":"Not Found"}}',
+                    },
+                }
+            },
+        )
+        result = classify_api_error(
+            e, provider="openrouter", model="nvidia/nemotron-3-ultra-550b-a55b:free"
+        )
+        assert result.reason == FailoverReason.model_not_found
+        assert result.retryable is False
+        assert result.should_fallback is True
+        assert result.should_rotate_credential is False
+        assert result.error_context.get("upstream_provider") == "NVIDIA"
+
+    def test_generic_404_stays_retryable(self):
+        """A 404 without the aggregator wrapper must keep its old behaviour.
+
+        A misconfigured local endpoint (llama.cpp / Ollama / vLLM) returns a
+        bare 404 that says nothing about models. Classifying that as
+        model_not_found would silently fall back and misreport the cause, so
+        it must remain a retryable unknown.
+        """
+        e = MockAPIError("404 page not found", status_code=404, body={"error": "404 page not found"})
+        result = classify_api_error(e, provider="ollama", model="llama3")
+        assert result.reason == FailoverReason.unknown
+        assert result.retryable is True
+
     def test_account_level_429_still_rotates_credential(self):
         """A real account-level 429 (no upstream wrapper) → rate_limit, rotates."""
         e = MockAPIError(
