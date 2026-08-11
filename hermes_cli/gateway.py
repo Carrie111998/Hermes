@@ -37,6 +37,7 @@ from hermes_cli.gateway_diag import (
     SPAWN_SITE_ENV as GATEWAY_SPAWN_SITE_ENV,
     launch_identity as _launch_identity,
     process_start_age_s as _process_start_age_s,
+    register_exit_hook as _register_exit_hook,
     write_diag as _gateway_exit_diag,
 )
 from gateway.status import pid_exists, terminate_pid
@@ -5138,15 +5139,15 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     #
     # The ``gateway.start`` record for this run was already written at
     # function entry — see the comment there for why it can't wait until here.
-    import atexit as _atexit
+    # The atexit record binds its destination here, at registration, rather
+    # than resolving HERMES_HOME when it fires: the interpreter runs it after
+    # everything else, including a test's env teardown. See
+    # ``gateway_diag.register_exit_hook``.
     import traceback as _traceback
 
     _exit_diag = _gateway_exit_diag
 
-    def _atexit_hook() -> None:
-        _exit_diag("atexit.hook", sys_exc=repr(sys.exc_info()))
-
-    _atexit.register(_atexit_hook)
+    _register_exit_hook()
 
     # Portable, app-level respawn-storm circuit breaker. launchd/systemd have
     # their own throttles, but this backstop works on every platform (and covers

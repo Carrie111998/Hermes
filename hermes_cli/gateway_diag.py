@@ -28,8 +28,13 @@ to break the gateway, so all failures are swallowed. Opt out entirely with
 
 from __future__ import annotations
 
+import atexit
 import os
 import sys
+from typing import TYPE_CHECKING, Callable
+
+if TYPE_CHECKING:  # a runtime pathlib import would cost the module its cheapness
+    from pathlib import Path
 
 DIAG_ENV_VAR = "HERMES_GATEWAY_EXIT_DIAG"
 DIAG_LOG_NAME = "gateway-exit-diag.log"
@@ -92,17 +97,52 @@ def diag_enabled() -> bool:
     return os.environ.get(DIAG_ENV_VAR, "1") == "1"
 
 
-def write_diag(tag: str, **extra: object) -> None:
-    """Append one JSON lifecycle record to ``logs/gateway-exit-diag.log``."""
+def resolve_log_dir() -> Path | None:
+    """Resolve the log directory *now*, for a record written later.
+
+    ``get_hermes_home()`` reads ``HERMES_HOME`` on every call, so a writer that
+    resolves it lazily writes wherever the env var happens to point when it
+    fires — which for an ``atexit`` hook is long after the code that registered
+    it stopped running. Capturing the path at registration is what pins a
+    record to the home its process actually ran under; see ``write_diag``'s
+    ``log_dir`` parameter.
+
+    Returns None if the home can't be resolved, keeping the module's
+    never-raise contract.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        return get_hermes_home() / "logs"
+    except Exception:
+        return None
+
+
+def write_diag(tag: str, *, log_dir: Path | None = None, **extra: object) -> None:
+    """Append one JSON lifecycle record to ``logs/gateway-exit-diag.log``.
+
+    ``log_dir`` pins the destination to a directory captured earlier by
+    :func:`resolve_log_dir`, instead of resolving ``HERMES_HOME`` at write
+    time. Pass it from any writer that can outlive the environment it was set
+    up in — an ``atexit`` hook above all, whose fire happens after pytest's
+    ``monkeypatch`` has restored the real ``HERMES_HOME`` and would otherwise
+    append test records to the live production log (observed 2026-08-11).
+    """
     if not diag_enabled():
         return
     try:
         import json
         from datetime import datetime, timezone
 
-        from hermes_constants import get_hermes_home
-
-        log_dir = get_hermes_home() / "logs"
+        if log_dir is None:
+            log_dir = resolve_log_dir()
+            if log_dir is None:
+                return
+        elif not log_dir.parent.exists():
+            # The captured home has been deleted (a pytest tmp dir, typically).
+            # Recreating it to hold a record nobody will read would just leave
+            # litter behind, so drop the record instead.
+            return
         log_dir.mkdir(parents=True, exist_ok=True)
         line = {
             "ts": datetime.now(timezone.utc).isoformat(),
@@ -116,6 +156,27 @@ def write_diag(tag: str, **extra: object) -> None:
             fh.write(json.dumps(line, default=str) + "\n")
     except Exception:
         pass  # never let the diagnostic itself crash the gateway
+
+
+def register_exit_hook() -> Callable[[], None]:
+    """Register the ``atexit.hook`` record, bound to the home current *now*.
+
+    The hook fires from the interpreter's shutdown path, arbitrarily far from
+    the code that registered it — so it is the one writer that must never
+    resolve its own destination. Under pytest that gap spans ``monkeypatch``
+    teardown, and a late-resolved path appended test records to the real
+    ``~/.hermes/profiles/main`` log: exactly the artifact the gateway
+    double-spawn investigation reads, stamped with a pytest PID.
+
+    Returns the registered hook so callers can ``atexit.unregister`` it.
+    """
+    log_dir = resolve_log_dir()
+
+    def _hook() -> None:
+        write_diag("atexit.hook", sys_exc=repr(sys.exc_info()), log_dir=log_dir)
+
+    atexit.register(_hook)
+    return _hook
 
 
 def process_start_age_s() -> float | None:
