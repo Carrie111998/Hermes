@@ -52,6 +52,12 @@ source ~/.bashrc    # 重新加载 shell（或: source ~/.zshrc）
 hermes              # 开始对话！
 ```
 
+## 在 Sealos 上部署
+
+[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/hermes-agent)
+
+该模板会为 Hermes 记忆、控制台认证和 API 服务配置持久化存储。
+
 ---
 
 ## 快速入门

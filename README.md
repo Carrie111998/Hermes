@@ -65,6 +65,12 @@ source ~/.bashrc    # reload shell (or: source ~/.zshrc)
 hermes              # start chatting!
 ```
 
+## Deploy on Sealos
+
+[![Deploy on Sealos](https://sealos.io/Deploy-on-Sealos.svg)](https://sealos.io/products/app-store/hermes-agent)
+
+The template provisions persistent storage for Hermes memory, dashboard auth, and the API server.
+
 ### Troubleshooting
 
 #### Windows Defender or antivirus flags `uv.exe` as malware
