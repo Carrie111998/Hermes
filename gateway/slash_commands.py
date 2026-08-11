@@ -2878,7 +2878,8 @@ class GatewaySlashCommandsMixin:
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
-            snapshot_id = agent._spawn_background_review(
+            snapshot_id = await asyncio.to_thread(
+                agent._spawn_background_review,
                 messages_snapshot=snapshot,
                 review_memory=True,
                 review_skills=review_skills,
