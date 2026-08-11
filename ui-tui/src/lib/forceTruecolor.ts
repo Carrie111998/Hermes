@@ -6,17 +6,16 @@
  * explicitly on terminals that support RGB but do not advertise COLORTERM.
  */
 
-const TRUE_RE = /^(?:1|true|yes|on)$/i
-const FALSE_RE = /^(?:0|false|no|off)$/i
+import { truthy, falsy } from './envFlags.js'
 
 export function shouldForceTruecolor(env: NodeJS.ProcessEnv = process.env): boolean {
   const override = (env.HERMES_TUI_TRUECOLOR ?? '').trim()
 
-  if (FALSE_RE.test(override) || 'NO_COLOR' in env) {
+  if (falsy(override) || 'NO_COLOR' in env) {
     return false
   }
 
-  return TRUE_RE.test(override)
+  return truthy(override)
 }
 
 const isAppleTerminal = (env: NodeJS.ProcessEnv = process.env) => (env.TERM_PROGRAM ?? '').trim() === 'Apple_Terminal'

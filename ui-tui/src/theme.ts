@@ -1,6 +1,7 @@
 import type { SkinBranding, SkinColors } from '@hermes/shared/skin'
 
 import { desaturate, grayOf, liftForContrast, mix, parseColor, relativeLuminance, toHex } from './lib/color.js'
+import { truthy, falsy } from './lib/envFlags.js'
 
 export interface ThemeColors {
   primary: string
@@ -636,8 +637,7 @@ export function deriveTones(seeds: {
   }
 }
 
-const TRUE_RE = /^(?:1|true|yes|on)$/
-const FALSE_RE = /^(?:0|false|no|off)$/
+
 
 // TERM_PROGRAM fallback allow-list for terminals whose default profile is
 // light and which may not expose COLORFGBG. This currently includes Apple
@@ -707,11 +707,11 @@ export function detectLightMode(
 ): boolean {
   const lightFlag = (env.HERMES_TUI_LIGHT ?? '').trim().toLowerCase()
 
-  if (TRUE_RE.test(lightFlag)) {
+  if (truthy(lightFlag)) {
     return true
   }
 
-  if (FALSE_RE.test(lightFlag)) {
+  if (falsy(lightFlag)) {
     return false
   }
 

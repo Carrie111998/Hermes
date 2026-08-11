@@ -1,9 +1,7 @@
 import type { MouseTrackingMode } from '@hermes/ink'
 
 import { isTermuxTuiMode } from '../lib/termux.js'
-
-const truthy = (v?: string) => /^(?:1|true|yes|on)$/i.test((v ?? '').trim())
-const falsy = (v?: string) => /^(?:0|false|no|off)$/i.test((v ?? '').trim())
+import { truthy, falsy } from '../lib/envFlags.js'
 
 const parseToggle = (v?: string): boolean | null => {
   const raw = (v ?? '').trim()
