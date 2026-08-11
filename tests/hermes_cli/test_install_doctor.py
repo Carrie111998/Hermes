@@ -110,3 +110,83 @@ def test_smoke_entrypoints_include_the_regression_chain():
     from hermes_cli.install_doctor import SMOKE_ENTRYPOINTS
 
     assert "events.gateway_integration" in SMOKE_ENTRYPOINTS
+
+
+def test_find_editable_finder_picks_the_hermes_agent_finder(tmp_path):
+    from hermes_cli.install_doctor import find_editable_finder
+
+    (tmp_path / "__editable___hermes_agent_0_19_0_finder.py").write_text(
+        "x = 1\n", encoding="utf-8"
+    )
+    (tmp_path / "__editable___hermes_hudui_0_3_1_finder.py").write_text(
+        "x = 1\n", encoding="utf-8"
+    )
+
+    found = find_editable_finder([tmp_path])
+    assert found is not None
+    assert found.name == "__editable___hermes_agent_0_19_0_finder.py"
+
+
+def test_find_editable_finder_returns_none_when_absent(tmp_path):
+    from hermes_cli.install_doctor import find_editable_finder
+
+    assert find_editable_finder([tmp_path]) is None
+
+
+def test_resolve_install_root_uses_the_common_parent_of_mapping_targets(tmp_path):
+    from hermes_cli.install_doctor import resolve_install_root
+
+    root = tmp_path / "agent-src"
+    finder = tmp_path / "__editable___hermes_agent_0_19_0_finder.py"
+    finder.write_text(
+        _finder_source(
+            {
+                "events": str(root / "events"),
+                "jobflow_dispatch": str(root / "jobflow_dispatch"),
+                "hermes_constants": str(root / "hermes_constants"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    resolved = resolve_install_root(finder)
+    assert resolved.path == root
+    assert resolved.mapping is not None
+    assert "jobflow_dispatch" in resolved.mapping
+    assert finder.name in resolved.provenance
+
+
+def test_resolve_install_root_handles_a_single_mapping_entry(tmp_path):
+    """commonpath over targets alone would return the package dir, not the root."""
+    from hermes_cli.install_doctor import resolve_install_root
+
+    root = tmp_path / "agent-src"
+    finder = tmp_path / "__editable___hermes_agent_0_19_0_finder.py"
+    finder.write_text(
+        _finder_source({"events": str(root / "events")}), encoding="utf-8"
+    )
+
+    assert resolve_install_root(finder).path == root
+
+
+def test_resolve_install_root_reports_an_unparseable_finder(tmp_path):
+    from hermes_cli.install_doctor import resolve_install_root
+
+    finder = tmp_path / "__editable___hermes_agent_0_19_0_finder.py"
+    finder.write_text("garbage, no mapping here\n", encoding="utf-8")
+
+    resolved = resolve_install_root(finder)
+    assert resolved.path is None
+    assert resolved.mapping is None
+    assert "did not parse" in resolved.provenance
+
+
+def test_resolve_install_root_falls_back_when_no_finder_exists(monkeypatch):
+    """A wheel install has no finder; fall back to the running module's repo."""
+    import hermes_cli.install_doctor as mod
+
+    monkeypatch.setattr(mod, "find_editable_finder", lambda *a, **k: None)
+    resolved = mod.resolve_install_root()
+
+    assert resolved.mapping is None
+    assert "no editable finder" in resolved.provenance

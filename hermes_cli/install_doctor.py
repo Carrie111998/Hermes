@@ -29,8 +29,12 @@ Design: docs/superpowers/specs/2026-08-10-editable-finder-drift-guard-design.md
 from __future__ import annotations
 
 import ast
+import os
 import re
+import site
+import sysconfig
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 
 #: Import chains whose MODULE-LEVEL imports must survive a neutral cwd.
@@ -101,3 +105,92 @@ def parse_finder_mapping(source: str) -> dict[str, str] | None:
         # propagate.
         return None
     return value if isinstance(value, dict) else None
+
+
+@dataclass(frozen=True)
+class InstallRoot:
+    """Where the install points, and how we worked that out.
+
+    ``path`` is the source root whose pyproject.toml is authoritative for
+    "declared". ``provenance`` is always rendered, so it is never ambiguous
+    which install was graded. ``mapping`` is None whenever the diagnosis
+    layer is unavailable.
+    """
+
+    path: Path | None
+    provenance: str
+    mapping: dict[str, str] | None
+
+
+def find_editable_finder(search_roots: list[Path] | None = None) -> Path | None:
+    """Locate the hermes-agent editable finder in site-packages.
+
+    User site-packages is searched first: that is where a `pip install -e .`
+    without a venv actually lands on the WindowsApps interpreter.
+    """
+    if search_roots is None:
+        search_roots = []
+        try:
+            search_roots.append(Path(site.getusersitepackages()))
+        except Exception:  # pragma: no cover - platform-dependent
+            pass
+        try:
+            search_roots.extend(Path(p) for p in site.getsitepackages())
+        except Exception:  # pragma: no cover - virtualenv without the attr
+            pass
+        search_roots.append(Path(sysconfig.get_paths()["purelib"]))
+
+    for root in search_roots:
+        try:
+            matches = sorted(root.glob("__editable___hermes_agent_*_finder.py"))
+        except OSError:
+            continue
+        if matches:
+            return matches[-1]
+    return None
+
+
+def resolve_install_root(finder: Path | None = None) -> InstallRoot:
+    """Resolve the root whose pyproject.toml is authoritative for 'declared'.
+
+    The INSTALL root, deliberately — not the cwd repo's. That keeps the
+    semantics self-consistent ("does the installed environment expose
+    everything the INSTALLED project declares") and stops a worktree from
+    reporting drift for packages that only exist on its own branch, which a
+    reinstall from agent-src would not fix anyway.
+    """
+    if finder is None:
+        finder = find_editable_finder()
+
+    if finder is None:
+        fallback = Path(__file__).resolve().parents[1]
+        has_pyproject = (fallback / "pyproject.toml").is_file()
+        return InstallRoot(
+            path=fallback if has_pyproject else None,
+            provenance=(
+                "no editable finder found (wheel install?); falling back to the "
+                f"repo root of the running hermes_cli: {fallback}"
+                + ("" if has_pyproject else " — which has no pyproject.toml")
+            ),
+            mapping=None,
+        )
+
+    mapping = parse_finder_mapping(finder.read_text(encoding="utf-8"))
+    if not mapping:
+        return InstallRoot(
+            path=None,
+            provenance=(
+                f"editable finder {finder.name} found, but its MAPPING did not "
+                "parse — setuptools' generated format may have changed"
+            ),
+            mapping=None,
+        )
+
+    # Parents, not the targets themselves: commonpath over a single target
+    # would return the package directory rather than the root.
+    root = Path(os.path.commonpath([str(Path(t).parent) for t in mapping.values()]))
+    return InstallRoot(
+        path=root,
+        provenance=f"editable finder {finder.name} -> {root}",
+        mapping=mapping,
+    )
