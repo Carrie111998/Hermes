@@ -182,6 +182,67 @@ def test_native_authorize_rejects_non_loopback_redirect(gated_client):
 
 
 # ---------------------------------------------------------------------------
+# Empty-provider auto-select on /auth/native/authorize
+# ---------------------------------------------------------------------------
+
+
+class _PasswordStubProvider(StubAuthProvider):
+    """Password-form provider. It cannot broker a native OAuth flow."""
+
+    name = "pwstub"
+    display_name = "Password Stub (test only)"
+    supports_password = True
+
+
+class _SecondOAuthStubProvider(StubAuthProvider):
+    """Second OAuth provider, to make the empty-provider hint ambiguous."""
+
+    name = "stub2"
+    display_name = "Stub IdP 2 (test only)"
+
+
+def _native_authorize(client, *, provider=""):
+    _verifier, challenge = _make_pkce()
+    return client.get(
+        "/auth/native/authorize",
+        params={
+            "provider": provider,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "redirect_uri": "http://127.0.0.1:53999/cb",
+            "state": "s",
+        },
+    )
+
+
+def test_native_authorize_empty_provider_selects_sole_provider(gated_client):
+    r = _native_authorize(gated_client, provider="")
+    assert r.status_code == 302, r.text
+
+
+def test_native_authorize_empty_provider_ignores_password_provider(
+    gated_client,
+):
+    """A registered password provider must not block the auto-select.
+
+    The password provider is rejected for native brokering below the
+    resolve step, so it must not count against uniqueness either. Before
+    the filter, basic + OAuth together made this request fail with 404.
+    """
+    register_provider(_PasswordStubProvider())
+    r = _native_authorize(gated_client, provider="")
+    assert r.status_code == 302, r.text
+
+
+def test_native_authorize_empty_provider_ambiguous_is_404(gated_client):
+    """Two native-capable providers stay ambiguous — the 404 remains."""
+    register_provider(_SecondOAuthStubProvider())
+    r = _native_authorize(gated_client, provider="")
+    assert r.status_code == 404
+    assert "Unknown provider" in r.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
 # Cookieless bearer auth of a gated route — the core deliverable
 # ---------------------------------------------------------------------------
 

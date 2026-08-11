@@ -315,14 +315,22 @@ async def auth_native_authorize(
         raise HTTPException(status_code=400, detail="code_challenge required")
     _validate_loopback_redirect_uri(redirect_uri)
 
-    # Resolve the provider. With exactly one session provider registered
-    # (the common hosted case) an empty ``provider`` selects it, mirroring
-    # the auto-SSO convenience so the desktop needn't hardcode the name.
+    # Resolve the provider. When ``provider`` is empty, select the only
+    # native-capable candidate, so the desktop does not hardcode the name.
+    # Password providers cannot broker a native flow (see the check below),
+    # so they do not count against uniqueness. Before this filter, a basic
+    # + OAuth pair made the empty-provider path fail with 404, although
+    # only one valid candidate existed.
     p = get_provider(provider) if provider else None
     if p is None and not provider:
-        sess_providers = list_session_providers()
-        if len(sess_providers) == 1:
-            p = sess_providers[0]
+        native_candidates = [
+            sp
+            for sp in list_session_providers()
+            if getattr(sp, "supports_session", True)
+            and not getattr(sp, "supports_password", False)
+        ]
+        if len(native_candidates) == 1:
+            p = native_candidates[0]
     if p is None:
         raise HTTPException(
             status_code=404, detail=f"Unknown provider: {provider!r}"
