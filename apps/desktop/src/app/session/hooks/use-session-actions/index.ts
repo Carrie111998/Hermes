@@ -1072,8 +1072,9 @@ export function useSessionActions({
         recoveredInFlightTail = inFlightRecovery.applied
 
         // Prefetch-hit fast path: `preferredMessages` IS the live `$messages`
-        // array (already error-merged when `localSnapshot` was built), so reuse
-        // the ref instead of rebuilding a throwaway transcript+Map every switch.
+        // array (already error-merged when the persisted baseline was
+        // published), so reuse the ref instead of rebuilding a throwaway
+        // transcript+Map every switch.
         const messagesForView =
           inFlightRecovery.messages === currentMessages
             ? currentMessages
@@ -1128,9 +1129,8 @@ export function useSessionActions({
         )
 
         // updateSessionState stages its view sync through requestAnimationFrame.
-        // Commit the final, already-reconciled transcript now so resume has one
-        // additive DOM build instead of an eager prefetch build plus a later
-        // runtime projection build.
+        // Publish only when runtime projection or journal recovery materially
+        // changed the already-visible persisted baseline.
         if (!chatMessageArraysEquivalent($messages.get(), messagesForView)) {
           setMessages(messagesForView)
         }
