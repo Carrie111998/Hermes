@@ -1476,7 +1476,6 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             task_id,
             raw_task_id,
             config,
-            preserve_creation_lock=True,
         )
         with _env_lock:
             if task_id in _active_environments:
@@ -1608,6 +1607,21 @@ def _special_file_kind(path) -> str | None:
     if _stat.S_ISBLK(mode):
         return "a block device"
     return "a special (non-regular) file"
+
+
+def _file_connection_error_result(exc: Exception, task_id: str) -> str | None:
+    """Evict an unreachable sandbox shared by any file-tool entry point."""
+    from tools.environments.base import EnvironmentConnectionError
+
+    if not isinstance(exc, EnvironmentConnectionError):
+        return None
+    from tools.terminal_tool import _environment_connection_error_result
+
+    return _environment_connection_error_result(
+        exc,
+        task_id,
+        operation="File backend",
+    )
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str = "default") -> str:
@@ -1995,6 +2009,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
 
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
+        connection_result = _file_connection_error_result(e, task_id)
+        if connection_result is not None:
+            return connection_result
         return tool_error(str(e))
 
 
@@ -2310,6 +2327,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 file_state.note_write(task_id, _resolved)
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
+        connection_result = _file_connection_error_result(e, task_id)
+        if connection_result is not None:
+            return connection_result
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
@@ -2534,6 +2554,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 )
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
+        connection_result = _file_connection_error_result(e, task_id)
+        if connection_result is not None:
+            return connection_result
         return tool_error(str(e))
 
 
@@ -2638,6 +2661,9 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json
     except Exception as e:
+        connection_result = _file_connection_error_result(e, task_id)
+        if connection_result is not None:
+            return connection_result
         return tool_error(str(e))
 
 
