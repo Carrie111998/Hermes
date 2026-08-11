@@ -2516,6 +2516,11 @@ def _ensure_windows_acp_shim() -> None:
     ``hermes update`` does not re-run install.ps1, so re-ensure the acp shim
     here for installs that predate the shim layout (their venv Scripts entry
     may still be on the user PATH, or may already have been migrated).
+
+    The target path is hardcoded to the standard layout, so installs with a
+    custom install dir (``target.is_file()`` false) degrade silently: no
+    shim is written and the existing ``hermes-acp`` resolution keeps
+    working the way the custom install configured it.
     """
     local_appdata = os.environ.get("LOCALAPPDATA", "")
     if not local_appdata:

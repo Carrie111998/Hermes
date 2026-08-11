@@ -120,6 +120,13 @@ Assert-Equal "$BIN;C:\Program Files\nodejs" $script:FakeUserPath `
 Invoke-Migration "$VENV_SCRIPTS;C:\Program Files\nodejs;$VENV_SCRIPTS"
 Assert-Equal "$BIN;C:\Program Files\nodejs" $script:FakeUserPath 'duplicates collapse'
 
+# A trailing backslash on the shim dir must not defeat membership detection:
+# the function normalizes it, so no duplicate entry is prepended.
+Invoke-Migration "$BIN;C:\Program Files\nodejs" "$BIN\"
+Assert-Equal "$BIN;C:\Program Files\nodejs" $script:FakeUserPath `
+    'trailing backslash on shim dir: no duplicate entry'
+Assert-Equal 0 $script:FakeWrites 'trailing backslash on shim dir: no write'
+
 Invoke-Migration ""
 Assert-Equal $BIN $script:FakeUserPath 'empty User PATH'
 
@@ -132,6 +139,85 @@ Assert-Equal "$BIN;C:\Program Files\nodejs;;" $script:FakeUserPath `
 Invoke-Migration "C:\Program Files\nodejs" "" ""
 Assert-Equal "C:\Program Files\nodejs" $script:FakeUserPath 'empty ShimDir is a no-op'
 Assert-Equal 0 $script:FakeWrites 'empty ShimDir does not write'
+
+# --- New-HermesShims (file-system behavior) --------------------------------
+#
+# Unlike Update-UserPathForHermes this function has no registry calls, so it
+# is tested against real temp dirs.
+
+$fn2 = $ast.Find({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $n.Name -eq 'New-HermesShims'
+}, $true)
+
+if (-not $fn2) {
+    throw "New-HermesShims not found in $installPs1"
+}
+Invoke-Expression $fn2.Extent.Text
+
+$shimRoot = Join-Path $env:TEMP ("hermes-shim-test-" + [guid]::NewGuid().ToString('N'))
+$fakeVenv = Join-Path $shimRoot 'venv\Scripts'
+$fakeBin = Join-Path $shimRoot 'bin'
+New-Item -ItemType Directory -Path $fakeVenv -Force | Out-Null
+
+# Seed the venv with the two console scripts the installer ships.
+Set-Content -LiteralPath (Join-Path $fakeVenv 'hermes.exe') -Value 'dummy' -Encoding ASCII
+Set-Content -LiteralPath (Join-Path $fakeVenv 'hermes-acp.exe') -Value 'dummy' -Encoding ASCII
+
+function Assert-Shim {
+    param([string]$Name, [string]$Expected, [string]$TestName)
+    $shim = Join-Path $fakeBin "$Name.cmd"
+    $actual = Get-Content -LiteralPath $shim -Raw
+    if ($actual -ceq $Expected) {
+        Write-Host "  PASS  $TestName"
+    } else {
+        Write-Host "  FAIL  $TestName"
+        Write-Host "        expected: [$Expected]"
+        Write-Host "        actual:   [$actual]"
+        $script:Failures++
+    }
+}
+
+$expectedHermes = "@echo off`r`n@`"$(Join-Path $fakeVenv 'hermes.exe')`" %*`r`n"
+$expectedAcp = "@echo off`r`n@`"$(Join-Path $fakeVenv 'hermes-acp.exe')`" %*`r`n"
+
+New-HermesShims -ShimDir $fakeBin -VenvScripts $fakeVenv
+Assert-Shim 'hermes' $expectedHermes 'shim created with quoted absolute target'
+Assert-Shim 'hermes-acp' $expectedAcp 'acp shim created with quoted absolute target'
+
+# Idempotent: unchanged content must not rewrite (mtime stays put).
+$before = (Get-Item (Join-Path $fakeBin 'hermes.cmd')).LastWriteTimeUtc
+Start-Sleep -Milliseconds 50
+New-HermesShims -ShimDir $fakeBin -VenvScripts $fakeVenv
+$after = (Get-Item (Join-Path $fakeBin 'hermes.cmd')).LastWriteTimeUtc
+if ($before -eq $after) {
+    Write-Host '  PASS  idempotent: no rewrite when content unchanged'
+} else {
+    Write-Host '  FAIL  idempotent: shim rewritten'
+    $script:Failures++
+}
+
+# A missing console script is skipped, not stubbed.
+$sparseVenv = Join-Path $shimRoot 'sparse\Scripts'
+$sparseBin = Join-Path $shimRoot 'sparse-bin'
+New-Item -ItemType Directory -Path $sparseVenv -Force | Out-Null
+Set-Content -LiteralPath (Join-Path $sparseVenv 'hermes.exe') -Value 'dummy' -Encoding ASCII
+New-HermesShims -ShimDir $sparseBin -VenvScripts $sparseVenv
+if ((Test-Path (Join-Path $sparseBin 'hermes.cmd')) -and
+    -not (Test-Path (Join-Path $sparseBin 'hermes-acp.cmd'))) {
+    Write-Host '  PASS  missing console script is skipped, not stubbed'
+} else {
+    Write-Host '  FAIL  missing console script handling'
+    $script:Failures++
+}
+
+# Empty args are a no-op.
+New-HermesShims -ShimDir '' -VenvScripts $fakeVenv
+New-HermesShims -ShimDir $fakeBin -VenvScripts ''
+Write-Host '  PASS  empty args are a no-op'
+
+Remove-Item -Recurse -Force $shimRoot -ErrorAction SilentlyContinue
 
 if ($script:Failures -gt 0) {
     Write-Host ""

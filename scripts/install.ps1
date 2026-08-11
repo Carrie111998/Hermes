@@ -2737,7 +2737,10 @@ function New-HermesShims {
         try {
             if (-not (Test-Path -LiteralPath $shim) -or
                 (Get-Content -LiteralPath $shim -Raw) -ne $content) {
-                Set-Content -LiteralPath $shim -Value $content -Encoding ASCII
+                # -NoNewline: Set-Content would otherwise append a trailing
+                # newline, making the shim bytes diverge from $content and
+                # defeating the idempotence check on the next run.
+                Set-Content -LiteralPath $shim -Value $content -Encoding ASCII -NoNewline
             }
         } catch {
             Write-Warn "Could not write shim $shim : $_"
@@ -2762,6 +2765,11 @@ function Update-UserPathForHermes {
     )
 
     if (-not $ShimDir) { return }
+
+    # Registry-sourced paths often carry a trailing backslash; normalize so
+    # the membership check below cannot miss an existing entry and prepend a
+    # duplicate (mirrors the TrimEnd on $LegacyVenvScripts).
+    $ShimDir = $ShimDir.TrimEnd('\')
 
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $items = if ($userPath) { @($userPath -split ";") } else { @() }
