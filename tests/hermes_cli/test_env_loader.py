@@ -354,8 +354,10 @@ def test_known_keys_absent_from_user_env_are_cleared(tmp_path, monkeypatch):
 
     load_hermes_dotenv(hermes_home=home)
 
-    # OPENAI_BASE_URL is defined in the profile .env → overridden to the new value
-    assert os.getenv("OPENAI_BASE_URL") == "https://profile.example/v1"
+    # OPENAI_BASE_URL is defined in the profile .env, but 12-factor precedence
+    # (#18705) means an already-set shell value wins — .env only fills keys
+    # that are absent from the environment.
+    assert os.getenv("OPENAI_BASE_URL") == "https://stale.example/v1"
     # HERMES_ACP_AUTH_METHOD and COPILOT_CLI_PATH are NOT in the profile .env → cleared
     assert "HERMES_ACP_AUTH_METHOD" not in os.environ
     assert "COPILOT_CLI_PATH" not in os.environ
@@ -380,9 +382,11 @@ def test_empty_assignment_in_user_env_is_preserved(tmp_path, monkeypatch):
 
     load_hermes_dotenv(hermes_home=home)
 
-    # KEY= in .env keeps the key (now empty string)
+    # KEY= in .env keeps the key present in the cleanup, but under 12-factor
+    # precedence (#18705) the already-set shell value wins — the empty .env
+    # assignment does not clobber it.
     assert "HERMES_ACP_AUTH_METHOD" in os.environ
-    assert os.environ["HERMES_ACP_AUTH_METHOD"] == ""
+    assert os.environ["HERMES_ACP_AUTH_METHOD"] == "cursor_login"
     # COPILOT_CLI_PATH is absent from .env → cleared
     assert "COPILOT_CLI_PATH" not in os.environ
 
@@ -407,7 +411,9 @@ def test_no_user_env_does_not_clear_anything(tmp_path, monkeypatch):
 
 def test_known_key_explicitly_set_in_user_env_is_kept(tmp_path, monkeypatch):
     """A known Hermes key that IS explicitly set in the profile .env survives
-    the cleanup (overrides the inherited value).
+    the cleanup — but under 12-factor precedence (#18705) an already-set shell
+    value wins, so the .env value only applies when the key is absent from the
+    environment.
     """
     home = tmp_path / "hermes"
     home.mkdir()
@@ -419,6 +425,24 @@ def test_known_key_explicitly_set_in_user_env_is_kept(tmp_path, monkeypatch):
 
     load_hermes_dotenv(hermes_home=home)
 
+    # Shell value wins under 12-factor precedence; the .env value is not applied.
+    assert os.getenv("HERMES_ACP_AUTH_METHOD") == "cursor_login"
+
+
+def test_known_key_set_in_user_env_applies_when_absent_from_shell(tmp_path, monkeypatch):
+    """The .env value applies when the key is NOT already set in the shell —
+    the 12-factor fill-absent contract from #18705.
+    """
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / ".env").write_text(
+        "HERMES_ACP_AUTH_METHOD=claude_code_cli\n", encoding="utf-8"
+    )
+
+    monkeypatch.delenv("HERMES_ACP_AUTH_METHOD", raising=False)
+
+    load_hermes_dotenv(hermes_home=home)
+
     assert os.getenv("HERMES_ACP_AUTH_METHOD") == "claude_code_cli"
 
 
@@ -426,7 +450,8 @@ def test_export_prefixed_known_key_in_user_env_is_kept(tmp_path, monkeypatch):
     """A known Hermes key defined with the bash-compatible ``export KEY=value``
     form in the profile .env must be recognized as defined and survive the
     cleanup - mirrors the ``export `` stripping in config.py's load_env()
-    (#6659).
+    (#6659). Under 12-factor precedence (#18705) the shell value wins when
+    present.
     """
     home = tmp_path / "hermes"
     home.mkdir()
@@ -435,7 +460,7 @@ def test_export_prefixed_known_key_in_user_env_is_kept(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HERMES_ACP_AUTH_METHOD", "cursor_login")
     load_hermes_dotenv(hermes_home=home)
-    assert os.getenv("HERMES_ACP_AUTH_METHOD") == "claude_code_cli"
+    assert os.getenv("HERMES_ACP_AUTH_METHOD") == "cursor_login"
 
 
 def test_shell_exported_credentials_survive_cleanup(tmp_path, monkeypatch):
