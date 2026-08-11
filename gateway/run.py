@@ -22002,6 +22002,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
+            is_bot=bool(getattr(context.source, "is_bot", False)),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

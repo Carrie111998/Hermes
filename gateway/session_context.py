@@ -38,7 +38,7 @@ needs to replace the import + call site:
 
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator
+from typing import Any, Iterator, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -88,6 +88,15 @@ _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=
 _SESSION_SCOPE_ID: ContextVar = ContextVar("HERMES_SESSION_SCOPE_ID", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
+# True when the current turn's inbound sender is a bot/webhook rather than a
+# human (mirrors SessionSource.is_bot). Kept out of _VAR_MAP like
+# _SESSION_ASYNC_DELIVERY below: it is a trust-relevant capability flag read
+# via session_is_bot(), not a legacy HERMES_SESSION_* string read via
+# get_session_env(), and it must default to "untrusted" rather than fall back
+# to os.environ. Consumed by gateway/tool_context.py to fail closed on a
+# bot-authored inbound message before any trusted actor is derived from it.
+_SESSION_IS_BOT: ContextVar = ContextVar("HERMES_SESSION_IS_BOT", default=_UNSET)
+
 # In-process UI session/window id for multi-session desktop/TUI hosts. This is
 # intentionally separate from HERMES_SESSION_ID: the latter is the durable
 # conversation/session-db id, while the UI id is the live frontend tab/window
@@ -229,6 +238,7 @@ def set_session_vars(
     async_delivery: bool = True,
     ui_session_id: str = "",
     cron_session: Any = _UNSET,
+    is_bot: bool = False,
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -248,6 +258,12 @@ def set_session_vars(
     ``cron_session`` is tri-state: ``_UNSET`` preserves legacy
     ``os.environ["HERMES_CRON_SESSION"]`` fallback, ``"1"`` marks a cron job,
     and ``""`` explicitly marks a non-cron session while masking leaked env.
+
+    ``is_bot`` mirrors ``SessionSource.is_bot`` — True when the inbound
+    message's author is a bot/webhook rather than a human. See
+    ``_SESSION_IS_BOT`` / ``session_is_bot`` for why this defaults to
+    "untrusted" when unset rather than falling back to this parameter's
+    default.
     """
     # Mark the session-context machinery engaged for this process. The
     # subprocess-env bridge uses this to switch from "os.environ fallback" to
@@ -271,6 +287,7 @@ def set_session_vars(
         _SESSION_PROFILE.set(profile),
         _CRON_SESSION.set(cron_session),
         _SESSION_ASYNC_DELIVERY.set(bool(async_delivery)),
+        _SESSION_IS_BOT.set(bool(is_bot)),
     ]
     try:
         from agent.runtime_cwd import set_session_cwd
@@ -315,6 +332,10 @@ def clear_session_vars(tokens: list) -> None:
     # behavior (CLI / unaware paths), not be mistaken for an opted-out
     # stateless adapter.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Reset is_bot to the "never set" sentinel, which session_is_bot() treats
+    # as untrusted — a handler that has exited must not leave behind a
+    # human-sender signal a later, unrelated read could pick up.
+    _SESSION_IS_BOT.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
@@ -363,12 +384,49 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    # Same inheritance-leak reason: an inherited is_bot=False from a sibling
+    # task's session must not survive into this task before it binds its own.
+    _SESSION_IS_BOT.set(_UNSET)
     try:
         from agent.runtime_cwd import clear_session_cwd
 
         clear_session_cwd()
     except Exception:
         pass
+
+
+def get_session_var_strict(name: str) -> Optional[str]:
+    """Read a ``HERMES_SESSION_*`` ContextVar with NO ``os.environ`` fallback.
+
+    Unlike :func:`get_session_env`, this returns ``None`` — never a value
+    borrowed from process-global environment — when the variable was never
+    bound in the current task-local context. Use this instead of
+    ``get_session_env`` wherever a same-process, differently-scoped
+    ``os.environ`` value must not be mistaken for this task's own session
+    state — e.g. deriving an authenticated identity in
+    ``gateway/tool_context.py``, where an env fallback would let a
+    CLI/cron/test process's leftover env vars masquerade as a real inbound
+    gateway message.
+    """
+    var = _VAR_MAP.get(name)
+    if var is None:
+        return None
+    value = var.get()
+    return None if value is _UNSET else value
+
+
+def session_is_bot() -> bool:
+    """Whether the current session's inbound sender is a bot/webhook.
+
+    Defaults to ``True`` (untrusted) when never explicitly bound via
+    ``set_session_vars(is_bot=...)``, so a context that hasn't been through
+    the trusted inbound-message pipeline is never mistaken for a verified
+    human sender. Never falls back to ``os.environ``.
+    """
+    value = _SESSION_IS_BOT.get()
+    if value is _UNSET:
+        return True
+    return bool(value)
 
 
 def get_session_env(name: str, default: str = "") -> str:

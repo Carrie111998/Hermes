@@ -1455,6 +1455,17 @@ def handle_function_call(
         except Exception:
             reset_current_observability_context = None
         try:
+            # Built fresh from the current task's ContextVar-bound session
+            # state (never from function_args or an env var) so a handler can
+            # accept a typed, unforgeable proof of the authenticated inbound
+            # sender. None on any non-gateway surface (CLI, API server, cron)
+            # and on any gateway session that isn't a real, non-bot Feishu
+            # inbound message. See gateway/tool_context.py.
+            try:
+                from gateway.tool_context import build_trusted_tool_invocation_context
+                _trusted_tool_context = build_trusted_tool_invocation_context()
+            except Exception:
+                _trusted_tool_context = None
             if function_name == "execute_code":
                 # Prefer the caller-provided list so subagents can't overwrite
                 # the parent's tool set via the process-global.
@@ -1465,6 +1476,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        tool_context=_trusted_tool_context,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1473,6 +1485,7 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        tool_context=_trusted_tool_context,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
