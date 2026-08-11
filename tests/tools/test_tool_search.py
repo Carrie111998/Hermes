@@ -267,6 +267,18 @@ class TestBridgeDispatch:
         # Will fail classification because unknown_xxx isn't deferrable.
         assert err is not None
 
+    def test_resolve_underlying_call_treats_empty_string_args_as_empty_object(self, monkeypatch):
+        from tools import tool_search
+
+        monkeypatch.setattr(tool_search, "is_deferrable_tool_name", lambda name: True)
+        name, args, err = tool_search.resolve_underlying_call({
+            "name": "mcp__demo__ping",
+            "arguments": "  ",
+        })
+
+        assert err is None
+        assert name == "mcp__demo__ping"
+        assert args == {}
 
     def test_resolve_underlying_call_rejects_recursion(self):
         """tool_call cannot invoke tool_call itself."""

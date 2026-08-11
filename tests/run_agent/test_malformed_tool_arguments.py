@@ -53,7 +53,6 @@ def _tool_call(call_id: str, arguments: str):
         pytest.param("not-json", id="malformed-json"),
         pytest.param('"scalar"', id="scalar"),
         pytest.param("[]", id="list"),
-        pytest.param("", id="empty"),
         pytest.param('{"query": "cut off', id="truncated"),
     ],
 )
@@ -95,3 +94,34 @@ def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(
     assert '"error": "Invalid tool arguments"' in messages[0]["content"]
     assert "JSON object" in messages[0]["content"]
     assert json.loads(messages[1]["content"]) == {"ok": "valid"}
+
+
+@pytest.mark.parametrize("dispatch_mode", ["sequential", "concurrent"])
+def test_empty_arguments_execute_as_empty_object(dispatch_mode: str):
+    agent = _make_agent()
+    assistant_message = SimpleNamespace(
+        content="",
+        tool_calls=[_tool_call("call-empty", "  ")],
+    )
+    messages = []
+    executed = []
+
+    def fake_dispatch(name, args, task_id, *positional, **kwargs):
+        call_id = kwargs.get("tool_call_id") or (positional[0] if positional else None)
+        executed.append((name, args, call_id))
+        return json.dumps({"ok": True})
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=fake_dispatch),
+        patch.object(agent, "_invoke_tool", side_effect=fake_dispatch),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
+        execute(assistant_message, messages, "task-1")
+
+    assert executed == [("web_search", {}, "call-empty")]
+    assert [message["tool_call_id"] for message in messages] == ["call-empty"]
+    assert json.loads(messages[0]["content"]) == {"ok": True}

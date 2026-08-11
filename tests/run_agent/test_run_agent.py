@@ -1867,6 +1867,24 @@ class TestConcurrentToolExecution:
         assert [m["tool_call_id"] for m in messages] == ["c1", "c2"]
         assert "tool was not executed" in messages[0]["content"].lower()
 
+    def test_concurrent_empty_string_args_execute_as_empty_object(self, agent):
+        """Models sometimes emit "" for no-argument tools; execute it as {}."""
+        tc = _mock_tool_call(name="noop_tool", arguments="   ", call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        seen_args = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            seen_args.append((name, args))
+            return json.dumps({"ok": True})
+
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert seen_args == [("noop_tool", {})]
+        assert [m["tool_call_id"] for m in messages] == ["c1"]
+        assert "invalid tool arguments" not in messages[0]["content"].lower()
+
     def test_concurrent_preserves_order_despite_timing(self, agent):
         """Even if tools finish in different order, messages should be in original order."""
         import time as _time
