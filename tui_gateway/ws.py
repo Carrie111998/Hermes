@@ -404,7 +404,7 @@ async def handle_ws(ws: Any) -> None:
                 if not ok:
                     disconnect_reason = "send_failed_after_heartbeat"
                     send_failures += 1
-                    _log.warning("ws heartbeat reply send failed peer=%s id=%s", peer, req_id)
+                    _log.warning("ws heartbeat reply send failed peer=%s", peer)
                     break
                 continue
 
