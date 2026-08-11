@@ -464,6 +464,20 @@ export function focusedSessionTabAnchor(): null | string {
   return active && isSessionStripPane(active) ? active : (group.panes.find(isSessionStripPane) ?? null)
 }
 
+/** The pane the strip actually exposes as selected. The model intentionally
+ * keeps a hidden active id so an unhide can restore it, while TreeGroup paints
+ * the first shown pane instead. Global tab actions must follow that painted
+ * selection or a hidden raw successor can consume every later shortcut. */
+function shownActivePaneInGroup(group: GroupNode | null): string | undefined {
+  if (!group) {
+    return undefined
+  }
+
+  const shown = shownPanesInGroup(group)
+
+  return shown.includes(group.active) ? group.active : shown[0]
+}
+
 /** ⌘W: close the FOCUSED tile zone's active tab, unless it's the uncloseable
  *  workspace itself. Any main-strip zone qualifies — a session stack, a lone
  *  Browser/page tile — while side chrome (files / terminal) in a zone of its
@@ -473,7 +487,7 @@ export function focusedSessionTabAnchor(): null | string {
  *  stays a no-op — it never closes the window. */
 export function closeFocusedSessionTab(recoverFocus = false): boolean {
   const group = tabTargetGroup(group => group.panes.some(isMainStripPane))
-  const active = group?.active
+  const active = shownActivePaneInGroup(group)
 
   if (!active || isUncloseablePane(active)) {
     return false
@@ -508,7 +522,7 @@ export function closeToolPane(paneId: string): PaneCloseResult {
  *  logs pane, the only tabs in the app you couldn't close from the keyboard. */
 export function closeFocusedToolTab(recoverFocus = false): boolean {
   const group = tabTargetGroup(g => g.panes.some(isCollapsePane))
-  const active = group?.active
+  const active = shownActivePaneInGroup(group)
 
   if (!active || !isCollapsePane(active)) {
     return false

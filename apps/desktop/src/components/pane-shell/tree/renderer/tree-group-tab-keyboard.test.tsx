@@ -295,8 +295,10 @@ describe('TreeGroup tab keyboard interaction', () => {
       ])
     )
     let closeCompletion: Promise<void> | undefined
+    const closeFiles = vi.fn(() => setTreePaneHidden('files', true))
 
     let finishClose = () => {}
+    registerPaneCloser('files', closeFiles)
     registerPaneCloser(
       'focused-side-b',
       () => {
@@ -333,7 +335,17 @@ describe('TreeGroup tab keyboard interaction', () => {
         expect(tabControl('focused-side-b')).toBeNull()
         expect(window.document.activeElement).toBe(tabControl('focused-side-a'))
       })
+
+      act(() => {
+        expect(closeActiveTab()).toBe(true)
+      })
+      await waitFor(() => {
+        expect(closeFiles).not.toHaveBeenCalled()
+        expect(tabControl('focused-side-a')).toBeNull()
+        expect(findGroup($layoutTree.get()!, 'grp-side')?.panes).toEqual(['files'])
+      })
     } finally {
+      act(() => registerPaneCloser('files'))
       act(() => registerPaneCloser('focused-side-b'))
     }
   })
