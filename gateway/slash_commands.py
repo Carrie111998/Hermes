@@ -2637,7 +2637,9 @@ class GatewaySlashCommandsMixin:
         """Handle /retry command - re-send the last user message."""
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
-        history = await self.async_session_store.load_transcript(session_entry.session_id)
+        history = await self.async_session_store.load_transcript(
+            session_entry.session_id, include_row_ids=True
+        )
         
         # Find the last *real* user message. Timeline bookkeeping rows carry
         # role=user + display_kind (model_switch / async_delegation_complete /
@@ -2704,6 +2706,10 @@ class GatewaySlashCommandsMixin:
                 session_entry.session_id,
                 truncated,
                 active_only=True,
+                archive_dropped=True,
+                expected_active_ids=[
+                    msg["_row_id"] for msg in history if "_row_id" in msg
+                ],
                 reject_active_turn_lease=True,
             ):
                 return "Retry failed; transcript was not changed."
