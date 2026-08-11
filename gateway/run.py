@@ -13030,6 +13030,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._systemd_watchdog = None
         await watchdog.stop()
 
+    def _schedule_shutdown_task(self) -> "asyncio.Task":
+        """Schedule ``stop()`` from a signal handler, keeping a strong reference.
+
+        Signal handlers cannot await, so the SIGINT/SIGTERM handler has to
+        schedule ``stop()`` as a task.  The event loop keeps only a *weak*
+        reference to a task, so a bare ``asyncio.create_task(self.stop())``
+        can be garbage-collected while still pending — the same hazard
+        ``request_restart()`` keeps ``self._restart_task`` to avoid on the
+        SIGUSR1 path.
+
+        ``stop()`` only becomes self-anchoring once it reaches
+        ``self._stop_task = asyncio.create_task(_stop_impl())``.  A collection
+        before that point means ``_stop_impl`` is never created at all, so the
+        gateway does not tear down: it keeps running until the service
+        manager's stop timeout escalates to SIGKILL, with in-flight turns
+        undrained and sessions never finalized.
+
+        A repeat signal must not re-point the anchor.  The handler re-enters in
+        ordinary operation — a second Ctrl+C, a SIGINT followed by the service
+        manager's SIGTERM, or ``_run_planned_stop_watcher`` driving the same
+        callable from its polling thread — and overwriting the attribute would
+        drop the only strong reference to the task performing the live
+        teardown.  Returning the in-flight task instead loses nothing:
+        ``stop()`` short-circuits on ``self._stop_task``, so a second task
+        would only have awaited the first one's work.
+
+        Returns the task that owns the shutdown, new or already running.
+        """
+        existing = self._shutdown_task
+        if existing is not None and not existing.done():
+            return existing
+        self._shutdown_task = asyncio.create_task(self.stop())
+        return self._shutdown_task
+
     async def stop(
         self,
         *,
@@ -27782,33 +27816,16 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
-        # Hold a strong reference to the shutdown task on the runner.  A bare
-        # asyncio.create_task() keeps only a weak reference, so the event loop
-        # may garbage-collect a still-pending task mid-flight — the identical
-        # hazard the SIGUSR1 restart path was hardened against (see
-        # request_restart(), which keeps self._restart_task for this reason).
-        # This path is the one every `systemctl stop`, `hermes gateway stop`
-        # and interactive Ctrl+C takes.  stop() only becomes self-anchoring
-        # once it reaches `self._stop_task = asyncio.create_task(_stop_impl())`;
-        # a collection before that point means _stop_impl is never created at
-        # all, so the gateway never tears down — it just keeps running until
-        # TimeoutStopSec escalates to SIGKILL, with in-flight turns undrained
-        # and sessions never finalized.
-        #
-        # Only re-point the anchor when the previous shutdown task has
-        # finished.  This handler runs more than once in ordinary operation:
-        # a second Ctrl+C, a SIGINT followed by the service manager's SIGTERM,
-        # or the planned-stop watcher thread racing a real signal — it calls
-        # `loop.call_soon_threadsafe(shutdown_handler, None)` and its own
-        # docstring notes that on POSIX "the signal handler always races us".
-        # Overwriting the attribute on the second call would drop the only
-        # strong reference to the task that owns the live teardown and put us
-        # straight back in the window above. Skipping the duplicate loses
-        # nothing: stop() short-circuits on `self._stop_task`, so the second
-        # task would only have awaited the first one's work.
-        _live_shutdown_task = runner._shutdown_task
-        if _live_shutdown_task is None or _live_shutdown_task.done():
-            runner._shutdown_task = asyncio.create_task(runner.stop())
+        # Schedule teardown while keeping a strong reference to the task: a
+        # bare asyncio.create_task() here leaves the event loop holding only a
+        # weak reference, so a still-pending shutdown can be garbage-collected
+        # and the gateway then never tears down at all.  This is the path every
+        # `systemctl stop`, `hermes gateway stop` and interactive Ctrl+C takes,
+        # and it re-enters (second Ctrl+C, SIGINT then SIGTERM, or the
+        # planned-stop watcher thread racing a real signal), so the anchor must
+        # not be re-pointed while a shutdown is still in flight.  See
+        # GatewayRunner._schedule_shutdown_task.
+        runner._schedule_shutdown_task()
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)
