@@ -11,7 +11,7 @@ prompt-assembly path — `cron.jobs.create_job()` + `cron.scheduler._build_job_p
 against a REAL profile's skill tree — so composition findings reflect actual
 production behavior, not a re-implementation that could silently drift from it.
 
-Two safety boundaries, both load-bearing — do not remove either:
+Three safety boundaries, all load-bearing — do not remove any:
 
 1. **Job/output state is redirected to a disposable temp directory** via
    `isolated_cron_state()`. This harness never reads or writes a real
@@ -20,6 +20,27 @@ Two safety boundaries, both load-bearing — do not remove either:
    model would see — this is the "prompt-composition proof" deliverable for
    Phase 3, Packet 2, and it is safe to run at will (no API spend, no risk of
    a real Telegram send).
+3. **Session-transcript persistence is redirected to the same disposable temp
+   directory**, inside `run_live_case()`. Found necessary the hard way: the
+   first live Packet 3 run wrote 41 real `session_*.json` files into the real
+   `profiles/ops-repair/sessions/` directory before this fix existed, because
+   `AIAgent.__init__` unconditionally creates `self.logs_dir =
+   get_hermes_home() / "sessions"` (run_agent.py:1676-1679) with **no
+   constructor parameter to disable it** — a write path entirely separate
+   from the `session_db`/SQLite mechanism (inert here since `session_db` is
+   never passed) and from `enabled_toolsets`/`skip_memory`. Zero tool access
+   is NOT sufficient isolation on its own — `AIAgent.__init__` itself has a
+   filesystem side effect regardless of what tools the model can call.
+   `run_live_case()` patches `run_agent.get_hermes_home` to the same tmp root
+   `isolated_cron_state()` already provides, scoped to each construction +
+   `run_conversation()` call, and asserts `agent.logs_dir` actually resolved
+   under that tmp root before proceeding — a hard runtime check, not an
+   assumption. Those 41 pre-fix files were NOT deleted (operator decision,
+   2026-08-11): they're gitignored ephemeral runtime artifacts (same
+   `.gitignore` category as `cron/output/`), fully attributed to this
+   harness's own Packet 3 calls, left in place. See
+   `EXPERIMENT-GENERATED EPHEMERAL RUNTIME ARTIFACTS` in the Phase 3 plan
+   for the full accounting.
 
 `run_live_case()` (Packet 3) is now wired up, gated behind `verify_tool_isolation()`
 — a HARD precondition, checked from actual constructed-object state, not
@@ -483,45 +504,62 @@ def run_live_case(case: PrecedenceCase, profile: str, n_runs: int, *, skills_ove
         print(json.dumps(check, indent=2))
         raise RuntimeError(BLOCKED_SENTINEL)
 
+    from unittest.mock import patch as _mock_patch
+
+    import run_agent
     from run_agent import AIAgent
     from toolsets import get_toolset_names
 
     rt = _resolve_experiment_runtime(profile)
     skills = case.skills if skills_override is None else skills_override
-    with isolated_cron_state(profile):
+    with isolated_cron_state(profile) as tmp:
         assembled = assemble_prompt(PrecedenceCase(case.key, case.description, case.prompt, skills))
         prompt_text = assembled["prompt"]
         prompt_hash = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()[:16]
 
         results = []
         for rep in range(1, n_runs + 1):
-            agent = AIAgent(
-                model=rt["model"],
-                api_key=rt["api_key"],
-                base_url=rt["base_url"],
-                provider=rt["provider"],
-                api_mode=rt["api_mode"],
-                enabled_toolsets=[],
-                disabled_toolsets=get_toolset_names(),
-                skip_memory=True,
-                skip_context_files=True,
-                quiet_mode=True,
-                platform="cron",
-                load_soul_identity=True,
-            )
-            # Re-verify on THIS instance too — cheap, and closes any gap
-            # between the pre-check instance and the one actually used.
-            live_tool_names = sorted(t.get("function", {}).get("name") for t in (agent.tools or []))
-            live_ctx_names = sorted(
-                s.get("name", "<unnamed>")
-                for s in (agent.context_compressor.get_tool_schemas() or [])
-                if isinstance(s, dict)
-            )
-            if live_tool_names or live_ctx_names:
-                print(BLOCKED_SENTINEL)
-                raise RuntimeError(BLOCKED_SENTINEL)
+            # AIAgent.__init__ unconditionally writes a session transcript
+            # under get_hermes_home()/sessions with NO constructor opt-out
+            # (run_agent.py:1676-1679) — a write path distinct from the
+            # session_db/SQLite mechanism (never passed here, so already
+            # inert) and discovered live during the first Packet 3 run,
+            # where it wrote 41 files into the REAL profile's sessions/
+            # directory. Redirect it to the same disposable tmp root used
+            # for cron job/output state, for the scope of construction +
+            # run_conversation only.
+            with _mock_patch.object(run_agent, "get_hermes_home", lambda: tmp):
+                agent = AIAgent(
+                    model=rt["model"],
+                    api_key=rt["api_key"],
+                    base_url=rt["base_url"],
+                    provider=rt["provider"],
+                    api_mode=rt["api_mode"],
+                    enabled_toolsets=[],
+                    disabled_toolsets=get_toolset_names(),
+                    skip_memory=True,
+                    skip_context_files=True,
+                    quiet_mode=True,
+                    platform="cron",
+                    load_soul_identity=True,
+                )
+                assert str(agent.logs_dir).startswith(str(tmp)), (
+                    f"session logs_dir not redirected: {agent.logs_dir}"
+                )
 
-            call_result = agent.run_conversation(prompt_text)
+                # Re-verify on THIS instance too — cheap, and closes any gap
+                # between the pre-check instance and the one actually used.
+                live_tool_names = sorted(t.get("function", {}).get("name") for t in (agent.tools or []))
+                live_ctx_names = sorted(
+                    s.get("name", "<unnamed>")
+                    for s in (agent.context_compressor.get_tool_schemas() or [])
+                    if isinstance(s, dict)
+                )
+                if live_tool_names or live_ctx_names:
+                    print(BLOCKED_SENTINEL)
+                    raise RuntimeError(BLOCKED_SENTINEL)
+
+                call_result = agent.run_conversation(prompt_text)
             raw_response = call_result.get("final_response", "") if isinstance(call_result, dict) else str(call_result)
 
             results.append({
