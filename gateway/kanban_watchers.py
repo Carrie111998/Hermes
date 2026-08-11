@@ -1220,7 +1220,9 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _tick_once_for_board(
+            slug: str, sweep_capacity=None,
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1271,6 +1273,7 @@ class GatewayKanbanWatchersMixin:
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
+                    sweep_capacity=sweep_capacity,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1321,9 +1324,14 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+            slugs = [b.get("slug") or _kb.DEFAULT_BOARD for b in boards]
+            sweep_capacity = _kb.DispatchSweepCapacity(
+                slugs,
+                max_in_progress=max_in_progress,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+            )
+            for slug in slugs:
+                out.append((slug, _tick_once_for_board(slug, sweep_capacity)))
             return out
 
         def _ready_nonempty() -> bool:
