@@ -850,6 +850,34 @@ app.get('/messages', (req, res) => {
   return res.json(messages);
 });
 
+// Lease one named-consumer message. Existing destructive polling remains
+// available for the gateway and legacy consumers.
+app.get('/messages/lease', (req, res) => {
+  const consumer = normalizeConsumerId(req.query.consumer);
+  const leaseMs = Math.min(3600000, Math.max(10000, Number(req.query.leaseMs) || 60000));
+  if (!consumer || consumer === 'default') {
+    return res.status(400).json({ error: 'A named consumer is required' });
+  }
+  const deliveries = messageConsumers.lease(consumer, leaseMs, 1);
+  if (deliveries === null) {
+    return res.status(404).json({ error: 'Consumer is not configured' });
+  }
+  return res.json(deliveries);
+});
+
+app.post('/messages/ack', (req, res) => {
+  const consumer = normalizeConsumerId(req.body?.consumer);
+  const deliveryId = typeof req.body?.deliveryId === 'string' ? req.body.deliveryId : '';
+  if (!consumer || consumer === 'default' || !deliveryId) {
+    return res.status(400).json({ error: 'consumer and deliveryId are required' });
+  }
+  const acknowledged = messageConsumers.ack(consumer, deliveryId);
+  if (acknowledged === null) {
+    return res.status(404).json({ error: 'Consumer is not configured' });
+  }
+  return res.json({ success: true, acknowledged });
+});
+
 // Send a message
 app.post('/send', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
