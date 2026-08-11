@@ -1380,6 +1380,15 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
+    # Third-party Anthropic-compatible endpoints use provider API keys, not
+    # local Claude Code OAuth credentials. If ANTHROPIC_BASE_URL points away
+    # from Anthropic and ANTHROPIC_API_KEY is set, prefer it before reading
+    # ~/.claude credentials.
+    base_url = os.getenv("ANTHROPIC_BASE_URL", "").strip()
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if base_url and "anthropic.com" not in base_url.lower() and api_key:
+        return api_key
+
     creds: Optional[Dict[str, Any]] = None
     creds_loaded = False
 

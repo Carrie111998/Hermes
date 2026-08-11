@@ -5867,10 +5867,12 @@ class AIAgent:
         # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
         if self.provider != "anthropic":
             return False
-        # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
-        # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
+        # Third-party Anthropic-compatible endpoints use static provider API keys —
+        # OAuth token rotation doesn't apply. Refreshing would pick up
+        # ~/.claude/.credentials.json OAuth tokens and break auth (for example
+        # api.oneprovider.dev must keep using the configured API key).
         _base = getattr(self, "_anthropic_base_url", "") or ""
-        if "azure.com" in _base:
+        if _base and "anthropic.com" not in _base:
             return False
 
         try:

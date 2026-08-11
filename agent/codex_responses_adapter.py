@@ -1184,6 +1184,16 @@ def _extract_responses_message_text(item: Any) -> str:
     return "".join(chunks).strip()
 
 
+def _safe_response_output_text(response: Any) -> str:
+    """Read response.output_text without letting SDK convenience accessors crash."""
+    try:
+        out_text = getattr(response, "output_text", None)
+    except Exception as exc:
+        logger.debug("Codex response.output_text access failed: %s", exc)
+        return ""
+    return out_text.strip() if isinstance(out_text, str) else ""
+
+
 def _extract_responses_reasoning_text(item: Any) -> str:
     """Extract a compact reasoning text from a Responses reasoning item."""
     summary = getattr(item, "summary", None)
@@ -1280,15 +1290,15 @@ def _normalize_codex_response(
         # The Codex backend can return empty output when the answer was
         # delivered entirely via stream events. Check output_text as a
         # last-resort fallback before raising.
-        out_text = getattr(response, "output_text", None)
-        if isinstance(out_text, str) and out_text.strip():
+        out_text = _safe_response_output_text(response)
+        if out_text:
             logger.debug(
                 "Codex response has empty output but output_text is present (%d chars); "
-                "synthesizing output item.", len(out_text.strip()),
+                "synthesizing output item.", len(out_text),
             )
             output = [SimpleNamespace(
                 type="message", role="assistant", status="completed",
-                content=[SimpleNamespace(type="output_text", text=out_text.strip())],
+                content=[SimpleNamespace(type="output_text", text=out_text)],
             )]
             response.output = output
         elif response_incomplete_content_filter:
