@@ -104,6 +104,81 @@ def test_create_rejects_blank_or_placeholder_body_before_db_write(
         assert kb.list_tasks(conn, limit=10) == []
 
 
+def test_long_body_survives_python_argv_db_dispatch_worker_and_monitor(
+    kanban_home,
+    all_assignees_spawnable,
+):
+    """One real card keeps one exact brief through every live read boundary."""
+    body = "\n".join(
+        f"Acceptance line {index:03d}: preserve this exact multiline instruction."
+        for index in range(120)
+    )
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban",
+        "create",
+        "full task body end-to-end",
+        "--body",
+        body,
+        "--assignee",
+        "stark",
+    ])
+
+    assert kc.kanban_command(args) == 0
+    with kb.connect_closing() as conn:
+        task = next(
+            row
+            for row in kb.list_tasks(conn, limit=100)
+            if row.title == "full task body end-to-end"
+        )
+        task_id = task.id
+        assert task.body == body
+
+    captured = {}
+
+    def spawn(claimed, workspace, board=None):
+        captured["claim_body"] = claimed.body
+        captured["workspace"] = workspace
+        return None
+
+    with kb.connect_closing() as conn:
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=spawn,
+            reconcile_orphans=False,
+        )
+        claimed = kb.get_task(conn, task_id)
+        worker_context = kb.build_worker_context(conn, task_id)
+
+    assert task_id in [row[0] for row in result.spawned]
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.body == body
+    assert captured["claim_body"] == body
+    assert Path(captured["workspace"]).is_dir()
+    assert body in worker_context
+
+    human_show = kc.run_slash(f"show {task_id}")
+    assert "Body:\n" + body in human_show
+
+    from plugins.kanban.dashboard import plugin_api
+
+    monitor_detail = plugin_api.get_task(
+        task_id,
+        board=None,
+        run_state_type=None,
+        run_state_name=None,
+    )
+    assert monitor_detail["task"]["body"] == body
+
+    with kb.connect_closing() as conn:
+        assert kb.delete_task(conn, task_id) is True
+        assert kb.get_task(conn, task_id) is None
+
+
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):
     kb.create_board("alpha")
     kb.create_board("beta")

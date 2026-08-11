@@ -117,6 +117,47 @@ def test_create_task_appears_on_board(client):
     assert "researcher" in data["assignees"]
 
 
+@pytest.mark.parametrize(
+    "body",
+    [None, "", "   ", "-", "--", "placeholder", "n/a", "tbd", "."],
+)
+def test_create_task_rejects_missing_blank_and_placeholder_bodies(client, body):
+    payload = {"title": "invalid body must not persist", "body": body}
+
+    response = client.post("/api/plugins/kanban/tasks", json=payload)
+
+    assert response.status_code == 400
+    assert "refusing to create" in response.json()["detail"]
+    with kb.connect_closing() as conn:
+        assert all(
+            task.title != payload["title"]
+            for task in kb.list_tasks(conn, limit=100)
+        )
+
+
+def test_create_task_preserves_long_multiline_body_in_monitor_detail(client):
+    body = "\n".join(
+        f"Step {index:03d}: verify the exact task brief survives every layer."
+        for index in range(120)
+    )
+
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "long body API regression", "body": body},
+    )
+
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+    assert created.json()["task"]["body"] == body
+    with kb.connect_closing() as conn:
+        stored = kb.get_task(conn, task_id)
+        assert stored is not None
+        assert stored.body == body
+    monitor = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert monitor.status_code == 200, monitor.text
+    assert monitor.json()["task"]["body"] == body
+
+
 def test_patch_board_sets_project_directory(client, tmp_path):
     """Board-level default_workdir must be editable after creation."""
     kb.create_board("late-config")
