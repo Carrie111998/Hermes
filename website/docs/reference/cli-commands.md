@@ -607,7 +607,7 @@ Multi-profile, multi-project collaboration board. Each install can host many boa
 | `boards show` / `boards current` | Print the currently-active board's name, DB path, and task counts. |
 | `boards rename <slug> "<name>"` | Change a board's display name. Slug is immutable. |
 | `boards rm <slug>` | Archive (default) or hard-delete a board. `--delete` skips the archive step. Archived boards move to `boards/_archived/<slug>-<ts>/`. Refused for `default`. |
-| `create "<title>"` | Create a new task on the active board. Flags: `--body`, `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--triage`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
+| `create "<title>"` | Create a new task on the active board. `--body <brief>` is required unless `--triage` is used; `--body -` reads a multiline brief from stdin. Blank and placeholder bodies are rejected. Other flags: `--assignee`, `--parent` (repeatable), `--workspace scratch\|worktree\|dir:<path>`, `--tenant`, `--priority`, `--idempotency-key`, `--max-runtime`, `--max-retries`, `--skill` (repeatable). |
 | `list` / `ls` | List tasks on the active board. Filter with `--mine`, `--assignee`, `--status`, `--tenant`, `--archived`, `--json`. |
 | `show <id>` | Show a task with comments and events. `--json` for machine output. |
 | `assign <id> <profile>` | Assign or reassign. Use `none` to unassign. Refused while task is running. |
@@ -635,7 +635,8 @@ Examples:
 ```bash
 # Create a second board and put a task on it without switching away.
 hermes kanban boards create atm10-server --name "ATM10 Server" --icon 🎮
-hermes kanban --board atm10-server create "Restart server" --assignee ops
+hermes kanban --board atm10-server create "Restart server" --assignee ops \
+    --body "Restart the ATM server and verify players can reconnect."
 
 # Switch the active board for subsequent calls.
 hermes kanban boards switch atm10-server

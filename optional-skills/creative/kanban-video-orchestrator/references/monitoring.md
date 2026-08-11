@@ -75,6 +75,7 @@ hermes kanban comment <renderer-task-id> "Scene 3 looks too sparse \
 hermes kanban create "Scene 3 — re-render with feedback" \
     --assignee renderer-ascii \
     --parent <renderer-task-id> \
+    --body "Re-render Scene 3 with denser visuals and the approved brand palette; address the parent feedback." \
     --workspace dir:"$HOME/projects/video-pipeline/<slug>" \
     --tenant <slug> \
     --skill ascii-video \
@@ -90,6 +91,7 @@ file):
 # 1. Create the new task and capture its id
 NEW_TASK_ID=$(hermes kanban create "Generate SRT captions from voiceover" \
     --assignee captioner \
+    --body "Generate time-aligned SRT captions from the final voiceover and verify the timestamps." \
     --workspace dir:"$HOME/projects/video-pipeline/<slug>" \
     --tenant <slug> \
     --json | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")

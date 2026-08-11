@@ -404,7 +404,7 @@ hermes kanban [--board <slug>] <action> [options]
 | `boards show` / `boards current` | 打印当前活跃看板的名称、数据库路径和任务数量。 |
 | `boards rename <slug> "<name>"` | 更改看板的显示名称。Slug 不可变。 |
 | `boards rm <slug>` | 归档（默认）或硬删除看板。`--delete` 跳过归档步骤。已归档看板移至 `boards/_archived/<slug>-<ts>/`。`default` 看板拒绝此操作。 |
-| `create "<title>"` | 在活跃看板上创建新任务。标志：`--body`、`--assignee`、`--parent`（可重复）、`--workspace scratch\|worktree\|dir:<path>`、`--tenant`、`--priority`、`--triage`、`--idempotency-key`、`--max-runtime`、`--max-retries`、`--skill`（可重复）。 |
+| `create "<title>"` | 在活跃看板上创建新任务。必须提供 `--body <brief>`，除非使用 `--triage`；`--body -` 从 stdin 读取多行说明。空白和占位正文会被拒绝。其他标志：`--assignee`、`--parent`（可重复）、`--workspace scratch\|worktree\|dir:<path>`、`--tenant`、`--priority`、`--idempotency-key`、`--max-runtime`、`--max-retries`、`--skill`（可重复）。 |
 | `list` / `ls` | 列出活跃看板上的任务。可用 `--mine`、`--assignee`、`--status`、`--tenant`、`--archived`、`--json` 过滤。 |
 | `show <id>` | 显示任务及其评论和事件。`--json` 用于机器输出。 |
 | `assign <id> <profile>` | 分配或重新分配。使用 `none` 取消分配。任务运行时拒绝此操作。 |
@@ -429,7 +429,8 @@ hermes kanban [--board <slug>] <action> [options]
 ```bash
 # 创建第二个看板并在不切换的情况下向其添加任务。
 hermes kanban boards create atm10-server --name "ATM10 Server" --icon 🎮
-hermes kanban --board atm10-server create "Restart server" --assignee ops
+hermes kanban --board atm10-server create "Restart server" --assignee ops \
+    --body "重启 ATM 服务器，并验证玩家可以重新连接。"
 
 # 切换活跃看板以供后续调用使用。
 hermes kanban boards switch atm10-server

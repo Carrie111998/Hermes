@@ -55,7 +55,7 @@ Hermes Kanban 是一个持久化任务看板，在所有 Hermes 配置文件之�
 ## 核心概念
 
 - **Board（看板）** —— 一个独立的任务队列，拥有自己的 SQLite DB、工作区目录和调度器循环。单次安装可以有多个看板（例如每个项目、仓库或领域一个）；详见下方[看板（多项目）](#boards-multi-project)。单项目用户保持使用 `default` 看板，在本文档章节之外不会看到"board"这个词。
-- **Task（任务）** —— 包含标题、可选正文、一个受让人（配置文件名称）、状态（`triage | todo | ready | running | blocked | review | done | archived`）、可选租户命名空间、可选幂等键（用于重试自动化的去重）的一行记录。
+- **Task（任务）** —— 包含标题、实质性工作正文、一个受让人（配置文件名称）、状态（`triage | todo | ready | running | blocked | review | done | archived`）、可选租户命名空间、可选幂等键（用于重试自动化的去重）的一行记录。只有明确使用 `triage`、等待 specifier 在分派前补写正文时，才可省略正文。
 - **Link（链接）** —— `task_links` 行，记录父 → 子依赖关系。当所有父任务变为 `done` 时，调度器将 `todo → ready`。
 - **Comment（评论）** —— agent 间协议。Agent 和人类追加评论；当 worker 被（重新）启动时，它将完整的评论线程作为上下文的一部分读取。
 - **Workspace（工作区）** —— worker 操作的目录。三种类型：
@@ -91,7 +91,8 @@ hermes kanban boards create atm10-server \
 
 # 在不切换的情况下操作特定看板。
 hermes kanban --board atm10-server list
-hermes kanban --board atm10-server create "Restart ATM server" --assignee ops
+hermes kanban --board atm10-server create "Restart ATM server" --assignee ops \
+    --body "重启 ATM 服务器，并验证玩家可以重新连接。"
 
 # 更改后续调用的"当前"看板。
 hermes kanban boards switch atm10-server
@@ -140,7 +141,8 @@ hermes kanban init
 hermes gateway start
 
 # 3. 创建任务（你 —— 或编排器 agent 通过 kanban_create）
-hermes kanban create "research AI funding landscape" --assignee researcher
+hermes kanban create "research AI funding landscape" --assignee researcher \
+    --body "汇总本季度公布的十笔最大 AI 融资，并附来源。"
 
 # 4. 实时查看活动（你）
 hermes kanban watch
@@ -176,6 +178,7 @@ kanban:
 # 返回现有任务 id 而不是重复创建。
 hermes kanban create "nightly ops review" \
     --assignee ops \
+    --body "检查夜间告警，列出活动事故以及每项事故的下一位负责人。" \
     --idempotency-key "nightly-ops-$(date -u +%Y-%m-%d)" \
     --json
 ```
@@ -205,7 +208,7 @@ hermes kanban block    t_abc "need input" --ids t_def t_hij
 | `kanban_block` | 以 `reason` 上报需要人工输入。 | `reason` |
 | `kanban_heartbeat` | 在长时间操作期间发出存活信号。纯副作用。 | — |
 | `kanban_comment` | 向任务线程追加持久化备注。 | `task_id`、`body` |
-| `kanban_create` | （编排器）将任务扇出为带有 `assignee`、可选 `parents`、`skills` 等的子任务。 | `title`、`assignee` |
+| `kanban_create` | （编排器）将任务扇出为带有 `assignee`、实质性 `body`、可选 `parents`、`skills` 等的子任务。只有 `triage=true` 时可省略正文。 | `title`、`body`、`assignee` |
 | `kanban_link` | （编排器）事后添加 `parent_id → child_id` 依赖边。 | `parent_id`、`child_id` |
 | `kanban_unblock` | （编排器）将阻塞任务恢复到来源阶段（`review` 或 `ready`）；父任务仍开放时进入 `todo`。 | `task_id` |
 
@@ -233,7 +236,7 @@ kanban_create(
     body="focus on seed + series A, North America, AI-adjacent",
 )
 # → 返回 {"task_id": "t_r1", ...}
-kanban_create(title="research ICP funding — EU angle", assignee="researcher-b", body="…")
+kanban_create(title="research ICP funding — EU angle", assignee="researcher-b", body="聚焦欧洲 2024-2026 年的种子轮和 A 轮 AI 相邻公司，并附来源。")
 # → 返回 {"task_id": "t_r2", ...}
 kanban_create(
     title="synthesize findings into launch brief",
@@ -304,12 +307,14 @@ kanban_complete(summary="decomposed into 2 research tasks + 1 writer; linked dep
 ```
 kanban_create(
     title="translate README to Japanese",
+    body="将 README.md 翻译成日语，不要更改代码示例或链接。",
     assignee="linguist",
     skills=["translation"],
 )
 
 kanban_create(
     title="audit auth flow",
+    body="审计认证流程中的可利用安全缺陷，并提供文件和行号证据。",
     assignee="reviewer",
     skills=["security-pr-audit", "github-code-review"],
 )
@@ -320,10 +325,12 @@ kanban_create(
 ```bash
 hermes kanban create "translate README to Japanese" \
     --assignee linguist \
+    --body "将 README.md 翻译成日语，不要更改代码示例或链接。" \
     --skill translation
 
 hermes kanban create "audit auth flow" \
     --assignee reviewer \
+    --body "审计认证流程中的可利用安全缺陷，并提供文件和行号证据。" \
     --skill security-pr-audit \
     --skill github-code-review
 ```
@@ -360,8 +367,8 @@ model:
 
 ```
 # 来自用户的目标："draft a launch post on the ICP funding landscape"
-kanban_create(title="research ICP funding, NA angle",  assignee="researcher-a", body="…")  # → t_r1
-kanban_create(title="research ICP funding, EU angle",  assignee="researcher-b", body="…")  # → t_r2
+kanban_create(title="research ICP funding, NA angle",  assignee="researcher-a", body="研究北美 2024-2026 年种子轮和 A 轮 AI 相邻公司，并附来源。")  # → t_r1
+kanban_create(title="research ICP funding, EU angle",  assignee="researcher-b", body="研究欧洲 2024-2026 年种子轮和 A 轮 AI 相邻公司，并附来源。")  # → t_r2
 kanban_create(
     title="synthesize ICP funding research into launch post draft",
     assignee="writer",
@@ -540,7 +547,7 @@ GUI 是刻意精简的。插件所做的一切都可以从 CLI 访问；插件�
 
 ```
 hermes kanban init                                     # 创建 kanban.db + 打印守护进程提示
-hermes kanban create "<title>" [--body ...] [--assignee <profile>]
+hermes kanban create "<title>" (--body <brief> | --triage) [--assignee <profile>]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
                                 [--branch <name>]
@@ -602,7 +609,7 @@ hermes kanban gc [--event-retention-days N]            # 工作区 + 旧事件 +
 ```
 /kanban list
 /kanban show t_abcd
-/kanban create "write launch post" --assignee writer --parent t_research
+/kanban create "write launch post" --assignee writer --parent t_research --body "根据研究交接撰写 300 字发布帖，仅使用已批准的声明。"
 /kanban comment t_abcd "looks good, ship it"
 /kanban unblock t_abcd
 /kanban dispatch --max 3
@@ -627,7 +634,7 @@ Gateway 通常在 agent 仍在思考时将斜杠命令和用户消息排队 —�
 当你从 gateway 使用 `/kanban create "…"` 创建任务时，发起聊天（平台 + 聊天 id + 线程 id）会自动订阅该任务的终端事件（`completed`、`blocked`、`gave_up`、`crashed`、`timed_out`）。每个终端事件你会收到一条消息回复 —— 包括 `completed` 时 worker 结果摘要的第一行 —— 无需轮询或记住任务 id。
 
 ```
-you> /kanban create "transcribe today's podcast" --assignee transcriber
+you> /kanban create "transcribe today's podcast" --assignee transcriber --body "逐字转录所附节目，并标出演讲者和行动项。"
 bot> Created t_9fc1a3  (ready, assignee=transcriber)
      (subscribed — you'll be notified when t_9fc1a3 completes or blocks)
 
@@ -721,6 +728,7 @@ hotspot: hermes_cli/kanban_db.py — 本轮对 dispatch 循环的第三次冲突
 hermes kanban create "monthly report" \
     --assignee researcher \
     --tenant business-a \
+    --body "从租户数据目录生成月度 KPI 报告，并注明每个来源文件。" \
     --workspace dir:~/tenants/business-a/data/
 ```
 

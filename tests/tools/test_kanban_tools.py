@@ -638,6 +638,16 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_never_prescribes_bodyless_create():
+    """Injected worker guidance must match the create-time body contract."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "kanban_create(title=..., body=" in KANBAN_GUIDANCE
+    assert "Every `kanban_create` call must include a substantive `body`" in KANBAN_GUIDANCE
+    assert "use `triage=True` only" in KANBAN_GUIDANCE
+    assert "kanban_create(title=..., assignee=" not in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------

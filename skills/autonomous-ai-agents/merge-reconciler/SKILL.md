@@ -51,9 +51,10 @@ repo: load the skill, then follow the Procedure top to bottom.
 - Kanban-native: create a reconciliation card assigned to a **third profile**
   (not either worker's profile) with BOTH conflicted cards linked as parents —
   `kanban_create(title="reconcile branch-a x branch-b", assignee="reconciler",
-  parents=["t_a", "t_b"])`. The parent links carry both sides' completion
-  summaries into the reconciler's context automatically; the card body should
-  name the repo path and the two branches.
+  body="Repo: /path/to/repo. Reconcile branch-a with branch-b; preserve both
+  parent intents and run the project test suite.", parents=["t_a", "t_b"])`.
+  The parent links carry both sides' completion summaries into the reconciler's
+  context automatically.
 
 ## Quick Reference
 

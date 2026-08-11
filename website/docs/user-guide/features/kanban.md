@@ -59,7 +59,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Task** — a row with title, a substantive work brief in `body`, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation). The body may be omitted only when the task is deliberately created in `triage` for a specifier to write it before dispatch.
 - **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
@@ -103,7 +103,8 @@ hermes kanban boards create atm10-server \
 
 # Operate on a specific board without switching.
 hermes kanban --board atm10-server list
-hermes kanban --board atm10-server create "Restart ATM server" --assignee ops
+hermes kanban --board atm10-server create "Restart ATM server" --assignee ops \
+    --body "Restart the ATM server and verify players can reconnect."
 
 # Change which board is "current" for subsequent calls.
 hermes kanban boards switch atm10-server
@@ -203,7 +204,8 @@ hermes kanban init
 hermes gateway start
 
 # 3. Create a task (you — or an orchestrator agent via kanban_create)
-hermes kanban create "research AI funding landscape" --assignee researcher
+hermes kanban create "research AI funding landscape" --assignee researcher \
+    --body "Summarize the ten largest AI funding rounds announced this quarter with sources."
 
 # 4. Watch activity live (you)
 hermes kanban watch
@@ -252,6 +254,7 @@ a gateway-embedded dispatcher AND a standalone daemon against the same
 # returns the existing task id instead of duplicating.
 hermes kanban create "nightly ops review" \
     --assignee ops \
+    --body "Review overnight alerts, name active incidents, and list the next owner action." \
     --idempotency-key "nightly-ops-$(date -u +%Y-%m-%d)" \
     --json
 ```
@@ -305,7 +308,7 @@ parent, missing input, unmet capability) before unblocking, or raise
 | `kanban_attach` | Attach a file to a task by passing its bytes inline (base64); stored under the task's attachments dir (25 MB cap). | file bytes + name |
 | `kanban_attach_url` | Attach a file to a task by URL. | `url` |
 | `kanban_attachments` | List a task's attachments. | — |
-| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, optional `parents`, `skills`, etc. | `title`, `assignee` |
+| `kanban_create` | (Orchestrators) fan out into child tasks with an `assignee`, substantive `body`, optional `parents`, `skills`, etc. Only `triage=true` may omit the body. | `title`, `body`, `assignee` |
 | `kanban_link` | (Orchestrators) add a `parent_id → child_id` dependency edge after the fact. | `parent_id`, `child_id` |
 | `kanban_unblock` | (Orchestrators) restore a blocked task to its source phase (`review` or `ready`), or `todo` while a parent remains open. | `task_id` |
 
@@ -333,7 +336,7 @@ kanban_create(
     body="focus on seed + series A, North America, AI-adjacent",
 )
 # → returns {"task_id": "t_r1", ...}
-kanban_create(title="research ICP funding — EU angle", assignee="researcher-b", body="…")
+kanban_create(title="research ICP funding — EU angle", assignee="researcher-b", body="focus on 2024-2026 EU seed and series A AI-adjacent companies; cite sources")
 # → returns {"task_id": "t_r2", ...}
 kanban_create(
     title="synthesize findings into launch brief",
@@ -435,12 +438,14 @@ Sometimes a single task needs specialist context the assignee profile doesn't ca
 ```
 kanban_create(
     title="translate README to Japanese",
+    body="Translate README.md to Japanese without changing code examples or links.",
     assignee="linguist",
     skills=["translation"],
 )
 
 kanban_create(
     title="audit auth flow",
+    body="Audit the authentication flow for exploitable defects with file/line evidence.",
     assignee="reviewer",
     skills=["security-pr-audit", "github-code-review"],
 )
@@ -451,10 +456,12 @@ kanban_create(
 ```bash
 hermes kanban create "translate README to Japanese" \
     --assignee linguist \
+    --body "Translate README.md to Japanese without changing code examples or links." \
     --skill translation
 
 hermes kanban create "audit auth flow" \
     --assignee reviewer \
+    --body "Audit the authentication flow for exploitable security defects and cite file/line evidence." \
     --skill security-pr-audit \
     --skill github-code-review
 ```
@@ -470,6 +477,7 @@ Pin a task's worker to a specific model (and optionally provider), independent o
 ```bash
 # At creation
 hermes kanban create "hard refactor" --assignee coder \
+    --body "Refactor the named module without changing its public behavior; run its focused tests." \
     --model claude-opus-4.6 --provider anthropic
 
 # Or later — takes effect on the next dispatch
@@ -536,8 +544,8 @@ A canonical orchestrator turn (two parallel researchers handing off to a writer)
 
 ```
 # Goal from user: "draft a launch post on the ICP funding landscape"
-kanban_create(title="research ICP funding, NA angle",  assignee="researcher-a", body="…")  # → t_r1
-kanban_create(title="research ICP funding, EU angle",  assignee="researcher-b", body="…")  # → t_r2
+kanban_create(title="research ICP funding, NA angle",  assignee="researcher-a", body="research 2024-2026 North American seed and series A AI-adjacent companies; cite sources")  # → t_r1
+kanban_create(title="research ICP funding, EU angle",  assignee="researcher-b", body="research 2024-2026 European seed and series A AI-adjacent companies; cite sources")  # → t_r2
 kanban_create(
     title="synthesize ICP funding research into launch post draft",
     assignee="writer",
@@ -718,7 +726,7 @@ This is the surface **you** (or scripts, cron, the dashboard) use to drive the b
 
 ```
 hermes kanban init                                     # create kanban.db + print daemon hint
-hermes kanban create "<title>" [--body ...] [--assignee <profile>]
+hermes kanban create "<title>" (--body <brief> | --triage) [--assignee <profile>]
                                 [--parent <id>]... [--tenant <name>]
                                 [--workspace scratch|worktree|worktree:<path>|dir:<path>]
                                 [--branch <name>]
@@ -805,7 +813,8 @@ Set `scheduled_at` on a task to delay dispatch until a specific time. The dispat
 
 ```bash
 hermes kanban create "nightly backup audit" \
-  --assignee ops --scheduled-at "2026-06-01T03:00:00Z"
+  --assignee ops --scheduled-at "2026-06-01T03:00:00Z" \
+  --body "Verify the latest backup, restore a sample, and report age plus integrity."
 ```
 
 ### Respawn guard
@@ -848,7 +857,7 @@ Every `hermes kanban <action>` verb is also reachable as `/kanban <action>` — 
 ```
 /kanban list
 /kanban show t_abcd
-/kanban create "write launch post" --assignee writer --parent t_research
+/kanban create "write launch post" --assignee writer --parent t_research --body "Use the research handoff to draft a 300-word launch post with the approved claims."
 /kanban comment t_abcd "looks good, ship it"
 /kanban unblock t_abcd
 /kanban dispatch --max 3
@@ -873,7 +882,7 @@ This is the whole point of the separation:
 When you create a task from the gateway with `/kanban create "…"`, the originating chat (platform + chat id + thread id) is automatically subscribed to that task's terminal events (`completed`, `blocked`, `gave_up`, `crashed`, `timed_out`). You'll get one message back per terminal event — including the first line of the worker's result summary on `completed` — without having to poll or remember the task id.
 
 ```
-you> /kanban create "transcribe today's podcast" --assignee transcriber
+you> /kanban create "transcribe today's podcast" --assignee transcriber --body "Transcribe the attached episode verbatim and identify speakers and action items."
 bot> Created t_9fc1a3  (ready, assignee=transcriber)
      (subscribed — you'll be notified when t_9fc1a3 completes or blocks)
 
@@ -989,6 +998,7 @@ When one specialist fleet serves multiple businesses, tag each task with a tenan
 hermes kanban create "monthly report" \
     --assignee researcher \
     --tenant business-a \
+    --body "Build the monthly KPI report from the tenant data directory and cite each source file." \
     --workspace dir:~/tenants/business-a/data/
 ```
 
