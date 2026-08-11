@@ -559,12 +559,11 @@ def _reapply_terminal_config_bridge(home_path: Path) -> None:
 def _apply_managed_env() -> None:
     """Apply the managed-scope .env last, with override, so it beats user/shell.
 
-    Managed scope is machine-global (independent of HERMES_HOME / profile). v1
-    enforcement is "applied last with override=True" — at the end of startup load
-    ``os.environ`` holds the managed value for every managed key, beating both the
-    user ``.env`` and any pre-existing shell export. This deliberately inverts the
-    usual env-over-config precedence for the pinned keys (see
-    ``docs/design/managed-scope.md`` §4.1).
+    A single-profile managed scope is applied last with override=True, so
+    ``os.environ`` holds each managed value over user ``.env`` and shell
+    exports. A shared serve's selected profile instead resolves managed values
+    through isolated config and secret mappings; they must never be copied into
+    the process-global environment.
 
     This does NOT prevent the agent from later mutating ``os.environ`` in-process
     or ``export``-ing in a subprocess shell; that hard boundary is a documented
@@ -575,6 +574,21 @@ def _apply_managed_env() -> None:
     """
     try:
         from hermes_cli import managed_scope
+        from hermes_constants import get_hermes_home, get_hermes_home_override
+
+        # A shared serve binds profile homes with a ContextVar while its process
+        # environment belongs to the base home. Never copy a selected profile's
+        # managed env into that shared process; managed config expansion and
+        # secret_scope resolve the same values from isolated mappings.
+        if (
+            os.environ.get("EVAOS_HERMES_MANAGED_PROFILE_ROOT")
+            and get_hermes_home_override() is not None
+        ):
+            process_home = Path(
+                os.environ.get("HERMES_HOME", Path.home() / ".hermes")
+            ).resolve()
+            if get_hermes_home().resolve() != process_home:
+                return
 
         managed_dir = managed_scope.get_managed_dir()
     except Exception:  # noqa: BLE001 — managed scope must never block startup

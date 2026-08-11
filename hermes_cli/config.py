@@ -241,11 +241,20 @@ _LAST_EXPANDED_CONFIG_BY_PATH: Dict[str, Any] = {}
 # produces a fresh inode, so stat() sees a new mtime_ns and the next
 # load repopulates automatically — no explicit invalidation hook.
 # Cached tuple is (user_mtime_ns, user_size, managed_mtime_ns, managed_size,
-# merged_value, env_ref_snapshot) — the managed-file signature is folded in so
-# editing the managed-scope config.yaml invalidates the cache (see
-# managed_scope), and the env snapshot invalidates it when a referenced ${VAR}
-# changes value (late .env load, in-process rotation — #58514).
-_LOAD_CONFIG_CACHE: Dict[str, Tuple[int, int, int, int, Dict[str, Any], Dict[str, Optional[str]]]] = {}
+# merged_value, user_env_snapshot, managed_env_snapshot). Separate snapshots
+# preserve process-env and trusted profile-managed-env precedence.
+_LOAD_CONFIG_CACHE: Dict[
+    str,
+    Tuple[
+        int,
+        int,
+        int,
+        int,
+        Dict[str, Any],
+        Dict[str, Optional[str]],
+        Dict[str, Optional[str]],
+    ],
+] = {}
 # (path, mtime_ns, size) -> cached raw yaml dict. Same pattern as
 # _LOAD_CONFIG_CACHE but for read_raw_config() — used when callers want
 # the user's on-disk values without defaults merged in.
@@ -2483,7 +2492,7 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
-def _env_expand_match(m: re.Match) -> str:
+def _env_expand_match(m: re.Match, env=None) -> str:
     """Expand one ``${...}`` config reference.
 
     Two accepted shapes, matching what MCP server config already resolves
@@ -2501,13 +2510,14 @@ def _env_expand_match(m: re.Match) -> str:
     ref only ever needs the env shape.  Unknown prefixes warn once and stay
     verbatim so callers can detect them.
     """
+    source = os.environ if env is None else env
     raw = m.group(0)
     inner = m.group(1).strip()
     if inner.startswith("env:"):
         name = inner[len("env:"):].strip()
         if not name:
             return raw
-        val = os.environ.get(name)
+        val = source.get(name)
         if val is not None:
             return val
         logger.warning(
@@ -2528,7 +2538,7 @@ def _env_expand_match(m: re.Match) -> str:
         )
         return raw
     # Legacy ``${VAR}`` — bare name.
-    return os.environ.get(inner, raw)
+    return source.get(inner, raw)
 
 
 def _env_ref_var_name(ref: str) -> Optional[str]:
@@ -2543,24 +2553,27 @@ def _env_ref_var_name(ref: str) -> Optional[str]:
     return ref
 
 
-def _expand_env_vars(obj):
+def _expand_env_vars(obj, env=None):
     """Recursively expand ``${VAR}`` / ``${env:VAR}`` references in config
     values.
 
     Only string values are processed; dict keys, numbers, booleans, and
     None are left untouched.  Unresolved references (variable not in
-    ``os.environ``) are kept verbatim so callers can detect them.
+    ``os.environ``) are kept verbatim so callers can detect them. ``env`` may
+    supply a trusted isolated mapping for profile-scoped managed overlays.
     """
     if isinstance(obj, str):
-        return re.sub(r"\${([^}]+)}", _env_expand_match, obj)
+        return re.sub(
+            r"\${([^}]+)}", lambda match: _env_expand_match(match, env), obj
+        )
     if isinstance(obj, dict):
-        return {k: _expand_env_vars(v) for k, v in obj.items()}
+        return {k: _expand_env_vars(v, env) for k, v in obj.items()}
     if isinstance(obj, list):
-        return [_expand_env_vars(item) for item in obj]
+        return [_expand_env_vars(item, env) for item in obj]
     return obj
 
 
-def _env_ref_snapshot(obj, snapshot=None):
+def _env_ref_snapshot(obj, snapshot=None, env=None):
     """Map every ``${VAR}`` / ``${env:VAR}`` name referenced in config values
     to its current ``os.environ`` value (``None`` when unset).
 
@@ -2575,19 +2588,20 @@ def _env_ref_snapshot(obj, snapshot=None):
     with a non-env source prefix never read the environment, so they are
     excluded from the snapshot.
     """
+    source = os.environ if env is None else env
     if snapshot is None:
         snapshot = {}
     if isinstance(obj, str):
         for raw in re.findall(r"\${([^}]+)}", obj):
             name = _env_ref_var_name(raw)
             if name is not None:
-                snapshot[name] = os.environ.get(name)
+                snapshot[name] = source.get(name)
     elif isinstance(obj, dict):
         for value in obj.values():
-            _env_ref_snapshot(value, snapshot)
+            _env_ref_snapshot(value, snapshot, source)
     elif isinstance(obj, list):
         for item in obj:
-            _env_ref_snapshot(item, snapshot)
+            _env_ref_snapshot(item, snapshot, source)
     return snapshot
 
 
@@ -3327,7 +3341,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
             env_snapshot = cached[5] if len(cached) > 5 else {}
-            if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
+            managed_env_snapshot = cached[6] if len(cached) > 6 else {}
+            managed_env = dict(os.environ)
+            managed_env.update(managed_scope.load_managed_env())
+            if (
+                all(os.environ.get(k) == v for k, v in env_snapshot.items())
+                and all(
+                    managed_env.get(k) == v
+                    for k, v in managed_env_snapshot.items()
+                )
+            ):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
@@ -3382,7 +3405,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                         _LOAD_CONFIG_CACHE[path_key] = (
                             cache_sig[0], cache_sig[1],
                             cache_sig[2], cache_sig[3],
-                            lkg_copy, _empty_env,
+                            lkg_copy, _empty_env, _empty_env,
                         )
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
 
@@ -3390,12 +3413,13 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         expanded = _expand_env_vars(normalized)
         # Managed scope wins at the leaf. Applied AFTER user expansion so a user
         # ${VAR} cannot shadow a managed literal: managed values are expanded only
-        # against the process environment, never against user-config-defined refs.
+        # against trusted env sources (profile-managed env first, then process
+        # env), never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
         managed_config = managed_scope.load_managed_config()
         if managed_config:
-            managed_expanded = _expand_env_vars(managed_config)
+            managed_expanded = managed_scope.expand_managed_config(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)
         _LAST_EXPANDED_CONFIG_BY_PATH[path_key] = copy.deepcopy(expanded)
         if cache_sig is not None:
@@ -3404,14 +3428,23 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # cached value, and ``load_config_readonly()`` (deepcopy=False)
             # callers all see the same stable cached object. The cached tuple is
             # (user_mtime, user_size, managed_mtime, managed_size, value,
-            # env_ref_snapshot). The snapshot records the environment values
-            # this expansion was made against so later loads can detect env
-            # drift (late .env load, in-process rotation) — see cache hit above.
+            # user_env_snapshot, managed_env_snapshot). Separate snapshots
+            # detect drift without conflating refs of the same name.
             cached_copy = copy.deepcopy(expanded)
             env_snapshot = _env_ref_snapshot(normalized)
+            managed_env_snapshot: Dict[str, Optional[str]] = {}
             if managed_config:
-                _env_ref_snapshot(managed_config, env_snapshot)
-            _LOAD_CONFIG_CACHE[path_key] = (*cache_sig, cached_copy, env_snapshot)
+                managed_env = dict(os.environ)
+                managed_env.update(managed_scope.load_managed_env())
+                _env_ref_snapshot(
+                    managed_config, managed_env_snapshot, managed_env
+                )
+            _LOAD_CONFIG_CACHE[path_key] = (
+                *cache_sig,
+                cached_copy,
+                env_snapshot,
+                managed_env_snapshot,
+            )
             # On the readonly path return the same cached object subsequent
             # calls will see — keeps "two readonly calls return the same
             # object" invariant that callers may rely on for identity checks.
