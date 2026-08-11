@@ -238,25 +238,29 @@ def _print_fast_version_info() -> None:
     print(f"OpenAI SDK: {openai_version}" if openai_version else "OpenAI SDK: Not installed")
 
 
-def _try_termux_ultrafast_version() -> bool:
-    """Handle ``hermes --version`` before config/logging imports on Termux."""
-    if os.environ.get("HERMES_TERMUX_DISABLE_FAST_CLI") == "1":
-        return False
-    if not _is_termux_startup_environment_fast():
-        return False
+def _try_ultrafast_version() -> bool:
+    """Handle exact module/Termux version requests before heavy imports."""
     if not _is_termux_fast_version_argv(sys.argv[1:]):
+        return False
+    module_fallback = __name__ == "__main__"
+    termux_fast_path = (
+        os.environ.get("HERMES_TERMUX_DISABLE_FAST_CLI") != "1"
+        and _is_termux_startup_environment_fast()
+    )
+    if not module_fallback and not termux_fast_path:
         return False
 
     _print_fast_version_info()
     return True
 
 
-if _try_termux_ultrafast_version():
+if _try_ultrafast_version():
     raise SystemExit(0)
 
 import argparse
 import hashlib
 import json
+import re
 import shlex
 import shutil
 import stat
@@ -9249,6 +9253,106 @@ def _discard_lockfile_churn(git_cmd, repo_root):
         pass
 
 
+def _downstream_update_guard_status(
+    repo_root: Path, target_branch: str
+) -> list[str]:
+    """Return downstream guards that are present locally but absent upstream."""
+    guard_path = Path(repo_root) / ".hermes-update-guard.json"
+    git_dir = Path(repo_root) / ".git"
+    if guard_path.is_symlink():
+        raise RuntimeError("downstream update guard must not be a symlink")
+    if not guard_path.is_file():
+        raise RuntimeError("downstream update guard is missing")
+    if not git_dir.exists():
+        raise RuntimeError("downstream update guard Git metadata is missing")
+    try:
+        value = json.loads(guard_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("downstream update guard is unreadable") from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "guards"}
+        or value.get("schema_version") != "1.0.0"
+        or not isinstance(value.get("guards"), list)
+        or not value["guards"]
+    ):
+        raise RuntimeError("downstream update guard is invalid")
+    safe_env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": "/nonexistent",
+        "LANG": "C",
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+    }
+    target = f"refs/remotes/origin/{target_branch}"
+    blocked = []
+    for guard in value["guards"]:
+        if (
+            not isinstance(guard, dict)
+            or set(guard) != {"guard_id", "anchor_commit"}
+            or not isinstance(guard.get("guard_id"), str)
+            or not guard["guard_id"]
+            or not re.fullmatch(r"[0-9a-f]{40}", str(guard.get("anchor_commit", "")))
+        ):
+            raise RuntimeError("downstream update guard entry is invalid")
+        anchor = guard["anchor_commit"]
+        try:
+            local = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", anchor, "HEAD"],
+                cwd=repo_root,
+                env=safe_env,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "downstream update guard Git probe failed"
+            ) from exc
+        if local.returncode == 1:
+            # The exact downstream history was removed by an intentional
+            # rebase; the stale anchor can no longer be overwritten.
+            continue
+        if local.returncode != 0:
+            raise RuntimeError("downstream update guard anchor is unavailable")
+        try:
+            upstream = subprocess.run(
+                ["git", "merge-base", "--is-ancestor", anchor, target],
+                cwd=repo_root,
+                env=safe_env,
+                capture_output=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "downstream update guard upstream probe failed"
+            ) from exc
+        if upstream.returncode != 0:
+            blocked.append(guard["guard_id"])
+    return blocked
+
+
+def _enforce_downstream_update_guard(repo_root: Path, target_branch: str) -> None:
+    try:
+        blocked = _downstream_update_guard_status(repo_root, target_branch)
+    except RuntimeError as exc:
+        print(f"✗ Refusing update: {exc}.")
+        sys.exit(2)
+    if blocked:
+        print("✗ Refusing update while protected downstream commits are not upstream.")
+        print(f"  Guard(s): {', '.join(blocked)}")
+        print(
+            "  Rebase the protected Stage 1 history or incorporate it into "
+            f"origin/{target_branch} before updating."
+        )
+        sys.exit(2)
+
+
 def cmd_update(args):
     """Update Hermes Agent to the latest version.
 
@@ -9414,16 +9518,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # always roll back to the exact state they had before this update.
     _run_pre_update_backup(args)
 
-    _windows_gateway_resume = _pause_windows_gateways_for_update()
-    if _windows_gateway_resume:
-        import atexit as _atexit
-
-        _atexit.register(
-            _resume_windows_gateways_after_update,
-            _windows_gateway_resume,
-        )
-
-    # With gateways paused, anything still running from the venv interpreter
+    # Anything still running from the venv interpreter
     # (most commonly the Desktop app's `hermes serve` backend) will keep .pyd
     # files locked and corrupt the dependency sync below. Refuse rather than
     # race: killing the desktop backend is futile (the app supervises and
@@ -9437,8 +9532,23 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _venv_holders = _detect_venv_python_processes()
         if _venv_holders:
             print(_format_venv_python_holders_message(_venv_holders))
-            _resume_windows_gateways_after_update(_windows_gateway_resume)
             sys.exit(2)
+
+    # A backup and read-only process probes are non-destructive and
+    # intentionally precede this guard. Refuse before pausing services or
+    # mutating any checkout/ref/install state.
+    _enforce_downstream_update_guard(
+        PROJECT_ROOT, _resolve_update_branch(args)
+    )
+
+    _windows_gateway_resume = _pause_windows_gateways_for_update()
+    if _windows_gateway_resume:
+        import atexit as _atexit
+
+        _atexit.register(
+            _resume_windows_gateways_after_update,
+            _windows_gateway_resume,
+        )
 
     # Try git-based update first, fall back to ZIP download on Windows
     # when git file I/O is broken (antivirus, NTFS filter drivers, etc.)

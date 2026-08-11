@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from plugins.builder_adapter.native import BUILDER_WORKER_POLICY
 
 
 @pytest.fixture
@@ -60,6 +61,232 @@ def test_init_creates_expected_tables(kanban_home):
         ).fetchall()
     names = {r["name"] for r in rows}
     assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+
+
+def test_governed_completion_retains_worker_lease_until_exit(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            created_by="hermes.builder_dispatch.v1",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        assert kb.claim_task(
+            conn, task_id, claimer=f"{kb._claimer_id()}:lease"
+        )
+        kb._set_worker_pid(conn, task_id, os.getpid())
+        before = kb.get_task(conn, task_id)
+        assert before is not None
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="requested",
+        )
+        pending = kb.get_task(conn, task_id)
+        assert pending is not None
+        assert pending.status == "completion_pending"
+        assert pending.worker_pid == os.getpid()
+        assert pending.claim_lock == before.claim_lock
+        assert pending.completed_at is None
+
+
+def test_governed_completion_requires_callback_and_process_group_cleanup(
+    kanban_home, monkeypatch
+):
+    fake_pid = 987654
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            created_by="hermes.builder_dispatch.v1",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id()}:lease")
+        monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            kb, "_kernel_process_start_identity", lambda pid: "kernel-start-a"
+        )
+        kb._set_worker_pid(conn, task_id, fake_pid)
+        assert kb.complete_task(conn, task_id, result="requested")
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_process_group_terminated", lambda pgid: True)
+        kb._recent_worker_exits.pop(fake_pid, None)
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "completion_pending"
+        lifecycle = conn.execute(
+            "SELECT * FROM governed_worker_lifecycle WHERE task_id=?", (task_id,)
+        ).fetchone()
+        kb._recent_worker_exits[fake_pid] = (
+            0,
+            time.time(),
+            lifecycle["start_identity"],
+            lifecycle["run_id"],
+        )
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "done"
+        lifecycle = conn.execute(
+            "SELECT * FROM governed_worker_lifecycle WHERE task_id=?", (task_id,)
+        ).fetchone()
+        assert lifecycle["state"] == "terminated"
+        assert lifecycle["completion_lease"]
+
+
+def test_governed_completion_denies_finalization_while_descendant_alive(
+    kanban_home, monkeypatch
+):
+    fake_pid = 987655
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            created_by="hermes.builder_dispatch.v1",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id()}:lease")
+        monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            kb, "_kernel_process_start_identity", lambda pid: "kernel-start-b"
+        )
+        kb._set_worker_pid(conn, task_id, fake_pid)
+        assert kb.complete_task(conn, task_id, result="requested")
+        lifecycle = conn.execute(
+            "SELECT * FROM governed_worker_lifecycle WHERE task_id=?", (task_id,)
+        ).fetchone()
+        kb._recent_worker_exits[fake_pid] = (
+            0,
+            time.time(),
+            lifecycle["start_identity"],
+            lifecycle["run_id"],
+        )
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(kb, "_process_group_terminated", lambda pgid: False)
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "completion_pending"
+
+
+def test_completion_pid_reuse_accepts_only_original_incarnation_callback(
+    kanban_home, monkeypatch
+):
+    fake_pid = 987656
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            created_by="hermes.builder_dispatch.v1",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id()}:lease")
+        monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            kb, "_kernel_process_start_identity", lambda pid: "kernel-original"
+        )
+        kb._set_worker_pid(conn, task_id, fake_pid)
+        assert kb.complete_task(conn, task_id, result="requested")
+        lifecycle = conn.execute(
+            "SELECT * FROM governed_worker_lifecycle WHERE task_id=?", (task_id,)
+        ).fetchone()
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            kb, "_kernel_process_start_identity", lambda pid: "kernel-replacement"
+        )
+        cleanup_calls = []
+        monkeypatch.setattr(
+            kb,
+            "_process_group_terminated",
+            lambda pgid: cleanup_calls.append(pgid) or True,
+        )
+        kb._recent_worker_exits[fake_pid] = (
+            0,
+            time.time(),
+            lifecycle["start_identity"],
+            lifecycle["run_id"],
+        )
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "done"
+        assert cleanup_calls == [fake_pid]
+
+
+def test_completion_pid_reuse_rejects_replacement_incarnation_callback(
+    kanban_home, monkeypatch
+):
+    fake_pid = 987657
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            created_by="hermes.builder_dispatch.v1",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        assert kb.claim_task(conn, task_id, claimer=f"{kb._claimer_id()}:lease")
+        monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+        monkeypatch.setattr(
+            kb, "_kernel_process_start_identity", lambda pid: "kernel-original"
+        )
+        kb._set_worker_pid(conn, task_id, fake_pid)
+        assert kb.complete_task(conn, task_id, result="requested")
+        lifecycle = conn.execute(
+            "SELECT * FROM governed_worker_lifecycle WHERE task_id=?", (task_id,)
+        ).fetchone()
+        monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+        monkeypatch.setattr(kb, "_pid_alive", lambda pid: True)
+        monkeypatch.setattr(
+            kb, "_kernel_process_start_identity", lambda pid: "kernel-replacement"
+        )
+        cleanup_calls = []
+        monkeypatch.setattr(
+            kb,
+            "_process_group_terminated",
+            lambda pgid: cleanup_calls.append(pgid) or True,
+        )
+        kb._recent_worker_exits[fake_pid] = (
+            0,
+            time.time(),
+            "kernel-replacement",
+            lifecycle["run_id"],
+        )
+        kb.detect_crashed_workers(conn)
+        assert kb.get_task(conn, task_id).status == "completion_pending"
+        assert cleanup_calls == []
+
+
+@pytest.mark.parametrize(
+    ("process_name", "start_time"),
+    [
+        ("ordinary", "424242"),
+        ("worker name with spaces", "515151"),
+        ("worker (nested) name) with parentheses", "616161"),
+    ],
+)
+def test_linux_proc_start_identity_parses_parenthesized_process_name(
+    process_name, start_time
+):
+    # Fields after comm are state (3) followed by fields 4..22. The final
+    # value below is field 22, starttime.
+    numeric = [str(value) for value in range(4, 22)] + [start_time]
+    raw = f"123 ({process_name}) S {' '.join(numeric)}\n"
+    assert kb._linux_proc_start_time(raw) == start_time
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "",
+        "123 no-parenthesized-name S 1 2 3",
+        "123 (unterminated S 1 2 3",
+        "123 (short) S 1 2 3",
+    ],
+)
+def test_linux_proc_start_identity_rejects_malformed_records(raw):
+    with pytest.raises(ProcessLookupError):
+        kb._linux_proc_start_time(raw)
 
 
 def test_connect_honors_kanban_busy_timeout_env(kanban_home, monkeypatch):
@@ -1740,6 +1967,51 @@ def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawna
         # Must return to ready so the next tick can retry.
         assert kb.get_task(conn, t).status == "ready"
         assert kb.get_task(conn, t).claim_lock is None
+
+
+def test_worker_identity_failure_holds_claim_when_cleanup_is_denied(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    fake_pid = 987658
+    monkeypatch.setattr(
+        kb,
+        "_kernel_process_start_identity",
+        lambda pid: (_ for _ in ()).throw(OSError("kernel identity unavailable")),
+    )
+    cleanup = []
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda pid, claim_lock: cleanup.append((pid, claim_lock))
+        or {
+            "prev_pid": pid,
+            "host_local": True,
+            "termination_attempted": True,
+            "terminated": False,
+            "sigkill": True,
+        },
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="governed",
+            assignee="deepseek-builder",
+            worker_policy=BUILDER_WORKER_POLICY,
+        )
+        result = kb.dispatch_once(
+            conn, spawn_fn=lambda _task, _workspace: fake_pid
+        )
+        task = kb.get_task(conn, task_id)
+        assert result.spawned == []
+        assert task.status == "running"
+        assert task.claim_lock
+        assert task.worker_pid is None
+        assert cleanup == [(fake_pid, task.claim_lock)]
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? "
+            "AND kind='spawn_cleanup_unconfirmed'",
+            (task_id,),
+        ).fetchone()
 
 
 def test_dispatch_max_spawn_counts_existing_running_tasks(
