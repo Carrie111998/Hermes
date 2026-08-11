@@ -1685,7 +1685,6 @@ class WeixinAdapter(BasePlatformAdapter):
     async def _download_voice(self, item: Dict[str, Any]) -> Optional[str]:
         voice_item = item.get("voice_item") or {}
         media = voice_item.get("media") or {}
-<<<<<<< HEAD
         # #27300: previously short-circuited when ``voice_item.text`` was set
         # on the assumption that Tencent Cloud's STT was good enough.
         # For non-Chinese audio that text is garbage (e.g. a Russian
@@ -1693,11 +1692,6 @@ class WeixinAdapter(BasePlatformAdapter):
         # download the raw audio so ``gateway/run.py``'s central STT
         # pipeline can re-transcribe with the user's configured
         # mlx-whisper / whisper.cpp / faster-whisper backend.
-=======
-        # Don't skip download when voice_item has pre-transcribed text —
-        # the WeChat API text is unreliable; always download and transcribe
-        # via STT for accurate results (#42084).
->>>>>>> f4a319db008 (fix(weixin): convert Silk voice messages to WAV via pilk for STT)
         try:
             data = await _download_and_decrypt_media(
                 self._poll_session,
