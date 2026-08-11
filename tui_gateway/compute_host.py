@@ -589,6 +589,7 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    profile_home=profile_home or None,
                 )
             finally:
                 reset_transport(token)

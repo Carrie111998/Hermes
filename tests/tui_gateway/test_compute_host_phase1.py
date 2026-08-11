@@ -72,6 +72,7 @@ def test_compute_host_turn_frame_preserves_multiplex_mode(
     }
     previous_multiplex = is_multiplex_active()
     seen = []
+    initialized_profile_homes = []
 
     class _Agent:
         pass
@@ -80,7 +81,15 @@ def test_compute_host_turn_frame_preserves_multiplex_mode(
         seen.append(is_multiplex_active())
         return _Agent()
 
-    def _init_session(session_id, key, agent, history, **_kwargs):
+    def _init_session(
+        session_id,
+        key,
+        agent,
+        history,
+        profile_home=None,
+        **_kwargs,
+    ):
+        initialized_profile_homes.append(profile_home)
         server._sessions[session_id] = {
             "agent": agent,
             "session_key": key,
@@ -107,6 +116,7 @@ def test_compute_host_turn_frame_preserves_multiplex_mode(
         ComputeHost._ensure_server_session(fake_host, server, frame)
 
         assert seen == [True]
+        assert initialized_profile_homes == [str(profile_home)]
     finally:
         server._sessions.pop(sid, None)
         set_multiplex_active(previous_multiplex)

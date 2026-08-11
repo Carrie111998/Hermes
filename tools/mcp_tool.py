@@ -5071,12 +5071,17 @@ def _load_mcp_config() -> Dict[str, dict]:
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli import managed_scope
+        from hermes_cli.config import read_raw_config
         from utils import env_var_enabled as _env_enabled
 
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
-        config = load_config()
+        # Keep user MCP placeholders intact until the active profile's secret
+        # scope is available below. load_config() expands against os.environ
+        # first, which can substitute the launch profile's credential in a
+        # multiplex process before _interpolate_env_vars() can isolate it.
+        config = managed_scope.apply_managed_overlay(read_raw_config() or {})
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
             return {}
