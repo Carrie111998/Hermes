@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -9,9 +11,12 @@ import hermes_cli.kanban_repository as repository_module
 from hermes_cli.kanban_repository import (
     RepositoryConfigurationError,
     RefreshRequest,
+    VerificationCommand,
+    VerificationProfile,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
+    run_verification,
 )
 
 
@@ -403,3 +408,203 @@ def test_refresh_story_branch_rechecks_dirty_worktree_before_cas(
     assert result.dirty_paths == ("README.md",)
     assert _git(story, "rev-parse", "story") == before
     assert (story / "README.md").read_text(encoding="utf-8") == "operator edit\n"
+
+
+def _write_verification_script(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/usr/bin/env python3\n{body}\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def _verification_profile(*commands: VerificationCommand) -> VerificationProfile:
+    return VerificationProfile(tuple(commands))
+
+
+def _verification_command(
+    candidate: Path,
+    executable: Path,
+    *args: str,
+    workdir: str = ".",
+    timeout_seconds: int = 5,
+) -> VerificationCommand:
+    workdir_path = candidate / Path(workdir)
+    return VerificationCommand(
+        argv=(executable.relative_to(workdir_path).as_posix(), *args),
+        workdir=PurePosixPath(workdir),
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def test_run_verification_uses_configured_argv_workdir_and_minimal_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    candidate = tmp_path / "candidate"
+    script = _write_verification_script(
+        candidate / "nested" / "record.py",
+        "import json, os; print('api_key=should-not-survive'); print(json.dumps({'argv': __import__('sys').argv[1:], 'cwd': os.getcwd(), 'secret': os.environ.get('R03_SECRET')}))",
+    )
+    monkeypatch.setenv("R03_SECRET", "must-not-cross-boundary")
+    profile = _verification_profile(
+        _verification_command(
+            candidate,
+            script,
+            "--first",
+            "value",
+            workdir="nested",
+            timeout_seconds=7,
+        )
+    )
+
+    result = run_verification(
+        profile,
+        candidate,
+        source_sha="source-sha",
+        candidate_sha="candidate-sha",
+        contract_digest="contract-digest",
+        scope="story_integration",
+        subject_id="story-1",
+    )
+
+    assert result.status == "passed"
+    assert result.source_sha == "source-sha"
+    assert result.candidate_sha == "candidate-sha"
+    assert result.contract_digest == "contract-digest"
+    assert result.profile == "story_integration"
+    assert len(result.steps) == 1
+    step = result.steps[0]
+    assert step.status == "passed"
+    assert step.argv[1:] == ("--first", "value")
+    assert step.workdir == PurePosixPath("nested")
+    payload = json.loads(step.stdout_tail.splitlines()[-1])
+    assert payload["argv"] == ["--first", "value"]
+    assert Path(payload["cwd"]) == candidate / "nested"
+    assert payload["secret"] is None
+    assert "should-not-survive" not in step.stdout_tail
+    assert "[REDACTED]" in step.stdout_tail
+
+
+def test_run_verification_stops_on_nonzero_and_caps_output(tmp_path: Path):
+    candidate = tmp_path / "candidate"
+    failing = _write_verification_script(
+        candidate / "fail.py",
+        "print('x' * 10000); raise SystemExit(3)",
+    )
+    marker = candidate / "should-not-run"
+    following = _write_verification_script(
+        candidate / "following.py",
+        f"__import__('pathlib').Path({str(marker)!r}).touch()",
+    )
+    profile = _verification_profile(
+        _verification_command(candidate, failing),
+        _verification_command(candidate, following),
+    )
+
+    result = run_verification(
+        profile,
+        candidate,
+        source_sha="source",
+        candidate_sha="candidate",
+        contract_digest="digest",
+        scope="epic_release",
+        subject_id="epic-1",
+    )
+
+    assert result.status == "failed"
+    assert len(result.steps) == 1
+    assert result.steps[0].returncode == 3
+    assert len(result.steps[0].stdout_tail) <= 4096
+    assert not marker.exists()
+
+
+def test_run_verification_classifies_timeout_as_infrastructure_error(tmp_path: Path):
+    candidate = tmp_path / "candidate"
+    sleeper = _write_verification_script(
+        candidate / "sleep.py",
+        "__import__('time').sleep(2)",
+    )
+    profile = _verification_profile(
+        _verification_command(candidate, sleeper, timeout_seconds=1),
+    )
+
+    result = run_verification(
+        profile,
+        candidate,
+        source_sha="source",
+        candidate_sha="candidate",
+        contract_digest="digest",
+        scope="story_integration",
+        subject_id="story-1",
+    )
+
+    assert result.status == "infrastructure_error"
+    assert len(result.steps) == 1
+    assert result.steps[0].status == "infrastructure_error"
+    assert result.steps[0].error == "timeout"
+
+
+def test_run_verification_missing_profile_is_configuration_error(tmp_path: Path):
+    result = run_verification(
+        None,
+        tmp_path,
+        source_sha="source",
+        candidate_sha="candidate",
+        contract_digest="digest",
+        scope="story_integration",
+        subject_id="story-1",
+    )
+
+    assert result.status == "configuration_error"
+    assert result.steps == ()
+
+
+def test_run_verification_missing_executable_is_configuration_error(tmp_path: Path):
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    profile = _verification_profile(
+        VerificationCommand(
+            argv=("does-not-exist-r03",),
+            workdir=PurePosixPath("."),
+            timeout_seconds=5,
+        )
+    )
+
+    result = run_verification(
+        profile,
+        candidate,
+        source_sha="source",
+        candidate_sha="candidate",
+        contract_digest="digest",
+        scope="story_integration",
+        subject_id="story-1",
+    )
+
+    assert result.status == "configuration_error"
+    assert result.steps == ()
+
+
+def test_run_verification_process_error_is_infrastructure_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    candidate = tmp_path / "candidate"
+    script = _write_verification_script(candidate / "runner.py", "print('ok')")
+    profile = _verification_profile(_verification_command(candidate, script))
+
+    def fail_process(*args, **kwargs):
+        raise OSError("process unavailable")
+
+    monkeypatch.setattr(repository_module.subprocess, "run", fail_process)
+    result = run_verification(
+        profile,
+        candidate,
+        source_sha="source",
+        candidate_sha="candidate",
+        contract_digest="digest",
+        scope="story_integration",
+        subject_id="story-1",
+    )
+
+    assert result.status == "infrastructure_error"
+    assert len(result.steps) == 1
+    assert result.steps[0].status == "infrastructure_error"
+    assert result.steps[0].error == "process_error"

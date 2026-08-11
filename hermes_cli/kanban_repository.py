@@ -9,16 +9,18 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
@@ -65,6 +67,340 @@ class VerificationCommand:
 @dataclass(frozen=True)
 class VerificationProfile:
     commands: tuple[VerificationCommand, ...]
+
+
+@dataclass(frozen=True)
+class VerificationStepResult:
+    """Bounded evidence for one configured verification command."""
+
+    argv: tuple[str, ...]
+    workdir: PurePosixPath
+    status: Literal["passed", "failed", "configuration_error", "infrastructure_error"]
+    returncode: int | None
+    duration_seconds: float
+    stdout_tail: str = ""
+    stderr_tail: str = ""
+    error: str | None = None
+
+    @property
+    def stdout(self) -> str:
+        """Compatibility alias for consumers that use the shorter field name."""
+
+        return self.stdout_tail
+
+    @property
+    def stderr(self) -> str:
+        """Compatibility alias for consumers that use the shorter field name."""
+
+        return self.stderr_tail
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Typed outcome of running one repository verification profile."""
+
+    status: Literal["passed", "failed", "configuration_error", "infrastructure_error"]
+    source_sha: str
+    candidate_sha: str
+    contract_digest: str
+    profile: str
+    steps: tuple[VerificationStepResult, ...]
+    error: str | None = None
+
+
+_VERIFICATION_OUTPUT_TAIL_CHARS = 4096
+_VERIFICATION_ENV_KEYS = (
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "PYTHONHASHSEED",
+    "TZ",
+)
+_VERIFICATION_SECRET_RE = re.compile(
+    r"(?i)(\b(?:api[_-]?key|authorization|password|secret|token)\b\s*[:=]\s*)([^\s,;]+)"
+)
+_VERIFICATION_BEARER_RE = re.compile(r"(?i)(\bbearer\s+)([^\s,;]+)")
+
+
+def _verification_tail(value: object) -> str:
+    """Return only the bounded tail of subprocess output."""
+
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = str(value)
+    text = _VERIFICATION_SECRET_RE.sub(r"\1[REDACTED]", text)
+    text = _VERIFICATION_BEARER_RE.sub(r"\1[REDACTED]", text)
+    return text[-_VERIFICATION_OUTPUT_TAIL_CHARS:]
+
+
+def _verification_result(
+    *,
+    status: Literal["passed", "failed", "configuration_error", "infrastructure_error"],
+    source_sha: str,
+    candidate_sha: str,
+    contract_digest: str,
+    profile: str,
+    steps: list[VerificationStepResult],
+    error: str | None = None,
+) -> VerificationResult:
+    return VerificationResult(
+        status=status,
+        source_sha=source_sha,
+        candidate_sha=candidate_sha,
+        contract_digest=contract_digest,
+        profile=profile,
+        steps=tuple(steps),
+        error=error,
+    )
+
+
+def _verification_workdir(candidate_root: Path, workdir: PurePosixPath) -> Path | None:
+    if workdir.is_absolute() or ".." in workdir.parts:
+        return None
+    resolved_root = candidate_root.resolve(strict=False)
+    resolved = (resolved_root / Path(*workdir.parts)).resolve(strict=False)
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError:
+        return None
+    return resolved if resolved.is_dir() else None
+
+
+def _verification_executable(
+    argv0: str, *, candidate_root: Path, workdir: Path, path_value: str
+) -> str | None:
+    """Resolve a configured executable without invoking a shell."""
+
+    if not isinstance(argv0, str) or not argv0 or "\x00" in argv0:
+        return None
+    requested = Path(argv0)
+    local_requested = requested if requested.is_absolute() else workdir / requested
+    if (
+        requested.is_absolute()
+        or "/" in argv0
+        or "\\" in argv0
+        or (local_requested.is_file() and os.access(local_requested, os.X_OK))
+    ):
+        requested = local_requested
+        resolved = requested.resolve(strict=False)
+        try:
+            resolved.relative_to(candidate_root.resolve(strict=False))
+        except ValueError:
+            # Absolute tools such as ``/usr/bin/python3`` are valid; only
+            # relative configured paths must remain inside the candidate.
+            if not Path(argv0).is_absolute():
+                return None
+        return str(resolved) if resolved.is_file() and os.access(resolved, os.X_OK) else None
+    return shutil.which(argv0, path=path_value)
+
+
+def _verification_environment(
+    candidate_root: Path, *, home_dir: Path | None = None
+) -> dict[str, str]:
+    """Build the intentionally small environment passed to candidate tools."""
+
+    host_path = os.environ.get("PATH") or os.defpath
+    values = {
+        "PATH": host_path,
+        "HOME": str((home_dir or candidate_root).resolve(strict=False)),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TZ": "UTC",
+        "PYTHONHASHSEED": "0",
+    }
+    return {key: values[key] for key in _VERIFICATION_ENV_KEYS}
+
+
+def run_verification(
+    profile: VerificationProfile | None,
+    candidate_path: Path,
+    *,
+    source_sha: str,
+    candidate_sha: str,
+    contract_digest: str,
+    scope: str,
+    subject_id: str,
+    profile_name: str | None = None,
+) -> VerificationResult:
+    """Run an operator-configured profile in a bounded isolated candidate.
+
+    Commands are resolved individually, run with explicit argv and
+    ``shell=False``, and receive only the small deterministic environment
+    needed for ordinary test/build tools.  The first non-passing step ends the
+    profile; a non-zero exit is a product failure, while missing configuration
+    and process/timeout errors stay distinct.
+    """
+
+    del subject_id  # identity is persisted by the caller alongside the result
+    result_profile = profile_name or scope
+    candidate_root = Path(candidate_path).expanduser().resolve(strict=False)
+    if profile is None:
+        return _verification_result(
+            status="configuration_error",
+            source_sha=source_sha,
+            candidate_sha=candidate_sha,
+            contract_digest=contract_digest,
+            profile=result_profile,
+            steps=[],
+            error="missing_profile",
+        )
+    if not candidate_root.is_dir() or not isinstance(profile, VerificationProfile):
+        return _verification_result(
+            status="configuration_error",
+            source_sha=source_sha,
+            candidate_sha=candidate_sha,
+            contract_digest=contract_digest,
+            profile=result_profile,
+            steps=[],
+            error="invalid_profile_or_candidate",
+        )
+    if not profile.commands:
+        return _verification_result(
+            status="configuration_error",
+            source_sha=source_sha,
+            candidate_sha=candidate_sha,
+            contract_digest=contract_digest,
+            profile=result_profile,
+            steps=[],
+            error="empty_profile",
+        )
+
+    path_value = os.environ.get("PATH") or os.defpath
+    verification_home = tempfile.TemporaryDirectory(prefix="hermes-verification-")
+    environment = _verification_environment(
+        candidate_root, home_dir=Path(verification_home.name)
+    )
+    steps: list[VerificationStepResult] = []
+    for command in profile.commands:
+        if not isinstance(command, VerificationCommand) or not command.argv:
+            return _verification_result(
+                status="configuration_error",
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                contract_digest=contract_digest,
+                profile=result_profile,
+                steps=steps,
+                error="invalid_command",
+            )
+        workdir = _verification_workdir(candidate_root, command.workdir)
+        if workdir is None:
+            return _verification_result(
+                status="configuration_error",
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                contract_digest=contract_digest,
+                profile=result_profile,
+                steps=steps,
+                error="invalid_workdir",
+            )
+        executable = _verification_executable(
+            command.argv[0],
+            candidate_root=candidate_root,
+            workdir=workdir,
+            path_value=path_value,
+        )
+        if executable is None:
+            return _verification_result(
+                status="configuration_error",
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                contract_digest=contract_digest,
+                profile=result_profile,
+                steps=steps,
+                error=f"missing_executable:{command.argv[0]}",
+            )
+
+        started = time.monotonic()
+        try:
+            completed = subprocess.run(
+                [executable, *command.argv[1:]],
+                cwd=workdir,
+                env=environment,
+                shell=False,
+                capture_output=True,
+                text=True,
+                timeout=command.timeout_seconds,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            steps.append(
+                VerificationStepResult(
+                    argv=command.argv,
+                    workdir=command.workdir,
+                    status="infrastructure_error",
+                    returncode=None,
+                    duration_seconds=time.monotonic() - started,
+                    stdout_tail=_verification_tail(getattr(exc, "stdout", None)),
+                    stderr_tail=_verification_tail(getattr(exc, "stderr", None)),
+                    error="timeout",
+                )
+            )
+            return _verification_result(
+                status="infrastructure_error",
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                contract_digest=contract_digest,
+                profile=result_profile,
+                steps=steps,
+                error="timeout",
+            )
+        except (OSError, subprocess.SubprocessError):
+            steps.append(
+                VerificationStepResult(
+                    argv=command.argv,
+                    workdir=command.workdir,
+                    status="infrastructure_error",
+                    returncode=None,
+                    duration_seconds=time.monotonic() - started,
+                    error="process_error",
+                )
+            )
+            return _verification_result(
+                status="infrastructure_error",
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                contract_digest=contract_digest,
+                profile=result_profile,
+                steps=steps,
+                error="process_error",
+            )
+
+        step_status = "passed" if completed.returncode == 0 else "failed"
+        steps.append(
+            VerificationStepResult(
+                argv=command.argv,
+                workdir=command.workdir,
+                status=step_status,
+                returncode=completed.returncode,
+                duration_seconds=time.monotonic() - started,
+                stdout_tail=_verification_tail(completed.stdout),
+                stderr_tail=_verification_tail(completed.stderr),
+                error=None if completed.returncode == 0 else "nonzero_exit",
+            )
+        )
+        if completed.returncode != 0:
+            return _verification_result(
+                status="failed",
+                source_sha=source_sha,
+                candidate_sha=candidate_sha,
+                contract_digest=contract_digest,
+                profile=result_profile,
+                steps=steps,
+                error="nonzero_exit",
+            )
+
+    return _verification_result(
+        status="passed",
+        source_sha=source_sha,
+        candidate_sha=candidate_sha,
+        contract_digest=contract_digest,
+        profile=result_profile,
+        steps=steps,
+    )
 
 
 @dataclass(frozen=True)

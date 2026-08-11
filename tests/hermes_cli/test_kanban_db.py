@@ -12,12 +12,13 @@ import threading
 import time
 import types
 import unittest.mock
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 
 import hermes_state
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_repository import VerificationCommand
 
 
 @pytest.fixture
@@ -9712,6 +9713,139 @@ def test_build_merge_candidate_verification_failure_preserves_target(tmp_path):
             repo, "main", "wt/source", "test candidate", lambda _path: False
         )
     assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_build_merge_candidate_uses_configured_verification_profile(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "-c", "wt/source"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    verifier = repo / "verify.py"
+    verifier.write_text(
+        "#!/usr/bin/env python3\nprint('configured-verifier')\n",
+        encoding="utf-8",
+    )
+    verifier.chmod(0o755)
+    source_sha = _commit_file(repo, "verify.py", verifier.read_text(), "verifier")
+    profile = kb.VerificationProfile(
+        (
+            VerificationCommand(
+                argv=("verify.py",),
+                workdir=PurePosixPath("."),
+                timeout_seconds=5,
+            ),
+        )
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "switch", "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    candidate = kb._build_verified_merge_candidate(
+        repo,
+        "main",
+        "wt/source",
+        "configured candidate",
+        verification_profile=profile,
+        verification_contract_digest="contract-digest",
+        verification_scope="story_integration",
+        verification_subject_id="story-1",
+        expected_source_sha=source_sha,
+    )
+
+    assert candidate.verification_result is not None
+    assert candidate.verification_result.status == "passed"
+    assert candidate.verification_result.profile == "story_integration"
+    assert candidate.verification_result.contract_digest == "contract-digest"
+
+
+def test_build_merge_candidate_missing_configured_profile_is_not_legacy_fallback(tmp_path):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    source_sha = _make_epic_branch(repo, "wt/source")
+    pre_sha = _git_output(repo, "rev-parse", "main")
+
+    with pytest.raises(kb.IntegrationCandidateError) as exc_info:
+        kb._build_verified_merge_candidate(
+            repo,
+            "main",
+            "wt/source",
+            "configured candidate",
+            verification_profile=None,
+            verification_contract_digest="contract-digest",
+            verification_scope="epic_release",
+            verification_subject_id="epic-1",
+            expected_source_sha=source_sha,
+        )
+
+    assert exc_info.value.verification_result is not None
+    assert exc_info.value.verification_result.status == "configuration_error"
+    assert _git_output(repo, "rev-parse", "main") == pre_sha
+
+
+def test_merge_epic_records_configured_profile_failure_as_attention_required(
+    kanban_home, tmp_path
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-merge-config-attention"
+    _v2_product_board_with_repo(board, repo)
+    meta_path = kb.board_metadata_path(board)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["repository"] = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": {
+                "commands": [
+                    {
+                        "argv": ["python", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 5,
+                    }
+                ]
+            }
+        },
+        "ci_observation": {
+            "provider": "test",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": [],
+            "fixture_globs": [],
+            "generated_paths": ["README.md"],
+        },
+    }
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+    epic, children = _make_epic_with_children(board, n_children=1)
+    with kb.connect(board=board) as conn:
+        _set_task_status(conn, children[0], "done")
+    epic_branch = kb.epic_branch_for(epic)
+    _make_epic_branch(repo, epic_branch)
+
+    with kb.connect(board=board) as conn:
+        result = kb.merge_epic_to_main(conn, epic, board=board)
+        task = kb.get_task(conn, epic)
+        verification_events = [
+            event
+            for event in kb.list_events(conn, epic)
+            if event.kind == "repository_verification"
+        ]
+
+    assert result == "attention_required"
+    assert task is not None and task.rework_count == 0
+    assert verification_events
+    payload = verification_events[-1].payload
+    assert isinstance(payload, dict)
+    assert payload["status"] == "configuration_error"
+    assert payload["rework_eligible"] is False
 
 
 def test_fast_forward_rejects_target_that_moved_after_candidate(tmp_path):

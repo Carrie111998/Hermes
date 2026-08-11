@@ -96,9 +96,12 @@ from hermes_cli.kanban_repository import (
     RepositoryContract,
     RefreshRequest,
     RefreshResult,
+    VerificationProfile,
+    VerificationResult,
     load_repository_contract,
     refresh_story_branch,
     resolve_commit,
+    run_verification,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -13470,6 +13473,7 @@ class IntegrationCandidate:
     scratch_worktree: Path
     repo_root: Path
     candidate_ref: str
+    verification_result: Optional[VerificationResult] = None
 
 
 _RECONCILE_INTEGRATION_VERIFY_UNSET = object()
@@ -13486,9 +13490,54 @@ class ReleaseResult:
 
 
 class IntegrationCandidateError(RuntimeError):
-    def __init__(self, message: str, *, scratch_worktree: Optional[Path] = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        scratch_worktree: Optional[Path] = None,
+        verification_result: Optional[VerificationResult] = None,
+    ):
         super().__init__(message)
         self.scratch_worktree = scratch_worktree
+        self.verification_result = verification_result
+
+
+def _verification_result_payload(
+    result: VerificationResult, *, scope: str, subject_id: str
+) -> dict[str, Any]:
+    """Serialize bounded repository verification evidence for a task event."""
+
+    return {
+        "scope": scope,
+        "subject_id": subject_id,
+        "status": result.status,
+        "source_sha": result.source_sha,
+        "candidate_sha": result.candidate_sha,
+        "contract_digest": result.contract_digest,
+        "profile": result.profile,
+        "error": result.error,
+        "rework_eligible": result.status == "failed",
+        "steps": [
+            {
+                "argv": list(step.argv),
+                "workdir": str(step.workdir),
+                "status": step.status,
+                "returncode": step.returncode,
+                "duration_seconds": step.duration_seconds,
+                "stdout_tail": step.stdout_tail,
+                "stderr_tail": step.stderr_tail,
+                "error": step.error,
+            }
+            for step in result.steps
+        ],
+    }
+
+
+def _verification_needs_attention(result: Optional[VerificationResult]) -> bool:
+    return result is not None and result.status in {
+        "configuration_error",
+        "infrastructure_error",
+    }
 
 
 def _integration_git(
@@ -13549,6 +13598,11 @@ def _build_verified_merge_candidate(
     *,
     expected_source_sha: Optional[str] = None,
     allow_empty_contribution: bool = False,
+    verification_profile: Optional[VerificationProfile] = None,
+    verification_contract_digest: Optional[str] = None,
+    verification_scope: str = "story_integration",
+    verification_subject_id: str = "",
+    verification_profile_name: Optional[str] = None,
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
@@ -13619,7 +13673,21 @@ def _build_verified_merge_candidate(
             "could not resolve integration candidate", scratch_worktree=scratch
         )
 
-    if candidate_verify_fn is None:
+    verification_result: Optional[VerificationResult] = None
+    if verification_contract_digest is not None:
+        configured_result = run_verification(
+            verification_profile,
+            scratch,
+            source_sha=approved_source_sha,
+            candidate_sha=candidate_sha,
+            contract_digest=verification_contract_digest,
+            scope=verification_scope,
+            subject_id=verification_subject_id,
+            profile_name=verification_profile_name,
+        )
+        verification_result = configured_result
+        verified = configured_result.status == "passed"
+    elif candidate_verify_fn is None:
         script = scratch / "scripts" / "run_tests.sh"
         if not script.is_file():
             verified = False
@@ -13644,7 +13712,12 @@ def _build_verified_merge_candidate(
     if not verified:
         _cleanup_provisioned_node_dependencies(scratch)
         _remove_clean_integration_worktree(repo_root, scratch)
-        raise IntegrationCandidateError("candidate verification failed")
+        raise IntegrationCandidateError(
+            "candidate verification failed"
+            if verification_result is None
+            else f"candidate verification {verification_result.status}",
+            verification_result=verification_result,
+        )
 
     _cleanup_provisioned_node_dependencies(scratch)
 
@@ -13684,6 +13757,7 @@ def _build_verified_merge_candidate(
         scratch_worktree=scratch,
         repo_root=repo_root,
         candidate_ref=candidate_ref,
+        verification_result=verification_result,
     )
 
 
@@ -13749,8 +13823,6 @@ def _default_epic_verify(
     unit tests (which inject ``verify_fn`` instead).
     """
     try:
-        if repository_contract_for_board(board) is not None:
-            return False
         board_default = (
             read_board_metadata(board or get_current_board()).get("default_workdir") or ""
         ).strip()
@@ -13759,6 +13831,7 @@ def _default_epic_verify(
         repo_root = _git_toplevel(Path(board_default).expanduser())
         if repo_root is None:
             return False
+        contract = repository_contract_for_board(board, repo_root=repo_root)
         _ensure_epic_branch(repo_root, epic_branch, start_point=None)
         target = repo_root / ".worktrees" / f"epic-verify-{epic_branch.replace('/', '-')}"
         from hermes_cli.worktree_dependencies import _acquire_project_lock
@@ -13773,6 +13846,23 @@ def _default_epic_verify(
                 repo_root, target, epic_branch, base="HEAD"
             )
             try:
+                if contract is not None:
+                    source_sha = _git_ref_sha(repo_root, epic_branch)
+                    candidate_result = _integration_git(target, ["rev-parse", "HEAD"])
+                    candidate_sha = (candidate_result.stdout or "").strip()
+                    if not source_sha or candidate_result.returncode != 0 or not candidate_sha:
+                        return False
+                    result = run_verification(
+                        contract.verification.get("epic_release"),
+                        target,
+                        source_sha=source_sha,
+                        candidate_sha=candidate_sha,
+                        contract_digest=contract.digest,
+                        scope="epic_release",
+                        subject_id=epic_branch,
+                        profile_name="epic_release",
+                    )
+                    return result.status == "passed"
                 script = target / "scripts" / "run_tests.sh"
                 if not script.exists():
                     return False
@@ -13910,7 +14000,15 @@ def merge_epic_to_main(
         return None
     _validate_stored_product_workflow_state(conn, epic_id)
 
-    readiness_verify = (lambda _branch: True) if candidate_verify_fn else verify_fn
+    # A repository contract owns verification for governed boards.  Do not
+    # run the legacy boolean readiness probe first: it would discard typed
+    # configuration/infrastructure results and return ``not_ready`` before the
+    # candidate builder can persist the required attention evidence.
+    readiness_verify = (
+        (lambda _branch: True)
+        if candidate_verify_fn is not None or "repository" in meta
+        else verify_fn
+    )
     if not epic_ready(conn, epic_id, board=board, verify_fn=readiness_verify):
         return "not_ready"
 
@@ -13920,6 +14018,7 @@ def merge_epic_to_main(
         epic_branch = epic_branch_for(epic_id)
         if repo_root is None or not _git_branch_exists(repo_root, epic_branch):
             return "not_ready"
+        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
     except Exception:
         return "not_ready"
 
@@ -13939,6 +14038,13 @@ def merge_epic_to_main(
             f"merge epic {epic_id}",
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
+            verification_profile=(
+                contract.verification.get("epic_release") if contract is not None else None
+            ),
+            verification_contract_digest=(contract.digest if contract is not None else None),
+            verification_scope="epic_release",
+            verification_subject_id=epic_id,
+            verification_profile_name="epic_release",
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -13951,6 +14057,17 @@ def merge_epic_to_main(
 
         try:
             with write_txn(conn):
+                if candidate.verification_result is not None:
+                    _append_event(
+                        conn,
+                        epic_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            candidate.verification_result,
+                            scope="epic_release",
+                            subject_id=epic_id,
+                        ),
+                    )
                 _append_event(
                     conn,
                     epic_id,
@@ -13971,7 +14088,24 @@ def merge_epic_to_main(
         return "merged"
     except IntegrationCandidateError as exc:
         reason = str(exc)
+        if exc.verification_result is not None:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        epic_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            exc.verification_result,
+                            scope="epic_release",
+                            subject_id=epic_id,
+                        ),
+                    )
+            except Exception:
+                pass
         _fail(reason)
+        if _verification_needs_attention(exc.verification_result):
+            return "attention_required"
         if "merge conflict" in reason:
             return "conflict"
         return "verify_failed"
@@ -14148,6 +14282,7 @@ def integrate_story_to_epic(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return None
+        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
         if reviewed_candidate is not None:
             if reviewed_candidate.branch != story_branch:
                 return None
@@ -14281,6 +14416,17 @@ def integrate_story_to_epic(
                         effective_verify_fn,
                         expected_source_sha=candidate_expected_source_sha,
                         allow_empty_contribution=existing_integration,
+                        verification_profile=(
+                            contract.verification.get("story_integration")
+                            if contract is not None
+                            else None
+                        ),
+                        verification_contract_digest=(
+                            contract.digest if contract is not None else None
+                        ),
+                        verification_scope="story_integration",
+                        verification_subject_id=story_id,
+                        verification_profile_name="story_integration",
                     )
                 finally:
                     if reviewed_source_ref is not None:
@@ -14313,14 +14459,39 @@ def integrate_story_to_epic(
                     return "verify_failed"
             except IntegrationCandidateError as exc:
                 with write_txn(conn):
+                    if exc.verification_result is not None:
+                        _append_event(
+                            conn,
+                            story_id,
+                            "repository_verification",
+                            _verification_result_payload(
+                                exc.verification_result,
+                                scope="story_integration",
+                                subject_id=story_id,
+                            ),
+                        )
                     _append_event(
                         conn,
                         story_id,
                         "story_integration_failed",
                         {"reason": str(exc), "release_candidate": True},
                     )
+                if _verification_needs_attention(exc.verification_result):
+                    return "attention_required"
                 return "conflict" if "merge conflict" in str(exc) else "verify_failed"
 
+            if candidate.verification_result is not None:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        story_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            candidate.verification_result,
+                            scope="story_integration",
+                            subject_id=story_id,
+                        ),
+                    )
             _record_story_integration(
                 conn, story_id, epic_id, epic_branch,
                 {
@@ -14489,6 +14660,7 @@ def _merge_standalone_story_to_main(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return "not_ready"
+        contract = repository_contract_for_metadata(meta, repo_root=repo_root)
         authority_records = _terminal_run_records(conn, story_id)
         authority_phase_present = any(
             record.phase in {"test", "review"} for record in authority_records
@@ -14556,6 +14728,15 @@ def _merge_standalone_story_to_main(
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
             allow_empty_contribution=already_merged,
+            verification_profile=(
+                contract.verification.get("story_integration")
+                if contract is not None
+                else None
+            ),
+            verification_contract_digest=(contract.digest if contract is not None else None),
+            verification_scope="story_integration",
+            verification_subject_id=story_id,
+            verification_profile_name="story_integration",
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -14568,6 +14749,17 @@ def _merge_standalone_story_to_main(
 
         try:
             with write_txn(conn):
+                if candidate.verification_result is not None:
+                    _append_event(
+                        conn,
+                        story_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            candidate.verification_result,
+                            scope="story_integration",
+                            subject_id=story_id,
+                        ),
+                    )
                 _append_event(
                     conn,
                     story_id,
@@ -14588,7 +14780,24 @@ def _merge_standalone_story_to_main(
         return "already_merged" if already_merged else "merged"
     except IntegrationCandidateError as exc:
         reason = str(exc)
+        if exc.verification_result is not None:
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        story_id,
+                        "repository_verification",
+                        _verification_result_payload(
+                            exc.verification_result,
+                            scope="story_integration",
+                            subject_id=story_id,
+                        ),
+                    )
+            except Exception:
+                pass
         _fail(reason)
+        if _verification_needs_attention(exc.verification_result):
+            return "attention_required"
         if "merge conflict" in reason:
             return "conflict"
         return "verify_failed"
