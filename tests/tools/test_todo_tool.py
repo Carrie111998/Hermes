@@ -30,6 +30,16 @@ class TestWriteAndRead:
             {"id": "1", "content": "Latest version", "status": "in_progress"},
         ]
 
+    def test_write_preserves_items_without_ids(self):
+        store = TodoStore()
+        result = store.write([
+            {"content": "Task 1", "status": "pending"},
+            {"content": "Task 2", "status": "pending"},
+        ])
+        assert len(result) == 2
+        assert result[0]["content"] == "Task 1"
+        assert result[1]["content"] == "Task 2"
+
 
 class TestHasItems:
     def test_empty_store(self):

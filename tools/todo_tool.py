@@ -196,8 +196,12 @@ class TodoStore:
                 # Non-dict items get a synthetic key so _validate can handle them
                 last_index[f"__invalid_{i}"] = i
                 continue
-            item_id = str(item.get("id", "")).strip() or "?"
-            last_index[item_id] = i
+            raw_id = item.get("id", "")
+            item_id = str(raw_id).strip() if raw_id is not None else ""
+            if not item_id:
+                last_index[f"__missing_id_{i}"] = i
+            else:
+                last_index[item_id] = i
         return [todos[i] for i in sorted(last_index.values())]
 
 
