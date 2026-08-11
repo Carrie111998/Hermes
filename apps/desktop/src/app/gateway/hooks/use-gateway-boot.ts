@@ -258,11 +258,15 @@ export function useGatewayBoot({
       try {
         const pref = await desktop.profile?.get?.()
         const profileKey = resolveWindowBackendProfile(connection.profile, pref?.profile)
+
+        sourceProfile = profileKey
         $activeGatewayProfile.set(profileKey)
         setPrimaryGateway(gateway, profileKey)
         void ensureGatewayForProfile(profileKey)
       } catch {
-        $activeGatewayProfile.set(resolveWindowBackendProfile(connection.profile, null))
+        sourceProfile = resolveWindowBackendProfile(connection.profile, null)
+        $activeGatewayProfile.set(sourceProfile)
+        setPrimaryGateway(gateway, sourceProfile)
       }
     }
 
@@ -378,9 +382,10 @@ export function useGatewayBoot({
     }
 
     const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    let sourceProfile = survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get())
 
     callbacksRef.current.onGatewayReady(gateway)
-    setPrimaryGateway(gateway, survivor?.profile ?? normalizeProfileKey($activeGatewayProfile.get()))
+    setPrimaryGateway(gateway, sourceProfile)
     // Secondary (background-profile) sockets funnel into the same handler.
     configureGatewayRegistry({ onEvent: event => callbacksRef.current.handleGatewayEvent(event) })
 
@@ -410,8 +415,6 @@ export function useGatewayBoot({
         scheduleReconnect()
       }
     })
-
-    const sourceProfile = normalizeProfileKey($activeGatewayProfile.get())
 
     const offEvent = gateway.onEvent(event =>
       callbacksRef.current.handleGatewayEvent({ ...event, profile: sourceProfile })

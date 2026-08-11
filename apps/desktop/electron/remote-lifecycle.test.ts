@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { execFile as execFileCallback } from 'node:child_process'
+import { execFile as execFileCallback, spawn } from 'node:child_process'
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -402,6 +402,41 @@ test.runIf(process.platform !== 'win32')('pidIsOurDashboard does not trust a tex
     }
 
     assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), false)
+  } finally {
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test.runIf(process.platform !== 'win32')('pidIsOurDashboard rejects a process with duplicate owner nonce options', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'hermes-ownership-nonce-'))
+  const entrypoint = join(directory, 'hermes-entrypoint')
+  const otherNonce = 'fedcba9876543210'
+
+  try {
+    await writeFile(entrypoint, 'import time\ntime.sleep(30)\n')
+    await chmod(entrypoint, 0o700)
+
+    const child = spawn('python3', [
+      entrypoint,
+      'serve',
+      '--isolated',
+      '--ssh-owner-nonce',
+      SPAWN_NONCE,
+      '--ssh-owner-nonce',
+      otherNonce
+    ])
+
+    try {
+      const ssh = {
+        async exec(command: string) {
+          return (await execFile('/bin/sh', ['-c', command])).stdout
+        }
+      }
+
+      assert.equal(await pidIsOurDashboard(ssh, child.pid, SPAWN_NONCE, entrypoint), false)
+    } finally {
+      child.kill('SIGKILL')
+    }
   } finally {
     await rm(directory, { recursive: true, force: true })
   }

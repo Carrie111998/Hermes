@@ -2,7 +2,9 @@ import { act, cleanup, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
+import { $activeGatewayProfile } from '@/store/profile'
 import { $currentCwd, $gatewayState } from '@/store/session'
+import type { RpcEvent } from '@/types/hermes'
 
 import { takeGatewaySurvivor } from './gateway-hmr-survivor'
 import { useGatewayBoot } from './use-gateway-boot'
@@ -69,6 +71,10 @@ class FakeWebSocket {
     this.emit('close', {})
   }
 
+  message(params: RpcEvent) {
+    this.emit('message', { data: JSON.stringify({ jsonrpc: '2.0', method: 'event', params }) })
+  }
+
   private emit(type: string, ev: unknown) {
     for (const fn of this.listeners[type] ?? []) {
       fn(ev)
@@ -76,11 +82,11 @@ class FakeWebSocket {
   }
 }
 
-function fakeDesktop() {
+function fakeDesktop(profile = 'default') {
   const conn = {
     authMode: 'token' as const,
     baseUrl: 'https://vps.example.com',
-    profile: 'default',
+    profile,
     token: 't',
     wsUrl: 'wss://vps.example.com/api/ws?token=t'
   }
@@ -115,11 +121,16 @@ function fakeDesktop() {
 
 function Harness({
   beforeConnectionSwitch = () => undefined,
+  handleGatewayEvent = () => undefined,
   refreshSessions
-}: { beforeConnectionSwitch?: () => void; refreshSessions?: () => Promise<void> } = {}) {
+}: {
+  beforeConnectionSwitch?: () => void
+  handleGatewayEvent?: (event: RpcEvent) => void
+  refreshSessions?: () => Promise<void>
+} = {}) {
   useGatewayBoot({
     beforeConnectionSwitch,
-    handleGatewayEvent: () => undefined,
+    handleGatewayEvent,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
     refreshHermesConfig: async () => undefined,
@@ -338,6 +349,30 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
     expect($desktopBoot.get().visible).toBe(false)
     expect($desktopBoot.get().phase).toBe('renderer.ready')
+  })
+
+  it('tags primary events with the main-owned connection profile adopted during boot', async () => {
+    const desktop = fakeDesktop('coder')
+
+    const handleGatewayEvent = vi.fn()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    $activeGatewayProfile.set('default')
+
+    render(<Harness handleGatewayEvent={handleGatewayEvent} />)
+    await flushAsync()
+
+    act(() => FakeWebSocket.instances[0].message({ type: 'sessions.changed' }))
+
+    expect(handleGatewayEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ profile: 'coder', type: 'sessions.changed' })
+    )
+
+    handleGatewayEvent.mockClear()
+    $activeGatewayProfile.set('reviewer')
+    act(() => FakeWebSocket.instances[0].message({ type: 'cron.changed' }))
+
+    expect(handleGatewayEvent).toHaveBeenCalledWith(expect.objectContaining({ profile: 'coder', type: 'cron.changed' }))
   })
 
   it('seeds the configured default project dir pre-connect — no route-resume race (#71873)', async () => {

@@ -433,10 +433,11 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
       'ok=False\n' +
       'try:\n' +
       ' serve=args.index("serve")\n' +
-      ' owner=args.index("--ssh-owner-nonce",serve+1)\n' +
+      ' tail=args[serve+1:]\n' +
+      ' owners=[i for i,value in enumerate(tail) if value=="--ssh-owner-nonce"]\n' +
       ' direct=args[0]==expected\n' +
       ' python_entry=len(args)>1 and args[1]==expected and os.path.basename(args[0]).startswith("python")\n' +
-      ' ok=(direct or python_entry) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
+      ' ok=(direct or python_entry) and args.count("serve")==1 and tail.count("--isolated")==1 and len(owners)==1 and owners[0]+1<len(tail) and tail[owners[0]+1]==nonce\n' +
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 
