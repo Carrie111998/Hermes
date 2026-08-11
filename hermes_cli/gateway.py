@@ -4094,22 +4094,35 @@ def generate_launchd_plist() -> str:
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
-    # Build a sane PATH for the launchd plist.  launchd provides only a
+    # Build a curated PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
-    # nvm, cargo, etc.  We prepend venv/bin and node_modules/.bin (matching
-    # the systemd unit), then capture the user's full shell PATH so every
-    # user-installed tool (node, ffmpeg, …) is reachable.
+    # nvm, cargo, etc.  We use the same curated approach as the systemd unit
+    # instead of capturing the invoking shell's os.environ["PATH"], which
+    # bakes session-scoped directories (sandbox bins, transient tool dirs)
+    # into a service definition that persists across reboots.  The staleness
+    # check masks PATH during comparison, so a stale session PATH is never
+    # detected and the daemon runs with a dead PATH indefinitely (#83699).
     detected_venv = _detect_venv_dir()
     venv_dir = str(detected_venv) if detected_venv else str(PROJECT_ROOT / "venv")
     # Resolve the directory containing the node binary (e.g. Homebrew, nvm)
     # so it's explicitly in PATH even if the user's shell PATH changes later.
     priority_dirs = _build_service_path_dirs()
     _append_node_dir_for_service(priority_dirs)
-    sane_path = ":".join(
-        dict.fromkeys(
-            priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]
-        )
-    )
+    # Add user-local bin dirs (uv, cargo, go, npm-global) if they exist.
+    priority_dirs.extend(_build_user_local_paths(Path.home(), priority_dirs))
+    # macOS standard tool locations (Homebrew Apple Silicon, Intel, system).
+    macos_common = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    ]
+    for p in macos_common:
+        if p not in priority_dirs:
+            priority_dirs.append(p)
+    sane_path = ":".join(dict.fromkeys(priority_dirs))
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
