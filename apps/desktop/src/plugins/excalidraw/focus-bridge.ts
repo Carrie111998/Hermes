@@ -11,35 +11,102 @@ export function focusedDrawingPaths(
   profile: string,
   layout: LayoutNode | null
 ): string[] {
-  if (!layout) {return []}
+  if (!layout) {
+    return []
+  }
 
   const profileKey = normalizeProfileKey(profile)
 
   return documents.flatMap(({ identity, status }) => {
     const group = findGroupOfPane(layout, excalidrawPaneId(identity))
 
-    return status === 'connected' && normalizeProfileKey(identity.profile) === profileKey && group?.active === excalidrawPaneId(identity)
+    return status === 'connected' &&
+      normalizeProfileKey(identity.profile) === profileKey &&
+      group?.active === excalidrawPaneId(identity)
       ? [identity.path]
       : []
   })
 }
 
+interface FocusSnapshot {
+  profile: string
+  sessionId: string
+}
+
+const sameFocusSession = (left: FocusSnapshot, right: FocusSnapshot) =>
+  left.profile === right.profile && left.sessionId === right.sessionId
+
 export function installFocusedDrawingBridge(): () => void {
+  let disposed = false
+  let generation = 0
+  let lastSession: FocusSnapshot | null = null
+  let pending = Promise.resolve()
+
+  const publish = (session: FocusSnapshot, paths: string[]) =>
+    host
+      .request('excalidraw.focus', {
+        paths,
+        profile: session.profile,
+        session_id: session.sessionId
+      })
+      .catch(() => undefined)
+
   const sync = () => {
+    if (disposed) {
+      return
+    }
+
+    const requestGeneration = ++generation
     const sessionId = host.state.activeSessionId.get()
+    const profile = host.state.profile.get()
+    const session = sessionId ? { profile, sessionId } : null
+    const paths = session ? focusedDrawingPaths($excalidrawDocuments.get(), profile, $layoutTree.get()) : []
+    const previousSession = lastSession
 
-    if (!sessionId) {return}
+    pending = pending.then(async () => {
+      if (disposed) {
+        return
+      }
 
-    void host.request('excalidraw.focus', {
-      paths: focusedDrawingPaths($excalidrawDocuments.get(), host.state.profile.get(), $layoutTree.get()),
-      profile: host.state.profile.get(),
-      session_id: sessionId
-    }).catch(() => undefined)
+      if (previousSession && (!session || !sameFocusSession(previousSession, session))) {
+        await publish(previousSession, [])
+      }
+
+      if (disposed || requestGeneration !== generation) {
+        return
+      }
+      if (!session) {
+        lastSession = null
+        return
+      }
+
+      lastSession = session
+      void publish(session, paths)
+    })
   }
 
-  const off = [$excalidrawDocuments.listen(sync), $layoutTree.listen(sync), host.state.activeSessionId.listen(sync), host.state.gateway.listen(sync), host.state.profile.listen(sync)]
+  const off = [
+    $excalidrawDocuments.listen(sync),
+    $layoutTree.listen(sync),
+    host.state.activeSessionId.listen(sync),
+    host.state.gateway.listen(sync),
+    host.state.profile.listen(sync)
+  ]
 
   sync()
 
-  return () => off.forEach(stop => stop())
+  return () => {
+    if (disposed) {
+      return
+    }
+    disposed = true
+    generation += 1
+    off.forEach(stop => stop())
+
+    const previousSession = lastSession
+    lastSession = null
+    if (previousSession) {
+      void publish(previousSession, [])
+    }
+  }
 }

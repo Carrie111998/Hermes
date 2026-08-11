@@ -3215,6 +3215,7 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        profile = _current_profile_name()
         with _sessions_lock:
             for sess in list(_sessions.values()):
                 if sess.get("session_key") == session_key:
@@ -3222,6 +3223,8 @@ def _set_session_context(
                     session_id = (
                         getattr(sess.get("agent"), "session_id", None) or session_key
                     )
+                    if sess.get("profile_home"):
+                        profile = Path(str(sess["profile_home"])).name
                     break
         return set_session_vars(
             session_key=session_key,
@@ -3229,6 +3232,7 @@ def _set_session_context(
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
+            profile=profile,
             cron_session="",
         )
     except Exception:

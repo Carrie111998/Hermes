@@ -98,6 +98,7 @@ from gateway.status import (
     read_runtime_status,
     resolve_gateway_liveness,
 )
+from tools.file_state import lock_path
 from utils import env_var_enabled
 
 try:
@@ -2657,8 +2658,15 @@ async def fs_read_text(path: str):
         raise HTTPException(status_code=413, detail="File too large")
     bytes_to_read = min(st.st_size, _FS_TEXT_PREVIEW_MAX_BYTES)
     try:
-        with target.open("rb") as handle:
-            data = handle.read(bytes_to_read)
+        # Excalidraw mutations hold this same per-path lock through their
+        # read→modify→write transaction. A drawing baseline therefore cannot
+        # observe a half-finished mutation.
+        with lock_path(str(target)):
+            with target.open("rb") as handle:
+                data = handle.read(bytes_to_read)
+                digest = hashlib.sha256(data)
+                while chunk := handle.read(64 * 1024):
+                    digest.update(chunk)
     except PermissionError:
         raise HTTPException(status_code=403, detail="File is not readable")
     except OSError as exc:
@@ -2666,6 +2674,7 @@ async def fs_read_text(path: str):
     return {
         "binary": _fs_looks_binary(data[:4096]),
         "byteSize": st.st_size,
+        "fingerprint": digest.hexdigest(),
         "language": _FS_PREVIEW_LANGUAGE_BY_EXT.get(target.suffix.lower(), "text"),
         "mimeType": _fs_mime_type(target),
         "path": str(target),
@@ -2676,41 +2685,45 @@ async def fs_read_text(path: str):
 
 @app.post("/api/fs/write-text")
 async def fs_write_text(payload: FsWriteText):
-    """Overwrite (or create) a UTF-8 text file for the in-app spot editor.
+    """Atomically write UTF-8 text, optionally compare-and-swapping a baseline.
 
-    Mirrors the local Electron ``hermes:fs:writeText`` hardening: the path is
-    resolved + validated by ``_fs_path``, the parent directory must already
-    exist (we never build directory trees), only regular files may be replaced,
-    and the payload is size-capped. The write is staged to a sibling temp file
-    and ``os.replace``-d into place so a crash mid-write can't truncate the
-    original. Stale-on-disk detection is the client's job (re-read before save),
-    so both transports behave identically.
+    Drawing saves supply an expected SHA-256 fingerprint. Its check, sibling
+    temp-file write, and replacement share ``tools.file_state.lock_path`` with
+    Excalidraw agent mutations, so a stale renderer can lose the race but
+    cannot overwrite the mutation that won it.
     """
     target = _fs_path(payload.path)
     text = payload.content or ""
-    if len(text.encode("utf-8")) > _FS_TEXT_WRITE_MAX_BYTES:
+    encoded = text.encode("utf-8")
+    if len(encoded) > _FS_TEXT_WRITE_MAX_BYTES:
         raise HTTPException(status_code=413, detail="Content too large")
-
-    try:
-        st: Optional[os.stat_result] = target.stat()
-    except FileNotFoundError:
-        st = None
-    except PermissionError:
-        raise HTTPException(status_code=403, detail="File is not writable")
-    except OSError as exc:
-        raise HTTPException(status_code=400, detail=str(exc) or "Invalid path")
-
-    if st is not None and stat.S_ISDIR(st.st_mode):
-        raise HTTPException(status_code=400, detail="Path points to a directory")
-    if st is not None and not stat.S_ISREG(st.st_mode):
-        raise HTTPException(status_code=400, detail="Only regular files can be written")
-    if not target.parent.is_dir():
-        raise HTTPException(status_code=400, detail="Parent directory does not exist")
 
     tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
     try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, target)
+        with lock_path(str(target)):
+            try:
+                st: Optional[os.stat_result] = target.stat()
+            except FileNotFoundError:
+                st = None
+            except PermissionError:
+                raise HTTPException(status_code=403, detail="File is not writable")
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail=str(exc) or "Invalid path")
+
+            if st is not None and stat.S_ISDIR(st.st_mode):
+                raise HTTPException(status_code=400, detail="Path points to a directory")
+            if st is not None and not stat.S_ISREG(st.st_mode):
+                raise HTTPException(status_code=400, detail="Only regular files can be written")
+            if not target.parent.is_dir():
+                raise HTTPException(status_code=400, detail="Parent directory does not exist")
+
+            if payload.expected_fingerprint is not None:
+                current_fingerprint = hashlib.sha256(target.read_bytes()).hexdigest() if st is not None else None
+                if current_fingerprint != payload.expected_fingerprint:
+                    raise HTTPException(status_code=409, detail="document changed since baseline")
+
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, target)
     except PermissionError:
         tmp.unlink(missing_ok=True)
         raise HTTPException(status_code=403, detail="File is not writable")
@@ -2718,7 +2731,12 @@ async def fs_write_text(payload: FsWriteText):
         tmp.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
 
-    return {"ok": True, "path": str(target), "byteSize": len(text.encode("utf-8"))}
+    return {
+        "ok": True,
+        "path": str(target),
+        "byteSize": len(encoded),
+        "fingerprint": hashlib.sha256(encoded).hexdigest(),
+    }
 
 
 @app.get("/api/fs/read-data-url")

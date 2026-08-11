@@ -137,6 +137,12 @@ export {
 export type { StatusbarItem } from '@/app/shell/statusbar-controls'
 
 export type { TitlebarTool } from '@/app/shell/titlebar-controls'
+/** Pane placement roles. `'floating'` is the one NON-tiling value: the pane is
+ *  excluded from the layout tree and rendered as a fixed, draggable card above
+ *  it — it takes no width from any zone, has no tab, and can't be docked.
+ *  Pair it with `anchor` (spawn corner, default `'top-right'`) plus
+ *  `width`/`height`. */
+export type { FloatingAnchor } from '@/components/pane-shell/tree/renderer/floating-rect'
 export { StatusDot, type StatusTone } from '@/components/status-dot'
 export { Badge } from '@/components/ui/badge'
 export { Button } from '@/components/ui/button'
@@ -216,6 +222,7 @@ export { type GrabScroll, useGrabScroll } from '@/hooks/use-grab-scroll'
  *  `ctx.i18n.register` let a plugin ship its OWN locale bundles, scoped like
  *  `ctx.storage` and resolved against the app's active locale — no core edit. */
 export {
+  type Locale,
   type PluginI18n,
   type PluginLocaleBundles,
   type PluginMessages,

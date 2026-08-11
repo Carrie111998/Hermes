@@ -6,6 +6,7 @@ from tools import desktop_ui
 from tools import excalidraw_tools
 from tools import file_tools
 from tools.registry import registry
+from model_tools import handle_function_call
 
 SCENE_PATH = '/tmp/scene.excalidraw'
 RESOLVED_SCENE_PATH = os.path.realpath(SCENE_PATH)
@@ -171,6 +172,92 @@ def test_mutation_emits_changed_event_only_after_durable_write(monkeypatch):
         'path': '/tmp/scene.excalidraw', 'profile': 'default', 'runtime': 'local', 'fingerprint': 'new-fingerprint',
     })]
 
+
+def test_production_dispatch_uses_live_desktop_profile_for_focus_and_events(monkeypatch):
+    """Registry dispatch only supplies task/session ids; profile lives in ContextVar."""
+    profile = 'work-a'
+    session_id = 'durable-session'
+    events = []
+    mutation_calls = []
+
+    def mutate(path, **kwargs):
+        mutation_calls.append((path, kwargs))
+        identity = type('Identity', (), {
+            'path': path,
+            'profile': kwargs['profile'],
+            'runtime': kwargs['runtime'],
+        })()
+        return type('Result', (), {
+            'path': path,
+            'fingerprint': 'updated-fingerprint',
+            'affected_ids': ['new-element'],
+            'identity': identity,
+        })()
+
+    document = type('Document', (), {'fingerprint': 'opened-fingerprint'})()
+    monkeypatch.setattr(excalidraw_tools, 'mutate_document', mutate)
+    monkeypatch.setattr(excalidraw_tools, 'read_document', lambda *args, **kwargs: document)
+    monkeypatch.setattr(excalidraw_tools.desktop_ui, 'available', lambda: True)
+    monkeypatch.setattr(excalidraw_tools, 'request_tool_approval', lambda *args, **kwargs: {'approved': True})
+    monkeypatch.setattr(excalidraw_tools.desktop_ui, 'emit', lambda event, payload: events.append((event, payload)) or True)
+
+    excalidraw_tools.set_focused_drawings(session_id, profile, [SCENE_PATH])
+    tokens = set_session_vars(source='desktop', profile=profile)
+    try:
+        changed = json.loads(handle_function_call(
+            'excalidraw_add',
+            {'elements': [{'id': 'new-element', 'type': 'rectangle'}]},
+            task_id='task-1',
+            session_id=session_id,
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        ))
+        opened = json.loads(handle_function_call(
+            'open_excalidraw',
+            {'path': SCENE_PATH},
+            task_id='task-1',
+            session_id=session_id,
+            skip_pre_tool_call_hook=True,
+            skip_tool_request_middleware=True,
+            skip_tool_execution_middleware=True,
+        ))
+    finally:
+        restore_session_vars(tokens)
+
+    assert mutation_calls == [(
+        SCENE_PATH,
+        {
+            'operation': 'add',
+            'payload': [{'id': 'new-element', 'type': 'rectangle'}],
+            'expected_fingerprint': None,
+            'task_id': 'task-1',
+            'profile': profile,
+            'runtime': 'local',
+        },
+    )]
+    assert changed == {
+        'path': SCENE_PATH,
+        'profile': profile,
+        'runtime': 'local',
+        'fingerprint': 'updated-fingerprint',
+        'affected_ids': ['new-element'],
+    }
+    assert opened == {'path': RESOLVED_SCENE_PATH}
+    assert events == [
+        ('excalidraw.changed', {
+            'path': SCENE_PATH,
+            'profile': profile,
+            'runtime': 'local',
+            'fingerprint': 'updated-fingerprint',
+        }),
+        ('excalidraw.open', {
+            'path': RESOLVED_SCENE_PATH,
+            'profile': profile,
+            'runtime': 'local',
+            'fingerprint': 'opened-fingerprint',
+        }),
+    ]
 
 
 def test_omitted_path_requires_exactly_one_focused_drawing():
