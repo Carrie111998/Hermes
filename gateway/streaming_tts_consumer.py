@@ -42,6 +42,7 @@ import asyncio
 import logging
 import queue
 import threading
+from concurrent.futures import Future
 from typing import Any, Dict, Optional
 
 from agent.async_utils import safe_schedule_threadsafe
@@ -55,6 +56,10 @@ _DONE = object()
 
 class StreamingTTSConsumer:
     """Consumes LLM text deltas and produces streaming PCM audio for an adapter."""
+
+    # Class-level default so the attribute is readable on instances built via
+    # ``__new__`` (which never run ``__init__``) as well as normal ones.
+    _abort_future: Optional[Future] = None
 
     def __init__(
         self,
@@ -101,6 +106,7 @@ class StreamingTTSConsumer:
         self._dropped = False
         self._suppress_whole_file = False
         self._task: Optional[asyncio.Task] = None
+        self._abort_future: Optional[Future] = None
         self._lock = threading.Lock()
 
         # Pre-allocate the strip-markdown helper lazily to avoid import cycles.
@@ -415,7 +421,16 @@ class StreamingTTSConsumer:
             # ``coroutine '_safe_abort' was never awaited``.  Route it through
             # the leak-safe bridge instead, which closes the coroutine on
             # every failure path.
-            safe_schedule_threadsafe(
+            #
+            # Retain the returned future.  The loop keeps only a weak
+            # reference to a task, so an in-flight abort with no owner can be
+            # collected mid-await; the future returned by
+            # run_coroutine_threadsafe is chained to the loop-side task and
+            # keeps it alive for its whole lifetime.  This mirrors how the
+            # drain task is anchored in ``self._task`` above, and gives the
+            # caller a handle it can wait on.  It is ``None`` when scheduling
+            # failed.
+            self._abort_future = safe_schedule_threadsafe(
                 self._safe_abort(reason),
                 self._loop,
                 logger=logger,
