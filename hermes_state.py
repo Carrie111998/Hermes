@@ -706,24 +706,94 @@ def _backup_db_file(db_path: Path) -> Optional[Path]:
         return None
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+class StateDbProbeTimeout(Exception):
+    """A bounded :func:`_db_opens_cleanly` probe ran out of budget.
+
+    Deliberately an exception rather than a reason string. Callers treat a
+    reason as "this database is corrupt" and escalate to destructive repair
+    strategies, so "we ran out of time" must be impossible to confuse with
+    "we found damage".
+    """
+
+    def __init__(self, stage: str, timeout_seconds: float) -> None:
+        self.stage = stage
+        self.timeout_seconds = timeout_seconds
+        super().__init__(
+            f"health probe exceeded its {timeout_seconds:g}s budget during {stage}"
+        )
+
+
+def _arm_probe_deadline(
+    conn: sqlite3.Connection, timeout_seconds: float
+) -> Tuple[Callable[[], None], threading.Event]:
+    """Abort *conn*'s in-flight statement after *timeout_seconds*.
+
+    Returns ``(cancel, timed_out)``.
+
+    ``sqlite3.Connection.interrupt`` is the only mechanism that reliably
+    aborts a statement already executing inside SQLite. ``PRAGMA
+    integrity_check`` is a single VDBE opcode, so a progress handler barely
+    fires inside it — measured on the 5.1 GB state.db that motivated this:
+    one callback in 3.5s at n=10000, versus ``interrupt()`` landing within
+    ~50ms of the deadline.
+    """
+    timed_out = threading.Event()
+
+    def _fire() -> None:
+        timed_out.set()
+        try:
+            conn.interrupt()
+        except Exception:  # pragma: no cover — connection already closed
+            pass
+
+    timer = threading.Timer(timeout_seconds, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer.cancel, timed_out
+
+
+def _db_opens_cleanly(
+    db_path: Path, *, timeout_seconds: Optional[float] = None
+) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
-    malformed-schema parse, then ``PRAGMA integrity_check`` and a canonical
-    ``sessions`` read, and finally a rolled-back ``messages`` write so that
-    FTS5 index corruption — which leaves base-table reads and
-    ``integrity_check`` passing while every ``INSERT INTO messages`` fails
-    through the FTS triggers — is reported as unhealthy rather than slipping
-    past as a false "ok" (#50502).
+    malformed-schema parse, a canonical ``sessions`` read, and a rolled-back
+    ``messages`` write so that FTS5 index corruption — which leaves base-table
+    reads and ``integrity_check`` passing while every ``INSERT INTO messages``
+    fails through the FTS triggers — is reported as unhealthy rather than
+    slipping past as a false "ok" (#50502).
+
+    ``PRAGMA integrity_check`` runs **last**. It is the only statement here
+    whose cost scales with database size (a page-by-page verification of every
+    b-tree), so putting it after the targeted probes means a database too
+    large to scan exhaustively still gets every cheap check.
+
+    Args:
+        timeout_seconds: Wall-clock budget for the whole probe. ``None`` (the
+            default) means unbounded: the repair paths gate destructive
+            strategies on this result and must not trade thoroughness for
+            latency. When a budget is set and exhausted, raises
+            :class:`StateDbProbeTimeout` — never a reason string.
+
+    Raises:
+        StateDbProbeTimeout: the budget was exhausted. Not a corruption signal.
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    cancel_deadline: Optional[Callable[[], None]] = None
+    timed_out: Optional[threading.Event] = None
+    deadline: Optional[float] = None
+    if timeout_seconds is not None:
+        deadline = time.monotonic() + timeout_seconds
+        cancel_deadline, timed_out = _arm_probe_deadline(conn, timeout_seconds)
+
+    def _raise_if_timed_out(stage: str, exc: Optional[sqlite3.Error] = None) -> None:
+        """Convert a watchdog-induced abort into the timeout signal."""
+        if timed_out is not None and timed_out.is_set():
+            raise StateDbProbeTimeout(stage, float(timeout_seconds)) from exc
+
     try:
         conn.execute("PRAGMA journal_mode").fetchone()
-        rows = conn.execute("PRAGMA integrity_check").fetchall()
-        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-        if problems:
-            return "; ".join(problems[:3])
         conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
 
         # FTS write probe: drive a row through the messages_fts* triggers in a
@@ -751,14 +821,34 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
                 conn.execute("ROLLBACK")
             except sqlite3.Error:
                 pass
+            _raise_if_timed_out("the FTS write probe", exc)
             msg = str(exc).lower()
             if "no such table" in msg or "no such column" in msg:
                 return None
             return str(exc)
+
+        # Exhaustive scan last: O(database size). Check the budget before
+        # starting it so an already-spent deadline reports a timeout instead
+        # of opening a scan the watchdog would only have to abort.
+        if deadline is not None and time.monotonic() >= deadline:
+            raise StateDbProbeTimeout(
+                "PRAGMA integrity_check", float(timeout_seconds)
+            )
+        try:
+            rows = conn.execute("PRAGMA integrity_check").fetchall()
+        except sqlite3.DatabaseError as exc:
+            _raise_if_timed_out("PRAGMA integrity_check", exc)
+            raise
+        problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+        if problems:
+            return "; ".join(problems[:3])
         return None
     except sqlite3.DatabaseError as exc:
+        _raise_if_timed_out("the health probe", exc)
         return str(exc)
     finally:
+        if cancel_deadline is not None:
+            cancel_deadline()
         conn.close()
 
 
