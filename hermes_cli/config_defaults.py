@@ -300,6 +300,9 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Optional cross-process guard for resource-heavy terminal jobs (test
+        # suites, Supabase/PGlite labs, and AI reviewer CLIs). Zero disables it.
+        "max_concurrent_heavy_jobs": 0,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
