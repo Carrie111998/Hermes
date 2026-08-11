@@ -1164,8 +1164,8 @@ Switch between them with `/model custom:neon-preview:gpt-5-mini`. A branch outsi
 Neon AI Gateway is in beta, requires a paid Neon plan, and runs only in AWS US East (Ohio) (`aws-us-east-2`). Outside a credential's branch lineage the gateway returns `403` with `credential not authorized for this branch`. The beta caps usage at 200,000 tokens per minute per account, counting input and output together.
 :::
 
-:::info Two models are Responses-only
-`gpt-5-3-codex` and `gpt-5-5-pro` are served only through the OpenAI Responses API, which Neon exposes under `/openai/v1` instead of `/v1`. A chat-completions custom endpoint cannot reach them. Every other model in the catalog answers on `/v1`.
+:::info Some models are Responses-only
+A few models are served only through the OpenAI Responses API, which Neon exposes under `/openai/v1` instead of `/v1`, and a chat-completions custom endpoint cannot reach them. The Endpoints column in Neon's [model catalog](https://neon.com/docs/ai-gateway/models) is what marks them; the set changes, so check the column rather than a list copied here. At the time of writing it is `gpt-5-3-codex` and `gpt-5-5-pro`. Everything the column lists with `chat/completions` answers on `/v1`.
 :::
 
 :::note Response content shape
