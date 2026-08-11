@@ -198,10 +198,8 @@ _TELEGRAM_UPDATER_SHUTDOWN_MESSAGE = (
 )
 
 
-def _is_nonnegative_finite_number(value: object) -> bool:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return False
-    return math.isfinite(value) and value >= 0
+def _is_nonnegative_finite_float(value: object) -> bool:
+    return type(value) is float and math.isfinite(value) and value >= 0
 
 
 def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> None:
@@ -217,17 +215,22 @@ def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> 
         return
     args = record.args
     discord_retry = (
-        record.name == "discord.client"
+        type(record.name) is str
+        and record.name == "discord.client"
+        and type(record.msg) is str
         and record.msg == _DISCORD_RECONNECT_TEMPLATE
-        and isinstance(args, tuple)
+        and type(args) is tuple
         and len(args) == 1
-        and _is_nonnegative_finite_number(args[0])
+        and _is_nonnegative_finite_float(args[0])
     )
     telegram_retry = (
-        record.name == "telegram.ext"
+        type(record.name) is str
+        and record.name == "telegram.ext"
+        and type(record.msg) is str
         and record.msg == _TELEGRAM_RETRY_ABORT_TEMPLATE
-        and isinstance(args, tuple)
+        and type(args) is tuple
         and len(args) == 3
+        and type(args[0]) is str
         and args[0] in _TELEGRAM_DELETE_WEBHOOK_PREFIXES
         and type(args[1]) is int
         and args[1] == 0
@@ -235,9 +238,12 @@ def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> 
         and args[2] == 0
     )
     telegram_shutdown = (
-        record.name == "telegram.ext.Updater"
+        type(record.name) is str
+        and record.name == "telegram.ext.Updater"
+        and type(record.msg) is str
         and record.msg == _TELEGRAM_UPDATER_SHUTDOWN_MESSAGE
-        and not args
+        and type(args) is tuple
+        and len(args) == 0
     )
     recovered_retry = (
         discord_retry

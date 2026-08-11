@@ -320,6 +320,7 @@ class TestRecoveredTransportRetrySeverity:
             ("discord.client", "Attempting a reconnect in %.2fs", (-1.0,)),
             ("discord.client", "Attempting a reconnect in %.2fs", (float("nan"),)),
             ("discord.client", "Attempting a reconnect in %.2fs", (True,)),
+            ("discord.client", "Attempting a reconnect in %.2fs", (10**10000,)),
             (
                 "telegram.ext",
                 "%s Failed run number %s of %s. Aborting.",
@@ -335,16 +336,30 @@ class TestRecoveredTransportRetrySeverity:
                 "%s Failed run number %s of %s. Aborting.",
                 ("Network Retry Loop (Bootstrap delete Webhook):", True, 0),
             ),
+            (
+                "telegram.ext",
+                "%s Failed run number %s of %s. Aborting.",
+                ([], 0, 0),
+            ),
         ],
     )
     def test_sdk_templates_with_unapproved_arguments_remain_errors(
-        self, caplog, logger_name, message, args
+        self, logger_name, message, args
     ):
-        caplog.set_level(logging.WARNING)
-        logging.getLogger(logger_name).error(message, *args)
-        record = caplog.records[-1]
+        factory = logging.getLogRecordFactory()
+        record = factory(
+            logger_name,
+            logging.ERROR,
+            __file__,
+            1,
+            message,
+            args,
+            None,
+        )
         assert record.levelno == logging.ERROR
         assert record.levelname == "ERROR"
+        assert record.msg == message
+        assert record.args == args
 
     def test_unrelated_malformed_error_formatting_is_not_evaluated(self):
         factory = logging.getLogRecordFactory()
@@ -360,6 +375,47 @@ class TestRecoveredTransportRetrySeverity:
         assert record.levelno == logging.ERROR
         assert record.msg == "broken %s"
         assert record.args == (1, 2)
+
+    @pytest.mark.parametrize("field", ["msg", "discord_arg", "telegram_prefix"])
+    def test_hostile_objects_are_not_evaluated(self, field):
+        class Hostile:
+            def __eq__(self, other):
+                raise AssertionError("equality must not run")
+
+            def __hash__(self):
+                raise AssertionError("hashing must not run")
+
+            def __float__(self):
+                raise AssertionError("float conversion must not run")
+
+            def __bool__(self):
+                raise AssertionError("truth testing must not run")
+
+        cases = {
+            "msg": ("discord.client", Hostile(), (1.0,)),
+            "discord_arg": (
+                "discord.client",
+                "Attempting a reconnect in %.2fs",
+                (Hostile(),),
+            ),
+            "telegram_prefix": (
+                "telegram.ext",
+                "%s Failed run number %s of %s. Aborting.",
+                (Hostile(), 0, 0),
+            ),
+        }
+        logger_name, message, args = cases[field]
+        factory = logging.getLogRecordFactory()
+        record = factory(
+            logger_name,
+            logging.ERROR,
+            __file__,
+            1,
+            message,
+            args,
+            None,
+        )
+        assert record.levelno == logging.ERROR
 
 
 class TestComponentFilter:
