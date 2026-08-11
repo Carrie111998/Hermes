@@ -17697,8 +17697,21 @@ def _maybe_open_browser(
 
 
 def _is_serve_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
-    """True when this process lost its original spawning parent (ppid changed)."""
-    return getppid() != original_ppid
+    """True when this process lost its original spawning parent (ppid changed).
+
+    On Windows, uv-managed venvs use a redirector shim for ``Scripts/python.exe``
+    that launches the real CPython as its child, so ``getppid()`` returns the
+    shim's PID, never the desktop's. A strict ppid comparison would then mark
+    every desktop-spawned backend as orphaned and kill it via ``os._exit(0)``
+    right after it announces READY. Prefer a liveness probe on the recorded
+    parent PID (psutil if available), falling back to the ppid comparison.
+    """
+    try:
+        import psutil
+
+        return not psutil.pid_exists(original_ppid)
+    except Exception:
+        return getppid() != original_ppid
 
 
 def _start_parent_death_watchdog() -> None:
@@ -17733,9 +17746,16 @@ def _start_parent_death_watchdog() -> None:
 
 
 def _demo() -> None:
-    # orphan iff current ppid differs from the recorded spawning parent
-    assert _is_serve_orphaned(999999999, getppid=lambda: 1) is True
-    assert _is_serve_orphaned(42, getppid=lambda: 42) is False
+    # orphan iff the recorded spawning parent is gone (ppid comparison
+    # fallback kept for the no-psutil path)
+    try:
+        import psutil  # noqa: F401
+
+        assert _is_serve_orphaned(999999999) is True
+        assert _is_serve_orphaned(__import__("os").getpid()) is False
+    except Exception:
+        assert _is_serve_orphaned(999999999, getppid=lambda: 1) is True
+        assert _is_serve_orphaned(42, getppid=lambda: 42) is False
     print("web_server parent-death watchdog self-check: OK")
 
 
