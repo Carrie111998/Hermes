@@ -86,6 +86,82 @@ describe("fetchJSON", () => {
 
     expect(reloadMocks.clearDashboardTokenReloadAttempt).toHaveBeenCalledTimes(1);
   });
+
+  it("does not show the session-expired banner when the reload fires", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        clone: () => ({ json: async () => ({}) }),
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        text: async () => "Unauthorized",
+      })),
+    );
+    reloadMocks.attemptDashboardTokenReloadOnce.mockReturnValue(true);
+
+    await Promise.race([
+      fetchJSON("/api/status"),
+      Promise.resolve("pending"),
+    ]);
+
+    expect(
+      document.getElementById("hermes-session-expired-banner"),
+    ).toBeNull();
+  });
+
+  it("shows the session-expired banner only after the reload was already attempted", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        clone: () => ({ json: async () => ({}) }),
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        text: async () => "Unauthorized",
+      })),
+    );
+    // Reload was already attempted (latch set) -> returns false, no navigation.
+    reloadMocks.attemptDashboardTokenReloadOnce.mockReturnValue(false);
+
+    await expect(fetchJSON("/api/status")).rejects.toThrow();
+
+    const banner = document.getElementById("hermes-session-expired-banner");
+    expect(banner).not.toBeNull();
+    expect(banner?.textContent).toContain("reload the page to reconnect");
+  });
+
+  it("dismisses the session-expired banner on a subsequent successful response", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        clone: () => ({ json: async () => ({}) }),
+        ok: false,
+        status: 401,
+        statusText: "Unauthorized",
+        text: async () => "Unauthorized",
+      })),
+    );
+    reloadMocks.attemptDashboardTokenReloadOnce.mockReturnValue(false);
+
+    await expect(fetchJSON("/api/status")).rejects.toThrow();
+    expect(
+      document.getElementById("hermes-session-expired-banner"),
+    ).not.toBeNull();
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        json: async () => ({ ok: true }),
+        ok: true,
+        status: 200,
+      })),
+    );
+    await expect(fetchJSON("/api/status")).resolves.toEqual({ ok: true });
+    expect(
+      document.getElementById("hermes-session-expired-banner"),
+    ).toBeNull();
+  });
 });
 
 describe("api.getModelOptions", () => {
