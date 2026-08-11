@@ -5,6 +5,19 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
+  claw3d: {
+    getStatus: profile => ipcRenderer.invoke('hermes:claw3d:status', profile),
+    setup: profile => ipcRenderer.invoke('hermes:claw3d:setup', profile),
+    start: profile => ipcRenderer.invoke('hermes:claw3d:start', profile),
+    stop: () => ipcRenderer.invoke('hermes:claw3d:stop'),
+    getLogs: () => ipcRenderer.invoke('hermes:claw3d:logs'),
+    open: profile => ipcRenderer.invoke('hermes:claw3d:open', profile),
+    onSetupProgress: callback => {
+      const listener = (_event, progress) => callback(progress)
+      ipcRenderer.on('hermes:claw3d:setup-progress', listener)
+      return () => ipcRenderer.removeListener('hermes:claw3d:setup-progress', listener)
+    }
+  },
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
