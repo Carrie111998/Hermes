@@ -1433,3 +1433,18 @@ test('windowsHide defaults to true on Windows, is left alone elsewhere', () => {
 If the logic lives inline in a god-file (`main.ts`, `cli.py`,
 `gateway/run.py`) and extracting it feels disruptive: that's the actual
 signal to do the extraction, not to regex around it.
+
+## Dispatched work: the Lane Contract is mandatory
+
+Every dispatched lane (Codex, Claude subagent, workflow agent) that writes code, configs, boxes,
+or trackers MUST carry a Lane Contract in its spec: Observable outcome · Done when (evidence,
+not task-list) · Resume identity (repo/branch/base SHA) · Proof-claim boundary · Stop conditions
+(200-LOC integration budget; scope drift → stop and report) · Evidence path · Secret boundary.
+Template: `~/.claude/skills/lane-contract/LANE-SPEC-TEMPLATE.md` (office Mac).
+
+Claim discipline: closeouts state a claim class (`advisory` / `pr_ready` / `merge_ready` /
+`release_ready` / `runtime_safe` / `customer_ready`) and what the result does NOT prove.
+`customer_ready` requires REAL end-user-session evidence (Telegram/Mattermost/Desktop) with
+pass-rates — in-process/loopback smokes are `loopback-only` and close no customer claim.
+Test harnesses never mutate customer-visible settings (approval modes, configs) to make a test
+fire. Integration UX problems get skills/runbooks/aliases before product code.
