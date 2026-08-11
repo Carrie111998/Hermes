@@ -496,6 +496,7 @@ def _require_tty(command_name: str) -> None:
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+from hermes_constants import get_hermes_home  # noqa: E402 -- needed at module level for _m().get_hermes_home() lookups from update_cmd.py
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
@@ -5046,6 +5047,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _npm_lockfile_changed,
     _npm_manifest_paths,
     _npm_manifests_digest,
+    _orphaned_desktop_backend_pids,
     _pause_windows_gateways_for_update,
     _print_curator_first_run_notice,
     _print_curator_recent_run_notice,
@@ -5058,6 +5060,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _refresh_windows_gateway_launchers,
     _reload_updated_runtime_modules,
     _resolve_pre_update_backup_mode,
+    _stop_process_trees,
     _resolve_stash_selector,
     _restore_stashed_changes,
     _resume_windows_gateways_after_update,

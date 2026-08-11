@@ -984,12 +984,23 @@ def get_catch_up_occurrence_count() -> int:
 
 
 def clear_ticker_error() -> None:
-    """Remove the last-tick-error marker after a successful tick. Best-effort."""
+    """Remove the last-tick-error marker after a successful tick. Best-effort.
+
+    A missing marker (FileNotFoundError) is the common, silent case -- there
+    was nothing to clear. Any other OSError (permissions, I/O failure) is a
+    genuine problem worth surfacing: a resolved failure could otherwise keep
+    being reported by 'hermes cron status'.
+    """
     store = _current_cron_store()
     try:
         (store.cron_dir / "ticker_last_error").unlink()
-    except OSError:
+    except FileNotFoundError:
         pass
+    except OSError as e:
+        logger.warning(
+            "Could not clear stale ticker_last_error marker — a resolved "
+            "failure may keep being reported by 'hermes cron status': %s", e,
+        )
 
 
 def get_ticker_last_error() -> Optional[str]:
