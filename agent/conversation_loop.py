@@ -516,6 +516,30 @@ def _billing_block_dict(provider, base_url, model, message="") -> Optional[dict]
         return None
 
 
+def _critical_both_failed_message(provider: str, model: str, summary: str) -> str:
+    """Distinct, higher-severity message for the double-failure case.
+
+    Fires only when the PRIMARY provider failed for a billing/credit reason
+    (HTTP 402 / ``FailoverReason.billing``) in this same turn AND the
+    fallback provider activated in response to that also failed (auth or
+    billing) before the turn could complete. An ordinary single-provider
+    auth/billing hiccup (primary fails, fallback succeeds; or only a
+    fallback is ever tried and it fails alone) keeps the existing generic
+    copy -- see ``TurnRetryState.primary_failed_billing_or_credit`` for the
+    exact gating. (kanban t_7b1728c5 / t_069d2d08)
+    """
+    provider_label = (provider or "").strip() or "unknown provider"
+    model_label = (model or "").strip() or "unknown model"
+    return (
+        "🔴 CRITICAL: both primary and fallback inference failed this turn. "
+        "The primary provider failed for a billing/credit reason (e.g. HTTP "
+        f"402), and the fallback provider ({provider_label} / {model_label}) "
+        f"also failed before completing this request: {summary}\n\n"
+        "Nothing will succeed until at least one of the two is fixed -- check "
+        "credentials/credits for BOTH the primary and fallback providers."
+    )
+
+
 def _print_billing_or_entitlement_guidance(
     agent,
     *,
@@ -4849,7 +4873,21 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                        # Record "primary died on billing/credits" ONLY when
+                        # this activation is still leaving the primary
+                        # (fallback_index was 0 before this call, i.e. we're
+                        # about to move to fallback_index 1). If we're
+                        # already deeper in an existing fallback chain, the
+                        # primary wasn't the source of this failure, so this
+                        # is ordinary fallback-chain churn, not the
+                        # "both-dead" case. See t_7b1728c5.
+                        _primary_billing_failure = (
+                            classified.reason == FailoverReason.billing
+                            and agent._fallback_index == 0
+                        )
                         if agent._try_activate_fallback(reason=classified.reason):
+                            if _primary_billing_failure:
+                                _retry.primary_failed_billing_or_credit = True
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -5661,6 +5699,23 @@ def run_conversation(
                     # the result with the same structured recovery descriptor as
                     # the max-retries path so every surface (CLI, TUI, desktop)
                     # renders one consistent billing signal.
+                    #
+                    # Distinct CRITICAL case: the primary already died on a
+                    # billing/credit reason this turn and the fallback we
+                    # switched to has now ALSO failed (billing or auth) before
+                    # completing — both legs of the failover are dead in the
+                    # same turn. That is a materially different, higher-
+                    # severity situation than an ordinary single-provider
+                    # billing/auth hiccup, so it gets its own message instead
+                    # of silently reusing the generic copy. (t_7b1728c5)
+                    _both_failed = (
+                        _retry.primary_failed_billing_or_credit
+                        and classified.reason in {
+                            FailoverReason.billing,
+                            FailoverReason.auth,
+                            FailoverReason.auth_permanent,
+                        }
+                    )
                     if classified.reason == FailoverReason.billing:
                         _ce_guidance = _billing_or_entitlement_message(
                             capability="model access",
@@ -5668,7 +5723,12 @@ def run_conversation(
                             base_url=str(_base),
                             model=_model,
                         )
-                        _ce_final = f"Billing or credits exhausted: {_nonretryable_summary}"
+                        if _both_failed:
+                            _ce_final = _critical_both_failed_message(
+                                _provider, _model, _nonretryable_summary,
+                            )
+                        else:
+                            _ce_final = f"Billing or credits exhausted: {_nonretryable_summary}"
                         if _ce_guidance:
                             _ce_final += f"\n\n{_ce_guidance}"
                         _ce_block = _billing_block_dict(_provider, _base, _model, _ce_guidance)
@@ -5679,8 +5739,24 @@ def run_conversation(
                             "completed": False,
                             "failed": True,
                             "error": _nonretryable_summary,
-                            "failure_reason": classified.reason.value,
+                            "failure_reason": (
+                                "critical_both_primary_and_fallback_failed"
+                                if _both_failed else classified.reason.value
+                            ),
                             "billing_block": _ce_block,
+                        }
+                    if _both_failed:
+                        _critical_final = _critical_both_failed_message(
+                            _provider, _model, _nonretryable_summary,
+                        )
+                        return {
+                            "final_response": _critical_final,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _nonretryable_summary,
+                            "failure_reason": "critical_both_primary_and_fallback_failed",
                         }
                     return {
                         "final_response": _nonretryable_summary,
@@ -5843,13 +5919,30 @@ def run_conversation(
                         )
                     agent._persist_session(messages, conversation_history)
                     _billing_block = None
+                    _both_failed_mr = (
+                        _retry.primary_failed_billing_or_credit
+                        and classified.reason in {
+                            FailoverReason.billing,
+                            FailoverReason.auth,
+                            FailoverReason.auth_permanent,
+                        }
+                    )
                     if classified.reason == FailoverReason.billing:
-                        _final_response = f"Billing or credits exhausted: {_final_summary}"
+                        if _both_failed_mr:
+                            _final_response = _critical_both_failed_message(
+                                _provider, _model, _final_summary,
+                            )
+                        else:
+                            _final_response = f"Billing or credits exhausted: {_final_summary}"
                         if _billing_guidance:
                             _final_response += f"\n\n{_billing_guidance}"
                         # Structured recovery descriptor so every surface renders
                         # the same link + label from one signal (see helper).
                         _billing_block = _billing_block_dict(_provider, _base, _model, _billing_guidance)
+                    elif _both_failed_mr:
+                        _final_response = _critical_both_failed_message(
+                            _provider, _model, _final_summary,
+                        )
                     else:
                         _final_response = f"API call failed after {max_retries} retries: {_final_summary}"
                     if _is_thinking_timeout:
@@ -5888,7 +5981,10 @@ def run_conversation(
                         # transient throttle from a real failure and choose a
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
-                        "failure_reason": classified.reason.value,
+                        "failure_reason": (
+                            "critical_both_primary_and_fallback_failed"
+                            if _both_failed_mr else classified.reason.value
+                        ),
                         # Present only for billing walls: structured recovery
                         # descriptor (provider, billing_url, is_nous, message).
                         "billing_block": _billing_block,

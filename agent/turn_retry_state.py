@@ -74,6 +74,17 @@ class TurnRetryState:
     # don't loop on the same auth failover within one attempt.
     auth_failover_attempted: bool = False
 
+    # Set once, within this same api-call attempt cycle, when the PRIMARY
+    # provider (fallback_index was 0) failed for a billing/credit reason
+    # (HTTP 402 / FailoverReason.billing) and we successfully activated the
+    # next entry in the fallback chain. If the fallback subsequently ALSO
+    # fails (auth or billing) before this cycle ends, the terminal-error
+    # branches use this flag to distinguish the "both primary AND fallback
+    # are dead" case — which needs a distinct, higher-severity alert — from
+    # an ordinary single-provider auth/billing hiccup. See the
+    # "both-primary-and-fallback-failed" fix (kanban t_7b1728c5 / t_069d2d08).
+    primary_failed_billing_or_credit: bool = False
+
     # ── Restart signals (read by the outer loop after the attempt) ───────
     restart_with_compressed_messages: bool = False
     restart_with_length_continuation: bool = False
