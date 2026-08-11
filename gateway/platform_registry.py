@@ -51,7 +51,22 @@ class PlatformEntry:
     adapter_factory: Callable[[Any], Any]
 
     # Returns True when the platform's dependencies are available.
+    #
+    # NOTE: for adapter plugins that defer a heavy SDK (see the Feishu
+    # adapter's FEISHU_AVAILABLE block), ``check_fn`` is also the *loader* --
+    # calling it imports the SDK.  Paths that only need to know "are the deps
+    # present?" (rather than "load them now") must prefer
+    # ``deps_available_fn`` below.
     check_fn: Callable[[], bool]
+
+    # Optional: cheap "are this platform's dependencies installed?" probe that
+    # must NOT import the SDK.  ``check_fn`` answers the same question by
+    # doing the load, which for lark_oapi means ~10k module imports (measured
+    # 413.9s cold on a chronically-full disk) -- far too expensive for
+    # ``_apply_env_overrides``, which runs on every ``load_gateway_config()``
+    # including the synchronous ``GET /api/status`` readiness probe.
+    # When None, callers fall back to ``check_fn``.
+    deps_available_fn: Optional[Callable[[], bool]] = None
 
     # Optional: given a PlatformConfig, is it properly configured?
     # If None, the registry skips config validation and lets the adapter

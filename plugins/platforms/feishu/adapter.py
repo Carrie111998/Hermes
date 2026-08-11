@@ -1372,6 +1372,33 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
         adapter._ws_thread_loop = None
 
 
+def lark_sdk_installed() -> bool:
+    """True when ``lark_oapi`` is importable from disk -- WITHOUT importing it.
+
+    ``check_feishu_requirements()`` answers the same question by performing the
+    load, which costs ~10k module imports (measured 413.9s cold on this box).
+    Enablement decisions in ``gateway/config.py::_apply_env_overrides`` only
+    need "is the SDK installed?", so they call this instead; the real load
+    still happens at adapter construction and in ``connect()``.
+
+    Deliberately ``PathFinder.find_spec``, not ``importlib.util.find_spec``:
+    the latter consults ``sys.modules`` first and raises ``ValueError`` when
+    the named module is present without a ``__spec__`` -- exactly what
+    ``tests/gateway/test_feishu_approval_buttons.py``'s ``MagicMock`` stub
+    looks like.  ``PathFinder`` searches ``sys.path``, so the answer reflects
+    the on-disk SDK.  Same rationale as ``_lark_installed()`` in
+    ``tests/gateway/test_feishu_lazy_sdk_import.py``.
+    """
+    if FEISHU_AVAILABLE:
+        return True
+    try:
+        from importlib.machinery import PathFinder
+
+        return PathFinder.find_spec("lark_oapi") is not None
+    except Exception:
+        return False
+
+
 def check_feishu_requirements() -> bool:
     """Load the Feishu/Lark SDK if needed and report whether it is usable.
 
@@ -5727,6 +5754,7 @@ def register(ctx) -> None:
         label="Feishu / Lark",
         adapter_factory=_build_adapter,
         check_fn=check_feishu_requirements,
+        deps_available_fn=lark_sdk_installed,
         is_connected=_is_connected,
         validate_config=_is_connected,
         required_env=["FEISHU_APP_ID", "FEISHU_APP_SECRET"],
