@@ -44,7 +44,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, FrozenSet, List, MutableMapping, Optional, Sequence
+from typing import Dict, FrozenSet, List, MutableMapping, Optional, Sequence, Tuple
 
 # Bump ONLY for breaking changes to the required contract surface
 # (abstract-method signatures, FetchResult required fields).  Additive
@@ -83,8 +83,9 @@ class ErrorKind(str, Enum):
 
     A fixed vocabulary keeps startup warnings and ``hermes secrets status``
     uniform across backends, and lets the orchestrator implement
-    kind-dependent policy (e.g. a future stale-cache fallback on
-    ``NETWORK``/``TIMEOUT`` but not on ``AUTH_FAILED``) exactly once.
+    kind-dependent policy (the stale-cache fallback on ``NETWORK``/
+    ``TIMEOUT``/``BINARY_MISSING`` but never on ``AUTH_FAILED`` — see
+    :meth:`SecretSource.stale_secrets`) exactly once.
     """
 
     NOT_CONFIGURED = "not_configured"    # enabled but missing token/project/map
@@ -199,6 +200,27 @@ class SecretSource(ABC):
         except (TypeError, ValueError):
             return DEFAULT_FETCH_TIMEOUT_SECONDS
         return val if val > 0 else DEFAULT_FETCH_TIMEOUT_SECONDS
+
+    def stale_secrets(
+        self, cfg: dict, home_path: Path
+    ) -> Optional[Tuple[Dict[str, str], float]]:
+        """Last complete cached pull for this config, or None.
+
+        Optional hook behind the orchestrator's stale-cache fallback: when
+        ``fetch()`` fails with a *retryable* kind (``NETWORK``/``TIMEOUT``/
+        ``BINARY_MISSING`` — never ``AUTH_FAILED``/``AUTH_EXPIRED``: revoked
+        credentials must not resurrect from a cache), the orchestrator asks
+        the source for its most recent complete pull and applies it with a
+        loud warning instead of letting the process start with nothing.
+        Rationale: a transient backend hiccup at boot otherwise ships empty
+        credentials to every downstream consumer for the process lifetime,
+        which is strictly worse than slightly-stale ones.
+
+        Returns ``(secrets, age_seconds)`` or None.  Must never raise,
+        prompt, or hit the network, and must respect the user's cache
+        opt-out (TTL <= 0 → None).  Default: no stale capability.
+        """
+        return None
 
     def config_schema(self) -> dict:
         """Optional description of this source's config keys.

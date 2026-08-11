@@ -32,7 +32,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, MutableMapping, Optional
+from typing import Dict, List, MutableMapping, Optional, Tuple
 
 from agent.secret_sources.base import (
     SECRET_SOURCE_API_VERSION,
@@ -50,6 +50,18 @@ logger = logging.getLogger(__name__)
 # insertion order, which doubles as the default apply order.
 _SOURCES: Dict[str, SecretSource] = {}
 _BUILTINS_LOADED = False
+
+# Failure kinds where serving a source's last complete cached pull is safe:
+# the backend was unreachable or slow — the credentials themselves were not
+# rejected.  AUTH_FAILED/AUTH_EXPIRED are deliberately absent (a revoked
+# credential must not resurrect from a cache), as is INTERNAL (unknown
+# failure shape → stay conservative).  Policy lives here, exactly once, per
+# the ErrorKind contract in base.py.
+_STALE_FALLBACK_KINDS = frozenset({
+    ErrorKind.NETWORK,
+    ErrorKind.TIMEOUT,
+    ErrorKind.BINARY_MISSING,
+})
 
 
 @dataclass
@@ -252,6 +264,30 @@ def _fetch_with_timeout(
     return result
 
 
+def _stale_rescue(
+    source: SecretSource, cfg: dict, home_path: Path,
+    environ: MutableMapping[str, str],
+) -> Optional[Tuple[Dict[str, str], float]]:
+    """Ask a failed source for its last complete cached pull; never raises.
+
+    Runs under the same per-fetch environment view as ``fetch()`` so the
+    source can fingerprint the auth material identically (a stale entry
+    cached under a different identity must not match).
+    """
+    try:
+        token = set_source_environment(environ)
+        try:
+            return source.stale_secrets(cfg, home_path)
+        finally:
+            reset_source_environment(token)
+    except Exception:  # noqa: BLE001 — optional hook, never block startup
+        logger.warning(
+            "Secret source '%s' stale_secrets() raised; ignoring",
+            source.name, exc_info=True,
+        )
+        return None
+
+
 def _ordered_enabled_sources(secrets_cfg: dict) -> List[SecretSource]:
     """Resolve which sources run, in which order.
 
@@ -387,6 +423,24 @@ def apply_all(secrets_cfg: dict, home_path: Path,
         cfg = secrets_cfg.get(source.name)
         cfg = cfg if isinstance(cfg, dict) else {}
         result = _fetch_with_timeout(source, cfg, home_path, env)
+        if not result.ok and result.error_kind in _STALE_FALLBACK_KINDS:
+            # Stale-cache fallback: a transient backend failure at startup
+            # must not ship empty credentials to every downstream consumer
+            # for the whole process lifetime.  Loud by design: warning on
+            # the result (surfaced by startup status) + logger.warning.
+            stale = _stale_rescue(source, cfg, home_path, env)
+            if stale is not None:
+                secrets, age = stale
+                note = (
+                    f"serving last cached secrets ({len(secrets)} var(s), "
+                    f"age {age / 3600.0:.1f}h) after {result.error_kind.value}"
+                    f" — original error: {result.error}"
+                )
+                logger.warning("secrets[%s]: %s", source.name, note)
+                result.warnings.append(note)
+                result.secrets = dict(secrets)
+                result.error = None
+                result.error_kind = None
         fetches.append((source, cfg, result))
         try:
             for var in source.protected_env_vars(cfg):
