@@ -510,6 +510,18 @@ class TestNativeScreenshots:
         out = f"step one saved {a}\nthen saved {b}\n"
         assert bu_cli._find_screenshot(out, since=time.time() - 5) == b
 
+    def test_find_screenshot_matches_native_windows_path(self, monkeypatch):
+        # A Windows-style path is not a leading-slash path; it must still be
+        # recognised. The file doesn't exist on this (POSIX) host, so stub the
+        # fs checks to accept it.
+        win = r"C:\Users\alice\AppData\Local\Temp\browser_use\shot.png"
+        monkeypatch.setattr(bu_cli.os.path, "isfile", lambda p: p == win)
+        monkeypatch.setattr(
+            bu_cli.os.path, "getmtime", lambda p: time.time() if p == win else 0
+        )
+        out = f"screenshot saved to {win}\n"
+        assert bu_cli._find_screenshot(out, since=time.time() - 5) == win
+
     def test_find_screenshot_rejects_stale_and_missing(self, tmp_path):
         stale = self._shot(tmp_path)
         os.utime(stale, (time.time() - 900, time.time() - 900))

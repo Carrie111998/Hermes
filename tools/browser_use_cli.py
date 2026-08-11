@@ -31,8 +31,13 @@ _STDERR_CAP_CHARS = 4000
 # Filesystem-safe task ids for per-task workspace dirs.
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
-# Screenshot paths printed by capture_screenshot() in the exec output
-_IMAGE_PATH_RE = re.compile(r"(/[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE)
+# Screenshot paths printed by capture_screenshot() in the exec output.
+# Match both POSIX paths (/tmp/.../shot.png) and native Windows paths
+# (C:\Users\...\shot.png) — a drive-letter prefix is not a leading slash.
+_IMAGE_PATH_RE = re.compile(
+    r"((?:/[^\s\"']+?|[A-Za-z]:\\[^\s\"']+?)\.(?:png|jpe?g|webp))",
+    re.IGNORECASE,
+)
 
 # http(s) URL literals in exec code checked against browser_navigate's policy
 _URL_RE = re.compile(r"https?://[^\s'\"\\)]+", re.IGNORECASE)
