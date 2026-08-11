@@ -23,9 +23,15 @@ import re
 from typing import Optional
 
 # Shape gate for ambient-endpoint token bodies (mode 1b in
-# _resolve_relay_identity_token): a bearer-token-ish string — base64url
-# segments, optionally dot-separated (JWT) — NOT an HTML error page.
-_AMBIENT_TOKEN_SHAPE = re.compile(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*")
+# _resolve_relay_identity_token). Accepts a bearer-token-shaped string:
+# either a multi-segment dotted token (JWT: header.payload.signature) or a
+# single long opaque token (>= 32 chars of the base64url alphabet). Short
+# bare words — 'unauthorized', 'error', 'null' — match the alphabet but are
+# plain-text error bodies, not credentials, and must fail closed.
+_AMBIENT_TOKEN_SHAPE = re.compile(
+    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+){2,}"  # JWT-like: 3+ dotted segments
+    r"|[A-Za-z0-9_-]{32,}"  # long opaque bearer token
+)
 
 
 def relay_url() -> Optional[str]:

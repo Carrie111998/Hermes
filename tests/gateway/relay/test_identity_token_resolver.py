@@ -146,6 +146,33 @@ def test_ambient_rejects_empty_body(monkeypatch):
         relay._resolve_relay_identity_token()
 
 
+def test_ambient_rejects_short_plaintext_error_words(monkeypatch):
+    """A terse plain-text error body (e.g. 'unauthorized') must not be
+    returned as a credential — it matches the base64url alphabet but is
+    neither a JWT nor plausibly an opaque token."""
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://proxy.local/access-token")
+
+    for body in ("unauthorized", "error", "access_denied", "null", "forbidden"):
+        def fake_urlopen(req, timeout=None, _b=body):
+            return io.BytesIO(_b.encode())
+
+        monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+        with pytest.raises(RuntimeError, match="ambient"):
+            relay._resolve_relay_identity_token()
+
+
+def test_ambient_accepts_long_opaque_token(monkeypatch):
+    """Non-JWT opaque bearer tokens (long random strings) still work."""
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://proxy.local/access-token")
+    opaque = "v2_9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b"
+
+    def fake_urlopen(req, timeout=None):
+        return io.BytesIO(opaque.encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    assert relay._resolve_relay_identity_token() == opaque
+
+
 def test_client_credentials_still_selected_when_creds_present(monkeypatch):
     """Presence of client creds keeps the POST grant — ambient never hijacks it."""
     monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://idp.test/token")
