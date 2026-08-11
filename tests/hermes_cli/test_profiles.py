@@ -719,6 +719,87 @@ class TestMigrateHonchoProfileHostWrite:
             os.path.dirname(src) == os.path.dirname(dst) for src, dst in replaces
         ), f"the rewrite staged its temp outside the resolved target's directory: {replaces}"
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX symlinks")
+    def test_unresolvable_candidate_is_skipped_not_written_through(
+        self, profile_env, monkeypatch
+    ):
+        """A candidate whose real path is unknown must never be written at all.
+
+        The rewrite is only safe when the writer is handed the *resolved*
+        target: it stages its temp beside whatever path it is given, so a
+        symlink stages on the link's filesystem and renames onto the real
+        file's.  ``Path.resolve`` can itself fail — ``ELOOP`` on a symlink
+        cycle, ``ENAMETOOLONG``, ``EACCES`` on a parent directory — and
+        falling back to the unresolved candidate hands the writer exactly the
+        symlink the invariant forbids, reinstating the cross-device truncation
+        of the file that holds the Honcho ``apiKey``.  Skipping the candidate
+        is the only outcome that cannot destroy credentials.
+        """
+        import errno
+
+        import utils
+
+        tmp_path = profile_env
+        other_fs = tmp_path / "other_fs"
+        other_fs.mkdir()
+        real = other_fs / "config.json"
+        real.write_text(json.dumps(self._host_block("oldname")))
+        os.chmod(real, 0o600)
+        link_dir = tmp_path / ".honcho"
+        link_dir.mkdir()
+        link = link_dir / "config.json"
+        link.symlink_to(real)
+        original_bytes = real.read_bytes()
+
+        genuine_resolve = Path.resolve
+
+        def resolve_fails_for_the_link(self, *args, **kwargs):
+            if os.fspath(self) == os.fspath(link):
+                raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), os.fspath(self))
+            return genuine_resolve(self, *args, **kwargs)
+
+        genuine_replace = os.replace
+
+        def replace_across_filesystems(src, dst, *args, **kwargs):
+            src, dst = os.fspath(src), os.fspath(dst)
+            if os.path.dirname(src) != os.path.dirname(dst):
+                raise OSError(errno.EXDEV, os.strerror(errno.EXDEV), src, None, dst)
+            return genuine_replace(src, dst)
+
+        def copyfile_runs_out_of_space(src, dst, **kwargs):
+            # shutil.copyfile opens the destination "wb" first; land a few
+            # bytes, then fail the way a filling disk does.
+            with open(src, "rb") as source, open(dst, "wb") as destination:
+                destination.write(source.read(8))
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+        written = []
+        genuine_write = utils.atomic_json_write
+
+        def record_write(path, data, **kwargs):
+            written.append(Path(path))
+            return genuine_write(path, data, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", resolve_fails_for_the_link)
+        monkeypatch.setattr(utils, "atomic_json_write", record_write)
+        monkeypatch.setattr("utils.os.replace", replace_across_filesystems)
+        monkeypatch.setattr("utils.shutil.copyfile", copyfile_runs_out_of_space)
+
+        profiles._migrate_honcho_profile_host("oldname", "newname", tmp_path / "absent")
+
+        assert real.read_bytes() == original_bytes, (
+            "a candidate that could not be resolved was written through and the "
+            f"Honcho credential file was destroyed; it now holds {real.read_bytes()!r}"
+        )
+        assert link not in written, (
+            "the rewrite was handed the unresolved symlink, which is exactly the "
+            f"input the resolved-target invariant forbids: {written}"
+        )
+        assert link.is_symlink()
+        assert real.stat().st_mode & 0o777 == 0o600
+        assert not list(other_fs.glob(".*.tmp"))
+        assert not list(link_dir.glob(".*.tmp"))
+
     def test_unwritable_candidate_still_advances_to_the_next(self, profile_env, monkeypatch):
         """The fail-soft ``continue`` must survive the switch to the helper."""
         import utils
