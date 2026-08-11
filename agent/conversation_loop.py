@@ -5003,6 +5003,22 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error("%s413 compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
+                        # A different provider may accept what this one refused: its context
+                        # window or request-size limit can simply be larger. Every other
+                        # terminal error class escalates to the chain before giving up (rate
+                        # limit, billing, transport, auth) -- the compression dead-ends were
+                        # the exception, so a configured fallback was never tried for a 413
+                        # or a context overflow. Mirrors the auth-failover block above.
+                        if agent._try_activate_fallback():
+                            agent._buffer_status(
+                                "Compression exhausted -- switching to fallback provider..."
+                            )
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Request payload too large: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -5075,6 +5091,22 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error("%s413 payload too large. Cannot compress further.", agent.log_prefix)
+                        # A different provider may accept what this one refused: its context
+                        # window or request-size limit can simply be larger. Every other
+                        # terminal error class escalates to the chain before giving up (rate
+                        # limit, billing, transport, auth) -- the compression dead-ends were
+                        # the exception, so a configured fallback was never tried for a 413
+                        # or a context overflow. Mirrors the auth-failover block above.
+                        if agent._try_activate_fallback():
+                            agent._buffer_status(
+                                "Compression exhausted -- switching to fallback provider..."
+                            )
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = "Request payload too large (413). Cannot compress further."
                         return {
@@ -5148,6 +5180,22 @@ def run_conversation(
                             agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
+                            # A different provider may accept what this one refused: its context
+                            # window or request-size limit can simply be larger. Every other
+                            # terminal error class escalates to the chain before giving up (rate
+                            # limit, billing, transport, auth) -- the compression dead-ends were
+                            # the exception, so a configured fallback was never tried for a 413
+                            # or a context overflow. Mirrors the auth-failover block above.
+                            if agent._try_activate_fallback():
+                                agent._buffer_status(
+                                    "Compression exhausted -- switching to fallback provider..."
+                                )
+                                active_system_prompt = _sync_failover_system_message(
+                                    agent, api_messages, active_system_prompt)
+                                retry_count = 0
+                                compression_attempts = 0
+                                _retry.primary_recovery_attempted = False
+                                continue
                             agent._persist_session(messages, conversation_history)
                             _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                             return {
@@ -5302,6 +5350,22 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                         logger.error("%sContext compression failed after %d attempts.", agent.log_prefix, max_compression_attempts)
+                        # A different provider may accept what this one refused: its context
+                        # window or request-size limit can simply be larger. Every other
+                        # terminal error class escalates to the chain before giving up (rate
+                        # limit, billing, transport, auth) -- the compression dead-ends were
+                        # the exception, so a configured fallback was never tried for a 413
+                        # or a context overflow. Mirrors the auth-failover block above.
+                        if agent._try_activate_fallback():
+                            agent._buffer_status(
+                                "Compression exhausted -- switching to fallback provider..."
+                            )
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded: max compression attempts ({max_compression_attempts}) reached."
                         return {
@@ -5365,6 +5429,22 @@ def run_conversation(
                         agent._vprint(f"{agent.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                         agent._vprint(f"{agent.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                         logger.error("%sContext length exceeded: %s tokens. Cannot compress further.", agent.log_prefix, f"{new_tokens:,}")
+                        # A different provider may accept what this one refused: its context
+                        # window or request-size limit can simply be larger. Every other
+                        # terminal error class escalates to the chain before giving up (rate
+                        # limit, billing, transport, auth) -- the compression dead-ends were
+                        # the exception, so a configured fallback was never tried for a 413
+                        # or a context overflow. Mirrors the auth-failover block above.
+                        if agent._try_activate_fallback():
+                            agent._buffer_status(
+                                "Compression exhausted -- switching to fallback provider..."
+                            )
+                            active_system_prompt = _sync_failover_system_message(
+                                agent, api_messages, active_system_prompt)
+                            retry_count = 0
+                            compression_attempts = 0
+                            _retry.primary_recovery_attempted = False
+                            continue
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Context length exceeded ({new_tokens:,} tokens). Cannot compress further."
                         return {
