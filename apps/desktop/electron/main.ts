@@ -192,6 +192,7 @@ import {
   SshConnection
 } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
+import { applyWindowsOcclusionCommandLineSwitches } from './windows-occlusion-flags'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
@@ -445,19 +446,25 @@ ipcMain.handle('hermes:get-remote-display-reason', () => REMOTE_DISPLAY_REASON)
 // window is minimized. This switch only affects scheduling priority; it does
 // not exempt timers from throttling and costs nothing at idle.
 //
-// The timer/rAF throttling story is deliberately NOT handled here anymore.
-// The old process-wide `disable-background-timer-throttling` /
-// `disable-backgrounding-occluded-windows` switches (plus a static
-// `backgroundThrottling: false` on every chat window) pinned every renderer's
-// `document.visibilityState` to 'visible' forever — which silently turned all
-// the renderer's visibility-gated backstop polls and clock ticks into
-// always-on timers. A completely idle, minimized Hermes burned ~20% CPU
-// around the clock. Throttling is now a runtime dial scoped to streaming:
-// see createStreamThrottle() — chat windows are unthrottled while any turn is
-// in flight (so a live answer keeps painting while blurred, occluded, or
-// minimized, exactly as before) and return to Chromium's default throttling
-// once the work settles.
+// Timer/rAF throttling is a runtime dial scoped to streaming (see
+// createStreamThrottle()) — NOT the old process-wide
+// `disable-background-timer-throttling` + static `backgroundThrottling: false`
+// combo that pinned every renderer's `document.visibilityState` to 'visible'
+// and burned ~20% CPU on an idle minimized Hermes.
+//
+// Windows still needs the occluded-window opt-out: Chromium's native
+// occlusion / backgrounding path can park the browser UI task runner on a
+// WaitableEvent with no wake after minimize or full occlusion (#83420).
+// That switch set is applied below; it does NOT restore the timer-throttling
+// opt-out or a static backgroundThrottling:false.
 app.commandLine.appendSwitch('disable-renderer-backgrounding')
+applyWindowsOcclusionCommandLineSwitches((name, value) => {
+  if (value === undefined) {
+    app.commandLine.appendSwitch(name)
+  } else {
+    app.commandLine.appendSwitch(name, value)
+  }
+})
 
 const SOURCE_REPO_ROOT = path.resolve(APP_ROOT, '../..')
 

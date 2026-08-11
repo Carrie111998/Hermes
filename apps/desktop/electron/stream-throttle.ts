@@ -44,6 +44,9 @@ export interface StreamThrottle {
   register(win: ThrottleWindowLike & { on?: (event: string, fn: () => void) => void }): void
   /** Report whether any turn is in flight across all renderers. */
   update(busy: boolean): void
+  /** Briefly unthrottle after show/restore/focus so a Windows occluded-window
+   * stall can pump the UI task runner again (#83420). */
+  wake(): void
 }
 
 export function createStreamThrottle(
@@ -53,6 +56,7 @@ export function createStreamThrottle(
   const windows = new Set<ThrottleWindowLike>()
   let unthrottled = false
   let trailing: unknown = null
+  let busy = false
 
   function apply(win: ThrottleWindowLike) {
     if (win.isDestroyed()) {
@@ -80,17 +84,25 @@ export function createStreamThrottle(
     }
   }
 
-  return {
+  const api: StreamThrottle = {
     isUnthrottled: () => unthrottled,
 
     register(win) {
       windows.add(win)
       win.on?.('closed', () => windows.delete(win))
+      // Defense in depth for #83420: when a chat window returns from
+      // minimize/occlusion, pulse unthrottled so the browser task runner
+      // gets a wake even if Chromium's occluded path wedged while hidden.
+      for (const event of ['show', 'restore', 'focus'] as const) {
+        win.on?.(event, () => api.wake())
+      }
       apply(win)
     },
 
-    update(busy) {
-      if (busy) {
+    update(nextBusy) {
+      busy = nextBusy
+
+      if (nextBusy) {
         if (trailing !== null) {
           timers.clearTimeout(trailing)
           trailing = null
@@ -114,6 +126,20 @@ export function createStreamThrottle(
         unthrottled = false
         applyAll()
       }, delayMs)
+    },
+
+    wake() {
+      // Force a trailing unthrottle window even when idle. If a turn is
+      // already in flight, update(true) is enough (and cancels any pending
+      // re-throttle). Capture busy first — update(true) latches it.
+      const wasBusy = busy
+      api.update(true)
+
+      if (!wasBusy) {
+        api.update(false)
+      }
     }
   }
+
+  return api
 }
