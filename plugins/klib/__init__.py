@@ -108,6 +108,25 @@ def _value_from_item(item: dict[str, Any], keys: tuple[str, ...]) -> str:
     return ""
 
 
+def _source_url_from_item(item: dict[str, Any]) -> str:
+    """Return only a source URL explicitly supplied by KLIB provenance."""
+    direct = _value_from_item(item, ("source_url", "drive_url"))
+    if direct:
+        return direct
+    provenance = item.get("source_provenance")
+    if not isinstance(provenance, dict):
+        return ""
+    for role in ("original", "mirror"):
+        source = provenance.get(role)
+        if not isinstance(source, dict):
+            continue
+        if source.get("status") == "verified":
+            url = source.get("view_url")
+            if isinstance(url, str) and url.strip():
+                return url.strip()
+    return ""
+
+
 def _deduplicate_results(results: list[Any]) -> list[Any]:
     """Deduplicate file results using the first hit for each identity."""
     distinct_results: list[Any] = []
@@ -147,6 +166,9 @@ def _format_result_lines(
         line = f"{index}. **{label}**"
         if snippet:
             line += f" — {snippet}"
+        source_url = _source_url_from_item(item) if isinstance(item, dict) else ""
+        if source_url:
+            line += f" — [Google Drive]({source_url})"
         lines.append(line)
     return lines
 
@@ -176,22 +198,22 @@ def _format_results(query: str, results: list[Any]) -> str:
     return _truncate_reply(reply, _MAX_REPLY_LENGTH)
 
 
-def _format_page(query: str, results: list[Any], page: int) -> str:
-    """Format one page of already-deduplicated results."""
-    total_pages = (len(results) + _PAGE_SIZE - 1) // _PAGE_SIZE
-    start = (page - 1) * _PAGE_SIZE
-    page_results = results[start : start + _PAGE_SIZE]
-    lines = [
-        f"Page {page} of {total_pages}.",
-    ]
-    lines.extend(_format_result_lines(query, page_results, start_index=start + 1))
+def _format_page(
+    query: str,
+    results: list[Any],
+    page: int,
+    total_pages: int | None = None,
+) -> str:
+    """Format one page of results returned by KLIB."""
+    lines = [f"Page {page} of {total_pages}." if total_pages else f"Page {page}."]
+    lines.extend(_format_result_lines(query, results, start_index=1))
     return _truncate_reply("\n".join(lines), _MAX_REPLY_LENGTH)
 
 
 def _make_pagination_keyboard(
     session_id: str,
     page: int,
-    total_pages: int,
+    has_more: bool,
 ) -> InlineKeyboardMarkup:
     buttons = []
     if page > 1:
@@ -200,7 +222,7 @@ def _make_pagination_keyboard(
                 "Prev", callback_data=f"klib:page:{page - 1}:{session_id}"
             )
         )
-    if page < total_pages:
+    if has_more:
         buttons.append(
             InlineKeyboardButton(
                 "Next", callback_data=f"klib:page:{page + 1}:{session_id}"
@@ -226,17 +248,102 @@ def _current_chat_id() -> str:
         return ""
 
 
-def _new_pagination_session(chat_id: int | str, query: str, results: list[Any]) -> str:
+def _new_pagination_session(
+    chat_id: int | str,
+    query: str,
+    mode: str,
+    results: list[Any],
+    pagination: dict[str, Any],
+    *,
+    legacy: bool = False,
+) -> str:
     session_id = hashlib.sha256(
-        f"{chat_id}:{query}:{time.time()}".encode()
+        f"{chat_id}:{query}:{mode}:{time.time()}".encode()
     ).hexdigest()[:8]
     _PAGINATION_SESSIONS[session_id] = {
         "chat_id": chat_id,
         "query": query,
-        "distinct_results": results,
+        "mode": mode,
+        "pages": {1: results},
+        "pagination": {1: pagination},
+        "legacy_results": results if legacy else None,
         "expires_at": time.time() + _SESSION_TTL,
     }
     return session_id
+
+
+async def _request_klib_page(
+    query: str,
+    cfg: dict[str, Any],
+    mode: str,
+    cursor: str | None = None,
+) -> dict[str, Any] | str:
+    """Fetch one KLIB page and normalize old/new response contracts."""
+    base_url = cfg.get("base_url")
+    if not isinstance(base_url, str) or not base_url.strip():
+        return _NOT_CONFIGURED_REPLY
+    headers: dict[str, str] = {}
+    key_file = cfg.get("key_file")
+    if key_file:
+        try:
+            api_key = Path(str(key_file)).read_text(encoding="utf-8").strip()
+            headers["Authorization"] = f"Bearer {api_key}"
+        except Exception:
+            return _static_reply("klib: could not read the configured API key file.")
+
+    params = {"q": query, "mode": mode, "limit": _PAGE_SIZE}
+    if cursor:
+        params["cursor"] = cursor
+    try:
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            response = await client.get(
+                f"{base_url.strip().rstrip('/')}/query",
+                params=params,
+                headers=headers,
+            )
+    except httpx.TimeoutException:
+        return _static_reply("klib: query timed out.")
+    except httpx.RequestError:
+        return _static_reply("klib: could not reach the klib service.")
+
+    if not 200 <= response.status_code < 300:
+        return f"klib: service returned HTTP status {response.status_code}."
+    try:
+        payload = response.json()
+    except Exception:
+        return _static_reply("klib: received an invalid JSON response.")
+    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
+        return _static_reply("klib: received an invalid response format.")
+
+    raw_pagination = payload.get("pagination")
+    if isinstance(raw_pagination, dict):
+        has_more = raw_pagination.get("has_more")
+        next_cursor = raw_pagination.get("next_cursor")
+        if not isinstance(has_more, bool) or (
+            has_more and not isinstance(next_cursor, str)
+        ):
+            return _static_reply("klib: received an invalid pagination response.")
+        pagination = {
+            "limit": _PAGE_SIZE,
+            "has_more": has_more,
+            "next_cursor": next_cursor if isinstance(next_cursor, str) else None,
+        }
+        legacy = False
+    else:
+        # Older KLIB instances have no cursor contract. Keep the old local
+        # fallback for responses that overfetch more than one page.
+        distinct = _deduplicate_results(payload["results"])
+        pagination = {
+            "limit": _PAGE_SIZE,
+            "has_more": len(distinct) > _PAGE_SIZE,
+            "next_cursor": None,
+        }
+        legacy = True
+    return {
+        "results": _deduplicate_results(payload["results"]),
+        "pagination": pagination,
+        "legacy": legacy,
+    }
 
 
 async def _handle_klib_callback(
@@ -264,19 +371,60 @@ async def _handle_klib_callback(
         ):
             return _INVALID_PAGINATION_REPLY, None
 
-        results = session.get("distinct_results")
         query = session.get("query")
-        if not isinstance(results, list) or not isinstance(query, str):
+        mode = session.get("mode")
+        pages = session.get("pages")
+        paginations = session.get("pagination")
+        if (
+            not isinstance(query, str)
+            or not isinstance(mode, str)
+            or not isinstance(pages, dict)
+            or not isinstance(paginations, dict)
+        ):
             return _INVALID_PAGINATION_REPLY, None
-
-        # Phase 1 intentionally pages only the _FETCH_LIMIT=25 overfetch: at
-        # most floor(25 / 5) = 5 pages. There is no offset re-fetch here.
-        total_pages = (len(results) + _PAGE_SIZE - 1) // _PAGE_SIZE
-        if page > total_pages or page > _FETCH_LIMIT // _PAGE_SIZE:
+        legacy_results = session.get("legacy_results")
+        legacy_total_pages = session.get("legacy_total_pages")
+        if (
+            isinstance(legacy_results, list)
+            and isinstance(legacy_total_pages, int)
+            and 1 <= page <= legacy_total_pages
+        ):
+            start = (page - 1) * _PAGE_SIZE
+            results = legacy_results[start : start + _PAGE_SIZE]
+            pagination = {
+                "has_more": page < legacy_total_pages,
+                "next_cursor": None,
+            }
+            pages[page] = results
+            paginations[page] = pagination
+        elif page in pages and page in paginations:
+            results = pages[page]
+            pagination = paginations[page]
+        elif page == max(pages) + 1:
+            previous = paginations.get(page - 1)
+            cursor = previous.get("next_cursor") if isinstance(previous, dict) else None
+            if not isinstance(cursor, str) or not cursor:
+                return _NO_MORE_RESULTS_REPLY, None
+            cfg = _load_klib_config()
+            if not cfg.get("enabled") or not cfg.get("base_url"):
+                return _NOT_CONFIGURED_REPLY, None
+            response = await _request_klib_page(query, cfg, mode, cursor)
+            if isinstance(response, str):
+                return response, None
+            results = response["results"]
+            pagination = response["pagination"]
+            pages[page] = results
+            paginations[page] = pagination
+        else:
             return _NO_MORE_RESULTS_REPLY, None
 
-        keyboard = _make_pagination_keyboard(session_id, page, total_pages)
-        return _format_page(query, results, page), keyboard
+        if not isinstance(results, list) or not isinstance(pagination, dict):
+            return _INVALID_PAGINATION_REPLY, None
+        keyboard = _make_pagination_keyboard(
+            session_id, page, bool(pagination.get("has_more"))
+        )
+        total_pages = legacy_total_pages if isinstance(legacy_total_pages, int) else None
+        return _format_page(query, results, page, total_pages), keyboard
     except Exception:
         logger.exception("klib: unexpected pagination callback failure")
         return _INVALID_PAGINATION_REPLY, None
@@ -289,58 +437,37 @@ async def _query_klib(
     chat_id: int | str = "",
 ) -> str | tuple[str, InlineKeyboardMarkup]:
     """Run the configured request and convert every expected failure to text."""
-    base_url = cfg.get("base_url")
-    if not isinstance(base_url, str) or not base_url.strip():
-        return _NOT_CONFIGURED_REPLY
-    base_url = base_url.strip()
+    response = await _request_klib_page(query, cfg, mode)
+    if isinstance(response, str):
+        return response
+    results = response["results"]
+    pagination = response["pagination"]
+    if not pagination.get("has_more"):
+        return _format_results(query, results)
 
-    headers: dict[str, str] = {}
-    key_file = cfg.get("key_file")
-    if key_file:
-        try:
-            api_key = Path(str(key_file)).read_text(encoding="utf-8").strip()
-            headers["Authorization"] = f"Bearer {api_key}"
-        except Exception:
-            return _static_reply("klib: could not read the configured API key file.")
-
-    try:
-        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-            response = await client.get(
-                f"{base_url.rstrip('/')}/query",
-                params={
-                    "q": query,
-                    "mode": mode,
-                    "limit": _FETCH_LIMIT,
-                },
-                headers=headers,
-            )
-    except httpx.TimeoutException:
-        return _static_reply("klib: query timed out.")
-    except httpx.RequestError:
-        return _static_reply("klib: could not reach the klib service.")
-
-    if not 200 <= response.status_code < 300:
+    if response.get("legacy"):
+        total_pages = (len(results) + _PAGE_SIZE - 1) // _PAGE_SIZE
+        session_id = _new_pagination_session(
+            chat_id,
+            query,
+            mode,
+            results,
+            pagination,
+            legacy=True,
+        )
+        session = _PAGINATION_SESSIONS[session_id]
+        session["legacy_total_pages"] = total_pages
         return (
-            "klib: service returned HTTP status "
-            f"{response.status_code}."
+            _format_page(query, results[:_PAGE_SIZE], 1, total_pages),
+            _make_pagination_keyboard(session_id, 1, True),
         )
 
-    try:
-        payload = response.json()
-    except Exception:
-        return _static_reply("klib: received an invalid JSON response.")
-
-    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-        return _static_reply("klib: received an invalid response format.")
-    distinct_results = _deduplicate_results(payload["results"])
-    if len(distinct_results) <= _PAGE_SIZE:
-        return _format_results(query, payload["results"])
-
-    total_pages = (len(distinct_results) + _PAGE_SIZE - 1) // _PAGE_SIZE
-    session_id = _new_pagination_session(chat_id, query, distinct_results)
+    session_id = _new_pagination_session(
+        chat_id, query, mode, results, pagination
+    )
     return (
-        _format_page(query, distinct_results, 1),
-        _make_pagination_keyboard(session_id, 1, total_pages),
+        _format_page(query, results, 1),
+        _make_pagination_keyboard(session_id, 1, True),
     )
 
 

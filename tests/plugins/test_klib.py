@@ -111,7 +111,7 @@ class TestKlibCommands:
         assert requests[0].url.path == "/query"
         assert requests[0].url.params["q"] == "cache invalidation"
         assert requests[0].url.params["mode"] == "lexical"
-        assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
+        assert requests[0].url.params["limit"] == str(mod._PAGE_SIZE)
         assert isinstance(result, tuple)
         text, keyboard = result
         assert "**docs/1.md**" in text
@@ -192,7 +192,7 @@ class TestKlibCommands:
         assert "Page 1 of 2." in text
         assert isinstance(keyboard, mod.InlineKeyboardMarkup)
         expected_session_id = hashlib.sha256(
-            f"chat-a:six files:{fixed_time}".encode()
+            f"chat-a:six files:lexical:{fixed_time}".encode()
         ).hexdigest()[:8]
         assert _callback_for_button(keyboard, "Next") == (
             f"klib:page:2:{expected_session_id}"
@@ -344,19 +344,130 @@ class TestKlibCommands:
 
         def handler(request):
             requests.append(request)
-            limit = int(request.url.params["limit"])
-            return httpx.Response(200, json={"results": corpus[:limit]})
+            return httpx.Response(200, json={"results": corpus})
 
         _install_transport(monkeypatch, mod, handler)
         result = _run(mod._handle_klib("shared topic"))
 
         assert len(requests) == 1
-        assert requests[0].url.params["limit"] == str(mod._FETCH_LIMIT)
+        assert requests[0].url.params["limit"] == str(mod._PAGE_SIZE)
         assert "**docs/dominant.md**" in result
         assert "**docs/other-1.md**" in result
         assert "**docs/other-2.md**" in result
         assert "**docs/other-3.md**" in result
         assert "Showing top 4 of 4 distinct files." not in result
+
+    def test_server_cursor_pages_exact_five_and_renders_drive_link(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        requests = []
+
+        def handler(request):
+            requests.append(request)
+            if request.url.params.get("cursor") == "cursor-1":
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": [
+                            {
+                                "file": "wiki/docs/6.md",
+                                "text": "sixth",
+                                "source_url": "https://drive.google.com/file/d/1A234567890/view",
+                                "source_provenance": {
+                                    "original": {"status": "verified"}
+                                },
+                            }
+                        ],
+                        "pagination": {
+                            "limit": 5,
+                            "has_more": False,
+                            "next_cursor": None,
+                        },
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "results": _distinct_results(5),
+                    "pagination": {
+                        "limit": 5,
+                        "has_more": True,
+                        "next_cursor": "cursor-1",
+                    },
+                },
+            )
+
+        _install_transport(monkeypatch, mod, handler)
+        initial = _run(mod._handle_klib("cursor query", chat_id="chat-a"))
+        text, keyboard = initial
+        assert "Page 1." in text
+        assert _callback_for_button(keyboard, "Next").startswith("klib:page:2:")
+
+        callback = _callback_for_button(keyboard, "Next")
+        page_two, page_two_keyboard = _run(
+            mod._handle_klib_callback(callback, "chat-a")
+        )
+        assert "wiki/docs/6.md" in page_two
+        assert "[Google Drive](https://drive.google.com/file/d/1A234567890/view)" in page_two
+        assert _callback_for_button(page_two_keyboard, "Prev")
+        assert requests[1].url.params["cursor"] == "cursor-1"
+
+    def test_server_has_more_shows_next_for_exactly_five_results(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "results": _distinct_results(5),
+                    "pagination": {
+                        "limit": 5,
+                        "has_more": True,
+                        "next_cursor": "cursor-1",
+                    },
+                },
+            ),
+        )
+
+        result = _run(mod._handle_klib("exactly five but more", chat_id="chat-a"))
+
+        assert isinstance(result, tuple)
+        assert _callback_for_button(result[1], "Next")
+
+    def test_verified_drive_link_is_not_invented_for_missing_provenance(self, monkeypatch):
+        mod = _load_plugin_init()
+        _mock_config(monkeypatch, mod, {"enabled": True, "base_url": "http://klib"})
+        _install_transport(
+            monkeypatch,
+            mod,
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "file": "wiki/docs/missing.md",
+                            "text": "no provenance",
+                            "source_provenance": {
+                                "status": "SOURCE_METADATA_MISSING",
+                                "original": {"status": "missing_metadata"},
+                            },
+                        }
+                    ],
+                    "pagination": {
+                        "limit": 5,
+                        "has_more": False,
+                        "next_cursor": None,
+                    },
+                },
+            ),
+        )
+
+        result = _run(mod._handle_klib("missing provenance"))
+
+        assert "Google Drive" not in result
+        assert "drive.google.com" not in result
 
     def test_successful_query_with_zero_results_is_friendly(self, monkeypatch):
         mod = _load_plugin_init()

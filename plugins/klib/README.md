@@ -23,15 +23,19 @@ klib:
 
 Queries use klib's lexical search mode by default and show at most five
 distinct files per page. Searches with more than five distinct results include
-Telegram Next/Prev buttons. Phase 1 uses the existing 25-result overfetch, so
-pagination is limited to at most five pages; it does not fetch additional
-results when a user goes past that limit. Prefix a query with the case-sensitive
+Telegram Next/Prev buttons. Pagination uses KLIB's cursor contract, so the
+Next button fetches another page instead of relying on a fixed local overfetch.
+Older KLIB responses without pagination metadata retain a bounded local
+fallback. Prefix a query with the case-sensitive
 `semantic ` keyword to use klib's semantic search mode instead.
 Repeated line hits from the same file are collapsed using the first hit in
 klib's response. The `read` form fetches and returns the full page text, with
 the Telegram reply capped at 2800 characters.
 
 Klib returns query text, file paths, snippets, and page content as raw text.
+When KLIB supplies verified Google Drive provenance, each result also includes
+a `[Google Drive](...)` link. Missing or unverified provenance is shown without
+inventing a URL.
 The downstream gateway formatter applies MarkdownV2 escaping once; result file
 labels are marked bold with standard `**label**` syntax.
 
