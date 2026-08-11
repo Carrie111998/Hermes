@@ -1080,7 +1080,11 @@ export function useSessionActions({
         // must not mask a lost transcript (a retry that reloads real history
         // is safer than surfacing the in-flight turn alone). Recovery only
         // ever appends, so this matches the final transcript's emptiness.
-        if (sessionShouldHaveTranscript(stored) && preferredMessages.length === 0) {
+        const responseClaimsHistory =
+          !createdThisRun.has(storedSessionId) && (resumed.message_count ?? 0) > 0
+        const shouldHaveTranscript = sessionShouldHaveTranscript(stored) || responseClaimsHistory
+
+        if (shouldHaveTranscript && preferredMessages.length === 0) {
           setActiveSessionId(null)
           activeSessionIdRef.current = null
           setResumeFailedSessionId(storedSessionId)

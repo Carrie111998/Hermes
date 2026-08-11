@@ -36,6 +36,7 @@ import {
   setSessions
 } from '@/store/session'
 import { $sessionTiles } from '@/store/session-states'
+import { isWatchWindow } from '@/store/windows'
 import type { SessionMessage, SessionResumeResponse } from '@/types/hermes'
 
 import { sessionRoute } from '../../routes'
@@ -65,6 +66,11 @@ vi.mock('@/components/pane-shell/tree/store', async importOriginal => ({
   revealTreePane: vi.fn()
 }))
 
+vi.mock('@/store/windows', async importOriginal => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  isWatchWindow: vi.fn(() => false)
+}))
+
 const RUNTIME_SESSION_ID = 'rt-new-001'
 
 function deferred<T>() {
@@ -81,7 +87,7 @@ function deferred<T>() {
 
 type HarnessHandle = Pick<
   ReturnType<typeof useSessionActions>,
-  'createBackendSessionForSend' | 'selectSidebarItem' | 'startFreshSessionDraft'
+  'createBackendSessionForSend' | 'resumeSession' | 'selectSidebarItem' | 'startFreshSessionDraft'
 >
 
 function storedSession(overrides: Partial<SessionInfo> = {}): SessionInfo {
@@ -654,6 +660,7 @@ describe('resumeSession failure recovery', () => {
     setResumeFailedSessionId(null)
     setMessages([])
     setSessions([])
+    vi.mocked(isWatchWindow).mockReset().mockReturnValue(false)
     vi.restoreAllMocks()
   })
 
@@ -898,6 +905,142 @@ describe('resumeSession failure recovery', () => {
     expect(JSON.stringify($messages.get())).toContain('continuation session history')
     expect(JSON.stringify($messages.get())).not.toContain('parent session history')
     expect($activeSessionId.get()).toBe('runtime-continuation')
+  })
+
+  it('arms the failure latch from resume message_count when the sidebar row is absent', async () => {
+    vi.mocked(getLatestSessionMessages).mockReset().mockRejectedValue(new Error('REST unavailable'))
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 3,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-1',
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway)
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(2)
+    expect($resumeFailedSessionId.get()).toBe('stored-1')
+    expect($activeSessionId.get()).toBeNull()
+  })
+
+  it('binds an empty session when REST fails and resume message_count is zero', async () => {
+    vi.mocked(getLatestSessionMessages).mockReset().mockRejectedValue(new Error('REST unavailable'))
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 0,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-1',
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway)
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(2)
+    expect($resumeFailedSessionId.get()).toBeNull()
+    expect($activeSessionId.get()).toBe('runtime-1')
+  })
+
+  it.each([true, false])(
+    'does not latch a newly created session from its live count when running=%s',
+    async running => {
+      const storedSessionId = `created-session-${String(running)}`
+
+      vi.mocked(getLatestSessionMessages).mockReset().mockResolvedValue({
+        messages: [],
+        session_id: storedSessionId
+      } as never)
+
+      const requestGateway = vi.fn(async (method: string) => {
+        if (method === 'session.create') {
+          return {
+            info: {},
+            message_count: 0,
+            messages: [],
+            session_id: `created-runtime-${String(running)}`,
+            stored_session_id: storedSessionId
+          } as never
+        }
+
+        if (method === 'session.resume') {
+          return {
+            info: {},
+            message_count: 1,
+            messages: [],
+            messages_omitted: true,
+            resumed: storedSessionId,
+            running,
+            session_id: `resumed-runtime-${String(running)}`,
+            session_key: storedSessionId
+          } as never
+        }
+
+        return {} as never
+      })
+
+      let handle: HarnessHandle | null = null
+      render(<Harness onReady={ready => (handle = ready)} requestGateway={requestGateway} />)
+      await waitFor(() => expect(handle).not.toBeNull())
+
+      await act(async () => {
+        await handle!.createBackendSessionForSend()
+      })
+      await act(async () => {
+        await handle!.resumeSession(storedSessionId, true)
+      })
+
+      expect($resumeFailedSessionId.get()).toBeNull()
+      expect($activeSessionId.get()).toBe(`resumed-runtime-${String(running)}`)
+    }
+  )
+
+  it('keeps watch-window lazy resume off the REST transcript path', async () => {
+    vi.mocked(isWatchWindow).mockReturnValue(true)
+    vi.mocked(getLatestSessionMessages).mockReset()
+    let resumeParams: Record<string, unknown> | undefined
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'session.resume') {
+        resumeParams = params
+
+        return {
+          info: {},
+          message_count: 1,
+          messages: [{ content: 'watch transcript', role: 'user', timestamp: 1 }],
+          resumed: 'stored-1',
+          session_id: 'runtime-watch',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway)
+
+    expect(getLatestSessionMessages).not.toHaveBeenCalled()
+    expect(resumeParams).toMatchObject({ lazy: true, source: 'desktop' })
+    expect(resumeParams).not.toHaveProperty('omit_messages')
+    expect(JSON.stringify($messages.get())).toContain('watch transcript')
+    expect($activeSessionId.get()).toBe('runtime-watch')
   })
 
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
