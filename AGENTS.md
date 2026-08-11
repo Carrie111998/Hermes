@@ -209,6 +209,15 @@ Do not hardcode a Tailnet IP in public repository documentation. Resolve the cur
 Tailnet DNS name/IP from `tailscale status --json` or the private system-context
 reference before use. Do not silently fall back to historical `192.168.0.x` addresses.
 
+## Deep codebase development guide
+
+When executable application-source work is explicitly authorized, read
+[`docs/HERMES_CODEBASE_DEVELOPMENT_GUIDE.md`](docs/HERMES_CODEBASE_DEVELOPMENT_GUIDE.md)
+before editing. It preserves the detailed architecture, contribution, testing, platform,
+and implementation conventions that previously lived in root `AGENTS.md`, while keeping
+the default context compact. Current owner directives, current source, and any more
+specific nested `AGENTS.md` take precedence.
+
 ## Application source map
 
 The filesystem is the source of truth; this map names the load-bearing areas rather
@@ -302,8 +311,8 @@ COMMIT_CREATED:
 REMOTE_UPDATED:
 LOCAL_PULL_RESULT:
 CACHE_REFRESH_RESULT:
-SESSION_RESET_RESULT:
-SERVICE_RELOAD_RESULT:
+SESSION_RESET_RESULTC:
+SERVICE_RELOAD_RESULTC:
 BEHAVIORAL_TEST_RESULT:
 UNRESOLVED_FACTS:
 ```
