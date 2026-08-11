@@ -1579,10 +1579,15 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     branch → ``run_gateway()``). If its pidfile or runtime record goes missing
     or stale, ``get_running_pid()`` returns ``None`` even though a live orphan
     still holds the webhook port, so a follow-up restart stacks a duplicate on
-    the same port (#51325). This is a no-op on hosts WITH a service supervisor,
-    where a ``gateway restart`` argv is a transient management command, not the
-    running gateway — gating on ``supports_systemd_services()`` keeps the
-    orphan-aware scan from killing live management processes there.
+    the same port (#51325). On hosts WITH an active service supervisor — a
+    systemd gateway unit, a macOS launchd plist, or the Windows
+    ``Hermes_Gateway`` scheduled task — this scan is a no-op: a ``gateway
+    restart`` argv is a transient management command, not the running gateway,
+    and the supervised gateway is owned by the supervisor (issue #83683). The
+    ``supports_systemd_services()`` early-return and the
+    ``_gateway_has_active_supervisor()`` guard below both enforce this, so the
+    scan never runs on macOS/launchd or Windows/scheduled-task hosts that have a
+    live supervisor.
 
     Regression guard (issue #83683): a *supervised* gateway — one that owns a
     live ``gateway.pid`` record, or one managed by an external supervisor
