@@ -154,8 +154,10 @@ class TestStaleBridgeHandshake:
 
     @pytest.mark.asyncio
     @pytest.mark.linux_only
-    async def test_foreign_listener_on_bridge_port_survives_connect(self, tmp_path):
-        """Bridge bootstrap must never terminate an unrelated port owner."""
+    async def test_foreign_listener_on_bridge_port_survives_connect(
+        self, tmp_path, caplog
+    ):
+        """An unrelated port owner survives and produces manual recovery help."""
         bridge_dir = _setup_bridge_dir(tmp_path)
         _fresh_node_modules(bridge_dir)
         adapter = _make_adapter(
@@ -197,10 +199,6 @@ class TestStaleBridgeHandshake:
             ), patch(
                 "plugins.platforms.whatsapp.adapter.subprocess.Popen",
                 return_value=failed_bridge,
-            ), patch(
-                "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
-                return_value=[listener.pid],
-                create=True,
             ), patch.object(
                 adapter,
                 "_acquire_platform_lock",
@@ -211,6 +209,9 @@ class TestStaleBridgeHandshake:
 
             assert result is False
             assert listener.poll() is None
+            assert f"port {adapter._bridge_port} is already in use" in caplog.text
+            assert "Hermes will not terminate the process" in caplog.text
+            assert "Stop the listener manually" in caplog.text
         finally:
             listener.terminate()
             try:

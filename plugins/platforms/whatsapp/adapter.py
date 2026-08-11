@@ -20,6 +20,7 @@ import logging
 import os
 import platform
 import signal
+import socket
 import subprocess
 
 _IS_WINDOWS = platform.system() == "Windows"
@@ -59,6 +60,24 @@ logger = logging.getLogger(__name__)
 # Inbound owner-typed WhatsApp text is prefixed at MessageEvent construction so
 # transcripts stay disambiguated even if downstream plugins fail before silent_ingest.
 _OWNER_REPLY_PREFIX = "[owner reply] "
+
+
+def _log_bridge_port_conflict(platform_name: str, port: int) -> None:
+    """Log operator action when another listener blocks bridge startup."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            pass
+    except (OSError, TypeError, ValueError, OverflowError):
+        return
+
+    logger.error(
+        "[%s] WhatsApp bridge could not start: port %d is already in use. "
+        "Hermes will not terminate the process using that port. Stop the "
+        "listener manually or configure a different WhatsApp bridge_port, "
+        "then retry.",
+        platform_name,
+        port,
+    )
 
 
 def _bridge_pid_is_ours(pid: int, session_path: Path, expected_start) -> bool:
@@ -672,6 +691,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 if self._bridge_process.poll() is not None:
                     print(f"[{self.name}] Bridge process died (exit code {self._bridge_process.returncode})")
                     print(f"[{self.name}] Check log: {self._bridge_log}")
+                    _log_bridge_port_conflict(self.name, self._bridge_port)
                     self._close_bridge_log()
                     return False
                 try:
@@ -692,6 +712,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not http_ready:
                 print(f"[{self.name}] Bridge HTTP server did not start in 15s")
                 print(f"[{self.name}] Check log: {self._bridge_log}")
+                if self._bridge_process.poll() is not None:
+                    _log_bridge_port_conflict(self.name, self._bridge_port)
                 self._close_bridge_log()
                 return False
             
@@ -704,6 +726,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     if self._bridge_process.poll() is not None:
                         print(f"[{self.name}] Bridge process died during connection")
                         print(f"[{self.name}] Check log: {self._bridge_log}")
+                        _log_bridge_port_conflict(self.name, self._bridge_port)
                         self._close_bridge_log()
                         return False
                     try:
