@@ -154,6 +154,35 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+def test_show_with_graph_context_no_closed_conn_crash(kanban_home):
+    """`kanban show` must not crash with a closed-conn ProgrammingError when
+    the task has parents/children (graph context).
+
+    Regression for the mechanism defect where _cmd_show computed
+    task_graph_context(conn, ...) AFTER the connect_closing() with-block had
+    closed the connection, so the human-readable show path printed the summary
+    and then raised sqlite3.ProgrammingError. run_slash swallows the exception
+    into an ``error:`` line, so assert the output is error-free and includes
+    the parent/child graph section.
+    """
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="graph parent", assignee="alice")
+        child = kb.create_task(
+            conn,
+            title="graph child",
+            assignee="bob",
+            parents=[parent],
+        )
+        assert child  # created + linked
+
+    out = kc.run_slash(f"show {child}")
+    assert "error:" not in out, out
+    assert "graph child" in out
+    assert "Traceback" not in out
+
+
 
 
 # ---------------------------------------------------------------------------
