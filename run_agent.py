@@ -1804,7 +1804,8 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
         focus: Optional[str] = None,
-    ) -> None:
+        snapshot_before_writes: bool = False,
+    ) -> Optional[str]:
         """Spawn the background memory/skill review thread.
 
         Thin wrapper — the heavy lifting lives in
@@ -1816,9 +1817,34 @@ class AIAgent:
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
+
+        ``snapshot_before_writes`` is set only by explicit ``/refine`` calls.
+        It records the current skill library through the curator backup layer
+        before the background fork starts, making autonomous skill changes
+        reviewable and reversible. Automatic post-turn reviews deliberately
+        leave this off so their existing cost and timing remain unchanged.
+
+        Returns the snapshot id when one was created, otherwise ``None``.
         """
         from agent.background_review import spawn_background_review_thread
         from tools.thread_context import propagate_context_to_thread
+
+        snapshot_id = None
+        if snapshot_before_writes and review_skills:
+            try:
+                from agent import curator_backup
+
+                snapshot = curator_backup.snapshot_skills(reason="pre-refine")
+            except Exception as exc:
+                raise RuntimeError(
+                    "Refine aborted: could not create the required rollback snapshot."
+                ) from exc
+            if snapshot is None:
+                raise RuntimeError(
+                    "Refine aborted: could not create the required rollback snapshot."
+                )
+            snapshot_id = snapshot.name
+
         target, _prompt = spawn_background_review_thread(
             self,
             messages_snapshot,
@@ -1832,6 +1858,7 @@ class AIAgent:
             target=propagate_context_to_thread(target), daemon=True, name="bg-review"
         )
         t.start()
+        return snapshot_id
 
     def _build_memory_write_metadata(
         self,

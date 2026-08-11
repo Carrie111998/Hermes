@@ -2568,11 +2568,12 @@ class CLICommandsMixin:
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
-            agent._spawn_background_review(
+            snapshot_id = agent._spawn_background_review(
                 messages_snapshot=snapshot,
                 review_memory=True,
                 review_skills=review_skills,
                 focus=focus or None,
+                snapshot_before_writes=review_skills,
             )
         except Exception as exc:
             _cprint(f"  /refine failed to start: {exc}")
@@ -2582,6 +2583,11 @@ class CLICommandsMixin:
             f"  ⚗ Reviewing this conversation in the background{tail} — "
             f"any memory/skill updates will be reported when done."
         )
+        if snapshot_id:
+            _cprint(
+                f"  {_DIM}Rollback snapshot: {snapshot_id} "
+                f"(`hermes curator rollback --id {snapshot_id}`).{_RST}"
+            )
 
     def _handle_goal_command(self, cmd: str) -> None:
         """Dispatch /goal subcommands: set / draft / show / gate / status / pause / resume / clear."""

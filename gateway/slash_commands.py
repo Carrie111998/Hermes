@@ -2878,18 +2878,25 @@ class GatewaySlashCommandsMixin:
 
         review_skills = "skill_manage" in getattr(agent, "valid_tool_names", set())
         try:
-            agent._spawn_background_review(
+            snapshot_id = agent._spawn_background_review(
                 messages_snapshot=snapshot,
                 review_memory=True,
                 review_skills=review_skills,
                 focus=args or None,
+                snapshot_before_writes=review_skills,
             )
         except Exception as exc:
             return f"/refine failed to start: {exc}"
         tail = f" (focus: {args})" if args else ""
+        rollback = (
+            f" Rollback snapshot: `{snapshot_id}` "
+            f"(`hermes curator rollback --id {snapshot_id}`)."
+            if snapshot_id
+            else ""
+        )
         return (
             f"⚗ Reviewing this conversation in the background{tail} — "
-            f"any memory/skill updates will be reported when done."
+            f"any memory/skill updates will be reported when done.{rollback}"
         )
 
     async def _handle_subgoal_command(self, event: "MessageEvent") -> str:
