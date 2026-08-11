@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -41,6 +42,14 @@ func buildEmbeddingCommand(cfg Config) (*exec.Cmd, string, error) {
 	args = append(args, extra...)
 	cmd := exec.Command(cfg.EmbeddingServer, args...)
 	cmd.Dir = filepath.Dir(cfg.EmbeddingServer)
+	// The generation stack may export a cache type that this stock embedding
+	// server rejects. Keep that process-level setting out of this child only.
+	for _, value := range os.Environ() {
+		if strings.HasPrefix(strings.ToUpper(value), "LLAMA_ARG_CACHE_TYPE_V=") {
+			continue
+		}
+		cmd.Env = append(cmd.Env, value)
+	}
 	return cmd, endpoint, nil
 }
 

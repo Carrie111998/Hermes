@@ -55,6 +55,36 @@ func TestBuildEmbeddingCommandUsesConfiguredLoopbackEndpoint(t *testing.T) {
 	}
 }
 
+func TestBuildEmbeddingCommandExcludesIncompatibleCacheTypeVEnvironment(t *testing.T) {
+	t.Setenv("LLAMA_ARG_CACHE_TYPE_V", "turbo3")
+	dir := t.TempDir()
+	serverPath := filepath.Join(dir, "llama-server.exe")
+	modelPath := filepath.Join(dir, "bge.gguf")
+	for _, path := range []string{serverPath, modelPath} {
+		if err := os.WriteFile(path, []byte("stub"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cmd, _, err := buildEmbeddingCommand(Config{
+		EmbeddingEndpoint: "http://127.0.0.1:18082",
+		EmbeddingServer:   serverPath,
+		EmbeddingModel:    modelPath,
+		EmbeddingArgsJSON: `["--embedding"]`,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cmd.Env == nil {
+		t.Fatal("embedding command inherited the incompatible cache environment")
+	}
+	for _, item := range cmd.Env {
+		if strings.HasPrefix(item, "LLAMA_ARG_CACHE_TYPE_V=") {
+			t.Fatalf("embedding command leaked incompatible environment %q", item)
+		}
+	}
+}
+
 func TestBuildEmbeddingCommandRejectsRemoteEndpoint(t *testing.T) {
 	cfg := Config{
 		EmbeddingEnabled:  true,
