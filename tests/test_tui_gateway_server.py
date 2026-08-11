@@ -12696,6 +12696,136 @@ def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
 # ── session.most_recent ──────────────────────────────────────────────
 
 
+def test_session_activate_refreshes_stale_live_history_from_store(monkeypatch):
+    """Warm activation must catch a live record up with the gateway's writes.
+
+    #81951: the desktop picks up a gateway-created session while it is still
+    young, so ``session["history"]`` — the model-fed snapshot — can lag the
+    authoritative store.  The next prompt.submit feeds ``conversation_history``
+    from that snapshot, silently truncating the provider request even though
+    the UI shows the full transcript.  ``session.activate`` refreshes the
+    history from state.db exactly like the cold resume path.
+    """
+    store_lineage = [
+        {"role": "user", "content": "first ask"},
+        {"role": "assistant", "content": "first answer"},
+        {"role": "user", "content": "second ask (gateway-only)"},
+        {"role": "assistant", "content": "second answer (gateway-only)"},
+    ]
+
+    class _DB:
+        def get_messages_as_conversation(
+            self, key, include_ancestors=False, repair_alternation=False, **_kwargs
+        ):
+            return list(store_lineage)
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    server._sessions["sid-stale"] = _session(
+        agent=types.SimpleNamespace(model="model-stale"),
+        history=[
+            {"role": "user", "content": "first ask"},
+            {"role": "assistant", "content": "first answer"},
+        ],
+        session_key="key-stale",
+    )
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.activate",
+                "params": {"session_id": "sid-stale", "omit_messages": True},
+            }
+        )
+
+        assert resp["result"]["session_key"] == "key-stale"
+        # The live record's model-fed history now matches the store lineage —
+        # the next prompt.submit sends the full conversation to the provider.
+        assert server._sessions["sid-stale"]["history"] == store_lineage
+    finally:
+        server._sessions.pop("sid-stale", None)
+
+
+def test_session_activate_keeps_live_history_when_store_is_not_ahead(monkeypatch):
+    """Never clobber the in-memory history with a shorter store lineage.
+
+    A not-yet-flushed in-flight tail lives only in memory; adopting a store
+    lineage shorter than it would drop those rows from the next model call.
+    """
+    in_memory = [
+        {"role": "user", "content": "turn 1"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "turn 2 not flushed yet"},
+        {"role": "assistant", "content": "reply 2 not flushed yet"},
+    ]
+
+    class _DB:
+        def get_messages_as_conversation(
+            self, key, include_ancestors=False, repair_alternation=False, **_kwargs
+        ):
+            # Store lags the live record — nothing to catch up.
+            return list(in_memory[:2])
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    server._sessions["sid-ahead"] = _session(
+        agent=types.SimpleNamespace(model="model-ahead"),
+        history=list(in_memory),
+        session_key="key-ahead",
+    )
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "session.activate",
+                "params": {"session_id": "sid-ahead", "omit_messages": True},
+            }
+        )
+        assert server._sessions["sid-ahead"]["history"] == in_memory
+    finally:
+        server._sessions.pop("sid-ahead", None)
+
+
+def test_session_activate_skips_history_refresh_while_turn_in_flight(monkeypatch):
+    """An in-flight turn's unflushed tail is the fresher record — don't touch it."""
+    calls = {"store_reads": 0}
+
+    class _DB:
+        def get_messages_as_conversation(
+            self, key, include_ancestors=False, repair_alternation=False, **_kwargs
+        ):
+            calls["store_reads"] += 1
+            return [
+                {"role": "user", "content": "older"},
+                {"role": "assistant", "content": "stored reply"},
+            ]
+
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    server._sessions["sid-busy"] = _session(
+        agent=types.SimpleNamespace(model="model-busy"),
+        history=[{"role": "user", "content": "older"}],
+        running=True,
+        inflight_turn={"user": "in flight", "assistant": "", "streaming": True},
+        session_key="key-busy",
+    )
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "session.activate",
+                "params": {"session_id": "sid-busy", "omit_messages": True},
+            }
+        )
+        # No store lineage was consulted for the model-fed history.
+        assert calls["store_reads"] == 0
+        assert server._sessions["sid-busy"]["history"] == [
+            {"role": "user", "content": "older"}
+        ]
+    finally:
+        server._sessions.pop("sid-busy", None)
+
+
 def test_session_most_recent_returns_first_non_denied(monkeypatch):
     """Drops `tool` rows like session.list does, returns the first hit."""
 

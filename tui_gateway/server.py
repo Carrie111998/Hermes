@@ -8067,6 +8067,45 @@ def _reconcile_display_with_live(
     return list(db_display) + list(in_memory[last_shared + 1 :])
 
 
+def _refresh_live_history_from_store(session: dict) -> None:
+    """Rebuild a live session's model-fed history from state.db (#81951).
+
+    The desktop's serve backend registers a live session record while the
+    session is still young (watching ``sessions.changed`` events), so
+    ``session["history"]`` can be an early snapshot that never caught up with
+    the gateway's concurrent writes.  The model's next-turn
+    ``conversation_history`` is fed from that snapshot (server.py
+    ``prompt.submit``), so a stale record silently truncates the provider
+    request even though the UI — which reads state.db — shows the full
+    transcript.
+
+    The cold resume path already rebuilds history from the store
+    (``get_messages_as_conversation(repair_alternation=True)`` →
+    ``sanitize_replay_history``); warm activation must do the same.
+
+    Safety: only adopt a store lineage LONGER than the in-memory history.  A
+    longer lineage means the live record missed writes; a shorter one would
+    mean the store is behind an unflushed in-flight tail — which the caller
+    already excludes by skipping running sessions.
+    """
+    key = session.get("session_key")
+    if not key:
+        return
+    db = _get_db()
+    if db is None:
+        return
+    try:
+        stored = db.get_messages_as_conversation(key, repair_alternation=True)
+    except Exception:
+        logger.debug("warm activate: state.db history read failed", exc_info=True)
+        return
+    with session["history_lock"]:
+        in_memory = list(session.get("history") or [])
+        if len(stored) <= len(in_memory):
+            return
+        session["history"] = sanitize_replay_history(stored)
+
+
 def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> list[dict]:
     """Return the user-visible DISPLAY projection for a live/warm session.
 

@@ -950,12 +950,26 @@ def _(rid, params: dict) -> dict:
 
     This intentionally does not close the previously focused session; it merely
     returns enough state for Ink to redraw around another live session id.
+
+    On attach, reconcile the live record's model-fed history against the
+    authoritative store (#81951): the desktop picks up a gateway-created
+    session while it is still young, so ``session["history"]`` can be an
+    early snapshot that never caught up with the gateway's concurrent
+    writes.  A stale snapshot silently truncates the next
+    ``conversation_history`` sent to the provider even though the UI (which
+    reads state.db) shows the full transcript.  Refresh it here the same
+    way the cold resume path does — but never clobber an in-flight turn's
+    unflushed in-memory tail, and never adopt a store lineage shorter than
+    what the live record already holds.
     """
     sid = str(params.get("session_id") or "")
     session, err = _sess_nowait({"session_id": sid}, rid)
     if err:
         return err
     assert session is not None
+
+    if not session.get("running") and not session.get("inflight_turn"):
+        _refresh_live_history_from_store(session)
 
     return _ok(
         rid,
