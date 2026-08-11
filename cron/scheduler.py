@@ -59,6 +59,18 @@ from agent.delegation_context import (
 logger = logging.getLogger(__name__)
 
 
+def _close_late_session_db(future) -> None:
+    """Close SessionDB returned after the cron init wait timed out."""
+    try:
+        session_db = future.result()
+    except Exception:
+        return
+    try:
+        session_db.close()
+    except Exception:
+        logger.debug("Late cron SessionDB init returned an uncloseable handle", exc_info=True)
+
+
 def _set_cron_session_title(session_db, session_id, base_title):
     """Robustly title a finished cron session before it is closed.
 
@@ -3422,8 +3434,15 @@ def run_job(
 
         if _session_db_timeout > 0:
             _session_db_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            _session_db_future = _session_db_pool.submit(SessionDB)
             try:
-                _session_db = _session_db_pool.submit(SessionDB).result(timeout=_session_db_timeout)
+                _session_db = _session_db_future.result(timeout=_session_db_timeout)
+            except concurrent.futures.TimeoutError:
+                # The worker keeps running after the bounded wait. If it later
+                # returns a live SessionDB, no caller owns that result, so
+                # close it in the future callback instead of leaking its fds.
+                _session_db_future.add_done_callback(_close_late_session_db)
+                raise
             finally:
                 # Don't wait for a wedged connect() to unwind — abandon the
                 # worker thread (same pattern as the agent inactivity timeout
