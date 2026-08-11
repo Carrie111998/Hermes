@@ -40,6 +40,7 @@ import {
 } from './model'
 import { FLOATING_PLACEMENT } from './renderer/floating-rect'
 import { rootChildSide } from './renderer/track-model'
+import { runTreeCloseWithFocusRecovery } from './tree-focus'
 
 // v2: v1 trees were saved against placeholder panes with index-order zone
 // assignment (chat could land in a corner cell). Retire them wholesale.
@@ -196,7 +197,11 @@ function setDismissed(paneId: string, dismissed: boolean) {
   }
 }
 
-const paneClosers: Record<string, () => void> = {}
+/** A pane closer either completes synchronously or settles its own deferred
+ * outcome. Rejection means its user interaction was canceled. */
+export type PaneCloseResult = PromiseLike<void> | void
+
+const paneClosers: Record<string, () => PaneCloseResult> = {}
 const paneOpeners: Record<string, () => void> = {}
 
 /** Pane ids whose Close an app store owns. True for the main workspace, whose
@@ -208,8 +213,10 @@ const paneOpeners: Record<string, () => void> = {}
 export const $panesWithCloser = atom<ReadonlySet<string>>(new Set())
 
 /** Route a pane's Close through the app store that owns its visibility.
- *  Passing no closer unregisters (a wiring effect's cleanup). */
-export function registerPaneCloser(paneId: string, close?: () => void) {
+ *  Passing no closer unregisters (a wiring effect's cleanup). A deferred close
+ *  must return a promise and reject it when canceled so focus recovery can
+ *  discard the keyboard interaction that requested it. */
+export function registerPaneCloser(paneId: string, close?: () => PaneCloseResult) {
   if (close) {
     paneClosers[paneId] = close
   } else {
@@ -414,14 +421,19 @@ export function focusedSessionTabAnchor(): null | string {
  *  made ⌘W over a lone preview zone fall all the way through and empty the
  *  MAIN chat instead. Returns false when there's nothing to close, so ⌘W
  *  stays a no-op — it never closes the window. */
-export function closeFocusedSessionTab(): boolean {
-  const active = tabTargetGroup(group => group.panes.some(isMainStripPane))?.active
+export function closeFocusedSessionTab(recoverFocus = false): boolean {
+  const group = tabTargetGroup(group => group.panes.some(isMainStripPane))
+  const active = group?.active
 
   if (!active || isUncloseablePane(active)) {
     return false
   }
 
-  closeTreePane(active)
+  if (recoverFocus) {
+    runTreeCloseWithFocusRecovery(active, () => closeTreePane(active), group?.id)
+  } else {
+    closeTreePane(active)
+  }
 
   return true
 }
@@ -434,16 +446,17 @@ export function closeFocusedSessionTab(): boolean {
  *  `closeTreePane` only collapsed the zone to a rail — the tab stayed put and
  *  Close read as a no-op. Dismiss first so the store listener's collapse lands
  *  on an absent pane instead of minimizing a shared zone's surviving sibling. */
-export function closeToolPane(paneId: string) {
+export function closeToolPane(paneId: string): PaneCloseResult {
   dismissTreePane(paneId)
-  paneClosers[paneId]?.()
+
+  return paneClosers[paneId]?.()
 }
 
 /** ⌘W over a TOOL PANEL zone (terminal / logs): close its active tab, the same
  *  as any other tab. These zones host no chat strip, so `focusedSessionGroup`
  *  skips them — without this rung ⌘W was a dead key over the terminal and the
  *  logs pane, the only tabs in the app you couldn't close from the keyboard. */
-export function closeFocusedToolTab(): boolean {
+export function closeFocusedToolTab(recoverFocus = false): boolean {
   const group = tabTargetGroup(g => g.panes.some(isCollapsePane))
   const active = group?.active
 
@@ -451,7 +464,11 @@ export function closeFocusedToolTab(): boolean {
     return false
   }
 
-  closeToolPane(active)
+  if (recoverFocus) {
+    runTreeCloseWithFocusRecovery(active, () => closeToolPane(active), group?.id)
+  } else {
+    closeToolPane(active)
+  }
 
   return true
 }
@@ -494,28 +511,40 @@ export function reloadTreePane(paneId: string): void {
 
 /** Close a tab the way its kind expects: a tool panel leaves the strip (and
  *  syncs its toggle), everything else routes through its owning Close. */
-export function closeTabPane(paneId: string) {
+export function closeTabPane(paneId: string): PaneCloseResult {
   if (isCollapsePane(paneId)) {
-    closeToolPane(paneId)
+    return closeToolPane(paneId)
   } else {
-    closeTreePane(paneId)
+    return closeTreePane(paneId)
   }
 }
 
-export function closeOtherTreeTabs(paneId: string): void {
-  closeableTreeSiblings(paneId).others.forEach(closeTabPane)
+/** Serialize aggregate closes: a busy session owns the singleton confirmation
+ * dialog until it settles, so the next pane must not request one early. */
+function closeTreePanes(paneIds: readonly string[]): PaneCloseResult {
+  let completion: PaneCloseResult | undefined
+
+  for (const paneId of paneIds) {
+    completion = completion ? Promise.resolve(completion).then(() => closeTabPane(paneId)) : closeTabPane(paneId)
+  }
+
+  return completion
 }
 
-export function closeTreeTabsToRight(paneId: string): void {
-  closeableTreeSiblings(paneId).right.forEach(closeTabPane)
+export function closeOtherTreeTabs(paneId: string): PaneCloseResult {
+  return closeTreePanes(closeableTreeSiblings(paneId).others)
+}
+
+export function closeTreeTabsToRight(paneId: string): PaneCloseResult {
+  return closeTreePanes(closeableTreeSiblings(paneId).right)
 }
 
 /** Close every closeable tab in `paneId`'s group (the uncloseable workspace stays). */
-export function closeAllTreeTabs(paneId: string): void {
+export function closeAllTreeTabs(paneId: string): PaneCloseResult {
   const tree = $layoutTree.get()
   const panes = (tree ? findGroupOfPane(tree, paneId) : null)?.panes ?? []
 
-  panes.filter(id => !isUncloseablePane(id)).forEach(closeTabPane)
+  return closeTreePanes(panes.filter(id => !isUncloseablePane(id)))
 }
 
 /** Pane ids in the tree under a `${prefix}:` namespace — lets a mirror prune
@@ -701,13 +730,11 @@ export function dismissTreePane(paneId: string) {
   }
 }
 
-export function closeTreePane(paneId: string) {
+export function closeTreePane(paneId: string): PaneCloseResult {
   const closer = paneClosers[paneId]
 
   if (closer) {
-    closer()
-
-    return
+    return closer()
   }
 
   // A plugin's pane: Close = DISABLE the plugin — the same switch as
@@ -719,14 +746,13 @@ export function closeTreePane(paneId: string) {
 
   if (source?.startsWith('plugin:')) {
     const pluginId = source.slice('plugin:'.length)
-    void setPluginEnabled(pluginId, false)
     notify({
       kind: 'info',
       title: translateNow('zones.pluginDisabled', pluginId),
       message: translateNow('zones.pluginDisabledBody')
     })
 
-    return
+    return setPluginEnabled(pluginId, false)
   }
 
   dismissTreePane(paneId)
@@ -1362,6 +1388,11 @@ function paneGroup(paneId: string) {
   return tree ? findGroupOfPane(tree, paneId) : null
 }
 
+/** The current zone id for a pane before a close mutates the layout tree. */
+export function treePaneGroupId(paneId: string): string | undefined {
+  return paneGroup(paneId)?.id
+}
+
 /** Collapse/restore a pane's ZONE to a minimized rail — its tab stays visible.
  *  Store-driven (one-way): a tool panel's $open store mirrors here via
  *  bindPaneCollapse, so a toggle collapses rather than hides. */
@@ -1476,7 +1507,7 @@ export function $paneVisible(paneId: string): ReadableAtom<boolean> {
 export function bindPaneVisibility(
   paneId: string,
   $open: { get(): boolean; listen(fn: (open: boolean) => void): void },
-  close?: () => void,
+  close?: () => PaneCloseResult,
   open?: () => void
 ) {
   setTreePaneHidden(paneId, !$open.get())
@@ -1515,7 +1546,7 @@ export function bindPaneVisibility(
 export function bindToolPaneCollapse(
   paneId: string,
   $open: { get(): boolean; listen(fn: (open: boolean) => void): void },
-  close: () => void,
+  close: () => PaneCloseResult,
   open: () => void
 ) {
   markCollapsePane(paneId)
@@ -1553,7 +1584,7 @@ export function bindToolPaneCollapse(
  */
 export function togglePaneVisible(paneId: string) {
   if (isPaneVisible(paneId)) {
-    closeTreePane(paneId)
+    runTreeCloseWithFocusRecovery(paneId, () => closeTreePane(paneId), treePaneGroupId(paneId))
   } else {
     restoreTreePane(paneId)
   }
@@ -1562,13 +1593,11 @@ export function togglePaneVisible(paneId: string) {
 /** Collapse a tool pane through its store closer (truthful), else minimize the
  *  zone directly. Gated on isCollapsePane so a non-tool pane's closer (a tile's
  *  REMOVES it) is never mistaken for a collapse. */
-export function collapseTreePane(paneId: string) {
+export function collapseTreePane(paneId: string): PaneCloseResult {
   const close = paneClosers[paneId]
 
   if (isCollapsePane(paneId) && close) {
-    close()
-
-    return
+    return close()
   }
 
   const group = paneGroup(paneId)

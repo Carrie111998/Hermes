@@ -143,6 +143,9 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
           'flex min-h-0 min-w-0 items-center self-stretch overflow-hidden outline-none',
           vertical && 'w-full justify-center'
         )}
+        // Context-menu triggers clone this element and replace `data-slot`.
+        // Keep a dedicated marker for tab focus recovery across that wrapper.
+        data-pane-tab-control="true"
         data-slot="pane-tab-control"
         onClick={onClick}
         onClickCapture={event => {
@@ -190,6 +193,7 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
         <Button
           aria-label={t.zones.closeTab}
           className="group/close relative mr-0.5 self-center text-(--ui-text-tertiary)"
+          data-pane-tab-close="true"
           onAuxClick={event => {
             if (event.button === 1) {
               event.preventDefault()
@@ -248,6 +252,15 @@ export const PaneTab = React.forwardRef<HTMLDivElement, PaneTabProps>(function P
             if (event.button === 0 || event.button === 1) {
               event.preventDefault()
               event.stopPropagation()
+
+              // Preventing the native primary press protects the parent tab
+              // from activating or starting a drag, but it also suppresses
+              // the browser's usual button focus. Restore that focus so the
+              // close lifecycle can move it to the surviving tab once this
+              // control unmounts.
+              if (event.button === 0) {
+                event.currentTarget.focus({ preventScroll: true })
+              }
             }
           }}
           onPointerUp={event => {

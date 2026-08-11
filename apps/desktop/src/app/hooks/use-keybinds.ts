@@ -168,8 +168,11 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
   }
 
   const showFiles = () => {
+    if (isPaneVisible('terminal')) {
+      togglePaneVisible('terminal')
+    }
+
     setFileBrowserOpen(true)
-    setTerminalTakeover(false)
   }
 
   handlersRef.current = {
