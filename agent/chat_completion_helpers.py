@@ -2117,6 +2117,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         full_content = "".join(content_parts) or None
         mock_tool_calls = None
         has_truncated_tool_args = False
+        had_invalid_tool_args_before_repair = False
         if tool_calls_acc:
             mock_tool_calls = []
             for idx in sorted(tool_calls_acc):
@@ -2127,6 +2128,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     try:
                         json.loads(arguments)
                     except json.JSONDecodeError:
+                        # Preserve the raw stream shape before attempting a
+                        # best-effort repair.  A clean stream close with no
+                        # finish_reason and syntactically incomplete tool
+                        # arguments is a dropped stream, even if balancing a
+                        # lone opening brace happens to produce valid JSON.
+                        # Repair remains useful when the provider supplied an
+                        # explicit terminal finish_reason.
+                        had_invalid_tool_args_before_repair = True
                         # Attempt repair before flagging as truncated.
                         # Models like GLM-5.1 via Ollama produce trailing
                         # commas, unclosed brackets, Python None, etc.
@@ -2185,7 +2194,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         #      against.  Route it through the partial-stream-stub path
         #      instead so the loop reports an honest mid-tool-call stream
         #      drop and fails fast rather than escalating output budget.
-        _tool_args_dropped_no_finish = has_truncated_tool_args and finish_reason is None
+        _tool_args_dropped_no_finish = (
+            had_invalid_tool_args_before_repair and finish_reason is None
+        )
         if _tool_args_dropped_no_finish:
             _dropped_names = [
                 (tool_calls_acc[idx]["function"]["name"] or "?")

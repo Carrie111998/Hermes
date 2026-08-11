@@ -444,6 +444,13 @@ class APIServerRunsMixin:
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
+        # Give the accepted run one scheduling turn before returning 202 so
+        # its executor work is submitted even when a client immediately
+        # enters a tight status-poll loop.  This is non-blocking and keeps the
+        # run asynchronous while avoiding starvation during short-lived
+        # request/test lifecycles.
+        await asyncio.sleep(0)
+
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
         )
