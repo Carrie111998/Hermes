@@ -4739,22 +4739,24 @@ class MessageSender:
 
     @staticmethod
     def strip_cron_wrapper(content: str) -> str:
-        """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output."""
-        if not content.startswith("Cronjob Response: "):
+        """Strip scheduler cron header/footer wrapper for cleaner Yuanbao output.
+
+        Matches the single-line header format from cron.scheduler._deliver_result:
+        "[{task_name} \u00b7 job:{job_id} \u00b7 {HH:MM}]\\n{content}\\n\\n{footer}".
+        """
+        if not content.startswith("[") or " \u00b7 job:" not in content.split("\n", 1)[0]:
             return content
 
-        divider = "\n-------------\n\n"
+        header_end = content.find("]\n")
+        if header_end < 0:
+            return content
+
         footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
-        divider_pos = content.find(divider)
         footer_pos = content.rfind(footer_prefix)
-        if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+        if footer_pos < 0 or footer_pos <= header_end:
             return content
 
-        header = content[:divider_pos]
-        if "\n(job_id: " not in header:
-            return content
-
-        body_start = divider_pos + len(divider)
+        body_start = header_end + len("]\n")
         body = content[body_start:footer_pos].strip()
         return body or content
 

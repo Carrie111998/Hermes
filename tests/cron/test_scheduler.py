@@ -279,11 +279,14 @@ class TestDeliverResultWrapping:
 
         send_mock.assert_called_once()
         sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
-        assert "Cronjob Response: daily-report" in sent_content
-        assert "(job_id: test-job)" in sent_content
-        assert "-------------" in sent_content
+        assert "[daily-report \u00b7 job:test-job \u00b7 " in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+        # Single-line header: everything up to the first newline should be
+        # the compact bracketed header, not the old 4-line block.
+        header_line = sent_content.split("\n", 1)[0]
+        assert header_line.startswith("[daily-report \u00b7 job:test-job \u00b7 ")
+        assert header_line.endswith("]")
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
