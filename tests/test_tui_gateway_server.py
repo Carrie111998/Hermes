@@ -12308,6 +12308,104 @@ def test_managed_session_registry_hides_and_refuses_other_profile(monkeypatch, t
     assert denied["error"]["code"] == 4001
 
 
+@pytest.mark.parametrize("recorded_profile", [None, "louis"])
+def test_managed_session_resume_refuses_unassigned_or_conflicting_profile(
+    monkeypatch,
+    recorded_profile,
+):
+    from hermes_cli.profile_scope import managed_profile_context, principal_from_headers
+
+    class _DB:
+        def get_session(self, session_id):
+            assert session_id == "target"
+            return {"id": session_id, "profile_name": recorded_profile}
+
+        def get_session_by_title(self, title):
+            return None
+
+        def reopen_session(self, session_id):
+            raise AssertionError("refused resume must not write")
+
+    db = _DB()
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    principal = principal_from_headers(
+        {
+            "x-evaos-allowed-profiles": "jane,louis",
+            "x-evaos-primary-profile": "jane",
+            "x-evaos-profile-admin": "1",
+            "x-evaos-principal-user": "user-1",
+        }
+    )
+
+    with managed_profile_context(principal, effective_profile="jane"):
+        response = server.handle_request(
+            {
+                "id": "resume",
+                "method": "session.resume",
+                "params": {"session_id": "target"},
+            }
+        )
+
+    assert response["error"] == {
+        "code": 4003,
+        "message": "session profile is not authorized",
+    }
+
+
+def test_managed_lazy_child_resume_uses_active_child_profile(monkeypatch):
+    from hermes_cli.profile_scope import managed_profile_context, principal_from_headers
+
+    class _DB:
+        def get_session(self, session_id):
+            assert session_id == "target"
+            return None
+
+        def get_session_by_title(self, title):
+            return None
+
+        def reopen_session(self, session_id):
+            assert session_id == "target"
+
+        def get_messages_as_conversation(self, session_id, **_kwargs):
+            assert session_id == "target"
+            return []
+
+    monkeypatch.setattr(server, "_profile_home", lambda _profile: None)
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(server, "_claim_or_reuse_live", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_deferred_session_record",
+        lambda *_args, **_kwargs: {"created_at": 1.0},
+    )
+    server._active_child_runs["target"] = time.time()
+    server._active_child_profiles["target"] = "jane"
+    principal = principal_from_headers(
+        {
+            "x-evaos-allowed-profiles": "jane,louis",
+            "x-evaos-primary-profile": "jane",
+            "x-evaos-principal-user": "user-1",
+        }
+    )
+
+    try:
+        with managed_profile_context(principal, effective_profile="jane"):
+            response = server.handle_request(
+                {
+                    "id": "resume",
+                    "method": "session.resume",
+                    "params": {"session_id": "target", "lazy": True},
+                }
+            )
+    finally:
+        server._active_child_runs.pop("target", None)
+        server._active_child_profiles.pop("target", None)
+
+    assert response["result"]["resumed"] == "target"
+    assert response["result"]["status"] == "streaming"
+
+
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
     """Switching into a still-running live session must hydrate partial output.

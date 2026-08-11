@@ -727,6 +727,7 @@ def _reset_tui_gateway_server_state():
         "_answers",
         "_child_mirrors",
         "_active_child_runs",
+        "_active_child_profiles",
     ):
         obj = getattr(mod, name, None)
         if isinstance(obj, dict):

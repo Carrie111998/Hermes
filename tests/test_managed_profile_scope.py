@@ -8,6 +8,7 @@ from hermes_cli.profile_scope import (
     managed_profile_context,
     principal_from_headers,
     require_profile,
+    require_session_profile,
 )
 
 
@@ -52,3 +53,26 @@ def test_managed_profile_header_rejects_primary_outside_allowlist():
                 "x-evaos-principal-user": "user-1",
             }
         )
+
+
+def test_multiplex_profile_selection_requires_assigned_principal(monkeypatch):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+
+    with pytest.raises(PermissionError, match="principal is required"):
+        require_profile("jane")
+
+
+@pytest.mark.parametrize("recorded_profile", [None, "louis"])
+def test_managed_session_profile_refuses_unassigned_or_conflicting_record(
+    recorded_profile,
+):
+    with managed_profile_context(_principal(admin=True), effective_profile="jane"):
+        with pytest.raises(PermissionError, match="session profile"):
+            require_session_profile(recorded_profile)
+
+
+def test_managed_admin_can_open_session_in_effective_profile():
+    with managed_profile_context(_principal(admin=True), effective_profile="louis"):
+        assert require_session_profile("louis") == "louis"

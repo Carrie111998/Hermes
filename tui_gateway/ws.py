@@ -320,7 +320,11 @@ async def handle_ws(ws: Any) -> None:
                     # change_events: this backend broadcasts pet.changed /
                     # cron.changed / sessions.changed, so clients can demote
                     # their legacy polls to slow backstops.
-                    "payload": {"skin": skin_payload, "change_events": True},
+                    "payload": {
+                        "skin": skin_payload,
+                        "change_events": True,
+                        "heartbeat": True,
+                    },
                 },
             }
         )
@@ -388,6 +392,22 @@ async def handle_ws(ws: Any) -> None:
             # response dict, which we write here from the loop.
             req_id = req.get("id") if isinstance(req, dict) else None
             req_method = req.get("method") if isinstance(req, dict) else None
+
+            if req_method == "gateway.ping":
+                ok = await transport.write_async(
+                    {
+                        "jsonrpc": "2.0",
+                        "result": {"ok": True},
+                        "id": req_id,
+                    }
+                )
+                if not ok:
+                    disconnect_reason = "send_failed_after_heartbeat"
+                    send_failures += 1
+                    _log.warning("ws heartbeat reply send failed peer=%s", peer)
+                    break
+                continue
+
             try:
                 resp = await asyncio.to_thread(server.dispatch, req, transport)
             except Exception:

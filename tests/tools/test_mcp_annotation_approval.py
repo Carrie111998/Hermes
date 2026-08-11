@@ -253,6 +253,58 @@ def test_multiplex_write_approval_uses_owning_profile_mode(tmp_path, monkeypatch
     assert "did not approve" in json.loads(blocked)["error"]
 
 
+def test_missing_approval_home_resolves_unique_profile_mode_off(tmp_path, monkeypatch):
+    from agent import secret_scope
+    from hermes_cli import config as config_module
+
+    pool_home = tmp_path / "pool"
+    profile_home = tmp_path / "profiles" / "jane"
+    pool_home.mkdir()
+    profile_home.mkdir(parents=True)
+    (pool_home / "config.yaml").write_text(
+        "approvals:\n  mode: manual\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "approvals:\n  mode: off\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(pool_home))
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    state_key = (str(profile_home.resolve()), "pipedream")
+    mcp_tool._tool_read_only_hints[state_key] = {"send_email": False}
+    config_module._LOAD_CONFIG_CACHE.clear()
+
+    with patch("tools.approval.request_elicitation_consent") as consent:
+        result = mcp_tool._mcp_tool_approval_check(
+            "pipedream",
+            "send_email",
+            {"to": "owner@example.com"},
+        )
+
+    consent.assert_not_called()
+    assert result is None
+
+
+def test_missing_approval_home_blocks_ambiguous_multiplex_owner(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope
+
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    for profile in ("jane", "louis"):
+        state_key = (str(tmp_path / profile), "pipedream")
+        mcp_tool._tool_read_only_hints[state_key] = {"send_email": False}
+
+    result = mcp_tool._mcp_tool_approval_check(
+        "pipedream",
+        "send_email",
+        {"to": "owner@example.com"},
+    )
+
+    assert "profile approval scope could not be resolved" in json.loads(result)["error"]
+
+
 def test_lazy_profile_owned_server_scopes_approval_when_process_is_not_multiplex(
     tmp_path, monkeypatch
 ):

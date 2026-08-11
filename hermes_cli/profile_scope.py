@@ -47,6 +47,13 @@ def current_effective_profile() -> str | None:
     return _effective_profile.get() or principal.primary_profile
 
 
+def managed_profile_binding_required() -> bool:
+    """Whether this process serves multiple profiles behind managed authority."""
+    from agent.secret_scope import is_multiplex_active
+
+    return is_multiplex_active()
+
+
 def principal_from_headers(headers: Mapping[str, str]) -> ManagedProfilePrincipal | None:
     raw_allowed = (headers.get("x-evaos-allowed-profiles") or "").strip()
     raw_primary = (headers.get("x-evaos-primary-profile") or "").strip()
@@ -76,8 +83,10 @@ def principal_from_headers(headers: Mapping[str, str]) -> ManagedProfilePrincipa
 def require_profile(name: str | None, *, allow_selectors: Iterable[str] = ()) -> str:
     """Return the effective profile or raise PermissionError.
 
-    With no managed principal this is a no-op.  Under managed authority an
-    omitted/default/current profile resolves to the server-selected primary.
+    With no managed principal this is a no-op outside multiplex mode.  A
+    multiplex server requires an assigned principal before selecting a profile.
+    Under managed authority an omitted/default/current profile resolves to the
+    server-selected primary.
     Route-specific selectors such as ``all`` may be explicitly allowed but do
     not grant access to any profile outside the principal's set.
     """
@@ -85,6 +94,8 @@ def require_profile(name: str | None, *, allow_selectors: Iterable[str] = ()) ->
     principal = current_principal()
     requested = (name or "").strip()
     if principal is None:
+        if managed_profile_binding_required():
+            raise PermissionError("managed profile principal is required")
         return requested
     if requested in set(allow_selectors):
         return requested
@@ -93,6 +104,21 @@ def require_profile(name: str | None, *, allow_selectors: Iterable[str] = ()) ->
     if requested not in principal.allowed_profiles:
         raise PermissionError("profile is not authorized")
     return requested
+
+
+def require_session_profile(recorded_profile: str | None) -> str | None:
+    """Require a stored session to belong to the request's effective profile."""
+    principal = current_principal()
+    if principal is None:
+        if managed_profile_binding_required():
+            raise PermissionError("managed profile principal is required")
+        return recorded_profile
+
+    recorded = (recorded_profile or "").strip()
+    effective = current_effective_profile() or principal.primary_profile
+    if not recorded or recorded != effective:
+        raise PermissionError("session profile is not authorized")
+    return recorded
 
 
 def filter_profile_names(names: Iterable[str]) -> set[str]:

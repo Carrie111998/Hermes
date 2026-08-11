@@ -40,6 +40,7 @@ def server():
     mod._answers.clear()
     mod._child_mirrors.clear()
     mod._active_child_runs.clear()
+    mod._active_child_profiles.clear()
 
 
 @pytest.fixture()
@@ -194,14 +195,19 @@ def test_active_child_runs_registry_tracks_liveness(server, emits):
     """Every relayed event marks the child as in flight (even with no window
     open), and completion clears it — lazy watch resumes read this registry to
     report running=true while the child is silent inside a long tool call."""
+    server._sessions["parent-sid"] = {
+        "profile_home": "/tmp/hermes/profiles/research",
+    }
     _relay(server, "subagent.start", preview="go", child_session_id="child-1")
     assert "child-1" in server._active_child_runs
+    assert server._child_run_profile("child-1") == "research"
 
     _relay(server, "subagent.tool", tool_name="terminal", child_session_id="child-1")
     assert "child-1" in server._active_child_runs
 
     _relay(server, "subagent.complete", child_session_id="child-1", status="completed", summary="ok")
     assert "child-1" not in server._active_child_runs
+    assert server._child_run_profile("child-1") is None
 
 
 def test_start_mirrors_as_immediate_header_line(server, emits):
@@ -236,5 +242,4 @@ def test_text_mirrors_as_message_delta(server, emits):
         ("message.delta", {"text": "Here is "}),
         ("message.delta", {"text": "the answer."}),
     ]
-
 
