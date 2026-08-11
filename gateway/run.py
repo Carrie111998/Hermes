@@ -27782,7 +27782,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # all, so the gateway never tears down — it just keeps running until
         # TimeoutStopSec escalates to SIGKILL, with in-flight turns undrained
         # and sessions never finalized.
-        runner._shutdown_task = asyncio.create_task(runner.stop())
+        #
+        # Only re-point the anchor when the previous shutdown task has
+        # finished.  This handler runs more than once in ordinary operation:
+        # a second Ctrl+C, a SIGINT followed by the service manager's SIGTERM,
+        # or the planned-stop watcher thread racing a real signal — it calls
+        # `loop.call_soon_threadsafe(shutdown_handler, None)` and its own
+        # docstring notes that on POSIX "the signal handler always races us".
+        # Overwriting the attribute on the second call would drop the only
+        # strong reference to the task that owns the live teardown and put us
+        # straight back in the window above. Skipping the duplicate loses
+        # nothing: stop() short-circuits on `self._stop_task`, so the second
+        # task would only have awaited the first one's work.
+        _live_shutdown_task = runner._shutdown_task
+        if _live_shutdown_task is None or _live_shutdown_task.done():
+            runner._shutdown_task = asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)
