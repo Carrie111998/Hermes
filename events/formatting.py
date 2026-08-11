@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Optional
+from types import MappingProxyType
+from typing import Mapping, Optional
 
 from events.outcomes import OutcomeState, OutcomeVerdict, marker_for_verdict
 from events.schema import Event, EventType, Priority
@@ -21,156 +22,16 @@ PRIORITY_EMOJI = {
     Priority.LOW:      "🟢",
 }
 
-# Event type -> icon
-EVENT_TYPE_EMOJI = {
-    EventType.CRON_STARTED:             "▶️",
-    EventType.CRON_TRIGGERED:           "👆",
-    EventType.CRON_COMPLETED:           "✔️",
-    EventType.CRON_FAILED:              "💥",
-    EventType.CRON_FAILED_CONSECUTIVE:  "🔥",
-    EventType.CRON_STALE:               "⌛",
-    EventType.CRON_SKIPPED:             "💤",
-    EventType.CRON_SKIPPED_DUPLICATE:   "⏭️",
-    EventType.CRON_SKIPPED_MIN_INTERVAL: "⏳",
-    EventType.JOB_DISCOVERED:           "🎯",
-    EventType.JOB_SCORED:               "📊",
-    EventType.JOB_HIGH_SCORE:           "⭐",
-    EventType.JOB_VIP_DISCOVERED:       "💎",
-    EventType.TAILOR_COMPLETED:         "✍️",
-    EventType.APPLICATION_READY:        "📋",
-    EventType.APPLICATION_SUBMITTED:    "✅",
-    EventType.APPLICATION_FAILED:       "❌",
-    EventType.APPLICATION_BLOCKED:      "🚧",
-    EventType.INTERVIEW_SIGNAL:         "🗓️",
-    EventType.OFFER_SIGNAL:             "💰",
-    EventType.STAGE_TRANSITION:         "➡️",
-    EventType.FOLLOWUP_DUE:             "⏰",
-    EventType.DIGEST_GENERATED:         "📝",
-    EventType.GATEWAY_HEALTH:           "🛰️",
-    EventType.AGENT_ERROR:              "⚠️",
-    EventType.MEMORY_CONSOLIDATED:      "🧠",
-    EventType.SKILL_EVOLVED:            "🚀",
-    EventType.MAILBOX_MESSAGE:          "📨",
-    # SR-001 secret scanner (fork-patch carried alongside SECRET_DETECTED enum +
-    # TOPIC_ROUTING entry). Padlock chosen because (a) no existing icon conflicts,
-    # (b) operators scanning the Security topic need a distinct visual hook
-    # separate from the generic HIGH dot. Added 2026-04-19 per SR-408 post-
-    # flood remediation — without this entry event_icon() returned "" and the
-    # header rendered with a double-space gap that swam in a noisy feed.
-    EventType.SECRET_DETECTED:          "🔐",
-    # Credential/infra loss (2026-07-10, R70 alert-gap fix). Key icon = a
-    # credential is gone; distinct from the padlock (a secret was *found*).
-    EventType.CREDENTIAL_LOSS:          "🔑",
-    # Phase B Stage-3 iter2 — HITL approvals + apply packet
-    EventType.APPROVAL_REQUEST:         "🙋",
-    EventType.APPLY_PACKET:             "📦",
-    # Phase C iter2 — Critic proposals
-    EventType.CRITIC_PROPOSAL:          "🧐",
-    # Watchdog signals (iter5, 2026-04-25) — promoted from AGENT_ERROR fallback
-    EventType.WATCHDOG_TICK:            "💓",
-    EventType.WATCHDOG_PROBE_TRANSITION:"🔄",
-    EventType.WATCHDOG_SILENCE_ALERT:   "🔕",
-    EventType.WATCHDOG_RECOVERED:       "💚",
-    EventType.AGENT_FAILURE_CLUSTER:    "🌪️",
-    # Curator nightly consolidation (2026-04-26)
-    EventType.CURATOR_DAILY:            "📚",
-    # DevFlow bridge (2026-04-26)
-    EventType.DEVFLOW_RUN_STARTED:      "🏃",
-    EventType.DEVFLOW_RUN_COMPLETED:    "🏁",
-    EventType.DEVFLOW_APPROVAL_REQUESTED:"🗳️",
-    EventType.DEVFLOW_TRACE_SNAPSHOT:   "📷",
-    # Scribe action telemetry (2026-04-28)
-    EventType.USER_INBOUND_MESSAGE:     "💬",
-    # Critic auto-apply (2026-04-29) + Watchdog burst-coalesce + self-degraded
-    EventType.CRITIC_AUTO_APPLIED:      "✅",
-    EventType.WATCHDOG_BURST:           "🌊",
-    EventType.WATCHDOG_SELF_DEGRADED:   "🤕",
-    # Tailor structured iteration (2026-04-29) — counts + reason so the
-    # Critic can distinguish "nothing to do" from "something is broken"
-    EventType.TAILOR_ITERATION:         "✂️",
-    # Generic agent iteration (2026-04-30) — per-agent run summary
-    # extending TAILOR_ITERATION pattern across all cron-driven agents.
-    EventType.AGENT_ITERATION:          "🔁",
-    # Watchdog daily heartbeat (2026-04-30) — once-per-day aggregate health
-    # summary. Stethoscope picks up on the existing health-theme set (💓
-    # tick, 🤕 self-degraded, 💚 recovered) while staying visually distinct
-    # from the per-failure signals so an operator scanning watchdog_alerts
-    # can spot the once-a-day summary at a glance.
-    EventType.WATCHDOG_DAILY:           "🩺",
-    # DevFlow PR + build telemetry (2026-04-30) — visibility-restoration
-    # B11 item 2-3. Spec docs/superpowers/specs/2026-04-30-devflow-pr-build-events.md.
-    EventType.DEVFLOW_PR_OPENED:        "🔃",
-    EventType.DEVFLOW_PR_MERGED:        "🟣",
-    EventType.DEVFLOW_PR_CLOSED:        "🚫",
-    EventType.DEVFLOW_PR_REVIEW_REQUESTED:"👀",
-    EventType.DEVFLOW_BUILD_STARTED:    "🔨",
-    EventType.DEVFLOW_BUILD_SUCCEEDED:  "🟢",
-    EventType.DEVFLOW_BUILD_FAILED:     "🧨",
-    # DevFlow Delegation Plane lifecycle (2026-08-06) — the DDP enum block
-    # (schema.py) and its routing specs (routing_policy.py DEVFLOW/ALERTS)
-    # both landed total, but this table was missed, so all twelve members
-    # rendered with event_icon() == "" and a double-space gap in the header.
-    # Spec: docs/superpowers/specs/2026-08-06-devflow-delegation-plane-design.md.
-    # Icons are deliberately disjoint from the PR/build set above so an
-    # operator scanning devflow_firehose can tell a *delegation* signal from
-    # an *SDLC* one: 🎫 work arrives, 🏷️ triaged, 🗺️ planned. The two
-    # flood-control outcomes read as "nothing new" (👯 dupe, 🔇 suppressed)
-    # and stay visually quieter than 🙅, which is a real decision.
-    EventType.DEVFLOW_WORK_REQUESTED:   "🎫",
-    EventType.DEVFLOW_WORK_TRIAGED:     "🏷️",
-    EventType.DEVFLOW_WORK_PLANNED:     "🗺️",
-    EventType.DEVFLOW_WORK_DUPLICATE:   "👯",
-    EventType.DEVFLOW_WORK_DECLINED:    "🙅",
-    EventType.DEVFLOW_WORK_SUPPRESSED:  "🔇",
-    # Merge/deploy (Stage 2/3). 🚦 = gated waiting for green; 🧩 = the pieces
-    # fit (distinct from 🟣 devflow.pr_merged, which is the *PR* event, and
-    # from 🔀 CODE_DRIFT); 🤖 marks the merge that happened with no human
-    # gate, which is why routing_policy gives it WARN and not INFO.
-    EventType.DEVFLOW_MERGE_PENDING:    "🚦",
-    EventType.DEVFLOW_MERGED:           "🧩",
-    EventType.DEVFLOW_AUTO_MERGED:      "🤖",
-    EventType.DEVFLOW_DEPLOY_STARTED:   "🛫",
-    EventType.DEVFLOW_DEPLOYED:         "🛬",
-    # Siren, not 🧨/💥/❌ — those are build/cron/application failures; a failed
-    # deploy is the one that escalates to WhatsApp (WA_URGENT).
-    EventType.DEVFLOW_DEPLOY_FAILED:    "🚨",
-    # Notification delivery reverse-signal (2026-04-30) — visibility
-    # for whether a notification reached the user. Distinct from generic
-    # green/red so an operator scanning watchdog_alerts can tell a
-    # delivery report apart from a build/system signal at a glance.
-    # The cycle guard in handle() makes these effectively unreachable
-    # in chat, but the icon entry keeps test_event_icons_cover_all_types
-    # honest and gives a fallback render if the guard ever regresses.
-    EventType.NOTIFICATION_DELIVERED:   "📬",
-    EventType.NOTIFICATION_FAILED:      "📭",
-    # Gateway lifecycle (boot/shutdown) -> watchdog_alerts. Green up / red down,
-    # mirroring the build up/down convention but for the gateway process itself.
-    EventType.GATEWAY_STARTED:          "🟢",
-    EventType.GATEWAY_STOPPED:          "🔴",
-    # Fork resilience signals emitted without an icon: backend-conformance
-    # canary (SR-470) + agent loop-fault loud-failure boundary (SR-471).
-    # 📐 = contract/conformance check; 💥 = loop fault at non-retryable abort.
-    EventType.BACKEND_CONTRACT_DRIFT:   "📐",
-    EventType.AGENT_LOOP_FAULT:         "💥",
-    # Resource-pressure early-warning (2026-06-11 pagefile-burst remediation).
-    # Fire extinguisher = "resource exhaustion fire, grab it now." Distinct
-    # from every other watchdog_alerts icon and (deliberately) not a priority
-    # dot, so it doesn't render adjacent to its own HIGH 🟠 dot in the header.
-    EventType.RESOURCE_PRESSURE:        "🧯",
-    # Tracker partial/ backlog alert (2026-07-14) — a growing queue of intents
-    # whose Postgres mirror is stuck; the inbox-tray icon reads as "pile-up".
-    EventType.TRACKER_PARTIAL_BACKLOG:  "📥",
-    # Agent-src code drift (2026-07-21) — the deployed detached checkout is
-    # not running what main says should be running. Shuffle arrows read as
-    # "the code paths crossed"; distinct from 🔃 (PR opened).
-    EventType.CODE_DRIFT:               "🔀",
-    # Laptop boot report (2026-07-27) — a boot that came up with services
-    # missing. The boot glyph is deliberately the same code point that
-    # ~/laptop-start.ps1 hardcodes in its non-bus fallback header
-    # (U+1F97E), so a fallback message and a bus-rendered one look alike;
-    # changing it here means changing it there too.
-    EventType.BOOT_SUMMARY:             "🥾",
-}
+# Event type -> icon. DERIVED, not hand-maintained: the icon is a required
+# field on the EventType member itself (see events/schema.py, which also
+# carries the per-glyph rationale that used to live in this table). The name
+# is kept because callers and tests import it, but it is a read-only view --
+# there is no second table left to keep in sync, which is the whole point.
+# Four separate drifts (2026-04-27 x2, 2026-05-29, 2026-08-11) came from this
+# being an independently-edited dict.
+EVENT_TYPE_EMOJI: Mapping[EventType, str] = MappingProxyType(
+    {et: et.icon for et in EventType}
+)
 
 # Inner mailbox-message type -> icon (overrides generic mailbox icon when known)
 MAILBOX_INNER_EMOJI = {
@@ -257,11 +118,17 @@ def event_icon(event: Event) -> str:
     """Return the icon for an event.
 
     For mailbox_message, use inner message_type when available.
+
+    Never returns "" for a real EventType: the icon is a required member field
+    validated at class-creation time (events/schema.py), so there is no
+    "missing icon" branch left to fall through. MAILBOX_INNER_EMOJI is a
+    genuinely partial override keyed by an arbitrary producer-supplied string,
+    hence its explicit fallback.
     """
     if event.event_type == EventType.MAILBOX_MESSAGE:
         inner_type = (event.payload or {}).get("message_type", "")
-        return MAILBOX_INNER_EMOJI.get(inner_type, EVENT_TYPE_EMOJI[EventType.MAILBOX_MESSAGE])
-    return EVENT_TYPE_EMOJI.get(event.event_type, "")
+        return MAILBOX_INNER_EMOJI.get(inner_type, EventType.MAILBOX_MESSAGE.icon)
+    return event.event_type.icon
 
 
 def _short_time(iso_ts: str) -> str:

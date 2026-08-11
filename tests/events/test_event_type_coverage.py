@@ -11,6 +11,8 @@ must be total, and which discovers EventType-keyed tables by walking the package
 so a table added later is covered without a new hand-written test.
 """
 
+from collections.abc import Mapping
+
 import pytest
 
 from events import coverage
@@ -81,10 +83,15 @@ def test_every_events_module_imports():
 
 
 def test_manifest_entries_still_resolve():
-    """No MANIFEST entry points at a renamed or deleted table."""
+    """No MANIFEST entry points at a renamed or deleted table.
+
+    ``Mapping``, not ``dict``: EVENT_TYPE_EMOJI is a MappingProxyType derived
+    from EventType.icon, which is not a dict. Same widening as
+    coverage.discover_tables() — see that function's docstring.
+    """
     for spec in MANIFEST:
         table = spec.resolve()
-        assert isinstance(table, dict), f"{spec.qualname} is not a dict"
+        assert isinstance(table, Mapping), f"{spec.qualname} is not a mapping"
         assert all(isinstance(k, EventType) for k in table), (
             f"{spec.qualname} has non-EventType keys; it does not belong in "
             f"the events.coverage manifest"
@@ -100,6 +107,61 @@ def test_historically_drifted_tables_are_required_total():
     required = {spec.qualname for spec in REQUIRED_TOTAL}
     assert "events.formatting.EVENT_TYPE_EMOJI" in required
     assert "events.routing_policy._POLICY" in required
+
+
+def test_policy_check_is_still_armed_against_a_real_gap(monkeypatch):
+    """The _POLICY check must FAIL on a table that is actually missing an entry.
+
+    This is the anti-false-green test. On 2026-08-11 a competing branch
+    (archive/eventtype-icon-as-enum-field-20260811) added a _finalize_policy()
+    that back-filled every unmapped EventType with a fallback AT IMPORT TIME.
+    coverage.py reads _POLICY *after* import, so the check reported
+    "_POLICY: 79/79" and exited 0 on a table with a hole in it — a guard that
+    looks armed and is not, which is worse than no guard.
+
+    So: remove a real entry and assert the check notices. A green suite must
+    not be consistent with "_POLICY is total by construction now".
+    """
+    import events.routing_policy as rp
+
+    victim = EventType.NOTIFICATION_FAILED
+    gapped = {k: v for k, v in rp._POLICY.items() if k is not victim}
+    assert len(gapped) == len(rp._POLICY) - 1, "victim was not in _POLICY"
+    monkeypatch.setattr(rp, "_POLICY", gapped)
+
+    gaps = coverage_gaps()
+    assert gaps.get("events.routing_policy._POLICY") == [victim.type_string], (
+        "coverage_gaps() did not report a _POLICY entry that is genuinely "
+        "missing — the table is being back-filled somewhere before the check "
+        "reads it, and every green run from here is meaningless"
+    )
+
+    report, ok = format_report()
+    assert ok is False
+    assert victim.type_string in report
+
+
+def test_policy_is_not_backfilled_at_import(monkeypatch):
+    """classify() must degrade at CALL time, not by pre-filling the table.
+
+    The graceful fallback for an unmapped type is deliberate and stays. What
+    must not exist is an import-time back-fill: that is what turns the
+    pre-commit check tautological. Pin the mechanism, not just the outcome.
+    """
+    import events.routing_policy as rp
+
+    assert not hasattr(rp, "_finalize_policy"), (
+        "_finalize_policy() back-fills _POLICY at import time and disarms "
+        "events.coverage — see test_policy_check_is_still_armed_against_a_real_gap"
+    )
+    assert not hasattr(rp, "UNROUTED_EVENT_TYPES")
+
+    # A type absent from the table still classifies (fallback), and is still
+    # absent afterwards — .get() must not be a setdefault in disguise.
+    victim = EventType.NOTIFICATION_FAILED
+    gapped = {k: v for k, v in rp._POLICY.items() if k is not victim}
+    monkeypatch.setattr(rp, "_POLICY", gapped)
+    assert missing_members(rp._POLICY) == [victim.type_string]
 
 
 def test_manifest_has_no_duplicate_entries():

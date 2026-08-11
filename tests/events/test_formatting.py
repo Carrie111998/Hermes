@@ -1,5 +1,7 @@
 """Tests for events.formatting emoji + header helpers."""
 
+from enum import Enum
+
 import pytest
 
 from events.formatting import (
@@ -30,6 +32,10 @@ def test_priority_dots_cover_all_levels():
 def test_event_icons_cover_all_types():
     """Every EventType member needs an icon.
 
+    Totality is now STRUCTURAL — the icon is a required EventType field and
+    EVENT_TYPE_EMOJI is derived from it — so this can only fail if the derived
+    table stops deriving. Kept as the canary for exactly that.
+
     Collect-then-assert, not assert-in-loop: the in-loop form short-circuited
     on the FIRST miss, so the failure message named one type at every
     recurrence of this drift (2026-04-27 x2, 2026-05-29, 2026-08-11) while
@@ -40,6 +46,61 @@ def test_event_icons_cover_all_types():
         f"{len(missing)} of {len(list(EventType))} EventType members have no "
         f"EVENT_TYPE_EMOJI entry: {', '.join(missing)}"
     )
+
+
+def test_event_type_emoji_is_derived_from_the_enum():
+    """EVENT_TYPE_EMOJI must stay a view over EventType.icon, not a second
+    hand-maintained table. Four drifts (2026-04-27 x2, 2026-05-29, 2026-08-11)
+    came from it being independently edited; re-introducing a literal dict here
+    re-opens that failure mode, so pin both the values and the fact that it
+    cannot be written to.
+    """
+    assert dict(EVENT_TYPE_EMOJI) == {et: et.icon for et in EventType}
+    with pytest.raises(TypeError):
+        EVENT_TYPE_EMOJI[EventType.CRON_STARTED] = "💩"  # read-only view
+
+
+class TestIconGuardIsArmed:
+    """Prove the structural guard actually fires.
+
+    Without these, a green suite is equally consistent with "the guard works"
+    and "the guard was silently removed" — the icons would all still be present
+    either way. Each case reproduces one shape of the drift against a throwaway
+    enum that reuses EventType's real __init__.
+    """
+
+    @staticmethod
+    def _define(*member_value):
+        class _Throwaway(Enum):
+            __init__ = EventType.__init__
+            SAMPLE = member_value
+
+        return _Throwaway
+
+    def test_omitting_the_icon_is_a_type_error(self):
+        """The 2026-08-11 shape: a member added with only (string, priority).
+
+        Enum's member construction rejects it at CLASS-CREATION time, so
+        ``import events.schema`` fails — and every producer imports it.
+        """
+        with pytest.raises(TypeError, match="icon"):
+            self._define("sample", Priority.LOW)
+
+    def test_empty_icon_is_rejected(self):
+        """Closes the obvious escape hatch: silencing the TypeError with "".
+
+        That would restore exactly the old failure (event_icon() -> "").
+        """
+        with pytest.raises(ValueError, match="non-empty"):
+            self._define("sample", Priority.LOW, "")
+
+    def test_whitespace_only_icon_is_rejected(self):
+        with pytest.raises(ValueError, match="non-empty"):
+            self._define("sample", Priority.LOW, "   ")
+
+    def test_a_real_icon_is_accepted(self):
+        """Negative-test control: the guard rejects blanks, not everything."""
+        assert self._define("sample", Priority.LOW, "🧪").SAMPLE.icon == "🧪"
 
 
 def test_event_icon_uses_inner_type_for_mailbox_message():
