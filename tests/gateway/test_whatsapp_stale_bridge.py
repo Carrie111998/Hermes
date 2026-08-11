@@ -17,6 +17,8 @@ package.json changes, not only when node_modules is missing.
 """
 
 import asyncio
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -144,12 +146,78 @@ class TestStaleBridgeHandshake:
              patch("aiohttp.ClientSession", mock_client), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
-             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
             await adapter.connect()
 
         mock_popen.assert_called_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.linux_only
+    async def test_foreign_listener_on_bridge_port_survives_connect(self, tmp_path):
+        """Bridge bootstrap must never terminate an unrelated port owner."""
+        bridge_dir = _setup_bridge_dir(tmp_path)
+        _fresh_node_modules(bridge_dir)
+        adapter = _make_adapter(
+            bridge_script=str(bridge_dir / "bridge.js"),
+            session_path=tmp_path / "session",
+        )
+
+        listener = subprocess.Popen(
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                (
+                    "from http.server import ThreadingHTTPServer,"
+                    "SimpleHTTPRequestHandler;"
+                    "server=ThreadingHTTPServer(('127.0.0.1',0),"
+                    "SimpleHTTPRequestHandler);"
+                    "print(server.server_port,flush=True);"
+                    "server.serve_forever()"
+                ),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        try:
+            assert listener.stdout is not None
+            adapter._bridge_port = int(listener.stdout.readline().strip())
+
+            failed_bridge = MagicMock()
+            failed_bridge.poll.return_value = 1
+            failed_bridge.returncode = 1
+            with patch(
+                "plugins.platforms.whatsapp.adapter.check_whatsapp_requirements",
+                return_value=True,
+            ), patch(
+                "plugins.platforms.whatsapp.adapter.asyncio.sleep",
+                new_callable=AsyncMock,
+            ), patch(
+                "plugins.platforms.whatsapp.adapter.subprocess.Popen",
+                return_value=failed_bridge,
+            ), patch(
+                "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
+                return_value=[listener.pid],
+                create=True,
+            ), patch.object(
+                adapter,
+                "_acquire_platform_lock",
+                return_value=True,
+                create=True,
+            ):
+                result = await adapter.connect()
+
+            assert result is False
+            assert listener.poll() is None
+        finally:
+            listener.terminate()
+            try:
+                listener.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                listener.kill()
+                listener.wait(timeout=5)
 
 
 class TestDepRefreshStamp:
@@ -169,7 +237,6 @@ class TestDepRefreshStamp:
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
-             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.run") as mock_run, \
              patch("subprocess.Popen", return_value=mock_proc), \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
@@ -196,7 +263,6 @@ class TestCacheDirEnvPassthrough:
              patch("aiohttp.ClientSession", _mock_health({"status": "disconnected"})), \
              patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock), \
              patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile"), \
-             patch("plugins.platforms.whatsapp.adapter._kill_port_process"), \
              patch("subprocess.Popen", return_value=mock_proc) as mock_popen, \
              patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True):
             await adapter.connect()
