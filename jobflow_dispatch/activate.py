@@ -41,6 +41,10 @@ def resolve_job_id_for_activity(activity_id: str) -> Optional[str]:
         return None
 
     names = {alias for alias in policy.aliases}
+    # Intentional asymmetry: a legacy record with no "enabled" key is treated
+    # as not-enabled HERE (fails closed), even though the due scan defaults
+    # missing "enabled" to True (`job.get("enabled", True)`). A record like
+    # that is runnable by the scheduler but permanently refused by this path.
     matches = [
         job for job in load_jobs()
         if job.get("name") in names and job.get("enabled")

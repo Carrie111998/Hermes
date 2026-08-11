@@ -765,10 +765,10 @@ def activate_pending(
 ```
 
 Add this import beside the others at the top of the file, and change the signature's
-annotation from `Sequence["Activation"]` to the unquoted `Sequence[Activation]`. Pyflakes
-counts a name used in an annotation as used even under `from __future__ import
-annotations`, so this needs no `noqa` — and the F group is enforced locally (agent memory
-`ruff-f601-scope-decision`), so a stray unused import would fail the lint step.
+annotation from `Sequence["Activation"]` to the unquoted `Sequence[Activation]`. The
+import is genuinely used by that annotation, so no `noqa` is warranted regardless of lint
+configuration — Pyflakes counts a name used in an annotation as used even under
+`from __future__ import annotations`.
 
 ```python
 from jobflow_dispatch.contracts import Activation
@@ -1156,3 +1156,4 @@ After all six tasks:
 - [ ] `hermes cron list --all` shows `jobflow-reconcile` active on `30 0,6,12,18 * * *`
 - [ ] The first live run at or after `2026-08-11T00:30` completes with `last_status=ok` (`hermes cron runs 64711e6d8334`)
 - [ ] Grep the gateway log for `request_run refused` — any hit is a genuine disabled-job save and worth reading
+- [ ] Check `~/.hermes/events/audit.jsonl` for the same `job_id` carrying `caller="cron:jobflow-reconcile"` across consecutive reconcile windows — that recurrence is the signature of the invisible wake loop documented in the spec's Accepted risks (a permanently stuck mailbox message that resolves and activates cleanly every pass, so the gate never opens)

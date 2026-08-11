@@ -251,3 +251,22 @@ dispatch mode does not affect.
 - **Concurrent scheduler activity.** `mark_job_run` and `get_due_and_skipped_jobs` re-read
   under the same lock before writing, so a `next_run_at` written by the script is not
   clobbered by an in-flight tick.
+- **A permanently stuck message produces an invisible wake loop.** The gate is
+  `{"wakeAgent": false}` whenever every resolved activity activates cleanly, and on that
+  branch the scheduler replaces the run's stdout with a fixed `silent_doc` — so a
+  successful activation leaves no run document, no delivered message, and no agent
+  session. If a message is permanently stuck in an inbox (a malformed packet, or a bug in
+  the worker's own drain path), the worker never consumes it, so the same activity is
+  still actionable on the next scan. Each reconcile resolves it, calls `request_run`
+  successfully, and closes the gate again — the reconciler silently wakes that worker at
+  00:30, 06:30, 12:30, and 18:30 forever, burning a worker run every six hours, with the
+  only trace being hourly-batched `cron_triggered` TRACE rows in
+  `~/.hermes/events/audit.jsonl`. Under the old prompt-driven design, any pending work
+  opened the gate, so this same condition produced a visible agent report every cycle
+  instead of silence. Closing this in code would require the reconciler to keep per-run
+  state across passes (e.g. "this activity resolved cleanly N times in a row with no
+  progress") — state this design deliberately keeps the reconciler without, since it is
+  meant to be a stateless safety net, not a second claimant with its own ledger. The
+  accepted mitigation is operational, not code: watch `audit.jsonl` for the same job_id
+  recurring under `caller="cron:jobflow-reconcile"` across consecutive reconcile windows
+  (see the plan's Verification checklist).

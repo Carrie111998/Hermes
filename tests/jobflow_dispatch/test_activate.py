@@ -8,9 +8,15 @@ rename of an alias breaks here rather than in production.
 
 from __future__ import annotations
 
-import pytest
+import json
 
-from jobflow_dispatch.activate import resolve_job_id_for_activity
+from jobflow_dispatch.activate import (
+    ActivationReport,
+    activate_pending,
+    render_report,
+    resolve_job_id_for_activity,
+)
+from jobflow_dispatch.contracts import Activation
 
 
 def _job(name, job_id, enabled=True):
@@ -60,10 +66,6 @@ def test_dispatcher_still_exposes_the_resolver():
     assert (
         jobflow_dispatcher.resolve_job_id_for_activity is resolve_job_id_for_activity
     )
-
-
-from jobflow_dispatch.activate import ActivationReport, activate_pending
-from jobflow_dispatch.contracts import Activation
 
 
 def _act(activity_id, key="tailor/inbox/m1.json"):
@@ -204,10 +206,23 @@ class TestActivatePending:
         assert report == ActivationReport(0, 0, (), (), (), ())
         assert report.needs_agent is False
 
+    def test_a_refusing_job_is_retried_by_a_later_activity_in_the_same_run(self):
+        """``woken`` only records SUCCESSFUL activation, so it is not a
+        dedup guard against retrying a refused job — two activities that
+        resolve to the same permanently-refusing job each call request_run,
+        and each activity ID shows up in ``report.refused``. This is safe
+        (a refusal writes nothing) and arguably more informative, but it is
+        incidental rather than designed, so pin it."""
+        runner = _Recorder(refuse={"job-1"})
+        report = activate_pending(
+            [_act("a.one", "k1"), _act("a.two", "k2")],
+            resolve=lambda a: "job-1",
+            request_run=runner,
+        )
 
-import json
-
-from jobflow_dispatch.activate import render_report
+        assert [c[0] for c in runner.calls] == ["job-1", "job-1"]
+        assert report.activated == ()
+        assert report.refused == ("a.one", "a.two")
 
 
 def _last_line(text):

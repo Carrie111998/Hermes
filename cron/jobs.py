@@ -1775,11 +1775,14 @@ def request_run(
     enabled. Fails closed on purpose: not activating is recoverable, reviving a
     disabled worker is not.
 
-    Writes EXACTLY ``next_run_at``. The due scan gates on ``enabled`` and never
-    reads ``state`` (see ``get_due_and_skipped_jobs``), and ``pause_job`` always
-    sets ``enabled: False`` alongside ``state: "paused"`` — so the single
-    ``enabled`` check above already covers paused jobs, and no lifecycle field
-    needs touching. Keeping the write to one field is what makes "this cannot
+    Writes NO LIFECYCLE field — only ``next_run_at`` (``update_job``'s shared
+    normalization may still materialize ``skills``/``skill`` on a legacy record
+    that lacks those keys, which is why the claim above is scoped to lifecycle
+    fields specifically). The due scan gates on ``enabled`` and never reads
+    ``state`` (see ``get_due_and_skipped_jobs``), and ``pause_job`` always sets
+    ``enabled: False`` alongside ``state: "paused"`` — so the single ``enabled``
+    check above already covers paused jobs, and no lifecycle field needs
+    touching. Keeping the write off lifecycle fields is what makes "this cannot
     change operator-visible state" assertable.
 
     ``caller`` is required, unlike ``trigger_job``'s warn-and-continue
@@ -1793,6 +1796,10 @@ def request_run(
     if not job:
         return None
 
+    # Intentional asymmetry: a legacy record with no "enabled" key is treated
+    # as not-enabled HERE (fails closed), even though the due scan defaults
+    # missing "enabled" to True (`job.get("enabled", True)`). A record like
+    # that is runnable by the scheduler but permanently refused by this path.
     if not job.get("enabled"):
         logger.info(
             "request_run refused job_id=%s name=%s: not enabled — not reviving "
