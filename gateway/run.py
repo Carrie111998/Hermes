@@ -2153,6 +2153,8 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     # sessions.* wins over stale env; env stays the cross-process carrier).
     sessions_cfg = cfg.get("sessions", {})
     if isinstance(sessions_cfg, dict):
+        if "trigram_fts" in sessions_cfg:
+            os.environ["HERMES_TRIGRAM_FTS"] = str(sessions_cfg["trigram_fts"])
         if "cjk_fts" in sessions_cfg:
             os.environ["HERMES_CJK_FTS"] = str(sessions_cfg["cjk_fts"])
         if "search_slow_ms" in sessions_cfg:
@@ -2501,6 +2503,10 @@ if _config_path.exists():
         # bridge semantics as the agent settings above.
         _sessions_cfg = _cfg.get("sessions", {})
         if _sessions_cfg and isinstance(_sessions_cfg, dict):
+            if "trigram_fts" in _sessions_cfg:
+                os.environ["HERMES_TRIGRAM_FTS"] = str(
+                    _sessions_cfg["trigram_fts"]
+                )
             if "cjk_fts" in _sessions_cfg:
                 os.environ["HERMES_CJK_FTS"] = str(_sessions_cfg["cjk_fts"])
             if "search_slow_ms" in _sessions_cfg:
