@@ -257,6 +257,10 @@ jobs:
       - lint
       - js-tests
       - installer-tests
+      # Blocks on frontend PRs and is `skipped` on Python-only ones, which the
+      # evaluator below counts as passing. It merged red three times before
+      # being listed here, because nothing was waiting on it.
+      - desktop-install-windows
       - e2e-desktop
       - docs-site
       - history-check
