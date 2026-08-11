@@ -57,6 +57,26 @@ SPAWN_LOGGED_PID_VAR = "HERMES_GATEWAY_SPAWN_DIAG_PID"
 # ``gateway_windows`` can reach it without paying a heavy import.
 SPAWN_SITE_ENV = "HERMES_GATEWAY_SPAWN_SITE"
 
+# What ``_spawn_detached`` stamps when its caller names no site. It records
+# "one of ours launched this, but it did not say which" — strictly less
+# information than the coarse inference in ``_detect_boot_reason``, so
+# consumers that classify a boot must treat it as absent rather than report it.
+SPAWN_SITE_UNSPECIFIED = "unspecified"
+
+
+def carried_spawn_site() -> str | None:
+    """The launcher's own label for this process, or None if it carries none.
+
+    Reads the stamp rather than inferring from the process tree: a detached
+    gateway outlives its spawner, so by the time anything asks, the parent is
+    typically gone. Returns None for both "never stamped" and "stamped without
+    a name" so a caller can use ``or`` to fall through to inference.
+    """
+    site = (os.environ.get(SPAWN_SITE_ENV) or "").strip()
+    if not site or site == SPAWN_SITE_UNSPECIFIED:
+        return None
+    return site
+
 
 def diag_enabled() -> bool:
     """Whether lifecycle records should be written (default: on)."""

@@ -1108,3 +1108,73 @@ def test_drain_helper_still_waits_if_marker_write_fails(monkeypatch):
 
     # Returns True because _pid_exists immediately says "gone".
     assert gateway_windows._drain_gateway_pid(pid, drain_timeout=5.0) is True
+
+
+# ── spawn label -> boot_reason round trip ────────────────────────────────────
+#
+# tests/hermes_cli/test_gateway_start_diag_attribution.py already pins that
+# `start()` passes "cli:start" and `restart()` passes "cli:restart" by stubbing
+# `_spawn_detached`. That leaves the seam untested: the label is only worth
+# anything if it survives the real spawn into the child env AND is read back as
+# the `boot_reason` an operator sees in ~/.hermes/events/audit.jsonl. Stubbing
+# either end would let the two halves drift apart while both files stayed green.
+
+
+@pytest.mark.parametrize(
+    "entry, expected_boot_reason",
+    [
+        ("start", "cli:start"),
+        ("restart", "cli:restart"),
+    ],
+)
+def test_cli_entrypoint_label_survives_into_boot_reason(
+    monkeypatch, tmp_path, entry, expected_boot_reason
+):
+    """A restart must be distinguishable from a plain start in the audit trail.
+
+    Drives the real `_spawn_detached` (only `Popen` is faked) so the assertion
+    covers the actual env hand-off, then evaluates `_detect_boot_reason` under
+    exactly the environment the child would have inherited.
+    """
+    import sys as _sys
+
+    from gateway.run import GatewayRunner
+    from hermes_cli import gateway_diag
+
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: None)
+    monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(gateway_windows, "is_startup_entry_installed", lambda: False)
+    monkeypatch.setattr(gateway_windows, "stop", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **k: True)
+    monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **k: True)
+    monkeypatch.setattr(gateway_windows.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(
+        gateway_windows,
+        "_build_gateway_argv",
+        lambda: (["pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"], str(tmp_path), {}),
+    )
+    monkeypatch.setattr(gateway_windows, "windows_detach_flags", lambda: 0)
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: tmp_path)
+
+    captured: dict[str, dict] = {}
+
+    class _FakePopen:
+        pid = 4242
+
+        def __init__(self, argv, **kwargs):
+            captured["env"] = kwargs["env"]
+
+    monkeypatch.setattr(gateway_windows.subprocess, "Popen", _FakePopen)
+
+    getattr(gateway_windows, entry)()
+
+    # The producer half: the child really was handed the label.
+    child_env = captured["env"]
+    assert child_env[gateway_diag.SPAWN_SITE_ENV] == expected_boot_reason
+
+    # The consumer half: that child classifies its own boot from the label.
+    monkeypatch.setattr(_sys, "argv", ["hermes", "gateway", "run"])
+    monkeypatch.setenv(gateway_diag.SPAWN_SITE_ENV, child_env[gateway_diag.SPAWN_SITE_ENV])
+    assert GatewayRunner._detect_boot_reason(None) == expected_boot_reason

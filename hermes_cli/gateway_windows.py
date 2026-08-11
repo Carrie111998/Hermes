@@ -40,6 +40,9 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 from hermes_cli.gateway_diag import SPAWN_SITE_ENV as GATEWAY_SPAWN_SITE_ENV
+from hermes_cli.gateway_diag import (
+    SPAWN_SITE_UNSPECIFIED as GATEWAY_SPAWN_SITE_UNSPECIFIED,
+)
 from hermes_cli._subprocess_compat import (
     windows_detach_flags,
     windows_detach_flags_without_breakaway,
@@ -65,7 +68,10 @@ _SPAWN_SITE_TASK_SCRIPT = "windows-task-script"
 _SPAWN_SITE_STARTUP_FOLDER = "windows-startup-folder"
 # Used when a _spawn_detached() caller names no site; a stamped-but-unnamed
 # launch is still distinguishable from one that never went through us at all.
-_SPAWN_SITE_UNSPECIFIED = "unspecified"
+# Defined in gateway_diag so the consumer that has to discount it
+# (``_detect_boot_reason``) and the producer that stamps it agree by import
+# rather than by two copies of the same string literal.
+_SPAWN_SITE_UNSPECIFIED = GATEWAY_SPAWN_SITE_UNSPECIFIED
 
 _TASK_NAME_DEFAULT = "Hermes_Gateway"
 _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
