@@ -1,5 +1,6 @@
 from gateway.runtime_contract import (
     RUNTIME_DRIVER_FRAME_TYPES,
+    RUNTIME_PROTOCOL_VERSION,
     runtime_error_envelope,
     runtime_health_contract,
 )
@@ -7,7 +8,7 @@ from gateway.runtime_contract import (
 
 def test_runtime_health_contract_is_explicit_and_versioned():
     contract = runtime_health_contract()
-    assert contract["runtime_protocol_version"] == "1"
+    assert contract["runtime_protocol_version"] == RUNTIME_PROTOCOL_VERSION
     assert contract["runtime_frame_types"] == list(RUNTIME_DRIVER_FRAME_TYPES)
     assert "checkpoint" not in contract["runtime_frame_types"]
     assert {

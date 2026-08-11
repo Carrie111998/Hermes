@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from typing import Any
 
-RUNTIME_PROTOCOL_VERSION = "1"
+RUNTIME_PROTOCOL_VERSION = "2"
 RUNTIME_DRIVER_FRAME_TYPES = (
     "run_started",
     "heartbeat",
     "text_delta",
+    "runtime_control_request",
     "tool_request",
     "activity_started",
     "activity_completed",
@@ -19,7 +20,9 @@ RUNTIME_DRIVER_FRAME_TYPES = (
 RUNTIME_CAPABILITIES = (
     "delegated_tools",
     "interrupt",
+    "model_contract_control",
     "session_db_resume",
+    "retry_current_turn/v1",
     "system_context.replace",
     "llm_egress",
 )

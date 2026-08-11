@@ -73,6 +73,15 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _accepted_tool_names(agent: Any) -> set[str]:
+    """Names the loop may dispatch without advertising deferred schemas."""
+    accepted = set(getattr(agent, "valid_tool_names", set()) or set())
+    accepted.update(
+        getattr(agent, "_runtime_deferred_tool_names", set()) or set()
+    )
+    return accepted
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -913,10 +922,15 @@ def run_conversation(
                             ),
                         }}
                     except Exception:
-                        tc["function"]["arguments"] = _repair_tool_call_arguments(
+                        repaired_arguments = _repair_tool_call_arguments(
                             tc["function"]["arguments"],
                             tc["function"].get("name", "?"),
                         )
+                        if repaired_arguments is None:
+                            raise ValueError(
+                                "conversation contains unrepairable tool_call arguments"
+                            )
+                        tc["function"]["arguments"] = repaired_arguments
                 new_tcs.append(tc)
             am["tool_calls"] = new_tcs
 
@@ -4071,17 +4085,13 @@ def run_conversation(
                     for tc in assistant_message.tool_calls:
                         logging.debug(f"Tool call: {tc.function.name} with args: {tc.function.arguments[:200]}...")
                 
-                # Validate tool call names - detect model hallucinations
-                # Repair mismatched tool names before validating
-                for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
-                        repaired = agent._repair_tool_call(tc.function.name)
-                        if repaired:
-                            print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
-                            tc.function.name = repaired
+                # Validate tool call names exactly. An unavailable or misspelled
+                # tool must be reported to the model, never rewritten to a
+                # different executable capability.
+                accepted_tool_names = _accepted_tool_names(agent)
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
+                    if tc.function.name not in accepted_tool_names
                 ]
                 if invalid_tool_calls:
                     # Track retries for invalid tool calls
@@ -4111,7 +4121,7 @@ def run_conversation(
                     messages.append(assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
-                        if _tc_name not in agent.valid_tool_names:
+                        if _tc_name not in accepted_tool_names:
                             # A blank/whitespace-only name is not a typo the
                             # model can fuzzy-correct toward a real tool — it is
                             # almost always a weak open model echoing tool-call

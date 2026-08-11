@@ -10,6 +10,7 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import Any
 
 from agent.skill_utils import parse_frontmatter
 
@@ -21,6 +22,42 @@ _HEX_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 @dataclass(frozen=True)
 class RuntimeSkillProjection:
     files: Mapping[str, bytes]
+
+
+def projection_skill_metadata(
+    projections: Mapping[str, RuntimeSkillProjection],
+) -> list[dict[str, Any]]:
+    """Build routing metadata from the exact run-bound Skill snapshot."""
+    result: list[dict[str, Any]] = []
+    for name in sorted(projections):
+        projection = projections[name]
+        try:
+            content = projection.files["SKILL.md"].decode("utf-8")
+        except (KeyError, UnicodeDecodeError) as exc:
+            raise ValueError(
+                f"run-bound Skill metadata is unreadable for {name}"
+            ) from exc
+        frontmatter, _ = parse_frontmatter(content)
+        if not isinstance(frontmatter, dict):
+            raise ValueError(f"run-bound Skill metadata is invalid for {name}")
+        description = frontmatter.get("description")
+        if not isinstance(description, str):
+            description = ""
+        routing = frontmatter.get("routing")
+        kind = str(frontmatter.get("kind") or "").strip()
+        item: dict[str, Any] = {
+            "name": name,
+            "description": " ".join(description.split()),
+            "category": (
+                "workflow-generation"
+                if kind == "workflow" or isinstance(routing, dict)
+                else kind or "skill"
+            ),
+        }
+        if isinstance(routing, dict):
+            item["routing"] = routing
+        result.append(item)
+    return result
 
 
 def resolve_skill_projections(

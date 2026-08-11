@@ -30,6 +30,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+from types import SimpleNamespace
 
 # Repo root = three levels up from tests/agent/<file>.
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -154,6 +155,17 @@ def _tool_results(handler) -> list[str]:
     return out
 
 
+def test_runtime_deferred_names_are_dispatchable_but_not_advertised():
+    from agent.conversation_loop import _accepted_tool_names
+
+    agent = SimpleNamespace(
+        valid_tool_names={"tool_search"},
+        _runtime_deferred_tool_names={"media.generate_video"},
+    )
+    assert _accepted_tool_names(agent) == {"tool_search", "media.generate_video"}
+    assert "media.generate_video" not in agent.valid_tool_names
+
+
 @pytest.mark.parametrize("blank", ["", "   ", "\n", "\t "])
 def test_empty_tool_name_gets_terse_error_no_catalog(agent_env, blank):
     """A blank/whitespace tool name must NOT trigger a full tool-catalog dump."""
@@ -181,3 +193,23 @@ def test_unknown_nonempty_name_keeps_catalog(agent_env):
     assert "frobnicate_xyz" in joined
     assert "Available tools:" in joined
     assert "tool name was empty" not in joined
+
+
+def test_unknown_media_tool_is_not_rewritten_to_adjacent_capability(agent_env):
+    """An unavailable video tool must not execute the similarly named image tool."""
+    agent, handler = agent_env
+    agent.valid_tool_names = {"media.generate_image"}
+    handler.response_queue.append(
+        _tc_resp(
+            "media.generate_video",
+            '{"requests": [{"model": "test-video", "prompt": "test"}]}',
+        )
+    )
+    handler.response_queue.append(_text_resp("Video tool is unavailable."))
+
+    agent.run_conversation("generate a video", conversation_history=[], task_id="t")
+
+    joined = " ".join(_tool_results(handler))
+    assert "media.generate_video" in joined
+    assert "does not exist" in joined
+    assert "Available tools: media.generate_image" in joined

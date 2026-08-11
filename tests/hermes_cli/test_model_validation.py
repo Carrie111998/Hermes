@@ -559,16 +559,16 @@ class TestValidateApiNotFound:
 
     def test_warning_includes_suggestions(self):
         result = _validate("anthropic/claude-opus-4.5")
-        assert result["accepted"] is True
-        # Close match auto-corrects; less similar inputs show suggestions
-        assert "Auto-corrected" in result["message"] or "Similar models" in result["message"]
+        assert result["accepted"] is False
+        assert "Similar models" in result["message"]
 
-    def test_auto_correction_returns_corrected_model(self):
-        """When a very close match exists, validate returns corrected_model."""
+    def test_close_match_is_suggested_without_rewriting_model(self):
         result = _validate("anthropic/claude-opus-4.5")
-        assert result["accepted"] is True
-        assert result.get("corrected_model") == "anthropic/claude-opus-4.6"
-        assert result["recognized"] is True
+        assert result["accepted"] is False
+        assert result["persist"] is False
+        assert result.get("corrected_model") is None
+        assert result["recognized"] is False
+        assert "anthropic/claude-opus-4.6" in result["message"]
 
     def test_dissimilar_model_shows_suggestions_not_autocorrect(self):
         """Models too different for auto-correction are rejected with suggestions."""
@@ -779,21 +779,21 @@ class TestValidateApiFallback:
         assert "Could not reach LM Studio" in result["message"]
 
 
-# -- validate — Codex auto-correction ------------------------------------------
+# -- validate — Codex typo guidance --------------------------------------------
 
-class TestValidateCodexAutoCorrection:
-    """Auto-correction for typos on openai-codex provider."""
+class TestValidateCodexTypoGuidance:
+    """Typos remain literal and receive suggestions on openai-codex."""
 
-    def test_missing_dash_auto_corrects(self):
-        """gpt5.3-codex (missing dash) auto-corrects to gpt-5.3-codex."""
+    def test_missing_dash_is_not_rewritten(self):
         codex_models = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.3-codex",
                         "gpt-5.2-codex", "gpt-5.1-codex-max"]
         with patch("hermes_cli.models.provider_model_ids", return_value=codex_models):
             result = validate_requested_model("gpt5.3-codex", "openai-codex")
-        assert result["accepted"] is True
-        assert result["recognized"] is True
-        assert result["corrected_model"] == "gpt-5.3-codex"
-        assert "Auto-corrected" in result["message"]
+        assert result["accepted"] is False
+        assert result["persist"] is False
+        assert result["recognized"] is False
+        assert result.get("corrected_model") is None
+        assert "gpt-5.3-codex" in result["message"]
 
     def test_exact_match_no_correction(self):
         """Exact model name does not trigger auto-correction."""

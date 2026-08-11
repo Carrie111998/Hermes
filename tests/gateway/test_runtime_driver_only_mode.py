@@ -27,6 +27,7 @@ RUNTIME_ROUTES = {
     ("GET", "/healthz"),
     ("POST", "/v1/runtime/runs"),
     ("POST", "/v1/runtime/runs/{run_id}/tool-results"),
+    ("POST", "/v1/runtime/runs/{run_id}/control-results"),
     ("POST", "/v1/runtime/runs/{run_id}/interrupt"),
 }
 

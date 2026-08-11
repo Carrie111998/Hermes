@@ -24,11 +24,13 @@ from gateway.api_server_shared import (
 from gateway.api_server_runtime import (
     APIServerRuntimeMixin,
     RuntimeBridgeSession,
+    _allowed_skills_prompt,
     _failed_tool_result_projection,
     _normalize_runtime_messages,
     _pin_run_model,
     _replacement_system_prompt,
     _project_runtime_resume_attachments,
+    _retry_session_db_history,
     _resume_session_db_history,
     _runtime_attachment_parts,
     _runtime_attachment_reference_prompt,
@@ -256,6 +258,8 @@ class _RuntimeAdapter(_TestRuntimeAdapter):
         assert agent._primary_runtime["compressor_model"] == "chat-test"
         assert agent._fallback_chain == []
         assert agent._fallback_model is None
+        assert agent._skip_mcp_refresh is True
+        assert agent._runtime_deferred_tool_names == {"ultra_media_job_create"}
         assert agent.valid_tool_names == {
             "ask_user_question",
             "image_analyze",
@@ -297,7 +301,8 @@ class _RuntimeAdapter(_TestRuntimeAdapter):
         )
         skill_envelope = json.loads(skill_result)
         assert skill_envelope["success"] is True
-        assert skill_envelope["content"] == "workflow instructions"
+        assert "description: Inspect generated media." in skill_envelope["content"]
+        assert skill_envelope["content"].endswith("workflow instructions\n")
         assert "skill_dir" not in skill_envelope
         assert skill_envelope["linked_files"] == {
             "references": ["references/guide.md"],
@@ -637,6 +642,47 @@ def test_runtime_image_tool_allows_remote_and_scopes_local_sources(tmp_path):
         session.loop.close()
 
 
+def test_runtime_tool_middleware_fails_closed_for_process_global_tools():
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_scoped",
+        asyncio.new_event_loop(),
+        queue,
+        [],
+        1_000,
+        "agent_scoped",
+    )
+    halt_decisions = []
+    session.agent_ref[0] = SimpleNamespace(
+        _set_tool_guardrail_halt=halt_decisions.append,
+    )
+    runtime_module._SESSIONS["agent_scoped"] = session
+    try:
+        denied = _runtime_tool_middleware(
+            tool_name="mcp_higgsfield_media_upload",
+            args={"filename": "reference.png"},
+            session_id="agent_scoped",
+            tool_call_id="unscoped_tool",
+            next_call=lambda _args: pytest.fail(
+                "process-global MCP tool escaped the Runtime scope"
+            ),
+        )
+        assert json.loads(denied)["error"] == {
+            "code": "tool_not_allowed",
+            "message": (
+                "Tool 'mcp_higgsfield_media_upload' is not authorized "
+                "for this Runtime Run."
+            ),
+            "retryable": False,
+        }
+        assert len(halt_decisions) == 1
+        assert halt_decisions[0].should_halt is True
+        assert halt_decisions[0].code == "runtime_tool_scope_violation"
+    finally:
+        runtime_module._SESSIONS.pop("agent_scoped", None)
+        session.loop.close()
+
+
 @pytest.mark.asyncio
 async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_content():
     captured = {}
@@ -821,15 +867,7 @@ def _runtime_skill_file(path: str, body: bytes) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
-async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypatch):
-    monkeypatch.setattr(runtime_module, "_discover_skill_metadata", lambda: [
-        {"name": "media-qa", "description": "Inspect generated media.", "category": "creative"},
-        {
-            "name": "planning-only",
-            "description": "Plan media without a delegated tool.",
-            "category": "creative",
-        },
-    ])
+async def test_runtime_driver_streams_tool_request_and_waits_for_result():
     adapter = _RuntimeAdapter()
     app = web.Application()
     app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
@@ -845,7 +883,21 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
             f"{version}\n{mode}\n{stable}".encode("utf-8"),
         ).hexdigest()
         package_digest = "sha256:" + hashlib.sha256(b"complete skill bundle").hexdigest()
-        root_skill_digest = "sha256:" + hashlib.sha256(b"workflow instructions").hexdigest()
+        media_skill = b"""---
+name: media-qa
+kind: method
+description: Inspect generated media.
+---
+workflow instructions
+"""
+        planning_skill = b"""---
+name: planning-only
+kind: method
+description: Plan media without a delegated tool.
+---
+planning instructions
+"""
+        root_skill_digest = "sha256:" + hashlib.sha256(media_skill).hexdigest()
         response = await client.post("/v1/runtime/runs", json={
             "run_id": "run_test",
             "intent": "bootstrap",
@@ -867,7 +919,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                         "content_digest": package_digest,
                         "path": "/orchestrator-only/media-qa",
                         "files": [
-                            _runtime_skill_file("SKILL.md", b"workflow instructions"),
+                            _runtime_skill_file("SKILL.md", media_skill),
                             _runtime_skill_file(
                                 "references/guide.md",
                                 b"reference instructions",
@@ -879,7 +931,7 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                         "content_digest": "sha256:" + hashlib.sha256(b"planning bundle").hexdigest(),
                         "path": "/orchestrator-only/planning-only",
                         "files": [
-                            _runtime_skill_file("SKILL.md", b"planning instructions"),
+                            _runtime_skill_file("SKILL.md", planning_skill),
                         ],
                     },
                 ],
@@ -1062,6 +1114,41 @@ def test_runtime_skill_projections_require_verified_inline_files():
         _runtime_skill_projections(manifest)
 
 
+def test_allowed_skill_prompt_uses_run_bound_projection_metadata():
+    skill_body = b"""---
+name: storyboard-quick-preview
+kind: workflow
+description: Legacy conversation-bound storyboard preview.
+routing:
+  mode: primary
+  priority: 72
+  triggers:
+    - storyboard quick preview
+    - quick campaign board video
+    - legacy storyboard preview
+  negative:
+    - generic single video
+---
+instructions
+"""
+    manifest = {
+        "skills": [{
+            "runtime_alias": "storyboard-quick-preview",
+            "content_digest": "sha256:" + hashlib.sha256(skill_body).hexdigest(),
+            "files": [_runtime_skill_file("SKILL.md", skill_body)],
+        }],
+    }
+
+    prompt = _allowed_skills_prompt(
+        {"storyboard-quick-preview"},
+        _runtime_skill_projections(manifest),
+    )
+
+    assert "- storyboard-quick-preview:" in prompt
+    assert "priority=72" in prompt
+    assert "applies=storyboard quick preview" in prompt
+
+
 def test_bound_skill_view_rejects_traversal_and_binary_files(monkeypatch):
     manifest = {
         "skills": [{
@@ -1174,6 +1261,15 @@ def test_runtime_resume_rejects_more_than_one_unfinished_tool_call():
             "thread_resume_conflict",
             db.get_messages_as_conversation("thread_resume_conflict"),
             [{"tool_call_id": "call_1", "status": "succeeded", "output": {}}],
+        )
+
+
+def test_runtime_same_turn_retry_requires_user_or_tool_tail():
+    history = [{"role": "user", "content": "make an image"}]
+    assert _retry_session_db_history(history) == history
+    with pytest.raises(RuntimeSessionStateError, match="must end with user or tool"):
+        _retry_session_db_history(
+            [*history, {"role": "assistant", "content": "finished"}],
         )
 
 
@@ -1392,6 +1488,125 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
     assert second_result["error"]["code"] == "repeated_non_retryable_tool_call"
     assert decisions[0].code == "repeated_non_retryable_tool_call"
     assert queue.empty()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["media.generate_image", "media.generate_audio"])
+async def test_runtime_media_requires_exact_private_contract_before_submission(tool_name):
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_media_schema_required",
+        asyncio.get_running_loop(),
+        queue,
+        [{"name": tool_name, "input_schema": {"type": "object"}}],
+        10_000,
+        "agent_media_schema_required",
+        _runtime_call_db(
+            "agent_media_schema_required",
+            ("call_generate", tool_name),
+        ),
+    )
+    call = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        tool_name,
+        {"requests": [{"model": "openai/gpt-image-2/text-to-image", "prompt": "poster"}]},
+        "call_generate",
+    ))
+    request = await queue.get()
+    assert request == {
+        "run_id": "run_media_schema_required",
+        "type": "runtime_control_request",
+        "payload": {
+            "request_id": request["payload"]["request_id"],
+            "kind": "model_contract.get",
+            "model": "openai/gpt-image-2/text-to-image",
+        },
+    }
+    assert session.submit_control_result({
+        "request_id": request["payload"]["request_id"],
+        "ok": False,
+        "error": {
+            "code": "model_not_found",
+            "message": "model schema unavailable",
+            "retryable": False,
+        },
+    })
+    result = json.loads(await call)
+    assert result["error"]["code"] == "model_schema_unavailable"
+    assert result["error"]["retryable"] is False
+    assert queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_runtime_media_uses_private_contract_and_rejects_domain_ratio_field():
+    queue = asyncio.Queue()
+    model = "openai/gpt-image-2/text-to-image"
+    session = RuntimeBridgeSession(
+        "run_media_schema",
+        asyncio.get_running_loop(),
+        queue,
+        [{"name": "media.generate_image", "input_schema": {"type": "object"}}],
+        10_000,
+        "agent_media_schema",
+        _runtime_call_db(
+            "agent_media_schema",
+            ("call_generate_bad", "media.generate_image"),
+            ("call_generate_good", "media.generate_image"),
+        ),
+    )
+    invalid_call = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        "media.generate_image",
+        {"requests": [{"model": model, "prompt": "poster", "aspect_ratio": "3:2"}]},
+        "call_generate_bad",
+    ))
+    contract_request = await queue.get()
+    assert contract_request["type"] == "runtime_control_request"
+    assert contract_request["payload"]["kind"] == "model_contract.get"
+    assert contract_request["payload"]["model"] == model
+    assert session.submit_control_result({
+        "request_id": contract_request["payload"]["request_id"],
+        "ok": True,
+        "result": {
+            "model": model,
+            "observed_schema_digest": "sha256:" + "a" * 64,
+            "parameters": [
+                {"name": "prompt", "type": "string", "required": True},
+                {
+                    "name": "size",
+                    "type": "string",
+                    "required": False,
+                    "options": ["1024x1024", "1536x1024"],
+                    "description": "Arbitrary resolutions are supported as WIDTHxHEIGHT strings.",
+                },
+                {
+                    "name": "quality",
+                    "type": "string",
+                    "required": False,
+                    "options": ["low", "medium", "high"],
+                },
+            ],
+        },
+    })
+    invalid = json.loads(await invalid_call)
+    assert invalid["error"]["code"] == "invalid_tool_arguments"
+    assert "aspect_ratio" in invalid["error"]["message"]
+    assert queue.empty()
+
+    generated = asyncio.create_task(asyncio.to_thread(
+        session.invoke_platform_tool,
+        "media.generate_image",
+        {"requests": [{"model": model, "prompt": "poster", "size": "2304x1536"}]},
+        "call_generate_good",
+    ))
+    request = await queue.get()
+    assert request["payload"]["arguments"]["requests"][0]["size"] == "2304x1536"
+    assert session.submit_result({
+        "call_id": "call_generate_good",
+        "ok": True,
+        "result": {"delivery_status": "ready"},
+    })
+    assert json.loads(await generated) == {"delivery_status": "ready"}
 
 
 @pytest.mark.asyncio
@@ -1702,7 +1917,7 @@ def _run_body(run_id: str, **extra):
             }
             for index, message in enumerate(body["messages"])
         ]
-    if body.get("intent") == "resume":
+    if body.get("intent") in {"resume", "retry"}:
         body["messages"] = []
     return body
 
@@ -1725,6 +1940,43 @@ def _complete_test_run(adapter, body):
             await client.close()
 
     return _run
+
+
+@pytest.mark.asyncio
+async def test_runtime_retry_continues_existing_turn_without_new_user_message():
+    class RetryAdapter(_TestRuntimeAdapter):
+        _api_key = ""
+
+        def __init__(self):
+            super().__init__()
+            self.db.create_session("thread_retry", "api_server")
+            self.db.append_message(
+                "thread_retry",
+                role="user",
+                content="make an image",
+                platform_message_id="user-retry",
+            )
+
+        def _check_auth(self, _request):
+            return None
+
+        async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(tools=[], valid_tool_names=set(), model="configured-model")
+            kwargs["agent_configurator"](agent)
+            assert agent._resume_from_tool_results is False
+            assert agent._retry_current_turn is True
+            assert kwargs["user_message"] == ""
+            assert [message["role"] for message in kwargs["conversation_history"]] == ["user"]
+            return {"final_response": "done"}, {"total_tokens": 2}
+
+    status, events = await _complete_test_run(RetryAdapter(), _run_body(
+        "retry",
+        intent="retry",
+        context={"session_id": "thread_retry"},
+        retry_context={"attempt": 2, "previous_error_code": "provider_timeout"},
+    ))()
+    assert status == 200
+    assert events[-1]["type"] == "completed"
 
 
 def test_runtime_message_validation_requires_stable_unique_ids_and_valid_roles():

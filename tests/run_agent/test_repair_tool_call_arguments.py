@@ -18,7 +18,7 @@ class TestRepairToolCallArguments:
 
     def test_none_type_returns_empty_object(self):
         """Non-string input (e.g. None from a broken model response)."""
-        assert _repair_tool_call_arguments(None, "t") == "{}"
+        assert _repair_tool_call_arguments(None, "t") is None
 
     # -- Stage 2: Python None literal --
 
@@ -73,12 +73,12 @@ class TestRepairToolCallArguments:
 
     # -- Stage 6: last resort --
 
-    def test_unrepairable_garbage_returns_empty_object(self):
-        assert _repair_tool_call_arguments("totally not json", "t") == "{}"
+    def test_unrepairable_garbage_fails_closed(self):
+        assert _repair_tool_call_arguments("totally not json", "t") is None
 
-    def test_unrepairable_partial_returns_empty_object(self):
+    def test_unrepairable_partial_fails_closed(self):
         # Truncated in the middle of a string key — bracket closing won't help
-        assert _repair_tool_call_arguments('{"truncated": "val', "t") == "{}"
+        assert _repair_tool_call_arguments('{"truncated": "val', "t") is None
 
     # -- Valid JSON passthrough (this path is via except, but still works) --
 
@@ -102,8 +102,7 @@ class TestRepairToolCallArguments:
         """Simulates GLM-5.1 truncating mid-argument."""
         raw = '{"command": "ls -la /tmp", "timeout": 30, "background":'
         result = _repair_tool_call_arguments(raw, "terminal")
-        # Should at least be valid JSON, even if background is lost
-        json.loads(result)
+        assert result is None
 
     # -- Stage 0: strict=False (literal control chars in strings) --
     # llama.cpp backends sometimes emit literal tabs/newlines inside JSON
@@ -139,4 +138,3 @@ class TestRepairToolCallArguments:
         result = _repair_tool_call_arguments(raw, "t")
         parsed = json.loads(result)
         assert "line" in parsed["msg"]
-

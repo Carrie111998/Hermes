@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 
 from gateway.runtime_skill_projection import (
     RuntimeSkillProjection,
+    projection_skill_metadata,
     resolve_skill_projections,
     view_skill,
 )
@@ -43,6 +44,7 @@ from agent.tool_dispatch_helpers import DeferredToolResult
 from gateway.runtime_session_history import (
     RuntimeSessionStateError as _RuntimeSessionStateError,
     load_runtime_session_history as _load_runtime_session_history,
+    retry_session_db_history as _retry_session_db_history,
     resume_session_db_history as _resume_session_db_history,
     runtime_history_tool_names as _runtime_history_tool_names,
     seed_runtime_session as _seed_runtime_session,
@@ -61,7 +63,15 @@ _LOCAL_ACTIVITY_TOOLS = {
     "web_search",
     "web_extract",
 }
+_RUNTIME_NATIVE_TOOLS = frozenset({
+    "skill_view",
+    "image_analyze",
+    "video_analyze",
+    "web_search",
+    "web_extract",
+})
 _MAX_ARGUMENT_CORRECTIONS = 1
+_MODEL_SCHEMA_ENVELOPE_FIELDS = frozenset({"request_id", "model", "medias"})
 _FAILED_ALLOWED_STRING_FIELDS = {"media_type", "model", "provider"}
 _FAILED_ALLOWED_STRING_LIST_FIELDS = {"aspect_ratios", "resolutions"}
 _FAILED_ALLOWED_INTEGER_LIST_FIELDS = {"durations"}
@@ -96,6 +106,10 @@ _TERMINAL_PLATFORM_ERROR_CODES = {
 # default executor. Runs use a dedicated bounded pool gated before streaming.
 _RUNTIME_MAX_CONCURRENT_ENV = "HERMES_RUNTIME_MAX_CONCURRENT"
 _RUNTIME_MAX_CONCURRENT_DEFAULT = 8
+
+
+def _requires_model_parameter_contract(tool_name: str) -> bool:
+    return tool_name == "media.estimate_cost" or tool_name.startswith("media.generate_")
 _RUNTIME_STREAM_HEARTBEAT_SECONDS = 15.0
 # Safety cap for pending.ready.wait when the run carries no explicit deadline;
 # prevents a lost tool result from pinning an executor thread forever.
@@ -428,6 +442,169 @@ def _failed_tool_result_projection(transport: Any) -> dict[str, Any]:
     return projection
 
 
+def _model_parameter_contract(
+    result: Any,
+) -> tuple[str, str, dict[str, dict[str, Any]]] | None:
+    """Extract one exact model contract from Runtime-private control data."""
+    if not isinstance(result, dict):
+        return None
+    if set(result) != {"model", "parameters", "observed_schema_digest"}:
+        return None
+    model = str(result.get("model") or "").strip()
+    digest = str(result.get("observed_schema_digest") or "").strip()
+    if not model or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        return None
+    parameters = result.get("parameters")
+    if not isinstance(parameters, list) or not parameters:
+        return None
+    contract: dict[str, dict[str, Any]] = {}
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            return None
+        if set(parameter) - {
+            "name", "type", "required", "default", "options", "description"
+        }:
+            return None
+        name = str(parameter.get("name") or "").strip()
+        parameter_type = str(parameter.get("type") or "").strip()
+        if not name or not parameter_type or name in contract:
+            return None
+        contract[name] = {
+            "type": parameter_type,
+            "required": parameter.get("required") is True,
+            "options": list(parameter.get("options") or []),
+            "description": str(parameter.get("description") or ""),
+        }
+    return model, digest, contract
+
+
+def _parameter_value_matches_type(value: Any, parameter_type: str) -> bool:
+    parameter_type = parameter_type.lower()
+    if parameter_type == "string":
+        return isinstance(value, str)
+    if parameter_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if parameter_type == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if parameter_type == "boolean":
+        return isinstance(value, bool)
+    if parameter_type == "array":
+        return isinstance(value, list)
+    if parameter_type == "object":
+        return isinstance(value, dict)
+    return False
+
+
+def _arbitrary_image_size_is_valid(value: Any, description: str) -> bool:
+    if not isinstance(value, str) or "arbitrary" not in description.lower():
+        return False
+    match = re.fullmatch(r"([1-9][0-9]*)x([1-9][0-9]*)", value.strip().lower())
+    if match is None:
+        return False
+    width, height = int(match.group(1)), int(match.group(2))
+    return (
+        width % 16 == 0
+        and height % 16 == 0
+        and 1 / 3 <= width / height <= 3
+        and max(width, height) <= 3840
+        and width * height <= 3840 * 2160
+    )
+
+
+def _model_request_contract_error(
+    tool_name: str,
+    args: Any,
+    contracts: dict[str, dict[str, dict[str, Any]]],
+) -> dict[str, Any] | None:
+    """Validate media requests against contracts fetched for their exact models."""
+    if not _requires_model_parameter_contract(tool_name):
+        return None
+    requests = args.get("requests") if isinstance(args, dict) else None
+    if not isinstance(requests, list) or not requests:
+        return None  # The platform tool schema owns the generic envelope error.
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            continue
+        model = str(request.get("model") or "").strip()
+        if not model:
+            continue
+        contract = contracts.get(model)
+        if contract is None:
+            return {
+                "error": {
+                    "code": "model_schema_required",
+                    "message": (
+                        f"Runtime did not resolve the exact input contract for model "
+                        f"{model!r} before calling {tool_name}."
+                    ),
+                    "retryable": True,
+                }
+            }
+        supplied = set(request) - _MODEL_SCHEMA_ENVELOPE_FIELDS
+        unknown = sorted(supplied - set(contract))
+        if unknown:
+            allowed_parts = []
+            for parameter_name in sorted(contract):
+                options = contract[parameter_name]["options"]
+                if options:
+                    allowed_parts.append(f"{parameter_name}={options}")
+                else:
+                    allowed_parts.append(parameter_name)
+            return {
+                "error": {
+                    "code": "invalid_tool_arguments",
+                    "message": (
+                        f"requests[{index}] contains parameters not declared by model "
+                        f"{model!r}: {', '.join(unknown)}. Allowed literal parameters: "
+                        f"{'; '.join(allowed_parts)}"
+                    ),
+                    "retryable": False,
+                }
+            }
+        missing = sorted(
+            name for name, parameter in contract.items()
+            if parameter["required"] and name not in request
+        )
+        if missing:
+            return {
+                "error": {
+                    "code": "invalid_tool_arguments",
+                    "message": f"requests[{index}] is missing required model parameters: {', '.join(missing)}",
+                    "retryable": False,
+                }
+            }
+        for name in sorted(supplied):
+            parameter = contract[name]
+            value = request[name]
+            if not _parameter_value_matches_type(value, parameter["type"]):
+                return {
+                    "error": {
+                        "code": "invalid_tool_arguments",
+                        "message": (
+                            f"requests[{index}].{name} must have model-declared type "
+                            f"{parameter['type']}"
+                        ),
+                        "retryable": False,
+                    }
+                }
+            options = parameter["options"]
+            if options and value not in options and not (
+                name == "size"
+                and _arbitrary_image_size_is_valid(value, parameter["description"])
+            ):
+                return {
+                    "error": {
+                        "code": "invalid_tool_arguments",
+                        "message": (
+                            f"requests[{index}].{name} is not allowed by model {model!r}; "
+                            f"use one of {options}"
+                        ),
+                        "retryable": False,
+                    }
+                }
+    return None
+
+
 def _skill_scope_error(name: str) -> str:
     return json.dumps(
         {
@@ -485,16 +662,16 @@ def _runtime_skill_projections(skill_manifest: Any) -> dict[str, RuntimeSkillPro
     return resolve_skill_projections(skill_manifest, _NO_SKILL_MANIFEST)
 
 
-def _discover_skill_metadata() -> list[dict[str, Any]]:
-    from gateway.ultrastudio_skill_routing import discover_skill_metadata
-
-    return discover_skill_metadata()
-
-
-def _allowed_skills_prompt(allowed_names: set[str]) -> str:
+def _allowed_skills_prompt(
+    allowed_names: set[str],
+    projections: dict[str, RuntimeSkillProjection],
+) -> str:
     from gateway.ultrastudio_skill_routing import format_allowed_skills
 
-    return format_allowed_skills(allowed_names, _discover_skill_metadata())
+    return format_allowed_skills(
+        allowed_names,
+        projection_skill_metadata(projections),
+    )
 
 
 def _message_text(content: Any) -> str:
@@ -1142,7 +1319,23 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
                 "success": False,
                 "error": "video_analyze may only read video attachments owned by this run.",
             })
-    return next_call(args) if callable(next_call) else args
+    if tool_name in _RUNTIME_NATIVE_TOOLS:
+        return next_call(args) if callable(next_call) else args
+
+    session._halt_tool_loop(
+        tool_name,
+        args,
+        "runtime_tool_scope_violation",
+        f"Tool '{tool_name}' is not authorized for this Runtime Run.",
+        1,
+    )
+    return json.dumps({
+        "error": {
+            "code": "tool_not_allowed",
+            "message": f"Tool '{tool_name}' is not authorized for this Runtime Run.",
+            "retryable": False,
+        },
+    }, ensure_ascii=False, separators=(",", ":"))
 
 
 def _image_analysis_sources(args: dict[str, Any]) -> list[str]:
@@ -1243,6 +1436,9 @@ class RuntimeBridgeSession:
         self.pending: dict[str, _PendingTool] = {}
         self.non_retryable_failures: dict[str, str] = {}
         self.argument_correction_failures: dict[str, int] = {}
+        self.model_parameter_contracts: dict[str, dict[str, dict[str, Any]]] = {}
+        self.model_contract_digests: dict[str, str] = {}
+        self.pending_controls: dict[str, _PendingTool] = {}
         self.agent_ref: list[Any] = [None]
         self.lock = threading.RLock()
         self.interrupted = threading.Event()
@@ -1254,6 +1450,12 @@ class RuntimeBridgeSession:
     def bind_agent(self, agent: Any, native_tool_schemas: list[dict[str, Any]]) -> None:
         self.agent_ref[0] = agent
         self.native_tool_schemas = [dict(schema) for schema in native_tool_schemas]
+        # Deferred Tools are granted to the Run but intentionally absent from
+        # the model schema until tool_search loads them. Keep that state
+        # separate from valid_tool_names so an exact direct call can reach the
+        # middleware's tool_not_loaded response instead of being mislabeled as
+        # an unknown Tool.
+        agent._runtime_deferred_tool_names = set(self.tool_exposure.deferred_names)
         self._refresh_agent_tools()
 
     def _refresh_agent_tools(self) -> None:
@@ -1300,6 +1502,81 @@ class RuntimeBridgeSession:
             count=count,
             signature=ToolCallSignature.from_call(name, args),
         ))
+
+    def _ensure_model_parameter_contracts(
+        self,
+        tool_name: str,
+        args: Any,
+        parent_call_id: str,
+    ) -> dict[str, Any] | None:
+        if not _requires_model_parameter_contract(tool_name):
+            return None
+        requests = args.get("requests") if isinstance(args, dict) else None
+        if not isinstance(requests, list):
+            return None
+        models = sorted({
+            str(request.get("model") or "").strip()
+            for request in requests
+            if isinstance(request, dict) and str(request.get("model") or "").strip()
+        })
+        for model in models:
+            with self.lock:
+                if model in self.model_parameter_contracts:
+                    continue
+            digest = hashlib.sha256(
+                (parent_call_id + "\x00" + model).encode("utf-8")
+            ).hexdigest()
+            request_id = f"contract_{digest}"
+            pending = _PendingTool(name="model_contract.get")
+            with self.lock:
+                if request_id in self.pending_controls:
+                    return {
+                        "error": {
+                            "code": "idempotency_conflict",
+                            "message": "duplicate active model schema resolution",
+                            "retryable": False,
+                        }
+                    }
+                self.pending_controls[request_id] = pending
+            self.emit("runtime_control_request", {
+                "request_id": request_id,
+                "kind": "model_contract.get",
+                "model": model,
+            })
+            wait_timeout = (
+                self.deadline_seconds
+                if self.deadline_seconds is not None
+                else _UNBOUNDED_TOOL_WAIT_CAP_SECONDS
+            )
+            ready = pending.ready.wait(wait_timeout)
+            if not ready or self.interrupted.is_set():
+                with self.lock:
+                    self.pending_controls.pop(request_id, None)
+                return {
+                    "error": {
+                        "code": "model_schema_unavailable",
+                        "message": f"Runtime could not resolve the exact contract for model {model!r}",
+                        "retryable": False,
+                    }
+                }
+            result = pending.result or {}
+            model_contract = (
+                _model_parameter_contract(result.get("result"))
+                if result.get("ok")
+                else None
+            )
+            if model_contract is None or model_contract[0] != model:
+                return {
+                    "error": {
+                        "code": "model_schema_unavailable",
+                        "message": f"Catalog did not return a usable exact contract for model {model!r}",
+                        "retryable": False,
+                    }
+                }
+            with self.lock:
+                self.model_contract_digests[model] = model_contract[1]
+                self.model_parameter_contracts[model] = model_contract[2]
+        return None
 
     def emit(self, event_type: str, payload: dict[str, Any]) -> None:
         event = {"run_id": self.run_id, "type": event_type, "payload": payload}
@@ -1434,6 +1711,24 @@ class RuntimeBridgeSession:
                     "retryable": False,
                 },
             }, ensure_ascii=False, separators=(",", ":"))
+        schema_error = self._ensure_model_parameter_contracts(name, args, call_id)
+        if schema_error is not None:
+            return json.dumps(schema_error, ensure_ascii=False, separators=(",", ":"))
+        contract_error = _model_request_contract_error(
+            name,
+            args,
+            self.model_parameter_contracts,
+        )
+        if contract_error is not None:
+            error = contract_error.get("error")
+            if isinstance(error, dict) and error.get("code") == "invalid_tool_arguments":
+                error["recovery"] = {
+                    "action": "correct_arguments",
+                    "same_arguments_allowed": False,
+                }
+                with self.lock:
+                    self.non_retryable_failures[signature_key] = "invalid_tool_arguments"
+            return json.dumps(contract_error, ensure_ascii=False, separators=(",", ":"))
         pending = _PendingTool(name=name, signature_key=signature_key)
         with self.lock:
             if call_id in self.pending:
@@ -1516,6 +1811,16 @@ class RuntimeBridgeSession:
             pending.ready.set()
         return True
 
+    def submit_control_result(self, result: dict[str, Any]) -> bool:
+        request_id = str(result.get("request_id") or "")
+        with self.lock:
+            pending = self.pending_controls.pop(request_id, None)
+            if pending is None:
+                return False
+            pending.result = result
+            pending.ready.set()
+        return True
+
     def interrupt(self, reason: str) -> None:
         self.interrupt_reason = reason
         self.interrupted.set()
@@ -1525,6 +1830,8 @@ class RuntimeBridgeSession:
             interrupt(reason)
         with self.lock:
             for pending in self.pending.values():
+                pending.ready.set()
+            for pending in self.pending_controls.values():
                 pending.ready.set()
 
     def mark_finished(self) -> None:
@@ -1602,6 +1909,7 @@ class APIServerRuntimeMixin:
                 "run_state",
                 "deadline_ms",
                 "llm_egress",
+                "retry_context",
             }
             if set(body) - supported_fields:
                 raise ValueError("request contains unsupported fields")
@@ -1613,8 +1921,8 @@ class APIServerRuntimeMixin:
                 in {"1", "true", "yes", "on"},
             )
             intent = body.get("intent")
-            if not isinstance(intent, str) or intent not in {"bootstrap", "new_turn", "resume"}:
-                raise ValueError("intent must be bootstrap, new_turn, or resume")
+            if not isinstance(intent, str) or intent not in {"bootstrap", "new_turn", "resume", "retry"}:
+                raise ValueError("intent must be bootstrap, new_turn, resume, or retry")
             run_id = str(body.get("run_id") or "").strip()
             requested_model = str(body.get("model") or "").strip()
             if not requested_model:
@@ -1640,9 +1948,9 @@ class APIServerRuntimeMixin:
                 raise ValueError("deadline_ms must be a non-negative integer") from exc
             if deadline_ms < 0:
                 raise ValueError("deadline_ms must be a non-negative integer")
-            if intent == "resume":
+            if intent in {"resume", "retry"}:
                 if messages != []:
-                    raise ValueError("resume messages must be exactly empty")
+                    raise ValueError("resume and retry messages must be exactly empty")
             elif not isinstance(messages, list) or not messages:
                 raise ValueError("bootstrap and new_turn require messages")
             normalized_messages = _normalize_runtime_messages(messages)
@@ -1653,6 +1961,24 @@ class APIServerRuntimeMixin:
                     raise ValueError("new_turn accepts exactly one user message")
             if intent != "resume" and tool_results:
                 raise ValueError("tool_results are only accepted for resume")
+            retry_context = body.get("retry_context")
+            if intent == "retry":
+                if not isinstance(retry_context, dict) or set(retry_context) != {
+                    "attempt",
+                    "previous_error_code",
+                }:
+                    raise ValueError("retry requires attempt and previous_error_code")
+                if (
+                    isinstance(retry_context.get("attempt"), bool)
+                    or not isinstance(retry_context.get("attempt"), int)
+                    or retry_context["attempt"] < 2
+                ):
+                    raise ValueError("retry attempt must be an integer greater than one")
+                previous_error_code = retry_context.get("previous_error_code")
+                if not isinstance(previous_error_code, str) or not previous_error_code.strip():
+                    raise ValueError("retry previous_error_code is required")
+            elif retry_context is not None:
+                raise ValueError("retry_context is only accepted for retry")
             _validate_runtime_artifact_manifest(body.get("artifact_manifest"))
             # Expose the run id to the audit middleware: its completion line
             # is logged after this handler returns, so the audit trail can
@@ -1670,7 +1996,10 @@ class APIServerRuntimeMixin:
             allowed_skill_projections = _runtime_skill_projections(skill_manifest)
             instructions = (
                 _replacement_system_prompt(system_context)
-                + _allowed_skills_prompt(allowed_skill_names)
+                + _allowed_skills_prompt(
+                    allowed_skill_names,
+                    allowed_skill_projections,
+                )
                 + _run_state_prompt(body.get("run_state"))
                 + _runtime_verified_activity_prompt(
                     body.get("runtime_context"),
@@ -1700,7 +2029,7 @@ class APIServerRuntimeMixin:
             )
             runtime_image_paths = _runtime_image_paths(attachment_parts)
             runtime_video_paths = _runtime_video_paths(attachment_parts)
-            if attachment_parts and intent != "resume":
+            if attachment_parts and intent not in {"resume", "retry"}:
                 last_user_index = len(normalized_messages) - 1
                 if normalized_messages[last_user_index].get("role") != "user":
                     raise ValueError("attachments require a user message")
@@ -1749,7 +2078,7 @@ class APIServerRuntimeMixin:
                         "Runtime message id already exists in SessionDB",
                         status=409,
                     )
-            else:
+            elif intent == "resume":
                 session_history = _resume_session_db_history(
                     db,
                     agent_session_id,
@@ -1760,9 +2089,11 @@ class APIServerRuntimeMixin:
                     session_history,
                     attachment_parts,
                 )
+            else:
+                session_history = _retry_session_db_history(session_history)
             history = session_history
             tool_exposure.activate_names(_runtime_history_tool_names(history))
-            if intent == "resume":
+            if intent in {"resume", "retry"}:
                 user_message = ""
                 runtime_user_message_id = None
             else:
@@ -1842,10 +2173,15 @@ class APIServerRuntimeMixin:
             agent.session_id = agent_session_id
             _configure_run_llm_egress(agent, llm_egress, body.get("model"))
             _pin_run_model(agent, body.get("model"))
+            # The Orchestrator owns the complete per-Run Tool grant. Hermes'
+            # ordinary between-turn MCP refresh rebuilds from a process-global
+            # registry and must not widen this scoped snapshot.
+            agent._skip_mcp_refresh = True
             agent.ephemeral_system_prompt = None
             agent._cached_system_prompt = instructions
             agent._build_system_prompt = lambda _system_message=None: instructions
             agent._resume_from_tool_results = intent == "resume"
+            agent._retry_current_turn = intent == "retry"
             agent._require_incremental_session_persistence = True
             # The Orchestrator already validated and materialized these image
             # assets. Its model catalog can lag newly deployed multimodal
@@ -1980,6 +2316,33 @@ class APIServerRuntimeMixin:
             return web.json_response({"error": {"code": "invalid_param", "message": "invalid JSON"}}, status=400)
         if not isinstance(result, dict) or not session.submit_result(result):
             return web.json_response({"error": {"code": "invalid_tool_result", "message": "unknown call_id"}}, status=409)
+        return web.Response(status=204)
+
+    async def _handle_runtime_control_result(self, request: "web.Request") -> "web.Response":
+        auth_error = self._check_auth(request)
+        if auth_error:
+            return auth_error
+        run_id = request.match_info["run_id"]
+        request["hermes_run_id"] = run_id
+        with _SESSIONS_LOCK:
+            session = _SESSIONS.get(run_id)
+        if session is None:
+            return web.json_response(
+                {"error": {"code": "run_not_found", "message": "run is not active"}},
+                status=404,
+            )
+        try:
+            result = await request.json()
+        except Exception:
+            return web.json_response(
+                {"error": {"code": "invalid_param", "message": "invalid JSON"}},
+                status=400,
+            )
+        if not isinstance(result, dict) or not session.submit_control_result(result):
+            return web.json_response(
+                {"error": {"code": "invalid_control_result", "message": "unknown request_id"}},
+                status=409,
+            )
         return web.Response(status=204)
 
     async def _handle_runtime_interrupt(self, request: "web.Request") -> "web.Response":

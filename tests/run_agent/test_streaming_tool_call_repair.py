@@ -46,8 +46,7 @@ class TestStreamingAssemblyRepair:
         """Model cuts off mid-string-value."""
         raw = '{"command": "git clone ht'
         result = _repair_tool_call_arguments(raw, "terminal")
-        # Should produce valid JSON (even if command value is lost)
-        json.loads(result)
+        assert result is None
 
     # -- Trailing comma cases (Ollama/GLM common) --
 
@@ -96,15 +95,12 @@ class TestStreamingAssemblyRepair:
         """GLM-5.1 via Ollama commonly truncates like this.
 
         This pattern has an unclosed colon at the end ("background":) which
-        makes it unrepairable — the last-resort empty object {} is the
-        safest option.  The important thing is that repairable patterns
+        makes it unrepairable and must fail closed. The important thing is that repairable patterns
         (trailing comma, unclosed brace WITHOUT hanging colon) DO get fixed.
         """
         raw = '{"command": "ls -la /tmp", "timeout": 30, "background":'
         result = _repair_tool_call_arguments(raw, "terminal")
-        # Unrepairable — returns empty object (hanging colon can't be fixed)
-        parsed = json.loads(result)
-        assert parsed == {}
+        assert result is None
 
     def test_glm_truncation_repairable(self):
         """GLM-5.1 truncation pattern that IS repairable."""
