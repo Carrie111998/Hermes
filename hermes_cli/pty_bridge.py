@@ -241,7 +241,13 @@ class PtyBridge:
     # -- teardown ---------------------------------------------------------
 
     def close(self) -> None:
-        """Terminate the child (SIGTERM → 0.5s grace → SIGKILL) and close fds.
+        """Terminate the child and close fds.
+
+        Escalates SIGHUP → SIGTERM → SIGKILL, waiting up to 0.5s after each
+        signal and stopping as soon as the child is gone (so a child that
+        exits on SIGHUP never sees SIGTERM).  Signals go to the child's
+        process group when it can be determined, and to the PTY leader alone
+        otherwise.
 
         Idempotent.  Reaping the child is important so we don't leak
         zombies across the lifetime of the dashboard process.
