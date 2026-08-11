@@ -2,6 +2,7 @@ import { backendScopeKey, type ConnectionState, type GatewayEvent, resolveGatewa
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
+import { desktopRuntimeIdentity } from '@/lib/desktop-fs'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
@@ -35,6 +36,7 @@ interface Secondary {
   connectionId: null | string
   gateway: HermesGateway
   offEvent: () => void
+  runtime: string
   offState: () => void
   reconnectTimer: ReturnType<typeof setTimeout> | null
   reconnectAttempt: number
@@ -207,6 +209,8 @@ async function openSecondary(entry: Secondary): Promise<void> {
       ? await desktop.getConnectionFor({ connectionId: entry.connectionId, profile: entry.profile })
       : await desktop.getConnection(entry.profile)
 
+  entry.runtime = desktopRuntimeIdentity(conn)
+
   const wsUrl = await resolveGatewayWsUrl(
     entry.connectionId && desktop.getGatewayWsUrlFor
       ? {
@@ -289,6 +293,7 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     scope,
     profile,
     connectionId,
+    runtime: '',
     gateway,
     offEvent: () => {},
     offState: () => {},
@@ -298,10 +303,15 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     wantOpen: true
   }
 
-  // Events keep carrying the bare profile — session routing is profile-keyed
-  // everywhere. connectionId rides along for surfaces that need the source.
+  // Events keep carrying the bare profile for session routing. connectionId
+  // identifies the registry source, while runtime identifies its filesystem.
   entry.offEvent = gateway.onEvent(event =>
-    g.config?.onEvent({ ...event, profile, ...(connectionId ? { connectionId } : {}) })
+    g.config?.onEvent({
+      ...event,
+      profile,
+      ...(connectionId ? { connectionId } : {}),
+      runtime: entry.runtime || undefined
+    })
   )
   entry.offState = gateway.onState(state => {
     reportGatewayState(scope, state)

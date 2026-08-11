@@ -922,6 +922,13 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     """
     if not session:
         return
+    try:
+        from tools.excalidraw_tools import set_focused_drawings
+
+        profile = Path(str(session["profile_home"])).name if session.get("profile_home") else _current_profile_name()
+        set_focused_drawings(str(session.get("session_key") or ""), profile, [])
+    except Exception:
+        pass
     _finalize_session(session, end_reason=end_reason)
     _announce_session_reclaimed(session, end_reason)
     try:
@@ -4465,7 +4472,10 @@ def _gui_surface_toolsets(platform: str) -> set[str]:
     """
     surfaces = {"project"}
     if platform == "desktop":
-        surfaces.add("desktop_ui")
+        # Excalidraw can emit a drawing-pane event only to the Desktop renderer.
+        # Keep its schema off every non-Desktop session rather than paying the
+        # model-tool cost across the core bundle.
+        surfaces.update({"desktop_ui", "excalidraw"})
     return surfaces
 
 
@@ -15239,6 +15249,7 @@ def _mcp_summarize_server(name, cfg):  # noqa: E402
 from . import (  # noqa: E402
     methods_complete as _methods_complete,
     methods_config as _methods_config,
+    methods_excalidraw as _methods_excalidraw,
     methods_images as _methods_images,
     methods_profiles as _methods_profiles,
     methods_prompt as _methods_prompt,
@@ -15251,6 +15262,7 @@ for _m in (
     _methods_prompt,
     _methods_config,
     _methods_complete,
+    _methods_excalidraw,
     _methods_tools,
     _methods_profiles,
     _methods_images,

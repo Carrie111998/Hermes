@@ -30,6 +30,8 @@ export interface GatewayEvent<P = unknown> {
   /** Registry connection whose socket delivered the event (renderer-side tag;
    * absent for the local/legacy primary path). */
   connectionId?: string
+  /** Renderer-side source runtime identity added by the Desktop gateway socket. */
+  runtime?: string
   session_id?: string
   type: GatewayEventName
 }

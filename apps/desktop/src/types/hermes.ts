@@ -452,12 +452,25 @@ export interface PaginatedSessions {
   errors?: Array<{ profile: string; error: string }>
 }
 
+export interface ExcalidrawDocumentEventPayload {
+  fingerprint: string
+  path: string
+  profile: string
+  runtime: string
+}
+
+export type ExcalidrawChangedEvent = RpcEvent<ExcalidrawDocumentEventPayload> & { type: 'excalidraw.changed' }
+
+export type ExcalidrawOpenEvent = RpcEvent<ExcalidrawDocumentEventPayload> & { type: 'excalidraw.open' }
+
 export interface RpcEvent<T = unknown> {
   payload?: T
   profile?: string
   /** Registry connection whose socket delivered the event (renderer-side tag;
    * absent for the local/legacy primary path). */
   connectionId?: string
+  /** Renderer-side source runtime identity supplied by the gateway socket. */
+  runtime?: string
   session_id?: string
   type: string
 }
