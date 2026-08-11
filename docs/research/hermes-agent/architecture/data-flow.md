@@ -54,6 +54,7 @@ flowchart TB
     subgraph Finish[Finalization]
         Repair[remove scaffolding / repair tail invariants]
         Persist[final SessionDB snapshot]
+        Project[delivery footer / output transform]
         Hooks[post turn hooks / external memory sync]
         Return[result + callbacks / delivery]
         Review[optional isolated background review]
@@ -85,7 +86,7 @@ flowchart TB
     Messages --> CachePlan
 
     Choice -->|no| Final --> Repair --> Persist --> DB
-    Persist --> Hooks --> Return
+    Persist --> Project --> Hooks --> Return
     Hooks -.eligible.-> Review
 ```
 
@@ -196,12 +197,15 @@ provider final response
 → append/repair final assistant row
 → strip private retry scaffolding
 → final persistence
+→ optional delivery footer / transform_llm_output
 → post-turn hooks / external memory sync
 → return result to caller
 → surface-specific final delivery
 ```
 
-但 streaming、thinking、tool progress 和 interim assistant callbacks 可以在回合尚未完成时已经投影到 UI。最终收尾因此不能假设“用户尚未看到任何内容”；它必须保证任何最终返回/交付的 answer 都有可恢复的 assistant row，同时把预览标记与最终交付区分开。
+但 streaming、thinking、tool progress 和 interim assistant callbacks 可以在回合尚未完成时已经投影到 UI。最终收尾因此不能假设“用户尚未看到任何内容”；它必须保证 canonical core answer 有可恢复的 assistant row，同时把预览标记与最终交付区分开。
+
+另一个容易混淆的边界是：`finalize_turn()` 在 canonical messages 持久化之后，才可能追加 file-mutation/异常完成说明，或运行 `transform_llm_output`。因此用户最终收到的 delivery projection 不保证与 durable assistant row 逐字相同。正常无变换路径二者相同；发生变换时，`result.final_response`/`response_transformed` 表达展示结果，`result.messages` 与 SessionDB 仍表达 canonical transcript。
 
 `finalize_turn()` 将 trajectory、资源清理和 persistence 分别保护：某个 cleanup 失败会进入 `cleanup_errors`，不应吞掉已经得到的 final response。
 
@@ -258,6 +262,7 @@ provider final response
 | tool 执行中崩溃 | assistant tool-call row 已持久化 | 恢复时可识别 incomplete sequence；错误/中断路径补 result |
 | tool result 持久化失败 | backend 可能已产生副作用 | 停止继续推理并报告 persistence failure，避免重复盲跑 |
 | final cleanup 失败 | final response 已产生 | 独立记录 cleanup error，继续其它收尾并保留 response |
+| delivery transform 失败 | canonical assistant row 已持久化 | hook fail-open，返回未变换或已追加安全说明的文本 |
 | context overflow | canonical transcript 尚在 | preflight/错误触发 compression，建立/更新 lineage 后重试 |
 | 另一个进程写 session | live Agent 可能陈旧 | Gateway 用 message count/session id 检测并重建 cache |
 

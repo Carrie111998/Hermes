@@ -17,7 +17,7 @@ confidence: medium
 | INV-003 | 持久消息历史必须满足 Provider 可接受的角色交替 | `AGENTS.md`, `agent/message_sanitization.py` | needs targeted tests |
 | INV-004 | 每个 assistant tool call 必须有匹配的 tool result，反之亦然 | `agent/conversation_loop.py` | needs targeted tests |
 | INV-005 | 有副作用工具执行前，assistant tool-call row 必须先进入 canonical SessionDB | `agent/conversation_loop.py` | verified by code |
-| INV-006 | 已投递给用户的最终响应必须存在于可恢复的持久化 transcript | `agent/turn_finalizer.py` | verified by code |
+| INV-006 | 可恢复 transcript 必须包含本轮 canonical core assistant response；持久化后追加的安全 footer 或 `transform_llm_output` 属于 delivery projection，不保证逐字回写该 row | `agent/turn_finalizer.py`, `tests/agent/test_turn_finalizer_final_response_persistence.py` | verified by code/tests |
 | INV-007 | Background Review 不得污染主对话、主 Session 生命周期或主工具权限 | `agent/background_review.py` | verified by code |
 | INV-008 | Memory 当前会话快照冻结；工具写入可立即落盘，但不隐式改变当前 prompt | `tools/memory_tool.py`, Memory 文档 | verified by code/docs |
 | INV-009 | 子 Agent 不能通过委派获得父 Agent 没有的能力 | `tools/delegate_tool.py` | needs targeted tests |
@@ -33,4 +33,3 @@ confidence: medium
 - `verified by code/docs`：代码和官方文档相互印证。
 - `needs targeted tests`：尚未定位或运行行为契约测试。
 - `design contract`：项目明确要求，但仍需检查所有重要路径是否遵守。
-

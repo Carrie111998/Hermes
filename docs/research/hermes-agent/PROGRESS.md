@@ -19,7 +19,7 @@ updated_at: 2026-08-11
 |---|---|---:|---|
 | M0 研究基线与工作协议 | completed | high | 分支、恢复协议、计划、基线、模板和索引已建立 |
 | M1 系统全景架构 | completed | high | 系统上下文、进程模型、一级模块图与顶层数据流均已有源码证据 |
-| M2 Canonical Turn | in progress | medium | 已有顶层数据流骨架，待逐 symbol 追踪 Classic CLI 回合 |
+| M2 Canonical Turn | in progress | high | 已完成 Classic CLI 最小无工具回合；下一单元验证单工具 intent/result hard gate |
 | M3 Agent Loop | pending | — | — |
 | M4 Prompt/Context/Provider | pending | — | — |
 | M5 Tool Runtime | pending | — | — |
@@ -34,9 +34,9 @@ updated_at: 2026-08-11
 
 ## 当前研究单元
 
-- 从 `hermes_cli.main::cmd_chat`、`cli.main` 和 `HermesCLI` 定位用户输入到 `AIAgent.run_conversation` 的调用链。
-- 追踪 `build_turn_context → conversation_loop → finalize_turn` 的最小无工具回合。
-- 再增加一次单工具调用，验证 assistant intent、handler side effect 和 tool result 的增量持久化顺序。
+- 沿 `conversation_loop` 的 tool-call branch 追踪一次成功的单工具回合。
+- 验证 assistant intent flush 是 side effect 前的 hard gate，以及 tool result flush 失败如何停止继续推理。
+- 比较 sequential、parallel batch 和 interrupt closure 对 call/result 配对的影响。
 
 ## 已确认事实
 
@@ -53,15 +53,21 @@ updated_at: 2026-08-11
 - Agent Core 的一级协作面是 Prompt/Context、Provider、Tool Runtime 与 Persistence；插件、Skills、MCP 和执行后端主要位于边缘。
 - 同一回合存在展示视图、API 视图和持久化视图；`api_content` 保存模型实际看到的当前 user content，同时保持 clean transcript。
 - Tool 调用遵循“先持久化 assistant intent，再执行 handler，再持久化匹配 result”的恢复顺序。
+- Classic CLI 通过 UI → `process_loop` → agent worker 三层线程外壳运行同步 Agent loop；thread-local approval callbacks 在 worker 内重新绑定。
+- CLI 在 worker 启动前暂存 exact user dict，并用 `conversation_history[:-1]` 调 Agent；turn prologue 通过 `_pending_cli_user_message` 复用同一 dict。
+- turn-start user persistence 是首个 Provider request 前的 crash-resilience attempt，失败会记录并由后续 flush 重试，不是立即中止的 hard gate。
+- 主循环每次 iteration 从 canonical messages 重建 provider projection，再经过 request/execution middleware 和 transport normalization。
+- 正常无工具文本先 append canonical assistant row，再由 `finalize_turn` 清理并持久化。
+- finalizer 可以在持久化之后追加安全 footer 或执行 `transform_llm_output`；最终展示文本与 durable assistant row 因此不保证逐字相同。
 - 系统架构研究必须把 prompt-cache stability、role alternation 和 narrow-waist tool surface 作为跨模块约束。
 
 ## 待回答问题
 
-1. Classic CLI 的输入方法、conversation history owner 和 `run_conversation` 调用点分别在哪里？
-2. 一个无工具回合从 user row 到 final assistant row 的准确 append/flush 顺序是什么？
-3. 一个工具回合在 parallel batch、interrupt 和 persistence failure 下如何保持 call/result 配对？
-4. `final_response`、streamed preview 与 durable assistant row 如何去重并保持一致？
+1. 一个工具回合在 sequential/parallel batch、interrupt 和 persistence failure 下如何保持 call/result 配对？
+2. tool middleware、approval、guard 和 registry dispatch 的准确先后顺序是什么？
+3. Gateway 与 Desktop 如何利用 `response_previewed`/`response_transformed` 避免重复投递？
+4. route/model 切换后，CLI history 与 Agent prompt/tool snapshot 如何重新建立？
 
 ## 下一步
 
-创建 M2 的 `flows/canonical-cli-turn.md`，先完成无工具回合，再叠加单工具回合。
+创建 M2 的单工具调用时序，重点验证 side effect 前后的两个持久化 checkpoint。

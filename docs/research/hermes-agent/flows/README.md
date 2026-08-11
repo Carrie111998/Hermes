@@ -13,3 +13,6 @@
 
 首批链路：CLI Tool Turn、Gateway Message、Context Compression、Background Learning、Delegated Task 和 Cron Delivery。
 
+## 已建立链路
+
+- [Classic CLI 最小回合](./canonical-cli-turn.md)：从 prompt-toolkit 输入，经同步 Agent loop，到 canonical persistence 与最终展示投影。

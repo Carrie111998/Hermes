@@ -12,7 +12,7 @@ confidence: medium
 
 | 领域 | 主要生产代码 | 官方文档 | 测试入口 |
 |---|---|---|---|
-| Agent 生命周期 | `run_agent.py`, `agent/agent_init.py`, `agent/conversation_loop.py`, `agent/turn_context.py`, `agent/turn_finalizer.py` | `website/docs/developer-guide/agent-loop.md` | `tests/run_agent/`, `tests/agent/` |
+| Agent 生命周期 | `run_agent.py`, `agent/agent_init.py`, `agent/conversation_loop.py`, `agent/turn_context.py`, `agent/turn_finalizer.py` | `website/docs/developer-guide/agent-loop.md` | `tests/agent/test_turn_context.py`, `tests/agent/test_turn_finalizer_final_response_persistence.py`, `tests/agent/` |
 | Prompt 构建 | `agent/system_prompt.py`, `agent/prompt_builder.py`, `agent/coding_context.py` | `website/docs/developer-guide/prompt-assembly.md` | `tests/agent/`, `tests/run_agent/` 中 prompt 相关测试 |
 | Context/Cache | `agent/context_engine.py`, `agent/context_compressor.py`, `agent/prompt_caching.py`, `agent/conversation_compression.py` | `website/docs/developer-guide/context-compression-and-caching.md` | `tests/agent/`, `tests/run_agent/` 中 compression/cache 测试 |
 | Provider/Transport | `providers/`, `hermes_cli/runtime_provider.py`, `agent/transports/`, `agent/anthropic_adapter.py` | `website/docs/developer-guide/provider-runtime.md` | `tests/providers/`, `tests/agent/` |
@@ -29,6 +29,7 @@ confidence: medium
 | Cron | `cron/jobs.py`, `cron/scheduler.py`, `tools/cronjob_tools.py` | `website/docs/user-guide/features/cron.md` | `tests/cron/` |
 | Kanban | `plugins/kanban/`, `tools/kanban_tools.py`, `hermes_cli/kanban_db.py` | `docs/kanban/` | `tests/plugins/`, kanban 相关测试 |
 | Gateway | `gateway/run.py`, `gateway/session.py`, `gateway/delivery.py`, `gateway/platforms/base.py` | `website/docs/developer-guide/gateway-internals.md` | `tests/gateway/` |
+| Classic CLI turn | `cli.py::HermesCLI.run/chat/_persist_active_session_before_close`, `hermes_cli/cli_agent_setup_mixin.py::_init_agent` | CLI 用户文档 | `tests/test_lazy_session_regressions.py`, `tests/cli/`, `tests/hermes_cli/` |
 | Slash Commands | `hermes_cli/commands.py`, `cli.py`, `gateway/slash_commands.py`, `hermes_cli/slash_exec.py` | CLI/Gateway 用户文档 | `tests/cli/`, `tests/gateway/` |
 | Plugin System | `hermes_cli/plugins.py`, `plugins/` | `website/docs/user-guide/features/plugins.md` | `tests/plugins/` |
 | TUI | `ui-tui/src/`, `tui_gateway/` | `ui-tui/README.md`, TUI 用户文档 | `tests/tui_gateway/`, `ui-tui` Vitest |
@@ -70,3 +71,4 @@ confidence: medium
 - [进程与部署模型](./architecture/process-model.md)：OS 进程、stdio/PTY/WS 和 state ownership。
 - [一级模块依赖](./architecture/module-map.md)：入口编排、Agent façade、核心协作面和扩展边缘。
 - [顶层数据流](./architecture/data-flow.md)：展示/API/持久化视图、tool-call 回路和失败边界。
+- [Classic CLI 最小回合](./flows/canonical-cli-turn.md)：线程外壳、staged input、Provider projection、无工具终止和最终展示投影。
