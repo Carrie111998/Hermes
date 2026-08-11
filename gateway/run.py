@@ -13391,6 +13391,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # into this _stop_impl and skip _shutdown_event.set() /
                     # _exit_code = 75 (#12875).  It self-terminates anyway.
                     continue
+                if _task is self._shutdown_task:
+                    # Same shape as _restart_task: the task the SIGINT/SIGTERM
+                    # handler created is sitting in `await self._stop_task`
+                    # right now, i.e. it is awaiting *this* coroutine.
+                    # Cancelling it would propagate CancelledError back into
+                    # _stop_impl and skip the tail of teardown.  Like
+                    # _restart_task it is deliberately not added to
+                    # _background_tasks, but the exemption belongs here with
+                    # the other two: this loop is the single place that
+                    # enforces the invariant, so any future path that does
+                    # track the handle cannot silently cancel the teardown.
+                    continue
                 _task.cancel()
             self._background_tasks.clear()
 
