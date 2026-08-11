@@ -4121,6 +4121,13 @@ class TurnRunner:
                 _progress_len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
             except Exception:
                 pass
+        if ctx.progress_collapsible:
+            try:
+                _rich_limit = adapter.streaming_overflow_limit()
+                if _rich_limit:
+                    _raw_progress_limit = max(_raw_progress_limit, int(_rich_limit))
+            except Exception:
+                pass
         # Leave a little room for platform quirks / formatting.  For tiny
         # test adapters keep the limit usable instead of clamping to 500+.
         _PROGRESS_TEXT_LIMIT = max(
@@ -4157,7 +4164,58 @@ class TurnRunner:
             return await adapter.edit_message(**kwargs)
 
         def _progress_text(lines: list) -> str:
+            renderer = getattr(adapter, "render_progress_message", None)
+            if callable(renderer):
+                return renderer(
+                    [str(line) for line in lines],
+                    collapsible=ctx.progress_collapsible,
+                )
             return "\n".join(str(line) for line in lines)
+
+        def _trim_progress_tail() -> None:
+            """Keep newest whole activity events within configured/platform caps."""
+            nonlocal progress_lines
+            configured_limit = max(0, int(ctx.progress_max_chars or 0))
+
+            def _body_text() -> str:
+                return "\n".join(str(line) for line in progress_lines)
+
+            if configured_limit:
+                while len(progress_lines) > 1 and len(_body_text()) > configured_limit:
+                    progress_lines.pop(0)
+                if progress_lines and len(_body_text()) > configured_limit:
+                    text = str(progress_lines[0])
+                    progress_lines[0] = (
+                        "…" + text[-(configured_limit - 1):]
+                        if configured_limit > 1
+                        else "…"
+                    )
+            else:
+                # Zero preserves the legacy platform-sized split/rollover path.
+                return
+
+            while (
+                len(progress_lines) > 1
+                and _progress_len_fn(_progress_text(progress_lines)) > _PROGRESS_TEXT_LIMIT
+            ):
+                progress_lines.pop(0)
+
+            # A single unusually large event must still remain one editable
+            # message. Trim from its oldest edge until the rendered wrapper fits.
+            while (
+                progress_lines
+                and _progress_len_fn(_progress_text(progress_lines)) > _PROGRESS_TEXT_LIMIT
+            ):
+                text = str(progress_lines[0])
+                if len(text) <= 1:
+                    break
+                excess = max(
+                    1,
+                    _progress_len_fn(_progress_text(progress_lines))
+                    - _PROGRESS_TEXT_LIMIT,
+                )
+                keep = max(1, len(text) - excess - 1)
+                progress_lines[0] = "…" + text[-keep:]
 
         def _split_progress_groups(lines: list) -> list[list]:
             """Partition progress lines into platform-sized editable bubbles."""
@@ -4202,6 +4260,11 @@ class TurnRunner:
                 """
             nonlocal progress_msg_id, progress_lines, can_edit
             if not progress_lines or not can_edit:
+                return False
+            _trim_progress_tail()
+            if ctx.progress_max_chars:
+                # A bounded rolling feed edits one stable message and evicts
+                # old entries instead of creating overflow continuations.
                 return False
             groups = _split_progress_groups(progress_lines)
             if len(groups) <= 1:
@@ -4284,6 +4347,9 @@ class TurnRunner:
                     ctx.last_progress_msg[0] = None
                     ctx.repeat_count[0] = 0
                     continue
+                elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__interim__":
+                    msg = str(raw[1])
+                    progress_lines.append(msg)
                 else:
                     msg = raw
                     progress_lines.append(msg)
@@ -4313,7 +4379,7 @@ class TurnRunner:
 
                 if can_edit and progress_msg_id is not None:
                     # Try to edit the existing progress message
-                    full_text = "\n".join(progress_lines)
+                    full_text = _progress_text(progress_lines)
                     result = await _edit_progress_message(progress_msg_id, full_text)
                     if not result.success:
                         _err = (getattr(result, "error", "") or "").lower()
@@ -4353,7 +4419,7 @@ class TurnRunner:
                 else:
                     if can_edit:
                         # First tool: send all accumulated text as new message
-                        full_text = "\n".join(progress_lines)
+                        full_text = _progress_text(progress_lines)
                         result = await adapter.send(
                             chat_id=ctx.source.chat_id,
                             content=full_text,
@@ -4407,6 +4473,9 @@ class TurnRunner:
                             progress_lines = []
                             ctx.last_progress_msg[0] = None
                             ctx.repeat_count[0] = 0
+                        elif isinstance(raw, tuple) and len(raw) == 2 and raw[0] == "__interim__":
+                            progress_lines.append(str(raw[1]))
+                            await _roll_progress_overflow_if_needed()
                         else:
                             progress_lines.append(raw)
                             await _roll_progress_overflow_if_needed()
@@ -4678,9 +4747,20 @@ class TurnRunner:
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
-        _want_stream_deltas = _streaming_enabled
+        # A combined activity feed must own interim commentary before any
+        # visible content bubble is created. The provider delta callback does
+        # not identify commentary vs. final-answer tokens, so progress mode
+        # deliberately disables visible text streaming for this turn. The final
+        # answer is delivered normally after the activity message.
+        _want_stream_deltas = (
+            _streaming_enabled
+            and ctx.interim_assistant_messages_mode != "progress"
+        )
         _want_interim_messages = ctx.interim_assistant_messages_enabled
-        _want_interim_consumer = _want_interim_messages
+        _want_interim_consumer = (
+            _want_interim_messages
+            and ctx.interim_assistant_messages_mode != "progress"
+        )
         if _want_stream_deltas or _want_interim_consumer:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -4729,6 +4809,13 @@ class TurnRunner:
             if not ctx._run_still_current():
                 return
             display_text = text
+            if ctx.interim_assistant_messages_mode == "progress":
+                if (
+                    ctx.progress_queue is not None
+                    and str(display_text or "").strip()
+                ):
+                    ctx.progress_queue.put(("__interim__", str(display_text)))
+                return
             if _stream_consumer is not None:
                 if already_streamed:
                     _stream_consumer.on_segment_break()
@@ -25432,6 +25519,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         # Tool progress grouping: "accumulate" (edit one bubble) or "separate" (one msg per tool)
         progress_grouping = resolve_display_setting(user_config, platform_key, "tool_progress_grouping") or "accumulate"
+        progress_collapsible = bool(
+            resolve_display_setting(user_config, platform_key, "tool_progress_collapsible")
+        )
+        progress_max_chars = int(
+            resolve_display_setting(user_config, platform_key, "tool_progress_max_chars") or 0
+        )
         from gateway.status_phrases import choose_status_phrase, resolve_status_phrase_catalog
         _generic_status_recent: List[str] = []
         _generic_status_catalog = resolve_status_phrase_catalog(user_config, platform_key)
@@ -25443,7 +25536,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for: set[Any] | None = None,
             allow_generic: bool = False,
         ) -> str:
-            """Return off|raw|generic for a gateway visibility surface."""
+            """Return off|raw|generic|progress for a visibility surface."""
             if require_platform_override_for:
                 current_platform = _gateway_platform_value(source.platform)
                 platform_only = {
@@ -25456,8 +25549,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ):
                     return "off"
             value = resolve_display_setting(user_config, platform_key, setting, default)
-            if isinstance(value, str) and value.strip().lower() == "generic":
-                return "generic" if allow_generic else "off"
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized == "generic":
+                    return "generic" if allow_generic else "off"
+                if normalized == "progress" and setting == "interim_assistant_messages":
+                    return "progress"
             return "raw" if bool(value) else "off"
 
         def _generic_status_phrase(kind: str, *, tool_name: str | None = None, preview: str | None = None, args: Any = None) -> str:
@@ -25518,7 +25615,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             require_platform_override_for={Platform.MATTERMOST},
         )
         _thinking_enabled = _thinking_mode != "off"
-        needs_progress_queue = tool_progress_enabled or _thinking_enabled
+        needs_progress_queue = (
+            tool_progress_enabled
+            or _thinking_enabled
+            or interim_assistant_messages_mode == "progress"
+        )
 
 
         # Queue for progress messages (thread-safe)
@@ -25590,6 +25691,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _thinking_enabled=_thinking_enabled,
             progress_mode=progress_mode,
             progress_grouping=progress_grouping,
+            progress_collapsible=progress_collapsible,
+            progress_max_chars=progress_max_chars,
             tool_progress_enabled=tool_progress_enabled,
             progress_queue=progress_queue,
             log_queue=log_queue,
@@ -25609,6 +25712,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             disabled_toolsets=disabled_toolsets,
             log_mode_enabled=log_mode_enabled,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
+            interim_assistant_messages_mode=interim_assistant_messages_mode,
             needs_progress_queue=needs_progress_queue,
             _voice_ack_fired=_voice_ack_fired,
             _voice_ack_guild=_voice_ack_guild,

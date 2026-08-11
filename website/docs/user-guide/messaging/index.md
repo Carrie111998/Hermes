@@ -770,6 +770,40 @@ display:
 
 Defaults to `false`. Only platforms whose adapter implements `delete_message` honor the setting (currently Telegram and Discord). Failed runs **skip** cleanup so the bubbles remain as breadcrumbs.
 
+### Combined activity feed (opt-in)
+
+Interim assistant commentary can share the editable tool-progress bubble instead
+of creating separate messages. Telegram can additionally render that bubble as a
+native Rich Message disclosure (`Show more`):
+
+```yaml
+display:
+  platforms:
+    telegram:
+      tool_progress: all
+      tool_progress_grouping: accumulate
+      interim_assistant_messages: progress
+      tool_progress_collapsible: true
+      tool_progress_max_chars: 6000
+      cleanup_progress: true
+
+telegram:
+  extra:
+    rich_messages: true
+```
+
+`tool_progress_max_chars` is a rolling character budget for the activity body.
+When it is exceeded, Hermes removes the oldest complete events while keeping the
+same editable message. A single overlong event is trimmed from its oldest edge.
+The default is `0`, which preserves the existing platform-sized rollover
+behavior. `cleanup_progress` deletes the entire combined activity message after
+a successful final reply, including commentary hidden inside the disclosure.
+Telegram's native disclosure and 32,768-character Rich Message limit require
+`telegram.extra.rich_messages: true`; without it, Telegram
+uses the legacy MarkdownV2 fallback. Progress-mode commentary also owns the
+visible mid-turn surface, so text token streaming is disabled for that turn and
+the completed final answer is sent separately.
+
 ## Next Steps
 
 - [Telegram Setup](telegram.md)

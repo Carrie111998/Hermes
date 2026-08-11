@@ -114,6 +114,37 @@ class TestYAMLNormalisation:
         config = {"display": {"platforms": {"whatsapp": {"thinking_progress": "false"}}}}
         assert resolve_display_setting(config, "whatsapp", "thinking_progress") is False
 
+    def test_interim_progress_and_activity_limits_are_preserved(self):
+        from gateway.display_config import resolve_display_setting
+
+        config = {
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "interim_assistant_messages": "progress",
+                        "tool_progress_collapsible": "true",
+                        "tool_progress_max_chars": "6000",
+                    }
+                }
+            }
+        }
+        assert resolve_display_setting(
+            config, "telegram", "interim_assistant_messages"
+        ) == "progress"
+        assert resolve_display_setting(
+            config, "telegram", "tool_progress_collapsible"
+        ) is True
+        assert resolve_display_setting(
+            config, "telegram", "tool_progress_max_chars"
+        ) == 6000
+
+    def test_activity_feed_config_defaults_preserve_legacy_behavior(self):
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        display = DEFAULT_CONFIG["display"]
+        assert display["tool_progress_collapsible"] is False
+        assert display["tool_progress_max_chars"] == 0
+
 
 # ---------------------------------------------------------------------------
 # Built-in platform defaults (tier system)

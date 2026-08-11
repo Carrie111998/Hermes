@@ -1775,6 +1775,18 @@ class TelegramAdapter(BasePlatformAdapter):
             payload["skip_entity_detection"] = True
         return payload
 
+    def render_progress_message(
+        self, entries: list[str], *, collapsible: bool = False
+    ) -> str:
+        """Render opt-in activity as one native Rich Message details block."""
+        if not collapsible:
+            return super().render_progress_message(entries, collapsible=False)
+        safe_entries = [_html.escape(str(entry), quote=False) for entry in entries]
+        latest = " ".join(str(entries[-1]).split()) if entries else "Working"
+        latest = _html.escape(latest[:120], quote=False)
+        body = "\n\n".join(safe_entries)
+        return f"<details><summary>{latest}</summary>\n\n{body}\n\n</details>"
+
     def _is_rich_capability_error(self, exc: Exception) -> bool:
         """True ⇒ the rich endpoint itself is unavailable (old PTB/server).
 

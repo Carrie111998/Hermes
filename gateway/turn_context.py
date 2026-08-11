@@ -41,6 +41,8 @@ class TurnContext:
     _thinking_enabled: bool = False
     progress_mode: str = "off"
     progress_grouping: str = "grouped"
+    progress_collapsible: bool = False
+    progress_max_chars: int = 0
     tool_progress_enabled: bool = False
 
     # --- queues ----------------------------------------------------------
@@ -96,6 +98,7 @@ class TurnContext:
     disabled_toolsets: Any = None
     log_mode_enabled: bool = False
     interim_assistant_messages_enabled: bool = False
+    interim_assistant_messages_mode: str = "off"
     needs_progress_queue: bool = False
 
     # --- lazy-imported callables captured from the outer body -------------

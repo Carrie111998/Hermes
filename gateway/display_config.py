@@ -33,6 +33,8 @@ from typing import Any
 _GLOBAL_DEFAULTS: dict[str, Any] = {
     "tool_progress": "all",
     "tool_progress_grouping": "accumulate",  # "accumulate" = edit one bubble; "separate" = one msg per tool
+    "tool_progress_collapsible": False,
+    "tool_progress_max_chars": 0,  # 0 = existing platform-sized rollover behavior
     "show_reasoning": False,
     # How a reasoning/thinking summary is rendered when show_reasoning is on.
     #   "code"      -> 💭 **Reasoning:** + fenced code block (legacy default)
@@ -266,10 +268,16 @@ def _normalise(setting: str, value: Any) -> Any:
         if val in {"true", "1", "yes", "on"}:
             return "all"
         return val if val in {"off", "new", "all", "verbose", "log"} else "all"
+    if setting == "interim_assistant_messages":
+        if isinstance(value, str):
+            val = value.strip().lower()
+            if val == "progress":
+                return "progress"
+            return val in {"true", "1", "yes", "on", "raw", "verbose"}
+        return bool(value)
     if setting in {
         "show_reasoning",
         "streaming",
-        "interim_assistant_messages",
         "long_running_notifications",
         "busy_ack_detail",
         "busy_steer_ack_enabled",
@@ -281,7 +289,7 @@ def _normalise(setting: str, value: Any) -> Any:
                 return "generic"
             return val in {"true", "1", "yes", "on", "raw", "verbose"}
         return bool(value)
-    if setting == "cleanup_progress":
+    if setting in {"cleanup_progress", "tool_progress_collapsible"}:
         if isinstance(value, str):
             return value.lower() in {"true", "1", "yes", "on"}
         return bool(value)
@@ -306,6 +314,11 @@ def _normalise(setting: str, value: Any) -> Any:
     if setting == "tool_preview_length":
         try:
             return int(value)
+        except (TypeError, ValueError):
+            return 0
+    if setting == "tool_progress_max_chars":
+        try:
+            return max(0, int(value))
         except (TypeError, ValueError):
             return 0
     return value

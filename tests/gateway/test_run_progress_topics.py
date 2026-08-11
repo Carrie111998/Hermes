@@ -376,6 +376,56 @@ class DelayedInterimAgent:
         }
 
 
+class MixedActivityFeedAgent:
+    """Emits tools and commentary into one bounded activity feed."""
+
+    def __init__(self, **kwargs):
+        self.tool_progress_callback = kwargs.get("tool_progress_callback")
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.tool_progress_callback is not None
+        assert self.interim_assistant_callback is not None
+        self.tool_progress_callback("tool.started", "terminal", "oldest-command", {})
+        time.sleep(0.35)
+        self.interim_assistant_callback("I found the relevant gateway seam.")
+        self.tool_progress_callback("tool.started", "terminal", "newest-command", {})
+        time.sleep(0.1)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class AlreadyStreamedActivityFeedAgent(MixedActivityFeedAgent):
+    """Models providers that mark pre-tool narration as already streamed."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.stream_delta_callback = kwargs.get("stream_delta_callback")
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        assert self.interim_assistant_callback is not None
+        assert self.tool_progress_callback is not None
+        # Progress mode must decline visible stream deltas, then still accept
+        # the provider's already_streamed marker into the activity feed.
+        assert self.stream_delta_callback is None
+        self.interim_assistant_callback(
+            "Provider-marked streamed commentary.", already_streamed=True
+        )
+        self.tool_progress_callback("tool.started", "terminal", "verify-command", {})
+        time.sleep(0.35)
+        return {"final_response": "done", "messages": [], "api_calls": 1}
+
+
+class CollapsibleProgressCaptureAdapter(ProgressCaptureAdapter):
+    """Expose the platform progress renderer expected by the gateway."""
+
+    def render_progress_message(self, entries, *, collapsible=False):
+        body = "\n".join(entries)
+        if not collapsible:
+            return body
+        return f"<details><summary>{entries[-1]}</summary>\n{body}\n</details>"
+
+
 def _make_runner(adapter):
     gateway_run = importlib.import_module("gateway.run")
     GatewayRunner = gateway_run.GatewayRunner
@@ -1024,6 +1074,73 @@ async def test_display_streaming_does_not_enable_gateway_streaming(monkeypatch, 
     assert result.get("already_sent") is not True
     assert adapter.edits == []
     assert [call["content"] for call in adapter.sent] == ["I'll inspect the repo first."]
+
+
+@pytest.mark.asyncio
+async def test_interim_progress_mode_shares_one_bounded_collapsible_tool_bubble(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        MixedActivityFeedAgent,
+        session_id="sess-collapsible-activity-feed",
+        config_data={
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "tool_progress": "all",
+                        "tool_progress_grouping": "accumulate",
+                        "interim_assistant_messages": "progress",
+                        "tool_progress_collapsible": True,
+                        "tool_progress_max_chars": 70,
+                    }
+                }
+            }
+        },
+        adapter_cls=CollapsibleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert adapter.sent[0]["content"].startswith("<details>")
+    rendered = adapter.edits[-1]["content"]
+    assert rendered.startswith("<details>")
+    assert "I found the relevant gateway seam." in rendered
+    assert "newest-command" in rendered
+    assert "oldest-command" not in rendered
+    assert all(call["content"] != "I found the relevant gateway seam." for call in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_interim_progress_mode_owns_provider_already_streamed_commentary(
+    monkeypatch, tmp_path
+):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        AlreadyStreamedActivityFeedAgent,
+        session_id="sess-progress-already-streamed-commentary",
+        config_data={
+            "streaming": {"enabled": True},
+            "display": {
+                "platforms": {
+                    "telegram": {
+                        "tool_progress": "off",
+                        "interim_assistant_messages": "progress",
+                        "tool_progress_collapsible": True,
+                        "tool_progress_max_chars": 6000,
+                    }
+                }
+            },
+        },
+        adapter_cls=CollapsibleProgressCaptureAdapter,
+    )
+
+    assert result["final_response"] == "done"
+    assert len(adapter.sent) == 1
+    assert "Provider-marked streamed commentary." in adapter.sent[0]["content"]
+    assert adapter.sent[0]["content"].startswith("<details>")
 
 
 class TransformedStreamAgent:

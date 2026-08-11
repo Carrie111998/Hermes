@@ -448,6 +448,41 @@ def test_streaming_overflow_limit_none_when_rich_latched_off():
     assert adapter.streaming_overflow_limit() is None
 
 
+def test_collapsible_progress_renderer_produces_rich_details_with_latest_summary():
+    adapter = _make_adapter()
+
+    rendered = adapter.render_progress_message(
+        ["💻 terminal: pytest", "I found the gateway seam."],
+        collapsible=True,
+    )
+
+    assert rendered.startswith("<details>")
+    assert "<summary>I found the gateway seam.</summary>" in rendered
+    assert "💻 terminal: pytest" in rendered
+    assert rendered.endswith("</details>")
+    assert adapter._rich_eligible(rendered) is True
+
+
+@pytest.mark.asyncio
+async def test_collapsible_progress_over_legacy_limit_edits_in_place_as_rich():
+    adapter = _make_adapter()
+    rendered = adapter.render_progress_message(["x" * 5000], collapsible=True)
+
+    assert len(rendered) > 4096
+    rich_limit = adapter.streaming_overflow_limit()
+    assert rich_limit is not None
+    assert len(rendered) < rich_limit
+
+    result = await adapter.edit_message("12345", "555", rendered, finalize=True)
+
+    assert result.success is True
+    assert result.message_id == "555"
+    api_kwargs = _rich_edit_kwargs(adapter)
+    assert api_kwargs["rich_message"]["markdown"] == rendered
+    assert adapter._bot is not None
+    adapter._bot.edit_message_text.assert_not_called()
+
+
 # ----------------------------------------------------------------------------
 # Rich finalize via editMessageText (Bot API 10.1 rich_message edit param).
 # Streamed previews finalize by editing the existing message IN PLACE as rich,

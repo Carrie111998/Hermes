@@ -1250,12 +1250,16 @@ DEFAULT_CONFIG = {
             "first_lines": 2,
             "last_lines": 2,
         },
-        "interim_assistant_messages": True,  # Gateway: send natural mid-turn assistant status messages. Desktop: keep mid-turn narration between tool calls instead of collapsing to the final message.
+        # Gateway: true sends natural mid-turn assistant status messages;
+        # "progress" appends them to the editable tool/activity bubble instead.
+        # Desktop: true keeps mid-turn narration between tool calls instead of
+        # collapsing to the final message.
+        "interim_assistant_messages": True,
         # Codex Responses models narrate progress in a dedicated commentary
-        # channel. When true (default), completed commentary messages are
-        # delivered as visible mid-turn updates via the interim message path.
-        # When false, commentary falls back to the reasoning channel and is
-        # only visible when show_reasoning is enabled.
+        # channel. When enabled (default: true), completed commentary messages
+        # are delivered through the configured interim message path. When false,
+        # commentary falls back to the reasoning channel and is only visible
+        # when show_reasoning is enabled.
         "show_commentary": True,
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         # NOTE: display.tool_progress_overrides is deprecated and no longer
@@ -1284,6 +1288,12 @@ DEFAULT_CONFIG = {
         # applies where tool_progress is already enabled. Per-platform override
         # via display.platforms.<platform>.tool_progress_grouping.
         "tool_progress_grouping": "accumulate",
+        # Render the editable activity bubble through a platform-native
+        # disclosure primitive where supported (Telegram Rich Messages).
+        "tool_progress_collapsible": False,
+        # Rolling character budget for one editable activity bubble. Zero keeps
+        # the legacy platform-sized split/rollover behavior.
+        "tool_progress_max_chars": 0,
         # Optional custom phrases for generic long-running status messages.
         # Built-in defaults live in gateway/assets/status_phrases.yaml. Users
         # can set `path`/`paths` to HERMES_HOME-relative YAML files/directories

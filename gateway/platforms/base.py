@@ -3374,6 +3374,18 @@ class BasePlatformAdapter(ABC):
         """
         return preview.text
 
+    def render_progress_message(
+        self, entries: list[str], *, collapsible: bool = False
+    ) -> str:
+        """Render one editable gateway activity/progress message.
+
+        The base rendering preserves the existing plain newline-separated
+        bubble. Adapters with a native disclosure primitive may override the
+        opt-in ``collapsible`` form without moving message ownership out of the
+        gateway.
+        """
+        return "\n".join(str(entry) for entry in entries)
+
     @property
     def has_fatal_error(self) -> bool:
         return self._fatal_error_message is not None
