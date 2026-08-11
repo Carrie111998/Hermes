@@ -463,6 +463,12 @@ async def test_gateway_busy_secondary_adapter_stamps_real_user_before_fifo(monke
     monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
     setattr(adapter, "gateway_runner", runner)
     runner._configure_profile_adapter(adapter, "coder", Platform.DISCORD)
+    # Keep this FIFO regression independent from the developer's real `coder`
+    # profile config. Profile-aware startup snapshots override the runner-wide
+    # fallback, and a local `busy_text_mode: queue` would divert these events to
+    # the adapter's text-debounce/merge path before the FIFO seam under test.
+    runner.__dict__.setdefault("_busy_input_modes_by_profile", {})["coder"] = "interrupt"
+    runner.__dict__.setdefault("_busy_text_modes_by_profile", {})["coder"] = "interrupt"
     adapter._busy_text_mode = "interrupt"
 
     source = adapter.build_source(

@@ -15311,15 +15311,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Stamp an owning adapter's profile before resolving busy policy."""
-        async def _handler(event, _session_key):
+        async def _handler(event, adapter_session_key):
             try:
                 if getattr(event, "source", None) is not None and not event.source.profile:
                     event.source.profile = profile_name
             except Exception:
                 pass
-            routed_session_key = self._session_key_for_source(event.source)
             return await self._handle_active_session_busy_message(
-                event, routed_session_key
+                event, adapter_session_key
             )
 
         return _handler
