@@ -45,6 +45,28 @@ def react_to_message_tool(emoji: str, message_row_id=None, messages_back=None) -
     if db is None:
         return tool_error("Session storage is unavailable.")
 
+    try:
+        return _react_with_db(db, emoji, session_key, message_row_id, messages_back)
+    finally:
+        # Never leak the dedicated SessionDB handle: every return path (success
+        # or error) after a successful open must release the SQLite connection
+        # and its file descriptors. Close failures are logged at debug level so
+        # they never replace the tool result.
+        try:
+            db.close()
+        except Exception:
+            import logging
+            logging.getLogger(__name__).debug(
+                "failed to close SessionDB in react_to_message_tool", exc_info=True
+            )
+
+
+def _react_with_db(db, emoji, session_key, message_row_id, messages_back) -> str:
+    """Implement the reaction logic using an already-open ``db`` handle.
+
+    The caller owns ``db`` and closes it in a ``finally`` block, so every
+    return path here leaks nothing.
+    """
     row_id = message_row_id
     target_role = "user"
     if row_id is None:
