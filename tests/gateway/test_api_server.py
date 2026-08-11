@@ -1621,6 +1621,111 @@ class TestResponsesEndpoint:
         assert retry.headers["X-Hermes-Session-Id"] == "responses-session"
 
     @pytest.mark.asyncio
+    async def test_responses_idempotency_partitions_normalized_conversation_history(self, auth_adapter):
+        app = _create_app(auth_adapter)
+
+        async def run_agent(**kwargs):
+            history_value = kwargs["conversation_history"][0]["content"]
+            return (
+                {"final_response": history_value, "session_id": "responses-session", "messages": []},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", side_effect=run_agent) as mock_run:
+                headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "history-retry"}
+                first = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={
+                        "model": "hermes-agent",
+                        "input": "hello",
+                        "conversation_history": [{"role": "user", "content": "secret-A"}],
+                        "store": False,
+                    },
+                )
+                second = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={
+                        "model": "hermes-agent",
+                        "input": "hello",
+                        "conversation_history": [{"role": "user", "content": "secret-B"}],
+                        "store": False,
+                    },
+                )
+                first_data = await first.json()
+                second_data = await second.json()
+
+        assert first.status == second.status == 200
+        assert mock_run.call_count == 2
+        assert [call.kwargs["conversation_history"] for call in mock_run.call_args_list] == [
+            [{"role": "user", "content": "secret-A"}],
+            [{"role": "user", "content": "secret-B"}],
+        ]
+        assert first_data["output"][0]["content"][0]["text"] == "secret-A"
+        assert second_data["output"][0]["content"][0]["text"] == "secret-B"
+
+    @pytest.mark.asyncio
+    async def test_responses_idempotency_partitions_truncation_mode(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        body = {"model": "hermes-agent", "input": "hello", "store": False}
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "ok", "session_id": "responses-session", "messages": []},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "truncation-retry"}
+                first = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={**body, "conversation_history": [{"role": "user", "content": "prior"}]},
+                )
+                second = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={
+                        **body,
+                        "conversation_history": [{"role": "user", "content": "prior"}],
+                        "truncation": "auto",
+                    },
+                )
+
+        assert first.status == second.status == 200
+        assert mock_run.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_responses_idempotency_normalizes_equivalent_input_forms(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "stable", "session_id": "responses-session", "messages": []},
+                    {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                )
+                headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "input-form-retry"}
+                first = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={"model": "hermes-agent", "input": "hello", "store": False},
+                )
+                second = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={
+                        "model": "hermes-agent",
+                        "input": [{"role": "user", "content": "hello"}],
+                        "store": False,
+                    },
+                )
+
+        assert first.status == second.status == 200
+        assert mock_run.call_count == 1
+
+
+    @pytest.mark.asyncio
     async def test_provider_auth_failure_replay_preserves_responses_session_identity(self, auth_adapter):
         app = _create_app(auth_adapter)
         body = {"model": "hermes-agent", "input": "hello", "store": False}
@@ -1932,6 +2037,40 @@ class TestResponsesEndpoint:
 
 
 class TestResponsesStreaming:
+
+    @pytest.mark.asyncio
+    async def test_authenticated_streaming_idempotency_requests_execute_independently(self, auth_adapter):
+        app = _create_app(auth_adapter)
+
+        async def run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "session_id": kwargs["session_id"], "messages": []},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        async def write_sse(**kwargs):
+            await kwargs["agent_task"]
+            return web.Response(status=200, text="ok")
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(auth_adapter, "_run_agent", side_effect=run_agent) as mock_run,
+                patch.object(auth_adapter, "_write_sse_responses", side_effect=write_sse),
+            ):
+                headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "stream-retry"}
+                first = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={"model": "hermes-agent", "input": "hello", "stream": True},
+                )
+                second = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={"model": "hermes-agent", "input": "hello", "stream": True},
+                )
+
+        assert first.status == second.status == 200
+        assert mock_run.call_count == 2
 
 
     @pytest.mark.asyncio

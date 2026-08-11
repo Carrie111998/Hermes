@@ -1268,6 +1268,13 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _make_normalized_request_fingerprint(payload: Dict[str, Any]) -> str:
+    from hashlib import sha256
+
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(encoded.encode("utf-8")).hexdigest()
+
+
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
@@ -5432,18 +5439,32 @@ class APIServerAdapter(BasePlatformAdapter):
         idempotency_key = request.headers.get("Idempotency-Key")
         idempotency_scope = self._idempotency_scope(request, "responses")
         if idempotency_key and idempotency_scope is not None:
-            fp = _make_request_fingerprint(
-                body,
-                keys=[
-                    "input",
-                    "instructions",
-                    "previous_response_id",
-                    "conversation",
-                    "model",
-                    "provider",
-                    "model_options",
-                    "tools",
-                ],
+            model_options = agent_overrides.get("model_options")
+            service_tier = _request_service_tier(model_options)
+            request_options = {
+                "reasoning_config": _request_reasoning_config(model_options),
+                "service_tier": None if service_tier is _REQUEST_OPTION_MISSING else service_tier,
+            }
+            route_identity = {
+                "source": "model_routes" if route else "global",
+                "model": route.get("model") if isinstance(route, dict) else None,
+                "provider": route.get("provider") if isinstance(route, dict) else None,
+            }
+            fp = _make_normalized_request_fingerprint(
+                {
+                    "user_message": user_message,
+                    "conversation_history": conversation_history,
+                    "instructions": instructions,
+                    "truncation": "auto" if body.get("truncation") == "auto" else "none",
+                    "request_options": request_options,
+                    "route": route_identity,
+                    "requested_model": agent_overrides.get("requested_model"),
+                    "requested_provider": agent_overrides.get("requested_provider"),
+                    "previous_response_id": previous_response_id,
+                    "conversation": conversation,
+                    "store": store,
+                    "tools": body.get("tools"),
+                }
             )
             try:
                 result, usage = await self._idempotency_cache.get_or_set(
