@@ -32,6 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { resolveAppIconPath } from './app-icon'
 import { stopBackendChild as stopBackendChildImpl, stopBackendTreesForUpdate } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -142,11 +143,11 @@ import {
   resolveTimeoutMs,
   TEXT_PREVIEW_SOURCE_MAX_BYTES
 } from './hardening'
+import { createBoundedLinkTitleQueue, fetchPinnedLinkTitle } from './link-title-fetch'
 import { cursorPointInWindow } from './hud-cursor'
 import { snapHudBounds } from './hud-snap'
 import { createHudSnapShortcut } from './hud-snap-shortcut'
 import { buildHudWindowUrl } from './hud-url'
-import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
 import {
   oauthGuardMayHardFail,
