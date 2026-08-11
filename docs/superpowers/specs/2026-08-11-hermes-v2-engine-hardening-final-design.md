@@ -485,6 +485,13 @@ Review run as `preflight_repaired`, `preflight_resolved`, or
 not move outcome validation into `_end_run`, `handoff`, or another generic run
 finalizer that would collapse these entrypoints.
 
+The separation is structural, not a persisted-outcome allowlist.
+`complete_task` never accepts or inspects a caller-claimed run outcome to skip
+the kernel; only `resolve_product_preflight` writes the three privileged
+outcomes through its separate path. Therefore an ordinary completion carrying
+`preflight_repaired`, `preflight_resolved`, or `preflight_escalated` in
+free-form metadata still requires canonical `workflow_outcome`.
+
 Accepted canonical shapes remain:
 
 ```text
@@ -1066,7 +1073,10 @@ Rollout gates:
 1. **Spec 1:** run-407 regression, latest-Review invariant, no-op integration
    guard, Resolver repair preservation, and existing release-evidence suite
    green. Run 304 proves the defect is not task-specific; runs 354/369 prove
-   non-verdict Resolver finalization remains outside the kernel.
+   non-verdict Resolver finalization remains outside the kernel. A
+   behavior-level impersonation test proves ordinary `complete_task` rejects
+   all three privileged outcome strings in metadata when canonical
+   `workflow_outcome` is absent, without mutating the task or run.
 2. **Spec 2:** real temporary-repository tests green; board repository contract
    validated for The Trading Company before enabling it.
 3. **Spec 3:** verifier fault-injection, retry ownership/budget, and concurrent

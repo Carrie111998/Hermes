@@ -520,6 +520,22 @@ Expected: FAIL because the migration module does not exist.
 
 - [ ] **Step 3: Implement a read-only dry-run manifest**
 
+Keep historical persisted-outcome classification local to the migration
+module:
+
+```python
+VERDICT_BEARING_HISTORICAL_OUTCOMES = frozenset({
+    "advanced", "rework_requested",
+})
+NON_VERDICT_RESOLVER_HISTORICAL_OUTCOMES = frozenset({
+    "preflight_repaired", "preflight_resolved", "preflight_escalated",
+})
+```
+
+These constants classify already-persisted rows for dry-run reporting only.
+Neither `kanban_product_outcomes.py`, `complete_task`, nor any outcome
+validation path may import or consult them.
+
 The manifest lists contract validation, blockers, each affected task's
 before/after state, refresh preflight result, history counts, Epic template
 changes, expected schema version, the rolling-50 verdict-bearing outcome

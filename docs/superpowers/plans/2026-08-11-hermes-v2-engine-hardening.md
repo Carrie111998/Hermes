@@ -83,6 +83,10 @@ scripts/run_tests.sh \
 
 ### Gate E — Board compatibility before enabling fail-closed
 
+- [ ] Verify the Resolver exemption is structural: ordinary `complete_task`
+  rejects missing canonical authority even when metadata claims
+  `preflight_repaired`, `preflight_resolved`, or `preflight_escalated`. No
+  persisted-outcome allowlist exists in the completion kernel.
 - [ ] On the target board, measure the 50 most recent verdict-bearing Test/Review runs with the exact persisted-outcome classification used by the migration:
 
 ```sql

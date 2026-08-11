@@ -181,12 +181,6 @@ class ProductOutcomeError(ValueError):
         super().__init__(code)
 
 
-VERDICT_BEARING_RUN_OUTCOMES = frozenset({"advanced", "rework_requested"})
-NON_VERDICT_RESOLVER_RUN_OUTCOMES = frozenset({
-    "preflight_repaired", "preflight_resolved", "preflight_escalated",
-})
-
-
 def validate_terminal_outcome(
     *, task_id: str, run_id: int, phase: str, summary: str | None,
     result: str | None, metadata: Mapping[str, object] | None,
@@ -216,8 +210,15 @@ existing routing/provenance code. Do not call the kernel from `_end_run`,
 worker is pinned to the exact `resolver_readonly` toolset and cannot call
 `kanban_complete`. It must continue to close non-verdict terminal runs as
 `preflight_repaired`, `preflight_resolved`, or `preflight_escalated` without canonical
-`workflow_outcome`. The two persisted-outcome constants above are for audit
-and migration classification; they are not a bypass inside the validator.
+`workflow_outcome`.
+
+This exemption is structural, not value-based. `complete_task` selects the
+kernel solely from its ordinary-completion entrypoint and the active Test or
+Review phase. It must never inspect caller-supplied `metadata.outcome`,
+`metadata.run_outcome`, `metadata.completion_outcome`, or any claimed
+persisted run outcome to bypass validation. Only
+`resolve_product_preflight` may author the three Resolver outcomes through
+its independently-authorized path.
 
 On ordinary-completion rejection, append one safe event in its own transaction
 and raise a typed `ProductOutcomeError`; do not close the run:
@@ -248,7 +249,17 @@ Replay the resolver-repair shapes from runs 354 and 369 through
 no canonical outcome, and route exactly as before without invoking the
 kernel. Add the same behavior assertions for `preflight_resolved` and
 `preflight_escalated` using the existing resolver-resume and escalation
-fixtures. Then simulate an ordinary worker clean exit
+fixtures.
+
+Add a behavior-level impersonation test, parameterized over active Test and
+Review phases and all three privileged strings. Call ordinary `complete_task`
+with no canonical `workflow_outcome`, but place the claimed value in each of
+`metadata.outcome`, `metadata.run_outcome`, and
+`metadata.completion_outcome`. Assert `ProductOutcomeError.code == "missing"`,
+the rejection event is safe, and the task/run snapshot is unchanged. The test
+must exercise the public behavior; it must not inspect implementation source.
+
+Then simulate an ordinary worker clean exit
 after a rejected `kanban_complete` without successful retry and assert the
 existing watcher closes the run as `crashed`, appends a run-scoped
 `protocol_violation`, and leaves the product card in Review/blocked so the
