@@ -136,6 +136,67 @@ def test_find_live_child_returns_continuation_with_foreign_markers(
     assert child["id"] == "inherited-continuation"
 
 
+def test_record_gateway_session_peer_walks_multi_hop_compression_lineage(
+    db: SessionDB,
+) -> None:
+    """Control case: a plain (no foreign markers) two-hop compression chain
+    must have the routing peer propagated to every ancestor."""
+    _compression_parent(db, "peer-root")
+    db.create_session(
+        "peer-mid", source="webui", parent_session_id="peer-root"
+    )
+    db.end_session("peer-mid", "compression")
+    db.create_session(
+        "peer-tip", source="webui", parent_session_id="peer-mid"
+    )
+
+    db.record_gateway_session_peer(
+        "peer-tip",
+        source="webui",
+        session_key="new-routing-key",
+        include_compression_ancestors=True,
+    )
+
+    assert db.get_session("peer-root")["session_key"] == "new-routing-key"
+    assert db.get_session("peer-mid")["session_key"] == "new-routing-key"
+    assert db.get_session("peer-tip")["session_key"] == "new-routing-key"
+
+
+def test_record_gateway_session_peer_walks_past_continuation_with_foreign_marker(
+    db: SessionDB,
+) -> None:
+    """Same bug class as the reopen/find_live tests above, in the recursive
+    ancestor walk ``record_gateway_session_peer(include_compression_ancestors=True)``
+    uses. A REAL continuation can carry ``_delegate_from`` pointing at some
+    OTHER session (the delegate's own original parent, not this parent) —
+    marker-PRESENCE matching stopped the walk one hop too early and left the
+    compression parent on a stale routing peer after an explicit gateway
+    ``/resume`` moved the tip to a new session_key."""
+    _compression_parent(db, "peer-parent-with-foreign-marker")
+    db.create_session(
+        "peer-continuation-foreign-marker",
+        source="subagent",
+        parent_session_id="peer-parent-with-foreign-marker",
+        model_config={"_delegate_from": "some-unrelated-original-parent"},
+    )
+
+    db.record_gateway_session_peer(
+        "peer-continuation-foreign-marker",
+        source="webui",
+        session_key="new-routing-key",
+        include_compression_ancestors=True,
+    )
+
+    assert (
+        db.get_session("peer-parent-with-foreign-marker")["session_key"]
+        == "new-routing-key"
+    )
+    assert (
+        db.get_session("peer-continuation-foreign-marker")["session_key"]
+        == "new-routing-key"
+    )
+
+
 def test_reopen_orphaned_compression_session_fails_closed_with_active_lease(
     db: SessionDB,
 ) -> None:
@@ -296,3 +357,54 @@ def test_compression_lease_blocks_non_owner_but_allows_owner_flush(
         compression_lock_holder="winner",
     )
     assert [m["content"] for m in db.get_messages("leased")] == ["winner flush"]
+
+
+def test_get_compression_tip_walks_past_continuation_with_foreign_marker(
+    db: SessionDB,
+) -> None:
+    """Same bug class as the reopen/find_live/record_gateway_session_peer
+    tests above, in the forward tip walk ``get_compression_tip`` uses. A REAL
+    continuation can carry ``_delegate_from`` pointing at some OTHER session
+    (the delegate's own original parent, not this parent) — marker-PRESENCE
+    matching stopped the walk one hop too early and returned the dead parent
+    as the "tip" instead of the live continuation that actually holds the
+    post-compression messages."""
+    _compression_parent(db, "tip-parent-with-foreign-marker")
+    db.create_session(
+        "tip-continuation-foreign-marker",
+        source="subagent",
+        parent_session_id="tip-parent-with-foreign-marker",
+        model_config={"_delegate_from": "some-unrelated-original-parent"},
+    )
+
+    assert (
+        db.get_compression_tip("tip-parent-with-foreign-marker")
+        == "tip-continuation-foreign-marker"
+    )
+
+
+def test_resolve_resume_session_id_walks_past_continuation_with_foreign_marker(
+    db: SessionDB,
+) -> None:
+    """Same bug class again, in the message-bearing-descendant walk
+    ``resolve_resume_session_id`` uses once ``get_compression_tip`` has
+    already redirected to the tip. Without the parent-bound marker check,
+    a continuation inheriting a foreign ``_delegate_from`` is excluded as if
+    it were an unrelated delegate child, and ``--resume`` on the parent
+    reloads the pre-compression transcript missing every post-compression
+    turn."""
+    _compression_parent(db, "resume-parent-with-foreign-marker")
+    db.create_session(
+        "resume-continuation-foreign-marker",
+        source="subagent",
+        parent_session_id="resume-parent-with-foreign-marker",
+        model_config={"_delegate_from": "some-unrelated-original-parent"},
+    )
+    db.append_message(
+        "resume-continuation-foreign-marker", "assistant", "post-compression reply"
+    )
+
+    assert (
+        db.resolve_resume_session_id("resume-parent-with-foreign-marker")
+        == "resume-continuation-foreign-marker"
+    )
