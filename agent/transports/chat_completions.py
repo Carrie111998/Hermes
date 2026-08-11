@@ -623,11 +623,20 @@ class ChatCompletionsTransport(ProviderTransport):
             "messages": sanitized,
         }
 
-        # Temperature
-        if profile.fixed_temperature is OMIT_TEMPERATURE:
+        # Temperature. The profile rule is provider-scoped; when the profile
+        # has none, fall back to the model-scoped directive the caller computed
+        # via _fixed_temperature_for_model(). Without this fallback a model with
+        # a strict temperature contract reached through a generic provider — a
+        # Kimi model behind provider="custom", say — silently loses its own rule
+        # and receives the caller's temperature, which the upstream rejects with
+        # "invalid temperature: only 1 is allowed for this model".
+        _temp_rule = profile.fixed_temperature
+        if _temp_rule is None:
+            _temp_rule = params.get("fixed_temperature")
+        if _temp_rule is OMIT_TEMPERATURE:
             pass  # Don't include temperature at all
-        elif profile.fixed_temperature is not None:
-            api_kwargs["temperature"] = profile.fixed_temperature
+        elif _temp_rule is not None:
+            api_kwargs["temperature"] = _temp_rule
         else:
             # Use caller's temperature if provided
             temp = params.get("temperature")

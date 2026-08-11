@@ -4118,6 +4118,13 @@ def _is_unsupported_parameter_error(exc: Exception, param: str) -> bool:
     err_lower = str(exc).lower()
     if param_lower not in err_lower:
         return False
+    # Some gateways name the parameter directly instead of using a generic
+    # "unsupported parameter" marker, e.g. Moonshot/Kimi via opencode-go:
+    #   "invalid temperature: only 1 is allowed for this model"
+    # Treat "invalid <param>" as the same class so the reactive retry fires
+    # instead of the caller re-sending an identical request that cannot work.
+    if f"invalid {param_lower}" in err_lower:
+        return True
     return any(marker in err_lower for marker in (
         "unsupported parameter",
         "unsupported_parameter",
