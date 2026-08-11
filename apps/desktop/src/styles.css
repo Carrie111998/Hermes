@@ -2712,6 +2712,23 @@ button[data-slot='aui_msg-reactions'] svg {
    element + the global button rule); the rest of the bar is the handle.
    macOS/Windows keep dragging on `useHudComposerDrag` — press and hold the
    bar, then move. */
+
+/* Grip affordance for the Linux drag band: the composer's top padding (pt-4)
+   is the only surface the region owns once the input/buttons are carved out,
+   so make it look like a handle — a centered pill, like a mobile grip. */
+.hud-native-drag::before {
+  content: '';
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 40px;
+  height: 4px;
+  border-radius: 9999px;
+  background: color-mix(in srgb, var(--ui-text-tertiary) 55%, transparent);
+  pointer-events: none;
+}
+
 [data-hud-shell] [data-slot='composer-dock'] {
   /* The one surface that is always there, so the one that always takes the
      mouse — everything else in the shell earns it by being on screen. */

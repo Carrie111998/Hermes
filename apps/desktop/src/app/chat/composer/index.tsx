@@ -1137,8 +1137,11 @@ export function ChatBar({
               // Linux HUD: the whole bar is a native drag handle for the
               // compositor (the input opts out below). setPosition/setBounds
               // is a no-op under Wayland compositors, so this is the only way
-              // the HUD can be repositioned there.
-              hudMode && IS_LINUX && '[-webkit-app-region:drag]'
+              // the HUD can be repositioned there. The top padding (pt-4) is
+              // the region's own grab band — the input/buttons below opt out
+              // with no-drag, so without it there'd be no surface left to
+              // grab. `.hud-native-drag` carries the grip pill (styles.css).
+              hudMode && IS_LINUX && 'hud-native-drag pt-4 [-webkit-app-region:drag]'
             )}
             data-drag-active={dragActive ? '' : undefined}
             data-hud-grabbing={hudGrabbing ? '' : undefined}
