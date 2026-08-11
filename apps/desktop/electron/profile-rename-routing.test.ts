@@ -15,6 +15,7 @@ test('applyProfileRenameLifecycle revokes and rehomes a renamed primary before r
   await applyProfileRenameLifecycle({ from: 'worker', to: 'coder' }, 'worker', {
     completeRevocation: mutation => events.push(`complete:${mutation}`),
     destroyRevokedWindows: ids => events.push(`destroy:${ids.join(',')}`),
+    failRevocation: mutation => events.push(`failed:${mutation}`),
     migrateConnectionOverride: (from, to) => events.push(`config:${from}->${to}`),
     revokeProfile: profile => {
       events.push(`revoke:${profile}`)
@@ -53,6 +54,7 @@ test('applyProfileRenameLifecycle leaves primary selection and backend untouched
   await applyProfileRenameLifecycle({ from: 'worker', to: 'coder' }, 'default', {
     completeRevocation: () => events.push('complete'),
     destroyRevokedWindows: () => events.push('destroy'),
+    failRevocation: () => events.push('failed'),
     migrateConnectionOverride: () => events.push('config'),
     revokeProfile: () => 'mutation',
     revokeWindowTargets: () => [],
@@ -66,6 +68,29 @@ test('applyProfileRenameLifecycle leaves primary selection and backend untouched
   })
 
   assert.deepEqual(events, ['destroy', 'config', 'pools', 'complete'])
+})
+
+test('applyProfileRenameLifecycle fails the revocation token when teardown rejects', async () => {
+  const failed: string[] = []
+
+  await assert.rejects(
+    applyProfileRenameLifecycle({ from: 'worker', to: 'coder' }, 'default', {
+      completeRevocation: () => {},
+      destroyRevokedWindows: () => {},
+      failRevocation: mutation => failed.push(mutation),
+      migrateConnectionOverride: () => {},
+      revokeProfile: () => 'rename-token',
+      revokeWindowTargets: () => [],
+      teardownPrimary: async () => {},
+      teardownProfilePools: async () => {
+        throw new Error('teardown failed')
+      },
+      writeActiveProfile: () => {}
+    }),
+    /teardown failed/
+  )
+
+  assert.deepEqual(failed, ['rename-token'])
 })
 
 test('profileRenameFromRequest parses a valid PATCH profile rename', () => {

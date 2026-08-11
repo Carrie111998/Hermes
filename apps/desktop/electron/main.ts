@@ -185,7 +185,8 @@ import {
   profileRenameFromRequest,
   removeProfileConnectionOverride,
   renameProfileConnectionOverride,
-  resolveRouteTarget
+  resolveRouteTarget,
+  runProfileMutationPreflight
 } from './profile-delete-routing'
 import { PROFILE_NAME_RE } from './profile-name'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
@@ -8755,6 +8756,7 @@ async function prepareProfileDeleteRequest(request) {
 
   return applyProfileDeleteLifecycle<ProfileMutationToken>(decision, {
     destroyRevokedWindows: webContentsIds => destroyRevokedWindows(webContentsIds, BrowserWindow.getAllWindows()),
+    failRevocation: mutation => profileRevocations.completeMutation({ mutation, succeeded: false }),
     revokeProfile: deletedProfile => profileRevocations.revoke(deletedProfile),
     revokeWindowTargets: deletedProfile => windowTargets.revokeProfile(deletedProfile),
     teardownPrimary: () => teardownPrimaryBackendAndWait(),
@@ -8798,6 +8800,8 @@ async function completeProfileMutation<T>(
         },
         destroyRevokedWindows: webContentsIds =>
           destroyRevokedWindows(webContentsIds, BrowserWindow.getAllWindows()),
+        failRevocation: renameMutation =>
+          profileRevocations.completeMutation({ mutation: renameMutation, succeeded: false }),
         migrateConnectionOverride: (from, to) => {
           const current = readDesktopConnectionConfig()
 
@@ -11504,90 +11508,101 @@ ipcMain.handle('hermes:api', async (event, request) => {
   const createdProfile = profileNameFromCreateRequest(request)
   const renamedProfile = profileRenameFromRequest(request)
   const creationMutation = createdProfile ? profileRevocations.startCreation(createdProfile) : null
-  const deletion = await prepareProfileDeleteRequest(request)
-  const tornDownProfile = deletion.profile
-  const profileMutation = deletion.mutation || creationMutation
 
-  // Remote-profile session requests would otherwise hit the local primary off
-  // each profile's on-disk state.db — fine for local profiles, but a remote
-  // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
-  // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request, initialTarget, boundTarget)
+  return runProfileMutationPreflight(
+    creationMutation,
+    async handoff => {
+      const deletion = await prepareProfileDeleteRequest(request)
+      const tornDownProfile = deletion.profile
+      const profileMutation = deletion.mutation || creationMutation
 
-  if (rerouted !== undefined) {
-    return rerouted
-  }
+      // Remote-profile session requests would otherwise hit the local primary off
+      // each profile's on-disk state.db — fine for local profiles, but a remote
+      // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
+      // no-op) the moment they run there. Route reads + mutations to the remote.
+      const rerouted = await interceptSessionRequestForRemote(request, initialTarget, boundTarget)
 
-  // After tearing down a backend for profile deletion, route to the primary
-  // backend instead of spawning a fresh pool backend.  A freshly spawned
-  // backend calls ensure_hermes_home() which recreates the profile directory,
-  // defeating the deletion and leaving a zombie process.
-  const target = resolveRouteTarget(tornDownProfile, initialTarget)
-  const profile = target.kind === 'configured-profile' ? target.profile : request?.profile
+      if (rerouted !== undefined) {
+        return rerouted
+      }
 
-  const connection = await ensureBackendForTarget(target)
-  const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+      // After tearing down a backend for profile deletion, route to the primary
+      // backend instead of spawning a fresh pool backend.  A freshly spawned
+      // backend calls ensure_hermes_home() which recreates the profile directory,
+      // defeating the deletion and leaving a zombie process.
+      const target = resolveRouteTarget(tornDownProfile, initialTarget)
+      const profile = target.kind === 'configured-profile' ? target.profile : request?.profile
 
-  const requestPath = target.kind === 'forced-local-profile'
-    ? request.path
-    : pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
+      const connection = await ensureBackendForTarget(target)
+      const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
-  const url = `${connection.baseUrl}${requestPath}`
+      const requestPath = target.kind === 'forced-local-profile'
+        ? request.path
+        : pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
 
-  // OAuth gateways authenticate REST via EITHER a native bearer token
-  // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
-  // partition. Prefer the native bearer when present (mirroring
-  // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
-  // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
-  // though a valid bearer is held. Cookie mode rides Electron's net stack bound
-  // to the OAuth partition so the cookie attaches automatically. Token/local
-  // modes keep using the static session-token header.
-  if (connection.authMode === 'oauth') {
-    // The OAuth path rides electron.net with JSON headers; multipart isn't
-    // wired there. Fail loudly rather than corrupting the upload.
-    if (request?.upload) {
-      throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
-    }
+      const url = `${connection.baseUrl}${requestPath}`
 
-    // Native bearer first (cookieless). ensureNativeAccessToken transparently
-    // refreshes a near-expiry AT via /auth/native/refresh; a null return means
-    // no native session (resolveOauthRestAuth then selects the cookie path).
-    const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
-    const restAuth = resolveOauthRestAuth(nativeAt)
+      // OAuth gateways authenticate REST via EITHER a native bearer token
+      // (cookieless RFC 8252 flow) OR the HttpOnly session cookie held in the OAuth
+      // partition. Prefer the native bearer when present (mirroring
+      // mintGatewayWsTicket): the native flow never sets a cookie, so routing an
+      // oauth-mode REST call through the cookie-only path returns 401 no_cookie even
+      // though a valid bearer is held. Cookie mode rides Electron's net stack bound
+      // to the OAuth partition so the cookie attaches automatically. Token/local
+      // modes keep using the static session-token header.
+      if (connection.authMode === 'oauth') {
+        // The OAuth path rides electron.net with JSON headers; multipart isn't
+        // wired there. Fail loudly rather than corrupting the upload.
+        if (request?.upload) {
+          throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
+        }
 
-    if (restAuth.kind === 'bearer') {
+        // Native bearer first (cookieless). ensureNativeAccessToken transparently
+        // refreshes a near-expiry AT via /auth/native/refresh; a null return means
+        // no native session (resolveOauthRestAuth then selects the cookie path).
+        const nativeAt = await ensureNativeAccessToken(connection.baseUrl).catch(() => null)
+        const restAuth = resolveOauthRestAuth(nativeAt)
+
+        handoff()
+
+        if (restAuth.kind === 'bearer') {
+          return completeProfileMutation(
+            profileMutation,
+            () => fetchJson(url, null, {
+              method: request?.method,
+              body: request?.body,
+              timeoutMs,
+              bearer: restAuth.token
+            }),
+            renamedProfile
+          )
+        }
+
+        return completeProfileMutation(
+          profileMutation,
+          () => fetchJsonViaOauthSession(url, {
+            method: request?.method,
+            body: request?.body,
+            timeoutMs
+          }),
+          renamedProfile
+        )
+      }
+
+      handoff()
+
       return completeProfileMutation(
         profileMutation,
-        () => fetchJson(url, null, {
+        () => fetchJson(url, connection.token, {
           method: request?.method,
           body: request?.body,
-          timeoutMs,
-          bearer: restAuth.token
+          upload: request?.upload,
+          timeoutMs
         }),
         renamedProfile
       )
-    }
-
-    return completeProfileMutation(
-      profileMutation,
-      () => fetchJsonViaOauthSession(url, {
-        method: request?.method,
-        body: request?.body,
-        timeoutMs
-      }),
-      renamedProfile
-    )
-  }
-
-  return completeProfileMutation(
-    profileMutation,
-    () => fetchJson(url, connection.token, {
-      method: request?.method,
-      body: request?.body,
-      upload: request?.upload,
-      timeoutMs
-    }),
-    renamedProfile
+    },
+    (mutation, succeeded) => profileRevocations.completeMutation({ mutation, succeeded })
   )
 })
 

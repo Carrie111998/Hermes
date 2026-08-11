@@ -10,7 +10,8 @@ import {
   profileNameFromCreateRequest,
   profileNameFromDeleteRequest,
   removeProfileConnectionOverride,
-  resolveRouteTarget
+  resolveRouteTarget,
+  runProfileMutationPreflight
 } from './profile-delete-routing'
 
 // ---------------------------------------------------------------------------
@@ -61,6 +62,54 @@ test('profileNameFromCreateRequest rejects other methods, paths, and invalid nam
   assert.equal(profileNameFromCreateRequest({ method: 'POST', path: '/api/profiles', body: { name: '../worker' } }), null)
 })
 
+test('runProfileMutationPreflight completes a tracked mutation when preflight fails', async () => {
+  const completions: string[] = []
+
+  await assert.rejects(
+    runProfileMutationPreflight(
+      'create-token',
+      async () => {
+        throw new Error('backend unavailable')
+      },
+      (mutation, succeeded) => completions.push(`${succeeded ? 'succeeded' : 'failed'}:${mutation}`)
+    ),
+    /backend unavailable/
+  )
+
+  assert.deepEqual(completions, ['failed:create-token'])
+})
+
+test('runProfileMutationPreflight does not double-complete after handoff', async () => {
+  const completions: string[] = []
+
+  await assert.rejects(
+    runProfileMutationPreflight(
+      'create-token',
+      async handoff => {
+        handoff()
+        throw new Error('request failed after handoff')
+      },
+      (mutation, succeeded) => completions.push(`${succeeded ? 'succeeded' : 'failed'}:${mutation}`)
+    ),
+    /request failed after handoff/
+  )
+
+  assert.deepEqual(completions, [])
+})
+
+test('runProfileMutationPreflight completes an early success before handoff', async () => {
+  const completions: string[] = []
+
+  const result = await runProfileMutationPreflight(
+    'create-token',
+    async () => 'intercepted',
+    (mutation, succeeded) => completions.push(`${succeeded ? 'succeeded' : 'failed'}:${mutation}`)
+  )
+
+  assert.equal(result, 'intercepted')
+  assert.deepEqual(completions, ['succeeded:create-token'])
+})
+
 // ---------------------------------------------------------------------------
 // decideProfileDeleteAction
 // ---------------------------------------------------------------------------
@@ -101,6 +150,7 @@ test('applyProfileDeleteLifecycle resets and tears down every primary-profile ba
     { action: 'teardown-primary', profile: 'primary-profile' },
     {
       destroyRevokedWindows: ids => events.push(`windows:${ids.join(',')}`),
+      failRevocation: mutation => events.push(`failed:${mutation}`),
       revokeProfile: profile => {
         events.push(`revoked:${profile}`)
 
@@ -130,6 +180,30 @@ test('applyProfileDeleteLifecycle resets and tears down every primary-profile ba
     'primary-torn-down',
     'profile-torn-down:primary-profile'
   ])
+})
+
+test('applyProfileDeleteLifecycle fails the revocation token when teardown rejects', async () => {
+  const failed: string[] = []
+
+  await assert.rejects(
+    applyProfileDeleteLifecycle(
+      { action: 'teardown-pool', profile: 'worker' },
+      {
+        destroyRevokedWindows: () => {},
+        failRevocation: mutation => failed.push(mutation),
+        revokeProfile: () => 'delete-token',
+        revokeWindowTargets: () => [],
+        teardownPrimary: async () => {},
+        teardownProfileBackends: async () => {
+          throw new Error('teardown failed')
+        },
+        writeActiveProfile: () => {}
+      }
+    ),
+    /teardown failed/
+  )
+
+  assert.deepEqual(failed, ['delete-token'])
 })
 
 // ---------------------------------------------------------------------------

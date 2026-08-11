@@ -56,6 +56,32 @@ export function profileNameFromCreateRequest(request) {
   return PROFILE_NAME_RE.test(name) && name !== 'default' ? name : null
 }
 
+export async function runProfileMutationPreflight<T, M>(
+  mutation: M | null,
+  operation: (handoff: () => void) => Promise<T>,
+  settle: (mutation: M, succeeded: boolean) => void
+): Promise<T> {
+  let handedOff = false
+
+  try {
+    const result = await operation(() => {
+      handedOff = true
+    })
+
+    if (mutation !== null && !handedOff) {
+      settle(mutation, true)
+    }
+
+    return result
+  } catch (error) {
+    if (mutation !== null && !handedOff) {
+      settle(mutation, false)
+    }
+
+    throw error
+  }
+}
+
 export interface ProfileRename {
   from: string
   to: string
@@ -94,6 +120,7 @@ export function decideProfileRenameAction(rename: ProfileRename, primaryProfile:
 export interface ProfileRenameLifecycleDeps<T> {
   completeRevocation: (mutation: T) => void
   destroyRevokedWindows: (webContentsIds: number[]) => void
+  failRevocation: (mutation: T) => void
   migrateConnectionOverride: (from: string, to: string) => void
   revokeProfile: (profile: string) => T
   revokeWindowTargets: (profile: string) => number[]
@@ -109,19 +136,25 @@ export async function applyProfileRenameLifecycle<T>(
 ): Promise<void> {
   const decision = decideProfileRenameAction(rename, primaryProfile)
   const mutation = deps.revokeProfile(decision.from)
-  const revokedWindowIds = deps.revokeWindowTargets(decision.from)
 
-  deps.destroyRevokedWindows(revokedWindowIds)
-  deps.migrateConnectionOverride(decision.from, decision.to)
+  try {
+    const revokedWindowIds = deps.revokeWindowTargets(decision.from)
 
-  if (decision.action === 'teardown-primary') {
-    deps.writeActiveProfile(decision.to)
-    await Promise.all([deps.teardownPrimary(), deps.teardownProfilePools(decision.from)])
-  } else {
-    await deps.teardownProfilePools(decision.from)
+    deps.destroyRevokedWindows(revokedWindowIds)
+    deps.migrateConnectionOverride(decision.from, decision.to)
+
+    if (decision.action === 'teardown-primary') {
+      deps.writeActiveProfile(decision.to)
+      await Promise.all([deps.teardownPrimary(), deps.teardownProfilePools(decision.from)])
+    } else {
+      await deps.teardownProfilePools(decision.from)
+    }
+
+    deps.completeRevocation(mutation)
+  } catch (error) {
+    deps.failRevocation(mutation)
+    throw error
   }
-
-  deps.completeRevocation(mutation)
 }
 
 export function createProfileRevocationGuard() {
@@ -401,6 +434,7 @@ export function decideProfileDeleteAction(
 
 export interface ProfileDeleteLifecycleDeps<T> {
   destroyRevokedWindows: (webContentsIds: number[]) => void
+  failRevocation: (mutation: T) => void
   revokeProfile: (profile: string) => T
   revokeWindowTargets: (profile: string) => number[]
   teardownPrimary: () => Promise<void>
@@ -417,18 +451,24 @@ export async function applyProfileDeleteLifecycle<T>(
   }
 
   const mutation = deps.revokeProfile(decision.profile)
-  const revokedWindowIds = deps.revokeWindowTargets(decision.profile)
 
-  deps.destroyRevokedWindows(revokedWindowIds)
+  try {
+    const revokedWindowIds = deps.revokeWindowTargets(decision.profile)
 
-  if (decision.action === 'teardown-primary') {
-    deps.writeActiveProfile('default')
-    await Promise.all([deps.teardownPrimary(), deps.teardownProfileBackends(decision.profile)])
-  } else {
-    await deps.teardownProfileBackends(decision.profile)
+    deps.destroyRevokedWindows(revokedWindowIds)
+
+    if (decision.action === 'teardown-primary') {
+      deps.writeActiveProfile('default')
+      await Promise.all([deps.teardownPrimary(), deps.teardownProfileBackends(decision.profile)])
+    } else {
+      await deps.teardownProfileBackends(decision.profile)
+    }
+
+    return { mutation, profile: decision.profile }
+  } catch (error) {
+    deps.failRevocation(mutation)
+    throw error
   }
-
-  return { mutation, profile: decision.profile }
 }
 
 /**

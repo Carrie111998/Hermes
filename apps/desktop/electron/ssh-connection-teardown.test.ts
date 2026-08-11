@@ -100,6 +100,7 @@ it('keeps a deleted profile scope retired through SSH and pool teardown', async 
     { action: 'teardown-pool', profile: 'worker' },
     {
       destroyRevokedWindows: () => events.push('windows-revoked'),
+      failRevocation: () => events.push('revocation-failed'),
       revokeProfile: () => 'mutation',
       revokeWindowTargets: () => [],
       teardownPrimary: async () => {
