@@ -1037,6 +1037,52 @@ class TestOneShotDispatchClaim:
         assert order == ["claim", "run"]  # claim strictly before side effect
 
 
+class TestRunOneJobSecretScopeThroughDelivery:
+    """Issue #83859: the job-owning profile's secret scope must stay active
+    through cron delivery so platform tokens resolve to the owning profile,
+    not whatever the multiplex gateway last loaded into os.environ.
+
+    Regression test: _deliver_result runs after the scope was previously
+    reset (in run_one_job's inner finally), so a Telegram cron delivery read
+    the wrong bot token. The scope must be live when _deliver_result runs
+    and reset only afterwards.
+    """
+
+    def _job(self):
+        return {
+            "id": "scope-job",
+            "name": "scope",
+            "prompt": "hello",
+            "deliver": "origin",
+            "origin": {"platform": "telegram", "chat_id": "123"},
+        }
+
+    def test_scope_active_during_delivery_and_reset_after(self):
+        from agent.secret_scope import current_secret_scope
+
+        observed = {}
+
+        def _fake_deliver_result(job, content, adapters=None, loop=None):
+            observed["scope_during_delivery"] = current_secret_scope() is not None
+            return None
+
+        with patch("cron.scheduler._hermes_home", tmp_path := __import__("tempfile").mkdtemp()), \
+             patch("cron.scheduler.claim_dispatch", return_value=True), \
+             patch("cron.scheduler.create_execution", return_value={"id": "exec-1"}), \
+             patch("cron.scheduler.run_job", return_value=(True, "# out", "ok", None)), \
+             patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
+             patch("cron.scheduler._deliver_result", side_effect=_fake_deliver_result), \
+             patch("cron.scheduler.mark_job_run"), \
+             patch("cron.scheduler.finish_execution"):
+            from cron.scheduler import run_one_job
+            result = run_one_job(self._job())
+            observed["scope_after_return"] = current_secret_scope() is not None
+
+        assert result is True
+        assert observed["scope_during_delivery"] is True
+        assert observed["scope_after_return"] is False
+
+
 class TestBuildJobPromptSilentHint:
     """Verify _build_job_prompt always injects [SILENT] guidance."""
 

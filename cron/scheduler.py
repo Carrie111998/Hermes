@@ -4618,9 +4618,13 @@ def run_one_job(
             # still triggers teardown before propagating.
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
-            raise
-        finally:
+            # The scope is reset here (and again after delivery below) because
+            # this re-raise short-circuits the outer finally. Keeping it reset
+            # on every path matters: delivery reads platform tokens through the
+            # secret scope, so an abandoned scope would leak the wrong profile's
+            # credential into os.environ fallback reads.
             reset_secret_scope(_scope_token)
+            raise
 
         # Everything from here through delivery runs with the agent still live
         # (deferred teardown). Wrap it ALL in a try/finally so that if any step
@@ -4714,6 +4718,13 @@ def run_one_job(
             # their subprocesses/clients (#10200).
             for _deferred_agent in _deferred_agents:
                 _teardown_cron_agent(_deferred_agent, job["id"])
+            # The profile secret scope installed above must stay active through
+            # delivery so `_deliver_result` resolves the job-owning profile's
+            # platform tokens (via gateway _getenv -> secret scope) instead of
+            # falling through to the process-global os.environ, which in a
+            # multiplex gateway holds whichever profile's token was loaded
+            # last (#83859). Reset it here — after delivery — on every path.
+            reset_secret_scope(_scope_token)
 
         # Treat empty final_response as a soft failure so last_status
         # is not "ok" — the agent ran but produced nothing useful.
