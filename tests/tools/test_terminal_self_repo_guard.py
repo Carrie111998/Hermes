@@ -116,3 +116,10 @@ class TestSelfRepoGuardWiring:
         result, env = _run("git checkout main", config, monkeypatch, None)
         assert result.get("status") != "blocked"
         env.execute.assert_called_once()
+
+    def test_explicit_dash_c_targeting_repo_is_blocked(self, repo, monkeypatch, tmp_path):
+        config = _make_env_config(cwd=str(tmp_path))
+        result, env = _run(f"git -C {repo} checkout main", config, monkeypatch, repo)
+        assert result["status"] == "blocked"
+        assert str(repo) in result["error"]
+        env.execute.assert_not_called()
