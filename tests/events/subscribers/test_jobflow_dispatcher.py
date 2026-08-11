@@ -29,8 +29,11 @@ def woken():
     return []
 
 
-def _dispatcher(store, woken, *, mode="on", resolver=None, clock=None):
+def _dispatcher(store, woken, *, mode="on", resolver=None, clock=None, sleep=None):
     kwargs = {"clock": clock} if clock is not None else {}
+    # Real backoff would make every release-failure test sleep; the retry's
+    # timing is asserted on its own below, not paid for in every other test.
+    kwargs["sleep"] = sleep if sleep is not None else (lambda _seconds: None)
     return JobFlowDispatcher(
         bus=None,
         store=store,
@@ -297,6 +300,7 @@ class _ReleaseFails:
     def __init__(self, inner):
         self._inner = inner
         self.lease_seconds = inner.lease_seconds
+        self.release_calls = 0
 
     def get(self, message_key, activity_id):
         return self._inner.get(message_key, activity_id)
@@ -305,7 +309,27 @@ class _ReleaseFails:
         return self._inner.claim(*a, **kw)
 
     def release(self, *a, **kw):
+        self.release_calls += 1
         raise sqlite3.OperationalError("database is locked")
+
+
+class _ReleaseFailsThenRecovers(_ReleaseFails):
+    """The contention case: SQLITE_BUSY for a while, then the writer lets go.
+
+    This is the failure the retry exists for. ``_ReleaseFails`` models the
+    permanent fault; this one models the transient one, which is the far more
+    likely of the two given ``PRAGMA busy_timeout=5000``.
+    """
+
+    def __init__(self, inner, failures):
+        super().__init__(inner)
+        self._failures = failures
+
+    def release(self, *a, **kw):
+        self.release_calls += 1
+        if self.release_calls <= self._failures:
+            raise sqlite3.OperationalError("database is locked")
+        return self._inner.release(*a, **kw)
 
 
 class TestOrphanClaimIsLoud:
@@ -367,3 +391,176 @@ class TestOrphanClaimIsLoud:
             d.handle(_event())
 
         assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text
+
+    def test_the_marker_is_only_reached_after_the_retries(self, store, woken, caplog):
+        """Loudness is the LAST resort, not the first response."""
+        import logging
+
+        ledger = _ReleaseFails(store)
+        d = _dispatcher(ledger, woken, resolver=lambda a: None)
+        with caplog.at_level(logging.ERROR):
+            d.handle(_event())
+
+        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
+        assert JobFlowDispatcher.ORPHAN_MARKER in caplog.text
+
+
+class TestReleaseRetriesBeforeConcedingAnOrphan:
+    """Prevent the orphan, don't just report it.
+
+    P4 made a failed release greppable. That makes an orphan findable after the
+    fact; it does not make one rarer. This is the one dispatcher fault that costs
+    WORK rather than latency — the reconciler skips the message because it looks
+    claimed, and no worker was ever woken, so it stays invisible to BOTH paths
+    for a full lease (7200s) against a reconciler that runs every 6h.
+
+    The plausible cause is transient: SQLITE_BUSY past the store's
+    ``busy_timeout=5000`` under contention. A short bounded backoff usually
+    clears it, which turns most would-be orphans into a few hundred milliseconds
+    of latency — the cheap failure this subsystem is designed around.
+    """
+
+    KEY = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
+    ACTIVITY = "jobflow.tailor.generate"
+
+    def test_a_release_that_recovers_on_the_last_attempt_leaves_no_orphan(
+        self, store, woken, caplog
+    ):
+        """The whole point: contention that clears must not strand the work."""
+        import logging
+
+        failures = JobFlowDispatcher.RELEASE_ATTEMPTS - 1
+        assert failures >= 1, (
+            "a budget of one attempt is not a retry — this test would pass "
+            "vacuously, and so would the orphan-prevention it stands for"
+        )
+        ledger = _ReleaseFailsThenRecovers(store, failures=failures)
+        d = _dispatcher(ledger, woken, resolver=lambda a: None)
+
+        with caplog.at_level(logging.DEBUG):
+            d.handle(_event())
+
+        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
+        assert store.get(self.KEY, self.ACTIVITY) is None, (
+            "the claim was handed back, so the reconciler can resurface the work"
+        )
+        assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text, (
+            "a recovered release is not an orphan; marking it would make the "
+            "marker useless for finding real ones"
+        )
+
+    def test_a_release_that_recovers_immediately_stops_retrying(self, store, woken):
+        """One transient failure costs one retry, not the full budget."""
+        ledger = _ReleaseFailsThenRecovers(store, failures=1)
+        d = _dispatcher(ledger, woken, resolver=lambda a: None)
+
+        d.handle(_event())
+
+        assert ledger.release_calls == 2
+        assert store.get(self.KEY, self.ACTIVITY) is None
+
+    def test_the_retry_budget_is_bounded(self, store, woken):
+        """Retrying must not become a way to stall the subscriber loop.
+
+        Each attempt can already cost a full ``busy_timeout`` inside SQLite, so
+        the bound that matters is the ATTEMPT count; the backoff is deliberately
+        a small fraction of it. Asserted together because a future edit that
+        raises either in isolation changes the worst-case loop stall.
+        """
+        slept = []
+        ledger = _ReleaseFails(store)
+        d = _dispatcher(ledger, woken, resolver=lambda a: None,
+                        sleep=slept.append)
+
+        d._dispatch(_event())
+
+        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
+        assert len(slept) == JobFlowDispatcher.RELEASE_ATTEMPTS - 1, (
+            "one backoff between attempts, and none after the last failure"
+        )
+        assert sum(slept) <= 1.0, (
+            f"worst-case added delay per release is {sum(slept)}s; the retry "
+            "budget must stay small next to the 5s busy_timeout it sits behind"
+        )
+
+    def test_there_is_a_backoff_for_every_retry(self):
+        """An off-by-one here would raise IndexError inside a fault handler."""
+        assert (
+            len(JobFlowDispatcher.RELEASE_BACKOFF_SECONDS)
+            >= JobFlowDispatcher.RELEASE_ATTEMPTS - 1
+        )
+
+    def test_a_budget_longer_than_the_backoff_still_reaches_the_marker(
+        self, store, woken, caplog, monkeypatch
+    ):
+        """The degrade path for the mis-edit the previous test forbids.
+
+        Indexing the backoff blind would raise IndexError from inside the fault
+        handler. That escapes ``_release`` and skips the ORPHAN_MARKER log — so
+        a botched constant bump would silently remove the only trace a stranded
+        claim leaves, which is worse than the mis-edit itself.
+        """
+        import logging
+
+        monkeypatch.setattr(
+            JobFlowDispatcher,
+            "RELEASE_ATTEMPTS",
+            len(JobFlowDispatcher.RELEASE_BACKOFF_SECONDS) + 3,
+        )
+        ledger = _ReleaseFails(store)
+        d = _dispatcher(ledger, woken, resolver=lambda a: None)
+
+        with caplog.at_level(logging.ERROR):
+            d._dispatch(_event())  # directly: an IndexError must be able to escape
+
+        assert ledger.release_calls == JobFlowDispatcher.RELEASE_ATTEMPTS
+        assert JobFlowDispatcher.ORPHAN_MARKER in caplog.text
+
+    def test_the_backoff_grows(self):
+        """Re-issuing at a fixed interval loses the same race repeatedly."""
+        backoff = JobFlowDispatcher.RELEASE_BACKOFF_SECONDS
+        assert all(b > 0 for b in backoff)
+        assert list(backoff) == sorted(backoff)
+
+    def test_exhausted_retries_still_never_stall_the_loop(self, store, woken):
+        """Calls ``_dispatch`` directly ON PURPOSE.
+
+        ``handle()`` swallows exceptions, so routing through it would let this
+        pass even if the retry loop re-raised on exhaustion. The final swallow
+        has to be the dispatcher's own, and the failure has to be able to escape
+        for this assertion to mean anything.
+        """
+        d = _dispatcher(_ReleaseFails(store), woken, resolver=lambda a: None)
+
+        d._dispatch(_event())  # must not raise
+
+        assert woken == []
+
+    def test_a_recovered_release_is_reported_without_the_marker(
+        self, store, woken, caplog
+    ):
+        """Contention that clears is still worth seeing — it precedes the real ones."""
+        import logging
+
+        d = _dispatcher(_ReleaseFailsThenRecovers(store, failures=1), woken,
+                        resolver=lambda a: None)
+        with caplog.at_level(logging.WARNING):
+            d.handle(_event())
+
+        assert "succeeded on attempt 2" in caplog.text
+        assert JobFlowDispatcher.ORPHAN_MARKER not in caplog.text
+
+    def test_the_wake_refusal_path_retries_too(self, store, woken):
+        """Both release call sites go through ``_release``, not just the resolver one.
+
+        The wake-channel refusal is the likelier release in production: it fires
+        under load, which is exactly when the ledger is contended.
+        """
+        ledger = _ReleaseFailsThenRecovers(store, failures=1)
+        d = _dispatcher(ledger, woken)
+        d._waker = lambda job_id, **kw: False  # channel full
+
+        d._dispatch(_event())
+
+        assert ledger.release_calls == 2
+        assert store.get(self.KEY, self.ACTIVITY) is None

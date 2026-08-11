@@ -70,6 +70,31 @@ class JobFlowDispatcher(BaseSubscriber):
     #: only trace it leaves.
     ORPHAN_MARKER = "ORPHAN_CLAIM"
 
+    #: Total ``store.release`` attempts before conceding an orphan.
+    #:
+    #: Deliberately small, because the retry is NOT the expensive part. The
+    #: plausible fault is SQLITE_BUSY, and ``ActivationStore`` already sets
+    #: ``PRAGMA busy_timeout=5000`` — so a contention failure has ALREADY blocked
+    #: up to five seconds inside SQLite before it reaches us. Three attempts is
+    #: therefore ~15s of contention coverage, against a ledger whose every write
+    #: is one indexed row inside ``BEGIN IMMEDIATE`` (sub-millisecond). Anything
+    #: that survives that is not transient contention, and a fourth attempt buys
+    #: another five seconds of stalled event loop for no realistic gain.
+    #:
+    #: This is why k is 3 here and 10 in the WinError-5 precedent: there an
+    #: attempt was a cheap file rename, so a high k cost nothing. Here each
+    #: attempt can cost a full busy_timeout.
+    RELEASE_ATTEMPTS = 3
+
+    #: Backoff before each retry: 0.1s then 0.2s, 0.3s of added delay worst case.
+    #:
+    #: Kept far below the busy_timeout on purpose. It exists for the failures
+    #: that come back IMMEDIATELY rather than after the timeout — notably a WAL
+    #: snapshot conflict on the ``BEGIN IMMEDIATE`` upgrade, which SQLite does not
+    #: retry for us — where a bare re-issue would just lose the same race again.
+    #: Where the timeout did fire, it has already done all the waiting needed.
+    RELEASE_BACKOFF_SECONDS = (0.1, 0.2)
+
     def __init__(
         self,
         bus: Any,
@@ -79,6 +104,7 @@ class JobFlowDispatcher(BaseSubscriber):
         waker: Optional[Callable[..., bool]] = None,
         mode: Optional[str] = None,
         clock: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         if bus is not None:
             super().__init__(bus)
@@ -88,6 +114,7 @@ class JobFlowDispatcher(BaseSubscriber):
         self._resolve_job_id = resolve_job_id
         self._mode = resolve_mode(mode)
         self._clock = clock
+        self._sleep = sleep
         if waker is None:
             from cron.wake_channel import request_wake
 
@@ -181,20 +208,61 @@ class JobFlowDispatcher(BaseSubscriber):
         )
 
     def _release(self, key: str, activity_id: str) -> None:
-        try:
-            self.store.release(key, activity_id)
-        except Exception:
-            # Swallowed to keep the subscriber loop alive — but this is the ONE
-            # dispatcher fault that costs work rather than latency. Everywhere
-            # else a dropped wake just waits for the reconciler; here the claim
-            # committed, so the reconciler SKIPS the message and nothing woke
-            # it. Logged with a stable marker so the stranded work can be found
-            # afterwards, since nothing else will report it.
-            logger.exception(
-                "dispatch: %s %s (%s) — claim committed but could not be "
-                "released; invisible to the reconciler for up to %ss",
-                self.ORPHAN_MARKER,
-                key,
-                activity_id,
-                getattr(self.store, "lease_seconds", "?"),
-            )
+        """Hand the claim back, retrying a bounded number of times.
+
+        A failed release is the one dispatcher fault that costs WORK rather than
+        latency, so it is worth spending a little of the subscriber loop's time
+        to prevent one instead of merely reporting it. The plausible cause —
+        SQLITE_BUSY under contention — is exactly the kind a short backoff
+        clears.
+
+        ``store.release`` DELETEs ``WHERE ... AND state != 'completed'``, so it
+        is idempotent: a retry after a partial or ambiguous failure cannot
+        resurrect completed work or corrupt a row a later claim installed.
+        """
+        for attempt in range(1, self.RELEASE_ATTEMPTS + 1):
+            try:
+                self.store.release(key, activity_id)
+            except Exception:
+                if attempt < self.RELEASE_ATTEMPTS:
+                    logger.warning(
+                        "dispatch: release of %s (%s) failed on attempt %d/%d — retrying",
+                        key, activity_id, attempt, self.RELEASE_ATTEMPTS,
+                        exc_info=True,
+                    )
+                    # Clamped, not indexed blind: raising RELEASE_ATTEMPTS
+                    # without extending the backoff would otherwise raise
+                    # IndexError from inside a fault handler, which escapes
+                    # _release and skips the ORPHAN_MARKER log — losing exactly
+                    # the trace this method exists to leave. A test asserts the
+                    # two stay in step; this makes the failure mode degrade
+                    # rather than detonate.
+                    backoff = self.RELEASE_BACKOFF_SECONDS[
+                        min(attempt - 1, len(self.RELEASE_BACKOFF_SECONDS) - 1)
+                    ]
+                    self._sleep(backoff)
+                    continue
+                # Still swallowed, and swallowed LAST: a release fault must
+                # never stall the subscriber loop, retries included. But the
+                # claim committed, so the reconciler SKIPS the message and
+                # nothing woke it. Logged with a stable marker so the stranded
+                # work can be found afterwards, since nothing else reports it.
+                logger.exception(
+                    "dispatch: %s %s (%s) — claim committed but could not be "
+                    "released after %d attempts; invisible to the reconciler "
+                    "for up to %ss",
+                    self.ORPHAN_MARKER,
+                    key,
+                    activity_id,
+                    self.RELEASE_ATTEMPTS,
+                    getattr(self.store, "lease_seconds", "?"),
+                )
+                return
+            else:
+                if attempt > 1:
+                    logger.warning(
+                        "dispatch: release of %s (%s) succeeded on attempt %d — "
+                        "transient ledger contention, no orphan",
+                        key, activity_id, attempt,
+                    )
+                return
