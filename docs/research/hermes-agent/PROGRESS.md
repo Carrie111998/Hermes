@@ -19,7 +19,7 @@ updated_at: 2026-08-11
 |---|---|---:|---|
 | M0 研究基线与工作协议 | completed | high | 分支、恢复协议、计划、基线、模板和索引已建立 |
 | M1 系统全景架构 | completed | high | 系统上下文、进程模型、一级模块图与顶层数据流均已有源码证据 |
-| M2 Canonical Turn | in progress | high | 已完成 Classic CLI 最小无工具回合；下一单元验证单工具 intent/result hard gate |
+| M2 Canonical Turn | in progress | high | 已完成 Classic CLI 无工具回合与 canonical 工具回合；下一单元比较 CLI/Gateway/Desktop 构造与交付 |
 | M3 Agent Loop | pending | — | — |
 | M4 Prompt/Context/Provider | pending | — | — |
 | M5 Tool Runtime | pending | — | — |
@@ -34,9 +34,9 @@ updated_at: 2026-08-11
 
 ## 当前研究单元
 
-- 沿 `conversation_loop` 的 tool-call branch 追踪一次成功的单工具回合。
-- 验证 assistant intent flush 是 side effect 前的 hard gate，以及 tool result flush 失败如何停止继续推理。
-- 比较 sequential、parallel batch 和 interrupt closure 对 call/result 配对的影响。
+- 比较 Classic CLI、Gateway 和 Desktop/TUI gateway 如何构造或复用 `AIAgent`。
+- 建立入口参数、session ownership、callback、approval 和 final delivery 对照。
+- 验证 `response_previewed` / `response_transformed` 如何防止流式/最终响应重复投递。
 
 ## 已确认事实
 
@@ -59,15 +59,23 @@ updated_at: 2026-08-11
 - 主循环每次 iteration 从 canonical messages 重建 provider projection，再经过 request/execution middleware 和 transport normalization。
 - 正常无工具文本先 append canonical assistant row，再由 `finalize_turn` 清理并持久化。
 - finalizer 可以在持久化之后追加安全 footer 或执行 `transform_llm_output`；最终展示文本与 durable assistant row 因此不保证逐字相同。
+- assistant tool-call intent 是副作用前 hard gate：明确持久化失败时既不投影 interim assistant，也不执行 handler。
+- tool result 是 completion/继续推理前 hard gate：明确持久化失败时停止后续 call/segment、completion UI 和下一次 Provider 请求。
+- 多工具 batch 由 ordered segments 规划；safe 连续区段并行，interactive/unsafe/未知工具与冲突文件路径形成 barrier。
+- concurrent worker 可以乱序完成，但 tool result 按模型 emission order append 和 flush。
+- relay 参数改写先于 plugin/guardrail/checkpoint/dispatch；外层 executor 用 skip flags 保证通用 dispatcher 的 middleware/pre-hook 不重复触发。
+- approval 分布在 plugin escalation、loop guardrail、ACP edit gate 和 handler-native policy，`tool.started` 不代表所有后续审批已通过。
+- `make_tool_result_message()` 同时承担 Provider/DB 字段、untrusted output framing 和 effect disposition。
+- `OPEN-M2-001`：aggregate budget 与 `/steer` 在 per-result flush 后原地改写已标记 tool row，可能造成热运行 Provider context 与 cold-resume SessionDB 内容差异；已核对代码和提交意图，尚待 real DB 复现。
 - 系统架构研究必须把 prompt-cache stability、role alternation 和 narrow-waist tool surface 作为跨模块约束。
 
 ## 待回答问题
 
-1. 一个工具回合在 sequential/parallel batch、interrupt 和 persistence failure 下如何保持 call/result 配对？
-2. tool middleware、approval、guard 和 registry dispatch 的准确先后顺序是什么？
-3. Gateway 与 Desktop 如何利用 `response_previewed`/`response_transformed` 避免重复投递？
-4. route/model 切换后，CLI history 与 Agent prompt/tool snapshot 如何重新建立？
+1. Gateway 与 Desktop 如何利用 `response_previewed`/`response_transformed` 避免重复投递？
+2. 三个入口在 Agent cache/reuse、SessionDB ownership、approval callback 和 profile/cwd 绑定上有什么差异？
+3. route/model 切换后，CLI history 与 Agent prompt/tool snapshot 如何重新建立？
+4. `OPEN-M2-001` 能否由 real SessionDB cold-resume test 稳定复现？
 
 ## 下一步
 
-创建 M2 的单工具调用时序，重点验证 side effect 前后的两个持久化 checkpoint。
+创建 M2 的 CLI/Gateway/Desktop 入口对照；随后运行或补充 `OPEN-M2-001` 的最小冷恢复契约。

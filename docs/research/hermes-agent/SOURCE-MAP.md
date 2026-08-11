@@ -16,7 +16,7 @@ confidence: medium
 | Prompt 构建 | `agent/system_prompt.py`, `agent/prompt_builder.py`, `agent/coding_context.py` | `website/docs/developer-guide/prompt-assembly.md` | `tests/agent/`, `tests/run_agent/` 中 prompt 相关测试 |
 | Context/Cache | `agent/context_engine.py`, `agent/context_compressor.py`, `agent/prompt_caching.py`, `agent/conversation_compression.py` | `website/docs/developer-guide/context-compression-and-caching.md` | `tests/agent/`, `tests/run_agent/` 中 compression/cache 测试 |
 | Provider/Transport | `providers/`, `hermes_cli/runtime_provider.py`, `agent/transports/`, `agent/anthropic_adapter.py` | `website/docs/developer-guide/provider-runtime.md` | `tests/providers/`, `tests/agent/` |
-| Tool Runtime | `model_tools.py`, `tools/registry.py`, `toolsets.py` | `website/docs/developer-guide/tools-runtime.md` | `tests/tools/`, `tests/run_agent/` |
+| Tool Runtime | `agent/tool_executor.py`, `agent/tool_dispatch_helpers.py`, `model_tools.py`, `tools/registry.py`, `tools/tool_result_storage.py`, `toolsets.py` | `website/docs/developer-guide/tools-runtime.md` | `tests/run_agent/test_tool_call_incremental_persistence.py`, `tests/run_agent/test_tool_batch_segmentation.py`, `tests/run_agent/test_tool_call_guardrail_runtime.py`, `tests/tools/` |
 | Terminal/Environment | `tools/terminal_tool.py`, `tools/process_registry.py`, `tools/environments/` | `website/docs/user-guide/features/tools.md` | `tests/tools/`, `tests/integration/` |
 | Programmatic Execution | `tools/code_execution_tool.py` | `website/docs/user-guide/features/code-execution.md` | `tests/tools/` 中 code execution 测试 |
 | Delegation | `tools/delegate_tool.py`, `agent/delegation_context.py` | `website/docs/guides/delegation-patterns.md` | `tests/tools/` 中 delegate 测试 |
@@ -72,3 +72,4 @@ confidence: medium
 - [一级模块依赖](./architecture/module-map.md)：入口编排、Agent façade、核心协作面和扩展边缘。
 - [顶层数据流](./architecture/data-flow.md)：展示/API/持久化视图、tool-call 回路和失败边界。
 - [Classic CLI 最小回合](./flows/canonical-cli-turn.md)：线程外壳、staged input、Provider projection、无工具终止和最终展示投影。
+- [Canonical 工具回合](./flows/canonical-tool-turn.md)：intent/result 双持久化门、ordered batch segments、middleware/approval 与恢复语义。

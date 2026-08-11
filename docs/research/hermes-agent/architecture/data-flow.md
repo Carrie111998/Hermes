@@ -171,8 +171,8 @@ sequenceDiagram
     L->>D: append assistant tool-call row
     Note over L,D: 副作用发生前先持久化意图
     loop each tool call / safe parallel batch
-        L->>M: handle_function_call(name, args, context)
-        M->>M: middleware / hook / approval / guard
+        L->>M: Agent-aware execute(name, args, context)
+        M->>M: relay / middleware / plugin / guard / start
         M->>R: dispatch(name, args)
         R->>H: bound handler
         H-->>R: structured/text result
@@ -187,6 +187,8 @@ sequenceDiagram
 
 1. assistant tool-call row 在执行有副作用的 handler 前进入 canonical store；崩溃后能够知道“模型要求做什么”。
 2. 每个 tool call 必须有匹配 result；中断或异常路径会补齐/闭合序列，避免下一次 provider replay 看到非法 transcript。
+
+完整的双 hard-gate、分段并行、approval 分层和 result canonicalization 见 [Canonical 工具回合](../flows/canonical-tool-turn.md)。需注意 aggregate budget 与 `/steer` 会在 per-result flush 后原地改写 live tool row；其冷恢复一致性暂记为 `OPEN-M2-001`，等待 real SessionDB 定向复现。
 
 ## 最终响应与投递顺序
 
