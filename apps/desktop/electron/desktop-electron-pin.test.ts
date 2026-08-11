@@ -107,3 +107,32 @@ test('lockfile resolves the pinned electron', () => {
     )
   }
 })
+
+test('root allowScripts names the pinned electron', () => {
+  // The fourth place the version is written down, and the one that drifted
+  // unnoticed while the three above were checked: `allowScripts` in the root
+  // package.json is keyed by `name@version`, so a bump leaves it pointing at a
+  // version that is no longer installed. Electron's postinstall is what fetches
+  // the actual binary, so a stale key means the allowlist silently stops
+  // covering it. Nothing in this repo reads the field today — it is consumed
+  // outside the tree — which is precisely why nothing caught the drift.
+  const spec = electronSpec(desktopPkg())
+  const root = JSON.parse(fs.readFileSync(path.join(REPO_ROOT, 'package.json'), 'utf-8'))
+  const allowScripts = (root.allowScripts ?? {}) as Record<string, unknown>
+
+  const electronKeys = Object.keys(allowScripts).filter(
+    (key) => key === 'electron' || key.startsWith('electron@')
+  )
+  if (electronKeys.length === 0) {
+    return
+  } // not pinned there at all is a separate choice, not drift
+
+  for (const key of electronKeys) {
+    assert.equal(
+      key,
+      `electron@${spec}`,
+      `root package.json allowScripts has "${key}", but electron is pinned to ` +
+        `"${spec}"; update the key so the postinstall allowlist still matches.`
+    )
+  }
+})
