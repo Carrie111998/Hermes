@@ -2340,6 +2340,29 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Board-level default notification channel. Task creation paths that
+        # have NO live chat context — `hermes kanban create` run from a
+        # detached terminal/cron script, or `kanban_create` invoked by an
+        # orchestrator agent with no user-facing message behind it — have no
+        # chat_id to auto-subscribe, so those tasks used to get zero
+        # notification coverage and nobody heard about them when they later
+        # hit `blocked` / `review_requested`.
+        #
+        # Keyed by board slug, because boards are the isolation unit here:
+        #
+        #   kanban:
+        #     default_notify:
+        #       myboard:
+        #         platform: slack
+        #         chat_id: C0BP91D49CH
+        #         chat_type: channel   # optional
+        #         thread_id: ""        # optional
+        #         user_id: ""          # optional
+        #
+        # A board with no entry keeps today's behaviour exactly: no
+        # auto-subscribe, no error, one dict lookup of overhead. This never
+        # overrides a live chat context — it is a fallback only.
+        "default_notify": {},
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

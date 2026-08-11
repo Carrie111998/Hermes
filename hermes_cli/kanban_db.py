@@ -9753,6 +9753,111 @@ def worker_log_rotation_config(kanban_cfg: Optional[dict] = None) -> tuple[int, 
     return max_bytes, backup_count
 
 
+def resolve_default_notify(
+    board: Optional[str] = None,
+    kanban_cfg: Optional[Mapping[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Return the configured board-level default notification target, or None.
+
+    Reads ``kanban.default_notify.<board-slug>`` from config.yaml. ``board``
+    defaults to the currently active board (:func:`get_current_board`), which
+    is the board a bare ``hermes kanban create`` / ``kanban_create`` writes to.
+
+    The return value is a kwargs dict for :func:`add_notify_sub` — always with
+    non-empty ``platform`` and ``chat_id``; ``chat_type`` / ``thread_id`` /
+    ``user_id`` are included only when configured. Returns None when the board
+    has no entry, the entry isn't a mapping, or platform/chat_id are missing —
+    i.e. an unconfigured board costs one dict lookup and behaves exactly as it
+    did before this feature existed.
+
+    Honours the same ``kanban.auto_subscribe_on_create`` kill switch as the
+    live-session auto-subscribe path: "auto-subscribe on create: off" means
+    off for every create-time subscription source, not just the chat one.
+
+    Never raises: a malformed config must not fail the task creation it is
+    merely decorating.
+    """
+    try:
+        if kanban_cfg is None:
+            from hermes_cli.config import load_config
+
+            kanban_cfg = (load_config() or {}).get("kanban") or {}
+        if not (kanban_cfg or {}).get("auto_subscribe_on_create", True):
+            return None
+        defaults = (kanban_cfg or {}).get("default_notify") or {}
+        if not isinstance(defaults, Mapping) or not defaults:
+            return None
+        slug = _normalize_board_slug(board) or get_current_board()
+        entry = defaults.get(slug)
+        if not isinstance(entry, Mapping):
+            return None
+        platform = str(entry.get("platform") or "").strip()
+        chat_id = str(entry.get("chat_id") or "").strip()
+        if not platform or not chat_id:
+            return None
+        resolved: dict[str, Any] = {"platform": platform, "chat_id": chat_id}
+        for field in ("chat_type", "thread_id", "user_id"):
+            value = str(entry.get(field) or "").strip()
+            if value:
+                resolved[field] = value
+        return resolved
+    except Exception:
+        _log.debug("resolve_default_notify failed for board=%r", board, exc_info=True)
+        return None
+
+
+def apply_default_notify_sub(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+    notifier_profile: Optional[str] = None,
+    kanban_cfg: Optional[Mapping[str, Any]] = None,
+) -> bool:
+    """Subscribe the board's default notification channel to ``task_id``.
+
+    Returns True when a default is configured and :func:`add_notify_sub` was
+    called, False when the board has no default (or the write failed). This is
+    the no-live-chat-context fallback shared by ``hermes kanban create`` and
+    ``kanban_create``; it is never used to override a real chat context.
+
+    ``add_notify_sub`` is ``INSERT OR IGNORE`` on
+    (task, platform, chat, thread), so calling this after an explicit
+    subscription to the same target is a no-op rather than a duplicate row.
+
+    Best-effort: notification bookkeeping must never fail a task creation.
+    """
+    target = resolve_default_notify(board, kanban_cfg=kanban_cfg)
+    if not target:
+        return False
+    thread_id = target.get("thread_id")
+    chat_type = target.get("chat_type")
+    delivery_metadata: dict[str, Any] = {}
+    if thread_id:
+        delivery_metadata["thread_id"] = thread_id
+    if chat_type:
+        delivery_metadata["chat_type"] = chat_type
+    try:
+        add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=target["platform"],
+            chat_id=target["chat_id"],
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_id=target.get("user_id"),
+            notifier_profile=notifier_profile,
+            delivery_metadata=delivery_metadata or None,
+        )
+        return True
+    except Exception:
+        _log.warning(
+            "apply_default_notify_sub failed for task=%s board=%r",
+            task_id, board, exc_info=True,
+        )
+        return False
+
+
 def _rotated_log_path(log_path: Path, generation: int) -> Path:
     return log_path.with_suffix(log_path.suffix + f".{generation}")
 
