@@ -1269,7 +1269,16 @@ def _auth_store_lock(
     refresh paths follow this order; violating it risks deadlock
     against a concurrent import on the shared store.
     """
-    auth_path = target_path if target_path is not None else _auth_file_path()
+    active_auth_path = _auth_file_path()
+    auth_path = target_path if target_path is not None else active_auth_path
+    if (
+        target_path is not None
+        and not _same_path(auth_path, active_auth_path)
+        and not profile_global_auth_inheritance_enabled()
+    ):
+        raise AuthError(
+            "Global auth persistence is disabled by auth.inherit_global"
+        )
     lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
     with _file_lock(
         lock_path,
@@ -6280,6 +6289,15 @@ def persist_nous_credentials(
     with _auth_store_lock():
         auth_store = _load_auth_store()
         _save_provider_state(auth_store, "nous", state)
+        suppressed = auth_store.get("suppressed_sources")
+        if isinstance(suppressed, dict):
+            sources = suppressed.get("nous")
+            if isinstance(sources, list) and "device_code" in sources:
+                remaining = [source for source in sources if source != "device_code"]
+                if remaining:
+                    suppressed["nous"] = remaining
+                else:
+                    suppressed.pop("nous", None)
         _save_auth_store(auth_store)
 
     # Mirror to the shared store so a new profile can one-tap import
@@ -6288,7 +6306,7 @@ def persist_nous_credentials(
     # auth.json is still the source of truth).
     _write_shared_nous_state(state)
 
-    pool = load_pool("nous")
+    pool = load_pool("nous", _allow_local_nous_sync=True)
     return next(
         (e for e in pool.entries() if e.source == NOUS_DEVICE_CODE_SOURCE),
         None,

@@ -3112,7 +3112,11 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+def load_pool(
+    provider: str,
+    *,
+    _allow_local_nous_sync: bool = False,
+) -> CredentialPool:
     provider = (provider or "").strip().lower()
     raw_entries = read_credential_pool(provider)
     disk_ids = {
@@ -3131,6 +3135,28 @@ def load_pool(provider: str) -> CredentialPool:
         # without local auth state. In particular, inspection commands must
         # not seed ambient env/singleton credentials into auth.json. Explicit
         # profile-local auth operations remain permitted.
+        if not (_allow_local_nous_sync and provider == "nous"):
+            return CredentialPool(provider, entries)
+        singleton_changed, singleton_sources = _seed_from_singletons(
+            provider,
+            entries,
+        )
+        changed = raw_needs_sanitization or singleton_changed
+        changed |= _prune_stale_seeded_entries(entries, singleton_sources)
+        if changed:
+            new_ids = {entry.id for entry in entries}
+            write_credential_pool(
+                provider,
+                [
+                    entry.to_dict()
+                    for entry in sorted(entries, key=lambda item: item.priority)
+                ],
+                removed_ids={
+                    str(entry_id)
+                    for entry_id in disk_ids - new_ids
+                    if entry_id
+                },
+            )
         return CredentialPool(provider, entries)
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)

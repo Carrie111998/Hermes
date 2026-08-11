@@ -316,6 +316,28 @@ def test_inheritance_disabled_refuses_explicit_global_store_write(profile_env):
     assert not (profile_env["profile"] / "auth.json").exists()
 
 
+def test_inheritance_disabled_denies_global_persist_before_lock(profile_env):
+    import hermes_cli.auth as auth
+
+    global_path = profile_env["global"] / "auth.json"
+    original = _make_auth_store(providers={
+        "nous": {"access_token": "synthetic-global-original"},
+    })
+    _write(global_path, original)
+    _disable_global_auth_inheritance(profile_env["profile"])
+
+    with pytest.raises(auth.AuthError, match="Global auth persistence is disabled"):
+        auth._persist_provider_state_to_store(
+            "nous",
+            {"access_token": "synthetic-global-replacement"},
+            global_path,
+        )
+
+    assert json.loads(global_path.read_text()) == original
+    assert not global_path.with_suffix(".lock").exists()
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
 def test_inheritance_disabled_skips_ambient_pool_seeding(profile_env, monkeypatch):
     from agent.credential_pool import load_pool
 

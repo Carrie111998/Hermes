@@ -6,6 +6,7 @@ import base64
 import json
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -165,6 +166,110 @@ def test_auth_add_nous_oauth_persists_pool_entry(tmp_path, monkeypatch):
     assert singleton["agent_key"] == token
     assert singleton["portal_base_url"] == "https://portal.example.com"
     assert singleton["inference_base_url"] == "https://inference.example.com/v1"
+
+
+def test_isolated_profile_nous_public_lifecycle_stays_local(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    global_root = tmp_path / ".hermes"
+    profile = global_root / "profiles" / "argus"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    (profile / "config.yaml").write_text(
+        "auth:\n  inherit_global: false\n",
+        encoding="utf-8",
+    )
+    global_store = {
+        "version": 1,
+        "providers": {"nous": {"access_token": "synthetic-global"}},
+    }
+    (global_root / "auth.json").write_text(
+        json.dumps(global_store, indent=2),
+        encoding="utf-8",
+    )
+
+    first_token = _jwt_with_email("first-nous@example.com")
+    second_token = _jwt_with_email("second-nous@example.com")
+    future = datetime.fromtimestamp(time.time() + 3600, tz=timezone.utc).isoformat()
+    logins = iter([
+        {
+            "access_token": first_token,
+            "refresh_token": "synthetic-local-refresh-1",
+            "agent_key": first_token,
+            "expires_at": future,
+            "agent_key_expires_at": future,
+            "portal_base_url": "https://portal.example.com",
+            "inference_base_url": "https://inference.example.com/v1",
+        },
+        {
+            "access_token": second_token,
+            "refresh_token": "synthetic-local-refresh-2",
+            "agent_key": second_token,
+            "expires_at": future,
+            "agent_key_expires_at": future,
+            "portal_base_url": "https://portal.example.com",
+            "inference_base_url": "https://inference.example.com/v1",
+        },
+    ])
+    monkeypatch.setattr(
+        "hermes_cli.auth._nous_device_code_login",
+        lambda **kwargs: next(logins),
+    )
+
+    from hermes_cli.auth_commands import (
+        auth_add_command,
+        auth_list_command,
+        auth_remove_command,
+    )
+
+    class _AddArgs:
+        provider = "nous"
+        auth_type = "oauth"
+        api_key = None
+        label = "local-nous"
+        portal_url = None
+        inference_url = None
+        client_id = None
+        scope = None
+        no_browser = False
+        timeout = None
+        insecure = False
+        ca_bundle = None
+
+    class _ListArgs:
+        provider = "nous"
+
+    class _RemoveArgs:
+        provider = "nous"
+        target = "1"
+
+    auth_add_command(_AddArgs())
+    capsys.readouterr()
+    auth_list_command(_ListArgs())
+    assert "local-nous" in capsys.readouterr().out
+
+    payload = json.loads((profile / "auth.json").read_text())
+    assert payload["providers"]["nous"]["access_token"] == first_token
+    assert len(payload["credential_pool"]["nous"]) == 1
+    assert payload["credential_pool"]["nous"][0]["access_token"] == first_token
+
+    auth_add_command(_AddArgs())
+    payload = json.loads((profile / "auth.json").read_text())
+    assert payload["providers"]["nous"]["access_token"] == second_token
+    assert len(payload["credential_pool"]["nous"]) == 1
+    assert payload["credential_pool"]["nous"][0]["access_token"] == second_token
+
+    auth_remove_command(_RemoveArgs())
+    payload = json.loads((profile / "auth.json").read_text())
+    assert "nous" not in payload.get("providers", {})
+    assert payload["credential_pool"]["nous"] == []
+    capsys.readouterr()
+    auth_list_command(_ListArgs())
+    assert capsys.readouterr().out == ""
+    assert json.loads((global_root / "auth.json").read_text()) == global_store
 
 
 def test_auth_add_nous_oauth_honors_custom_label(tmp_path, monkeypatch):
