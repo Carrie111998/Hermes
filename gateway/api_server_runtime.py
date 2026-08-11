@@ -323,6 +323,40 @@ def _pin_run_model(agent: Any, requested_model: Any) -> str:
 def _activity_arguments(tool_name: str, args: Any) -> dict[str, str]:
     if not isinstance(args, dict):
         return {}
+    if tool_name == "image_analyze":
+        sources = [source for source in _image_analysis_sources(args) if source]
+        if not sources:
+            return {}
+        source_kinds: set[str] = set()
+        output_refs: list[str] = []
+        for source in sources:
+            parsed = urlparse(source)
+            if (
+                parsed.scheme == ""
+                and source.startswith("output_")
+                and len(source) <= 256
+                and all(character.isalnum() or character in {"_", "-"} for character in source)
+            ):
+                source_kinds.add("run_output")
+                output_refs.append(source)
+            elif parsed.scheme.lower() in {"http", "https"}:
+                source_kinds.add("remote_url")
+            else:
+                # Local attachment paths are private capabilities. Report only
+                # their type; never project the path into Runtime activity or
+                # the browser event stream.
+                source_kinds.add("run_attachment")
+        projected = {
+            "source_count": str(len(sources)),
+            "source_kind": (
+                next(iter(source_kinds))
+                if len(source_kinds) == 1
+                else "mixed"
+            ),
+        }
+        if len(output_refs) == 1 and len(sources) == 1:
+            projected["output_ref"] = output_refs[0]
+        return projected
     allowed = {
         "skill_view": ("name", "file_path"),
         "tool_search": ("query",),

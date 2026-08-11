@@ -683,6 +683,24 @@ def test_runtime_tool_middleware_fails_closed_for_process_global_tools():
         session.loop.close()
 
 
+def test_image_analyze_activity_arguments_expose_typed_refs_without_private_paths():
+    assert runtime_module._activity_arguments("image_analyze", {
+        "image_url": "output_board_123",
+        "question": "check the layout",
+    }) == {
+        "source_count": "1",
+        "source_kind": "run_output",
+        "output_ref": "output_board_123",
+    }
+    assert runtime_module._activity_arguments("image_analyze", {
+        "image_paths": ["/private/runtime/output.png", "https://example.com/reference.png"],
+        "question": "compare",
+    }) == {
+        "source_count": "2",
+        "source_kind": "mixed",
+    }
+
+
 @pytest.mark.asyncio
 async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_content():
     captured = {}
