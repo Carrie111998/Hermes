@@ -880,7 +880,11 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
 
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+            ["git", "-c", "core.hooksPath=/dev/null", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
         )
 
     git("init", "-q")
@@ -930,7 +934,11 @@ def test_install_method_marker_not_autostashed_by_update(tmp_path):
 
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+            ["git", "-c", "core.hooksPath=/dev/null", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
         )
 
     git("init", "-q")

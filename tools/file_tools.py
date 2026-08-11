@@ -7,6 +7,7 @@ import logging
 import os
 import posixpath
 import sys
+import tempfile
 import threading
 from pathlib import Path, PurePosixPath
 
@@ -604,11 +605,14 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
-    for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+    temp_root = os.path.realpath(tempfile.gettempdir())
+    in_temp_root = resolved == temp_root or resolved.startswith(temp_root + os.sep)
+    if not in_temp_root:
+        for prefix in _SENSITIVE_PATH_PREFIXES:
+            if resolved.startswith(prefix) or normalized.startswith(prefix):
+                return _err
+        if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
-        return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
