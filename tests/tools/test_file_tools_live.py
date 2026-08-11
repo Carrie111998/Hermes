@@ -208,6 +208,19 @@ class TestSearch:
             _assert_clean(m.content)
             _assert_clean(m.path)
 
+    def test_grep_fallback_searches_relative_dot_root(self, ops, tmp_path, monkeypatch):
+        """The grep fallback must not exclude ``.`` as a hidden directory."""
+        needle = "relative-dot-root-regression"
+        (tmp_path / "needle.txt").write_text(f"{needle}\n")
+        monkeypatch.setattr(ops, "_has_command", lambda command: command == "grep")
+
+        result = ops.search(needle, path=".", target="content")
+
+        assert result.error is None
+        assert result.total_count == 1
+        assert result.matches[0].path == str(tmp_path / "needle.txt")
+        assert result.matches[0].content == needle
+
 
 # ── _expand_path ─────────────────────────────────────────────────────────
 
