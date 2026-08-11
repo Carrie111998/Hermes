@@ -7,7 +7,9 @@
 // fanless MacBooks) and competing with local inference on shared iGPUs.
 // See https://github.com/NousResearch/hermes-agent/issues/50107.
 //
-// These windows mirror the TUI's timing module (ui-tui/src/config/timing.ts).
+// These windows adopt the batch values suggested in issue #50107 (80 ms
+// streaming / 200 ms idle) rather than the TUI's timing module, which uses
+// 16 ms for both (TUI flushes per-token, not per-batch).
 // 80 ms ≈ 12 fps — visually smooth for reading streamed text while cutting
 // the flush (and thus re-render) rate ~5x. Idle heartbeats (nothing actively
 // streaming) batch harder still: the view is static, only the status line

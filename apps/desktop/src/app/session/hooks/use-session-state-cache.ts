@@ -260,9 +260,9 @@ export function useSessionStateCache({
       // through the view. Batch them at a human-visible cadence instead of one
       // flush per animation frame: a 60 fps flush repaints the whole transcript
       // on every token chunk (see #50107). Critical transitions stay
-      // synchronous above; timers are unthrottled here because the app
-      // disables background timer throttling (`backgroundThrottling: false` +
-      // `disable-background-timer-throttling` in electron/main.ts).
+      // synchronous above; timer throttling is scoped to streaming via
+      // createStreamThrottle() (electron/stream-throttle.ts) — chat windows are
+      // unthrottled only while a turn is in flight, not process-wide.
       const batchMs = state.busy ? STREAM_BATCH_MS : STREAM_IDLE_BATCH_MS
 
       viewSyncTimerRef.current = window.setTimeout(() => {
