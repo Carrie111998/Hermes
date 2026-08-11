@@ -93,10 +93,13 @@ from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missi
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
+    CandidateEligibilityError,
     OutcomeValidationError,
+    PassedTest,
     ProductOutcomeError,
     TerminalOutcome,
     TerminalRunRecord,
+    candidate_eligibility,
     latest_review_authority,
     latest_test_authority,
     validate_terminal_outcome,
@@ -13112,6 +13115,7 @@ def _build_verified_merge_candidate(
     candidate_verify_fn: Optional[Callable[[Path], bool]] = None,
     *,
     expected_source_sha: Optional[str] = None,
+    allow_empty_contribution: bool = False,
 ) -> IntegrationCandidate:
     repo_root = repo_root.resolve()
     target_worktree = _checked_out_branch_worktree(repo_root, target_branch)
@@ -13135,6 +13139,16 @@ def _build_verified_merge_candidate(
     if pre_result.returncode != 0 or not pre_sha:
         raise IntegrationCandidateError(f"could not resolve {target_branch}")
 
+    source_ancestor = _integration_git(
+        repo_root,
+        ["merge-base", "--is-ancestor", approved_source_sha, pre_sha],
+    )
+    empty_contribution = source_ancestor.returncode == 0
+    if empty_contribution and not allow_empty_contribution:
+        raise IntegrationCandidateError("empty contribution")
+    if source_ancestor.returncode not in {0, 1}:
+        raise IntegrationCandidateError("could not verify candidate contribution")
+
     nonce = secrets.token_hex(6)
     scratch = repo_root / ".worktrees" / f"integration-{nonce}"
     scratch.parent.mkdir(parents=True, exist_ok=True)
@@ -13144,15 +13158,16 @@ def _build_verified_merge_candidate(
     if added.returncode != 0:
         raise IntegrationCandidateError("could not create integration worktree")
 
-    merged = _integration_git(
-        scratch,
-        ["merge", "--no-ff", approved_source_sha, "-m", message],
-        timeout=900,
-    )
-    if merged.returncode != 0:
-        _integration_git(scratch, ["merge", "--abort"])
-        _remove_clean_integration_worktree(repo_root, scratch)
-        raise IntegrationCandidateError("merge conflict")
+    if not empty_contribution:
+        merged = _integration_git(
+            scratch,
+            ["merge", "--no-ff", approved_source_sha, "-m", message],
+            timeout=900,
+        )
+        if merged.returncode != 0:
+            _integration_git(scratch, ["merge", "--abort"])
+            _remove_clean_integration_worktree(repo_root, scratch)
+            raise IntegrationCandidateError("merge conflict")
 
     try:
         _provision_node_dependencies(_primary_checkout_root(repo_root), scratch)
@@ -13625,14 +13640,22 @@ def integrate_story_to_epic(
     # any Git ref only for the ordinary reconcile fast path. Explicit source,
     # candidate, or ownership controls must retain their verification semantics
     # and must never be hidden by an older integration row.
-    reviewed_candidate: Optional[tuple[str, str]] = None
+    authority_records = _terminal_run_records(conn, story_id)
+    authority_phase_present = any(
+        record.phase in {"test", "review"} for record in authority_records
+    )
+    reviewed_candidate = latest_review_authority(authority_records)
+    passed_test = (
+        latest_test_authority(authority_records, reviewed_candidate.source_sha)
+        if reviewed_candidate is not None
+        else None
+    )
     ordinary_reconcile = (
         candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
         and expected_source_sha is None
         and before_apply_fn is None
     )
     if ordinary_reconcile:
-        reviewed_candidate = _latest_approved_review_candidate(conn, story_id)
         if reviewed_candidate is not None:
             already_integrated = conn.execute(
                 """
@@ -13662,6 +13685,13 @@ def integrate_story_to_epic(
             ).fetchone()
         if already_integrated is not None:
             return "already_integrated"
+    if authority_phase_present and (
+        reviewed_candidate is None or passed_test is None
+    ):
+        # A product Test/Review attempt exists, so legacy ancestor replay is
+        # not allowed to create a new integration fact without current,
+        # dispatcher-pinned authority from both phases.
+        return None
 
     try:
         board_default = str(meta.get("default_workdir") or "").strip()
@@ -13677,6 +13707,23 @@ def integrate_story_to_epic(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return None
+        if reviewed_candidate is not None:
+            if reviewed_candidate.branch != story_branch:
+                return None
+            if (
+                expected_source_sha is not None
+                and expected_source_sha != reviewed_candidate.source_sha
+            ):
+                return None
+            assert passed_test is not None
+            try:
+                candidate_eligibility(
+                    repo_root, reviewed_candidate, passed_test
+                )
+            except CandidateEligibilityError:
+                # No candidate intent/fact has been written yet.  Leave the
+                # existing integration state untouched for a later replay.
+                return "verify_failed"
         if ordinary_reconcile and reviewed_candidate is None:
             current_source_sha = _git_ref_sha(repo_root, story_branch)
             if current_source_sha and conn.execute(
@@ -13713,6 +13760,12 @@ def integrate_story_to_epic(
             and candidate_verify_fn is _RECONCILE_INTEGRATION_VERIFY_UNSET
             and expected_source_sha is None
         ):
+            if reviewed_candidate is not None:
+                # A reviewed source that is already an ancestor may have been
+                # applied by an earlier crash, but without the exact durable
+                # composite fact the ancestor relation alone is not replay
+                # authority.
+                return "verify_failed"
             _record_story_integration(
                 conn, story_id, epic_id, epic_branch,
                 {
@@ -13730,6 +13783,24 @@ def integrate_story_to_epic(
             or expected_source_sha is not None
             or reviewed_candidate is not None
         ):
+            reviewed_source_sha = (
+                reviewed_candidate.source_sha
+                if reviewed_candidate is not None
+                else expected_source_sha
+            )
+            existing_integration = (
+                reviewed_source_sha is not None
+                and conn.execute(
+                    """
+                    SELECT 1
+                      FROM epic_story_integrations
+                     WHERE epic_id=? AND story_id=? AND source_sha=?
+                     LIMIT 1
+                    """,
+                    (epic_id, story_id, reviewed_source_sha),
+                ).fetchone()
+                is not None
+            )
             candidate_source_branch = story_branch
             candidate_expected_source_sha = expected_source_sha
             reviewed_source_ref: Optional[str] = None
@@ -13768,6 +13839,7 @@ def integrate_story_to_epic(
                         f"integrate story {story_id}",
                         effective_verify_fn,
                         expected_source_sha=candidate_expected_source_sha,
+                        allow_empty_contribution=existing_integration,
                     )
                 finally:
                     if reviewed_source_ref is not None:
@@ -13976,6 +14048,31 @@ def _merge_standalone_story_to_main(
             or not _git_branch_exists(repo_root, story_branch)
         ):
             return "not_ready"
+        authority_records = _terminal_run_records(conn, story_id)
+        authority_phase_present = any(
+            record.phase in {"test", "review"} for record in authority_records
+        )
+        reviewed_candidate = latest_review_authority(authority_records)
+        passed_test = (
+            latest_test_authority(authority_records, reviewed_candidate.source_sha)
+            if reviewed_candidate is not None
+            else None
+        )
+        if authority_phase_present:
+            if (
+                reviewed_candidate is None
+                or passed_test is None
+                or reviewed_candidate.branch != story_branch
+                or (
+                    expected_source_sha is not None
+                    and expected_source_sha != reviewed_candidate.source_sha
+                )
+            ):
+                return "verify_failed"
+            try:
+                candidate_eligibility(repo_root, reviewed_candidate, passed_test)
+            except CandidateEligibilityError:
+                return "verify_failed"
     except Exception:
         return "not_ready"
 
@@ -13988,6 +14085,8 @@ def _merge_standalone_story_to_main(
         )
         already_merged = ancestor_result.returncode == 0
         if already_merged and expected_source_sha is None:
+            if reviewed_candidate is not None:
+                return "verify_failed"
             with write_txn(conn):
                 _append_event(
                     conn,
@@ -14015,6 +14114,7 @@ def _merge_standalone_story_to_main(
             f"merge story {story_id}",
             effective_verify_fn,
             expected_source_sha=expected_source_sha,
+            allow_empty_contribution=already_merged,
         )
         if before_apply_fn is not None and not before_apply_fn():
             return "ownership_conflict"
@@ -14430,6 +14530,22 @@ def release_product_task(
     evidence: dict[str, Any] = _release_run_evidence(
         conn, task_id, branch, source_sha
     )
+    if reviewed_candidate is not None:
+        authority_records = _terminal_run_records(conn, task_id)
+        passed_test = latest_test_authority(
+            authority_records, reviewed_candidate.source_sha
+        )
+        if passed_test is None:
+            raise ReleaseEvidenceError(task_id, ["tester_pass"])
+        try:
+            candidate_eligibility(repo_root, reviewed_candidate, passed_test)
+        except CandidateEligibilityError as exc:
+            missing = (
+                "reviewed_candidate"
+                if exc.code == "stale_review"
+                else exc.code
+            )
+            raise ReleaseEvidenceError(task_id, [missing]) from exc
     evidence.update(source_branch=branch, source_sha=source_sha)
     evidence.update(_release_history_evidence(conn, task_id))
     note = str(measurement_note or "").strip()

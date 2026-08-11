@@ -4,17 +4,23 @@ from __future__ import annotations
 
 import copy
 import json
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_product_outcomes as outcomes
 from hermes_cli.kanban_product_outcomes import (
+    ApprovedCandidate,
+    CandidateEligibilityError,
     OutcomeValidationError,
+    PassedTest,
     ProductOutcomeError,
     TerminalOutcome,
     TerminalRunRecord,
+    candidate_eligibility,
     latest_review_authority,
     latest_test_authority,
     validate_terminal_outcome,
@@ -535,3 +541,114 @@ def test_review_authority_rejects_same_provider_writer_and_reviewer():
 
 def test_test_authority_requires_exact_requested_source_sha():
     assert latest_test_authority([_test_record(1, head_sha=_SHA_C)], _SHA_B) is None
+
+
+def test_candidate_eligibility_rejects_test_branch_mismatch(tmp_path):
+    approved = ApprovedCandidate(
+        run_id=1,
+        branch="story/reviewed",
+        base_sha=_SHA_A,
+        source_sha=_SHA_B,
+        reviewer_provider="codex",
+        writer_provider="claude-code",
+    )
+    passed = PassedTest(
+        run_id=2,
+        branch="story/other",
+        source_sha=_SHA_B,
+        tester_provider="hermes",
+        writer_provider="claude-code",
+    )
+    with pytest.raises(CandidateEligibilityError) as raised:
+        candidate_eligibility(tmp_path, approved, passed)
+    assert raised.value.code == "stale_review"
+
+
+def test_candidate_eligibility_rejects_empty_review_diff(tmp_path):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, capture_output=True, text=True)
+    (repo / "README.md").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, text=True)
+    base_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
+    ).stdout.strip()
+    approved = ApprovedCandidate(
+        run_id=1,
+        branch="story/example",
+        base_sha=base_sha,
+        source_sha=base_sha,
+        reviewer_provider="codex",
+        writer_provider="claude-code",
+    )
+    passed = PassedTest(
+        run_id=2,
+        branch="story/example",
+        source_sha=base_sha,
+        tester_provider="hermes",
+        writer_provider="claude-code",
+    )
+    with pytest.raises(CandidateEligibilityError) as raised:
+        candidate_eligibility(repo, approved, passed)
+    assert raised.value.code == "empty_contribution"
+
+
+def test_candidate_eligibility_reports_git_diff_exit_failures_as_io_error(
+    tmp_path, monkeypatch
+):
+    approved = ApprovedCandidate(
+        run_id=1,
+        branch="story/example",
+        base_sha=_SHA_A,
+        source_sha=_SHA_B,
+        reviewer_provider="codex",
+        writer_provider="claude-code",
+    )
+    passed = PassedTest(
+        run_id=2,
+        branch="story/example",
+        source_sha=_SHA_B,
+        tester_provider="hermes",
+        writer_provider="claude-code",
+    )
+
+    monkeypatch.setattr(
+        outcomes.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"returncode": 2})(),
+    )
+
+    with pytest.raises(CandidateEligibilityError) as raised:
+        candidate_eligibility(tmp_path, approved, passed)
+    assert raised.value.code == "io_error"
+
+
+def test_candidate_eligibility_reports_git_diff_oserror_as_io_error(
+    tmp_path, monkeypatch
+):
+    approved = ApprovedCandidate(
+        run_id=1,
+        branch="story/example",
+        base_sha=_SHA_A,
+        source_sha=_SHA_B,
+        reviewer_provider="codex",
+        writer_provider="claude-code",
+    )
+    passed = PassedTest(
+        run_id=2,
+        branch="story/example",
+        source_sha=_SHA_B,
+        tester_provider="hermes",
+        writer_provider="claude-code",
+    )
+
+    def raise_os_error(*args, **kwargs):
+        raise OSError("git unavailable")
+
+    monkeypatch.setattr(outcomes.subprocess, "run", raise_os_error)
+
+    with pytest.raises(CandidateEligibilityError) as raised:
+        candidate_eligibility(tmp_path, approved, passed)
+    assert raised.value.code == "io_error"

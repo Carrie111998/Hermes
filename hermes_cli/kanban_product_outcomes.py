@@ -9,8 +9,10 @@ parsed as lifecycle authority.
 from __future__ import annotations
 
 import re
+import subprocess
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, cast
 
 
@@ -123,6 +125,20 @@ class PassedTest:
     writer_provider: str
 
 
+@dataclass(frozen=True)
+class CandidateEligibility:
+    source_sha: str
+    non_empty: bool
+
+
+class CandidateEligibilityError(ValueError):
+    """A candidate cannot be used as a new integration contribution."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -225,6 +241,42 @@ def latest_test_authority(
         if latest is not None
         else None
     )
+
+
+def candidate_eligibility(
+    repo: Path,
+    approved: ApprovedCandidate,
+    passed: PassedTest,
+) -> CandidateEligibility:
+    """Require matching authority and a non-empty reviewed contribution."""
+
+    if (
+        approved.branch != passed.branch
+        or approved.source_sha != passed.source_sha
+    ):
+        raise CandidateEligibilityError("stale_review")
+    if _full_sha(approved.base_sha) is None or _full_sha(approved.source_sha) is None:
+        raise CandidateEligibilityError("stale_review")
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "diff",
+                "--quiet",
+                approved.base_sha,
+                approved.source_sha,
+            ],
+            check=False,
+        )
+    except OSError as exc:
+        raise CandidateEligibilityError("io_error") from exc
+    if result.returncode == 0:
+        raise CandidateEligibilityError("empty_contribution")
+    if result.returncode != 1:
+        raise CandidateEligibilityError("io_error")
+    return CandidateEligibility(source_sha=approved.source_sha, non_empty=True)
 
 
 def _has_serialized_parameter_marker(summary: str | None, result: str | None) -> bool:
@@ -388,11 +440,14 @@ def validate_terminal_outcome(
 
 __all__ = [
     "ApprovedCandidate",
+    "CandidateEligibility",
+    "CandidateEligibilityError",
     "OutcomeValidationError",
     "PassedTest",
     "ProductOutcomeError",
     "TerminalOutcome",
     "TerminalRunRecord",
+    "candidate_eligibility",
     "latest_review_authority",
     "latest_test_authority",
     "validate_terminal_outcome",

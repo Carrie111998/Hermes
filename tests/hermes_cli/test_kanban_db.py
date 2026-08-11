@@ -9823,6 +9823,121 @@ def test_integrate_story_to_epic_idempotent_second_call_is_noop(kanban_home, tmp
     assert calls == []
 
 
+def test_integrate_story_to_epic_rejects_empty_contribution_before_fact(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-empty-contribution"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+    _git_output(repo, "branch", "-f", story_branch, epic_branch)
+    empty_sha = _git_output(repo, "rev-parse", story_branch)
+    assert empty_sha != story_sha
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, empty_sha)
+        before = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+        result = kb.integrate_story_to_epic(conn, story, board=board)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+        events = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='story_integrated_to_epic'",
+            (story,),
+        ).fetchone()[0]
+
+    assert result == "verify_failed"
+    assert after == before == 0
+    assert events == 0
+    assert _git_output(repo, "rev-parse", epic_branch) == _git_output(
+        repo, "rev-parse", story_branch
+    )
+
+
+def test_integrate_story_to_epic_rejects_ancestor_without_existing_fact(
+    kanban_home, tmp_path,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-ancestor-without-fact"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, story_sha)
+
+    # The reviewed contribution is now already in the target branch, but no
+    # durable composite fact records that handoff.  An ancestor check alone is
+    # not enough to manufacture that fact during a later reconcile pass.
+    _git_output(repo, "branch", "-f", epic_branch, story_sha)
+
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board)
+        fact_count = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+        event_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events "
+            "WHERE task_id=? AND kind='story_integrated_to_epic'",
+            (story,),
+        ).fetchone()[0]
+
+    assert result == "verify_failed"
+    assert fact_count == 0
+    assert event_count == 0
+
+
+def test_integrate_story_to_epic_replays_existing_composite_fact(
+    kanban_home, tmp_path, monkeypatch,
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    board = "v2-integrate-replay"
+    _v2_product_board_with_repo(board, repo)
+    epic, story, epic_branch, story_sha = _make_epic_and_done_story(board, repo)
+    story_branch = f"story/{epic}-s1"
+
+    with kb.connect(board=board) as conn:
+        _add_approved_review_candidate(conn, story, story_branch, story_sha)
+        kb._record_story_integration(
+            conn,
+            story,
+            epic,
+            epic_branch,
+            {
+                "source_branch": story_branch,
+                "source_sha": story_sha,
+                "target_branch": epic_branch,
+                "candidate_sha": story_sha,
+            },
+        )
+        before = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+
+    calls = _record_git_calls(monkeypatch)
+    with kb.connect(board=board) as conn:
+        result = kb.integrate_story_to_epic(conn, story, board=board)
+        after = conn.execute(
+            "SELECT COUNT(*) FROM epic_story_integrations WHERE story_id=?",
+            (story,),
+        ).fetchone()[0]
+
+    assert result == "already_integrated"
+    assert after == before == 1
+    assert calls == []
+
+
 def test_integrate_story_to_epic_conflict_aborts_blocks_story_and_never_pushes(
     kanban_home, tmp_path, monkeypatch,
 ):
