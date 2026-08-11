@@ -3,15 +3,28 @@
 from __future__ import annotations
 
 import copy
+import logging
+import os
+import ssl
+import sys
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Iterable
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Headers safe to forward to a different origin. Everything else is dropped:
 # custom provider headers routinely carry credentials under arbitrary names.
 _CROSS_ORIGIN_SAFE_HEADERS = frozenset({"accept", "user-agent"})
 _DEFAULT_PORTS = {"http": 80, "https": 443}
+_CA_BUNDLE_ENV_VARS = (
+    "HERMES_CA_BUNDLE",
+    "SSL_CERT_FILE",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+)
 
 
 def url_origin(url: str) -> tuple[str, str, int | None]:
@@ -83,11 +96,59 @@ class _CrossOriginRequestSanitizer(urllib.request.BaseHandler):
     https_request = _sanitize
 
 
+def _resolved_https_context() -> ssl.SSLContext | None:
+    """Return the explicit CA context for Hermes-owned urllib openers."""
+    ca_bundle = next(
+        (
+            value
+            for name in _CA_BUNDLE_ENV_VARS
+            if (value := os.getenv(name, "").strip())
+        ),
+        "",
+    )
+    if ca_bundle:
+        ca_path = Path(ca_bundle).expanduser()
+        if ca_path.is_file():
+            try:
+                return ssl.create_default_context(cafile=str(ca_path))
+            except (OSError, ssl.SSLError) as exc:
+                logger.warning(
+                    "CA bundle could not be loaded from %s: %s — falling back to default certificates",
+                    ca_bundle,
+                    exc,
+                )
+        else:
+            logger.warning(
+                "CA bundle path does not exist: %s — falling back to default certificates",
+                ca_bundle,
+            )
+
+    if sys.platform != "darwin":
+        return None
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except (ImportError, OSError, ssl.SSLError) as exc:
+        logger.warning(
+            "Could not load certifi for urllib HTTPS verification: %s — falling back to default certificates",
+            exc,
+        )
+        return None
+
+
 def _secure_opener_from_installed_policy(original_url: str):
     """Clone the installed opener's handlers, replacing redirect policy only."""
     installed = getattr(urllib.request, "_opener", None)
     if installed is None:
-        installed = urllib.request.build_opener()
+        context = _resolved_https_context()
+        if context is None:
+            installed = urllib.request.build_opener()
+        else:
+            installed = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=context)
+            )
 
     handlers = [
         copy.copy(handler)
