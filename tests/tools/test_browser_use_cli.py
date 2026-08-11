@@ -151,20 +151,40 @@ class TestFindCli:
     def test_prefers_installed_binary(self, monkeypatch):
         monkeypatch.setattr(
             bu_cli.shutil, "which",
-            lambda name: "/usr/local/bin/browser-use" if name == "browser-use" else "/usr/local/bin/uvx",
+            lambda name, path=None: "/usr/local/bin/browser-use"
+            if name == "browser-use"
+            else "/usr/local/bin/uvx",
         )
         assert bu_cli._find_cli_unpatched() == ["/usr/local/bin/browser-use"]
 
     def test_falls_back_to_uvx(self, monkeypatch):
         monkeypatch.setattr(
             bu_cli.shutil, "which",
-            lambda name: "/usr/local/bin/uvx" if name == "uvx" else None,
+            lambda name, path=None: "/usr/local/bin/uvx" if name == "uvx" else None,
         )
         assert bu_cli._find_cli_unpatched() == ["/usr/local/bin/uvx", "browser-use"]
 
     def test_none_when_neither_available(self, monkeypatch):
-        monkeypatch.setattr(bu_cli.shutil, "which", lambda name: None)
+        monkeypatch.setattr(bu_cli.shutil, "which", lambda name, path=None: None)
         assert bu_cli._find_cli_unpatched() is None
+
+    def test_finds_user_local_binary_outside_inherited_path(self, tmp_path, monkeypatch):
+        home = tmp_path / "home"
+        cli_dir = home / ".local" / "bin"
+        cli_dir.mkdir(parents=True)
+        cli = cli_dir / "browser-use"
+        cli.write_text("#!/bin/sh\n")
+        cli.chmod(cli.stat().st_mode | stat.S_IXUSR)
+
+        monkeypatch.setattr(
+            bu_cli.os.path,
+            "expanduser",
+            lambda value: str(home) if value == "~" else value,
+        )
+        monkeypatch.setenv("PATH", "/usr/bin")
+        monkeypatch.setattr(bu_cli, "get_hermes_home", lambda: tmp_path / "hermes")
+
+        assert bu_cli._find_cli_unpatched() == [str(cli)]
 
 
 class TestLegacyCloudMigration:

@@ -13,6 +13,7 @@ import subprocess
 import time
 from typing import Any, Dict, List, Optional
 
+from hermes_constants import get_hermes_home
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -137,13 +138,24 @@ def is_browser_use_cli_mode() -> bool:
 def _find_cli() -> Optional[List[str]]:
     """Locate the browser-use CLI, or None when it can't be run.
 
-    Prefers an installed browser-use binary; falls back to running it
-    through uvx
+    Prefer an installed browser-use binary; fall back to running it through
+    uvx. The desktop backend may start with a minimal PATH, so also search
+    the standard user tool directory and Hermes' managed bin directory.
     """
-    direct = shutil.which("browser-use")
+    paths = [
+        os.environ.get("PATH", ""),
+        os.path.join(os.path.expanduser("~"), ".local", "bin"),
+    ]
+    try:
+        paths.append(os.path.join(os.fspath(get_hermes_home()), "bin"))
+    except Exception:
+        pass
+    search_path = os.pathsep.join(dict.fromkeys(path for path in paths if path))
+
+    direct = shutil.which("browser-use", path=search_path)
     if direct:
         return [direct]
-    uvx = shutil.which("uvx")
+    uvx = shutil.which("uvx", path=search_path)
     if uvx:
         return [uvx, "browser-use"]
     return None
