@@ -17696,9 +17696,46 @@ def _maybe_open_browser(
     threading.Thread(target=_open, daemon=True).start()
 
 
-def _is_serve_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
-    """True when this process lost its original spawning parent (ppid changed)."""
-    return getppid() != original_ppid
+def _is_serve_orphaned(original_ppid: int, getppid=os.getppid, pid_exists=None) -> bool:
+    """True when the recorded spawning parent is actually gone.
+
+    A changed ppid is only EVIDENCE of orphaning, not proof (#83555). On
+    Windows, a uv-created ``relocatable = true`` venv ships
+    ``venv\\Scripts\\python.exe`` as a ~45 KB trampoline that launches the real
+    interpreter as its own child and waits on it, so the backend's parent is
+    always that trampoline and never the desktop process that recorded
+    HERMES_PARENT_PID. Treating the mismatch as orphaning made
+    ``_start_parent_death_watchdog`` fire on the FIRST poll of a completely
+    healthy install — ``os._exit(0)`` before ``HERMES_BACKEND_READY`` — so
+    Hermes Desktop never booted and its repair path escalated to a venv
+    reinstall that could not fix it.
+
+    So confirm the mismatch by probing whether the recorded parent is still
+    alive; only a parent that is really gone means we were orphaned. Uses
+    ``gateway.status._pid_exists`` rather than ``os.kill(pid, 0)``: on Windows
+    CPython routes signal 0 through ``GenerateConsoleCtrlEvent``, so the
+    "harmless" liveness probe can actually signal the target.
+
+    Fails SAFE — if the probe itself errors we report "not orphaned" and keep
+    serving. A stray backend is recoverable; a desktop that never boots is the
+    bug being fixed here.
+    """
+    if getppid() == original_ppid:
+        return False
+    if pid_exists is None:
+        from gateway.status import _pid_exists
+
+        pid_exists = _pid_exists
+    try:
+        return not pid_exists(original_ppid)
+    except Exception:
+        _log.debug(
+            "serve parent-death watchdog: liveness probe for pid %s failed; "
+            "treating parent as alive",
+            original_ppid,
+            exc_info=True,
+        )
+        return False
 
 
 def _start_parent_death_watchdog() -> None:
@@ -17733,9 +17770,12 @@ def _start_parent_death_watchdog() -> None:
 
 
 def _demo() -> None:
-    # orphan iff current ppid differs from the recorded spawning parent
-    assert _is_serve_orphaned(999999999, getppid=lambda: 1) is True
+    # orphan iff the recorded spawning parent is really gone
+    assert _is_serve_orphaned(999999999, getppid=lambda: 1, pid_exists=lambda _p: False) is True
     assert _is_serve_orphaned(42, getppid=lambda: 42) is False
+    # #83555: a Windows uv trampoline interposes itself, so ppid never matches
+    # even though the desktop parent is alive and well — not orphaned.
+    assert _is_serve_orphaned(42, getppid=lambda: 77, pid_exists=lambda _p: True) is False
     print("web_server parent-death watchdog self-check: OK")
 
 
