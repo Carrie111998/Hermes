@@ -1330,8 +1330,13 @@ def build_environment_hints() -> str:
 
     hints: list[str] = []
 
-    backend = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
-    is_remote_backend = backend in _REMOTE_TERMINAL_BACKENDS or _plugin_backend_is_remote(backend)
+    from tools.terminal_tool import _terminal_backend_identity
+
+    backend = _terminal_backend_identity()[1]
+    is_remote_backend = (
+        backend in _REMOTE_TERMINAL_BACKENDS
+        or _plugin_backend_is_remote(backend)
+    )
 
     if not is_remote_backend:
         # --- Host info block (local backend: host == where tools run) ---
