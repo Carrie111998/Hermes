@@ -293,7 +293,7 @@ def test_analyze_reports_exactly_the_drifted_five():
     assert findings.missing == tuple(sorted(DRIFTED_ON_2026_08_10))
     assert findings.ok is False
     assert findings.checked_breadth is True
-    assert "18" in findings.diagnosis and "23" in findings.diagnosis
+    assert "holds 18 of the 23 declared" in findings.diagnosis
 
 
 def test_analyze_is_clean_when_everything_resolves():
@@ -365,6 +365,22 @@ def test_analyze_skips_breadth_without_declarations_and_says_so():
     assert any("no pyproject" in note.lower() for note in findings.notes)
 
 
+def test_analyze_treats_an_empty_declaration_list_as_skipped_not_clean():
+    """Zero declared names must not render as "everything resolves".
+
+    declared_names returns set() (not None) for a pyproject with no
+    [tool.setuptools.packages.find].include — the list form, or a move to
+    another build backend. Reporting that as a pass would be a confident
+    clean bill of health over zero checks.
+    """
+    from hermes_cli.install_doctor import analyze
+
+    findings = analyze(set(), _probe_result([]), _install_root_with({}))
+
+    assert findings.checked_breadth is False
+    assert any("declared no top-level names" in note for note in findings.notes)
+
+
 def test_remedy_names_the_command_the_root_and_the_console_script_trap():
     from hermes_cli.install_doctor import remedy_lines
 
@@ -391,3 +407,36 @@ def test_render_failure_output_contains_the_remedy():
     assert "jobflow_dispatch" in text
     assert "pip install -e . --no-deps" in text
     assert "/usr/bin/python3.11" in text
+
+
+def test_render_never_claims_a_pass_when_breadth_was_skipped():
+    from hermes_cli.install_doctor import analyze, render
+
+    root = _install_root_with(None, root=None)
+    result = _probe_result([], imports={"events.gateway_integration": {"ok": True, "error": None}})
+    findings = analyze(None, result, root)
+
+    text = "\n".join(render(findings, root, result))
+
+    assert "breadth not checked" in text
+    assert "no pyproject.toml was readable" in text
+    assert "every declared package resolves" not in text
+
+
+def test_render_reports_a_broken_import_even_when_breadth_was_skipped():
+    from hermes_cli.install_doctor import analyze, render
+
+    root = _install_root_with(None, root=None)
+    result = _probe_result(
+        [],
+        imports={"events.gateway_integration": {"ok": False, "error": "ModuleNotFoundError: jobflow_dispatch"}},
+    )
+    findings = analyze(None, result, root)
+
+    text = "\n".join(render(findings, root, result))
+
+    assert findings.checked_breadth is False
+    assert findings.ok is False
+    assert "events.gateway_integration" in text
+    assert "pip install -e . --no-deps" in text
+    assert "[OK]" not in text

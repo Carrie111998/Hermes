@@ -312,6 +312,12 @@ class Findings:
 
     @property
     def ok(self) -> bool:
+        """True when nothing was found wrong.
+
+        NOTE: also True when breadth was SKIPPED. A caller reporting a clean
+        bill of health must consult `checked_breadth` as well — `ok` alone
+        cannot distinguish "checked and clean" from "did not check".
+        """
         return not self.missing and not self.broken_imports
 
 
@@ -323,24 +329,38 @@ def analyze(
     """Turn a probe result into a verdict.
 
     ``declared`` is None when no root yielded a readable pyproject.toml (a
-    sealed wheel install). Breadth is then SKIPPED with an explicit note
-    rather than reported as a pass — there is nothing to have drifted from,
-    and an unqualified "clean" would overstate what was checked. Depth still
-    runs, because importing the entrypoints is meaningful on any install.
+    sealed wheel install), and an empty set when a pyproject WAS readable but
+    declared no top-level names (e.g. the list form of ``packages =`` rather
+    than ``[tool.setuptools.packages.find].include``). Either way Breadth is
+    then SKIPPED with an explicit note rather than reported as a pass — there
+    is nothing to have drifted from, and an unqualified "clean" would
+    overstate what was checked. Depth still runs, because importing the
+    entrypoints is meaningful on any install.
     """
-    resolved = probe_result.get("resolved", {})
+    resolved = probe_result.get("resolved") or {}
     notes: list[str] = []
 
-    if declared is None:
+    if not declared:
         checked_breadth = False
         missing: list[str] = []
-        notes.append(
-            "Breadth check SKIPPED: no pyproject.toml was readable at the "
-            "resolved install root, so there is no declaration list to diff "
-            "against. Import checks still ran."
-        )
+        if declared is None:
+            notes.append(
+                "Breadth check SKIPPED: no pyproject.toml was readable at the "
+                "resolved install root, so there is no declaration list to diff "
+                "against. Import checks still ran."
+            )
+        else:
+            notes.append(
+                "Breadth check SKIPPED: the pyproject.toml at the resolved "
+                "install root declared no top-level names. That usually means "
+                "it does not use [tool.setuptools.packages.find].include, so "
+                "there is nothing to diff against. Import checks still ran."
+            )
     else:
         checked_breadth = True
+        # Breadth is defined as a diff against `declared`: probe entries for
+        # names the probe happened to resolve but that are not in `declared`
+        # are intentionally not reported here.
         missing = sorted(
             name
             for name in declared
@@ -349,7 +369,7 @@ def analyze(
 
     broken = tuple(
         (name, entry.get("error") or "import failed")
-        for name, entry in sorted(probe_result.get("imports", {}).items())
+        for name, entry in sorted((probe_result.get("imports") or {}).items())
         if not entry.get("ok", False)
     )
 
@@ -397,7 +417,7 @@ def render(findings: Findings, install_root: InstallRoot, probe_result: dict) ->
     """Human-readable report lines."""
     lines: list[str] = [
         f"install root : {install_root.provenance}",
-        f"interpreter  : {probe_result.get('executable', sys.executable)}",
+        f"interpreter  : {probe_result.get('executable') or sys.executable}",
     ]
     for note in findings.notes:
         lines.append(f"note         : {note}")
