@@ -43,6 +43,50 @@ Usage:
     hermes claw migrate --dry-run  # Preview migration without changes
 """
 
+# ── Single module identity under `python -m hermes_cli.main` ─────────────
+# runpy executes this file as `__main__` WITHOUT populating
+# `sys.modules["hermes_cli.main"]`, so the first lazy `from hermes_cli.main
+# import ...` anywhere downstream re-executes this entire module body under a
+# second, separate module object. Publishing `__main__` under the real name
+# closes that: every later import resolves to the module that is actually
+# running, and the body executes exactly once.
+#
+# This matters for correctness, not speed. The duplicate import is cheap —
+# ~0.17s end-to-end at the real call site, of which only ~7ms is the body
+# executing (everything it imports is already warm); the rest is re-reading and
+# unmarshalling this file's bytecode. Measured 2026-08-11; next to a ~50s
+# gateway boot it is noise, and it is NOT the 19s gap visible between
+# `gateway.start` and the duplicate `gateway.spawn` in gateway-exit-diag.log —
+# that gap is `from gateway.run import start_gateway`.
+#
+# What it actually cost was correctness: it forked every module-level global in
+# this file into two copies. Whoever mutates `hermes_cli.main.X` at runtime and
+# whoever reads it then disagree, depending only on which module object each
+# side happened to reach. It also re-ran `_apply_profile_override()` mid-flight
+# in an already-booted gateway.
+#
+# The importer that exposed this was `gateway.code_skew._fingerprint()`, called
+# from `start_gateway()`'s first statement — confirmed by a live traceback, not
+# by reading (2026-08-11, `python -m hermes_cli.main gateway run`).
+#
+# Guarded on `__spec__` so it only fires for the `-m hermes_cli.main` launch:
+# a direct `python path/to/main.py` run has `__spec__ is None` and must not
+# claim a package name it was not imported under.
+if __name__ == "__main__" and globals().get("__spec__") is not None:
+    import sys as _sys
+
+    if __spec__.name == "hermes_cli.main" and "hermes_cli.main" not in _sys.modules:
+        _sys.modules["hermes_cli.main"] = _sys.modules["__main__"]
+        # Mirror what the import system would have done, so `import
+        # hermes_cli.main` followed by attribute access still resolves.
+        try:
+            import hermes_cli as _hermes_cli_pkg
+
+            _hermes_cli_pkg.main = _sys.modules["__main__"]
+        except Exception:  # pragma: no cover - package is already imported here
+            pass
+    del _sys
+
 # IMPORTANT: hermes_bootstrap must be the very first import — it sets up
 # UTF-8 stdio on Windows so print()/subprocess children don't hit
 # UnicodeEncodeError with non-ASCII characters.  No-op on POSIX.

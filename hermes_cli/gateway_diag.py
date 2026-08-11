@@ -41,6 +41,15 @@ DIAG_LOG_NAME = "gateway-exit-diag.log"
 # with separate globals. Observed live — PID 40772 logged spawn at
 # proc_age_s=12.5 and again at 144.9.
 #
+# That root cause is now fixed: `hermes_cli/main.py` publishes its `__main__`
+# module object under `sys.modules["hermes_cli.main"]`, so the body executes
+# once per process and a module global would in fact suffice today. This stays
+# an env var anyway — it is the strictly stronger guard, and it is the one that
+# survives the module ever being executed twice again for some other reason
+# (a fresh `-m` alias regression, an explicit `importlib.reload`, a vendored
+# copy on a second sys.path entry). The suppression is per-PID, so it costs
+# nothing when the body only runs once.
+#
 # The value is the PID, not a bare "1", because env vars are inherited: a
 # gateway spawned as a CHILD of a process that already logged (e.g. by
 # `gateway restart`) must still record its own spawn. Comparing PIDs makes the
