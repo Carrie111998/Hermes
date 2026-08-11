@@ -24,6 +24,8 @@ import time
 import pytest
 
 from tools import terminal_tool as tt
+from tools.environments.base import BaseEnvironment
+from tools.environments.local import _quote_bash_path
 from tools.interrupt import (
     set_interrupt,
     is_interrupted,
@@ -46,7 +48,34 @@ def _isolate(tmp_path, monkeypatch):
         _interrupted_threads.clear()
 
 
-def _wait_for_sentinel(sentinel, timeout=10.0):
+def _touch(sentinel):
+    """A `touch` of *sentinel* safe to interpolate into a shell command string.
+
+    A bare f-string of a pathlib path is a trap on Windows: the native
+    ``C:\\Users\\...`` form reaches Git Bash unquoted, the backslashes are
+    eaten as escapes, and the drive colon is mapped to U+F03A -- so the whole
+    path collapses into ONE literal token and ``touch`` creates a zero-byte
+    file with an unportable name in the CWD (the repo root) instead of at
+    ``tmp_path``.  ``_quote_bash_path`` is the repo's own helper: it rewrites
+    to the ``/c/...`` MSYS form and shell-quotes, and no-ops off Windows.
+    """
+    return f"touch {_quote_bash_path(str(sentinel))}"
+
+
+# Barrier deadline, derived rather than guessed.  This is a FAILURE bound, not
+# a delay: the poll below returns the instant the sentinel appears (~4s warm),
+# so a healthy run never pays it.  The first terminal_tool call of a session
+# can pay the whole cold-start path before the command ever spawns --
+# `BaseEnvironment.init_session` spends up to `_snapshot_timeout` on the login
+# snapshot bootstrap and, when that times out, up to another 15s on the
+# non-login probe before falling back.  Measured 18-34s on a Windows host at
+# ~85% commit, with the bootstrap exiting 124.  The original hard-coded 10s
+# was a wall-clock guess that lost to that and failed the test for a reason
+# with nothing to do with the interrupt behaviour under test.
+_SENTINEL_TIMEOUT = float(2 * (BaseEnvironment._snapshot_timeout + 15))
+
+
+def _wait_for_sentinel(sentinel, timeout=_SENTINEL_TIMEOUT):
     """Block until the running command created its sentinel (proving the
     clean-slate clear already ran and the command is in its poll loop)."""
     deadline = time.monotonic() + timeout
@@ -94,7 +123,7 @@ def test_approved_command_genuine_interrupt_after_start_still_kills(tmp_path):
 
     def worker():
         holder["result"] = tt.terminal_tool(
-            command=f"touch {sentinel}; sleep 5; echo DONE", force=True
+            command=f"{_touch(sentinel)}; sleep 5; echo DONE", force=True
         )
 
     t = threading.Thread(target=worker, daemon=True)
@@ -125,7 +154,7 @@ def test_approved_note_enriched_not_misleading_on_interrupt(monkeypatch, tmp_pat
     holder = {}
 
     def worker():
-        holder["result"] = tt.terminal_tool(command=f"touch {sentinel}; sleep 5; echo DONE")
+        holder["result"] = tt.terminal_tool(command=f"{_touch(sentinel)}; sleep 5; echo DONE")
 
     t = threading.Thread(target=worker, daemon=True)
     t.start()
