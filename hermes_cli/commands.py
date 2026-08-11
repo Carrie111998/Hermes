@@ -184,7 +184,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef(
         "profile",
-        "Show the active profile; terminal chat can switch with /profile <name>",
+        "Show the active profile; terminal chat can switch with /profile <name> (resumes last session)",
         "Info",
         args_hint="[name]",
         busy_policy="dispatch",

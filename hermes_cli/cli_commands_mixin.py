@@ -780,6 +780,11 @@ class CLICommandsMixin:
         target = parts[1].strip() if len(parts) > 1 else ""
 
         if target:
+            from hermes_cli.profiles import (
+                build_profile_switch_relaunch_argv,
+                normalize_profile_name,
+            )
+
             try:
                 set_active_profile(target)
             except (FileNotFoundError, ValueError) as exc:
@@ -787,13 +792,20 @@ class CLICommandsMixin:
                 return False
 
             current = get_active_profile_name()
-            selected = target.lower()
+            selected = normalize_profile_name(target)
             if selected == current:
                 print(f"  Profile '{current}' is already active.")
                 return False
 
-            print(f"  Switching to profile '{selected}'...")
-            self._pending_relaunch = ["--profile", selected, "--cli", "chat"]
+            relaunch_argv = build_profile_switch_relaunch_argv(selected, ui="cli")
+            if "--resume" in relaunch_argv:
+                print(
+                    f"  Switching to profile '{selected}' "
+                    f"(resuming last session)..."
+                )
+            else:
+                print(f"  Switching to profile '{selected}'...")
+            self._pending_relaunch = relaunch_argv
             return True
 
         reply = execute_command("profile", CommandContext(surface="cli"))

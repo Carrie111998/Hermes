@@ -167,7 +167,7 @@ export const coreCommands: SlashCommand[] = [
   },
 
   {
-    help: 'show or switch the active profile [name]',
+    help: 'show or switch the active profile [name] (resumes last session)',
     name: 'profile',
     run: (arg, ctx) => {
       const target = arg.trim()
@@ -203,7 +203,9 @@ export const coreCommands: SlashCommand[] = [
               return
             }
 
-            ctx.transcript.sys(`switching to profile '${result.profile}'...`)
+            ctx.transcript.sys(
+              `switching to profile '${result.profile}' (will resume last session if any)...`
+            )
             setTimeout(() => ctx.session.dieWithCode(43), 100)
           })
         )

@@ -189,7 +189,9 @@ describe('createSlashHandler', () => {
     })
 
     await vi.waitFor(() => {
-      expect(ctx.transcript.sys).toHaveBeenCalledWith("switching to profile 'coder'...")
+      expect(ctx.transcript.sys).toHaveBeenCalledWith(
+        "switching to profile 'coder' (will resume last session if any)..."
+      )
     })
     vi.advanceTimersByTime(150)
     expect(ctx.session.dieWithCode).toHaveBeenCalledWith(43)
