@@ -2143,7 +2143,15 @@ def _migrate_honcho_profile_host(old_name: str, new_name: str, new_dir: Path) ->
         try:
             resolved = path.resolve()
         except OSError:
-            resolved = path
+            # Fail closed. The rewrite below is only safe when it is handed the
+            # REAL file (see the comment on the write), so a candidate whose
+            # target cannot be determined — ELOOP on a symlink cycle,
+            # ENAMETOOLONG, EACCES on a parent directory — must be skipped, not
+            # written through unresolved. Falling back to the candidate would
+            # hand the writer the very symlink this function must never pass it,
+            # and would also defeat the dedup below, since an unresolved entry
+            # cannot match a resolved one for the same file.
+            continue
         if resolved in seen or not path.is_file():
             continue
         seen.add(resolved)
