@@ -963,6 +963,43 @@ class TestMemoryToolToolsetGate:
         assert "disabled_toolsets=[]" in caplog.text
         assert "memory_tool_present=False" in caplog.text
 
+    @pytest.mark.parametrize(
+        ("memory_manager", "tools", "expected_state"),
+        [
+            (None, [], "memory_manager_present=False, tools_present=True"),
+            (SimpleNamespace(), None, "memory_manager_present=True, tools_present=False"),
+        ],
+    )
+    def test_missing_injection_prerequisites_log_state(
+        self,
+        caplog,
+        memory_manager,
+        tools,
+        expected_state,
+    ):
+        """Missing injection prerequisites must identify the absent boundary."""
+        agent = SimpleNamespace(_memory_manager=memory_manager, tools=tools)
+
+        with caplog.at_level("DEBUG", logger="agent.memory_manager"):
+            assert inject_memory_provider_tools(agent) == 0
+
+        assert "Memory provider tools not injected: prerequisites unavailable" in caplog.text
+        assert expected_state in caplog.text
+
+    def test_missing_schema_api_logs_reason(self, caplog):
+        """A manager without the schema API must not fail silently."""
+        agent = SimpleNamespace(
+            _memory_manager=SimpleNamespace(),
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+            tools=[],
+        )
+
+        with caplog.at_level("DEBUG", logger="agent.memory_manager"):
+            assert inject_memory_provider_tools(agent) == 0
+
+        assert "Memory provider tools not injected: schema API unavailable" in caplog.text
+
     def test_toolsets_without_memory_blocks_injection(self):
         """Toolsets that don't include memory must suppress injection."""
         mgr = self._mgr_with_tools("fact_store")
