@@ -45,6 +45,7 @@ from agent.models_dev import (
     get_model_info,
     list_provider_models,
 )
+from utils import base_url_hostname
 
 # Providers whose picker model list should NOT be capped by max_models.
 # OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
@@ -361,10 +362,21 @@ MODEL_ALIASES: dict[str, ModelIdentity] = {
 # ---------------------------------------------------------------------------
 
 class DirectAlias(NamedTuple):
-    """Exact model mapping that bypasses catalog resolution."""
+    """Exact model mapping that bypasses catalog resolution.
+
+    ``api_key`` / ``key_env`` carry the alias endpoint's OWN credential.
+    Without them the switch keeps whatever key the *default* provider
+    resolved, which 401s against the alias host and sends that provider's
+    secret to an unrelated third party (#83612).
+    """
     model: str
     provider: str
     base_url: str
+    # Defaulted so existing positional construction —
+    # ``DirectAlias(model, provider, base_url)`` — keeps working for callers
+    # and for the string-format aliases built below.
+    api_key: str = ""
+    key_env: str = ""
 
 
 # Built-in direct aliases (can be extended via config.yaml model_aliases:)
@@ -388,6 +400,16 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
             model: "minimax-m2.7"
             provider: custom
             base_url: "https://ollama.com/v1"
+          theta:
+            model: "theta-1"
+            provider: custom
+            base_url: "https://theta.example.com/v1"
+            api_key: "sk-..."          # literal, or "${THETA_API_KEY}"
+            key_env: "THETA_API_KEY"   # read from the environment instead
+
+    ``api_key``/``key_env`` are the alias endpoint's own credential. When
+    neither is set the key is resolved from the alias HOST, never from the
+    previously active provider (#83612).
 
     Also reads ``model.aliases`` (set by ``hermes config set model.aliases.xxx``)
     and converts simple string entries (``ds-flash: deepseek/deepseek-v4-flash``)
@@ -411,6 +433,8 @@ def _load_direct_aliases() -> dict[str, DirectAlias]:
                 if model:
                     merged[name.strip().lower()] = DirectAlias(
                         model=model, provider=provider, base_url=base_url,
+                        api_key=str(entry.get("api_key", "") or "").strip(),
+                        key_env=str(entry.get("key_env", "") or "").strip(),
                     )
 
         # --- model.aliases (string-based format, from config set) ---
@@ -451,6 +475,23 @@ def _ensure_direct_aliases() -> None:
     """
     if not DIRECT_ALIASES:
         DIRECT_ALIASES.update(_load_direct_aliases())
+
+
+def direct_alias_api_key(alias: DirectAlias) -> str:
+    """Resolve a direct alias's own credential, or "" when it has none.
+
+    Accepts a literal ``api_key``, a ``${VAR}`` indirection, or ``key_env``.
+    Environment reads go through the per-profile secret scope for the same
+    reason the user-provider branch does: a raw ``os.environ`` read hands
+    this profile whatever key the process env holds — another profile's,
+    under the multiplexed gateway.
+    """
+    raw = (alias.api_key or "").strip()
+    if raw.startswith("${") and raw.endswith("}"):
+        return _scoped_key_env(raw[2:-1].strip())
+    if raw:
+        return raw
+    return _scoped_key_env((alias.key_env or "").strip())
 
 
 # ---------------------------------------------------------------------------
@@ -1774,10 +1815,51 @@ def switch_model(
         _ensure_direct_aliases()
         _da = DIRECT_ALIASES.get(resolved_alias)
         if _da is not None and _da.base_url:
-            base_url = _da.base_url
+            # Credentials above were resolved against the DEFAULT provider.
+            # Carrying that key onto the alias's endpoint both 401s and ships
+            # the default provider's secret to an unrelated third-party host
+            # (#83612). The alias's own endpoint decides the credential
+            # instead: its declared key when it has one, otherwise a fresh
+            # resolution against the alias base_url, whose env-key fallbacks
+            # are gated on authoritative hosts (#28660) — so OLLAMA_API_KEY
+            # still resolves for an ollama.com alias while OPENROUTER_API_KEY
+            # never reaches an unrelated host.
+            _alias_key = direct_alias_api_key(_da)
+            if _alias_key:
+                # The alias states its own credential: nothing left to
+                # resolve, and re-entering the resolver would only risk a
+                # second local-endpoint model probe.
+                base_url = _da.base_url
+                api_key = _alias_key
+            else:
+                try:
+                    _alias_runtime = resolve_runtime_provider(
+                        requested=_da.provider or "custom",
+                        explicit_base_url=_da.base_url,
+                        target_model=new_model,
+                    )
+                except Exception:
+                    _alias_runtime = {}
+                # The already-resolved key is reusable only when the alias
+                # points at the SAME host it was resolved for (an alias that
+                # just pins a model on the provider already in use). Across
+                # hosts it is the leak, so it is dropped, not carried.
+                _same_host = bool(base_url) and (
+                    base_url_hostname(base_url) == base_url_hostname(_da.base_url)
+                )
+                base_url = _alias_runtime.get("base_url", "") or _da.base_url
+                # The resolver reports "no key found" with the
+                # `no-key-required` placeholder rather than "". Normalise it
+                # so a same-host credential still outranks the placeholder.
+                _resolved_key = _alias_runtime.get("api_key", "")
+                if _resolved_key == "no-key-required":
+                    _resolved_key = ""
+                api_key = (
+                    _resolved_key
+                    or (api_key if _same_host else "")
+                    or "no-key-required"
+                )
             api_mode = ""  # clear so determine_api_mode re-detects from URL
-            if not api_key:
-                api_key = "no-key-required"
 
     # --- Resolve api_mode from the final (provider, base_url) before validation ---
     # Two cases this closes, both surfaced when the switched model's reasoning
