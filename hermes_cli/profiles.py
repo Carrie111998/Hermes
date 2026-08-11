@@ -2209,8 +2209,12 @@ def rename_profile(old_name: str, new_name: str) -> Path:
 def resolve_profile_env(profile_name: str) -> str:
     """Resolve a profile name to a HERMES_HOME path string.
 
-    Called early in the CLI entry point, before any hermes modules
-    are imported, to set the HERMES_HOME environment variable.
+    Called from ``hermes_cli.main._apply_profile_override()`` to set the
+    HERMES_HOME environment variable. That runs after main.py's
+    ``hermes_cli.subcommands.*`` parser-builder imports but before anything
+    that resolves HERMES_HOME — see the comment above
+    ``_apply_profile_override`` for what that ordering does and does not
+    guarantee.
     """
     canon = normalize_profile_name(profile_name)
     validate_profile_name(canon)
