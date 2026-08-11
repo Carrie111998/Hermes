@@ -173,6 +173,74 @@ def _content_cache_key(
     return f"pck_{digest}"
 
 
+def _is_azure_foundry_responses(params: Dict[str, Any]) -> bool:
+    """Return True for Microsoft Foundry's OpenAI-compatible Responses API.
+
+    Matched on the registered provider id first, then on the endpoint host.
+    Host matching goes through ``base_url_host_matches`` rather than a
+    substring test, so a path or query segment carrying the Foundry domain
+    (``https://proxy.example.com/.services.ai.azure.com/v1``) is not
+    misclassified as Foundry.
+    """
+    from utils import base_url_host_matches
+
+    provider = str(params.get("provider") or "").strip().lower()
+    if provider == "azure-foundry":
+        return True
+
+    return base_url_host_matches(
+        str(params.get("base_url") or ""), "services.ai.azure.com"
+    )
+
+
+def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
+    """Return True when ``messages`` end on a tool result awaiting a follow-up.
+
+    Azure Foundry only rejects the *post-tool follow-up* payload — the shape
+    where a prior assistant ``function_call`` and its ``function_call_output``
+    are replayed alongside an encrypted ``reasoning`` item (HTTP 400
+    invalid_payload). Detecting that shape here keeps reasoning suppression
+    scoped to the failing turn, so ordinary (non-tool) Foundry multi-turn
+    continuity is left unchanged.
+
+    The test is on the *trailing* messages, not on the history as a whole.
+    Scanning the whole history for any tool call plus any tool result makes
+    the predicate sticky: one tool call early in a conversation would then
+    suppress reasoning on every later turn, including plain user follow-ups
+    that Foundry accepts. The rejected payload is specifically the turn whose
+    last item is a tool result, so that is what this matches: the final
+    non-system message is a ``tool`` result, and the assistant message that
+    issued its ``tool_call_id`` is present.
+    """
+    trailing_call_ids = set()
+    for msg in reversed(messages or ()):
+        if not isinstance(msg, dict):
+            return False
+        role = msg.get("role")
+        if role == "system":
+            continue
+        if role == "tool":
+            call_id = msg.get("tool_call_id")
+            if not call_id:
+                return False
+            trailing_call_ids.add(call_id)
+            continue
+        # First message before the trailing run of tool results. It must be
+        # the assistant turn that issued them for this to be the follow-up
+        # payload; a non-empty ``trailing_call_ids`` is what proves the run
+        # existed at all.
+        if role != "assistant":
+            return False
+        issued = {
+            call.get("id")
+            for call in (msg.get("tool_calls") or [])
+            if isinstance(call, dict)
+        }
+        return bool(trailing_call_ids & issued)
+
+    return False
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -271,6 +339,17 @@ class ResponsesApiTransport(ProviderTransport):
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
         )
+        if replay_encrypted_reasoning and _is_azure_foundry_responses(params):
+            # Microsoft Foundry accepts the initial Responses function-call
+            # request and ordinary (non-tool) multi-turn continuity, but
+            # rejects the post-tool follow-up payload that carries prior
+            # encrypted reasoning items alongside function_call /
+            # function_call_output, with HTTP 400 invalid_payload. Scope the
+            # suppression to that follow-up turn: keep function_call /
+            # function_call_output continuity intact and drop only the
+            # encrypted reasoning replay for this endpoint.
+            if _is_post_tool_replay(payload_messages):
+                replay_encrypted_reasoning = False
         # Native server-side compaction (gpt-5.6 on direct OpenAI/Codex routes
         # only). The caller resolves eligibility via
         # agent.native_compaction.native_compaction_context_management();
