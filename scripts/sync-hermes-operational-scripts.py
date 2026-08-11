@@ -25,6 +25,8 @@ ALLOWLIST = (
     "disaster-news-jp.py",
     "lm-twitterer-post.py",
     "lm-twitterer-replies.py",
+    "lm-twitterer-topic-bank-post.py",
+    "lm-twitterer-topic-bank-weekly-update.py",
     "mhlw-designated-check.py",
     "osint-agent-evening.py",
     "osint-agent-morning.py",
