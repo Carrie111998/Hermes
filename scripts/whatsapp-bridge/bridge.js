@@ -10,6 +10,7 @@
  *   POST /send           - Send a message { chatId, message, replyTo? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
+ *   POST /send-album     - Send a native media album { chatId, items[], delayMs? }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
@@ -46,6 +47,8 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  prepareAlbumItems,
+  sendAlbumSequence,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -142,7 +145,7 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+function sendSocketWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(
@@ -150,10 +153,12 @@ function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT
       timeoutMs,
     );
   });
-  return enqueueSend(() =>
-    Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
-      .finally(() => clearTimeout(timer))
-  );
+  return Promise.race([sock.sendMessage(chatId, payload, options), timeoutPromise])
+    .finally(() => clearTimeout(timer));
+}
+
+function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
+  return enqueueSend(() => sendSocketWithTimeout(chatId, payload, options, timeoutMs));
 }
 
 function formatOutgoingMessage(message) {
@@ -988,6 +993,52 @@ app.post('/send-media', async (req, res) => {
     res.json({ success: true, messageId: sent?.key?.id });
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// Send multiple images/videos as one native WhatsApp album. The whole parent
+// + children sequence occupies one queue slot so unrelated sends cannot
+// interleave with the album on the shared Baileys socket.
+app.post('/send-album', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, items, delayMs } = req.body;
+  if (!chatId || !Array.isArray(items)) {
+    return res.status(400).json({ error: 'chatId and items are required' });
+  }
+
+  try {
+    // Preflight every file before the parent is sent. Known local failures
+    // must not leave an empty or permanently incomplete album envelope.
+    const preparedItems = prepareAlbumItems(items);
+    const parsedDelayMs = Number(delayMs || 0);
+    if (!Number.isFinite(parsedDelayMs) || parsedDelayMs < 0) {
+      return res.status(400).json({ error: 'delayMs must be a non-negative number' });
+    }
+
+    const result = await enqueueSend(() => sendAlbumSequence({
+      chatId,
+      items: preparedItems,
+      delayMs: Math.min(parsedDelayMs, 60000),
+      send: async (targetChatId, payload) => {
+        const sent = await sendSocketWithTimeout(targetChatId, payload);
+        trackSentMessageId(sent);
+        messageStore.remember(sent);
+        return sent;
+      },
+    }));
+
+    const statusCode = result.success ? 200 : (result.status === 'partial_failure' ? 207 : 502);
+    return res.status(statusCode).json(result);
+  } catch (err) {
+    return res.status(400).json({
+      success: false,
+      attempted: false,
+      status: 'validation_error',
+      error: err.message,
+    });
   }
 });
 

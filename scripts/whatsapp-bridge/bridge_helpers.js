@@ -1,5 +1,5 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { randomBytes } from 'crypto';
 
 export const MIME_MAP = {
@@ -530,6 +530,119 @@ export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, file
     default:
       return null;
   }
+}
+
+export function buildAlbumPlan(items) {
+  if (!Array.isArray(items) || items.length < 2) {
+    throw new Error('at least two album items are required');
+  }
+
+  let expectedImageCount = 0;
+  let expectedVideoCount = 0;
+  const children = items.map((item, index) => {
+    const type = String(item?.type || '').trim().toLowerCase();
+    if (!['image', 'video'].includes(type)) {
+      throw new Error(`album item ${index} must be an image or video`);
+    }
+    if (!item?.payload || typeof item.payload !== 'object') {
+      throw new Error(`album item ${index} payload is required`);
+    }
+    if (type === 'image') expectedImageCount += 1;
+    if (type === 'video') expectedVideoCount += 1;
+    return { type, filePath: item.filePath, payload: item.payload };
+  });
+
+  return {
+    parentPayload: {
+      album: { expectedImageCount, expectedVideoCount },
+    },
+    children,
+  };
+}
+
+export function prepareAlbumItems(items) {
+  if (!Array.isArray(items) || items.length < 2) {
+    throw new Error('at least two album items are required');
+  }
+
+  return items.map((item, index) => {
+    const filePath = String(item?.filePath || '').trim();
+    if (!filePath) throw new Error(`album item ${index} filePath is required`);
+    if (!existsSync(filePath)) throw new Error(`album item ${index} file not found: ${filePath}`);
+
+    const ext = filePath.toLowerCase().split('.').pop();
+    const inferredType = inferMediaType(ext);
+    const type = String(item?.mediaType || inferredType).trim().toLowerCase();
+    if (!['image', 'video'].includes(type) || type !== inferredType) {
+      throw new Error(`album item ${index} must be an image or video matching its file type`);
+    }
+
+    const payload = mediaPayloadForFile({
+      buffer: readFileSync(filePath),
+      filePath,
+      mediaType: type,
+      caption: item?.caption,
+      fileName: item?.fileName,
+    });
+    if (!payload) throw new Error(`album item ${index} could not be prepared`);
+    return { type, filePath, payload };
+  });
+}
+
+export async function sendAlbumSequence({ chatId, items, send, delayMs = 0 }) {
+  if (typeof send !== 'function') throw new Error('album send function is required');
+  const plan = buildAlbumPlan(items);
+  let parent;
+  try {
+    parent = await send(chatId, plan.parentPayload);
+    if (!parent?.key?.id) throw new Error('album parent send returned no message id');
+  } catch (error) {
+    return {
+      success: false,
+      attempted: true,
+      status: 'parent_failure',
+      parentMessageId: null,
+      childMessageIds: [],
+      items: [],
+      error: error?.message || String(error),
+    };
+  }
+
+  const itemResults = [];
+  for (let index = 0; index < plan.children.length; index += 1) {
+    const child = plan.children[index];
+    try {
+      const sent = await send(chatId, {
+        ...child.payload,
+        albumParentKey: parent.key,
+      });
+      if (!sent?.key?.id) throw new Error('album child send returned no message id');
+      itemResults.push({ index, filePath: child.filePath, success: true, messageId: sent.key.id });
+    } catch (error) {
+      itemResults.push({
+        index,
+        filePath: child.filePath,
+        success: false,
+        error: error?.message || String(error),
+      });
+    }
+    if (delayMs > 0 && index < plan.children.length - 1) {
+      await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+  }
+
+  const childMessageIds = itemResults
+    .filter(item => item.success)
+    .map(item => item.messageId);
+  const success = itemResults.every(item => item.success);
+  return {
+    success,
+    attempted: true,
+    status: success ? 'success' : 'partial_failure',
+    parentMessageId: parent.key.id,
+    childMessageIds,
+    items: itemResults,
+  };
 }
 
 export function buildPollPayload({ question, options, selectableCount = 1 }) {

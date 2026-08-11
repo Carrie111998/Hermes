@@ -43,3 +43,98 @@ async def test_send_location_posts_to_bridge_location_endpoint():
     }
 
 
+@pytest.mark.asyncio
+async def test_send_multiple_images_posts_one_native_album_request(tmp_path):
+    adapter = _make_adapter()
+    session = adapter._http_session
+    assert session is not None
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    resp = MagicMock(status=200)
+    resp.json = AsyncMock(return_value={
+        "success": True,
+        "parentMessageId": "album-parent",
+        "childMessageIds": ["child-1", "child-2"],
+    })
+    session.post = MagicMock(return_value=_AsyncCM(resp))
+
+    await adapter.send_multiple_images(
+        "15551234567",
+        [(first.as_uri(), ""), (second.as_uri(), "second caption")],
+    )
+
+    session.post.assert_called_once()
+    call = session.post.call_args
+    assert call.args[0] == "http://127.0.0.1:3000/send-album"
+    assert call.kwargs["json"] == {
+        "chatId": "15551234567@s.whatsapp.net",
+        "items": [
+            {"filePath": str(first), "mediaType": "image"},
+            {"filePath": str(second), "mediaType": "image", "caption": "second caption"},
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_send_multiple_images_falls_back_when_album_preflight_was_not_attempted(tmp_path):
+    adapter = _make_adapter()
+    session = adapter._http_session
+    assert session is not None
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    validation_resp = MagicMock(status=400)
+    validation_resp.json = AsyncMock(return_value={
+        "success": False,
+        "attempted": False,
+        "status": "validation_error",
+        "error": "invalid album",
+    })
+    media_resp = MagicMock(status=200)
+    media_resp.json = AsyncMock(return_value={"success": True, "messageId": "child"})
+    session.post = MagicMock(side_effect=[
+        _AsyncCM(validation_resp),
+        _AsyncCM(media_resp),
+        _AsyncCM(media_resp),
+    ])
+
+    await adapter.send_multiple_images(
+        "15551234567",
+        [(first.as_uri(), ""), (second.as_uri(), "")],
+    )
+
+    urls = [call.args[0] for call in session.post.call_args_list]
+    assert urls == [
+        "http://127.0.0.1:3000/send-album",
+        "http://127.0.0.1:3000/send-media",
+        "http://127.0.0.1:3000/send-media",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_album_does_not_hold_global_queue_for_human_delay(tmp_path):
+    adapter = _make_adapter()
+    session = adapter._http_session
+    assert session is not None
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    resp = MagicMock(status=200)
+    resp.json = AsyncMock(return_value={"success": True})
+    session.post = MagicMock(return_value=_AsyncCM(resp))
+
+    await adapter.send_multiple_images(
+        "15551234567",
+        [(first.as_uri(), ""), (second.as_uri(), "")],
+        human_delay=2.5,
+    )
+
+    payload = session.post.call_args.kwargs["json"]
+    assert "delayMs" not in payload
+
+
