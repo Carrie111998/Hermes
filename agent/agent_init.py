@@ -582,6 +582,16 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    # Kanban workers are one-shot and must never silently mix the launch
+    # profile's prompt identity with another profile's state database.
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        from agent.profile_scope import assert_profile_scope
+
+        assert_profile_scope(
+            os.environ.get("HERMES_PROFILE") or None,
+            getattr(session_db, "db_path", None) or getattr(session_db, "path", None),
+        )
+
     _install_safe_stdio()
 
     agent.model = model

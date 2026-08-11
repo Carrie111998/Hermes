@@ -190,8 +190,8 @@ class HolographicMemoryProvider(MemoryProvider):
         if total == 0:
             return (
                 "# Holographic Memory\n"
-                "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
-                "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
+                "Profile-scoped memory is enabled but this store is empty. It is isolated from the default profile's memory; do not copy global personal facts into it without an explicit policy.\n"
+                "Use fact_store(action='add') only for durable facts this worker is authorized to retain.\n"
                 "Use fact_feedback to rate facts after using them (trains trust scores)."
             )
         return (
