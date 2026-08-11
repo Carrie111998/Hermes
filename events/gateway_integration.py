@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from events.bus import EventBus
@@ -218,6 +219,10 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _stop_event.clear()
     _subscriber_thread = threading.Thread(
         target=_subscriber_poll_loop,
+        # Capture the heartbeat target NOW — at startup, where its meaning is
+        # fixed — and carry it. shutdown()'s join has a 5s timeout, so on a
+        # loaded box this thread can outlive the test that started it.
+        args=(gateway_heartbeat_path(),),
         daemon=True,
         name="event-subscribers",
     )
@@ -432,7 +437,9 @@ def _get_et_hour() -> int:
         return datetime.utcnow().hour  # fallback
 
 
-def _write_heartbeat(consecutive_outer_errors: int) -> None:
+def _write_heartbeat(
+    consecutive_outer_errors: int, *, path: Optional[Path] = None
+) -> None:
     """Atomically write a liveness signal file for external watchers.
 
     Payload keys:
@@ -446,8 +453,20 @@ def _write_heartbeat(consecutive_outer_errors: int) -> None:
     file's mtime and alert when it exceeds a staleness threshold; reading
     the JSON gives them richer diagnostic context for why the loop is
     degraded even if still writing.
+
+    ``path`` lets a caller CARRY a target captured when its meaning was fixed
+    rather than re-resolving ``HERMES_HOME`` on every tick. The early-boot
+    heartbeat thread needs this: it can outlive the scope that started it, and
+    a per-tick resolve follows the env to whatever a test's teardown restores.
+    Direct callers pass nothing and resolve live — correct, since the process
+    still holds the home it was launched with.
     """
-    path = gateway_heartbeat_path()
+    if path is None:
+        path = gateway_heartbeat_path()
+    elif not path.parent.exists():
+        # The captured home is gone (e.g. a torn-down pytest tmp_path).
+        # Leave no litter — do not recreate someone else's deleted directory.
+        return
     subscriber_count = len(_registry.subscribers) if _registry is not None else 0
     uptime = time.monotonic() - _startup_monotonic if _startup_monotonic else 0.0
     payload = {
@@ -572,8 +591,13 @@ def _should_attempt_whatsapp_flush(
     return (now - last_flush_attempt) >= retry_interval
 
 
-def _subscriber_poll_loop() -> None:
+def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
     """Background thread that polls all subscribers at their configured intervals.
+
+    ``heartbeat_path`` is captured by :func:`startup` and carried in, so a tick
+    that lands after ``shutdown()``'s bounded ``join(timeout=5)`` gives up still
+    writes to the home this loop was started with. Re-resolving it per tick
+    would follow ``HERMES_HOME`` into whatever a test's teardown restored.
 
     Outer try/except is a safety net: every sub-operation below already has
     its own try/except, but a handful of state saves and iterations are not
@@ -878,7 +902,7 @@ def _subscriber_poll_loop() -> None:
             # because a stuck filesystem must not kill the loop.
             if now - last_heartbeat >= HEARTBEAT_INTERVAL_SECONDS:
                 try:
-                    _write_heartbeat(consecutive_outer_errors)
+                    _write_heartbeat(consecutive_outer_errors, path=heartbeat_path)
                 except Exception:
                     logger.exception("Heartbeat write failed")
                 last_heartbeat = now
