@@ -38,6 +38,8 @@ describe('backend action helpers are profile-scoped', () => {
     void getStatus()
     void getMessagingPlatforms()
 
+    expect(api.mock.calls).toHaveLength(2)
+
     for (const call of api.mock.calls) {
       expect(call[0].profile).toBeUndefined()
     }

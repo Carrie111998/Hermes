@@ -85,3 +85,11 @@ required full verification suite.
 No configuration or data migration is required. The fix changes only request
 routing when a non-default profile is active; default-profile and
 single-profile behavior remains unchanged.
+
+Known limitation: when multiple profiles share one remote backend, switching
+profiles does not remount `MessagingView`. Its platform data lives in local
+React state and does not respond to `invalidateProfileScopedQueries()`, so the
+page can continue showing the previous profile's credentials until it is
+manually refreshed. This change intentionally fixes request routing only;
+refreshing local Messaging state on a shared-remote profile switch is follow-up
+work.

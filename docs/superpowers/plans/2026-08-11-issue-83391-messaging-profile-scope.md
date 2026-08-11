@@ -21,7 +21,7 @@
 - Test: `apps/desktop/src/hermes-profile-scope.test.ts:3-15,83`
 - Modify: `apps/desktop/src/hermes.ts:1265-1286`
 
-- [ ] **Step 1: Write the failing regression test**
+- [x] **Step 1: Write the failing regression test**
 
 Add the three messaging helpers to the existing import:
 
@@ -86,7 +86,7 @@ it('omits profile when none is active (single-profile users unaffected)', () => 
 })
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run:
 
@@ -96,7 +96,7 @@ npm --prefix apps/desktop run test:ui -- src/hermes-profile-scope.test.ts
 
 Expected: FAIL in `forwards the active profile to messaging platform endpoints`; each messaging request is missing `profile: 'hmbot2'`.
 
-- [ ] **Step 3: Implement the minimal profile propagation**
+- [x] **Step 3: Implement the minimal profile propagation**
 
 Update only the three request descriptors in `apps/desktop/src/hermes.ts`:
 
@@ -129,7 +129,7 @@ export function testMessagingPlatform(platformId: string): Promise<MessagingPlat
 }
 ```
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run:
 
@@ -139,7 +139,7 @@ npm --prefix apps/desktop run test:ui -- src/hermes-profile-scope.test.ts
 
 Expected: PASS for the complete `hermes-profile-scope.test.ts` file.
 
-- [ ] **Step 5: Commit the tested fix**
+- [x] **Step 5: Commit the tested fix**
 
 ```bash
 git add apps/desktop/src/hermes.ts apps/desktop/src/hermes-profile-scope.test.ts
@@ -152,7 +152,7 @@ git commit -m "fix(desktop): scope messaging requests to active profile"
 - Verify: `apps/desktop/src/hermes.ts`
 - Verify: `apps/desktop/src/hermes-profile-scope.test.ts`
 
-- [ ] **Step 1: Run the complete desktop unit-test suite**
+- [x] **Step 1: Run the complete desktop unit-test suite**
 
 ```bash
 npm --prefix apps/desktop test
@@ -160,7 +160,7 @@ npm --prefix apps/desktop test
 
 Expected: all UI and Electron Vitest projects pass.
 
-- [ ] **Step 2: Run desktop type checking and linting**
+- [x] **Step 2: Run desktop type checking and linting**
 
 ```bash
 npm --prefix apps/desktop run typecheck
@@ -169,7 +169,7 @@ npm --prefix apps/desktop run lint
 
 Expected: both commands exit with status 0 and report no errors.
 
-- [ ] **Step 3: Run the repository Python suite required by AGENTS.md**
+- [x] **Step 3: Run the repository Python suite required by AGENTS.md**
 
 ```bash
 source venv/bin/activate
@@ -178,7 +178,7 @@ python -m pytest tests/ -q
 
 Expected: the full Python test suite exits with status 0 and no failures.
 
-- [ ] **Step 4: Inspect the final diff and worktree**
+- [x] **Step 4: Inspect the final diff and worktree**
 
 ```bash
 git diff origin/main...HEAD --check
