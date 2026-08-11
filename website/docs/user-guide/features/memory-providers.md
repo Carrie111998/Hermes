@@ -305,18 +305,33 @@ hermes memory setup    # select "openviking"
 hermes config set memory.provider openviking
 ```
 
-`hermes memory setup` can reuse or copy connection values from
-`~/.openviking/ovcli.conf`. Manual setup uses the active profile's `.env` file;
-for the default profile that is `~/.hermes/.env`, and for named profiles use
-`~/.hermes/profiles/<profile>/.env`.
+`hermes memory setup` can reuse an `~/.openviking/ovcli.conf` or copy selected
+connection values into the active profile's `.env`. For manual configuration,
+put only the API key there; for the default profile that is `~/.hermes/.env`,
+and for named profiles use `~/.hermes/profiles/<profile>/.env`.
 
 ```text
-OPENVIKING_ENDPOINT=http://127.0.0.1:1933
-# OPENVIKING_API_KEY=...
-# OPENVIKING_ACCOUNT=default
-# OPENVIKING_USER=default
-# OPENVIKING_AGENT=hermes
+OPENVIKING_API_KEY=...
 ```
+
+Put the endpoint and local/trusted identity settings in the active profile's
+`config.yaml`:
+
+```yaml
+memory:
+  provider: openviking
+  openviking:
+    endpoint: http://127.0.0.1:1933
+    account: default
+    user: default
+    agent: hermes
+```
+
+The setup command may store all selected connection values in the profile's
+`.env`. Legacy `OPENVIKING_ENDPOINT`, `OPENVIKING_ACCOUNT`, `OPENVIKING_USER`,
+and `OPENVIKING_AGENT` overrides remain supported. Bound profiles resolve
+identity from their own secret scope; the process-level `OPENVIKING_ENDPOINT`
+remains a non-secret fallback when the profile supplies none.
 
 OpenViking server settings live in `ov.conf` (`--config`,
 `OPENVIKING_CONFIG_FILE`, or `~/.openviking/ov.conf`). Client connection values
@@ -329,7 +344,10 @@ live in `ovcli.conf` (`OPENVIKING_CLI_CONFIG_FILE` or
 - `viking://` URI scheme for hierarchical knowledge browsing
 
 `OPENVIKING_ACCOUNT` and `OPENVIKING_USER` are used for local/trusted mode.
-`OPENVIKING_AGENT` is Hermes' peer ID in OpenViking for peer-scoped memories.
+`OPENVIKING_AGENT` is the peer identity sent through the
+`X-OpenViking-Actor-Peer` header. For current-user shorthand memory writes,
+OpenViking uses that identity together with the authenticated account and
+applies its own namespace policy when resolving the canonical URI.
 
 ---
 
