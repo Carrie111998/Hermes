@@ -559,13 +559,17 @@ def test_notifier_review_requested_carries_kanban_review_metadata(tmp_path, monk
         f"{len(adapter.sent)}"
     )
     text = adapter.sent[0]["text"]
-    assert tid in text
-    assert "review" in text.lower()
-    assert "Card:" in text
-    assert "Run:" in text
-    assert "Status: review" in text
-    assert "Current step: Awaiting decision" in text
-    assert "Next action: Click Approve or Reject" in text
+    assert text.startswith("👀 **Review decision required**\n")
+    assert "**Status:** Awaiting your decision" in text
+    assert "**What changed:** review button test" in text
+    assert "Use the buttons below: Approve accepts this review; Reject asks for a reason." in text
+    assert "**Diff / impact**" in text
+    assert "**Owner / current step / next action**" in text
+    assert "worker · Awaiting decision · Click Approve or Reject" in text
+    assert text.endswith(f"Audit: card {tid} · run 1")
+    assert "Card:" not in text
+    assert "Run:" not in text
+    assert "\\n" not in text
     assert "Replace the old approval path" in text
     assert "pytest -q tests/gateway/test_kanban_notifier.py" in text
     assert "A stale button" in text

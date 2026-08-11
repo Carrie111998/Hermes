@@ -517,23 +517,19 @@ class GatewayKanbanWatchersMixin:
                             if handoff.startswith("Not supplied") and ev.payload and ev.payload.get("summary"):
                                 handoff = str(ev.payload["summary"])
                             owner = task.assignee if task and task.assignee else "unassigned"
-                            location_id = str(sub.get("thread_id") or sub["chat_id"])
+                            what_changed = " ".join(title.splitlines()).strip() or "Review the proposed change below."
                             msg = (
-                                "👀 Kanban review\n"
-                                f"Card: {sub['task_id']}\n"
-                                f"Run: {getattr(ev, 'run_id', None) or 'unknown'}\n"
-                                f"Status: review\n"
-                                f"Owner: {owner}\n"
-                                "Current step: Awaiting decision\n"
-                                f"Last update: {getattr(ev, 'created_at', 'unknown')}\n"
-                                "Blocker: none\n"
-                                "Next action: Click Approve or Reject\n"
-                                f"Location: this message in <#{location_id}>\n\n"
-                                f"Summary:\n{handoff}\n\n"
-                                f"Proposed change:\n{review_value('proposed_change', 'change', 'diff')}\n\n"
-                                f"Tests:\n{review_value('tests', 'tests_run', 'verification')}\n\n"
-                                f"Risks:\n{review_value('risks')}\n\n"
-                                f"Rollback:\n{review_value('rollback')}"
+                                "👀 **Review decision required**\n"
+                                "**Status:** Awaiting your decision\n"
+                                f"**What changed:** {what_changed}\n"
+                                "Use the buttons below: Approve accepts this review; Reject asks for a reason.\n\n"
+                                f"**Diff / impact**\n{review_value('proposed_change', 'change', 'diff')}\n\n"
+                                f"**Tests**\n{review_value('tests', 'tests_run', 'verification')}\n\n"
+                                f"**Risks**\n{review_value('risks')}\n\n"
+                                f"**Rollback**\n{review_value('rollback')}\n\n"
+                                "**Owner / current step / next action**\n"
+                                f"{owner} · Awaiting decision · Click Approve or Reject\n\n"
+                                f"Audit: card {sub['task_id']} · run {getattr(ev, 'run_id', None) or 'unknown'}"
                             )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
