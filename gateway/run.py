@@ -5908,6 +5908,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
+    _shutdown_task: Optional[asyncio.Task] = None
     _profile_failed_platforms: Optional[Dict[str, Dict[Platform, asyncio.Task]]] = None
     _systemd_watchdog: Optional[Any] = None
     _startup_restore_in_progress: bool = False
@@ -6113,6 +6114,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._booted_from_restart: bool = False
         self._stop_task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
+        # Strong reference to the task the SIGINT/SIGTERM handler creates for
+        # stop().  Same role as _restart_task on the SIGUSR1 path — see the
+        # comment in request_restart() and shutdown_signal_handler().
+        self._shutdown_task: Optional[asyncio.Task] = None
         self._executor_lock = threading.Lock()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
@@ -27765,7 +27770,19 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 )
             except Exception as _e:
                 logger.debug("spawn_async_diagnostic failed: %s", _e)
-        asyncio.create_task(runner.stop())
+        # Hold a strong reference to the shutdown task on the runner.  A bare
+        # asyncio.create_task() keeps only a weak reference, so the event loop
+        # may garbage-collect a still-pending task mid-flight — the identical
+        # hazard the SIGUSR1 restart path was hardened against (see
+        # request_restart(), which keeps self._restart_task for this reason).
+        # This path is the one every `systemctl stop`, `hermes gateway stop`
+        # and interactive Ctrl+C takes.  stop() only becomes self-anchoring
+        # once it reaches `self._stop_task = asyncio.create_task(_stop_impl())`;
+        # a collection before that point means _stop_impl is never created at
+        # all, so the gateway never tears down — it just keeps running until
+        # TimeoutStopSec escalates to SIGKILL, with in-flight turns undrained
+        # and sessions never finalized.
+        runner._shutdown_task = asyncio.create_task(runner.stop())
 
     def restart_signal_handler():
         runner.request_restart(detached=False, via_service=True)
