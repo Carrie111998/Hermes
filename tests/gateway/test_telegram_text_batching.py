@@ -44,6 +44,7 @@ def _make_adapter():
     adapter._set_status_indicator = AsyncMock()
     adapter._release_platform_lock = lambda: None
     adapter._text_batch_delay_seconds = 0.1  # fast for tests
+    adapter._media_batch_delay_seconds = 0.1
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter._message_handler = AsyncMock()
@@ -73,6 +74,19 @@ def _make_event(
         platform_update_id=update_id,
         timestamp=datetime(2026, 8, 7, 12, 0, tzinfo=timezone.utc),
     )
+
+
+def _make_typed_event(text: str, update_id: int) -> MessageEvent:
+    event = _make_event(text)
+    event.metadata["telegram_update"] = {
+        "event_type": "message.new",
+        "update_id": update_id,
+        "message_id": str(update_id),
+        "dispatch_kind": "gateway_dispatch",
+        "payload_hash": f"payload-{update_id}",
+        "content_hash": f"content-{update_id}",
+    }
+    return event
 
 
 class TestTextBatching:
@@ -154,6 +168,66 @@ class TestTextBatching:
                 "message_type": "text",
             },
         ]
+
+    @pytest.mark.asyncio
+    async def test_split_batch_preserves_all_updates_without_claiming_single_identity(self):
+        adapter = _make_adapter()
+
+        adapter._enqueue_text_event(_make_typed_event("chunk one", 101))
+        await asyncio.sleep(0.02)
+        adapter._enqueue_text_event(_make_typed_event("chunk two", 102))
+        await asyncio.sleep(0.2)
+
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert "telegram_update" not in dispatched.metadata
+        assert [
+            item["update_id"] for item in dispatched.metadata["telegram_updates"]
+        ] == [101, 102]
+
+    @pytest.mark.asyncio
+    async def test_photo_batch_preserves_all_updates_without_claiming_single_identity(self):
+        adapter = _make_adapter()
+        first = _make_typed_event("first caption", 201)
+        first.media_urls = ["/tmp/first.jpg"]
+        first.media_types = ["image/jpeg"]
+        second = _make_typed_event("second caption", 202)
+        second.media_urls = ["/tmp/second.jpg"]
+        second.media_types = ["image/jpeg"]
+
+        adapter._enqueue_photo_event("album", first)
+        await asyncio.sleep(0.02)
+        adapter._enqueue_photo_event("album", second)
+        await asyncio.sleep(0.2)
+
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert "telegram_update" not in dispatched.metadata
+        assert [
+            item["update_id"] for item in dispatched.metadata["telegram_updates"]
+        ] == [201, 202]
+
+    @pytest.mark.asyncio
+    async def test_media_group_preserves_all_updates_without_claiming_single_identity(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        adapter = _make_adapter()
+        first = _make_typed_event("album caption", 301)
+        first.media_urls = ["/tmp/first.jpg"]
+        first.media_types = ["image/jpeg"]
+        second = _make_typed_event("", 302)
+        second.media_urls = ["/tmp/second.jpg"]
+        second.media_types = ["image/jpeg"]
+
+        with patch.object(TelegramAdapter, "MEDIA_GROUP_WAIT_SECONDS", 0.1):
+            await adapter._queue_media_group_event("album", first)
+            await asyncio.sleep(0.02)
+            await adapter._queue_media_group_event("album", second)
+            await asyncio.sleep(0.2)
+
+        dispatched = adapter.handle_message.call_args[0][0]
+        assert "telegram_update" not in dispatched.metadata
+        assert [
+            item["update_id"] for item in dispatched.metadata["telegram_updates"]
+        ] == [301, 302]
 
     @pytest.mark.asyncio
     async def test_three_way_split_aggregated(self):
