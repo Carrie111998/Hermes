@@ -56,12 +56,15 @@ class TestDesktopUiToolset:
 
 
 class TestSurfaceResolution:
-    def test_desktop_session_gets_them_with_no_desktop_env(self, no_desktop_env):
+    def test_desktop_session_gets_gui_and_drawing_tools_with_no_desktop_env(self, no_desktop_env):
         """THE regression: a desktop client on a remote/cloud backend."""
-        assert "desktop_ui" in server._gui_surface_toolsets("desktop")
+        surfaces = server._gui_surface_toolsets("desktop")
+
+        assert {"desktop_ui", "excalidraw"} <= surfaces
 
     def test_tui_session_does_not(self, no_desktop_env):
         assert "desktop_ui" not in server._gui_surface_toolsets("tui")
+        assert "excalidraw" not in server._gui_surface_toolsets("tui")
 
     def test_desktop_env_alone_does_not_grant_them(self, no_desktop_env):
         """A desktop-spawned backend serving a TUI session stays clean.
@@ -87,6 +90,7 @@ class TestResolverPlumbing:
         assert server._load_enabled_toolsets("desktop") == [
             "coding",
             "desktop_ui",
+            "excalidraw",
             "project",
         ]
         assert server._load_enabled_toolsets("tui") == ["coding", "project"]

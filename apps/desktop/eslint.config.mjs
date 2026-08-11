@@ -35,6 +35,15 @@ export default [
     }
   },
   {
+    // Excalidraw is a bundled first-party integration. Its private imports keep
+    // host-only filesystem, persistence, and pane-tree capabilities out of the
+    // runtime SDK, whose exports are injected into untrusted runtime plugins.
+    files: ['src/plugins/excalidraw/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': 'off'
+    }
+  },
+  {
     files: ['**/*.test.tsx'],
     rules: {
       'no-restricted-globals': ['warn', 'document']

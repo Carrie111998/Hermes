@@ -2,6 +2,7 @@ import { type ConnectionState, type GatewayEvent, resolveGatewayWsUrl } from '@h
 import { atom } from 'nanostores'
 
 import { HermesGateway } from '@/hermes'
+import { desktopRuntimeIdentity } from '@/lib/desktop-fs'
 import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setGatewayState } from '@/store/session'
@@ -31,6 +32,7 @@ interface Secondary {
   profile: string
   gateway: HermesGateway
   offEvent: () => void
+  runtime: string
   offState: () => void
   reconnectTimer: ReturnType<typeof setTimeout> | null
   reconnectAttempt: number
@@ -175,6 +177,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
   }
 
   const conn = await desktop.getConnection(entry.profile)
+  entry.runtime = desktopRuntimeIdentity(conn)
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
   await entry.gateway.connect(wsUrl)
   void desktop.touchBackend?.(entry.profile).catch(() => undefined)
@@ -221,6 +224,7 @@ function createSecondary(profile: string): Secondary {
 
   const entry: Secondary = {
     profile,
+    runtime: '',
     gateway,
     offEvent: () => {},
     offState: () => {},
@@ -230,7 +234,7 @@ function createSecondary(profile: string): Secondary {
     wantOpen: true
   }
 
-  entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile }))
+  entry.offEvent = gateway.onEvent(event => g.config?.onEvent({ ...event, profile, runtime: entry.runtime || undefined }))
   entry.offState = gateway.onState(state => {
     reportGatewayState(profile, state)
 

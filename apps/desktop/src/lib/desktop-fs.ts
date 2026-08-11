@@ -16,9 +16,9 @@ export function setDesktopFsRemotePicker(next: DesktopFsRemotePicker | null) {
   remotePicker = next
 }
 
-function connectionCacheKey(connection: HermesConnection | null) {
-  if (!connection) {
-    return 'local:'
+export function desktopRuntimeIdentity(connection: HermesConnection | null = $connection.get()): string {
+  if (!connection || connection.mode !== 'remote') {
+    return 'local'
   }
 
   const target =
@@ -26,11 +26,11 @@ function connectionCacheKey(connection: HermesConnection | null) {
       ? connection.remoteIdentity || connection.remoteHost || ''
       : connection.baseUrl || ''
 
-  return `${connection.mode || 'local'}:${connection.remoteKind || ''}:${connection.profile || ''}:${target}`
+  return `remote:${connection.remoteKind || ''}:${connection.profile || ''}:${target}`
 }
 
 export function desktopFsCacheKey(connection: HermesConnection | null = $connection.get()) {
-  return connectionCacheKey(connection)
+  return desktopRuntimeIdentity(connection)
 }
 
 export function isDesktopFsRemoteMode() {
