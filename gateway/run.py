@@ -8039,6 +8039,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+        try:
+            # Keep the cross-process LSP snapshot aligned with gateway
+            # lifecycle transitions without instantiating an LSP singleton.
+            from agent.lsp import publish_service_status
+
+            publish_service_status()
+        except Exception:
+            pass
 
     def _persist_active_agents(self) -> None:
         """Persist the live in-flight agent count to ``gateway_state.json``.
