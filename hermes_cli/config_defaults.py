@@ -2324,6 +2324,24 @@ DEFAULT_CONFIG = {
         # behaviour — e.g. for a profile that prefers explicit
         # ``kanban_notify-subscribe`` calls per task.
         "auto_subscribe_on_create": True,
+        # Session-independent fallback subscription. ``auto_subscribe_on_create``
+        # only fires when a task is created from inside a live gateway/TUI
+        # session; CLI (`hermes kanban create`), cron, and dispatcher-spawned
+        # workers have no session context, so those tasks used to complete
+        # silently. When this is true, every task created through
+        # ``kanban_db.create_task`` also subscribes the active profile's
+        # configured home channel (``platforms.<platform>.home_channel``), so
+        # completion / block events always reach the user's own chat regardless
+        # of where the task was created. Set to false to restore the
+        # session-only behaviour.
+        "default_notify_home_channel": True,
+        # Only subscribe the home channel for tasks at or above this priority.
+        # 0 (the default task priority) means "every task".
+        "default_notify_min_priority": 0,
+        # Platform whose home channel receives the fallback subscription.
+        # Empty = auto-detect: the first enabled platform in ``platforms:``
+        # that has a ``home_channel.chat_id``.
+        "default_notify_platform": "",
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false

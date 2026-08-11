@@ -1583,3 +1583,175 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# create_task(): home-channel fallback notification subscription
+#
+# The session-based auto-subscribe in tools/kanban_tools.py only fires when the
+# caller has live gateway/TUI session context. CLI, cron, and dispatcher-spawned
+# worker creations have none, so those tasks completed silently. create_task()
+# now also subscribes the active profile's configured home channel, gated by
+# kanban.default_notify_home_channel.
+# ---------------------------------------------------------------------------
+
+_SLACK_HOME_CONFIG = (
+    "platforms:\n"
+    "  slack:\n"
+    "    enabled: true\n"
+    "    home_channel:\n"
+    "      platform: slack\n"
+    "      chat_id: D0HOMECHAN\n"
+    "      name: D0HOMECHAN\n"
+    "      user_id: U0USER\n"
+)
+
+
+def _subs_for(task_id):
+    conn = kb.connect()
+    try:
+        return list(kb.list_notify_subs(conn, task_id))
+    finally:
+        conn.close()
+
+
+@pytest.fixture
+def slack_home(kanban_home):
+    """kanban_home plus a slack home channel in config.yaml."""
+    (kanban_home / "config.yaml").write_text(_SLACK_HOME_CONFIG, encoding="utf-8")
+    return kanban_home
+
+
+def test_create_task_subscribes_home_channel_by_default(slack_home):
+    """A CLI-style create (no session context) still gets a notify sub."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="home channel default", assignee="peer")
+    finally:
+        conn.close()
+
+    subs = _subs_for(tid)
+    assert len(subs) == 1, subs
+    assert subs[0]["platform"] == "slack"
+    assert subs[0]["chat_id"] == "D0HOMECHAN"
+    assert subs[0]["chat_type"] == "dm"  # D-prefixed slack id -> DM
+    assert subs[0]["user_id"] == "U0USER"
+    assert subs[0]["notifier_profile"]  # stamped with the owning profile
+
+
+def test_create_task_home_channel_gate_disabled(slack_home):
+    """kanban.default_notify_home_channel: false restores session-only behaviour."""
+    (slack_home / "config.yaml").write_text(
+        _SLACK_HOME_CONFIG + "kanban:\n  default_notify_home_channel: false\n",
+        encoding="utf-8",
+    )
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="gated off", assignee="peer")
+    finally:
+        conn.close()
+
+    assert _subs_for(tid) == []
+
+
+def test_create_task_home_channel_respects_min_priority(slack_home):
+    """Below default_notify_min_priority nothing is subscribed; at/above it is."""
+    (slack_home / "config.yaml").write_text(
+        _SLACK_HOME_CONFIG + "kanban:\n  default_notify_min_priority: 5\n",
+        encoding="utf-8",
+    )
+    conn = kb.connect()
+    try:
+        low = kb.create_task(conn, title="low prio", assignee="peer", priority=1)
+        high = kb.create_task(conn, title="high prio", assignee="peer", priority=5)
+    finally:
+        conn.close()
+
+    assert _subs_for(low) == []
+    assert len(_subs_for(high)) == 1
+
+
+def test_create_task_no_home_channel_configured_is_noop(kanban_home):
+    """No platforms/home_channel in config -> no subscription, no error."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="no home channel", assignee="peer")
+    finally:
+        conn.close()
+
+    assert _subs_for(tid) == []
+
+
+def test_create_task_home_channel_skipped_for_originating_session(
+    slack_home, monkeypatch
+):
+    """When the calling session IS the home channel, the richer session-based
+    subscription written by tools/kanban_tools.py::_maybe_auto_subscribe must be
+    the only row — otherwise a thread_id mismatch double-notifies."""
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "slack")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "D0HOMECHAN")
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="session owns it", assignee="peer")
+        assert _subs_for(tid) == []
+        # The tool layer then writes its own session-scoped subscription.
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="slack",
+            chat_id="D0HOMECHAN",
+            thread_id="1699999.0001",
+            notifier_profile="default",
+        )
+    finally:
+        conn.close()
+
+    subs = _subs_for(tid)
+    assert len(subs) == 1, subs
+    assert subs[0]["thread_id"] == "1699999.0001"
+
+
+def test_create_task_home_channel_not_duplicated_when_sub_exists(slack_home):
+    """A pre-existing sub for the same chat suppresses the fallback row even
+    when its thread_id differs (no unique-constraint overlap to rely on)."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="dupe guard", assignee="peer")
+        assert len(_subs_for(tid)) == 1
+        # A second pass (e.g. a re-entrant caller) must not add another row for
+        # the same (task, platform, chat).
+        assert kb._maybe_subscribe_home_channel(conn, tid) is False
+
+        other = kb.create_task(conn, title="dupe guard 2", assignee="peer")
+        kb.add_notify_sub(
+            conn,
+            task_id=other,
+            platform="slack",
+            chat_id="D0HOMECHAN",
+            thread_id="some-thread",
+        )
+        assert kb._maybe_subscribe_home_channel(conn, other) is False
+    finally:
+        conn.close()
+
+    assert len(_subs_for(tid)) == 1
+    assert len(_subs_for(other)) == 2  # fallback row + the explicit threaded one
+
+
+def test_create_task_home_channel_failure_never_breaks_create(
+    slack_home, monkeypatch
+):
+    """add_notify_sub blowing up must not fail the task creation."""
+    def _boom(*a, **kw):
+        raise RuntimeError("simulated DB failure")
+
+    monkeypatch.setattr(kb, "add_notify_sub", _boom)
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="best effort", assignee="peer")
+    finally:
+        conn.close()
+
+    assert tid
+    assert _subs_for(tid) == []

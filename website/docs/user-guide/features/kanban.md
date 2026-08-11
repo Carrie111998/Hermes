@@ -584,6 +584,9 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `default_notify_home_channel` | `true` | Session-independent fallback: every task created through `kanban_db.create_task` — CLI (`hermes kanban create`), cron, dispatcher-spawned workers, the `kanban_create` tool — also subscribes the active profile's `platforms.<platform>.home_channel`. Without it, tasks created outside a live chat session complete silently, because `auto_subscribe_on_create` has no session context to subscribe. Skipped when the creating session already *is* the home channel (the session-scoped row wins) or when a subscription for that chat already exists. |
+| `default_notify_min_priority` | `0` | Only fall back to the home channel for tasks at or above this priority. `0` (the default task priority) means every task. |
+| `default_notify_platform` | `""` | Platform whose home channel receives the fallback subscription. Empty = the first enabled platform in `platforms:` that has a `home_channel.chat_id`. |
 
 And the two auxiliary LLM slots:
 

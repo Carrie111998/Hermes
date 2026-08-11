@@ -3271,6 +3271,9 @@ def create_task(
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+            # Outside the write txn: add_notify_sub opens its own
+            # BEGIN IMMEDIATE and write_txn is not reentrant.
+            _maybe_subscribe_home_channel(conn, task_id, priority=priority)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -3332,6 +3335,155 @@ def _inherit_notify_subs(
             *parent_ids,
         ),
     )
+
+
+def _resolve_home_channel_target() -> Optional[dict[str, Any]]:
+    """Resolve the active profile's home channel for fallback notifications.
+
+    Returns ``None`` when the feature is disabled, no platform is enabled with
+    a ``home_channel.chat_id``, or config can't be read. The caller treats any
+    failure as "don't subscribe" — this is bookkeeping, never a hard error.
+    """
+    from hermes_cli.config import load_config_readonly, cfg_get
+
+    cfg = load_config_readonly()
+    if not cfg_get(cfg, "kanban", "default_notify_home_channel", default=True):
+        return None
+
+    platforms = cfg_get(cfg, "platforms", default=None)
+    if not isinstance(platforms, Mapping):
+        return None
+
+    configured = str(
+        cfg_get(cfg, "kanban", "default_notify_platform", default="") or ""
+    ).strip().lower()
+    # Explicit platform wins; otherwise take the first enabled platform that
+    # actually has a home channel (config order, so a single-platform install
+    # needs no extra config at all).
+    candidates = [configured] if configured else list(platforms.keys())
+    for name in candidates:
+        plat_cfg = platforms.get(name)
+        if not isinstance(plat_cfg, Mapping) or not plat_cfg.get("enabled"):
+            continue
+        home = plat_cfg.get("home_channel")
+        if not isinstance(home, Mapping):
+            continue
+        chat_id = str(home.get("chat_id") or "").strip()
+        if not chat_id:
+            continue
+        platform = str(name).strip().lower()
+        chat_type = str(home.get("chat_type") or "").strip() or None
+        if not chat_type and platform == "slack" and chat_id.startswith("D"):
+            # Slack DM ids are D-prefixed; the notifier keys wake-sessions off
+            # chat_type and would otherwise fall back to "group".
+            chat_type = "dm"
+        return {
+            "platform": platform,
+            "chat_id": chat_id,
+            "chat_type": chat_type,
+            "thread_id": str(home.get("thread_id") or "").strip() or None,
+            "user_id": str(home.get("user_id") or "").strip() or None,
+        }
+    return None
+
+
+def _maybe_subscribe_home_channel(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    priority: int = 0,
+) -> bool:
+    """Subscribe the active profile's home channel to a new task's events.
+
+    ``tools/kanban_tools.py::_maybe_auto_subscribe`` only fires when the
+    creating call has live session context (a gateway chat or a TUI session
+    key). Tasks created by `hermes kanban create`, cron, or a dispatcher-spawned
+    worker have none, so their completion / block events reached nobody. This
+    hook lives in the DB-layer ``create_task`` — the single chokepoint every
+    surface goes through — so the user's home channel is subscribed regardless
+    of where the task came from.
+
+    Gated by ``kanban.default_notify_home_channel`` (default True) and
+    ``kanban.default_notify_min_priority`` (default 0 = all tasks). Returns
+    True only when a row was written.
+
+    Duplicate suppression: skipped when any subscription for this task already
+    targets the same platform+chat (e.g. inherited from a parent), and when the
+    calling session IS the home channel — there the richer session-based
+    subscription (thread anchor, delivery metadata) is written by the tool
+    layer right after this and would otherwise double-notify on a sibling
+    thread_id.
+
+    Best-effort by design: every failure is logged at WARNING and swallowed so
+    notification bookkeeping can never fail a task creation.
+    """
+    try:
+        target = _resolve_home_channel_target()
+        if not target:
+            return False
+
+        from hermes_cli.config import load_config_readonly, cfg_get
+        cfg = load_config_readonly()
+        try:
+            min_priority = int(
+                cfg_get(cfg, "kanban", "default_notify_min_priority", default=0) or 0
+            )
+        except (TypeError, ValueError):
+            min_priority = 0
+        if int(priority or 0) < min_priority:
+            return False
+
+        platform = target["platform"]
+        chat_id = target["chat_id"]
+
+        # The session-based auto-subscribe covers this exact chat with better
+        # routing metadata; let it win instead of writing a second row.
+        if cfg_get(cfg, "kanban", "auto_subscribe_on_create", default=True):
+            try:
+                from gateway.session_context import get_session_env
+                if (
+                    get_session_env("HERMES_SESSION_PLATFORM", "").lower() == platform
+                    and get_session_env("HERMES_SESSION_CHAT_ID", "") == chat_id
+                ):
+                    return False
+            except Exception:
+                pass
+
+        existing = conn.execute(
+            "SELECT 1 FROM kanban_notify_subs "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? LIMIT 1",
+            (task_id, platform, chat_id),
+        ).fetchone()
+        if existing:
+            return False
+
+        # Stamp the profile whose config supplied the home channel: the chat id
+        # is that profile's own bot conversation, so only a gateway hosting that
+        # profile's adapter can deliver to it.
+        notifier_profile = os.environ.get("HERMES_PROFILE") or ""
+        if not notifier_profile:
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                notifier_profile = get_active_profile_name() or "default"
+            except Exception:
+                notifier_profile = "default"
+
+        add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=platform,
+            chat_id=chat_id,
+            chat_type=target["chat_type"],
+            thread_id=target["thread_id"],
+            user_id=target["user_id"],
+            notifier_profile=notifier_profile,
+        )
+        return True
+    except Exception as exc:
+        _log.warning(
+            "_maybe_subscribe_home_channel failed for %s: %r", task_id, exc
+        )
+        return False
 
 
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
