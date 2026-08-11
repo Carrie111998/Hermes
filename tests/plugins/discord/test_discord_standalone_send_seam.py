@@ -169,3 +169,130 @@ def test_standalone_send_token_fallback_to_secret_scope(monkeypatch):
     get_secret.assert_called_once_with("DISCORD_BOT_TOKEN", "")
     auth_header = mock_session.post.call_args.kwargs["headers"]["Authorization"]
     assert auth_header == "Bot scoped-token"
+
+
+def test_standalone_sanitize_error_masks_authorization_token_and_keeps_context():
+    """Sanitization is a runtime behavior: redact only the token-like value."""
+    diagnostic = (
+        "upload failed; Authorization: Bot super-secret-token-123, "
+        "status=403; request_id=req-42"
+    )
+
+    sanitized = standalone_send._standalone_sanitize_error(diagnostic)
+
+    assert "super-secret-token-123" not in sanitized
+    assert "Authorization: Bot ***" in sanitized
+    assert "upload failed" in sanitized
+    assert "status=403" in sanitized
+    assert "request_id=req-42" in sanitized
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ordinary diagnostic text",
+        "",
+        "TimeoutError()",
+        "unicode: café — こんにちは",
+        "Authorization: Bot token-without-trailing-punctuation",
+        "Authorization: bot token, next=field}",
+        object(),
+        None,
+    ],
+)
+def test_standalone_sanitize_error_accepts_arbitrary_text(value):
+    """Sanitization must never turn an arbitrary exception into another error."""
+    sanitized = standalone_send._standalone_sanitize_error(value)
+    assert isinstance(sanitized, str)
+
+
+def test_standalone_send_media_http_failure_returns_warning_shape(monkeypatch, tmp_path):
+    """A non-2xx media upload is reported as a warning, not an escaping error."""
+    monkeypatch.setattr("gateway.channel_directory.lookup_channel_type", _no_channel_type)
+    media_path = tmp_path / "payload.bin"
+    media_path.write_bytes(b"payload")
+    mock_session, _ = _build_mock_chain(500, response_text="media endpoint unavailable")
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = asyncio.run(
+            standalone_send._standalone_send(
+                SimpleNamespace(token="tok"),
+                "111222333",
+                "",
+                media_files=[(str(media_path), False)],
+            )
+        )
+
+    assert result["error"] == "No deliverable text or media remained after processing"
+    assert len(result["warnings"]) == 1
+    assert "Failed to send media" in result["warnings"][0]
+    assert "media endpoint unavailable" in result["warnings"][0]
+
+
+def test_standalone_send_media_request_exception_returns_warning_shape(monkeypatch, tmp_path):
+    """An exception while opening/requesting media is captured as a warning."""
+    monkeypatch.setattr("gateway.channel_directory.lookup_channel_type", _no_channel_type)
+    media_path = tmp_path / "payload.bin"
+    media_path.write_bytes(b"payload")
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.post = MagicMock(side_effect=RuntimeError("media request failed"))
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = asyncio.run(
+            standalone_send._standalone_send(
+                SimpleNamespace(token="tok"),
+                "111222333",
+                "",
+                media_files=[(str(media_path), False)],
+            )
+        )
+
+    assert result["error"] == "No deliverable text or media remained after processing"
+    assert len(result["warnings"]) == 1
+    assert "Failed to send media" in result["warnings"][0]
+    assert "media request failed" in result["warnings"][0]
+
+
+def test_standalone_send_forum_multipart_exception_returns_shaped_error(monkeypatch, tmp_path):
+    """Forum multipart failures are sanitized and returned as an error shape."""
+    monkeypatch.setattr(
+        "gateway.channel_directory.lookup_channel_type", lambda platform, chat_id: "forum"
+    )
+    media_path = tmp_path / "forum.bin"
+    media_path.write_bytes(b"payload")
+    mock_session = MagicMock()
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+    mock_session.post = MagicMock(side_effect=RuntimeError("forum multipart failed"))
+
+    with patch("aiohttp.ClientSession", return_value=mock_session):
+        result = asyncio.run(
+            standalone_send._standalone_send(
+                SimpleNamespace(token="tok"),
+                "111222333",
+                "forum post",
+                media_files=[(str(media_path), False)],
+            )
+        )
+
+    assert set(result) == {"error"}
+    assert "Discord forum thread upload failed" in result["error"]
+    assert "forum multipart failed" in result["error"]
+
+
+def test_standalone_send_outer_exception_returns_shaped_error(monkeypatch):
+    """An unexpected outer-path exception is shaped instead of escaping."""
+    monkeypatch.setattr("gateway.channel_directory.lookup_channel_type", _no_channel_type)
+
+    with patch("aiohttp.ClientSession", side_effect=RuntimeError("outer request setup failed")):
+        result = asyncio.run(
+            standalone_send._standalone_send(
+                SimpleNamespace(token="tok"), "111222333", "hello"
+            )
+        )
+
+    assert set(result) == {"error"}
+    assert result["error"].startswith("Discord send failed: RuntimeError:")
+    assert "outer request setup failed" in result["error"]
