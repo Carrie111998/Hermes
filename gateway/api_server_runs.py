@@ -257,6 +257,7 @@ class APIServerRunsMixin:
             session_id=session_id,
             model=body.get("model", self._model_name),
         )
+        run_sync_started = asyncio.Event()
 
         async def _run_and_close():
             try:
@@ -306,6 +307,11 @@ class APIServerRunsMixin:
                             principal_scope=scope,
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
+                        # Signal only after the executor thread has bound the
+                        # run's principal/session context.  The HTTP handler
+                        # uses this as a bounded admission handshake before
+                        # returning 202; it does not wait for model execution.
+                        loop.call_soon_threadsafe(run_sync_started.set)
                         r = agent.run_conversation(
                             user_message=user_message,
                             conversation_history=conversation_history,
@@ -415,6 +421,9 @@ class APIServerRunsMixin:
                 except Exception:
                     pass
             finally:
+                # Unblock the admission handshake if setup failed before the
+                # executor thread reached the principal-binding boundary.
+                run_sync_started.set()
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -444,12 +453,18 @@ class APIServerRunsMixin:
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-        # Give the accepted run one scheduling turn before returning 202 so
-        # its executor work is submitted even when a client immediately
-        # enters a tight status-poll loop.  This is non-blocking and keeps the
-        # run asynchronous while avoiding starvation during short-lived
-        # request/test lifecycles.
-        await asyncio.sleep(0)
+        # A 202 response means the run has been admitted, not merely queued in
+        # this event-loop turn.  Wait briefly for executor startup so an
+        # immediate status-poll loop cannot starve the run before its scoped
+        # context is bound.  Slow executor pools still return asynchronously
+        # after the bounded timeout.
+        try:
+            await asyncio.wait_for(run_sync_started.wait(), timeout=0.25)
+        except asyncio.TimeoutError:
+            logger.debug(
+                "[api_server] run %s executor admission still queued after 250ms",
+                run_id,
+            )
 
         response_headers = (
             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
