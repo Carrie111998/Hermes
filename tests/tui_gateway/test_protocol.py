@@ -140,6 +140,53 @@ def test_release_slot_retries_transient_registry_write_with_temp_home(
     assert active_sessions.active_session_registry_snapshot() == []
 
 
+def test_public_close_then_prompt_immediately_recovers_slot_after_transient_release_failure(
+    server, tmp_path, monkeypatch
+):
+    from hermes_cli import active_sessions
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 1})
+    old = {"session_key": "old-key", "history": [], "history_lock": threading.Lock(),
+           "running": False, "attached_images": []}
+    new = {"session_key": "new-key", "history": [], "history_lock": threading.Lock(),
+           "running": False, "attached_images": [], "agent": object()}
+    lease, message = server._claim_active_session_slot(
+        "old-key", live_session_id="old", surface="desktop"
+    )
+    assert message is None and lease is not None
+    old["active_session_lease"] = lease
+    server._sessions.update({"old": old, "new": new})
+    real_write = active_sessions._write_entries
+    writes = 0
+
+    def fail_once(path, entries):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError("transient registry write failure")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_once)
+    monkeypatch.setattr(server, "_teardown_session", lambda session, **kwargs:
+                        server._release_active_session_slot(session))
+    closed = server._methods["session.close"]("close", {"session_id": "old"})
+    assert closed["result"]["closed"] is True
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: None)
+    response = server._methods["prompt.submit"](
+        "prompt", {"session_id": "new", "text": "hello"}
+    )
+    assert response["result"]["status"] == "streaming"
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [entry["session_id"] for entry in entries] == ["new-key"]
+    assert new["active_session_lease"].lease_id == entries[0]["lease_id"]
+
+
 def test_transfer_retries_failed_old_lease_on_next_cleanup(server, monkeypatch):
     class _Lease:
         def __init__(self, fail=False):

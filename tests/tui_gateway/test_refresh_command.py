@@ -426,3 +426,67 @@ def test_compute_host_rejection_rolls_back_but_dispatch_ack_commits(monkeypatch)
         "rid-2", "sid", session, "hello", refresh_reservation=retry
     )
     assert "pending_refresh_notes" not in session
+
+
+def test_legacy_compute_host_async_busy_rolls_back_instead_of_synthetic_dispatch(monkeypatch):
+    import tui_gateway.server as server
+
+    session = {"history_lock": threading.Lock(), "history": [], "history_version": 0,
+               "session_key": "key", "attached_images": [], "cols": 80}
+    server._queue_pending_refresh_note(session, "NOTE")
+    reservation = server._claim_pending_refresh_note(session)
+
+    class LegacySupervisor:
+        def submit_turn(self, frame, *, on_complete):
+            on_complete({"type": "turn.error", "request_id": frame["request_id"],
+                         "message": "session busy"})
+
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda cfg=None: LegacySupervisor())
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_on_compute_host_turn_done", lambda *a, **k: None)
+    server._submit_prompt_to_compute_host("rid", "sid", session, "hello",
+                                          refresh_reservation=reservation)
+    assert server._claim_pending_refresh_note(session) == reservation
+
+
+@pytest.mark.parametrize("metadata", [{"model_attempted": True}, {"api_calls": 1}])
+def test_legacy_compute_host_success_metadata_commits_refresh(monkeypatch, metadata):
+    import tui_gateway.server as server
+
+    session = {"history_lock": threading.Lock(), "history": [], "history_version": 0,
+               "session_key": "key", "attached_images": [], "cols": 80}
+    server._queue_pending_refresh_note(session, "NOTE")
+    reservation = server._claim_pending_refresh_note(session)
+
+    class LegacySupervisor:
+        def submit_turn(self, frame, *, on_complete):
+            on_complete({"type": "turn.end", "request_id": frame["request_id"], **metadata})
+
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda cfg=None: LegacySupervisor())
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    monkeypatch.setattr(server, "_on_compute_host_turn_done", lambda *a, **k: None)
+    server._submit_prompt_to_compute_host("rid", "sid", session, "hello",
+                                          refresh_reservation=reservation)
+    assert "pending_refresh_notes" not in session
+
+
+def test_legacy_compute_host_send_failure_rolls_back_refresh(monkeypatch):
+    import tui_gateway.server as server
+
+    session = {"history_lock": threading.Lock(), "history": [], "history_version": 0,
+               "session_key": "key", "attached_images": [], "cols": 80}
+    server._queue_pending_refresh_note(session, "NOTE")
+    reservation = server._claim_pending_refresh_note(session)
+
+    class LegacySupervisor:
+        def submit_turn(self, frame, *, on_complete):
+            on_complete({"type": "turn.error", "request_id": frame["request_id"],
+                         "reason": "send_failed"})
+            raise OSError("pipe closed")
+
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda cfg=None: LegacySupervisor())
+    monkeypatch.setattr(server, "_load_dashboard_process_isolation_config", lambda: {})
+    response = server._submit_prompt_to_compute_host("rid", "sid", session, "hello",
+                                                     refresh_reservation=reservation)
+    assert response["error"]["code"] == 5019
+    assert server._claim_pending_refresh_note(session) == reservation

@@ -14384,6 +14384,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self, "_pending_one_turn_model_restore", None
                 )
                 self._pending_one_turn_model_restore = None
+                _refresh_committed = False
+
+                def _on_model_attempt() -> None:
+                    nonlocal _refresh_committed
+                    if _refresh_committed or _refresh_reservation is None:
+                        return
+                    try:
+                        _refresh_queue.remove(_refresh_reservation)
+                    except ValueError:
+                        pass
+                    _refresh_committed = True
+
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
@@ -14392,12 +14404,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        on_model_attempt=_on_model_attempt,
                     )
-                    if _refresh_reservation is not None:
-                        try:
-                            _refresh_queue.remove(_refresh_reservation)
-                        except ValueError:
-                            pass
+                    if _refresh_reservation is not None and not _refresh_committed:
+                        _refresh_reservation["reserved"] = False
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -14407,7 +14417,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._pending_moa_restore_model = None
                         self._pending_moa_disable_after_turn = False
                 except Exception as exc:
-                    if _refresh_reservation is not None:
+                    if _refresh_reservation is not None and not _refresh_committed:
                         _refresh_reservation["reserved"] = False
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)

@@ -514,7 +514,9 @@ def _claim_active_session_slot(
     *,
     live_session_id: str,
     surface: str = "tui",
+    exclude_release: Any = None,
 ) -> tuple[Any, str | None]:
+    _retry_failed_active_session_releases(exclude=exclude_release)
     try:
         from hermes_cli.active_sessions import try_acquire_active_session
 
@@ -640,6 +642,7 @@ def _transfer_active_session_slot(
         new_session_id,
         live_session_id=sid,
         surface=_session_source(session),
+        exclude_release=lease,
     )
     if new_lease is not None:
         old_lease = session.get("active_session_lease")
@@ -1874,10 +1877,17 @@ def _submit_prompt_to_compute_host(
         # can fail open to the historical in-process path without emitting a
         # duplicate terminal error.
         if done.get("reason") == "send_failed":
+            if refresh_reservation and not dispatch_state["attempted"]:
+                _finish_pending_refresh_note(
+                    session, refresh_reservation["token"], attempted=False
+                )
             return
         if refresh_reservation and not dispatch_state["attempted"]:
+            attempted = bool(done.get("model_attempted")) or int(
+                done.get("api_calls") or 0
+            ) > 0
             _finish_pending_refresh_note(
-                session, refresh_reservation["token"], attempted=False
+                session, refresh_reservation["token"], attempted=attempted
             )
         _on_compute_host_turn_done(rid, sid, session, done)
 
@@ -1891,9 +1901,11 @@ def _submit_prompt_to_compute_host(
         if "on_dispatch" in submit_params:
             submit_kwargs["on_dispatch"] = _dispatched
         supervisor.submit_turn(frame, **submit_kwargs)
-        if "on_dispatch" not in submit_params:
-            _dispatched({"type": "turn.dispatched", "request_id": rid})
     except Exception as exc:
+        if refresh_reservation and not dispatch_state["attempted"]:
+            _finish_pending_refresh_note(
+                session, refresh_reservation["token"], attempted=False
+            )
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
