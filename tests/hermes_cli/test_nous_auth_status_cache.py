@@ -3,9 +3,10 @@
 The cache avoids re-validating Nous credentials on every menu paint —
 `hermes tools` → "All Platforms" used to fire ~31 OAuth refresh POSTs
 against portal.nousresearch.com during one render. The cache is keyed
-on auth.json path + mtime so profile switches stay isolated while
-login/logout flows invalidate naturally; tests and other writers can
-also call invalidate_nous_auth_status_cache().
+on local/global auth-store identity plus strict inheritance policy so
+profile or policy transitions stay isolated while auth writes invalidate
+naturally; tests and other writers can also call
+invalidate_nous_auth_status_cache().
 """
 
 from __future__ import annotations
@@ -86,4 +87,36 @@ def test_get_nous_auth_status_caches_failure_path(tmp_path, monkeypatch):
         f"Logged-out snapshots must cache; got {call_count['n']} computes for 10 calls."
     )
 
+    auth_mod.invalidate_nous_auth_status_cache()
+
+
+def test_get_nous_auth_status_invalidates_when_global_source_changes(
+    tmp_path,
+    monkeypatch,
+):
+    """An inherited source write invalidates even if local auth is unchanged."""
+    local_home = tmp_path / "profile"
+    local_home.mkdir()
+    global_auth = tmp_path / "global-auth.json"
+    global_auth.write_text('{"version": 1}\n', encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(local_home))
+
+    from hermes_cli import auth as auth_mod
+
+    auth_mod.invalidate_nous_auth_status_cache()
+    monkeypatch.setattr(auth_mod, "_global_auth_file_path", lambda: global_auth)
+    calls = 0
+
+    def fake_compute():
+        nonlocal calls
+        calls += 1
+        return {"logged_in": True, "call": calls}
+
+    with patch.object(auth_mod, "_compute_nous_auth_status", side_effect=fake_compute):
+        assert auth_mod.get_nous_auth_status()["call"] == 1
+        assert auth_mod.get_nous_auth_status()["call"] == 1
+        global_auth.write_text('{"version": 2}\n', encoding="utf-8")
+        assert auth_mod.get_nous_auth_status()["call"] == 2
+
+    assert calls == 2
     auth_mod.invalidate_nous_auth_status_cache()

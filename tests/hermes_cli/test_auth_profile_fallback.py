@@ -269,28 +269,50 @@ def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
 # ---------------------------------------------------------------------------
 
 
-def test_inheritance_disabled_refuses_profile_auth_materialization(profile_env):
-    from hermes_cli.auth import AuthError, write_credential_pool
+def test_inheritance_disabled_allows_profile_local_pool_persistence(profile_env):
+    from hermes_cli.auth import write_credential_pool
 
     _disable_global_auth_inheritance(profile_env["profile"])
 
-    with pytest.raises(AuthError, match="auth materialization is disabled"):
-        write_credential_pool("openrouter", [_pool_entry(access_token="synthetic-local")])
+    write_credential_pool("openrouter", [_pool_entry(access_token="synthetic-local")])
 
-    assert not (profile_env["profile"] / "auth.json").exists()
+    profile_store = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_store["credential_pool"]["openrouter"][0]["access_token"] == "synthetic-local"
 
 
-def test_inheritance_disabled_refuses_singleton_auth_materialization(profile_env):
+def test_inheritance_disabled_allows_profile_local_singleton_persistence(profile_env):
+    from hermes_cli.auth import _save_auth_store
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+
+    _save_auth_store({
+        "version": 1,
+        "providers": {"nous": {"access_token": "synthetic-local"}},
+    })
+
+    profile_store = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_store["providers"]["nous"]["access_token"] == "synthetic-local"
+
+
+def test_inheritance_disabled_refuses_explicit_global_store_write(profile_env):
     from hermes_cli.auth import AuthError, _save_auth_store
 
+    global_path = profile_env["global"] / "auth.json"
+    original = _make_auth_store(providers={
+        "nous": {"access_token": "synthetic-global-original"},
+    })
+    _write(global_path, original)
     _disable_global_auth_inheritance(profile_env["profile"])
 
-    with pytest.raises(AuthError, match="auth materialization is disabled"):
-        _save_auth_store({
-            "version": 1,
-            "providers": {"nous": {"access_token": "synthetic-local"}},
-        })
+    with pytest.raises(AuthError, match="Global auth persistence is disabled"):
+        _save_auth_store(
+            _make_auth_store(providers={
+                "nous": {"access_token": "synthetic-global-replacement"},
+            }),
+            target_path=global_path,
+        )
 
+    assert json.loads(global_path.read_text()) == original
     assert not (profile_env["profile"] / "auth.json").exists()
 
 
@@ -368,6 +390,41 @@ def test_nous_token_memo_cannot_cross_into_isolated_profile(profile_env):
     with pytest.raises(AuthError, match="not logged into Nous Portal"):
         auth.resolve_nous_access_token()
 
+    assert not (profile_env["profile"] / "auth.json").exists()
+
+
+def test_nous_status_memo_invalidates_when_inheritance_is_disabled(
+    profile_env,
+    monkeypatch,
+):
+    import hermes_cli.auth as auth
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "synthetic-global-status"},
+    }))
+    auth.invalidate_nous_auth_status_cache()
+    calls = 0
+
+    def _compute_without_network():
+        nonlocal calls
+        calls += 1
+        state = auth.get_provider_auth_state("nous") or {}
+        return {
+            "logged_in": bool(state.get("access_token")),
+            "access_token": state.get("access_token"),
+        }
+
+    monkeypatch.setattr(auth, "_compute_nous_auth_status", _compute_without_network)
+
+    first = auth.get_nous_auth_status()
+    assert first["access_token"] == "synthetic-global-status"
+
+    _disable_global_auth_inheritance(profile_env["profile"])
+    second = auth.get_nous_auth_status()
+
+    assert second["logged_in"] is False
+    assert second["access_token"] is None
+    assert calls == 2
     assert not (profile_env["profile"] / "auth.json").exists()
 
 

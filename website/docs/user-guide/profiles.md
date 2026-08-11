@@ -213,7 +213,7 @@ coder config set terminal.cwd /absolute/path/to/project
 
 Named profiles normally inherit provider credentials from global Hermes auth
 stores when they have no profile-local entry. To create a fail-closed profile
-that must not inherit or materialize Hermes authentication state, add:
+that must not inherit global or shared Hermes authentication state, add:
 
 ```yaml
 auth:
@@ -222,14 +222,16 @@ auth:
 
 With this setting, Hermes does not read global-root credential pools,
 provider/OAuth singletons, or the cross-profile shared Nous OAuth store. Nous
-token memos are also scoped to one canonical profile home. Hermes does not seed
-ambient credentials into the profile auth pool and refuses writes that would
-create or update the profile's `auth.json` or shared Nous state. Inspection
-commands such as `hermes -p <name> auth list` remain read-only.
+token and status memos are bound to the active profile and policy context.
+Hermes does not seed ambient credentials into the profile auth pool and refuses
+writes to shared Nous state. Inspection commands such as
+`hermes -p <name> auth list` remain read-only and do not create `auth.json`.
+Intentional profile-local login, add, rotation, and removal operations may
+create or update the profile's own `auth.json`.
 
 The setting is deliberately fail-closed: if `inherit_global` is present, only
-the boolean value `true` enables inheritance and auth materialization. Invalid,
-unreadable, malformed, or duplicate-key policy YAML denies those paths.
+the boolean value `true` enables global/shared inheritance. Invalid, unreadable,
+malformed, or duplicate-key policy YAML denies those inheritance paths.
 Omitting the setting preserves the standard profile behavior.
 
 This setting is an **auth-store boundary**, not by itself a promise that the

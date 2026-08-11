@@ -1058,14 +1058,16 @@ def _auth_file_path() -> Path:
     return path
 
 
-def profile_auth_materialization_enabled() -> bool:
-    """Return whether the active profile may inherit or persist auth state.
+def profile_global_auth_inheritance_enabled() -> bool:
+    """Return whether the active profile may use global/shared auth sources.
 
     ``auth.inherit_global`` is intentionally a fail-closed profile boundary.
     The setting is backward-compatible when absent, but once present only the
-    boolean value ``true`` permits global-root fallback, ambient credential
-    seeding, or auth.json writes. Invalid values and unreadable configuration
-    deny those paths rather than silently restoring credential authority.
+    boolean value ``true`` permits global-root fallback, shared auth state,
+    cross-profile token caches, or ambient credential seeding. Invalid values
+    and unreadable configuration deny those paths rather than silently
+    restoring credential authority. Explicit profile-local reads and writes
+    remain permitted.
     """
     try:
         config = read_raw_config_strict()
@@ -1093,7 +1095,7 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
-    if not profile_auth_materialization_enabled():
+    if not profile_global_auth_inheritance_enabled():
         return None
     try:
         from hermes_constants import get_default_hermes_root
@@ -1353,11 +1355,16 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
-    if not profile_auth_materialization_enabled():
+    active_auth_file = _auth_file_path()
+    auth_file = target_path if target_path is not None else active_auth_file
+    if (
+        target_path is not None
+        and not _same_path(auth_file, active_auth_file)
+        and not profile_global_auth_inheritance_enabled()
+    ):
         raise AuthError(
-            "Profile auth materialization is disabled by auth.inherit_global"
+            "Global auth persistence is disabled by auth.inherit_global"
         )
-    auth_file = target_path if target_path is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
     # No-op on Windows (POSIX mode bits not enforced); ignore failures.
@@ -1741,10 +1748,6 @@ def write_credential_pool(
     Pass ``removed_ids`` for entries the caller intentionally removed, so the
     merge does not resurrect them from the on-disk copy.
     """
-    if not profile_auth_materialization_enabled():
-        raise AuthError(
-            "Profile auth materialization is disabled by auth.inherit_global"
-        )
     removed = {rid for rid in (removed_ids or ()) if rid}
     with _auth_store_lock():
         auth_store = _load_auth_store()
@@ -5383,7 +5386,7 @@ def _nous_shared_store_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
     can't race on the single-use shared refresh token; that helper must
     NOT be called with ``_auth_store_lock`` already held.
     """
-    if not profile_auth_materialization_enabled():
+    if not profile_global_auth_inheritance_enabled():
         yield
         return
     try:
@@ -5447,7 +5450,7 @@ def _write_shared_nous_state(state: Dict[str, Any]) -> None:
     We deliberately omit the runtime ``agent_key`` compatibility field;
     the OAuth tokens are the cross-profile source of truth.
     """
-    if not profile_auth_materialization_enabled():
+    if not profile_global_auth_inheritance_enabled():
         return
     refresh_token = state.get("refresh_token")
     access_token = state.get("access_token")
@@ -5513,7 +5516,7 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     lacks required fields. Callers should treat ``None`` as "no shared
     credentials available — fall through to device-code".
     """
-    if not profile_auth_materialization_enabled():
+    if not profile_global_auth_inheritance_enabled():
         return None
     try:
         path = _nous_shared_store_path()
@@ -5540,7 +5543,7 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
 
 def _clear_shared_nous_state(reason: str) -> None:
     """Remove the shared Nous OAuth store after a terminal token failure."""
-    if not profile_auth_materialization_enabled():
+    if not profile_global_auth_inheritance_enabled():
         return
     try:
         with _nous_shared_store_lock():
@@ -5738,7 +5741,7 @@ def _try_import_shared_nous_state(
     etc.) — caller should then fall through to the normal device-code
     flow.
     """
-    if not profile_auth_materialization_enabled():
+    if not profile_global_auth_inheritance_enabled():
         return None
     try:
         with _nous_shared_store_lock(timeout_seconds=max(timeout_seconds + 5.0, AUTH_LOCK_TIMEOUT_SECONDS)):
@@ -5953,7 +5956,7 @@ def resolve_nous_access_token(
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
     global _RESOLVE_TOKEN_CACHE
     cache_home = _resolve_token_cache_home()
-    cache_allowed = profile_auth_materialization_enabled()
+    cache_allowed = profile_global_auth_inheritance_enabled()
     # Memo: collapse the startup burst of managed-tool check_fns into one
     # network refresh. Only cache a successful, non-forced resolution for a
     # short window; force_fresh / error paths bypass and don't populate it.
@@ -6710,25 +6713,61 @@ def _snapshot_nous_pool_status() -> Dict[str, Any]:
 # ~350ms even on the failure path, and read-only UI surfaces (`hermes tools`, status panels,
 # subscription-feature checks) call it many times per render — `hermes tools` → "All Platforms"
 # was firing the refresh ~31× during one menu paint, racking up >13s of HTTP and burning
-# single-use refresh tokens. Cache the snapshot for a few seconds, keyed on the auth.json
-# path + mtime so that profile switches do not share a process memo and
-# `hermes auth login/logout/add/remove` invalidate naturally on the next call.
+# single-use refresh tokens. Cache the snapshot for a few seconds, keyed on the
+# local and inherited auth stores plus the strict inheritance verdict so profile
+# switches and policy changes do not share a process memo. Auth writes invalidate
+# naturally through the high-resolution mtime components.
 _NOUS_AUTH_STATUS_CACHE_TTL = 15.0  # seconds
-_nous_auth_status_cache: Optional[Tuple[float, str, Optional[float], Dict[str, Any]]] = None
+_NousAuthStatusCacheIdentity = Tuple[
+    str,
+    Optional[int],
+    bool,
+    Optional[str],
+    Optional[int],
+]
+_nous_auth_status_cache: Optional[
+    Tuple[float, _NousAuthStatusCacheIdentity, Dict[str, Any]]
+] = None
 
 
-def _auth_file_cache_key() -> Tuple[str, Optional[float]]:
+def _auth_file_cache_key() -> Tuple[str, Optional[int]]:
     auth_file = _auth_file_path()
     try:
         auth_file_key = str(auth_file.resolve(strict=False))
     except Exception:
         auth_file_key = str(auth_file)
     try:
-        return auth_file_key, auth_file.stat().st_mtime
+        return auth_file_key, auth_file.stat().st_mtime_ns
     except FileNotFoundError:
         return auth_file_key, None
     except Exception:
         return auth_file_key, None
+
+
+def _nous_auth_status_cache_identity() -> _NousAuthStatusCacheIdentity:
+    """Bind a status memo to local/global stores and strict policy state."""
+    auth_file_key, mtime_ns = _auth_file_cache_key()
+    inherit_global = profile_global_auth_inheritance_enabled()
+    global_key: Optional[str] = None
+    global_mtime_ns: Optional[int] = None
+    if inherit_global:
+        global_path = _global_auth_file_path()
+        if global_path is not None:
+            try:
+                global_key = str(global_path.resolve(strict=False))
+            except Exception:
+                global_key = str(global_path)
+            try:
+                global_mtime_ns = global_path.stat().st_mtime_ns
+            except (FileNotFoundError, OSError):
+                global_mtime_ns = None
+    return (
+        auth_file_key,
+        mtime_ns,
+        inherit_global,
+        global_key,
+        global_mtime_ns,
+    )
 
 
 def invalidate_nous_auth_status_cache() -> None:
@@ -6752,27 +6791,26 @@ def get_nous_auth_status() -> Dict[str, Any]:
     as a healthy login. If provider state is absent, fall back to the credential
     pool for the just-logged-in / not-yet-promoted case.
 
-    The returned snapshot is memoised for ~15s keyed on the auth.json mtime,
-    so menu/status surfaces that ask repeatedly don't trigger one refresh POST
-    per call. Login/logout flows write to auth.json and therefore invalidate
-    the cache automatically; tests can also call
+    The returned snapshot is memoised for ~15s keyed on local/global auth-store
+    identity and the strict inheritance verdict, so policy/profile changes do
+    not reuse another authority context. Login/logout flows write to auth.json
+    and therefore invalidate the cache automatically; tests can also call
     ``invalidate_nous_auth_status_cache()`` explicitly.
     """
     global _nous_auth_status_cache
     now = time.monotonic()
-    auth_file_key, mtime = _auth_file_cache_key()
+    cache_identity = _nous_auth_status_cache_identity()
     cached = _nous_auth_status_cache
     if cached is not None:
-        cached_at, cached_auth_file_key, cached_mtime, cached_status = cached
+        cached_at, cached_identity, cached_status = cached
         if (
-            cached_auth_file_key == auth_file_key
-            and cached_mtime == mtime
+            cached_identity == cache_identity
             and (now - cached_at) < _NOUS_AUTH_STATUS_CACHE_TTL
         ):
             return dict(cached_status)
 
     status = _compute_nous_auth_status()
-    _nous_auth_status_cache = (now, auth_file_key, mtime, dict(status))
+    _nous_auth_status_cache = (now, cache_identity, dict(status))
     return status
 
 
