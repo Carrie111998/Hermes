@@ -6,6 +6,7 @@ from .base import (
     EmbeddingModelIdentity,
 )
 from .fake import DeterministicFakeEmbeddingBackend
+from .llama_cpp import LlamaCppEmbeddingBackend
 from .serializer import (
     QUERY_INSTRUCTION,
     serialize_embedding_node,
@@ -28,6 +29,7 @@ __all__ = [
     "EmbeddingBackendError",
     "EmbeddingModelIdentity",
     "DeterministicFakeEmbeddingBackend",
+    "LlamaCppEmbeddingBackend",
     "QUERY_INSTRUCTION",
     "serialize_embedding_node",
     "serialize_embedding_query",
