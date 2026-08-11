@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
 import { ArchiveSkillConfirmDialog } from '@/app/learning/archive-skill-confirm-dialog'
 import { CodeEditor } from '@/components/chat/code-editor'
@@ -16,15 +16,16 @@ import {
   getSkills,
   getToolsets,
   getUsageAnalytics,
-  type HermesGateway,
-  toggleSkill,
-  toggleToolset
+  setSkillEnabled,
+  setToolsetEnabled
 } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopToolsetVisible } from '@/lib/desktop-toolsets'
 import { compactNumber } from '@/lib/format'
 import { queryClient, writeCache } from '@/lib/query-client'
+import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
+import { useStoreSelector } from '@/lib/use-session-slice'
 import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
@@ -190,8 +191,10 @@ interface SkillsViewProps extends React.ComponentProps<'section'> {
 
 export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: SkillsViewProps) {
   const { t } = useI18n()
-  const gateway = useStore($gateway) as HermesGateway | null
   const [mode, setMode] = useRouteEnumParam('tab', SKILLS_MODES, 'skills')
+  // $gateway only feeds the MCP tab — gate the subscription so Skills/Toolsets/Hub
+  // tabs don't re-render on connect/disconnect/reconnect.
+  const gateway = useStoreSelector($gateway, g => (mode === 'mcp' ? g : null))
 
   const [query, setQuery] = useState('')
 
@@ -228,6 +231,8 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
       queryClient.invalidateQueries({ queryKey: SKILLS_QUERY_KEY }),
       queryClient.invalidateQueries({ queryKey: TOOLSETS_QUERY_KEY })
     ])
+
+    invalidateSlashCompletions()
 
     // An explicit refresh is the one time we bypass the analytics TTL — but
     // only if the badges are already on screen; otherwise let the lazy load
@@ -342,7 +347,10 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     setSkills(current => current?.map(row => (row.name === skill.name ? { ...row, enabled } : row)) ?? current)
 
     try {
-      await toggleSkill(skill.name, enabled)
+      await setSkillEnabled(skill.name, enabled)
+      // A disabled skill loses its `/name` command, so the composer's cached
+      // `/` list has to be dropped along with the row repaint.
+      invalidateSlashCompletions()
     } catch (err) {
       setSkills(
         current => current?.map(row => (row.name === skill.name ? { ...row, enabled: !enabled } : row)) ?? current
@@ -358,7 +366,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     )
 
     try {
-      await toggleToolset(toolset.name, enabled)
+      await setToolsetEnabled(toolset.name, enabled)
     } catch (err) {
       setToolsets(
         current =>
@@ -382,13 +390,13 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
 
     try {
       for (const row of skillTargets) {
-        await toggleSkill(row.name, enabled)
+        await setSkillEnabled(row.name, enabled)
         setSkills(cur => cur?.map(r => (r.name === row.name ? { ...r, enabled } : r)) ?? cur)
         done += 1
       }
 
       for (const row of toolsetTargets) {
-        await toggleToolset(row.name, enabled)
+        await setToolsetEnabled(row.name, enabled)
         setToolsets(cur => cur?.map(r => (r.name === row.name ? { ...r, enabled, available: enabled } : r)) ?? cur)
         done += 1
       }
@@ -397,6 +405,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     } catch (err) {
       notifyError(err, t.skills.failedToUpdate(mode === 'skills' ? t.skills.tabSkills : t.skills.tabToolsets))
     } finally {
+      invalidateSlashCompletions()
       setBulkBusy(false)
     }
   }
@@ -662,7 +671,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
                   onToggle={checked => void handleToggleToolset(toolset, checked)}
                   subtitle={toolsetDescription(toolset, t)}
                   title={label}
-                  toggleLabel={t.skills.toggleToolset(label)}
+                  toggleLabel={t.skills.toggleToolset(label, !toolset.enabled)}
                 />
               )
             })}
@@ -681,6 +690,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
             const snapshot = skills
 
             setSkills(current => current?.filter(skill => skill.name !== name) ?? current)
+            invalidateSlashCompletions()
 
             if (skillEditor?.name === name) {
               setSkillEditor(null)
