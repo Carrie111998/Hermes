@@ -7554,7 +7554,8 @@ async def validate_custom_endpoint(body: CustomEndpointUpdate):
         headers["Authorization"] = f"Bearer {body.api_key.strip()}"
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+        from tools.url_safety import create_ssrf_safe_async_client
+        async with create_ssrf_safe_async_client(timeout=httpx.Timeout(8.0)) as client:
             resp = await client.get(url, headers=headers)
     except Exception:
         return {"ok": False, "reachable": False, "message": f"Could not reach {url}.", "models": []}
@@ -7596,7 +7597,8 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         api_key = (body.api_key or "").strip()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as client:
+            from tools.url_safety import create_ssrf_safe_async_client
+            async with create_ssrf_safe_async_client(timeout=httpx.Timeout(8.0)) as client:
                 resp = await client.get(url, headers=headers)
             return {"ok": True, "reachable": True, "message": "", "models": _parse_model_ids(resp)}
         except Exception:
@@ -7616,7 +7618,8 @@ async def validate_provider_credential(body: EnvVarUpdate, request: Request):
         params["key"] = value
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as client:
+        from tools.url_safety import create_ssrf_safe_async_client
+        async with create_ssrf_safe_async_client(timeout=httpx.Timeout(10.0)) as client:
             resp = await client.get(url, headers=headers, params=params)
     except Exception:
         return {"ok": False, "reachable": False, "message": "Could not reach the provider to verify the key."}
