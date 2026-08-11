@@ -6118,6 +6118,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        # A cancelled asyncio wrapper does not stop its executor worker. Keep
+        # per-session worker ownership until the worker's real finally runs so
+        # governed replay can hold the gateway lock fail-closed.
+        self._turn_worker_waiters_lock = threading.Lock()
+        self._turn_worker_waiters: Dict[str, set[threading.Event]] = {}
         # ALL per-session state (turn / conversation / persistent scopes)
         # lives in one container — see gateway/session_state.py.  Access via
         # self._session_state(key) (get-or-create) or
@@ -22250,6 +22255,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             *args,
         )
 
+    def _turn_worker_state(self) -> tuple[threading.Lock, Dict[str, set[threading.Event]]]:
+        lock = getattr(self, "_turn_worker_waiters_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._turn_worker_waiters_lock = lock
+        waiters = getattr(self, "_turn_worker_waiters", None)
+        if waiters is None:
+            waiters = {}
+            self._turn_worker_waiters = waiters
+        return lock, waiters
+
+    def _register_turn_worker(self, session_key: Optional[str], worker_done: threading.Event) -> None:
+        if not session_key:
+            return
+        lock, waiters = self._turn_worker_state()
+        with lock:
+            waiters.setdefault(session_key, set()).add(worker_done)
+
+    def _unregister_turn_worker(self, session_key: Optional[str], worker_done: threading.Event) -> None:
+        if not session_key:
+            return
+        lock, waiters_by_session = self._turn_worker_state()
+        with lock:
+            waiters = waiters_by_session.get(session_key)
+            if not waiters:
+                return
+            waiters.discard(worker_done)
+            if not waiters:
+                waiters_by_session.pop(session_key, None)
+
+    async def wait_for_session_quiescence(self, session_key: Optional[str]) -> None:
+        """Wait until every executor worker for one session has really exited."""
+        lock, waiters_by_session = self._turn_worker_state()
+        while True:
+            with lock:
+                waiters = list(waiters_by_session.get(session_key or "", ()))
+            if not waiters:
+                return
+            await asyncio.gather(*(asyncio.to_thread(waiter.wait) for waiter in waiters))
+
+    async def wait_for_all_session_quiescence(self) -> None:
+        """Wait for all tracked turn workers before closing runner resources."""
+        lock, waiters_by_session = self._turn_worker_state()
+        while True:
+            with lock:
+                waiters = [
+                    waiter
+                    for session_waiters in waiters_by_session.values()
+                    for waiter in session_waiters
+                ]
+            if not waiters:
+                return
+            await asyncio.gather(*(asyncio.to_thread(waiter.wait) for waiter in waiters))
+
     def _get_executor(self) -> concurrent.futures.ThreadPoolExecutor:
         """Return the gateway-owned executor for blocking agent work."""
         lock = getattr(self, "_executor_lock", None)
@@ -26294,6 +26353,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return run_sync()
                 finally:
                     _turn_worker_done.set()
+                    self._unregister_turn_worker(session_key, _turn_worker_done)
                     # `.turn.agent` on the session state is only reset to
                     # _AGENT_PENDING_SENTINEL when the *next* turn is
                     # claimed (see _session_state(...).turn.agent = ... at
@@ -26330,6 +26390,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _executor_task = asyncio.ensure_future(
                 self._run_in_executor_with_context(_run_sync_with_timeout_lifecycle)
             )
+            self._register_turn_worker(session_key, _turn_worker_done)
+            if _turn_worker_done.is_set():
+                self._unregister_turn_worker(session_key, _turn_worker_done)
 
             _inactivity_timeout = False
             _POLL_INTERVAL = 5.0

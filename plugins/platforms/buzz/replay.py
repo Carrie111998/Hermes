@@ -474,6 +474,9 @@ async def _watched_channels(adapter: Any) -> set[str]:
 
 
 async def _close_runner(runner: Any) -> None:
+    wait_for_workers = getattr(runner, "wait_for_all_session_quiescence", None)
+    if callable(wait_for_workers):
+        await wait_for_workers()
     runner._running = False
     seen: set[int] = set()
     for owner in (getattr(getattr(runner, "session_store", None), "_db", None),
@@ -485,6 +488,13 @@ async def _close_runner(runner: Any) -> None:
         if callable(close):
             with contextlib.suppress(Exception):
                 close()
+
+
+async def _wait_for_session_quiescence(adapter: Any, session_key: str) -> None:
+    runner = getattr(adapter, "gateway_runner", None)
+    wait_for_session = getattr(runner, "wait_for_session_quiescence", None)
+    if callable(wait_for_session):
+        await wait_for_session(session_key)
 
 
 async def dispatch_exact_event(
@@ -619,16 +629,19 @@ async def dispatch_exact_event(
         task = after_map[session_key]
         try:
             # The authoritative gateway lock cannot be released while a
-            # replay session is still running. Let wait_for cancel the task
-            # and await its cancellation before returning the CLAIMED receipt.
+            # replay session or its executor worker is still running. Let
+            # wait_for cancel the async task, then await the production worker
+            # registry before returning the CLAIMED receipt.
             await asyncio.wait_for(task, timeout=wait_timeout)
         except asyncio.TimeoutError:
+            await _wait_for_session_quiescence(adapter, session_key)
             result["session"]["status"] = "CANCELLED"
             result["session"]["quiesced"] = True
             _processing_result()
             result["outcome"] = {"status": CLAIMED, "code": "session_timeout"}
             return result
         except BaseException as exc:
+            await _wait_for_session_quiescence(adapter, session_key)
             result["session"]["status"] = "CRASH_AMBIGUOUS"
             result["dispatch"]["error_type"] = type(exc).__name__
             _processing_result()

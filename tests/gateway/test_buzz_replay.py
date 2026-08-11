@@ -564,6 +564,102 @@ class ReplayLifecycleTests(unittest.TestCase):
             self.assertEqual(close_observation["startup_lock_probe"], "False")
             self.assertEqual(side_effects, [])
 
+    def test_timeout_waits_for_production_executor_worker_before_close(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        import gateway.run as gateway_run
+        import plugins.platforms.buzz.replay as replay_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            runner = object.__new__(gateway_run.GatewayRunner)
+            executor = ThreadPoolExecutor(max_workers=1)
+            runner._get_executor = lambda: executor
+            runner._turn_worker_waiters = {}
+            runner._turn_worker_waiters_lock = threading.Lock()
+            adapter = type("ReplayAdapter", (), {})()
+            adapter._channel_state = {}
+            adapter._session_tasks = {}
+            adapter.gateway_runner = runner
+            worker_started = threading.Event()
+            timeout_observed = threading.Event()
+            release_worker = threading.Event()
+            worker_done = threading.Event()
+            side_effects = []
+            close_observation = {}
+
+            def worker():
+                try:
+                    worker_started.set()
+                    assert release_worker.wait(timeout=5)
+                    side_effects.append("late")
+                finally:
+                    worker_done.set()
+                    runner._unregister_turn_worker("executor-session", worker_done)
+
+            async def handle_event(_channel, _state, _event):
+                async def session():
+                    try:
+                        await runner._run_in_executor_with_context(worker)
+                    except asyncio.CancelledError:
+                        timeout_observed.set()
+                        raise
+
+                adapter._session_tasks["executor-session"] = asyncio.create_task(session())
+
+            runner._register_turn_worker("executor-session", worker_done)
+            adapter._handle_event = handle_event
+
+            async def prepare(_profile):
+                return runner, adapter, None, str(home)
+
+            async def watched(_adapter):
+                return {CHANNEL}
+
+            async def fetch(_adapter, _event_id):
+                return {"id": self.EVENT_ID, "created_at": 1_700_000_000}, {"found_count": 1}
+
+            def validate(*_args, **_kwargs):
+                return {"channel": CHANNEL}
+
+            async def release_after_timeout():
+                await asyncio.to_thread(timeout_observed.wait)
+                self.assertTrue(worker_started.is_set())
+                release_worker.set()
+
+            async def close_runner(_runner):
+                close_observation.update(
+                    worker_done=worker_done.is_set(),
+                    side_effects=list(side_effects),
+                    startup_lock_probe=self._probe_gateway_lock(home),
+                )
+
+            async def exercise():
+                coordinator = asyncio.create_task(release_after_timeout())
+                with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False), \
+                    patch.object(replay_module, "_prepare_adapter", new=AsyncMock(side_effect=prepare)), \
+                    patch.object(replay_module, "_watched_channels", new=AsyncMock(side_effect=watched)), \
+                    patch.object(replay_module, "fetch_event", new=AsyncMock(side_effect=fetch)), \
+                    patch.object(replay_module, "validate_event", new=validate), \
+                    patch.object(replay_module, "_close_runner", new=close_runner):
+                    result = await run_replay("omar", self.EVENT_ID, wait_timeout=2.0)
+                await coordinator
+                return result
+
+            try:
+                result = asyncio.run(exercise())
+            finally:
+                release_worker.set()
+                executor.shutdown(wait=True)
+
+            self.assertEqual(result["outcome"], {"status": CLAIMED, "code": "session_timeout"})
+            self.assertTrue(timeout_observed.is_set())
+            self.assertTrue(close_observation["worker_done"])
+            self.assertEqual(close_observation["side_effects"], ["late"])
+            self.assertEqual(close_observation["startup_lock_probe"], "False")
+            self.assertEqual(side_effects, ["late"])
+
     def test_transient_fetch_failure_leaves_no_row_and_controlled_retry_succeeds(self):
         import plugins.platforms.buzz.replay as replay_module
 

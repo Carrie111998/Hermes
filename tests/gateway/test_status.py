@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -170,6 +171,88 @@ class TestGatewayPidState:
             assert probe.stdout.strip() == "False"
         finally:
             status.release_gateway_runtime_lock()
+
+    def test_stale_cleanup_cannot_unlink_lock_acquired_after_probe(
+        self, tmp_path, monkeypatch
+    ):
+        """A replay acquiring after the inactive probe must remain authoritative."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        status._clear_running_pid_cache()
+        pid_path = tmp_path / "gateway.pid"
+        pid_path.write_text("stale", encoding="utf-8")
+        probe_complete = threading.Event()
+        replay_acquired = threading.Event()
+        observed = {}
+
+        def gated_lock_active(lock_path=None):
+            probe_complete.set()
+            assert replay_acquired.wait(timeout=5)
+            return False
+
+        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", gated_lock_active)
+        holder_code = (
+            "import sys\n"
+            "from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock\n"
+            "if sys.stdin.readline().strip() != 'go':\n"
+            "    raise SystemExit(2)\n"
+            "print(acquire_gateway_runtime_lock(), flush=True)\n"
+            "sys.stdin.readline()\n"
+            "release_gateway_runtime_lock()\n"
+        )
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_code],
+            env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])},
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        worker = threading.Thread(
+            target=lambda: observed.setdefault(
+                "pid", status.get_running_pid(pid_path=pid_path)
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            assert probe_complete.wait(timeout=5)
+            assert holder.stdin is not None
+            holder.stdin.write("go\n")
+            holder.stdin.flush()
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "True"
+            replay_acquired.set()
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            assert observed["pid"] is None
+
+            lock_path = tmp_path / "gateway.lock"
+            assert lock_path.exists()
+            probe = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock; "
+                    "ok=acquire_gateway_runtime_lock(); print(ok); "
+                    "release_gateway_runtime_lock() if ok else None",
+                ],
+                env={
+                    **os.environ,
+                    "HERMES_HOME": str(tmp_path),
+                    "PYTHONPATH": str(Path(__file__).parents[2]),
+                },
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            assert probe.stdout.strip() == "False"
+        finally:
+            replay_acquired.set()
+            if holder.stdin is not None:
+                holder.stdin.write("stop\n")
+                holder.stdin.flush()
+            holder.terminate()
+            holder.wait(timeout=5)
 
     def test_gateway_identity_files_use_process_home_not_context_override(
         self, tmp_path, monkeypatch

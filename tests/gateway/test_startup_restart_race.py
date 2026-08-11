@@ -178,17 +178,26 @@ async def test_start_gateway_rejects_replay_lock_before_replacing_inode(tmp_path
     patch_startup_side_effects(monkeypatch, tmp_path)
 
     holder_code = (
-        "from gateway.status import acquire_gateway_runtime_lock; import time; "
-        "print(acquire_gateway_runtime_lock(), flush=True); time.sleep(8)"
+        "import sys\n"
+        "from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock\n"
+        "if sys.stdin.readline().strip() != 'go':\n"
+        "    raise SystemExit(2)\n"
+        "print(acquire_gateway_runtime_lock(), flush=True)\n"
+        "sys.stdin.readline()\n"
+        "release_gateway_runtime_lock()\n"
     )
     holder = subprocess.Popen(
         [sys.executable, "-c", holder_code],
         env={**os.environ, "PYTHONPATH": str(Path(__file__).parents[2])},
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
     try:
+        assert holder.stdin is not None
+        holder.stdin.write("go\n")
+        holder.stdin.flush()
         assert holder.stdout is not None
         assert holder.stdout.readline().strip() == "True"
         lock_path = tmp_path / "gateway.lock"
@@ -224,6 +233,9 @@ async def test_start_gateway_rejects_replay_lock_before_replacing_inode(tmp_path
         assert lock_path.exists()
         assert lock_path.stat().st_ino == old_inode
     finally:
+        if holder.stdin is not None:
+            holder.stdin.write("stop\n")
+            holder.stdin.flush()
         holder.terminate()
         holder.wait(timeout=3)
 
