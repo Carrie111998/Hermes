@@ -150,6 +150,14 @@ class SkillBundle:
     identifier: str
     trust_level: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+    file_modes: Dict[str, int] = field(default_factory=dict)
+
+
+_GIT_BLOB_MODES = {
+    "100644": 0o644,
+    "100755": 0o755,
+}
+_ALLOWED_BUNDLE_FILE_MODES = frozenset(_GIT_BLOB_MODES.values())
 
 
 _ALLOWED_SUPPORT_DIRS = frozenset({"references", "templates", "scripts", "assets", "examples"})
@@ -660,40 +668,91 @@ class GitHubSource(SkillSource):
         repo = f"{parts[0]}/{parts[1]}"
         skill_path = parts[2]
 
-        skill_md = self._fetch_file_content(repo, f"{skill_path.rstrip('/')}/SKILL.md")
+        # Resolve the tree first so every byte in the tree-backed bundle can
+        # be fetched from the same immutable snapshot as its path and mode.
+        # Contents API requests without ``ref`` follow the moving default
+        # branch and can otherwise mix revisions during a concurrent push.
+        tree = self._get_repo_tree(repo)
+        revision = ""
+        if tree is not None:
+            branch, _entries = tree
+            revision = self._tree_revisions.get(repo) or branch
+
+        skill_md = self._fetch_file_content(
+            repo,
+            f"{skill_path.rstrip('/')}/SKILL.md",
+            ref=revision or None,
+        )
         if skill_md is None:
             return None
+        # Keep link validation even though GitHub bundles are now enumerated
+        # from the repository tree. Traversal remains unsafe, and a referenced
+        # file that is absent from the complete bundle must still fail closed.
         referenced = _referenced_support_paths(skill_md)
         if referenced is None:
             return None
 
         files: Dict[str, Union[str, bytes]] = {"SKILL.md": skill_md}
-        tree = self._get_repo_tree(repo)
+        file_modes: Dict[str, int] = {}
+        warnings: List[str] = []
         if tree is not None:
             branch, entries = tree
             prefix = f"{skill_path.rstrip('/')}/"
-            entries_by_path = {item.get("path", ""): item for item in entries}
-            for rel_path in sorted(referenced):
-                item_path = f"{prefix}{rel_path}"
-                item = entries_by_path.get(item_path)
-                if item is None:
-                    logger.warning("Referenced skill support file is missing: %s", item_path)
-                    return None
-                if item.get("type") != "blob" or item.get("mode") == "120000":
+            saw_skill_md = False
+            for item in sorted(entries, key=lambda entry: entry.get("path", "")):
+                item_path = item.get("path", "")
+                if not item_path.startswith(prefix):
+                    continue
+                if item.get("type") == "tree":
+                    continue
+                if item.get("type") != "blob":
                     logger.warning("Rejected non-regular file in skill bundle: %s", item_path)
                     return None
-                content = self._fetch_file_bytes(repo, item_path)
+                git_mode = item.get("mode")
+                file_mode = _GIT_BLOB_MODES.get(git_mode)
+                if file_mode is None:
+                    logger.warning(
+                        "Rejected unsupported Git mode %r in skill bundle: %s",
+                        git_mode,
+                        item_path,
+                    )
+                    return None
+                try:
+                    rel_path = _validate_bundle_rel_path(item_path[len(prefix):])
+                except ValueError:
+                    logger.warning("Rejected unsafe file in skill bundle: %s", item_path)
+                    return None
+                file_modes[rel_path] = file_mode
+                if rel_path == "SKILL.md":
+                    saw_skill_md = True
+                    continue
+                content = self._fetch_file_bytes(repo, item_path, ref=revision)
                 if content is None:
+                    logger.warning("Failed to fetch skill bundle file: %s", item_path)
                     return None
                 files[rel_path] = content
-            revision = self._tree_revisions.get(repo) or branch
+            if not saw_skill_md:
+                logger.warning("Git tree did not contain the resolved skill file: %sSKILL.md", prefix)
+                return None
         else:
-            for rel_path in referenced:
-                content = self._fetch_file_bytes(repo, f"{skill_path.rstrip('/')}/{rel_path}")
-                if content is None:
-                    return None
-                files[rel_path] = content
+            downloaded = self._download_bundle_via_contents(repo, skill_path)
+            if downloaded is None or "SKILL.md" not in downloaded:
+                return None
+            files.update(downloaded)
+            files["SKILL.md"] = skill_md
+            warnings.append(
+                "GitHub file modes were unavailable. The complete skill directory was "
+                "downloaded, but executable bits could not be preserved."
+            )
             revision = ""
+
+        missing_references = referenced.difference(files)
+        if missing_references:
+            logger.warning(
+                "Referenced skill support files are missing: %s",
+                ", ".join(sorted(missing_references)),
+            )
+            return None
 
         skill_name = skill_path.rstrip("/").split("/")[-1]
         trust = self.trust_level_for(identifier)
@@ -710,8 +769,53 @@ class GitHubSource(SkillSource):
                     if revision else f"https://github.com/{repo}/{skill_path}"
                 ),
                 "source_revision": revision,
+                "bundle_warnings": warnings,
             },
+            file_modes=file_modes,
         )
+
+    def _download_bundle_via_contents(
+        self, repo: str, path: str
+    ) -> Optional[Dict[str, bytes]]:
+        """Strictly download a complete directory when the Trees API is unavailable."""
+        url = f"https://api.github.com/repos/{repo}/contents/{path.rstrip('/')}"
+        resp = self._github_get(url)
+        if resp is None or resp.status_code != 200:
+            return None
+        try:
+            entries = resp.json()
+        except ValueError:
+            return None
+        if not isinstance(entries, list):
+            return None
+
+        files: Dict[str, bytes] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return None
+            name = entry.get("name", "")
+            entry_path = entry.get("path", "")
+            entry_type = entry.get("type", "")
+            try:
+                safe_name = _validate_bundle_rel_path(name)
+            except ValueError:
+                return None
+            if entry_type == "file":
+                content = self._fetch_file_bytes(repo, entry_path)
+                if content is None:
+                    logger.warning("Failed to fetch skill bundle file: %s", entry_path)
+                    return None
+                files[safe_name] = content
+            elif entry_type == "dir":
+                nested = self._download_bundle_via_contents(repo, entry_path)
+                if nested is None:
+                    return None
+                for nested_path, content in nested.items():
+                    files[f"{safe_name}/{nested_path}"] = content
+            else:
+                logger.warning("Rejected non-regular file in skill bundle: %s", entry_path)
+                return None
+        return files
 
     def inspect(self, identifier: str) -> Optional[SkillMeta]:
         """Fetch just the SKILL.md metadata for preview."""
@@ -1067,9 +1171,11 @@ class GitHubSource(SkillSource):
 
         return None
 
-    def _fetch_file_content(self, repo: str, path: str) -> Optional[str]:
+    def _fetch_file_content(
+        self, repo: str, path: str, *, ref: Optional[str] = None
+    ) -> Optional[str]:
         """Fetch a single text file from GitHub."""
-        content = self._fetch_file_bytes(repo, path)
+        content = self._fetch_file_bytes(repo, path, ref=ref)
         if content is None:
             return None
         try:
@@ -1077,11 +1183,14 @@ class GitHubSource(SkillSource):
         except UnicodeDecodeError:
             return None
 
-    def _fetch_file_bytes(self, repo: str, path: str) -> Optional[bytes]:
+    def _fetch_file_bytes(
+        self, repo: str, path: str, *, ref: Optional[str] = None
+    ) -> Optional[bytes]:
         """Fetch exact file bytes from GitHub without text decoding."""
         url = f"https://api.github.com/repos/{repo}/contents/{path}"
         resp = self._github_get(
             url,
+            params={"ref": ref} if ref else None,
             headers={**self.auth.get_headers(), "Accept": "application/vnd.github.v3.raw"},
         )
         if resp is not None and resp.status_code == 200:
@@ -1546,7 +1655,17 @@ class UrlSource(SkillSource):
             source="url",
             identifier=url,
             trust_level="community",
-            metadata={"url": url, "source_url": url, "awaiting_name": not skill_name},
+            metadata={
+                "url": url,
+                "source_url": url,
+                "awaiting_name": not skill_name,
+                "bundle_warnings": [
+                    "Raw SKILL.md URLs cannot enumerate sibling files or preserve "
+                    "executable modes. Only files explicitly referenced by SKILL.md can "
+                    "be installed; use a GitHub tap or manifest-based source for a "
+                    "complete bundle."
+                ],
+            },
         )
 
     @staticmethod
@@ -3377,7 +3496,7 @@ class OptionalSkillSource(SkillSource):
                 and "__pycache__" not in f.parts
                 and f.suffix != ".pyc"
             ):
-                rel_path = str(f.relative_to(skill_dir))
+                rel_path = f.relative_to(skill_dir).as_posix()
                 try:
                     files[rel_path] = f.read_bytes()
                 except OSError:
@@ -3705,6 +3824,7 @@ class HubLockFile:
         files: List[str],
         metadata: Optional[Dict[str, Any]] = None,
         scan_provenance: Optional[Dict[str, Any]] = None,
+        file_modes: Optional[Dict[str, int]] = None,
     ) -> None:
         # Validate both the skill name and the install path SHAPE before
         # writing into lock.json. A poisoned lock entry is the precondition
@@ -3721,6 +3841,7 @@ class HubLockFile:
             "content_hash": skill_hash,
             "install_path": safe_install_path,
             "files": files,
+            "file_modes": file_modes or {},
             "metadata": metadata or {},
             "scan_provenance": scan_provenance or {},
             "installed_at": datetime.now(timezone.utc).isoformat(),
@@ -3840,6 +3961,18 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
     for rel_path, file_content in bundle.files.items():
         safe_rel_path = _validate_bundle_rel_path(rel_path)
         validated_files.append((safe_rel_path, file_content))
+    validated_modes: Dict[str, int] = {}
+    for rel_path, file_mode in bundle.file_modes.items():
+        safe_rel_path = _validate_bundle_rel_path(rel_path)
+        if safe_rel_path not in bundle.files:
+            raise ValueError(f"File mode references missing bundle file: {safe_rel_path}")
+        if (
+            isinstance(file_mode, bool)
+            or not isinstance(file_mode, int)
+            or file_mode not in _ALLOWED_BUNDLE_FILE_MODES
+        ):
+            raise ValueError(f"Unsupported bundle file mode for {safe_rel_path}: {file_mode!r}")
+        validated_modes[safe_rel_path] = file_mode
 
     dest = _quarantine_dir() / skill_name
     if dest.exists():
@@ -3853,6 +3986,9 @@ def quarantine_bundle(bundle: SkillBundle) -> Path:
             file_dest.write_bytes(file_content)
         else:
             file_dest.write_text(file_content, encoding="utf-8")
+        file_mode = validated_modes.get(rel_path)
+        if file_mode is not None:
+            file_dest.chmod(file_mode)
 
     return dest
 
@@ -4000,6 +4136,7 @@ def install_from_quarantine(
         skill_hash=content_hash(install_dir),
         install_path=str(install_dir.relative_to(_skills_dir())),
         files=list(bundle.files.keys()),
+        file_modes=bundle.file_modes,
         metadata=bundle.metadata,
         scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
     )
@@ -4135,7 +4272,13 @@ def check_for_skill_updates(
 
         current_hash = entry.get("content_hash", "")
         latest_hash = bundle_content_hash(bundle)
-        status = "up_to_date" if current_hash == latest_hash else "update_available"
+        current_modes = entry.get("file_modes", {})
+        latest_modes = bundle.file_modes
+        status = (
+            "up_to_date"
+            if current_hash == latest_hash and current_modes == latest_modes
+            else "update_available"
+        )
         results.append({
             "name": entry.get("name", ""),
             "identifier": identifier,

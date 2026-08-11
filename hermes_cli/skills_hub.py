@@ -122,6 +122,14 @@ def _format_extra_metadata_lines(extra: Dict[str, Any]) -> list[str]:
     return lines
 
 
+def _bundle_warning_messages(bundle) -> list[str]:
+    """Return source limitations that must remain visible on forced installs."""
+    warnings = (getattr(bundle, "metadata", {}) or {}).get("bundle_warnings", [])
+    if not isinstance(warnings, list):
+        return []
+    return [warning for warning in warnings if isinstance(warning, str) and warning]
+
+
 def _resolve_source_meta_and_bundle(identifier: str, sources):
     """Resolve metadata and bundle for a specific identifier."""
     meta = None
@@ -609,6 +617,12 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         if meta is not None:
             meta.name = bundle.name
             meta.path = bundle.name
+
+    bundle_warnings = _bundle_warning_messages(bundle)
+    for warning in bundle_warnings:
+        c.print(f"[bold yellow]Warning:[/] {warning}")
+    if bundle_warnings:
+        c.print()
 
     # URL-sourced skills: offer to pick a category interactively when the
     # caller didn't specify one (TTY only — non-interactive installs fall

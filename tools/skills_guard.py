@@ -700,11 +700,14 @@ def _content_digest(skill_path: Path) -> str:
     """Canonical SHA-256 over relative paths and exact file bytes."""
     h = hashlib.sha256()
     if skill_path.is_dir():
-        for file_path in sorted(skill_path.rglob("*")):
-            if file_path.is_file():
-                rel = file_path.relative_to(skill_path).as_posix()
-                h.update(rel.encode("utf-8") + b"\x00")
-                h.update(file_path.read_bytes())
+        files = (path for path in skill_path.rglob("*") if path.is_file())
+        for file_path in sorted(
+            files,
+            key=lambda path: path.relative_to(skill_path).as_posix(),
+        ):
+            rel = file_path.relative_to(skill_path).as_posix()
+            h.update(rel.encode("utf-8") + b"\x00")
+            h.update(file_path.read_bytes())
     else:
         h.update(skill_path.read_bytes())
     return h.hexdigest()
@@ -869,6 +872,20 @@ def content_hash(skill_path: Path) -> str:
 # Structural checks
 # ---------------------------------------------------------------------------
 
+_SCRIPT_EXTENSIONS = frozenset({'.sh', '.bash', '.py', '.rb', '.pl'})
+
+
+def _is_recognized_script(path: Path) -> bool:
+    """Recognize extensionless executable scripts by their shebang."""
+    if path.suffix.lower() in _SCRIPT_EXTENSIONS:
+        return True
+    try:
+        with path.open("rb") as handle:
+            return handle.read(2) == b"#!"
+    except OSError:
+        return False
+
+
 def _check_structure(skill_dir: Path, ignore=None) -> List[Finding]:
     """
     Check the skill directory for structural anomalies:
@@ -959,8 +976,9 @@ def _check_structure(skill_dir: Path, ignore=None) -> List[Finding]:
                 description=f"binary/executable file ({ext}) should not be in a skill",
             ))
 
-        # Executable permission on non-script files
-        if ext not in {'.sh', '.bash', '.py', '.rb', '.pl'} and f.stat().st_mode & 0o111:
+        # Executable permission on non-script files. Extensionless command-line
+        # scripts are common in skill bundles, so recognize a real shebang.
+        if not _is_recognized_script(f) and f.stat().st_mode & 0o111:
             findings.append(Finding(
                 pattern_id="unexpected_executable",
                 severity="medium",

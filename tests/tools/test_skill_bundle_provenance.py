@@ -106,7 +106,11 @@ def test_url_source_rejects_traversal_reference(monkeypatch):
 
 def test_github_source_rejects_symlink_in_referenced_directory(monkeypatch):
     source = GitHubSource(GitHubAuth())
-    monkeypatch.setattr(source, "_fetch_file_content", lambda _repo, path: SKILL_MD if path.endswith("SKILL.md") else "x")
+    monkeypatch.setattr(
+        source,
+        "_fetch_file_content",
+        lambda _repo, path, **_kwargs: SKILL_MD if path.endswith("SKILL.md") else "x",
+    )
     source._tree_cache["owner/repo"] = (
         "main",
         [
@@ -162,7 +166,9 @@ def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path)
     entry = json.loads((home / "skills" / ".hub" / "lock.json").read_text())["installed"]["demo-bundle"]
     assert entry["scan_provenance"]["source_url"] == url
     assert entry["scan_provenance"]["fresh"] is True
-    assert "Scan provenance: fresh" in sink.getvalue()
+    output = sink.getvalue()
+    assert "Scan provenance: fresh" in output
+    assert "Raw SKILL.md URLs cannot enumerate sibling files" in output
 
 
 def test_bundled_optional_source_still_includes_support_files(tmp_path, monkeypatch):

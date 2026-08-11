@@ -289,6 +289,138 @@ class TestFindSkillInRepoTree:
         assert result is None
 
 
+class TestGitHubBundleFetch:
+    def _source(self):
+        auth = MagicMock(spec=GitHubAuth)
+        auth.get_headers.return_value = {}
+        return GitHubSource(auth=auth)
+
+    def test_fetch_includes_unreferenced_files_and_git_modes(self):
+        source = self._source()
+        skill_md = "---\nname: demo\n---\n\n# Demo\n"
+        source._tree_revisions["owner/repo"] = "abc123"
+
+        with patch.object(source, "_fetch_file_content", return_value=skill_md), \
+             patch.object(source, "_get_repo_tree", return_value=("main", [
+                 {"path": "skills/demo/SKILL.md", "type": "blob", "mode": "100644"},
+                 {"path": "skills/demo/scripts/selftest", "type": "blob", "mode": "100755"},
+                 {"path": "skills/demo/assets/logo.png", "type": "blob", "mode": "100644"},
+                 {"path": "skills/other/SKILL.md", "type": "blob", "mode": "100644"},
+             ])), \
+             patch.object(
+                 source,
+                 "_fetch_file_bytes",
+                 side_effect=lambda _repo, path, **_kwargs: path.encode(),
+             ):
+            bundle = source.fetch("owner/repo/skills/demo")
+
+        assert bundle is not None
+        assert set(bundle.files) == {"SKILL.md", "scripts/selftest", "assets/logo.png"}
+        assert bundle.files["scripts/selftest"] == b"skills/demo/scripts/selftest"
+        assert bundle.file_modes == {
+            "SKILL.md": 0o644,
+            "assets/logo.png": 0o644,
+            "scripts/selftest": 0o755,
+        }
+        assert bundle.metadata["source_revision"] == "abc123"
+        assert bundle.metadata["bundle_warnings"] == []
+
+    def test_fetch_pins_every_tree_backed_file_to_one_revision(self):
+        source = self._source()
+        source._tree_revisions["owner/repo"] = "abc123"
+        skill_md = "---\nname: demo\n---\n"
+
+        with patch.object(
+            source, "_fetch_file_content", return_value=skill_md
+        ) as fetch_text, patch.object(
+            source,
+            "_get_repo_tree",
+            return_value=("main", [
+                {"path": "demo/SKILL.md", "type": "blob", "mode": "100644"},
+                {"path": "demo/scripts/run", "type": "blob", "mode": "100755"},
+            ]),
+        ), patch.object(
+            source, "_fetch_file_bytes", return_value=b"#!/bin/sh\n"
+        ) as fetch_bytes:
+            bundle = source.fetch("owner/repo/demo")
+
+        assert bundle is not None
+        fetch_text.assert_called_once_with(
+            "owner/repo", "demo/SKILL.md", ref="abc123"
+        )
+        fetch_bytes.assert_called_once_with(
+            "owner/repo", "demo/scripts/run", ref="abc123"
+        )
+
+    def test_fetch_fails_instead_of_returning_partial_tree_bundle(self):
+        source = self._source()
+        with patch.object(source, "_fetch_file_content", return_value="# Demo\n"), \
+             patch.object(source, "_get_repo_tree", return_value=("main", [
+                 {"path": "demo/SKILL.md", "type": "blob", "mode": "100644"},
+                 {"path": "demo/scripts/selftest", "type": "blob", "mode": "100755"},
+             ])), \
+             patch.object(source, "_fetch_file_bytes", return_value=None):
+            assert source.fetch("owner/repo/demo") is None
+
+    def test_fetch_rejects_complete_bundle_with_missing_referenced_file(self):
+        source = self._source()
+        skill_md = "Run `scripts/missing` when needed.\n"
+        with patch.object(source, "_fetch_file_content", return_value=skill_md), \
+             patch.object(source, "_get_repo_tree", return_value=("main", [
+                 {"path": "demo/SKILL.md", "type": "blob", "mode": "100644"},
+             ])):
+            assert source.fetch("owner/repo/demo") is None
+
+    def test_fetch_rejects_unreferenced_symlink(self):
+        source = self._source()
+        with patch.object(source, "_fetch_file_content", return_value="# Demo\n"), \
+             patch.object(source, "_get_repo_tree", return_value=("main", [
+                 {"path": "demo/SKILL.md", "type": "blob", "mode": "100644"},
+                 {"path": "demo/scripts/link", "type": "blob", "mode": "120000"},
+             ])):
+            assert source.fetch("owner/repo/demo") is None
+
+    def test_contents_fallback_is_complete_and_warns_when_modes_are_unavailable(self):
+        source = self._source()
+        downloaded = {
+            "SKILL.md": b"# Demo\n",
+            "scripts/unreferenced": b"#!/bin/sh\n",
+        }
+        with patch.object(source, "_fetch_file_content", return_value="# Demo\n"), \
+             patch.object(source, "_get_repo_tree", return_value=None), \
+             patch.object(source, "_download_bundle_via_contents", return_value=downloaded):
+            bundle = source.fetch("owner/repo/demo")
+
+        assert bundle is not None
+        assert set(bundle.files) == {"SKILL.md", "scripts/unreferenced"}
+        assert bundle.file_modes == {}
+        assert "executable bits could not be preserved" in bundle.metadata["bundle_warnings"][0]
+
+    def test_contents_fallback_recursively_downloads_every_regular_file(self):
+        source = self._source()
+        root = MagicMock(status_code=200)
+        root.json.return_value = [
+            {"name": "SKILL.md", "path": "demo/SKILL.md", "type": "file"},
+            {"name": "scripts", "path": "demo/scripts", "type": "dir"},
+        ]
+        scripts = MagicMock(status_code=200)
+        scripts.json.return_value = [
+            {"name": "selftest", "path": "demo/scripts/selftest", "type": "file"},
+        ]
+        with patch.object(source, "_github_get", side_effect=[root, scripts]), \
+             patch.object(
+                 source,
+                 "_fetch_file_bytes",
+                 side_effect=lambda _repo, path, **_kwargs: path.encode(),
+             ):
+            files = source._download_bundle_via_contents("owner/repo", "demo")
+
+        assert files == {
+            "SKILL.md": b"demo/SKILL.md",
+            "scripts/selftest": b"demo/scripts/selftest",
+        }
+
+
 class TestWellKnownSkillSource:
     @pytest.fixture(autouse=True)
     def _allow_public_skill_fetches(self, monkeypatch):
@@ -397,6 +529,22 @@ class TestUrlSource:
         assert self._source().fetch("http://127.0.0.1/SKILL.md") is None
         mock_get.assert_not_called()
 
+    def test_fetch_warns_that_raw_bundle_completeness_and_modes_are_unknown(self):
+        source = self._source()
+        skill_md = (
+            "---\nname: demo\ndescription: test\n---\n\n"
+            "Run `scripts/known` when needed.\n"
+        )
+        with patch.object(source, "_fetch_text", return_value=skill_md), \
+             patch.object(source, "_fetch_bytes", return_value=b"#!/bin/sh\n"):
+            bundle = source.fetch("https://example.com/demo/SKILL.md")
+
+        assert bundle is not None
+        assert set(bundle.files) == {"SKILL.md", "scripts/known"}
+        warning = bundle.metadata["bundle_warnings"][0]
+        assert "cannot enumerate sibling files" in warning
+        assert "cannot" in warning and "executable modes" in warning
+
 
     def test_is_valid_skill_name_rejects_sentinel_and_garbage(self):
         invalid = [
@@ -427,9 +575,9 @@ class TestCheckForSkillUpdates:
         )
         skill_dir = tmp_path / "demo-skill"
         skill_dir.mkdir()
-        (skill_dir / "SKILL.md").write_text("same content")
+        (skill_dir / "SKILL.md").write_bytes(b"same content")
         (skill_dir / "references").mkdir()
-        (skill_dir / "references" / "checklist.md").write_text("- [ ] security\n")
+        (skill_dir / "references" / "checklist.md").write_bytes(b"- [ ] security\n")
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
@@ -458,6 +606,32 @@ class TestCheckForSkillUpdates:
 
         assert len(results) == 1
         assert results[0]["name"] == "demo-skill"
+        assert results[0]["status"] == "update_available"
+
+    def test_reports_update_when_only_remote_file_modes_differ(self):
+        bundle = SkillBundle(
+            name="demo-skill",
+            files={"SKILL.md": "same", "scripts/run": "#!/bin/sh\n"},
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+            file_modes={"SKILL.md": 0o644, "scripts/run": 0o755},
+        )
+        lock = MagicMock()
+        lock.list_installed.return_value = [{
+            "name": "demo-skill",
+            "source": "github",
+            "identifier": "owner/repo/demo-skill",
+            "content_hash": bundle_content_hash(bundle),
+            "file_modes": {},
+            "install_path": "demo-skill",
+        }]
+        source = MagicMock()
+        source.source_id.return_value = "github"
+        source.fetch.return_value = bundle
+
+        results = check_for_skill_updates(lock=lock, sources=[source])
+
         assert results[0]["status"] == "update_available"
 
 class TestCreateSourceRouter:
@@ -491,6 +665,7 @@ class TestHubLockFile:
             name="s1", source="github", identifier="x",
             trust_level="trusted", scan_verdict="pass",
             skill_hash="h1", install_path="s1", files=["SKILL.md"],
+            file_modes={"SKILL.md": 0o644},
         )
         lock.record_install(
             name="s2", source="clawhub", identifier="y",
@@ -501,6 +676,7 @@ class TestHubLockFile:
         assert len(installed) == 2
         names = {e["name"] for e in installed}
         assert names == {"s1", "s2"}
+        assert lock.get_installed("s1")["file_modes"] == {"SKILL.md": 0o644}
 
 
 # ---------------------------------------------------------------------------
@@ -762,8 +938,8 @@ class TestOptionalSkillSourceBinaryAssets:
         (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.wav").write_bytes(
             wav_bytes
         )
-        (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.txt").write_text(
-            "hello\n", encoding="utf-8"
+        (skill_dir / "assets" / "neutts-cli" / "samples" / "jo.txt").write_bytes(
+            b"hello\n"
         )
         pycache_dir = skill_dir / "assets" / "neutts-cli" / "src" / "neutts_cli" / "__pycache__"
         pycache_dir.mkdir(parents=True)
@@ -947,6 +1123,52 @@ class TestQuarantineBundleBinaryAssets:
 
         assert (q_path / "SKILL.md").read_text(encoding="utf-8").startswith("---")
         assert (q_path / "assets" / "neutts-cli" / "samples" / "jo.wav").read_bytes() == b"RIFF\x00\x01fakewav"
+
+    def test_quarantine_bundle_applies_validated_file_modes(self, tmp_path):
+        import tools.skills_hub as hub
+
+        hub_dir = tmp_path / "skills" / ".hub"
+        bundle = SkillBundle(
+            name="demo",
+            files={"SKILL.md": "# Demo\n", "scripts/run": b"#!/bin/sh\n"},
+            source="github",
+            identifier="owner/repo/demo",
+            trust_level="community",
+            file_modes={"SKILL.md": 0o644, "scripts/run": 0o755},
+        )
+        with patch.object(hub, "SKILLS_DIR", tmp_path / "skills"), \
+             patch.object(hub, "HUB_DIR", hub_dir), \
+             patch.object(hub, "LOCK_FILE", hub_dir / "lock.json"), \
+             patch.object(hub, "QUARANTINE_DIR", hub_dir / "quarantine"), \
+             patch.object(hub, "AUDIT_LOG", hub_dir / "audit.log"), \
+             patch.object(hub, "TAPS_FILE", hub_dir / "taps.json"), \
+             patch.object(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache"), \
+             patch("pathlib.Path.chmod") as chmod:
+            quarantine_bundle(bundle)
+
+        assert [call.args[0] for call in chmod.call_args_list] == [0o644, 0o755]
+
+    def test_quarantine_bundle_rejects_mode_for_missing_file(self, tmp_path):
+        import tools.skills_hub as hub
+
+        hub_dir = tmp_path / "skills" / ".hub"
+        bundle = SkillBundle(
+            name="demo",
+            files={"SKILL.md": "# Demo\n"},
+            source="github",
+            identifier="owner/repo/demo",
+            trust_level="community",
+            file_modes={"scripts/missing": 0o755},
+        )
+        with patch.object(hub, "SKILLS_DIR", tmp_path / "skills"), \
+             patch.object(hub, "HUB_DIR", hub_dir), \
+             patch.object(hub, "LOCK_FILE", hub_dir / "lock.json"), \
+             patch.object(hub, "QUARANTINE_DIR", hub_dir / "quarantine"), \
+             patch.object(hub, "AUDIT_LOG", hub_dir / "audit.log"), \
+             patch.object(hub, "TAPS_FILE", hub_dir / "taps.json"), \
+             patch.object(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache"):
+            with pytest.raises(ValueError, match="missing bundle file"):
+                quarantine_bundle(bundle)
 
     def test_quarantine_bundle_rejects_traversal_file_paths(self, tmp_path):
         import tools.skills_hub as hub

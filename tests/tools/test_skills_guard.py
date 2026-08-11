@@ -30,6 +30,7 @@ from tools.skills_guard import (
     _determine_verdict,
     _resolve_trust_level,
     _check_structure,
+    _is_recognized_script,
     _unicode_char_name,
     _load_skill_ignore,
     MAX_FILE_COUNT,
@@ -243,6 +244,18 @@ class TestScanSkill:
 
 
 class TestCheckStructure:
+    def test_recognizes_extensionless_shebang_script(self, tmp_path):
+        script = tmp_path / "selftest"
+        script.write_bytes(b"#!/usr/bin/env bash\nset -eu\n")
+
+        assert _is_recognized_script(script) is True
+
+    def test_extensionless_non_script_is_not_recognized(self, tmp_path):
+        data = tmp_path / "payload"
+        data.write_bytes(b"not a script\n")
+
+        assert _is_recognized_script(data) is False
+
     def test_structural_limits(self, tmp_path):
         for i in range(MAX_FILE_COUNT + 5):
             (tmp_path / f"file_{i}.txt").write_text("x")
