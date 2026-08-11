@@ -290,7 +290,13 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     setMessages
   })
 
-  const { connectionRef, gateway, gatewayRef, requestGateway: ambientRequestGateway } = useGatewayRequest()
+  const {
+    bindGatewayRequest,
+    connectionRef,
+    gateway,
+    gatewayRef,
+    requestGateway: ambientRequestGateway
+  } = useGatewayRequest()
 
   // When chrome stays on the launch backend (Bot Mode / all-profiles
   // navigation), session-owned RPCs still have to hit the session's backend.
@@ -488,6 +494,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   } = useSessionActions({
     activeSessionId,
     activeSessionIdRef,
+    bindGatewayRequest,
     busyRef,
     creatingSessionRef,
     ensureSessionState,

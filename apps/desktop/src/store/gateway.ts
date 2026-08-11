@@ -1,4 +1,10 @@
-import { type ConnectionState, type GatewayEvent, registryBackendScopeKey, resolveGatewayWsUrl } from '@hermes/shared'
+import {
+  type ConnectionState,
+  type GatewayEvent,
+  isGatewayReauthRequired,
+  registryBackendScopeKey,
+  resolveGatewayWsUrl
+} from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import type { HermesConnection } from '@/global'
@@ -23,6 +29,18 @@ const normKey = (profile: string | null | undefined): string => (profile ?? '').
 // Read connection state through a call so TS control-flow analysis doesn't
 // narrow the getter to a constant across guards (it genuinely changes).
 const isOpen = (gateway: HermesGateway | null): boolean => gateway?.connectionState === 'open'
+
+export type GatewayRequester = <T>(
+  method: string,
+  params?: Record<string, unknown>,
+  timeoutMs?: number,
+  signal?: AbortSignal
+) => Promise<T>
+
+export interface GatewayRequestLease {
+  request: GatewayRequester
+  release(): void
+}
 
 interface RegistryConfig {
   /** Electron's published descriptor is authoritative for a primary gateway's
@@ -1488,6 +1506,142 @@ export async function ensureActiveGatewayOpen(): Promise<HermesGateway | null> {
 // How long ensureActiveGatewayOpen waits out an in-flight secondary
 // activation before reporting the gateway as unavailable.
 const ACTIVE_GATEWAY_OPEN_WAIT_MS = 8_000
+
+let primaryCommandReconnect: { gateway: HermesGateway; profile: string; promise: Promise<void> } | null = null
+
+/**
+ * Pin the concrete socket that owned a command at invocation time. Secondary
+ * leases reuse the registry's active-request hold, so pruning and connection
+ * edits cannot replace that socket while metadata lookup is pending.
+ */
+export function acquireGatewayRequestLease(gateway: HermesGateway, profile: string): GatewayRequestLease {
+  const key = normKey(profile)
+  const secondary =
+    [...g.secondaries.values()].find(entry => entry.gateway === gateway && normKey(entry.profile) === key) ?? null
+  const ownsPrimary = !secondary && g.primaryGateway === gateway && g.primaryProfile === key
+
+  if (!secondary && !ownsPrimary) {
+    throw new Error('Hermes source gateway unavailable')
+  }
+
+  if (secondary) {
+    secondary.activeRequests += 1
+  }
+
+  let released = false
+  const stillRegistered = () =>
+    !released &&
+    (secondary
+      ? secondary.wantOpen && g.secondaries.get(secondary.scope) === secondary && secondary.gateway === gateway
+      : g.primaryGateway === gateway && g.primaryProfile === key)
+
+  const recover = async (): Promise<boolean> => {
+    if (!stillRegistered()) {
+      return false
+    }
+
+    if (secondary) {
+      clearTimer(secondary)
+      secondary.reconnectAttempt = 0
+      await openSecondary(secondary)
+
+      return stillRegistered() && isOpen(gateway)
+    }
+
+    const current = primaryCommandReconnect
+
+    if (current?.gateway === gateway && current.profile === key) {
+      await current.promise
+
+      return stillRegistered() && isOpen(gateway)
+    }
+
+    const attempt = (async () => {
+      const desktop = window.hermesDesktop
+
+      if (!desktop || !stillRegistered()) {
+        return
+      }
+
+      const connection = await desktop.getConnection(key)
+      const wsUrl = await resolveGatewayWsUrl(desktop, connection)
+
+      if (stillRegistered()) {
+        await gateway.connect(wsUrl)
+      }
+    })()
+    const reconnect = { gateway, profile: key, promise: attempt }
+    primaryCommandReconnect = reconnect
+
+    try {
+      await attempt
+    } finally {
+      if (primaryCommandReconnect === reconnect) {
+        primaryCommandReconnect = null
+      }
+    }
+
+    return stillRegistered() && isOpen(gateway)
+  }
+
+  return {
+    request: async <T>(method: string, params = {}, timeoutMs?: number, signal?: AbortSignal): Promise<T> => {
+      if (!stillRegistered()) {
+        throw new Error('Hermes source gateway unavailable')
+      }
+
+      try {
+        return await gateway.request<T>(method, params, timeoutMs, signal)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+
+        if (!/not connected|connection closed/i.test(message)) {
+          throw error
+        }
+
+        try {
+          if (!(await recover())) {
+            throw error
+          }
+        } catch (reconnectError) {
+          if (isGatewayReauthRequired(reconnectError)) {
+            throw reconnectError
+          }
+
+          throw error
+        }
+
+        return gateway.request<T>(method, params, timeoutMs, signal)
+      }
+    },
+    release: () => {
+      if (released) {
+        return
+      }
+
+      released = true
+
+      if (secondary) {
+        secondary.activeRequests = Math.max(0, secondary.activeRequests - 1)
+
+        if (
+          !drainPendingConnectionRedial(secondary) &&
+          secondary.activeRequests === 0 &&
+          !secondary.retained &&
+          !relayRetained(secondary) &&
+          !foregroundPinned(secondary) &&
+          g.activeKey !== secondary.scope
+        ) {
+          disposeSecondary(secondary)
+
+          if (g.secondaries.get(secondary.scope) === secondary) {
+            g.secondaries.delete(secondary.scope)
+          }
+        }
+      }
+    }
+  }
+}
 
 // Recovery signal: nudge every live secondary back open. Power-resume/network
 // signals can force sockets that still report open to retire before redialing.
