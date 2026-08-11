@@ -13,6 +13,7 @@ import base64
 import json
 from unittest.mock import patch
 
+from agent.media_provenance import register_trusted_media
 
 from tools.vision_tools import (
     _build_native_vision_tool_result,
@@ -153,6 +154,7 @@ class TestHandleVisionAnalyzeFastPath:
         """Main model supports native vision → fast path returns multimodal."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
+        register_trusted_media("test-session", [str(img)], origin="user_explicit")
 
         # Set runtime override so the handler thinks we're on opus@openrouter
         from agent.auxiliary_client import set_runtime_main, clear_runtime_main
@@ -164,7 +166,7 @@ class TestHandleVisionAnalyzeFastPath:
                 "agent.image_routing.decide_image_input_mode",
                 return_value="native",
             ):
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"}, session_id="test-session")
                 result = asyncio.get_event_loop().run_until_complete(coro)
         finally:
             clear_runtime_main()
@@ -178,6 +180,7 @@ class TestHandleVisionAnalyzeFastPath:
         """Even with vision-capable model, unknown provider → fall through."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
+        register_trusted_media("test-session", [str(img)], origin="user_explicit")
 
         async def _aux_sentinel(*args, **kwargs):
             return '{"sentinel": "aux-path"}'
@@ -186,7 +189,7 @@ class TestHandleVisionAnalyzeFastPath:
         set_runtime_main("brand-new-provider", "anthropic/claude-opus-4.6")
         try:
             with patch("tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel):
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"}, session_id="test-session")
                 result = asyncio.get_event_loop().run_until_complete(coro)
         finally:
             clear_runtime_main()
@@ -198,6 +201,7 @@ class TestHandleVisionAnalyzeFastPath:
         """supports_vision=true enables the fast path on an unlisted provider."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
+        register_trusted_media("test-session", [str(img)], origin="user_explicit")
 
         async def _aux_sentinel(*args, **kwargs):
             return '{"sentinel": "aux-path"}'
@@ -211,7 +215,7 @@ class TestHandleVisionAnalyzeFastPath:
             ), patch(
                 "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel,
             ) as mock_aux:
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"}, session_id="test-session")
                 result = asyncio.get_event_loop().run_until_complete(coro)
         finally:
             clear_runtime_main()
@@ -223,6 +227,7 @@ class TestHandleVisionAnalyzeFastPath:
         """Explicit text routing blocks the fast path even with supports_vision."""
         img = tmp_path / "x.png"
         img.write_bytes(_TINY_PNG)
+        register_trusted_media("test-session", [str(img)], origin="user_explicit")
 
         async def _aux_sentinel(*args, **kwargs):
             return '{"sentinel": "aux-path"}'
@@ -239,7 +244,7 @@ class TestHandleVisionAnalyzeFastPath:
             ), patch(
                 "tools.vision_tools.vision_analyze_tool", side_effect=_aux_sentinel,
             ) as mock_aux:
-                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"})
+                coro = _handle_vision_analyze({"image_url": str(img), "question": "?"}, session_id="test-session")
                 result = asyncio.get_event_loop().run_until_complete(coro)
         finally:
             clear_runtime_main()

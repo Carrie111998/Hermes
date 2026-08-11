@@ -179,6 +179,8 @@ class TestSchemaAndHandler:
         from tools.vision_tools import _handle_vision_analyze
 
         src = _make_png(tmp_path / "img.png", 100, 50)
+        from agent.media_provenance import register_trusted_media
+        register_trusted_media("test-session", [str(src)], origin="user_explicit")
         seen = {}
 
         async def _fake_native(image_url, question, task_id=None, region=None):
@@ -191,7 +193,8 @@ class TestSchemaAndHandler:
         )
         asyncio.get_event_loop().run_until_complete(
             _handle_vision_analyze(
-                {"image_url": str(src), "question": "q", "region": [1, 2, 30, 40]}
+                {"image_url": str(src), "question": "q", "region": [1, 2, 30, 40]},
+                session_id="test-session",
             )
         )
         assert seen["region"] == [1, 2, 30, 40]

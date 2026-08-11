@@ -356,7 +356,10 @@ class TestVisionDispatchLoopSafety:
         """After dispatching vision_analyze via the registry, the event
         loop must remain open so cached async clients don't crash on GC."""
         from model_tools import _get_tool_loop
+        from agent.media_provenance import register_user_media_references
         from tools.registry import registry
+
+        register_user_media_references("test-session", "https://example.com/cat.png")
 
         fake_response = _mock_vision_response()
 
@@ -384,6 +387,7 @@ class TestVisionDispatchLoopSafety:
             result_json = registry.dispatch(
                 "vision_analyze",
                 {"image_url": "https://example.com/cat.png", "question": "What is this?"},
+                session_id="test-session",
             )
 
         result = json.loads(result_json)
@@ -401,7 +405,10 @@ class TestVisionDispatchLoopSafety:
         and share the same loop (simulates 'first call fails, second
         works' from the issue report)."""
         from model_tools import _get_tool_loop
+        from agent.media_provenance import register_user_media_references
         from tools.registry import registry
+
+        register_user_media_references("test-session", "https://example.com/cat.png")
 
         fake_response = _mock_vision_response()
 
@@ -428,10 +435,10 @@ class TestVisionDispatchLoopSafety:
         ):
             args = {"image_url": "https://example.com/cat.png", "question": "Describe"}
 
-            r1 = json.loads(registry.dispatch("vision_analyze", args))
+            r1 = json.loads(registry.dispatch("vision_analyze", args, session_id="test-session"))
             loop_after_first = _get_tool_loop()
 
-            r2 = json.loads(registry.dispatch("vision_analyze", args))
+            r2 = json.loads(registry.dispatch("vision_analyze", args, session_id="test-session"))
             loop_after_second = _get_tool_loop()
 
         assert r1.get("success") is True
