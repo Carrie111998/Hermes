@@ -615,9 +615,9 @@ check_python() {
         local install_attempted=false
         local candidate
         while true; do
-            # Prefer the project's pinned minor when Termux also exposes a
-            # newer default `python`. Keep this range in sync with pyproject.toml.
-            for candidate in "python${PYTHON_VERSION}" python; do
+            # Prefer every explicitly supported minor before Termux's default
+            # `python`, which may already be newer than Hermes supports.
+            for candidate in python3.11 python3.12 python3.13 python; do
                 if ! command -v "$candidate" >/dev/null 2>&1; then
                     continue
                 fi
@@ -638,7 +638,7 @@ check_python() {
         done
 
         log_error "Hermes requires Python >=3.11,<3.14 on Termux"
-        log_info "Install python${PYTHON_VERSION} and re-run this script"
+        log_info "Install Python 3.11, 3.12, or 3.13 and re-run this script"
         exit 1
     fi
 

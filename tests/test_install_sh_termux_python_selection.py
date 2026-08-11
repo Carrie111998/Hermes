@@ -1,77 +1,130 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 from pathlib import Path
+
+import pytest
 
 INSTALL_SH = Path(__file__).resolve().parents[1] / "scripts" / "install.sh"
 
 
-def _check_python_source() -> str:
-    text = INSTALL_SH.read_text(encoding="utf-8")
-    match = re.search(r"^check_python\(\) \{.*?^\}", text, re.MULTILINE | re.DOTALL)
-    assert match, "check_python() missing from install.sh"
-    return match.group(0)
-
-
-def _fake_python(path: Path, version: str, supported: bool) -> None:
-    path.write_text(
-        "#!/bin/sh\n"
-        "if [ \"${1:-}\" = \"-c\" ]; then exit " + ("0" if supported else "1") + "; fi\n"
-        f"if [ \"${{1:-}}\" = \"--version\" ]; then echo 'Python {version}'; exit 0; fi\n"
-        "exit 0\n",
-        encoding="utf-8",
-    )
+def _write_executable(path: Path, body: str) -> None:
+    path.write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
     path.chmod(0o755)
 
 
-def _run_check_python(tmp_path: Path, *, with_python311: bool) -> subprocess.CompletedProcess[str]:
+def _fake_python(path: Path, version: str, supported: bool, probe_log: Path) -> None:
+    _write_executable(
+        path,
+        f"""case "${{1:-}}" in
+  -c)
+    echo "$(basename "$0") -c" >> {probe_log!s}
+    exit {0 if supported else 1}
+    ;;
+  --version)
+    echo "$(basename "$0") --version" >> {probe_log!s}
+    echo "Python {version}"
+    exit 0
+    ;;
+esac
+exit 0""",
+    )
+
+
+def _run_termux_prerequisites(
+    tmp_path: Path,
+    *,
+    supported_candidate: tuple[str, str] | None,
+) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _fake_python(bin_dir / "python", "3.14.6", supported=False)
-    if with_python311:
-        _fake_python(bin_dir / "python3.11", "3.11.15", supported=True)
+    probe_log = tmp_path / "python-probes.log"
     pkg_log = tmp_path / "pkg.log"
-    pkg = bin_dir / "pkg"
-    pkg.write_text(f"#!/bin/sh\necho \"$*\" >> {pkg_log!s}\nexit 0\n", encoding="utf-8")
-    pkg.chmod(0o755)
 
-    harness = f"""
-set -u
-DISTRO=termux
-PYTHON_VERSION=3.11
-PYTHON_PATH=""
-PYTHON_FOUND_VERSION=""
-log_info() {{ :; }}
-log_success() {{ :; }}
-log_error() {{ echo "$*" >&2; }}
-{_check_python_source()}
-check_python
-echo "SELECTED=$PYTHON_PATH"
-echo "VERSION=$PYTHON_FOUND_VERSION"
-"""
+    _fake_python(bin_dir / "python", "3.14.6", False, probe_log)
+    if supported_candidate is not None:
+        candidate, version = supported_candidate
+        _fake_python(bin_dir / candidate, version, True, probe_log)
+
+    _write_executable(
+        bin_dir / "pkg",
+        f'echo "$*" >> {pkg_log!s}\nexit 0',
+    )
+    _write_executable(bin_dir / "uname", 'echo "Linux"')
+    _write_executable(bin_dir / "git", 'echo "git version 2.50.0"')
+    _write_executable(bin_dir / "node", 'echo "v22.22.0"')
+    _write_executable(bin_dir / "npm", 'echo "11.9.0"')
+    _write_executable(bin_dir / "curl", "exit 0")
+    _write_executable(bin_dir / "rg", 'echo "ripgrep 14.1.0"')
+    _write_executable(bin_dir / "ffmpeg", 'echo "ffmpeg version 7.1 Copyright"')
+
+    home = tmp_path / "home"
+    prefix = tmp_path / "com.termux" / "files" / "usr"
+    home.mkdir()
+    prefix.mkdir(parents=True)
     env = os.environ.copy()
-    env["PATH"] = f"{bin_dir}:/usr/bin:/bin"
-    return subprocess.run(
-        ["/bin/bash", "-c", harness],
+    env.update({
+        "HOME": str(home),
+        "HERMES_HOME": str(home / ".hermes"),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "PREFIX": str(prefix),
+        "TERMUX_VERSION": "0.118.2",
+    })
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            str(INSTALL_SH),
+            "--stage",
+            "prerequisites",
+            "--json",
+            "--non-interactive",
+        ],
         text=True,
         capture_output=True,
         env=env,
         check=False,
     )
+    return result, probe_log, pkg_log
 
 
-def test_termux_prefers_supported_python311_over_default_python314(tmp_path: Path) -> None:
-    result = _run_check_python(tmp_path, with_python311=True)
-    assert result.returncode == 0, result.stderr
-    assert f"SELECTED={tmp_path / 'bin' / 'python3.11'}" in result.stdout
-    assert "VERSION=Python 3.11.15" in result.stdout
-    assert not (tmp_path / "pkg.log").exists()
+@pytest.mark.parametrize(
+    ("candidate", "version"),
+    [
+        ("python3.11", "3.11.15"),
+        ("python3.12", "3.12.11"),
+        ("python3.13", "3.13.7"),
+    ],
+)
+def test_termux_prefers_each_supported_explicit_interpreter_over_python314(
+    tmp_path: Path,
+    candidate: str,
+    version: str,
+) -> None:
+    result, probe_log, pkg_log = _run_termux_prerequisites(
+        tmp_path,
+        supported_candidate=(candidate, version),
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Python found: Python {version}" in result.stdout
+    assert probe_log.read_text(encoding="utf-8").splitlines() == [
+        f"{candidate} -c",
+        f"{candidate} --version",
+    ]
+    assert "install -y python" not in pkg_log.read_text(encoding="utf-8").splitlines()
 
 
 def test_termux_rejects_python314_after_package_install_attempt(tmp_path: Path) -> None:
-    result = _run_check_python(tmp_path, with_python311=False)
+    result, probe_log, pkg_log = _run_termux_prerequisites(
+        tmp_path,
+        supported_candidate=None,
+    )
+
     assert result.returncode != 0
-    assert "Python >=3.11,<3.14" in result.stderr
-    assert (tmp_path / "pkg.log").read_text(encoding="utf-8").strip() == "install -y python"
+    assert "Python >=3.11,<3.14" in result.stdout + result.stderr
+    assert probe_log.read_text(encoding="utf-8").splitlines() == [
+        "python -c",
+        "python -c",
+    ]
+    assert pkg_log.read_text(encoding="utf-8").splitlines() == ["install -y python"]
