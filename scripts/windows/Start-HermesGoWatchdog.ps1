@@ -252,8 +252,9 @@ function Quote-WatchdogArgument([string]$Value) {
     return $Value
 }
 
-# Pass flag name and value as separate argv entries so paths with spaces
-# ("New project") are not truncated by Start-Process command-line quoting.
+# Build one safely quoted Windows command line. Start-Process joins an array
+# before CreateProcess, so passing a raw array splits a root such as
+# "...\\New project\\..." and makes Go's flag parser ignore every later flag.
 # Go's flag package accepts both -name=value and -name value.
 $embeddingWatchdogArgs = @(Get-EmbeddingWatchdogArguments -Root $RepoRoot)
 $argList = @(
@@ -272,11 +273,12 @@ if (-not $NoTsnet -and ($env:HERMES_WATCHDOG_TS_AUTHKEY -or $env:TS_AUTHKEY)) {
 }
 
 $workDir = Split-Path -Parent $Exe
-Write-Host "Starting Go watchdog detached: $Exe $($argList -join ' ')"
+$quotedArgList = @($argList | ForEach-Object { Quote-WatchdogArgument ([string]$_) })
+Write-Host "Starting Go watchdog detached: $Exe $($quotedArgList -join ' ')"
 
 $launched = $false
 try {
-    $proc = Start-Process -FilePath $Exe -ArgumentList $argList -WorkingDirectory $workDir -WindowStyle Hidden -PassThru
+    $proc = Start-Process -FilePath $Exe -ArgumentList ($quotedArgList -join ' ') -WorkingDirectory $workDir -WindowStyle Hidden -PassThru
     if ($proc) { $launched = $true }
 } catch {
     Write-Warning "Start-Process ArgumentList failed: $($_.Exception.Message); trying UseShellExecute"
