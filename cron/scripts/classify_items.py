@@ -165,7 +165,10 @@ def main() -> int:
     try:
         resp = call_llm(
             task="monitor",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": _CLASSIFY_INSTRUCTIONS},
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=1024,
             temperature=0,
         )
