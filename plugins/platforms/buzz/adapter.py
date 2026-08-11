@@ -1201,13 +1201,13 @@ class BuzzAdapter(BasePlatformAdapter):
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
 
-        # Top-level and thread mention gates are independent, matching Slack:
-        # thread_require_mention can keep replies gated even when top-level
-        # channel messages are free-response. DMs always dispatch.
-        if not is_dm and not self._is_mentioned(content):
+        # Mention policy only applies while the shared-channel gate is enabled.
+        # thread_require_mention can relax that gate for active agent threads,
+        # but must not tighten require_mention=False installs. DMs always dispatch.
+        if not is_dm and self.require_mention and not self._is_mentioned(content):
             if reply_target and self.thread_require_mention:
                 return
-            if self.require_mention and not in_agent_thread:
+            if not in_agent_thread:
                 if reply_target:
                     self._remember_pending_thread_event(state, event)
                 return

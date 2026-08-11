@@ -300,6 +300,31 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_require_mention_false_still_dispatches_unmentioned_thread_replies(self):
+        adapter = _make_adapter({"require_mention": False})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {
+            "chat_type": "group", "last_ts": 0, "seen": {},
+        }
+
+        await self._poll_with(
+            adapter,
+            _tagged_event("root", CHANNEL, content="Starting a thread", created_at=10),
+            _tagged_event(
+                "reply", CHANNEL, content="Following up", created_at=11,
+                reply_to="root",
+            ),
+        )
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["root", "reply"]
+
+    @pytest.mark.asyncio
     async def test_unmentioned_followup_dispatches_after_agent_replies_when_thread_mentions_disabled(self):
         adapter = _make_adapter({"thread_require_mention": False})
         adapter._dispatched = []
@@ -377,7 +402,7 @@ class TestMentionGating:
         ]
 
     @pytest.mark.asyncio
-    async def test_thread_mention_gate_still_applies_when_top_level_mentions_disabled(
+    async def test_thread_mention_gate_does_not_tighten_disabled_top_level_gate(
         self,
     ):
         adapter = _make_adapter(
@@ -403,7 +428,7 @@ class TestMentionGating:
             ),
         )
 
-        assert [d["message_id"] for d in adapter._dispatched] == ["root"]
+        assert [d["message_id"] for d in adapter._dispatched] == ["root", "reply"]
 
     @pytest.mark.asyncio
     async def test_saved_mention_settings_apply_without_adapter_restart(
@@ -446,7 +471,10 @@ class TestMentionGating:
             ),
         )
 
-        assert [d["message_id"] for d in adapter._dispatched] == ["top-level"]
+        assert [d["message_id"] for d in adapter._dispatched] == [
+            "top-level",
+            "followup",
+        ]
 
     def test_malformed_saved_config_preserves_working_mention_policy(
         self, monkeypatch, tmp_path
