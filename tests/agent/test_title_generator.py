@@ -108,6 +108,101 @@ class TestGenerateTitle:
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
 
+    def test_falls_back_to_json_object_when_json_schema_rejected(self):
+        """Providers without structured output (DeepSeek: 400 on json_schema)
+        must get a json_object retry with thinking pinned off instead of a
+        failed title."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - 'This response_format type is "
+                    "unavailable now'"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix login button"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("fix login button")
+
+        assert title == "Fix login button"
+        assert len(calls) == 2
+        # First attempt keeps the ideal json_schema constraint.
+        assert calls[0]["extra_body"]["response_format"]["type"] == "json_schema"
+        # Retry loosens to json_object and disables thinking so a
+        # default-on reasoning model doesn't burn the token budget.
+        assert calls[1]["extra_body"] == {
+            "response_format": {"type": "json_object"},
+            "thinking": {"type": "disabled"},
+        }
+        assert calls[1]["reasoning_config"] == {"enabled": False}
+
+    def test_falls_back_to_unconstrained_when_json_object_also_rejected(self):
+        """A provider that rejects both json_schema and json_object still
+        titles via the prompt's own JSON instruction."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise RuntimeError(
+                    "Error code: 400 - 'This response_format type is "
+                    "unavailable now'"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix login button"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("fix login button")
+
+        assert title == "Fix login button"
+        assert len(calls) == 3
+        assert calls[2]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    def test_continues_ladder_on_empty_content(self):
+        """A 200 with empty content (Console Go on glm-5 returns this for
+        json_schema AND json_object) must not stop the ladder — the
+        unconstrained rung still titles the session."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            if len(calls) < 3:
+                resp.choices[0].message.content = ""  # silent empty completion
+            else:
+                resp.choices[0].message.content = '{"title": "Improve titles"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("improve title generation")
+
+        assert title == "Improve titles"
+        assert len(calls) == 3
+        assert calls[2]["extra_body"] == {"thinking": {"type": "disabled"}}
+
+    def test_does_not_retry_on_unrelated_errors(self):
+        """Auth/quota/network failures must not be retried — a different
+        response format cannot fix those."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("Error code: 429 - rate limit exceeded")
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("question")
+
+        assert title is None
+        assert len(calls) == 1
+
 
 
 

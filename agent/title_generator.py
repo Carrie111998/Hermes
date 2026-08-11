@@ -105,6 +105,32 @@ _TITLE_RESPONSE_FORMAT = {
     },
 }
 
+# json_object is the loosest structured-output hint. DeepSeek, Moonshot/Kimi
+# and other OpenAI-compatible endpoints document only json_object (DeepSeek
+# rejects json_schema with HTTP 400 "This response_format type is unavailable
+# now"). The title prompt already embeds the expected shape and
+# _extract_title_text() has a loose-JSON scan, so a looser hint stays safe.
+_TITLE_RESPONSE_FORMAT_JSON_OBJECT = {"type": "json_object"}
+
+
+def _response_format_rejected(exc: BaseException) -> bool:
+    """True when the provider rejected the ``response_format`` parameter.
+
+    Matches the parameter name in the error text (DeepSeek: "This
+    response_format type is unavailable now"; most providers echo the
+    parameter they reject). Also catches HTTP 400s that never mention
+    ``response_format`` — vLLM gateways translate json_schema into
+    guided_grammar and fail with ``compile_grammar_error``. Auth, quota
+    and network failures are deliberately excluded: a different format
+    cannot fix those, so the ladder must not waste a retry on them.
+    """
+    text = str(exc).lower()
+    if "response_format" in text or "json_schema" in text:
+        return True
+    if "guided_grammar" in text or "xgrammar" in text or "compile_grammar" in text:
+        return True
+    return False
+
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
 # named after a slash command or an injected reminder rather than the user's
@@ -391,31 +417,73 @@ def generate_title(
         {"role": "user", "content": user_snippet},
     ]
 
-    try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
-        )
-        content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
-    except Exception as e:
-        # Log at WARNING so this shows up in agent.log without debug mode.
-        # Full detail at debug level for operators who need the stack.
-        logger.warning("Title generation failed: %s", e)
+    # Walk the response-format ladder: json_schema (ideal) → json_object
+    # → unconstrained. Providers without structured-output support (e.g.
+    # DeepSeek, Console Go) 400 on json_schema; retrying looser keeps
+    # titling alive. Failures unrelated to response_format (auth, quota,
+    # network) break out immediately — a different format cannot fix those.
+    #
+    # An empty completion is treated like a rejection too: some gateways
+    # (Console Go on glm-5) accept json_schema/json_object but return a
+    # 200 with empty content, which would leave the session with the
+    # derived title even though the loosest rung works. Only return when a
+    # rung actually yields a title.
+    last_exc: Optional[BaseException] = None
+    for response_format, pin_thinking_off in (
+        (_TITLE_RESPONSE_FORMAT, False),
+        (_TITLE_RESPONSE_FORMAT_JSON_OBJECT, True),
+        (None, True),
+    ):
+        try:
+            extra_body: dict = {}
+            if response_format is not None:
+                extra_body["response_format"] = response_format
+            if pin_thinking_off:
+                # Pin thinking off so a default-on reasoning model does not
+                # burn the 64-token budget on reasoning and return empty.
+                extra_body["thinking"] = {"type": "disabled"}
+            call_kwargs = {
+                "task": "title_generation",
+                "messages": messages,
+                # A title is a handful of tokens. The old 500-token ceiling let a
+                # chatty model burn seconds generating prose we then threw away.
+                "max_tokens": 64,
+                "temperature": 0.3,
+                "timeout": timeout,
+                "main_runtime": main_runtime,
+                "extra_body": extra_body,
+            }
+            if pin_thinking_off:
+                # Profiles read reasoning_config to decide thinking, and they
+                # override extra_body, so send the disable through both
+                # channels or a reasoning profile can silently re-enable it.
+                call_kwargs["reasoning_config"] = {"enabled": False}
+            response = call_llm(**call_kwargs)
+            content = response.choices[0].message.content or ""
+            title = _clean_title(_extract_title_text(content))
+            if title:
+                return title
+            # Empty completion: try the next, looser rung instead of giving up.
+        except Exception as e:
+            last_exc = e
+            if response_format is not None and not _response_format_rejected(e):
+                break
+    # Log at WARNING so this shows up in agent.log without debug mode.
+    # Full detail at debug level for operators who need the stack.
+    if last_exc is not None:
+        logger.warning("Title generation failed: %s", last_exc)
         logger.debug("Title generation traceback", exc_info=True)
-        if failure_callback is not None:
-            try:
-                failure_callback("title generation", e)
-            except Exception:
-                logger.debug("Title generation failure_callback raised", exc_info=True)
-        return None
+    else:
+        logger.debug("Title generation returned no usable title on any rung")
+    if failure_callback is not None:
+        try:
+            failure_callback(
+                "title generation",
+                last_exc or RuntimeError("no usable title from any response-format rung"),
+            )
+        except Exception:
+            logger.debug("Title generation failure_callback raised", exc_info=True)
+    return None
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
