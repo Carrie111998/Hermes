@@ -68,6 +68,7 @@ The picker shows each entry with its current status:
 ```
 n8n          available              Manage and inspect n8n workflows from Hermes
 linear       enabled                Linear issue/project management (remote OAuth)
+browserless  available              Browser automation, scraping, search, and crawl
 github       installed (disabled)   GitHub repo + PR tools
 ```
 
@@ -252,6 +253,33 @@ mcp_servers:
 
 Or: `hermes mcp install figma`, then `hermes mcp login figma`.
 :::
+
+#### Browserless browser automation
+
+[Browserless](https://www.browserless.io/) provides a
+[hosted MCP server](https://docs.browserless.io/mcp/browserless-mcp-server/setup)
+for interactive browser tasks, scraping, search, crawl and map operations,
+page exports, performance audits, custom browser functions, and authenticated
+profiles. Install the catalog entry and complete Browserless sign-in:
+
+```bash
+hermes mcp install browserless
+hermes mcp login browserless
+hermes mcp test browserless
+```
+
+The login command opens your browser for OAuth; no API token needs to be copied
+into Hermes. Start a new Hermes session after authentication so the Browserless
+tools are loaded. To reduce the tool surface later, run:
+
+```bash
+hermes mcp configure browserless
+```
+
+This integration uses Browserless's MCP tools rather than Hermes's built-in
+`browser_*` toolset, so it does not add a cloud provider to the `hermes tools`
+browser-provider picker. The two surfaces can coexist, and no
+`browser.cloud_provider` setting is required for Browserless MCP.
 
 ```yaml
 mcp_servers:
