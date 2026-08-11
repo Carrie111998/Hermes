@@ -49,11 +49,20 @@ def _create_local_environment(request: BackendFactoryRequest) -> "BaseEnvironmen
 def _create_docker_environment(request: BackendFactoryRequest) -> "BaseEnvironment":
     _require_backend(request, "docker")
     from tools.environments.docker import DockerEnvironment
-    from tools.terminal_tool import _maybe_reap_docker_orphans
+    from tools.terminal_tool import (
+        _docker_session_isolation_enabled,
+        _has_isolation_overrides,
+        _maybe_reap_docker_orphans,
+    )
 
     config = _nested_config(request, "container_config")
     _maybe_reap_docker_orphans(config)
-    return DockerEnvironment(
+    session_scoped = (
+        _docker_session_isolation_enabled()
+        and request.task_id != "default"
+        and not _has_isolation_overrides(request.task_id)
+    )
+    environment = DockerEnvironment(
         image=request.image,
         cwd=request.cwd,
         timeout=request.timeout,
@@ -70,11 +79,15 @@ def _create_docker_environment(request: BackendFactoryRequest) -> "BaseEnvironme
         run_as_host_user=config.get("docker_run_as_host_user", False),
         network=config.get("docker_network", True),
         extra_args=config.get("docker_extra_args", []),
-        persist_across_processes=config.get(
-            "docker_persist_across_processes", True
+        persist_across_processes=(
+            False
+            if session_scoped
+            else config.get("docker_persist_across_processes", True)
         ),
         shm_size=config.get("docker_shm_size", "1g"),
     )
+    environment._session_scoped = session_scoped
+    return environment
 
 
 def _create_singularity_environment(
