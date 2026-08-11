@@ -5942,17 +5942,29 @@ def _agent_key_is_usable(state: Dict[str, Any], min_ttl_seconds: int) -> bool:
 # burst into a single network round-trip; callers that need freshness use
 # separate flows (force_fresh / refresh_nous_oauth_pure) and are unaffected.
 _RESOLVE_TOKEN_CACHE_LOCK = threading.Lock()
-_RESOLVE_TOKEN_CACHE: "tuple[str, float, str] | None" = None
+_RESOLVE_TOKEN_CACHE: "tuple[_NousAuthStoreIdentity, float, str] | None" = None
 _RESOLVE_TOKEN_CACHE_TTL_S = 5.0
 
 
-def _resolve_token_cache_home() -> str:
-    """Return the canonical profile home that owns a memoized Nous token."""
-    home = get_hermes_home()
-    try:
-        return str(home.resolve(strict=False))
-    except Exception:
-        return str(home)
+def _memoize_nous_access_token(
+    token: str,
+    *,
+    insecure: Optional[bool],
+    ca_bundle: Optional[str],
+) -> None:
+    """Cache a resolved token under the post-persistence auth-store identity."""
+    global _RESOLVE_TOKEN_CACHE
+    if insecure or ca_bundle is not None:
+        return
+    if not profile_global_auth_inheritance_enabled():
+        return
+    cache_identity = _nous_auth_store_identity()
+    with _RESOLVE_TOKEN_CACHE_LOCK:
+        _RESOLVE_TOKEN_CACHE = (
+            cache_identity,
+            time.monotonic(),
+            token,
+        )
 
 
 def resolve_nous_access_token(
@@ -5964,7 +5976,7 @@ def resolve_nous_access_token(
 ) -> str:
     """Resolve a refresh-aware Nous Portal access token for managed tool gateways."""
     global _RESOLVE_TOKEN_CACHE
-    cache_home = _resolve_token_cache_home()
+    cache_identity = _nous_auth_store_identity()
     cache_allowed = profile_global_auth_inheritance_enabled()
     # Memo: collapse the startup burst of managed-tool check_fns into one
     # network refresh. Only cache a successful, non-forced resolution for a
@@ -5972,9 +5984,9 @@ def resolve_nous_access_token(
     if cache_allowed and not insecure and ca_bundle is None:
         with _RESOLVE_TOKEN_CACHE_LOCK:
             if _RESOLVE_TOKEN_CACHE is not None:
-                cached_home, cached_at, cached_token = _RESOLVE_TOKEN_CACHE
+                cached_identity, cached_at, cached_token = _RESOLVE_TOKEN_CACHE
                 if (
-                    cached_home == cache_home
+                    cached_identity == cache_identity
                     and (time.monotonic() - cached_at) < _RESOLVE_TOKEN_CACHE_TTL_S
                 ):
                     return cached_token
@@ -6038,13 +6050,12 @@ def resolve_nous_access_token(
                 # state reads to reach this return. The token has at least
                 # refresh_skew_seconds (>= 120s) of life here, so a 5s memo
                 # can never serve an expired token.
-                if cache_allowed and not insecure and ca_bundle is None:
-                    with _RESOLVE_TOKEN_CACHE_LOCK:
-                        _RESOLVE_TOKEN_CACHE = (
-                            cache_home,
-                            time.monotonic(),
-                            access_token,
-                        )
+                if cache_allowed:
+                    _memoize_nous_access_token(
+                        access_token,
+                        insecure=insecure,
+                        ca_bundle=ca_bundle,
+                    )
                 return access_token
 
             if not isinstance(refresh_token, str) or not refresh_token:
@@ -6103,13 +6114,12 @@ def resolve_nous_access_token(
             _save_provider_state_to_source(auth_store, "nous", state, state_source_path)
             _write_shared_nous_state(state)
             resolved = state["access_token"]
-            if cache_allowed and not insecure and ca_bundle is None:
-                with _RESOLVE_TOKEN_CACHE_LOCK:
-                    _RESOLVE_TOKEN_CACHE = (
-                        cache_home,
-                        time.monotonic(),
-                        resolved,
-                    )
+            if cache_allowed:
+                _memoize_nous_access_token(
+                    resolved,
+                    insecure=insecure,
+                    ca_bundle=ca_bundle,
+                )
             return resolved
 
 
@@ -6736,7 +6746,7 @@ def _snapshot_nous_pool_status() -> Dict[str, Any]:
 # switches and policy changes do not share a process memo. Auth writes invalidate
 # naturally through the high-resolution mtime components.
 _NOUS_AUTH_STATUS_CACHE_TTL = 15.0  # seconds
-_NousAuthStatusCacheIdentity = Tuple[
+_NousAuthStoreIdentity = Tuple[
     str,
     Optional[int],
     bool,
@@ -6744,7 +6754,7 @@ _NousAuthStatusCacheIdentity = Tuple[
     Optional[int],
 ]
 _nous_auth_status_cache: Optional[
-    Tuple[float, _NousAuthStatusCacheIdentity, Dict[str, Any]]
+    Tuple[float, _NousAuthStoreIdentity, Dict[str, Any]]
 ] = None
 
 
@@ -6762,8 +6772,8 @@ def _auth_file_cache_key() -> Tuple[str, Optional[int]]:
         return auth_file_key, None
 
 
-def _nous_auth_status_cache_identity() -> _NousAuthStatusCacheIdentity:
-    """Bind a status memo to local/global stores and strict policy state."""
+def _nous_auth_store_identity() -> _NousAuthStoreIdentity:
+    """Bind an auth memo to local/global stores and strict policy state."""
     auth_file_key, mtime_ns = _auth_file_cache_key()
     inherit_global = profile_global_auth_inheritance_enabled()
     global_key: Optional[str] = None
@@ -6817,7 +6827,7 @@ def get_nous_auth_status() -> Dict[str, Any]:
     """
     global _nous_auth_status_cache
     now = time.monotonic()
-    cache_identity = _nous_auth_status_cache_identity()
+    cache_identity = _nous_auth_store_identity()
     cached = _nous_auth_status_cache
     if cached is not None:
         cached_at, cached_identity, cached_status = cached

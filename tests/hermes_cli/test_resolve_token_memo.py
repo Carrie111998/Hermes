@@ -8,6 +8,7 @@ cross-process file locks + state reads) or triggering a network refresh.
 
 import json
 import time
+from pathlib import Path
 
 import pytest
 
@@ -76,12 +77,12 @@ def test_memo_expires_after_ttl(monkeypatch, tmp_path):
 
     auth.resolve_nous_access_token()
     assert auth._RESOLVE_TOKEN_CACHE is not None
-    cached_home, cached_at, tok = auth._RESOLVE_TOKEN_CACHE
+    cached_identity, cached_at, tok = auth._RESOLVE_TOKEN_CACHE
     monkeypatch.setattr(
         auth,
         "_RESOLVE_TOKEN_CACHE",
         (
-            cached_home,
+            cached_identity,
             cached_at - auth._RESOLVE_TOKEN_CACHE_TTL_S - 1.0,
             tok,
         ),
@@ -99,3 +100,45 @@ def test_insecure_callers_bypass_memo(monkeypatch, tmp_path):
     auth.resolve_nous_access_token(insecure=True)
 
     assert calls["n"] == 2, "insecure callers must bypass the memo entirely"
+
+
+def test_memo_invalidates_when_profile_shadows_inherited_global_source(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    global_root = tmp_path / ".hermes"
+    profile = global_root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    auth._RESOLVE_TOKEN_CACHE = None
+
+    expires_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%S+00:00",
+        time.gmtime(time.time() + 3600),
+    )
+    (global_root / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "access_token": "synthetic-global-token",
+                "refresh_token": "synthetic-global-refresh",
+                "expires_at": expires_at,
+            },
+        },
+    }))
+
+    assert auth.resolve_nous_access_token() == "synthetic-global-token"
+
+    (profile / "auth.json").write_text(json.dumps({
+        "version": 1,
+        "providers": {
+            "nous": {
+                "access_token": "synthetic-local-token",
+                "refresh_token": "synthetic-local-refresh",
+                "expires_at": expires_at,
+            },
+        },
+    }))
+
+    assert auth.resolve_nous_access_token() == "synthetic-local-token"
