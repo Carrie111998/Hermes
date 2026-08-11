@@ -97,12 +97,14 @@ function ProfileOwnedWebhooksView({ backendProfile, onClose }: ProfileOwnedWebho
   const queryKey = useMemo(() => ['webhooks', backendProfile] as const, [backendProfile])
   const ownerActive = useRef(true)
 
-  useEffect(
-    () => () => {
+  // eslint-disable-next-line no-restricted-syntax -- lifecycle ownership flag, not an atom mirror
+  useEffect(() => {
+    ownerActive.current = true
+
+    return () => {
       ownerActive.current = false
-    },
-    []
-  )
+    }
+  }, [])
 
   const [query, setQuery] = useState('')
   const [enabling, setEnabling] = useState(false)

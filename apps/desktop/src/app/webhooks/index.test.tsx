@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { StrictMode } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => ({
@@ -18,7 +19,8 @@ vi.mock('@/hermes', () => ({
   enableWebhooks: (profile?: string) => mocks.enableWebhooks(profile),
   createWebhook: (body: unknown, profile?: string) => mocks.createWebhook(body, profile),
   deleteWebhook: (name: string, profile?: string) => mocks.deleteWebhook(name, profile),
-  setWebhookEnabled: (name: string, enabled: boolean, profile?: string) => mocks.setWebhookEnabled(name, enabled, profile)
+  setWebhookEnabled: (name: string, enabled: boolean, profile?: string) =>
+    mocks.setWebhookEnabled(name, enabled, profile)
 }))
 
 vi.mock('@/store/profile', async () => {
@@ -53,14 +55,16 @@ function deferred<T>() {
   return { promise, reject, resolve }
 }
 
-function renderView() {
+function renderView({ strictMode = false }: { strictMode?: boolean } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
 
-  return render(
+  const view = (
     <QueryClientProvider client={client}>
       <WebhooksView onClose={() => undefined} />
     </QueryClientProvider>
   )
+
+  return render(strictMode ? <StrictMode>{view}</StrictMode> : view)
 }
 
 beforeEach(() => {
@@ -102,6 +106,24 @@ describe('WebhooksView profile ownership', () => {
 
     await waitFor(() => expect(mocks.getWebhooks).toHaveBeenCalledWith('beta'))
     expect(screen.queryByDisplayValue('alpha-hook')).toBeNull()
+  })
+
+  it('accepts a create completion after the StrictMode effect rehearsal', async () => {
+    const create = deferred<{ secret: string; url: string }>()
+    mocks.createWebhook.mockReturnValue(create.promise)
+    renderView({ strictMode: true })
+
+    fireEvent.click(await screen.findByRole('button', { name: /new subscription/i }))
+    fireEvent.change(screen.getByLabelText(/^name$/i), { target: { value: 'strict-hook' } })
+    fireEvent.click(screen.getByRole('button', { name: /^create$/i }))
+
+    await waitFor(() =>
+      expect(mocks.createWebhook).toHaveBeenCalledWith(expect.objectContaining({ name: 'strict-hook' }), 'alpha')
+    )
+    await act(async () => create.resolve({ secret: 'strict-secret', url: 'https://alpha.example/strict' }))
+
+    expect(await screen.findByText('strict-secret')).toBeTruthy()
+    expect(mocks.notify).toHaveBeenCalledWith(expect.objectContaining({ kind: 'success' }))
   })
 
   it('ignores a create completion owned by the previous profile', async () => {

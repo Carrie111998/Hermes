@@ -27,7 +27,9 @@ describe('Webhook REST parity helpers', () => {
   it('enables the webhook platform with POST', async () => {
     await enableWebhooks('coder')
 
-    expect(api).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/webhooks/enable', profile: 'coder' }))
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'POST', path: '/api/webhooks/enable', profile: 'coder' })
+    )
   })
 
   it('creates a subscription with the full payload', async () => {
@@ -42,13 +44,17 @@ describe('Webhook REST parity helpers', () => {
 
     await createWebhook(body, 'coder')
 
-    expect(api).toHaveBeenCalledWith(expect.objectContaining({ body, method: 'POST', path: '/api/webhooks', profile: 'coder' }))
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ body, method: 'POST', path: '/api/webhooks', profile: 'coder' })
+    )
   })
 
   it('encodes the name when deleting a subscription', async () => {
     await deleteWebhook('my hook', 'coder')
 
-    expect(api).toHaveBeenCalledWith(expect.objectContaining({ method: 'DELETE', path: '/api/webhooks/my%20hook', profile: 'coder' }))
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({ method: 'DELETE', path: '/api/webhooks/my%20hook', profile: 'coder' })
+    )
   })
 
   it('toggles a subscription enabled state via PUT', async () => {
