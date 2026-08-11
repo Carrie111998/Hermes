@@ -1,0 +1,36 @@
+name: briar-platform
+label: Briar
+kind: platform
+version: 1.0.0
+description: >
+  Briar peer-to-peer platform adapter for Hermes Agent.
+  Connects to a local ``briar-headless`` instance and relays messages
+  between Briar contacts and the Hermes agent over the documented
+  ``/v1/...`` REST API and ``/v1/ws`` WebSocket.
+author: Nous Research
+requires_env:
+  - name: BRIAR_API_URL
+    description: "Base URL for briar-headless (default: http://127.0.0.1:7000)"
+    prompt: "briar-headless API URL"
+    password: false
+  - name: BRIAR_CONTACT_ID
+    description: "Contact ID to send messages as / receive from"
+    prompt: "Default Briar contact ID"
+    password: false
+  - name: BRIAR_API_TOKEN
+    description: "Bearer token for briar-headless"
+    prompt: "briar-headless bearer token"
+    password: true
+optional_env:
+  - name: BRIAR_ALLOWED_USERS
+    description: "Comma-separated contact IDs allowed to talk to the bot"
+    prompt: "Allowed contact IDs (comma-separated)"
+    password: false
+  - name: BRIAR_ALLOW_ALL_USERS
+    description: "Allow any Briar contact to talk to the bot"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: BRIAR_HOME_CHANNEL
+    description: "Default contact ID for cron / notification delivery"
+    prompt: "Home contact ID (or empty)"
+    password: false
