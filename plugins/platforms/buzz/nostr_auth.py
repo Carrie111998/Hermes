@@ -20,6 +20,23 @@ BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 Point = Optional[tuple[int, int]]
 
 
+def event_id(event: dict[str, Any]) -> str:
+    """Return the NIP-01 id for a serialized Nostr event."""
+    serialized = json.dumps(
+        [
+            0,
+            event.get("pubkey"),
+            event.get("created_at"),
+            event.get("kind"),
+            event.get("tags"),
+            event.get("content"),
+        ],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
 def _bech32_polymod(values: list[int]) -> int:
     generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
     checksum = 1
@@ -116,6 +133,19 @@ def _point_multiply(scalar: int, point: Point = GENERATOR) -> Point:
     return result
 
 
+def _lift_x(x: int) -> Point:
+    """Lift an x-only secp256k1 coordinate to the even-y point."""
+    if not 0 <= x < FIELD_ORDER:
+        return None
+    y_squared = (pow(x, 3, FIELD_ORDER) + 7) % FIELD_ORDER
+    y = pow(y_squared, (FIELD_ORDER + 1) // 4, FIELD_ORDER)
+    if (y * y - y_squared) % FIELD_ORDER != 0:
+        return None
+    if y & 1:
+        y = FIELD_ORDER - y
+    return x, y
+
+
 def _tagged_hash(tag: str, payload: bytes) -> bytes:
     tag_hash = hashlib.sha256(tag.encode()).digest()
     return hashlib.sha256(tag_hash + tag_hash + payload).digest()
@@ -178,6 +208,38 @@ def schnorr_sign(
     )
     signature_scalar = (adjusted_nonce + challenge * adjusted_secret) % CURVE_ORDER
     return nonce_x + signature_scalar.to_bytes(32, "big")
+
+
+def schnorr_verify(message: bytes, public_key: str, signature: str | bytes) -> bool:
+    """Verify a BIP-340 Schnorr signature against an x-only pubkey."""
+    if len(message) != 32:
+        return False
+    try:
+        pubkey_bytes = bytes.fromhex(public_key)
+        signature_bytes = (
+            bytes.fromhex(signature) if isinstance(signature, str) else bytes(signature)
+        )
+    except (TypeError, ValueError):
+        return False
+    if len(pubkey_bytes) != 32 or len(signature_bytes) != 64:
+        return False
+    x = int.from_bytes(pubkey_bytes, "big")
+    rx = int.from_bytes(signature_bytes[:32], "big")
+    scalar = int.from_bytes(signature_bytes[32:], "big")
+    if x >= FIELD_ORDER or rx >= FIELD_ORDER or scalar >= CURVE_ORDER:
+        return False
+    public_point = _lift_x(x)
+    if public_point is None:
+        return False
+    challenge = int.from_bytes(
+        _tagged_hash("BIP0340/challenge", signature_bytes[:32] + pubkey_bytes + message),
+        "big",
+    ) % CURVE_ORDER
+    result = _point_add(
+        _point_multiply(scalar),
+        _point_multiply(CURVE_ORDER - challenge, public_point),
+    )
+    return result is not None and result[1] % 2 == 0 and result[0] == rx
 
 
 def build_auth_event(

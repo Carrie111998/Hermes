@@ -159,6 +159,37 @@ def build_gateway_parser(
     )
     _add_compat_platform_flag(gateway_status)
 
+    # gateway replay-buzz — one-shot, exact-id stored-event replay. This is
+    # deliberately separate from the live gateway lifecycle commands: it must
+    # never start a subscription or republish an inbound event.
+    gateway_replay_buzz = gateway_subparsers.add_parser(
+        "replay-buzz",
+        help="Replay one already-stored Buzz event by exact id",
+        description=(
+            "Fetch and replay one signed Buzz event through the normal intake "
+            "and session-dispatch path. Refuses to run while this profile's "
+            "gateway is active."
+        ),
+    )
+    gateway_replay_buzz.add_argument(
+        "--event-id",
+        required=True,
+        help="Exact 64-character stored Buzz event id; no event is republished",
+    )
+    gateway_replay_buzz.add_argument(
+        "--parent-event-id",
+        help=(
+            "Optional exact 64-character reply parent; when supplied, a different "
+            "parent fails before claim"
+        ),
+    )
+    gateway_replay_buzz.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=900.0,
+        help="Maximum seconds to wait for the spawned session (default: 900)",
+    )
+
     # gateway install
     gateway_install = gateway_subparsers.add_parser(
         "install", help="Install gateway as a systemd/launchd background service"
