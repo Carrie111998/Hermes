@@ -11,9 +11,13 @@ param(
     [ValidateSet(
         "Qwen3.6-35B-A3B-Uncensored-IQ3_M",
         "Huihui-gemma-4-12B-agentic-fable5-Q4_K_M",
+        "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M",
         "primary",
         "secondary",
         "qwen",
+        "qwen35",
+        "qwen9b",
+        "aggressive",
         "gemma",
         "huihui",
         "agentic"
@@ -32,6 +36,9 @@ $map = @{
     gemma     = "Huihui-gemma-4-12B-agentic-fable5-Q4_K_M"
     huihui    = "Huihui-gemma-4-12B-agentic-fable5-Q4_K_M"
     agentic   = "Huihui-gemma-4-12B-agentic-fable5-Q4_K_M"
+    qwen35    = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M"
+    qwen9b    = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M"
+    aggressive = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M"
 }
 $modelId = if ($map.ContainsKey($Model)) { $map[$Model] } else { $Model }
 

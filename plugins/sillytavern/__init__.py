@@ -175,9 +175,30 @@ def _configure() -> dict:
         changed.append("power_user.max_context_unlocked")
     settings["power_user"] = pu
 
+    # Configure SillyTavern's built-in OpenAI Compatible TTS provider to use
+    # the loopback Hakua bridge. The bridge keeps Fish Audio credentials server-side.
+    extension_settings = settings.setdefault("extension_settings", {})
+    tts = extension_settings.setdefault("tts", {})
+    bridge_url = os.environ.get("HAKUA_TTS_BRIDGE_URL", "http://127.0.0.1:8765/v1/audio/speech")
+    tts_updates = {
+        "ttsEnabled": True,
+        "currentProvider": "OpenAI Compatible",
+        "OpenAI Compatible": {
+            "provider_endpoint": bridge_url,
+            "model": "hakua",
+            "speed": 1,
+            "available_voices": ["hakua"],
+            "voiceMap": {},
+        },
+    }
+    for key, value in tts_updates.items():
+        if tts.get(key) != value:
+            tts[key] = value
+            changed.append(f"extension_settings.tts.{key}")
+
     if changed:
         with open(settings_path, "w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2)
+            json.dump(settings, f, indent=2, ensure_ascii=False)
 
     return {"secrets_written": written, "settings_changed": changed}
 

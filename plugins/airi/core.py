@@ -338,6 +338,27 @@ def tts_payload(values: dict[str, Any] | None = None) -> dict[str, Any]:
             },
         }
 
+    if provider in {"fish", "fishaudio", "fish_audio", "fish-audio"}:
+        fish = tts.get("fishaudio", tts.get("fish_audio", {}))
+        fish = fish if isinstance(fish, dict) else {}
+        bridge = str(
+            fish.get("bridge_base_url")
+            or _cfg().get("tts_bridge_base_url")
+            or "http://127.0.0.1:8765"
+        )
+        return {
+            "ok": True,
+            "source": "hermes_tts.fishaudio_bridge",
+            "hermes_provider": provider,
+            "airi_provider": "openai-compatible-audio-speech",
+            "config": {
+                "apiKey": "local",
+                "baseUrl": _normalize_base_url(bridge.rstrip("/") + "/v1"),
+                "model": "hakua",
+                "voice": "hakua",
+            },
+        }
+
     if provider in {"irodori-tts", "irodori", "irodori_tts"}:
         irodori = tts.get("irodori") if isinstance(tts.get("irodori"), dict) else {}
         try:

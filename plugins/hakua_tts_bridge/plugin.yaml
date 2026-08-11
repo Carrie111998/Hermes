@@ -1,0 +1,24 @@
+name: hakua-tts-bridge
+version: 0.1.0
+description: Local OpenAI-compatible Hakua TTS bridge for AIRI and SillyTavern, routing to Fish Audio or Irodori TTS.
+author: HermesAgent
+kind: backend
+platforms:
+  - windows
+  - linux
+  - macos
+config:
+  host:
+    type: string
+    default: "127.0.0.1"
+  port:
+    type: integer
+    default: 8765
+provides_tools:
+  - hakua_tts_bridge_status
+  - hakua_tts_bridge_start
+  - hakua_tts_bridge_stop
+provides_cli:
+  - hakua-tts-bridge
+provides_tts_providers:
+  - hakua-bridge

@@ -1,12 +1,13 @@
 # llama.cpp router hot-swap launcher (RTX 5060 Ti 16GB / turboquant)
 # Primary: current HERMES_LLAMA_* model (default Qwen3.6-35B IQ3_M)
 # Secondary: Huihui-gemma-4-12B-agentic-fable5 Q4_K_M (HF cache local GGUF)
+# Tertiary: HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M
 # Same runtime knobs as start-llama-secretary.ps1 / .env — swap via OpenAI "model" field.
 #
 # Usage:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\start-llama-hotswap.ps1
 #   powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\start-llama-hotswap.ps1 -ForceRestart -WarmSecondary
-#   # then request model "Qwen3.6-35B-A3B-Uncensored-IQ3_M" or "Huihui-gemma-4-12B-agentic-fable5-Q4_K_M"
+#   # then request any of the three registered model IDs via the OpenAI "model" field
 #
 # VRAM: --models-max 1 (default) so only one GGUF is resident; requesting the other unloads LRU.
 # Warm standby: secondary stays registered + file-cached; -WarmSecondary does load->unload->reload primary
@@ -46,6 +47,19 @@ function Resolve-Default {
     $fromEnv = [Environment]::GetEnvironmentVariable($Name)
     if (-not [string]::IsNullOrWhiteSpace($fromEnv)) { return $fromEnv }
     return $Default
+}
+
+function Resolve-TertiaryGgufPath {
+    $candidates = @(
+        $env:HERMES_LLAMA_TERTIARY_MODEL,
+        "C:\Users\downl\Desktop\SO8T\gguf_models\HauhauCS\Qwen3.5-9B-Uncensored-HauhauCS-Aggressive\Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q4_K_M.gguf"
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($p in $candidates) {
+        if ((Test-Path -LiteralPath $p) -and -not ((Get-Item -LiteralPath $p).PSIsContainer) -and ((Get-Item -LiteralPath $p).Length -gt 1GB)) {
+            return (Resolve-Path -LiteralPath $p).Path
+        }
+    }
+    throw "Tertiary GGUF not found: HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M"
 }
 
 function Resolve-SecondaryGgufPath {
@@ -146,6 +160,8 @@ function Write-HotswapPreset {
         [string]$PrimaryId,
         [string]$SecondaryPath,
         [string]$SecondaryId,
+        [string]$TertiaryPath,
+        [string]$TertiaryId,
         [int]$Ctx,
         [int]$GpuLayers,
         [int]$Threads,
@@ -184,6 +200,11 @@ stop-timeout = 30
 
 [$SecondaryId]
 model = $SecondaryPath
+load-on-startup = false
+stop-timeout = 30
+
+[$TertiaryId]
+model = $TertiaryPath
 load-on-startup = false
 stop-timeout = 30
 "@
@@ -291,6 +312,8 @@ $PrimaryPath = Resolve-Default "HERMES_LLAMA_GGUF_PATH" "C:\Users\downl\Desktop\
 $PrimaryId = Resolve-Default "HERMES_LLAMA_ALIAS" (Resolve-Default "HERMES_LLAMA_MODEL" "Qwen3.6-35B-A3B-Uncensored-IQ3_M")
 $SecondaryId = "Huihui-gemma-4-12B-agentic-fable5-Q4_K_M"
 $SecondaryPath = Resolve-SecondaryGgufPath
+$TertiaryId = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive:Q4_K_M"
+$TertiaryPath = Resolve-TertiaryGgufPath
 $HostName = Resolve-Default "HERMES_LLAMA_HOST" "127.0.0.1"
 $Port = [int](Resolve-Default "HERMES_LLAMA_PORT" "8080")
 $Ctx = [int](Resolve-Default "HERMES_LLAMA_CTX" "65536")
@@ -329,7 +352,7 @@ if (Test-PortListening -TargetHost $HostName -TargetPort $Port) {
         $ids = @($listed.data | ForEach-Object { $_.id })
         Write-Output ("models: {0}" -f ($ids -join ", "))
         # HF-cache stubs look like org/repo:QUANT
-        $hfStubs = @($ids | Where-Object { $_ -match '/' -and $_ -notin @($PrimaryId, $SecondaryId) })
+        $hfStubs = @($ids | Where-Object { $_ -match '/' -and $_ -notin @($PrimaryId, $SecondaryId, $TertiaryId) })
         if ($hfStubs.Count -gt 0) {
             Write-Warning ("HF-cache stubs still listed ({0}). Re-run with -ForceRestart to apply hf-cache isolation." -f ($hfStubs -join ", "))
         }
@@ -351,6 +374,8 @@ Write-HotswapPreset `
     -PrimaryId $PrimaryId `
     -SecondaryPath $SecondaryPath `
     -SecondaryId $SecondaryId `
+    -TertiaryPath $TertiaryPath `
+    -TertiaryId $TertiaryId `
     -Ctx $Ctx `
     -GpuLayers $GpuLayers `
     -Threads $Threads `
@@ -376,7 +401,13 @@ $serverArgs = @(
     "--models-max", [string]$ModelsMax,
     "--host", $HostName,
     "--port", [string]$Port,
-    "--jinja"
+    "--jinja",
+    "--cache-type-k", $CacheK,
+    "--cache-type-v", $CacheV,
+    "--spec-type", "ngram-mod",
+    "--spec-ngram-mod-n-match", "24",
+    "--spec-ngram-mod-n-min", "48",
+    "--spec-ngram-mod-n-max", "64"
 )
 $disableAutoload = -not $AllowAutoload
 if ($disableAutoload) {
@@ -407,6 +438,7 @@ Write-Output "Starting llama router hot-swap on ${HostName}:${Port}"
 Write-Output "preset=$PresetPath models-max=$ModelsMax"
 Write-Output "primary=$PrimaryId -> $PrimaryPath"
 Write-Output "secondary=$SecondaryId -> $SecondaryPath (warm-standby registered)"
+Write-Output "tertiary=$TertiaryId -> $TertiaryPath (warm-standby registered)"
 Write-Output "hf-cache-isolated=$routerHfCache (preset-only /v1/models)"
 
 try {
@@ -445,13 +477,14 @@ while ((Get-Date) -lt $deadline) {
         $ids = @($models.data | ForEach-Object { $_.id })
         $hasPrimary = $ids -contains $PrimaryId
         $hasSecondary = $ids -contains $SecondaryId
-        if ($hasPrimary -and $hasSecondary -and -not $listedOnce) {
+        $hasTertiary = $ids -contains $TertiaryId
+        if ($hasPrimary -and $hasSecondary -and $hasTertiary -and -not $listedOnce) {
             $listedOnce = $true
-            Write-Output ("router listed both presets: {0}" -f ($ids -join ", "))
+            Write-Output ("router listed all presets: {0}" -f ($ids -join ", "))
         }
         $primaryRow = @($models.data | Where-Object { $_.id -eq $PrimaryId }) | Select-Object -First 1
         $primaryStatus = if ($primaryRow -and $primaryRow.status) { [string]$primaryRow.status.value } else { "" }
-        if ($hasPrimary -and $hasSecondary -and $primaryStatus -notin @("failed", "error")) {
+        if ($hasPrimary -and $hasSecondary -and $hasTertiary -and $primaryStatus -notin @("failed", "error")) {
             if ($primaryStatus -in @("", "loading")) {
                 Write-Output ("waiting for primary load status=$primaryStatus ...")
                 Start-Sleep -Seconds 5
@@ -460,7 +493,7 @@ while ((Get-Date) -lt $deadline) {
             Write-Output "llama.cpp hot-swap ready on $modelsUrl"
             Write-Output "pid=$($proc.Id) primary_status=$primaryStatus"
             Write-Output ("models: {0}" -f ($ids -join ", "))
-            Write-Output "swap: model='$PrimaryId' or '$SecondaryId' (models-max=$ModelsMax LRU)"
+            Write-Output "swap: model='$PrimaryId', '$SecondaryId' or '$TertiaryId' (models-max=$ModelsMax LRU)"
             $routerReady = $true
             break
         }
