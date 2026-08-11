@@ -24,6 +24,7 @@ from tools.delegation_live_log import (
     create_live_transcripts,
     live_transcript_root,
     prune_stale_live_dirs,
+    update_manifest_task_status,
     update_manifest_statuses,
     wrap_progress_callback,
 )
@@ -253,6 +254,44 @@ def test_manifest_goal_is_redacted():
 
     assert _BEARER not in goal
     assert "deploy using" in goal, "redaction must not blank the goal entirely"
+
+
+def test_maximum_task_and_unicode_goal_manifest_fits_consumer_envelope():
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "🧪" * 500} for _ in range(100)],
+        delegation_id="deleg_feedface",
+    )
+
+    assert delegation_id == "deleg_feedface"
+    manifest_path = live_transcript_root() / delegation_id / "manifest.json"
+    size = manifest_path.stat().st_size
+    assert size > 64 * 1024, "regression must exceed the superseded consumer limit"
+    assert size <= 1024 * 1024, "producer envelope must fit the bounded consumer read"
+
+
+def test_manifest_task_status_updates_as_each_sibling_finishes():
+    delegation_id, _writers, _paths = create_live_transcripts(
+        [{"goal": "fast"}, {"goal": "slow"}]
+    )
+    manifest_path = live_transcript_root() / delegation_id / "manifest.json"
+
+    update_manifest_task_status(
+        delegation_id,
+        {"task_index": 0, "status": "completed", "exit_reason": "completed"},
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [task["status"] for task in manifest["tasks"]] == ["completed", "running"]
+    assert "completed" not in manifest
+
+    update_manifest_task_status(
+        delegation_id,
+        {"task_index": 1, "status": "error", "exit_reason": "provider_error"},
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert [task["status"] for task in manifest["tasks"]] == ["completed", "error"]
+    assert manifest["completed"]
 
 
 def test_no_file_in_the_dispatch_directory_carries_the_raw_key():
