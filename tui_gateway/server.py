@@ -6333,8 +6333,15 @@ def _make_agent(
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
     try:
-        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+        from hermes_cli.mcp_startup import (
+            start_background_mcp_discovery,
+            wait_for_mcp_discovery,
+        )
 
+        start_background_mcp_discovery(
+            logger=logger,
+            thread_name="tui-mcp-discovery",
+        )
         wait_for_mcp_discovery()
     except Exception:
         pass

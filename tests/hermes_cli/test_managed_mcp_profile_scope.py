@@ -2,6 +2,7 @@
 
 from contextlib import contextmanager
 import os
+from types import SimpleNamespace
 
 import yaml
 
@@ -128,3 +129,176 @@ def test_base_scope_mcp_config_is_unchanged(tmp_path, monkeypatch):
     _setup_scopes(tmp_path, monkeypatch)
     assert mcp_startup._has_configured_mcp_servers() is True
     assert set(_load_mcp_config()) == {"base-only"}
+
+
+def test_multiplex_sessions_discover_managed_mcp_per_profile(
+    tmp_path, monkeypatch
+):
+    """Each session home gets one isolated lazy discovery slot."""
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from hermes_cli import mcp_startup
+    from hermes_constants import get_hermes_home
+    from tools import mcp_tool
+    from tools import registry as registry_mod
+    from tools.registry import ToolRegistry
+    from tui_gateway import entry
+
+    _, jane, louis = _setup_scopes(tmp_path, monkeypatch)
+    empty = tmp_path / "profiles" / "empty"
+    empty.mkdir()
+    _write_yaml(empty / "config.yaml", {"display": {"skin": "empty"}})
+    fresh_registry = ToolRegistry()
+    monkeypatch.setattr(registry_mod, "registry", fresh_registry)
+
+    previous_multiplex = is_multiplex_active()
+    previous_enabled = entry._mcp_discovery_enabled
+    seen = []
+    added_state_keys = []
+
+    def _fake_discover():
+        home = str(get_hermes_home().resolve())
+        seen.append(home)
+        for server_name in mcp_tool._load_mcp_config():
+            tool_name = f"mcp__{server_name}__whoami"
+            fresh_registry.register(
+                name=tool_name,
+                toolset=f"mcp-{server_name}",
+                schema={
+                    "name": tool_name,
+                    "description": "profile identity probe",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+                handler=lambda _args: "ok",
+                registration_home_override=home,
+            )
+            state_key = mcp_tool._server_state_key(server_name, home)
+            with mcp_tool._lock:
+                mcp_tool._servers[state_key] = SimpleNamespace(
+                    session=object(),
+                    _registered_tool_names=[tool_name],
+                    _sampling=None,
+                )
+            added_state_keys.append(state_key)
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "_discover_mcp_tools_without_interactive_oauth",
+        _fake_discover,
+    )
+    monkeypatch.setattr(entry, "_mcp_discovery_enabled", False)
+    set_multiplex_active(True)
+    mcp_startup._mcp_discovery_started_scopes.clear()
+    mcp_startup._mcp_discovery_threads.clear()
+    # Model the Dorman topology: base MCP state was published before
+    # multiplex activation. It must not count as Jane's discovery state.
+    base_state_key = "base-pre-multiplex"
+    with mcp_tool._lock:
+        mcp_tool._servers[base_state_key] = SimpleNamespace(
+            session=object(),
+            _registered_tool_names=["mcp__base__probe"],
+            _sampling=None,
+        )
+    added_state_keys.append(base_state_key)
+
+    try:
+        with _profile_scope(jane):
+            entry.ensure_mcp_discovery_started()
+            assert mcp_startup.join_mcp_discovery(timeout=2)
+            assert fresh_registry.get_entry("mcp__gbrain__whoami") is not None
+            assert fresh_registry.get_entry("mcp__louis-local__whoami") is None
+
+        with _profile_scope(louis):
+            assert fresh_registry.get_entry("mcp__gbrain__whoami") is None
+            entry.ensure_mcp_discovery_started()
+            assert mcp_startup.join_mcp_discovery(timeout=2)
+            assert fresh_registry.get_entry("mcp__gbrain__whoami") is None
+            assert (
+                fresh_registry.get_entry("mcp__louis-local__whoami") is not None
+            )
+
+        # A profile with no MCP config never inherits Jane's tools and does
+        # not create an empty retrying discovery slot.
+        with _profile_scope(empty):
+            entry.ensure_mcp_discovery_started()
+            mcp_startup.start_background_mcp_discovery(
+                logger=SimpleNamespace(
+                    debug=lambda *_args, **_kwargs: None,
+                    warning=lambda *_args, **_kwargs: None,
+                ),
+                thread_name="test-empty-profile-mcp",
+            )
+            assert mcp_startup.join_mcp_discovery(timeout=2)
+            assert fresh_registry.get_entry("mcp__gbrain__whoami") is None
+            assert str(empty.resolve()) not in (
+                mcp_startup._mcp_discovery_started_scopes
+            )
+
+        # Opening another session for Jane reuses her completed scope instead
+        # of rescanning every profile or starting another discovery thread.
+        with _profile_scope(jane):
+            entry.ensure_mcp_discovery_started()
+            assert mcp_startup.join_mcp_discovery(timeout=2)
+            assert fresh_registry.get_entry("mcp__gbrain__whoami") is not None
+
+        assert seen == [str(jane.resolve()), str(louis.resolve())]
+        assert set(mcp_startup._mcp_discovery_started_scopes) == {
+            str(jane.resolve()),
+            str(louis.resolve()),
+        }
+    finally:
+        for state_key in added_state_keys:
+            with mcp_tool._lock:
+                mcp_tool._servers.pop(state_key, None)
+        mcp_startup._mcp_discovery_threads.clear()
+        mcp_startup._mcp_discovery_started_scopes.clear()
+        entry._mcp_discovery_enabled = previous_enabled
+        set_multiplex_active(previous_multiplex)
+
+
+def test_single_profile_discovery_keeps_legacy_process_slot(
+    tmp_path, monkeypatch
+):
+    """Profile-keyed ownership stays dormant outside multiplex mode."""
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+    from hermes_cli import mcp_startup
+
+    _setup_scopes(tmp_path, monkeypatch)
+    previous_multiplex = is_multiplex_active()
+    seen = []
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "_discover_mcp_tools_without_interactive_oauth",
+        lambda: seen.append("base"),
+    )
+    monkeypatch.setattr(
+        "tools.mcp_tool.get_mcp_status",
+        lambda: [{"connected": True}],
+    )
+    mcp_startup._mcp_discovery_started = False
+    mcp_startup._mcp_discovery_thread = None
+    set_multiplex_active(False)
+
+    try:
+        mcp_startup.start_background_mcp_discovery(
+            logger=SimpleNamespace(
+                debug=lambda *_args, **_kwargs: None,
+                warning=lambda *_args, **_kwargs: None,
+            ),
+            thread_name="test-single-profile-mcp",
+        )
+        assert mcp_startup.join_mcp_discovery(timeout=2)
+        mcp_startup.start_background_mcp_discovery(
+            logger=SimpleNamespace(
+                debug=lambda *_args, **_kwargs: None,
+                warning=lambda *_args, **_kwargs: None,
+            ),
+            thread_name="test-single-profile-mcp",
+        )
+
+        assert seen == ["base"]
+        assert not mcp_startup._mcp_discovery_started_scopes
+    finally:
+        mcp_startup._mcp_discovery_thread = None
+        mcp_startup._mcp_discovery_started = False
+        set_multiplex_active(previous_multiplex)

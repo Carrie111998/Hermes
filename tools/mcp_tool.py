@@ -6331,6 +6331,31 @@ def _existing_tool_names() -> List[str]:
     return names
 
 
+def has_mcp_state_for_current_profile() -> bool:
+    """Whether multiplex discovery has published state for this profile.
+
+    Process-global MCP entries from before multiplex activation are
+    intentionally ignored: they cannot prove that the active profile's own
+    config was discovered.
+    """
+    current_key = _server_state_key("")
+    if isinstance(current_key, str):
+        return any(get_mcp_status())
+    current_home = current_key[0]
+    with _lock:
+        connected = any(
+            isinstance(state_key, tuple)
+            and state_key[0] == current_home
+            and getattr(server, "session", None) is not None
+            for state_key, server in _servers.items()
+        )
+        lazy_registered = any(
+            isinstance(state_key, tuple) and state_key[0] == current_home
+            for state_key in _lazy_server_tool_names
+        )
+        return connected or lazy_registered
+
+
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
     """Register tools from an already-connected server into the registry.
 
