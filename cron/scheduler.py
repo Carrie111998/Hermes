@@ -3691,7 +3691,16 @@ def run_job(
         # re-read from storage every tick so a ``cronjob action=update
         # model=...`` after a failed run takes effect on the next tick — there
         # is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        # Normalize "auto" sentinel — the agent naturally writes model=auto
+        # provider=auto when the user says "use the default", but the run
+        # path treats any non-empty pin as an explicit choice (#83596).
+        _raw_model = str(job.get("model") or "").strip()
+        _raw_provider = str(job.get("provider") or "").strip()
+        if _raw_model.lower() == "auto":
+            _raw_model = ""
+        if _raw_provider.lower() == "auto":
+            _raw_provider = ""
+        model = _raw_model or os.getenv("HERMES_MODEL") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
         # so unattended jobs stop shadowing chat `/model` switches. When an
@@ -3891,7 +3900,7 @@ def run_job(
             else ""
         )
         primary_provider_for_drift = (
-            str(job.get("provider") or "").strip().lower()
+            _raw_provider.lower()
             or configured_provider_for_drift
             or None
         )
@@ -3905,7 +3914,7 @@ def run_job(
                 # Per-job user pin wins; otherwise the cron-fleet default
                 # provider (cron.model_provider); otherwise resolve from
                 # persisted global config.
-                "requested": job.get("provider") or _cron_default_provider or None,
+                "requested": _raw_provider or _cron_default_provider or None,
                 # Derive provider-specific api_mode from the model this job
                 # will actually run (per-job pin > env > config default), not
                 # the stale persisted default — mirrors the fallback path
