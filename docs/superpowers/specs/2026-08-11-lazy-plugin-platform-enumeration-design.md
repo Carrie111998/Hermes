@@ -115,6 +115,32 @@ skip gates, and with the SDK installed the tests still **run** rather than skip.
 
 Full file: 213 passed, 0 skipped.
 
+## Cross-check against prior work
+
+Agent memory `gateway-config-sweep-two-import-costs` (written earlier the same day)
+splits this into **two independent costs**, and warns against parts of this design.
+Reconciled:
+
+- **Cost A** — `_resolve_all()` importing all 20 adapters, ~74s cold / 10–15s warm,
+  concentrated in dingtalk/telegram/slack. **This is what the present change fixes**,
+  and per that memory it is also what actually killed `TestConfigEnvOverrides`.
+- **Cost B** — `check_fn()` → `check_feishu_requirements()` → `import lark_oapi`,
+  413.9s cold. **Already fixed by an unmerged commit**, `243b230da` on branch
+  `claude/ecstatic-poincare-518471`, which adds `PlatformEntry.deps_available_fn`
+  (a probe that must not import) and prefers it in the sweep. Not on `main`. That is
+  the right fix for the residual below and should be landed separately.
+- The memory says *"do not pre-gate plugin resolution on manifest `requires_env`"*,
+  citing google_chat. That warning holds for a gate on **exact declared names**; the
+  prefix widening used here covers the cited case, and a static audit of all 20
+  platforms' enablement functions found zero uncovered env vars. The residual
+  scenario it raises — google_chat via Application Default Credentials with
+  `GOOGLE_CHAT_SERVICE_ACCOUNT_JSON` unset — cannot auto-enable regardless, because
+  `_env_enablement` returns `None` unless `GOOGLE_CHAT_HTTP_EVENTS_URL` or
+  (project **and** subscription) is set, all of which match `GOOGLE_`. A YAML-configured
+  google_chat is covered by the `config.platforms` branch of the gate.
+- Its `importlib.util.find_spec` warning was **directly applicable** and had been
+  violated by the first version of the test change — corrected to `PathFinder`.
+
 ## Residual risk (not addressed)
 
 `check_feishu_requirements()` answers "is the SDK available?" by fully importing and
@@ -123,9 +149,10 @@ via `patch.dict` — the enable pass legitimately triggers that import, now meas
 17.38s inside a 30s per-test cap. That passes, but with less headroom than is
 comfortable on a cold-disk day.
 
-A `find_spec` probe would fix it, but `check_fn`'s contract is explicitly "loaded and
-bound" (`FEISHU_AVAILABLE` means bound, and the adapter warns against branching on it),
-so changing it is a real behaviour change in the plugin and was left out of scope.
+The fix is **not** to make `check_feishu_requirements()` cheap —
+`tests/gateway/test_feishu_lazy_sdk_import.py` asserts it *binds* the SDK. It belongs
+at the call site, which is exactly what the unmerged `243b230da`
+(`PlatformEntry.deps_available_fn`) does. Landing that branch closes this gap.
 
 ## Testing
 
