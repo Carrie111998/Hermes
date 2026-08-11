@@ -2,6 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **STATUS: EXECUTED 2026-08-11. This plan is now a historical record, not a
+> specification.** Six task reviews and one end-to-end verification changed
+> decisions after it was written, so its code blocks no longer match the
+> shipped module. **`hermes_cli/install_doctor.py` is authoritative.** Known
+> divergences: `analyze` gates the breadth skip on `if not declared:` (not
+> `is None`); `Findings` has a sixth field `finder_is_stale`; `remedy_lines`
+> takes a second parameter; `resolve_install_root` falls back to a usable root
+> when the MAPPING will not parse; and the stated test counts are outdated
+> (44 now). See the "Corrections" section of the design spec for why each
+> changed.
+
 **Goal:** Detect when the INSTALLED editable finder no longer exposes every package `pyproject.toml` declares, and name the reinstall remedy.
 
 **Architecture:** A new standalone module `hermes_cli/install_doctor.py` (following the `hermes_cli/events_doctor.py` precedent) resolves the install root from the editable finder, reads that root's `pyproject.toml`, then spawns one subprocess from a freshly created empty directory to `find_spec` every declared name and import a short list of real entrypoints. A neutral cwd is the falsifier: from inside `agent-src` every package resolves via cwd and the drift is invisible. The MAPPING parse is used only to *explain* drift and is allowed to fail soft.

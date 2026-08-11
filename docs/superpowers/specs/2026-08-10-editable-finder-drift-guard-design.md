@@ -1,7 +1,12 @@
 # Editable-install drift guard — design
 
 **Date:** 2026-08-10
-**Status:** approved, pending implementation
+**Status:** implemented and verified 2026-08-11 (see "Verified" and "Corrections" below)
+
+> Sections below describe the design as approved on 2026-08-10. Six task reviews
+> and one end-to-end verification changed several decisions. **Where this
+> document and `hermes_cli/install_doctor.py` disagree, the module is
+> authoritative.** Known divergences are listed under "Corrections".
 
 ## Problem
 
@@ -269,3 +274,91 @@ additive and covers a different property.
 Against the unmodified environment the guard exits **0** and reports
 `[OK] every declared package resolves from a neutral cwd`, which is correct —
 the drift was repaired before this work began.
+
+---
+
+## Corrections (2026-08-11)
+
+Recorded rather than silently edited, so the reasoning that changed is visible.
+The module is authoritative wherever this document still says otherwise.
+
+### Signatures that changed
+
+- `resolve_install_root()` returns an **`InstallRoot` dataclass**
+  (`path`, `provenance`, `mapping`), not the `(Path, str)` tuple described
+  above. The provenance string has to travel with the path to every consumer,
+  and a tuple made that easy to drop.
+- `probe(names, entrypoints, python=None, env=None)` — not
+  `probe(python, names, entrypoints)`. The `env` seam was added so the guard
+  could be proven end-to-end against the real interpreter under
+  `PYTHONNOUSERSITE=1`.
+- `remedy_lines(install_root, finder_is_stale=True)` gained its second
+  parameter with the not-loaded fix.
+- `Findings` has **six** fields: the five described plus `finder_is_stale`.
+
+### "Tests never spawn a subprocess" is wrong
+
+The design said `probe` is injected everywhere so no test spawns a subprocess.
+Three tests deliberately DO spawn one, against stdlib names and a
+guaranteed-missing name. That is the better decision and it stays: the
+neutral-cwd guarantee is the foundation the whole guard rests on, and mocking
+it would only test the mock. `test_probe_runs_from_a_directory_that_is_not_the_repo`
+plants a decoy module in the caller's cwd and proves the child cannot see it.
+Those tests remain hermetic — they need no editable install. Slowest individual
+test call is ~2.3 s against a per-test 30 s cap.
+
+### The doctor remediation goes to `manual_issues`, not `issues`
+
+`issues` is doctor's auto-fixable list. Editable-install drift cannot be
+auto-fixed, so it belongs in `manual_issues`.
+
+### The cost estimate was wrong by ~8x
+
+"Roughly one second for the subprocess" is not true. Measured:
+`doctor_section_lines()` takes **~8.5 s**, because the depth layer imports
+`events.gateway_integration`, which pulls in 13 subscribers, 5 producers, and
+the bus. That is the honest price of the layer that actually reproduces the
+outage, and it is paid on every `hermes doctor` run. Recorded here so nobody
+later "optimizes" the depth layer away believing it was free. If that cost ever
+needs bounding, add a breadth-only quick path rather than deleting depth —
+breadth is the mechanism-independent layer, but depth is the one that caught
+the real chain.
+
+### A Critical defect the final review found
+
+`resolve_install_root` used the MAPPING parse for **two** purposes: computing
+the install root (a verdict input, since `_collect` reads
+`root.path / "pyproject.toml"` for `declared`) and producing the diagnosis. So
+an unparseable MAPPING returned `path=None`, which left `declared=None`, which
+SKIPPED breadth, which made `ok` True — and `run()` exited **0**.
+
+That violated this document's own layering rule, and the consequence was
+severe: the first time setuptools changed its generated-file format, the guard
+would have become a permanent silent no-op reporting success. The exit code is
+the machine-readable channel a monitor or CI step consumes; prose notes are not.
+The guard's own failure mode was the bug class it exists to catch.
+
+Fixed in `1ad9fec41`: the unparseable branch now falls back to the running
+module's repo root for declarations while keeping `mapping=None`, so breadth
+still runs and only the diagnosis degrades. Verified: an unparseable finder now
+yields `checked_breadth=True`, 37 missing, `ok=False`, `finder_is_stale=None`.
+
+**The layering rule needs restating, because the original wording was too
+narrow.** "The MAPPING parse must never affect the verdict" was read as "the
+`diagnosis` field is the only thing gated on it" — but the parse also fed the
+root, and therefore the verdict, through a second path. The rule is: *no value
+derived from the MAPPING parse may reach the breadth or depth layers.*
+
+### Also fixed in the same pass
+
+- `doctor_section_lines` prefixed every remediation with "Editable install has
+  drifted", contradicting the not-loaded remedy that followed it — the same
+  contradiction `50edfc58e` fixed, surviving at the other surface.
+- The doctor summary item was a 1140-character single line (the whole remedy
+  block space-joined); it is now a short line pointing at
+  `python -m hermes_cli.install_doctor` for the full text.
+- Two tests would have passed against the Critical defect above; both now pin
+  that breadth was actually checked.
+- `find_editable_finder` selected the lexicographically-last finder, so
+  `0_9_0` outranked `0_10_0`. Now ordered by parsed numeric version — 0.20.0 is
+  the next minor, so this was close.
