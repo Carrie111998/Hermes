@@ -4040,7 +4040,7 @@ def _append_event(
     payload: Optional[dict] = None,
     *,
     run_id: Optional[int] = None,
-) -> None:
+) -> int:
     """Record an event row.  Called from within an already-open txn.
 
     ``run_id`` is optional: pass the current run id so UIs can group
@@ -4050,10 +4050,35 @@ def _append_event(
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
-    conn.execute(
+    cur = conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
+    )
+    return int(cur.lastrowid or 0)
+
+
+def _update_event_payload(
+    conn: sqlite3.Connection,
+    event_id: int,
+    payload: dict,
+) -> None:
+    conn.execute(
+        "UPDATE task_events SET payload = ? WHERE id = ?",
+        (json.dumps(payload, ensure_ascii=False), event_id),
+    )
+
+
+def _update_run_metadata(
+    conn: sqlite3.Connection,
+    run_id: Optional[int],
+    metadata: dict,
+) -> None:
+    if run_id is None:
+        return
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(metadata, ensure_ascii=False), run_id),
     )
 
 
@@ -8141,7 +8166,7 @@ def enforce_max_runtime(
                     error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                     metadata=payload,
                 )
-                _append_event(
+                event_id = _append_event(
                     conn, tid, "timed_out", payload, run_id=run_id,
                 )
                 timed_out.append(tid)
@@ -8151,7 +8176,7 @@ def enforce_max_runtime(
         # emits a ``gave_up`` event on top of the ``timed_out`` we
         # already emitted.
         if cur.rowcount == 1:
-            _record_task_failure(
+            tripped = _record_task_failure(
                 conn, tid,
                 error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
                 outcome="timed_out",
@@ -8163,6 +8188,10 @@ def enforce_max_runtime(
                     "retry_status": retry_status,
                 },
             )
+            payload["will_retry"] = not tripped
+            with write_txn(conn):
+                _update_event_payload(conn, event_id, payload)
+                _update_run_metadata(conn, run_id, payload)
     return timed_out
 
 
@@ -8511,8 +8540,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, int, Optional[int], dict]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, event_id, run_id, payload)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -8619,7 +8648,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     error=error_text,
                     metadata=dict(event_payload),
                 )
-                _append_event(
+                event_id = _append_event(
                     conn, row["id"], event_kind,
                     event_payload,
                     run_id=run_id,
@@ -8651,7 +8680,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, event_id, run_id,
+                         dict(event_payload))
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the retried task transitions to blocked with a ``gave_up`` event
@@ -8673,10 +8703,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _, _, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid, pid, claimer, protocol_violation, error_text, event_id,
+            run_id, event_payload,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -8734,6 +8767,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
             )
+            event_payload["will_retry"] = not tripped
+            with write_txn(conn):
+                _update_event_payload(conn, event_id, event_payload)
+                _update_run_metadata(conn, run_id, event_payload)
             if tripped:
                 auto_blocked.append(tid)
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.

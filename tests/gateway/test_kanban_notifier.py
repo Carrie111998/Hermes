@@ -353,6 +353,46 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     assert "crashed" in adapter.sent[1]["text"].lower()
 
 
+def test_notifier_retry_copy_requires_affirmative_payload(tmp_path, monkeypatch):
+    db_path = tmp_path / "retry-copy.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="retry copy", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(conn, tid, kind="crashed", payload={"will_retry": False})
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "crashed" in adapter.sent[0]["text"].lower()
+    assert "will retry" not in adapter.sent[0]["text"].lower()
+
+    conn = kb.connect()
+    try:
+        kb._append_event(
+            conn,
+            tid,
+            kind="timed_out",
+            payload={"limit_seconds": 5, "will_retry": True},
+        )
+    finally:
+        conn.close()
+
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 2
+    assert "timed out" in adapter.sent[1]["text"].lower()
+    assert "will retry" in adapter.sent[1]["text"].lower()
+
+
 def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
     db_path = tmp_path / "chat-type-wakeup.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))

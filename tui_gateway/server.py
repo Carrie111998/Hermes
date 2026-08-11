@@ -9108,14 +9108,16 @@ def _format_kanban_event_text(sub: dict, task, ev, board_slug: str) -> Optional[
         err = f"\n{str(payload.get('error'))[:200]}" if payload.get("error") else ""
         return f"✖ {board_tag}{tag}Kanban {task_id} gave up after repeated spawn failures{err}"
     if kind == "crashed":
-        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone); dispatcher will retry"
+        retry = "; dispatcher will retry" if payload.get("will_retry") is True else ""
+        return f"✖ {board_tag}{tag}Kanban {task_id} worker crashed (pid gone){retry}"
     if kind == "timed_out":
         limit = 0
         try:
             limit = int(payload.get("limit_seconds") or 0)
         except (TypeError, ValueError):
             pass
-        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s); will retry"
+        retry = "; will retry" if payload.get("will_retry") is True else ""
+        return f"⏱ {board_tag}{tag}Kanban {task_id} timed out (max_runtime={limit}s){retry}"
     if kind == "status":
         return f"🔄 {board_tag}{tag}Kanban {task_id} → {payload.get('status') or ''}"
     return None

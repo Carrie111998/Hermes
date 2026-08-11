@@ -469,17 +469,27 @@ class GatewayKanbanWatchersMixin:
                                 f"after repeated spawn failures{err}"
                             )
                         elif kind == "crashed":
+                            retry = (
+                                "; dispatcher will retry"
+                                if ev.payload and ev.payload.get("will_retry") is True
+                                else ""
+                            )
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"(pid gone){retry}"
                             )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
+                            retry = (
+                                "; will retry"
+                                if ev.payload and ev.payload.get("will_retry") is True
+                                else ""
+                            )
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"(max_runtime={limit}s){retry}"
                             )
                         elif kind == "status":
                             new_status = ""
