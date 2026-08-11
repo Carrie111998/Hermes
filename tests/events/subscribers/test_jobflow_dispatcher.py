@@ -27,13 +27,15 @@ def woken():
     return []
 
 
-def _dispatcher(store, woken, *, mode="on", resolver=None):
+def _dispatcher(store, woken, *, mode="on", resolver=None, clock=None):
+    kwargs = {"clock": clock} if clock is not None else {}
     return JobFlowDispatcher(
         bus=None,
         store=store,
         resolve_job_id=resolver or (lambda activity_id: f"job-for-{activity_id}"),
         waker=lambda job_id, **kw: woken.append((job_id, kw.get("reason"))) or True,
         mode=mode,
+        **kwargs,
     )
 
 
@@ -190,3 +192,99 @@ class TestClaimIsReleasedWhenTheWakeFails:
 
         key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
         assert store.get(key, "jobflow.tailor.generate") is None
+
+
+class _WriteTrap:
+    """A ledger that permits reads and detonates on every write."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.lease_seconds = inner.lease_seconds
+
+    def get(self, message_key, activity_id):
+        return self._inner.get(message_key, activity_id)
+
+    def claim(self, *a, **kw):
+        raise AssertionError("shadow must never claim")
+
+    def release(self, *a, **kw):
+        raise AssertionError("shadow must never release")
+
+    def complete(self, *a, **kw):
+        raise AssertionError("shadow must never complete")
+
+
+class TestShadowNeverTouchesTheLedger:
+    """Shadow must be passive on disk, not merely tidy afterwards.
+
+    Claiming and then releasing leaves a window: the claim is committed while
+    ``_resolve_job_id`` parses a 130 KB jobs.json. A kill inside that window —
+    or a release that fails, since ``_release`` swallows every exception — left
+    an orphan claim behind. Shadow wakes nobody, so every orphan was guaranteed
+    lost work, hidden from the reconciler for a full lease (now two hours, up
+    from fifteen minutes). The fix is to never write at all.
+    """
+
+    def test_shadow_issues_no_writes_whatsoever(self, store, woken):
+        """Calls ``_dispatch`` directly ON PURPOSE.
+
+        ``handle()`` swallows exceptions, so going through it would catch the
+        trap's AssertionError and let this test pass while shadow was still
+        writing. The write must be able to escape for the trap to mean anything.
+        """
+        d = _dispatcher(_WriteTrap(store), woken, mode="shadow")
+
+        d._dispatch(_event())
+
+        assert woken == []
+
+    def test_shadow_still_reports_what_it_would_have_woken(self, store, woken, caplog):
+        """Passivity must not cost the observation — that IS shadow's output."""
+        import logging
+
+        d = _dispatcher(_WriteTrap(store), woken, mode="shadow")
+        with caplog.at_level(logging.INFO):
+            d._dispatch(_event())
+
+        assert "would wake job-for-jobflow.tailor.generate" in caplog.text
+        assert "jobflow.tailor.generate" in caplog.text
+
+    def test_shadow_respects_a_live_claim_it_did_not_make(self, store, woken, caplog):
+        """It reads the ledger; it just refuses to write to it.
+
+        A message the real path already holds is not something shadow "would
+        wake", so reporting it would overstate recall at the gate.
+        """
+        import logging
+
+        key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
+        store.claim(key, "jobflow.tailor.generate", now=0)
+
+        d = _dispatcher(_WriteTrap(store), woken, mode="shadow", clock=lambda: 1.0)
+        with caplog.at_level(logging.INFO):
+            d._dispatch(_event())
+
+        assert "would wake" not in caplog.text
+
+    def test_shadow_resurfaces_the_work_once_the_lease_lapses(self, store, woken, caplog):
+        import logging
+
+        key = "tailor/inbox/20260810T01_TAILOR_REQUEST_main_aa.json"
+        store.claim(key, "jobflow.tailor.generate", now=0)
+
+        d = _dispatcher(_WriteTrap(store), woken, mode="shadow",
+                        clock=lambda: 901.0)
+        with caplog.at_level(logging.INFO):
+            d._dispatch(_event())
+
+        assert "would wake" in caplog.text
+
+    def test_a_resolver_fault_in_shadow_is_still_contained(self, store, woken):
+        def _boom(activity_id):
+            raise RuntimeError("jobs.json unreadable")
+
+        d = _dispatcher(_WriteTrap(store), woken, mode="shadow", resolver=_boom)
+
+        d._dispatch(_event())  # must not raise, and must not reach a write
+
+        assert woken == []

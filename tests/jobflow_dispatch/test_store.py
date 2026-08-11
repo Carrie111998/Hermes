@@ -217,3 +217,89 @@ class TestLeaseOutlivesRealRuns:
 
         store = ActivationStore(pathlib.Path(tempfile.mkdtemp()) / "d.db", lease_seconds=900)
         store.release("nope", "a1")
+
+
+class TestLeaseFitsInsideTheRecoveryWindow:
+    """The lease is a blind spot in the safety net, not just a crash timer.
+
+    A claimed row is invisible to ``scan_actionable`` until its lease lapses.
+    So the lease is bounded on BOTH sides and the existing
+    ``TestLeaseOutlivesRealRuns`` only pins the lower one — which is exactly how
+    the 900 -> 7200 bump landed without anyone re-deriving what it did to the
+    6-hourly reconciler. These are the missing upper bounds.
+    """
+
+    def test_reconciler_period_matches_the_scheduled_cron(self):
+        """Pinned to cron ``jobflow-reconcile`` (64711e6d8334, `30 0,6,12,18`).
+
+        If that schedule is ever widened, this constant must move with it or the
+        headroom assertion below silently starts checking a fiction.
+        """
+        from jobflow_dispatch.store import RECONCILER_PERIOD_SECONDS
+
+        assert RECONCILER_PERIOD_SECONDS == 6 * 3600
+
+    def test_default_lease_closes_well_before_the_reconciler_returns(self):
+        """A lease that outlives the reconciler window blinds the safety net.
+
+        Nothing calls complete() in production, so lease expiry is the only
+        thing that makes a claim visible again. If the lease ever reaches the
+        reconciler's period, a claim can span an entire window and genuinely
+        stranded work waits for the tick after next. The 2x margin is
+        deliberate: at exactly 1x the two clocks merely have to drift to
+        reproduce the bug.
+
+        Today: 7200 * 2 = 14400 <= 21600, so this passes as written. It is a
+        tripwire for the NEXT bump, not a description of a current defect.
+        """
+        from jobflow_dispatch.store import (
+            DEFAULT_LEASE_SECONDS,
+            RECONCILER_PERIOD_SECONDS,
+        )
+
+        assert DEFAULT_LEASE_SECONDS * 2 <= RECONCILER_PERIOD_SECONDS, (
+            f"lease {DEFAULT_LEASE_SECONDS}s leaves too little headroom under a "
+            f"{RECONCILER_PERIOD_SECONDS}s reconciler window — a claim would hide "
+            "genuinely stranded work across a full recovery cycle"
+        )
+
+
+class TestIsAvailableIsTheOnlyPredicate:
+    """Both recovery paths must reach the same verdict from the same code.
+
+    The reconciler decides what to resurface with this; shadow decides what it
+    would have woken with it. Two copies would eventually disagree, and the
+    disagreement would look like a dispatcher fault.
+    """
+
+    def test_unknown_work_is_available(self, store):
+        from jobflow_dispatch.store import is_available
+
+        assert is_available(store, "m1", "a1", 1000) is True
+
+    def test_live_claim_is_not_available(self, store):
+        from jobflow_dispatch.store import is_available
+
+        store.claim("m1", "a1", now=1000)
+        assert is_available(store, "m1", "a1", 1000 + LEASE) is False
+
+    def test_expired_claim_is_available_again(self, store):
+        from jobflow_dispatch.store import is_available
+
+        store.claim("m1", "a1", now=1000)
+        assert is_available(store, "m1", "a1", 1000 + LEASE + 1) is True
+
+    def test_completed_work_is_never_available(self, store):
+        from jobflow_dispatch.store import is_available
+
+        store.claim("m1", "a1", now=1000)
+        store.complete("m1", "a1", outcome="succeeded", now=1010)
+        assert is_available(store, "m1", "a1", 10_000_000) is False
+
+    def test_reconcile_imports_it_rather_than_reimplementing(self):
+        """Guards against someone quietly restoring a second copy."""
+        from jobflow_dispatch import reconcile
+        from jobflow_dispatch.store import is_available
+
+        assert reconcile.is_available is is_available
+        assert not hasattr(reconcile, "_is_available")

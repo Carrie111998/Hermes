@@ -53,6 +53,20 @@ CRON_WALL_CLOCK_CEILING_SECONDS = 3600
 #: going and wakes it a second time.
 DEFAULT_LEASE_SECONDS = 2 * CRON_WALL_CLOCK_CEILING_SECONDS
 
+#: How often the deterministic reconciler actually runs — cron
+#: ``jobflow-reconcile`` (64711e6d8334), ``30 0,6,12,18 * * *``.
+#:
+#: This is the OTHER side of the lease, and the reason the lease is bounded
+#: above as well as below. A claimed row is invisible to ``scan_actionable``
+#: until its lease lapses, so the lease is not only a crash-recovery timer; it
+#: is a blind spot in the safety net. Keep ``DEFAULT_LEASE_SECONDS`` comfortably
+#: under this or a claim can span an entire recovery window and genuinely
+#: stranded work waits for the tick after next. The relationship is asserted in
+#: tests/jobflow_dispatch/test_store.py — raising the lease multiplier above 3x
+#: is meant to fail there rather than quietly blind the reconciler, which is
+#: what the 900 -> 7200 bump did.
+RECONCILER_PERIOD_SECONDS = 6 * 3600
+
 
 def default_ledger_path() -> Path:
     """The one ledger the dispatcher and the reconciler must both use.
@@ -249,6 +263,28 @@ class ActivationStore:
             (_identity(message_key, "message_key"), _identity(activity_id, "activity_id")),
         ).fetchone()
         return _row(row) if row is not None else None
+
+
+def is_available(
+    store: ActivationStore, message_key: str, activity_id: str, now: float
+) -> bool:
+    """True when no live claim and no completion covers this work.
+
+    The ONE availability predicate. The reconciler decides what to resurface
+    with it; the dispatcher's shadow mode decides what it *would* have woken
+    with it. A second copy would eventually drift, and the drift would surface
+    as shadow under- or over-reporting recall — i.e. as a dispatcher fault that
+    isn't one. Keep both callers on this function.
+
+    Read-only on purpose: deciding is not consuming. A predicate that also
+    claimed would mean a scan that merely *looks* takes the work.
+    """
+    row = store.get(message_key, activity_id)
+    if row is None:
+        return True
+    if row.state == "completed":
+        return False
+    return (now - (row.claimed_at or 0.0)) > store.lease_seconds
 
 
 def _row(row: sqlite3.Row) -> ActivationRow:

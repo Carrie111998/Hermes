@@ -19,7 +19,10 @@ Three properties, each closing a specific hazard:
   reconciler is the safety net, so dropping a wake costs latency, never work.
 
 Default mode is ``off``: registering the subscriber changes nothing until an
-operator sets ``HERMES_JOBFLOW_EVENT_DISPATCH``.
+operator sets ``HERMES_JOBFLOW_EVENT_DISPATCH``. ``shadow`` is read-only on the
+ledger — it answers "would this have woken?" with the reconciler's own
+``is_available`` predicate and writes nothing, so a seven-day observation window
+cannot leave residue that would suppress the first real run.
 
 Known coverage gap: ``RESEARCH_REQUEST`` is not in the mailbox watcher's
 ``MIRRORED_MESSAGE_TYPES``, so no event is ever emitted for it and the
@@ -37,6 +40,7 @@ from typing import Any, Callable, Optional
 from events.schema import Event, EventType
 from events.subscribers.base import BaseSubscriber
 from jobflow_dispatch.contracts import message_key as canonical_key, route_mailbox
+from jobflow_dispatch.store import is_available
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +144,10 @@ class JobFlowDispatcher(BaseSubscriber):
         now = self._clock()
 
         for activity_id in targets:
+            if self._mode == MODE_SHADOW:
+                self._observe(key, activity_id, now)
+                continue
+
             if not self.store.claim(
                 key, activity_id, now=now, correlation_id=correlation_id
             ):
@@ -159,22 +167,39 @@ class JobFlowDispatcher(BaseSubscriber):
                 self._release(key, activity_id)
                 continue
 
-            if self._mode == MODE_SHADOW:
-                logger.info(
-                    "dispatch[shadow]: would wake %s (%s) for %s",
-                    job_id, activity_id, key,
-                )
-                # Shadow observes; it must not consume work it never dispatched,
-                # or the real run would find it already claimed.
-                self._release(key, activity_id)
-                continue
-
             if self._waker(job_id, caller=self.subscriber_id, reason="mailbox_message") is False:
                 logger.warning(
                     "dispatch: wake channel refused %s (%s) — releasing claim",
                     job_id, activity_id,
                 )
                 self._release(key, activity_id)
+
+    def _observe(self, key: str, activity_id: str, now: float) -> None:
+        """Record what ``on`` would have done, without touching the ledger.
+
+        Shadow used to claim and then hand the claim straight back. That left a
+        window — the claim is committed to disk while ``_resolve_job_id`` parses
+        a 130 KB jobs.json — in which a kill, or a release that failed (and
+        ``_release`` swallows everything), stranded the message behind a claim
+        nothing would ever wake. Shadow wakes nobody, so every such orphan was
+        guaranteed lost work, hidden from the reconciler for a full lease: two
+        hours since the lease bump, up from fifteen minutes.
+
+        Reading the reconciler's own predicate instead costs a race that does
+        not matter to an observer, and removes the window entirely.
+        """
+        if not is_available(self.store, key, activity_id, now):
+            return  # the real path already holds this; shadow would not wake it
+        try:
+            job_id = self._resolve_job_id(activity_id)
+        except Exception:
+            logger.exception("dispatch: resolving %s failed", activity_id)
+            return
+        if not job_id:
+            return
+        logger.info(
+            "dispatch[shadow]: would wake %s (%s) for %s", job_id, activity_id, key
+        )
 
     def _release(self, key: str, activity_id: str) -> None:
         try:

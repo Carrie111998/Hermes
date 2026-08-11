@@ -3,8 +3,9 @@
 Events are primary but not exclusive. A dropped event, a dispatcher restart, or
 a message written while the subscriber was down would otherwise leave real work
 sitting in an inbox indefinitely. This scan is the safety net, and it reaches
-its verdict through exactly the same routing table and claim ledger as the
-dispatcher — two sources of truth would eventually disagree.
+its verdict through exactly the same routing table, claim ledger, and
+availability predicate (``store.is_available``) as the dispatcher — two sources
+of truth would eventually disagree.
 
 Routing is **filename-only**. Real names look like
 ``20260810T200409_TAILOR_REQUEST_tracker_3af5f853.json`` and sometimes carry a
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from .contracts import ROUTES, Activation, message_key, route_mailbox
-from .store import ActivationStore
+from .store import ActivationStore, is_available
 
 #: Only these inbox directories are scanned. An unknown destination is not
 #: silently treated as work.
@@ -91,7 +92,7 @@ def scan_actionable(
             key = message_key(f"{destination}/inbox/{path.name}")
             correlation_id = _correlation_id(path)
             for activity_id in targets:
-                if not _is_available(store, key, activity_id, now):
+                if not is_available(store, key, activity_id, now):
                     continue
                 found.append(
                     Activation(
@@ -103,20 +104,3 @@ def scan_actionable(
                     )
                 )
     return found
-
-
-def _is_available(
-    store: ActivationStore, message_key: str, activity_id: str, now: float
-) -> bool:
-    """True when no live claim and no completion covers this work.
-
-    Read-only on purpose: the scan reports what needs doing, the caller decides
-    whether to claim it. Claiming here would mean a scan that merely *looks*
-    also consumes the work.
-    """
-    row = store.get(message_key, activity_id)
-    if row is None:
-        return True
-    if row.state == "completed":
-        return False
-    return (now - (row.claimed_at or 0.0)) > store.lease_seconds
