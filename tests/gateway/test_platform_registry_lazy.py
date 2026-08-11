@@ -348,6 +348,55 @@ def test_manifest_hints_add_platform_name_prefix_for_mismatched_vars():
     assert "SMS_" in hints
 
 
+def test_manifest_hints_cover_the_google_chat_falsifier():
+    """The named counter-example to manifest-based gating must be covered.
+
+    Prior work (agent memory ``feishu-lark-sdk-deferred-import``) warned that
+    "only import configured platforms" is unsound, citing google_chat:
+    ``_env_enablement`` enables on ``GOOGLE_CLOUD_PROJECT``, which its
+    ``plugin.yaml`` never declares (it declares
+    ``GOOGLE_CHAT_SERVICE_ACCOUNT_JSON``).  A gate on exact declared names
+    alone would silently kill it.
+
+    The head-prefix widening (``GOOGLE_CHAT_SERVICE_ACCOUNT_JSON`` ->
+    ``GOOGLE_``) is what covers it.  If someone narrows that derivation, this
+    test fails rather than google_chat silently ceasing to auto-enable.
+    """
+    from hermes_cli.plugins import PluginManager, PluginManifest
+
+    manifest = PluginManifest(
+        name="google_chat-platform",
+        kind="platform",
+        requires_env=["GOOGLE_CHAT_SERVICE_ACCOUNT_JSON"],
+    )
+    hints = PluginManager()._platform_env_hints(manifest, "google_chat")
+
+    for undeclared in (
+        "GOOGLE_CLOUD_PROJECT",
+        "GOOGLE_CHAT_SUBSCRIPTION_NAME",
+        "GOOGLE_CHAT_HTTP_EVENTS_URL",
+    ):
+        assert any(
+            h.endswith("_") and undeclared.startswith(h) for h in hints
+        ), f"{undeclared} not covered by {hints}"
+
+
+def test_manifest_hints_cover_homeassistant_name_prefix():
+    """homeassistant declares HASS_TOKEN but also reads HOMEASSISTANT_* vars.
+
+    Covered only by the platform-name-derived prefix, so this pins that half
+    of the widening.
+    """
+    from hermes_cli.plugins import PluginManager, PluginManifest
+
+    manifest = PluginManifest(
+        name="homeassistant-platform", kind="platform", requires_env=["HASS_TOKEN"]
+    )
+    hints = PluginManager()._platform_env_hints(manifest, "homeassistant")
+    assert "HASS_" in hints
+    assert "HOMEASSISTANT_" in hints
+
+
 def test_manifest_hints_empty_when_manifest_declares_nothing():
     """No requires_env => no gate => fail open.  Must NOT synthesize a prefix."""
     from hermes_cli.plugins import PluginManager, PluginManifest
@@ -418,28 +467,52 @@ def test_manifest_derived_name_matches_registered_name_for_every_bundled_platfor
 # ── the regression guard ─────────────────────────────────────────────────────
 
 
-def test_load_gateway_config_does_not_import_feishu_sdk(monkeypatch, tmp_path):
+def test_load_gateway_config_does_not_import_feishu_sdk(tmp_path):
     """The assertion that would have caught the original defect.
 
     With no FEISHU_* env vars and no Feishu config, loading gateway config must
-    not drag in lark_oapi (~10k modules, 106s of the measured 118s).
+    not drag in lark_oapi (~10k modules).
+
+    Runs in a SUBPROCESS: ``sys.modules`` is process-global, so a sibling test
+    that already imported the SDK (``test_feishu.py`` does, legitimately, via
+    the enable pass) would otherwise mask the regression — and skipping on that
+    condition turns the guard off exactly when the directory is run as a whole,
+    which is when it matters most.  Mirrors
+    ``test_feishu_lazy_sdk_import``'s subprocess discipline.
     """
-    if "lark_oapi" in sys.modules:
-        pytest.skip("lark_oapi already imported by an earlier test in this process")
+    import subprocess
+    from pathlib import Path
 
-    for key in list(os.environ):
+    repo_root = Path(__file__).resolve().parents[2]
+    code = (
+        "import sys\n"
+        "from gateway.config import load_gateway_config\n"
+        "load_gateway_config()\n"
+        "leaked = [m for m in sys.modules "
+        "if m == 'lark_oapi' or m.startswith('lark_oapi.')]\n"
+        "print('LEAKED=%d' % len(leaked))\n"
+        "print('TOTAL=%d' % len(sys.modules))\n"
+        "sys.exit(1 if leaked else 0)\n"
+    )
+    env = dict(os.environ)
+    for key in list(env):
         if key.startswith("FEISHU_"):
-            monkeypatch.delenv(key, raising=False)
-    monkeypatch.delenv(_EAGER_PLATFORM_PLUGINS_ENV, raising=False)
-    monkeypatch.setenv("HERMES_DISABLE_LAZY_INSTALLS", "1")
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+            del env[key]
+    env.pop(_EAGER_PLATFORM_PLUGINS_ENV, None)
+    env["HERMES_DISABLE_LAZY_INSTALLS"] = "1"
+    env["HERMES_HOME"] = str(tmp_path)
 
-    from gateway.config import load_gateway_config
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(repo_root),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
 
-    load_gateway_config()
-
-    leaked = [m for m in sys.modules if m == "lark_oapi" or m.startswith("lark_oapi.")]
-    assert not leaked, (
-        f"load_gateway_config() imported {len(leaked)} lark_oapi modules with "
-        "Feishu unconfigured — plugin enumeration went eager again"
+    assert proc.returncode == 0, (
+        "load_gateway_config() imported lark_oapi with Feishu unconfigured — "
+        f"plugin enumeration went eager again.\n"
+        f"stdout: {proc.stdout}\nstderr: {proc.stderr[-2000:]}"
     )

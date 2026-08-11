@@ -1,13 +1,13 @@
 """Tests for the Feishu gateway integration."""
 
 import asyncio
-import importlib.util
 import json
 import os
 import tempfile
 import time
 import unittest
 from collections import OrderedDict
+from importlib.machinery import PathFinder
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
@@ -22,11 +22,15 @@ from gateway.platforms.base import ProcessingOutcome
 # decorators, and the one test that needs the real symbols imports them itself
 # (``from lark_oapi.ws import Client``), so a spec probe is exactly equivalent:
 # with the SDK installed these tests still RUN rather than skip.
-# The try/except mirrors the tolerance of the ``import lark_oapi`` this
-# replaced: find_spec can raise on a broken/partial install, and a probe
-# failure must mean "skip", never "error at collection".
+# PathFinder, deliberately NOT ``importlib.util.find_spec``: the latter
+# consults ``sys.modules`` first and raises ``ValueError`` when the name is
+# already there without a ``__spec__`` — exactly what the ``MagicMock`` stub
+# ``test_feishu_approval_buttons.py`` injects looks like. That would silently
+# flip these tests to SKIPPED depending on collection order. PathFinder
+# searches ``sys.path``, so the answer describes the on-disk SDK. Same probe
+# as ``test_feishu_lazy_sdk_import._lark_installed``.
 try:
-    _HAS_LARK_OAPI = importlib.util.find_spec("lark_oapi") is not None
+    _HAS_LARK_OAPI = PathFinder.find_spec("lark_oapi") is not None
 except (ImportError, ValueError):
     _HAS_LARK_OAPI = False
 
