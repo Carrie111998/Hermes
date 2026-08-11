@@ -112,6 +112,64 @@ def test_init_creates_expected_tables(kanban_home):
     } <= names
 
 
+def test_board_metadata_repository_policy_is_validated(kanban_home, tmp_path):
+    repo = tmp_path / "repository-policy"
+    _init_git_repo(repo)
+    _commit_file(repo, "generated.txt", "generated\n", "add generated path")
+    policy = {
+        "base_ref": "refs/heads/main",
+        "target_branch": "main",
+        "verification_profiles": {
+            "story_integration": {
+                "commands": [
+                    {
+                        "argv": ["python", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+            "epic_release": {
+                "commands": [
+                    {
+                        "argv": ["python", "-m", "unittest"],
+                        "workdir": ".",
+                        "timeout_seconds": 60,
+                    }
+                ]
+            },
+        },
+        "ci_observation": {
+            "provider": "github_actions",
+            "required_workflows": ["CI"],
+        },
+        "boundary_evidence": {
+            "test_globs": ["tests/**"],
+            "fixture_globs": ["tests/fixtures/**"],
+            "generated_paths": ["generated.txt"],
+        },
+    }
+
+    metadata = kb.ensure_product_board_defaults(
+        "repository-policy",
+        default_workdir=str(repo),
+        repository=policy,
+    )
+    assert metadata["repository"]["base_ref"] == "refs/heads/main"
+    contract = kb.repository_contract_for_board("repository-policy")
+    assert contract is not None and contract.digest
+
+    invalid = dict(policy)
+    invalid["target_branch"] = ""
+    with pytest.raises(kb.RepositoryConfigurationError) as exc_info:
+        kb.write_board_metadata(
+            "repository-policy",
+            default_workdir=str(repo),
+            repository=invalid,
+        )
+    assert exc_info.value.code == "malformed_target_branch"
+
+
 
 
 def test_cross_process_init_lock_uses_windows_byte_range_lock(tmp_path, monkeypatch):

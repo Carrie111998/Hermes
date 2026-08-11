@@ -91,6 +91,11 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
+from hermes_cli.kanban_repository import (
+    RepositoryConfigurationError,
+    RepositoryContract,
+    load_repository_contract,
+)
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
     CandidateEligibilityError,
@@ -888,6 +893,7 @@ def write_board_metadata(
     project_id: Optional[str] = None,
     preset: Optional[str] = None,
     columns: Optional[list[dict[str, str]]] = None,
+    repository: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -925,8 +931,12 @@ def write_board_metadata(
         meta["preset"] = preset_name
     if columns is not None:
         meta["columns"] = [dict(column) for column in columns]
+    if repository is not None:
+        meta["repository"] = dict(repository)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
+    if "repository" in meta:
+        repository_contract_for_metadata(meta)
     path = board_metadata_path(slug)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -989,6 +999,7 @@ def ensure_product_board_defaults(
     color: Optional[str] = None,
     default_workdir: Optional[str] = None,
     switch: bool = False,
+    repository: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Create/update a product board with canonical Kanban V2 defaults."""
 
@@ -1006,6 +1017,7 @@ def ensure_product_board_defaults(
         default_workdir=default_workdir,
         preset="product",
         columns=defaults["columns"],
+        repository=repository,
     )
     meta.pop("db_path", None)
     existing_wf = meta.get("product_workflow")
@@ -1063,6 +1075,7 @@ def create_board(
     default_workdir: Optional[str] = None,
     project_id: Optional[str] = None,
     preset: Optional[str] = None,
+    repository: Optional[Mapping[str, object]] = None,
 ) -> dict:
     """Create a new board directory + DB + metadata. Idempotent.
 
@@ -1086,6 +1099,7 @@ def create_board(
         project_id=project_id,
         preset=preset_name,
         columns=BOARD_PRESETS[preset_name] if preset_name else None,
+        repository=repository,
     )
     # Touch the DB so list_boards() sees it immediately.
     init_db(board=normed)
@@ -1102,6 +1116,40 @@ def product_board_metadata(board: Optional[str] = None) -> Optional[dict]:
     slug = _normalize_board_slug(board) if board is not None else get_current_board()
     meta = read_board_metadata(slug or DEFAULT_BOARD)
     return meta if str(meta.get("preset") or "").lower() == "product" else None
+
+
+def repository_contract_for_metadata(
+    metadata: Mapping[str, object], *, repo_root: Optional[Path] = None
+) -> Optional[RepositoryContract]:
+    """Validate a board's repository policy when one is configured.
+
+    Repository policy is opt-in for older boards while the migration is
+    rolling out.  Once the ``repository`` key is present, every write and
+    governed Epic materialization goes through the same strict loader.
+    """
+    if "repository" not in metadata:
+        return None
+    raw_root = repo_root
+    if raw_root is None:
+        raw_default = metadata.get("default_workdir")
+        if not isinstance(raw_default, str) or not raw_default.strip():
+            raise RepositoryConfigurationError("missing_repo_root", "default_workdir")
+        raw_root = Path(raw_default).expanduser()
+    else:
+        raw_root = Path(raw_root).expanduser()
+    if not raw_root.is_absolute():
+        raise RepositoryConfigurationError("invalid_repo_root", str(raw_root))
+    return load_repository_contract(metadata, repo_root=raw_root)
+
+
+def repository_contract_for_board(
+    board: Optional[str] = None, *, repo_root: Optional[Path] = None
+) -> Optional[RepositoryContract]:
+    """Return the validated repository policy for a product board, if set."""
+    metadata = product_board_metadata(board)
+    if metadata is None:
+        return None
+    return repository_contract_for_metadata(metadata, repo_root=repo_root)
 
 
 def is_product_board(board: Optional[str] = None) -> bool:
