@@ -3193,6 +3193,31 @@ def run_conversation(
                         error_detail=_refusal_text or "model declined (content_filter)",
                     )
 
+                if finish_reason == "malformed_function_call":
+                    malformed_response = (
+                        "Gemini returned MALFORMED_FUNCTION_CALL, so the model's "
+                        "tool call payload could not be parsed or executed."
+                    )
+                    logger.warning(
+                        "%sGemini returned malformed function call. "
+                        "model=%s provider=%s",
+                        agent.log_prefix, agent.model, agent.provider,
+                    )
+                    agent._emit_status(
+                        "Gemini returned a malformed function call; stopping this turn."
+                    )
+                    messages.append(
+                        {
+                            "role": "assistant",
+                            "content": malformed_response,
+                            "finish_reason": finish_reason,
+                        }
+                    )
+                    final_response = malformed_response
+                    failed = True
+                    _turn_exit_reason = "malformed_function_call"
+                    break
+
                 if finish_reason == "length":
                     if getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID:
                         agent._vprint(

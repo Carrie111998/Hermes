@@ -575,6 +575,7 @@ def _map_gemini_finish_reason(reason: str) -> str:
         "MAX_TOKENS": "length",
         "SAFETY": "content_filter",
         "RECITATION": "content_filter",
+        "MALFORMED_FUNCTION_CALL": "malformed_function_call",
         "OTHER": "stop",
     }
     return mapping.get(str(reason or "").upper(), "stop")
@@ -652,7 +653,13 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
                 tool_call.extra_content = extra_content
             tool_calls.append(tool_call)
 
-    finish_reason = "tool_calls" if tool_calls else _map_gemini_finish_reason(str(cand.get("finishReason") or ""))
+    finish_reason_raw = str(cand.get("finishReason") or "")
+    mapped_finish_reason = _map_gemini_finish_reason(finish_reason_raw)
+    finish_reason = (
+        "tool_calls"
+        if tool_calls and mapped_finish_reason != "malformed_function_call"
+        else mapped_finish_reason
+    )
     usage_meta = resp.get("usageMetadata") or {}
     usage = SimpleNamespace(
         prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
@@ -820,7 +827,12 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
 
     finish_reason_raw = str(cand.get("finishReason") or "")
     if finish_reason_raw:
-        mapped = "tool_calls" if tool_call_indices else _map_gemini_finish_reason(finish_reason_raw)
+        mapped_finish_reason = _map_gemini_finish_reason(finish_reason_raw)
+        mapped = (
+            "tool_calls"
+            if tool_call_indices and mapped_finish_reason != "malformed_function_call"
+            else mapped_finish_reason
+        )
         finish_chunk = _make_stream_chunk(model=model, finish_reason=mapped)
         # Attach usage from this event's usageMetadata so the streaming
         # loop in run_agent.py can record token counts (mirrors the

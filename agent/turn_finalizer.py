@@ -67,6 +67,25 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _turn_completed_successfully(
+    *,
+    final_response,
+    failed: bool,
+    api_call_count: int,
+    max_iterations: int,
+    turn_exit_reason,
+) -> bool:
+    normal_text_response = str(turn_exit_reason).startswith("text_response(")
+    return (
+        final_response is not None
+        and not failed
+        and (
+            api_call_count < max_iterations
+            or normal_text_response
+        )
+    )
+
+
 def finalize_turn(
     agent,
     *,
@@ -192,14 +211,12 @@ def finalize_turn(
                 )
 
     # Determine if conversation completed successfully
-    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
-    completed = (
-        final_response is not None
-        and not failed
-        and (
-            api_call_count < agent.max_iterations
-            or normal_text_response
-        )
+    completed = _turn_completed_successfully(
+        final_response=final_response,
+        failed=failed,
+        api_call_count=api_call_count,
+        max_iterations=agent.max_iterations,
+        turn_exit_reason=_turn_exit_reason,
     )
 
     # Preflight can seed the display count before the provider receives the
