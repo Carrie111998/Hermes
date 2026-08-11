@@ -812,7 +812,7 @@ async def _wait_for_callback() -> tuple[str, str | None]:
     return await _make_callback_waiter(_oauth_port)()
 
 
-def _make_callback_waiter(port: int):
+def _make_callback_waiter(port: int, timeout: float = 300.0):
     """Return a callback waiter bound to a single OAuth flow's port.
 
     Closing over the port (instead of reading the module-level
@@ -913,11 +913,11 @@ def _make_callback_waiter(port: int):
             )
             paste_thread.start()
 
-        timeout = 300.0
+        callback_timeout = max(0.0, float(timeout))
         poll_interval = 0.5
         elapsed = 0.0
         try:
-            while elapsed < timeout:
+            while elapsed < callback_timeout:
                 if result["auth_code"] is not None or result["error"] is not None:
                     break
                 await asyncio.sleep(poll_interval)

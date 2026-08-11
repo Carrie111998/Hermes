@@ -35,6 +35,8 @@ Design reference:
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import threading
@@ -43,6 +45,28 @@ from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class MCPAuthFlowProtocolError(RuntimeError):
+    """Raised when the installed SDK cannot provide HTTPX auth-flow semantics."""
+
+
+class MCPAuthFlowLifecycleError(RuntimeError):
+    """Raised when a cached provider has unsafe loop or flow ownership."""
+
+
+def _oauth_config_fingerprint(oauth_config: Optional[dict]) -> str:
+    """Fingerprint every provider-construction input without retaining a cache alias."""
+    try:
+        encoded = json.dumps(
+            oauth_config or {},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        encoded = repr(oauth_config or {}).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -112,6 +136,7 @@ class _ProviderEntry:
     last_mtime_ns: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     loop: Optional[asyncio.AbstractEventLoop] = None
+    oauth_config_fingerprint: str = ""
     pending_401: dict[str, "asyncio.Future[bool]"] = field(default_factory=dict)
 
 
@@ -162,6 +187,8 @@ def _make_hermes_provider_class() -> Optional[type]:
             # registration can't help. Only auto-heal dynamically-registered
             # clients. See _maybe_flag_poisoned_client.
             self._hermes_preregistered = preregistered
+            self._hermes_active_flows: dict[int, Any] = {}
+            self._hermes_loop: Optional[asyncio.AbstractEventLoop] = None
 
         async def _initialize(self) -> None:
             """Load stored tokens + client info AND seed token_expiry_time.
@@ -434,6 +461,36 @@ def _make_hermes_provider_class() -> Optional[type]:
             # contract. Regression from PR #11383 caught by
             # tests/tools/test_mcp_oauth_bidirectional.py.
             inner = super().async_auth_flow(request)
+            required = ("__anext__", "asend", "aclose")
+            if any(not callable(getattr(inner, name, None)) for name in required):
+                raise MCPAuthFlowProtocolError(
+                    "MCP SDK OAuth auth flow must implement __anext__, asend, and aclose"
+                )
+
+            current_loop = asyncio.get_running_loop()
+            owner_loop = getattr(self, "_hermes_loop", None)
+            if owner_loop is not None and owner_loop is not current_loop:
+                if owner_loop.is_closed() or not owner_loop.is_running():
+                    raise MCPAuthFlowLifecycleError(
+                        "MCP OAuth provider is bound to a stopped event loop"
+                    )
+            elif owner_loop is None:
+                self._hermes_loop = current_loop
+            active_flows = getattr(self, "_hermes_active_flows", None)
+            if active_flows is None:
+                active_flows = self._hermes_active_flows = {}
+            active_flows[id(inner)] = inner
+            primary: BaseException | None = None
+
+            async def _close_inner() -> None:
+                flow_id = id(inner)
+                if flow_id not in active_flows:
+                    return
+                try:
+                    await inner.aclose()
+                finally:
+                    active_flows.pop(flow_id, None)
+
             try:
                 outgoing = await inner.__anext__()
                 while True:
@@ -447,16 +504,25 @@ def _make_hermes_provider_class() -> Optional[type]:
                 # 401 branch so a subsequent cold-load skips discovery.
                 self._persist_oauth_metadata_if_changed()
                 return
+            except BaseException as exc:
+                primary = exc
+                raise
             finally:
-                # Close the inner SDK auth-flow generator so it can
-                # release its anyio.Lock deterministically from the
-                # owning asyncio task. Without this, the inner generator
-                # is left suspended inside ``async with self.context.lock``
-                # and Python's async generator finalizer later tries to
-                # release from a different task, causing: RuntimeError("The
-                # current task is not holding this lock"). The lock stays
-                # held permanently, deadlocking reconnect.
-                await inner.aclose()
+                # Close the inner SDK auth-flow generator so it can release its
+                # SDK lock in the task that owns the HTTPX bridge. A cleanup
+                # failure must never replace a transport/provider exception.
+                try:
+                    await _close_inner()
+                except BaseException as cleanup_exc:
+                    if primary is not None:
+                        logger.warning(
+                            "MCP OAuth '%s': inner auth-flow cleanup failed "
+                            "while preserving primary exception: %s",
+                            self._hermes_server_name,
+                            cleanup_exc,
+                        )
+                    else:
+                        raise
 
     return HermesMCPOAuthProvider
 
@@ -503,13 +569,28 @@ class MCPOAuthManager:
         Returns None if the MCP SDK's OAuth support is unavailable.
         """
         key = self._key(server_name)
+        config_fingerprint = _oauth_config_fingerprint(oauth_config)
         with self._entries_lock:
             entry = self._entries.get(key)
-            if entry is not None and entry.server_url != server_url:
-                logger.info(
-                    "MCP OAuth '%s': URL changed from %s to %s, discarding cache",
-                    server_name, entry.server_url, server_url,
-                )
+            if entry is not None and (
+                entry.server_url != server_url
+                or entry.oauth_config_fingerprint != config_fingerprint
+            ):
+                if self._entry_has_active_flows(entry):
+                    raise MCPAuthFlowLifecycleError(
+                        "cannot replace an MCP OAuth provider while its auth flow "
+                        "is still suspended"
+                    )
+                if entry.oauth_config_fingerprint != config_fingerprint:
+                    logger.info(
+                        "MCP OAuth '%s': construction config changed, discarding cache",
+                        server_name,
+                    )
+                else:
+                    logger.info(
+                        "MCP OAuth '%s': URL changed from %s to %s, discarding cache",
+                        server_name, entry.server_url, server_url,
+                    )
                 entry = None
 
             # A cached provider carries two asyncio primitives bound to the
@@ -523,6 +604,11 @@ class MCPOAuthManager:
             # only sees a bare ``TimeoutError`` from its own ``wait_for``.
             # Rebuild instead — tokens live on disk, so this costs one reload.
             if entry is not None and not self._is_entry_loop_usable(entry):
+                if self._entry_has_active_flows(entry):
+                    raise MCPAuthFlowLifecycleError(
+                        "cannot rebuild an MCP OAuth provider whose suspended auth "
+                        "flow belongs to a stopped event loop"
+                    )
                 logger.info(
                     "MCP OAuth '%s': cached provider was bound to a stopped "
                     "event loop, rebuilding to avoid a stranded lock",
@@ -533,7 +619,8 @@ class MCPOAuthManager:
             if entry is None:
                 entry = _ProviderEntry(
                     server_url=server_url,
-                    oauth_config=oauth_config,
+                    oauth_config=dict(oauth_config or {}),
+                    oauth_config_fingerprint=config_fingerprint,
                 )
                 self._entries[key] = entry
 
@@ -544,6 +631,12 @@ class MCPOAuthManager:
                     entry.loop = _running_loop_or_none()
 
             return entry.provider
+
+    @staticmethod
+    def _entry_has_active_flows(entry: _ProviderEntry) -> bool:
+        """Return whether replacement would strand a delegated SDK generator."""
+        provider = entry.provider
+        return bool(provider and getattr(provider, "_hermes_active_flows", None))
 
     @staticmethod
     def _is_entry_loop_usable(entry: _ProviderEntry) -> bool:
@@ -559,6 +652,8 @@ class MCPOAuthManager:
         healthy provider would force an avoidable re-auth.
         """
         loop = entry.loop
+        if loop is None and entry.provider is not None:
+            loop = getattr(entry.provider, "_hermes_loop", None)
         if loop is None:
             return True
         return not loop.is_closed() and loop.is_running()
@@ -637,8 +732,12 @@ class MCPOAuthManager:
         _maybe_preregister_client(storage, cfg, client_metadata)
 
         resolved_port = cfg.get("_resolved_port", 0)
-        redirect_handler = _make_redirect_handler(resolved_port)
-        callback_handler = _make_callback_waiter(resolved_port)
+        redirect_handler = _make_redirect_handler(
+            resolved_port, redirect_uri=cfg.get("redirect_uri")
+        )
+        callback_handler = _make_callback_waiter(
+            resolved_port, timeout=float(cfg.get("timeout", 300))
+        )
 
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
