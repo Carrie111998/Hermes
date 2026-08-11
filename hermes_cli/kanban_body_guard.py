@@ -70,7 +70,7 @@ PLACEHOLDER_BODIES = frozenset({
 _STDIN_SENTINEL = "-"
 
 
-def is_placeholder_body(body: Optional[str]) -> bool:
+def is_placeholder_body(body: object | None) -> bool:
     """True when ``body`` carries no usable instruction.
 
     Covers null, empty, whitespace-only, and the punctuation/word
@@ -78,7 +78,7 @@ def is_placeholder_body(body: Optional[str]) -> bool:
     ``bool(body and body.strip())`` returns True for ``"-"`` — that is
     precisely the hole this closes.
     """
-    if body is None:
+    if body is None or not isinstance(body, str):
         return True
     stripped = body.strip()
     if not stripped:
@@ -126,7 +126,7 @@ def resolve_body(body: Optional[str], *, stdin=None) -> Optional[str]:
     return piped
 
 
-def validate_body(body: Optional[str], *, allow_missing: bool = False) -> Optional[str]:
+def validate_body(body: object | None, *, allow_missing: bool = False) -> Optional[str]:
     """Return ``body`` if it is a real instruction, else raise.
 
     ``allow_missing=True`` permits ``None`` (used for ``--triage`` cards,
@@ -138,7 +138,12 @@ def validate_body(body: Optional[str], *, allow_missing: bool = False) -> Option
         return None
 
     if is_placeholder_body(body):
-        shown = "<missing>" if body is None else repr(body.strip()[:40])
+        if body is None:
+            shown = "<missing>"
+        elif isinstance(body, str):
+            shown = repr(body.strip()[:40])
+        else:
+            shown = f"<{type(body).__name__}>"
         raise BlankBodyError(
             f"refusing to create a card with no instruction (body={shown}). "
             "The body IS the job spec: a worker with a blank brief guesses. "
@@ -146,4 +151,5 @@ def validate_body(body: Optional[str], *, allow_missing: bool = False) -> Option
             "not exist yet."
         )
 
+    assert isinstance(body, str)
     return body

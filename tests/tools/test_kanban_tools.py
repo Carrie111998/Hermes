@@ -438,6 +438,42 @@ def test_create_rejects_blank_and_placeholder_bodies(worker_env, body):
         )
 
 
+@pytest.mark.parametrize("body", [None, 0, False, [], {}])
+def test_create_rejects_explicit_null_and_non_string_triage_bodies(
+    worker_env, body
+):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "invalid triage body",
+        "body": body,
+        "assignee": "peer",
+        "parents": [worker_env],
+        "triage": True,
+    }))
+
+    assert out.get("ok") is not True
+    assert "no instruction" in out["error"]
+
+
+def test_create_allows_genuinely_omitted_triage_body(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "triage child task",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "triage": True,
+    }))
+
+    assert out["ok"] is True
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert task.body is None
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

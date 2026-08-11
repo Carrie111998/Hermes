@@ -1368,7 +1368,13 @@ def _handle_create(args: dict, **kw) -> str:
     from hermes_cli.kanban_body_guard import BlankBodyError, validate_body
 
     try:
-        body = validate_body(args.get("body"), allow_missing=triage)
+        if "body" not in args:
+            body = validate_body(None, allow_missing=triage)
+        else:
+            # Preserve the distinction between an omitted body (allowed only
+            # for triage) and an explicitly supplied JSON null. The latter is
+            # malformed input, not an omission.
+            body = validate_body(args["body"], allow_missing=False)
     except BlankBodyError as exc:
         return tool_error(f"kanban_create: {exc}")
     parents = args.get("parents") or []

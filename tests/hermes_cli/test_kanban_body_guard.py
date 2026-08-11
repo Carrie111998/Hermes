@@ -26,6 +26,7 @@ from hermes_cli.kanban_body_guard import (
     "tbd", "TBD", "tba", "todo", "TODO",
     "(none)", "(empty)", "no body", "placeholder",
     "***", "___", "###",
+    0, False, [], {},
 ])
 def test_placeholders_are_rejected(body):
     assert is_placeholder_body(body) is True
@@ -58,6 +59,11 @@ def test_missing_allowed_only_for_triage():
     assert validate_body(None, allow_missing=True) is None
     with pytest.raises(BlankBodyError):
         validate_body(None, allow_missing=False)
+
+
+def test_non_string_body_fails_loudly_instead_of_crashing():
+    with pytest.raises(BlankBodyError, match="body=<int>"):
+        validate_body(7)
 
 
 def test_triage_still_rejects_an_explicit_placeholder():
