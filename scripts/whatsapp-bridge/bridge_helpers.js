@@ -1,5 +1,5 @@
 import path from 'path';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { accessSync, constants, existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { randomBytes } from 'crypto';
 
 export const MIME_MAP = {
@@ -544,12 +544,17 @@ export function buildAlbumPlan(items) {
     if (!['image', 'video'].includes(type)) {
       throw new Error(`album item ${index} must be an image or video`);
     }
-    if (!item?.payload || typeof item.payload !== 'object') {
-      throw new Error(`album item ${index} payload is required`);
+    if ((!item?.payload || typeof item.payload !== 'object') && typeof item?.createPayload !== 'function') {
+      throw new Error(`album item ${index} payload or createPayload is required`);
     }
     if (type === 'image') expectedImageCount += 1;
     if (type === 'video') expectedVideoCount += 1;
-    return { type, filePath: item.filePath, payload: item.payload };
+    return {
+      type,
+      filePath: item.filePath,
+      payload: item.payload,
+      createPayload: item.createPayload,
+    };
   });
 
   return {
@@ -569,6 +574,7 @@ export function prepareAlbumItems(items) {
     const filePath = String(item?.filePath || '').trim();
     if (!filePath) throw new Error(`album item ${index} filePath is required`);
     if (!existsSync(filePath)) throw new Error(`album item ${index} file not found: ${filePath}`);
+    accessSync(filePath, constants.R_OK);
 
     const ext = filePath.toLowerCase().split('.').pop();
     const inferredType = inferMediaType(ext);
@@ -577,19 +583,25 @@ export function prepareAlbumItems(items) {
       throw new Error(`album item ${index} must be an image or video matching its file type`);
     }
 
-    const payload = mediaPayloadForFile({
-      buffer: readFileSync(filePath),
+    return {
+      type,
       filePath,
-      mediaType: type,
-      caption: item?.caption,
-      fileName: item?.fileName,
-    });
-    if (!payload) throw new Error(`album item ${index} could not be prepared`);
-    return { type, filePath, payload };
+      createPayload: () => {
+        const payload = mediaPayloadForFile({
+          buffer: readFileSync(filePath),
+          filePath,
+          mediaType: type,
+          caption: item?.caption,
+          fileName: item?.fileName,
+        });
+        if (!payload) throw new Error(`album item ${index} could not be prepared`);
+        return payload;
+      },
+    };
   });
 }
 
-export async function sendAlbumSequence({ chatId, items, send, delayMs = 0 }) {
+export async function sendAlbumSequence({ chatId, items, send }) {
   if (typeof send !== 'function') throw new Error('album send function is required');
   const plan = buildAlbumPlan(items);
   let parent;
@@ -612,8 +624,9 @@ export async function sendAlbumSequence({ chatId, items, send, delayMs = 0 }) {
   for (let index = 0; index < plan.children.length; index += 1) {
     const child = plan.children[index];
     try {
+      const payload = child.payload || child.createPayload();
       const sent = await send(chatId, {
-        ...child.payload,
+        ...payload,
         albumParentKey: parent.key,
       });
       if (!sent?.key?.id) throw new Error('album child send returned no message id');
@@ -625,9 +638,6 @@ export async function sendAlbumSequence({ chatId, items, send, delayMs = 0 }) {
         success: false,
         error: error?.message || String(error),
       });
-    }
-    if (delayMs > 0 && index < plan.children.length - 1) {
-      await new Promise(resolve => setTimeout(resolve, delayMs));
     }
   }
 

@@ -1229,7 +1229,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await super().send_multiple_images(chat_id, images, metadata, human_delay)
             return
 
-        from urllib.parse import unquote, urlparse
+        from urllib.parse import unquote
         import aiohttp
 
         items = []
@@ -1239,7 +1239,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     await super().send_multiple_images(chat_id, images, metadata, human_delay)
                     return
                 if image_url.startswith("file://"):
-                    file_path = unquote(urlparse(image_url).path)
+                    # Match BasePlatformAdapter's file URI contract. In
+                    # particular, file://C%3A%5C... must retain the drive.
+                    file_path = unquote(image_url[7:])
                 else:
                     file_path = await cache_image_from_url(image_url)
                 if not os.path.exists(file_path):
@@ -1267,16 +1269,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as resp:
-                data = await resp.json()
-                if not data.get("attempted", True):
+                if resp.status in (404, 405):
+                    # An older bridge has no album route, so no send occurred.
                     should_fallback = True
-                elif resp.status not in (200, 207) or not data.get("success", False):
-                    logger.error(
-                        "[%s] Native WhatsApp album send failed (%s): %s",
-                        self.name,
-                        resp.status,
-                        data,
-                    )
+                else:
+                    data = await resp.json()
+                    if not data.get("attempted", True):
+                        should_fallback = True
+                    elif resp.status not in (200, 207) or not data.get("success", False):
+                        logger.error(
+                            "[%s] Native WhatsApp album send failed (%s): %s",
+                            self.name,
+                            resp.status,
+                            data,
+                        )
         except Exception as exc:
             # The bridge may already have sent the parent and some children.
             # Do not fall back here or successful children would be duplicated.

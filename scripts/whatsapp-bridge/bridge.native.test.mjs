@@ -300,9 +300,9 @@ import {
   assert.equal(prepared.length, 2);
   assert.equal(prepared[0].type, 'image');
   assert.equal(prepared[0].filePath, first);
-  assert.equal(prepared[0].payload.mimetype, 'image/jpeg');
+  assert.equal(prepared[0].createPayload().mimetype, 'image/jpeg');
   assert.equal(prepared[1].type, 'video');
-  assert.equal(prepared[1].payload.caption, 'clip');
+  assert.equal(prepared[1].createPayload().caption, 'clip');
   console.log('  ✓ album files are fully validated and prepared before parent send');
 }
 

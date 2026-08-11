@@ -31,6 +31,7 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
+import { registerAlbumRoute } from './album_route.js';
 import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
@@ -47,8 +48,6 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
-  prepareAlbumItems,
-  sendAlbumSequence,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -996,50 +995,12 @@ app.post('/send-media', async (req, res) => {
   }
 });
 
-// Send multiple images/videos as one native WhatsApp album. The whole parent
-// + children sequence occupies one queue slot so unrelated sends cannot
-// interleave with the album on the shared Baileys socket.
-app.post('/send-album', async (req, res) => {
-  if (!sock || connectionState !== 'connected') {
-    return res.status(503).json({ error: 'Not connected to WhatsApp' });
-  }
-
-  const { chatId, items, delayMs } = req.body;
-  if (!chatId || !Array.isArray(items)) {
-    return res.status(400).json({ error: 'chatId and items are required' });
-  }
-
-  try {
-    // Preflight every file before the parent is sent. Known local failures
-    // must not leave an empty or permanently incomplete album envelope.
-    const preparedItems = prepareAlbumItems(items);
-    const parsedDelayMs = Number(delayMs || 0);
-    if (!Number.isFinite(parsedDelayMs) || parsedDelayMs < 0) {
-      return res.status(400).json({ error: 'delayMs must be a non-negative number' });
-    }
-
-    const result = await enqueueSend(() => sendAlbumSequence({
-      chatId,
-      items: preparedItems,
-      delayMs: Math.min(parsedDelayMs, 60000),
-      send: async (targetChatId, payload) => {
-        const sent = await sendSocketWithTimeout(targetChatId, payload);
-        trackSentMessageId(sent);
-        messageStore.remember(sent);
-        return sent;
-      },
-    }));
-
-    const statusCode = result.success ? 200 : (result.status === 'partial_failure' ? 207 : 502);
-    return res.status(statusCode).json(result);
-  } catch (err) {
-    return res.status(400).json({
-      success: false,
-      attempted: false,
-      status: 'validation_error',
-      error: err.message,
-    });
-  }
+registerAlbumRoute(app, {
+  getSocket: () => sock,
+  getConnectionState: () => connectionState,
+  enqueueSend,
+  trackSentMessageId,
+  messageStore,
 });
 
 // Send poll primitive. Approval UX is intentionally not wired here; gateway

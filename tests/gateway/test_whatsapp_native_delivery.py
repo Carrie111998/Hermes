@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -136,5 +136,61 @@ async def test_native_album_does_not_hold_global_queue_for_human_delay(tmp_path)
 
     payload = session.post.call_args.kwargs["json"]
     assert "delayMs" not in payload
+
+
+@pytest.mark.asyncio
+async def test_native_album_falls_back_when_old_bridge_returns_non_json_404(tmp_path):
+    adapter = _make_adapter()
+    session = adapter._http_session
+    assert session is not None
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    missing_route = MagicMock(status=404)
+    missing_route.json = AsyncMock(side_effect=ValueError("not json"))
+    media_resp = MagicMock(status=200)
+    media_resp.json = AsyncMock(return_value={"success": True})
+    session.post = MagicMock(side_effect=[
+        _AsyncCM(missing_route),
+        _AsyncCM(media_resp),
+        _AsyncCM(media_resp),
+    ])
+
+    await adapter.send_multiple_images(
+        "15551234567",
+        [(first.as_uri(), ""), (second.as_uri(), "")],
+    )
+
+    assert [call.args[0] for call in session.post.call_args_list] == [
+        "http://127.0.0.1:3000/send-album",
+        "http://127.0.0.1:3000/send-media",
+        "http://127.0.0.1:3000/send-media",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_native_album_preserves_windows_file_uri_paths():
+    adapter = _make_adapter()
+    session = adapter._http_session
+    assert session is not None
+    resp = MagicMock(status=200)
+    resp.json = AsyncMock(return_value={"success": True})
+    session.post = MagicMock(return_value=_AsyncCM(resp))
+
+    with patch("plugins.platforms.whatsapp.adapter.os.path.exists", return_value=True):
+        await adapter.send_multiple_images(
+            "15551234567",
+            [
+                ("file://C%3A%5Cphotos%5Cone.jpg", ""),
+                ("file://C%3A%5Cphotos%5Ctwo.jpg", ""),
+            ],
+        )
+
+    items = session.post.call_args.kwargs["json"]["items"]
+    assert [item["filePath"] for item in items] == [
+        "C:\\photos\\one.jpg",
+        "C:\\photos\\two.jpg",
+    ]
 
 
