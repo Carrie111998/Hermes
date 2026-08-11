@@ -2360,6 +2360,16 @@ def _launch_tui(
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
 
+    # Best-effort: reap orphaned node TUI trees left by crashed prior launches
+    # (stacked prompt_toolkit status frames on Windows). The reaper only touches
+    # verified Node processes that are true orphans; it never blocks launch.
+    try:
+        from hermes_cli.dashboard_procs import _reap_orphaned_tui_nodes
+
+        _reap_orphaned_tui_nodes(tui_dir=tui_dir)
+    except Exception:
+        logger.debug("TUI orphan reaper skipped", exc_info=True)
+
     import tempfile
 
     # TUI child is a hermes process: propagate the profile-home contract via

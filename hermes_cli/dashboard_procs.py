@@ -13,6 +13,7 @@ patches on ``hermes_cli.main`` resolve unchanged.
 """
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -458,237 +459,350 @@ def _detect_concurrent_hermes_instances(
     return matches
 
 
-def _is_desktop_local_serve_cmdline(command: str) -> bool:
-    """True for the Desktop-local serve spawn shape (loopback + ephemeral port).
+# --- Orphaned TUI node reaper ------------------------------------------------
+#
+# ``hermes desktop`` / ``hermes --tui`` spawn a ``node`` TUI process
+# (``node ui-tui/dist/entry.js`` via _make_tui_argv). When the parent
+# ``hermes``/``python`` process exits uncleanly, the node child survives and
+# keeps emitting prompt_toolkit status chrome to a shared terminal, producing
+# the stacked/repeated status frames seen on Windows.
+#
+# Safety is the whole point: this MUST NOT kill anything except a Hermes TUI
+# node that is a true orphan. Two independent gates enforce that:
+#   (1) the executable must be verified Node (node / node.exe) — a process
+#       whose cmdline merely *mentions* ``ui-tui/dist/entry`` (a python
+#       shell, a notepad.exe, a grep) is never selected;
+#   (2) the node must be a true orphan — its launching parent has exited.
 
-    Desktop primary/pool backends launch as::
+# The launcher (_launch_tui in main.py) only ever launches these concrete
+# entry scripts (each via `node --expose-gc <entry>`):
+#   1. <ui-tui>/dist/entry.js             (development checkout / build)
+#   2. <HERMES_TUI_DIR>/dist/entry.js     (external prebuilt, via env)
+#   3. <hermes_cli>/tui_dist/entry.js     (wheel-bundled prebuilt)
+# We match ONLY those normalized, approved paths (not generic fragments), so an
+# unrelated `node --expose-gc /tmp/unrelated/dist/entry.js` is never reaped
+# (Greptile P1: generic entry paths match unrelated nodes).
+def _hermes_tui_entry_paths() -> set[str]:
+    """Return the normalized absolute entry.js paths Hermes can launch as TUI.
 
-        hermes serve --host 127.0.0.1 --port 0
-        hermes serve --isolated --host 127.0.0.1 --port 0 ...
-
-    Intentional long-lived headless serves (e.g. ``--host <tailscale-ip>
-    --port 9119``) must never match — those are operator-managed remote
-    backends and may legitimately run with ppid 1 under launchd/nohup.
+    These are exactly the paths _launch_tui may pass to `node --expose-gc`.
+    The reaper matches a candidate cmdline's entry path against this set.
     """
-    cmd = command.lower()
-    if "serve" not in cmd:
+    paths: set[str] = set()
+    # (3) wheel-bundled prebuilt: <hermes_cli>/tui_dist/entry.js
+    try:
+        bundled = Path(__file__).resolve().parent / "tui_dist" / "entry.js"
+        paths.add(str(bundled))
+    except Exception:
+        pass
+    # (2) external prebuilt via HERMES_TUI_DIR
+    ext = os.environ.get("HERMES_TUI_DIR")
+    if ext:
+        try:
+            paths.add(str(Path(ext).resolve() / "dist" / "entry.js"))
+        except Exception:
+            pass
+    # (1) development checkout: <HERMES_HOME>/ui-tui/dist/entry.js
+    home = os.environ.get("HERMES_HOME")
+    if home:
+        try:
+            paths.add(str(Path(home).resolve() / "ui-tui" / "dist" / "entry.js"))
+        except Exception:
+            pass
+    # Also accept a ui-tui dir next to the hermes_cli package (checkout layout).
+    try:
+        checkout = Path(__file__).resolve().parent.parent / "ui-tui" / "dist" / "entry.js"
+        paths.add(str(checkout))
+    except Exception:
+        pass
+    return {p.lower() for p in paths}
+
+
+# Precomputed once at import; cheap and stable for a given home/env.
+_APPROVED_TUI_ENTRY_PATHS = _hermes_tui_entry_paths()
+
+
+def _is_tui_node_cmdline(cmd: str) -> bool:
+    """True iff *cmd* is a Hermes TUI node launch (one of the approved layouts).
+
+    Requires the Hermes launcher flag ``--expose-gc`` followed by an entry path
+    that normalizes to one of the concrete TUI entry scripts Hermes launches
+    (see ``_hermes_tui_entry_paths``). An unrelated node whose cmdline merely
+    contains ``dist/entry.js`` is NOT selected.
+    """
+    if "--expose-gc" not in cmd:
         return False
-    if "hermes" not in cmd and "hermes_cli" not in cmd:
+    # Find the path token that follows --expose-gc.
+    try:
+        tokens = cmd.split()
+        idx = tokens.index("--expose-gc")
+        entry = tokens[idx + 1] if idx + 1 < len(tokens) else ""
+    except (ValueError, IndexError):
         return False
-    # Ephemeral desktop bind: host loopback + port 0 (exact tokens).
-    has_loopback = (
-        "--host 127.0.0.1" in cmd
-        or "--host=127.0.0.1" in cmd
-        or "--host localhost" in cmd
-        or "--host=localhost" in cmd
-    )
-    has_ephemeral = "--port 0" in cmd or "--port=0" in cmd
-    if not (has_loopback and has_ephemeral):
+    if not entry:
         return False
-    # Spare anything with a concrete non-zero port flag first (defensive).
-    # (port 0 already required above.)
-    return True
+    try:
+        normalized = str(Path(entry).resolve()).lower()
+    except (OSError, ValueError):
+        normalized = entry.lower()
+    return normalized in _APPROVED_TUI_ENTRY_PATHS
+
+
+def _is_node_exe(command: str) -> bool:
+    """True iff the command's executable is Node (node / node.exe).
+
+    The first whitespace-delimited token of a process command line is the
+    executable. We resolve its basename case-insensitively so both POSIX
+    ``node`` and Windows ``node.exe`` match, and common shim forms
+    (``node.cmd``, ``node.bat``) are rejected as non-Node. Paths are stripped
+    of surrounding quotes (Windows wmic may quote the exe).
+    """
+    if not command:
+        return False
+    head = command.split(None, 1)[0] if " " in command else command
+    head = head.strip().strip('"').strip("'")
+    if not head:
+        return False
+    name = Path(head).name.lower()
+    # Windows wmic may quote the exe path; strip any residual quotes from the
+    # resolved basename before comparing.
+    name = name.strip('"').strip("'")
+    return name in ("node", "node.exe")
 
 
 def _process_ppid(pid: int) -> int | None:
-    """Best-effort parent pid lookup. None on failure."""
+    """Best-effort parent pid lookup, cross-platform via psutil.
+
+    Returns None on any failure. Uses psutil (a core dependency) rather than a
+    POSIX-only ``ps`` shell-out so Windows TUI nodes can also be evaluated for
+    orphanhood — a shell-out to ``ps`` returns nothing on Windows and would make
+    the entire Windows reaper unreachable.
+    """
     try:
-        if sys.platform == "win32":
-            return None  # Windows orphan reap is handled by desktop tree-kill.
-        result = subprocess.run(
-            ["ps", "-o", "ppid=", "-p", str(pid)],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-        )
-        if result.returncode != 0 or not result.stdout:
-            return None
-        return int(result.stdout.strip().split()[0])
-    except (ValueError, FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        import psutil  # type: ignore
+
+        return psutil.Process(pid).ppid()
+    except Exception:
         return None
 
 
-def _exclude_pids_from_env() -> set[int]:
-    """PIDs Desktop marks as live backends (HERMES_DESKTOP_CHILD_PID)."""
-    raw = os.environ.get("HERMES_DESKTOP_CHILD_PID", "")
-    out: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            out.add(int(part))
-        except ValueError:
-            continue
-    return out
-
-
-# --- SSH remote-backend lock ownership -------------------------------------
-#
-# ``backend.lock.json`` is the ownership record the Desktop SSH runtime writes
-# on the *remote* host for every ``hermes serve`` backend it spawns over SSH
-# (see apps/desktop/electron/remote-lifecycle.ts). A backend started from
-# another client/machine — e.g. a MacBook driving a ``hermes serve`` on a Mac
-# Mini over SSH — is a *legitimate, lock-owned* backend even though it has no
-# parent on this host (sshd has long since exited, reparenting it to pid 1).
-#
-# The orphan reap must NEVER kill a PID that a valid ``backend.lock.json``
-# claims as its owner. Doing so murdered a real production SSH remote backend
-# on a Mac Mini the first time the local Desktop app rebooted. The lock file is
-# the source of truth for "is this serve legitimately owned by some client",
-# regardless of which machine started it.
-
-# Mirror the schema constants in remote-lifecycle.ts (the writer). Bumping one
-# side without the other makes the lock unreadable on purpose, which is the
-# safe failure mode for reuse — but for the reap we only ever *spare*, so a
-# mismatched-schema record is simply ignored (never used to kill).
-_LOCKFILE_SCHEMA_VERSION = 2
-_PROTOCOL_VERSION = 1
-_REMOTE_LOCK_SUBDIR = "desktop-ssh"
-_HEX32 = set("0123456789abcdef")
-_HEX16 = _HEX32
-
-
-def _hermes_home_dir() -> Path:
-    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
-    override = os.environ.get("HERMES_HOME", "").strip()
-    if override:
-        return Path(override).expanduser()
-    return Path.home() / ".hermes"
-
-
-def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
-    """Validate a parsed ``backend.lock.json`` body, mirroring readLockfile().
-
-    Returns True only when every structural field the SSH runtime writes is
-    present and well-formed. A lock that fails validation is ignored (treated
-    as "no ownership claim"), which never causes a kill — the reap only ever
-    *adds* lock-owned PIDs to its spare-set.
-    """
-    if not isinstance(parsed, dict):
-        return False
-    if parsed.get("schemaVersion") != _LOCKFILE_SCHEMA_VERSION:
-        return False
-    if parsed.get("protocolVersion") != _PROTOCOL_VERSION:
-        return False
-    if parsed.get("ownershipId") != ownership_id:
-        return False
-    spawn_nonce = parsed.get("spawnNonce")
-    if not isinstance(spawn_nonce, str) or len(spawn_nonce) != 16:
-        return False
-    if set(spawn_nonce) - _HEX16:
-        return False
-    token_fp = parsed.get("tokenFingerprint")
-    if not isinstance(token_fp, str) or len(token_fp) != 32 or set(token_fp) - _HEX32:
-        return False
-    pid = parsed.get("pid")
-    if not isinstance(pid, int) or pid <= 0 or pid > 4194304:
-        return False
-    port = parsed.get("port")
-    if not isinstance(port, int) or port < 0 or port > 65535:
-        return False
-    # String fields must be present and bounded (the writer enforces <=1024).
-    for field in ("profile", "hermesPath", "hermesHome", "logPath", "startedAt"):
-        value = parsed.get(field)
-        if not isinstance(value, str) or len(value) > 1024:
-            return False
-    # logPath is written as ``{lock_root}/{ownershipId}/{spawnNonce}.log``. We
-    # only check the suffix so a relocated HERMES_HOME (different leading path)
-    # doesn't falsely reject a legitimate remote-owned backend — a false reject
-    # here would re-introduce the exact kill we're fixing.
-    log_path = parsed["logPath"]
-    if not log_path.endswith(f"/{ownership_id}/{spawn_nonce}.log"):
-        return False
-    return True
-
-
-def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
-    """PIDs claimed as owners by valid ``backend.lock.json`` records on this host.
-
-    Scans ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
-    same directory the Desktop SSH runtime writes to). Any PID a valid lock
-    names is a legitimately-owned backend — including backends another client
-    or machine started over SSH — and must be spared by the orphan reap.
-
-    Best-effort: any read/parse/IO error for a single record is swallowed and
-    that record contributes no PID. Never raises.
-    """
-    import json
-
-    root = base_dir if base_dir is not None else (
-        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
-    )
-    owned: set[int] = set()
-    if not root.is_dir():
-        return owned
+def _is_alive_parent(ppid: int) -> bool:
+    """True iff *ppid* is a live process (psutil-free check)."""
+    if ppid <= 1:
+        return False  # reparented to init / already a true orphan
     try:
-        entries = list(root.iterdir())
-    except OSError:
-        return owned
-    for entry in entries:
-        try:
-            if not entry.is_dir():
+        import psutil  # type: ignore
+
+        return psutil.pid_exists(ppid)
+    except Exception:
+        # If we cannot determine liveness, err toward sparing the process.
+        return True
+
+
+def _tui_node_exclude_pids() -> set[int]:
+    """PIDs that must never be reaped by the TUI node reaper.
+
+    Mirrors the safety exclusions of the dashboard reaper:
+    - the current Python process and every ancestor whose exe is a Hermes venv
+      shim (so we never reap the live launcher that owns this launch);
+    - HERMES_DESKTOP_CHILD_PID entries (Desktop-managed backends).
+    Never raises.
+    """
+    exclude: set[int] = set()
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return exclude
+
+    seed = os.getpid()
+    exclude.add(seed)
+    try:
+        exclude.add(os.getppid())  # direct parent (the launcher / shell)
+    except Exception:
+        pass
+    # Desktop-managed live backend children must be spared.
+    raw_pid = os.environ.get("HERMES_DESKTOP_CHILD_PID")
+    if raw_pid:
+        for part in raw_pid.split(","):
+            part = part.strip()
+            if not part:
                 continue
-        except OSError:
-            continue
-        ownership_id = entry.name
-        # Mirror validateOwnershipId(): exactly 32 lowercase hex chars.
-        if len(ownership_id) != 32 or set(ownership_id) - _HEX32:
-            continue
-        lock_path = entry / "backend.lock.json"
-        try:
-            if not lock_path.is_file():
-                continue
-            with open(lock_path, "rb") as handle:
-                data = handle.read()
-        except OSError:
-            continue
-        if len(data) > 65536:
-            continue
-        try:
-            parsed = json.loads(data)
-        except (UnicodeDecodeError, ValueError):
-            continue
-        if _valid_lockfile_payload(parsed, ownership_id):
             try:
-                owned.add(int(parsed["pid"]))
-            except (TypeError, ValueError):
+                exclude.add(int(part))
+            except (ValueError, TypeError):
+                pass
+    # Exclude the whole ancestor chain whose exe is a Hermes venv shim.
+    try:
+        shim_paths: set[str] = set()
+        scripts_dir = _m()._venv_scripts_dir()
+        if scripts_dir is not None:
+            for shim in _m()._hermes_exe_shims(scripts_dir):
+                try:
+                    shim_paths.add(str(shim.resolve()).lower())
+                except OSError:
+                    shim_paths.add(str(shim).lower())
+    except Exception:
+        shim_paths = set()
+    if shim_paths:
+        try:
+            proc = psutil.Process(seed)
+            for ancestor in proc.parents():
+                try:
+                    anc_exe = ancestor.exe()
+                except Exception:
+                    continue
+                if not anc_exe:
+                    continue
+                try:
+                    anc_norm = str(Path(anc_exe).resolve()).lower()
+                except (OSError, ValueError):
+                    anc_norm = str(anc_exe).lower()
+                if anc_norm in shim_paths:
+                    try:
+                        exclude.add(int(ancestor.pid))
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    return exclude
+
+
+def _scan_posix_node_processes(
+    exclude: set[int]
+) -> list[tuple[int, str, tuple[float, str] | None]]:
+    """Scan POSIX for orphanable TUI node processes (psutil process_iter).
+
+    Returns ``(pid, cmdline, identity)`` tuples. A process is only returned
+    when BOTH:
+    - its executable is verified Node (gate 1), and
+    - its cmdline matches a TUI pattern.
+    ``identity`` is a NON-NONE stable (create_time, exe) snapshot taken from the
+    SAME process_iter observation as the cmdline (no separate lookup), so a PID
+    reused after this snapshot can never masquerade as the scanned process
+    (Greptile P1: scan identity reused). Excludes *exclude* PIDs and self.
+    Empty list on any error.
+    """
+    self_pid = os.getpid()
+    found: list[tuple[int, str, tuple[float, str] | None]] = []
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return []
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline", "create_time", "exe"]):
+            try:
+                info = proc.info
+                pid = int(info.get("pid"))
+                cmd_parts = info.get("cmdline") or []
+                cmd = " ".join(str(c) for c in cmd_parts)
+            except (ValueError, TypeError, psutil.Error):
                 continue
-    return owned
+            if pid == self_pid or pid in exclude:
+                continue
+            if not cmd:
+                continue
+            if not _is_node_exe(cmd):
+                continue
+            if not _is_tui_node_cmdline(cmd):
+                continue
+            try:
+                identity = (float(proc.info["create_time"]), (proc.info.get("exe") or "").lower())
+            except (TypeError, ValueError, psutil.Error):
+                identity = None
+            found.append((pid, cmd, identity))
+    except Exception:
+        return found
+    return found
 
 
-def _reap_orphaned_desktop_local_serves(
+def _scan_windows_node_processes(
+    exclude: set[int]
+) -> list[tuple[int, str, tuple[float, str] | None]]:
+    """Scan Windows for orphanable TUI node processes (psutil process_iter).
+
+    Uses the SAME cross-platform process_iter snapshot as the POSIX scanner, so
+    identity (create_time, exe) is bound to the exact process whose cmdline was
+    read — no separate ``psutil.Process(pid)`` lookup that a PID reuse could fool
+    (Greptile P1: scan identity reused). This also removes the prior wmic
+    dependency entirely, so discovery still works on builds where wmic was
+    removed (Greptile P1: no WMIC fallback). Returns ``(pid, cmdline, identity)``
+    tuples. Empty list on any error.
+    """
+    self_pid = os.getpid()
+    found: list[tuple[int, str, tuple[float, str] | None]] = []
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        return []
+    try:
+        for proc in psutil.process_iter(["pid", "cmdline", "create_time", "exe"]):
+            try:
+                info = proc.info
+                pid = int(info.get("pid"))
+                cmd_parts = info.get("cmdline") or []
+                cmd = " ".join(str(c) for c in cmd_parts)
+            except (ValueError, TypeError, psutil.Error):
+                continue
+            if pid == self_pid or pid in exclude:
+                continue
+            if not cmd:
+                continue
+            if not _is_node_exe(cmd):
+                continue
+            if not _is_tui_node_cmdline(cmd):
+                continue
+            try:
+                identity = (float(proc.info["create_time"]), (proc.info.get("exe") or "").lower())
+            except (TypeError, ValueError, psutil.Error):
+                identity = None
+            found.append((pid, cmd, identity))
+    except Exception:
+        return found
+    return found
+
+
+def _reap_orphaned_tui_nodes(
     *,
-    reason: str = "orphaned desktop-local hermes serve",
-    signal_term=None,
-    signal_kill=None,
+    tui_dir: Path | None = None,
+    signal_term: int | None = None,
+    signal_kill: int | None = None,
     sleep_fn=None,
     lock_owned_pids_fn=None,
 ) -> dict[str, list]:
-    """Kill leftover Desktop-local ``hermes serve`` backends with no parent.
+    """Kill leftover ``node`` TUI processes (``ui-tui/dist/entry``) from prior launches.
 
-    When Electron dies uncleanly (crash / SIGKILL / update handoff), local
-    ``serve --host 127.0.0.1 --port 0`` children can be reparented to pid 1 and
-    keep their full MCP trees alive. The next Desktop boot then stacks a fresh
-    backend on top of the corpses until the machine hits EMFILE and the UI
-    loses tabs/sidebar.
+    ``hermes desktop`` and ``hermes --tui`` launch a ``node`` TUI process via
+    :func:`hermes_cli.main._launch_tui` (``node ui-tui/dist/entry.js``). That
+    call previously never reaped the previous launch's node tree: when the
+    parent ``hermes``/``python`` process died uncleanly, the node child
+    survived and kept emitting prompt_toolkit status chrome to a shared
+    terminal surface, producing the stacked/repeated status frames observed on
+    Windows (multiple independent TUI UIs sharing one TTY).
 
-    The parent-death watchdog prevents *future* orphans once a backend is
-    running under HERMES_PARENT_PID; this helper clears *already* orphaned
-    corpses at the start of a new Desktop backend.
+    This is the TUI analogue of :func:`_reap_orphaned_desktop_local_serves`,
+    applied at TUI-launch time. It reuses the same safety model and the same
+    Windows ``taskkill /T /F`` tree-kill the rest of the codebase uses for
+    Windows process teardown; the POSIX path mirrors the SIGTERM-then-SIGKILL
+    grace of the desktop reaper.
 
-    Safety:
-    - only the Desktop-local spawn shape (loopback + ``--port 0``)
-    - only processes whose current ppid is 1 (or 0 on some supervisors)
-    - never self / never HERMES_DESKTOP_CHILD_PID entries
-    - never a PID a valid ``backend.lock.json`` claims as its owner — that is
-      a legitimately lock-owned backend, *including SSH remote backends started
-      by another client/machine* which legitimately sit at ppid 1 after sshd
-      exits. Killing those is a production incident, not cleanup.
-    - never fixed-port remote serves (e.g. ``--port 9119``)
-    - best-effort; failures never raise to the caller
+    Safety (never relaxes below what the dashboard reaper enforces):
+    - the process executable MUST be verified Node (``node``/``node.exe``):
+      a ``python``/``notepad.exe``/``grep`` cmdline that merely mentions
+      ``ui-tui/dist/entry`` is never selected (Greptile P1, #verified-node);
+    - only nodes that are true orphans — their parent ``hermes``/launcher has
+      exited (reparented to init on POSIX). A concurrently-running,
+      legitimately-owned TUI launched by another still-alive ``hermes`` process
+      keeps its parent and is never reaped, so a fresh launch cannot murder an
+      unrelated in-use session;
+    - never self / never the ancestor chain / never ``HERMES_DESKTOP_CHILD_PID``;
+    - never a PID a valid ``backend.lock.json`` claims (SSH remote backends
+      started by other clients/machines are legitimate, even at ppid 1);
+    - on Windows, the tree-kill (``/T /F``) reaps the node child's own
+      descendants along with it, matching Desktop ``forceKillProcessTree``;
+    - best-effort; failures are swallowed and never propagate to launch.
+
+    Returns the same ``{"matched", "killed", "failed"}`` shape as the dashboard
+    reaper for testability and consistency.
     """
     import signal as _signal
     import time as _time
@@ -700,104 +814,142 @@ def _reap_orphaned_desktop_local_serves(
     if sleep_fn is None:
         sleep_fn = _time.sleep
     if lock_owned_pids_fn is None:
-        lock_owned_pids_fn = _lock_owned_serve_pids
+        lock_owned_pids_fn = lambda: set()  # no external ownership claims by default
+
+    exclude = _tui_node_exclude_pids()
+    exclude.add(os.getpid())
 
     if sys.platform == "win32":
-        # Windows desktop uses taskkill tree teardown; orphan scan here is POSIX.
+        scanned = _scan_windows_node_processes(exclude)
+    else:
+        scanned = _scan_posix_node_processes(exclude)
+
+    if not scanned:
         return {"matched": [], "killed": [], "failed": []}
 
-    exclude = _exclude_pids_from_env()
-    exclude.add(os.getpid())
-    # Also spare our direct parent (the desktop / sshd wrapper).
-    try:
-        exclude.add(os.getppid())
-    except Exception:
-        pass
-    # Spare every PID a valid backend.lock.json owns — SSH remote backends
-    # started by other clients/machines are legitimate, lock-owned owners even
-    # though they are orphaned (ppid 1) on this host. (#78872 regression)
-    try:
-        exclude |= set(lock_owned_pids_fn())
-    except Exception:
-        # Best-effort: never let lock scanning block or widen the reap.
-        pass
-
-    try:
-        scanned = _scan_dashboard_processes(exclude_pids=exclude)
-    except Exception:
-        return {"matched": [], "killed": [], "failed": []}
-
-    # Re-read lock ownership defensively: the scan above already filtered
-    # exclude PIDs, but a lock file may have been written between the scan and
-    # now. Defense in depth — never kill a freshly-claimed owner.
-    try:
-        owned_now = set(lock_owned_pids_fn())
-    except Exception:
-        owned_now = set()
-
-    targets: list[tuple[int, str]] = []
-    for pid, cmd in scanned:
-        if not _is_desktop_local_serve_cmdline(cmd):
+    targets: list[tuple[int, str, tuple[float, str]]] = []
+    for pid, cmd, scan_identity in scanned:
+        if pid in exclude:
             continue
+        # Re-check lock ownership defensively (lock files may be written
+        # between the scan and now). Defense in depth — never kill a freshly
+        # claimed owner.
+        try:
+            owned_now = set(lock_owned_pids_fn())
+        except Exception:
+            owned_now = set()
         if pid in owned_now:
             continue
+        # Only reap *orphaned* TUI nodes — those whose launcher parent has
+        # already exited. A live sibling TUI launched from another still-alive
+        # hermes process keeps its parent and must survive.
+        #
+        # Fail closed on an *unknown* parent on BOTH platforms: if we cannot
+        # establish that the launcher is dead, we must not reap (a concurrent
+        # live TUI would otherwise be killed). POSIX and Windows branches must
+        # agree here.
         ppid = _process_ppid(pid)
         if ppid is None:
+            # Parent lookup failed: cannot prove orphanhood, skip safely.
             continue
-        # Orphaned under init/launchd.
-        if ppid not in (0, 1):
+        if _is_alive_parent(ppid):
             continue
-        targets.append((pid, cmd))
+        # Require the NON-NONE identity captured by the scanner at scan time
+        # (bound to the exact process that passed the Node/TUI gates). If the
+        # scanner could not snapshot it, or it is empty, skip — we must not reap
+        # an unidentifiable PID, and we must not let a later PID reuse replace
+        # the baseline (Greptile P1: scan identity not preserved).
+        if not scan_identity or scan_identity[0] == 0.0 and scan_identity[1] == "":
+            continue
+        targets.append((pid, cmd, scan_identity))
 
     if not targets:
         return {"matched": [], "killed": [], "failed": []}
 
-    matched = [pid for pid, _ in targets]
+    matched = [pid for pid, _cmd, _ident in targets]
     killed: list[int] = []
     failed: list[int] = []
 
-    for pid, _cmd in targets:
+    def _current_identity(pid: int) -> tuple[float, str] | None:
+        """Live identity of *pid* now, or None if gone/unidentifiable."""
         try:
-            os.kill(pid, signal_term)
-        except ProcessLookupError:
-            continue
-        except PermissionError:
-            failed.append(pid)
-            continue
-        except OSError:
-            failed.append(pid)
-            continue
+            import psutil  # type: ignore
 
-    # Brief grace, then SIGKILL survivors.
-    sleep_fn(1.5)
-    # psutil.pid_exists for the liveness probe: os.kill(pid, 0) is a
-    # Windows footgun (sends CTRL_C_EVENT, bpo-14484). This path is
-    # POSIX-only (win32 early-returns above), but the linter blocks the
-    # pattern everywhere and psutil is a core dependency anyway.
-    import psutil
+            proc = psutil.Process(pid)
+            return (proc.create_time(), (proc.exe() or "").lower())
+        except Exception:
+            return None
 
-    for pid, _cmd in targets:
-        if pid in failed:
-            continue
-        if not psutil.pid_exists(pid):
-            killed.append(pid)
-            continue
-        try:
-            os.kill(pid, signal_kill)
-            killed.append(pid)
-        except ProcessLookupError:
-            killed.append(pid)
-        except OSError:
-            failed.append(pid)
+    if sys.platform == "win32":
+        from hermes_cli._subprocess_compat import windows_hide_flags
+
+        for pid, _cmd, baseline in targets:
+            # Require a non-None identity that still matches the scanned process
+            # immediately before the forced tree-kill. A None, or a changed
+            # identity (PID reused by an unrelated process), means skip.
+            current = _current_identity(pid)
+            if current is None or current != baseline:
+                continue
+            try:
+                result = subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                    creationflags=windows_hide_flags(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.returncode == 0:
+                    killed.append(pid)
+                else:
+                    failed.append(pid)
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                failed.append(pid)
+    else:
+        for pid, _cmd, baseline in targets:
+            # Re-validate right before SIGTERM: skip if the PID is now gone or
+            # belongs to a different (reused) process.
+            current = _current_identity(pid)
+            if current is None or current != baseline:
+                continue
+            try:
+                os.kill(pid, signal_term)
+            except ProcessLookupError:
+                killed.append(pid)
+                continue
+            except (PermissionError, OSError):
+                failed.append(pid)
+                continue
+        sleep_fn(1.5)
+
+        for pid, _cmd, baseline in targets:
+            if pid in failed:
+                continue
+            # Re-validate before escalating to SIGKILL: only the SAME process
+            # instance we SIGTERM'd may be killed. A None or changed identity
+            # (PID reused) means skip — never kill an unrelated replacement.
+            current = _current_identity(pid)
+            if current is None or current != baseline:
+                continue
+            try:
+                os.kill(pid, signal_kill)
+                killed.append(pid)
+            except ProcessLookupError:
+                killed.append(pid)
+            except OSError:
+                failed.append(pid)
 
     if matched:
         try:
             print(
-                f"⟲ Reaped {len(killed)} orphaned desktop-local serve "
-                f"backend(s) ({reason}): {killed or matched}"
+                f"⟲ Reaped {len(killed)} orphaned TUI node process(es): "
+                f"{killed or matched}"
             )
         except Exception:
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
-
