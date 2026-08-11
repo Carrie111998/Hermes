@@ -1,6 +1,5 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
-
 import { JsonRpcGatewayClient } from '@hermes/shared'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 interface ListenerEntry {
   callback: (event: any) => void
