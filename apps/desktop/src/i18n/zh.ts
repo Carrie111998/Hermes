@@ -2660,6 +2660,7 @@ export const zh: Translations = {
     },
     statusbar: {
       unknown: '未知',
+      checkFailed: '检查失败',
       restart: '重启',
       update: '更新',
       updateInProgress: '正在更新',

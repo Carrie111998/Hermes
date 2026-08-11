@@ -2302,6 +2302,7 @@ export const ja = defineLocale({
     },
     statusbar: {
       unknown: '不明',
+      checkFailed: '確認失敗',
       restart: '再起動',
       update: '更新',
       updateInProgress: '更新中',

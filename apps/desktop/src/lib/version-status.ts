@@ -14,6 +14,7 @@ export interface VersionStatusCopy {
   backendLabel: (version: string) => string
   backendVersion: (version: string) => string
   branch: (branch: string) => string
+  checkFailed: string
   clientLabel: (version: string) => string
   commit: (sha: string) => string
   commitsBehind: (count: number, branch: string) => string
@@ -32,6 +33,7 @@ export interface VersionStatusInput {
   behind?: number
   branch?: string
   copy: VersionStatusCopy
+  error?: string
   /** Remote mode: the client is one of two versions on screen, so it says so. */
   remote: boolean
   /** The apply reached the restart stage — labels `restart`, not `update`. */
@@ -61,6 +63,7 @@ export function resolveVersionStatus({
   behind = 0,
   branch,
   copy,
+  error,
   remote,
   restarting,
   sha = null,
@@ -83,10 +86,19 @@ export function resolveVersionStatus({
 
   // Commits behind is the precise diff; `(update)` is the fallback for a
   // backend that knows it's stale but can't count (pip, non-git checkout).
-  const hint = busy ? '' : behind > 0 ? ` (+${behind})` : available ? ` (${copy.update})` : ''
+  const hint = busy
+    ? ''
+    : error
+      ? ` (${copy.checkFailed})`
+      : behind > 0
+        ? ` (+${behind})`
+        : available
+          ? ` (${copy.update})`
+          : ''
 
   const tooltip = [
     busy && (applyMessage || copy.updateInProgress),
+    !busy && error && copy.checkFailed,
     !busy && behind > 0 && copy.commitsBehind(behind, (client ? branch : 'main') || '...'),
     !busy && behind <= 0 && available && copy.update,
     version && (client ? copy.desktopVersion(version) : copy.backendVersion(version)),
@@ -98,7 +110,7 @@ export function resolveVersionStatus({
 
   return {
     detail: client && version && sha && !busy && !remote ? sha : undefined,
-    hasUpdate: !busy && available,
+    hasUpdate: !busy && !error && available,
     label: busy ? `${base} · ${restarting ? copy.restart : copy.update}` : `${base}${hint}`,
     tooltip: tooltip || undefined,
     unknown: !version && !(client && sha)

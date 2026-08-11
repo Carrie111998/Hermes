@@ -2225,6 +2225,7 @@ export const zhHant = defineLocale({
     },
     statusbar: {
       unknown: '未知',
+      checkFailed: '檢查失敗',
       restart: '重新啟動',
       update: '更新',
       updateInProgress: '更新中',

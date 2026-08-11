@@ -79,6 +79,21 @@ describe('resolveVersionStatus', () => {
     expect(backend({ behind: 4, updateAvailable: true, version: '0.4.2' }).label).toBe('backend v0.4.2 (+4)')
   })
 
+  it('shows a failed backend check instead of implying the backend is current', () => {
+    const status = backend({ error: 'update-check-failed', version: '0.4.2' })
+
+    expect(status.label).toBe('backend v0.4.2 (check failed)')
+    expect(status.hasUpdate).toBe(false)
+    expect(status.tooltip).toContain('check failed')
+  })
+
+  it('suppresses a stale client update tint when the latest check failed', () => {
+    const status = client({ behind: 3, error: 'check-failed', version: '0.4.2' })
+
+    expect(status.label).toBe('v0.4.2 (check failed)')
+    expect(status.hasUpdate).toBe(false)
+  })
+
   it('hides a backend row that has no version at all', () => {
     expect(backend().unknown).toBe(true)
   })

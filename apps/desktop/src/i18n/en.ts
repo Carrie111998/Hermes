@@ -2481,6 +2481,7 @@ export const en: Translations = {
     },
     statusbar: {
       unknown: 'unknown',
+      checkFailed: 'check failed',
       restart: 'restart',
       update: 'update',
       updateInProgress: 'Update in progress',

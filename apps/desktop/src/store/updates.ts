@@ -266,7 +266,11 @@ export function requestActiveUpdate(): void {
   const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
   const status = target === 'backend' ? $backendUpdateStatus.get() : $updateStatus.get()
 
-  if ((status?.behind ?? 0) > 0 || status?.updateAvailable) {
+  if (
+    status?.supported !== false &&
+    !status?.error &&
+    ((status?.behind ?? 0) > 0 || status?.updateAvailable)
+  ) {
     startActiveUpdate()
 
     return
@@ -308,13 +312,14 @@ function isRemoteMode(): boolean {
 }
 
 function mapBackendCheck(res: BackendUpdateCheckResponse): DesktopUpdateStatus {
-  const behind = res.behind ?? 0
+  const notApplicable = res.error_code === 'update-check-not-applicable'
 
   return {
     supported: res.can_apply,
     message: res.message ?? undefined,
+    error: notApplicable ? undefined : (res.error_code ?? (res.behind === null ? 'check-failed' : undefined)),
     updateAvailable: res.update_available,
-    behind: behind > 0 ? behind : 0,
+    behind: res.behind === null ? undefined : Math.max(0, res.behind),
     currentVersion: res.current_version,
     targetSha: res.update_available ? `backend:${res.current_version}` : undefined,
     commits: res.commits,
@@ -387,6 +392,24 @@ export async function checkUpdates(): Promise<DesktopUpdateStatus | null> {
 }
 
 export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promise<DesktopUpdateApplyResult> {
+  const status = $updateStatus.get()
+  const updateAvailable =
+    status?.updateAvailable === true || (typeof status?.behind === 'number' && status.behind > 0)
+  if (!status || status.supported === false || status.error || !updateAvailable) {
+    $updateOverlayTarget.set('client')
+    $updateOverlayOpen.set(true)
+
+    return {
+      ok: false,
+      error: 'update-not-applyable',
+      message: status?.error
+        ? 'Desktop update status must be checked successfully before applying.'
+        : !updateAvailable && status
+          ? 'Hermes Desktop is already up to date.'
+          : 'Desktop updates are unavailable for this installation.'
+    }
+  }
+
   const bridge = window.hermesDesktop?.updates
 
   if (!bridge) {
@@ -681,6 +704,24 @@ async function runBackendUpdate(): Promise<DesktopUpdateApplyResult> {
 }
 
 export function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
+  const status = $backendUpdateStatus.get()
+  const updateAvailable =
+    status?.updateAvailable === true || (typeof status?.behind === 'number' && status.behind > 0)
+  if (!status || status.supported === false || status.error || !updateAvailable) {
+    $updateOverlayTarget.set('backend')
+    $updateOverlayOpen.set(true)
+
+    return Promise.resolve({
+      ok: false,
+      error: 'update-not-applyable',
+      message: status?.error
+        ? 'Backend update status must be checked successfully before applying.'
+        : !updateAvailable && status
+          ? 'The backend is already up to date.'
+          : 'Backend updates are managed outside Hermes Desktop.'
+    })
+  }
+
   if (backendUpdateInFlight) {
     return backendUpdateInFlight
   }

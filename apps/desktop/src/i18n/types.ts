@@ -2077,6 +2077,7 @@ export interface Translations {
     }
     statusbar: {
       unknown: string
+      checkFailed: string
       restart: string
       update: string
       updateInProgress: string

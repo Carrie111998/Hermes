@@ -1193,6 +1193,7 @@ export interface BackendUpdateCheckResponse {
   can_apply: boolean
   update_command: string | null
   message: string | null
+  error_code?: string
   commits?: BackendUpdateCommit[]
 }
 
