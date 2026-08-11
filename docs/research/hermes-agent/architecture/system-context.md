@@ -3,7 +3,7 @@ title: "Hermes System Context"
 status: draft
 source_commit: dd0827710
 verified_at: 2026-08-11
-confidence: medium
+confidence: high
 ---
 
 # 系统上下文图
@@ -56,7 +56,10 @@ flowchart LR
     User --> Desktop
     User --> Dashboard
     User --> Messaging
+    User --> API
     User --> ACP
+    User --> Batch
+    User --> Scheduler
     Developer --> Plugins
     Developer --> SkillHub
 
@@ -66,7 +69,7 @@ flowchart LR
     Desktop --> Agent
     Dashboard --> TUI
     Gateway --> Agent
-    API --> Agent
+    API --> Gateway
     ACP --> Agent
     Batch --> Agent
     Scheduler --> Agent
@@ -91,11 +94,15 @@ flowchart LR
 
 | 边 | 初始证据 | 状态 |
 |---|---|---|
-| CLI → AIAgent | `cli.py`, `run_agent.py` | 需在 M2 追踪准确构造点 |
-| Gateway → AIAgent | `gateway/run.py`, 架构文档 | 需验证 agent cache 与每轮复用方式 |
-| TUI → Python runtime | `ui-tui/README.md`, `tui_gateway/` | 已验证为 JSON-RPC 边界，待画进程图 |
-| Dashboard → TUI | 根 `AGENTS.md` Dashboard 架构说明 | 已验证：主聊天通过 PTY 嵌入 TUI |
-| Desktop → Python runtime | `apps/desktop/README.md`, 根 `AGENTS.md` | 已验证：通过 `hermes serve`/JSON-RPC，待画进程图 |
+| CLI → AIAgent | `hermes_cli/main.py::cmd_chat`, `cli.py::main`, `HermesCLI` | verified：同一 Python 进程 |
+| Gateway → AIAgent | `gateway/run.py::GatewayRunner` 与 `_agent_cache` | verified：按 session 缓存并在状态漂移时重建 |
+| TUI → Python runtime | `ui-tui/src/gatewayClient.ts`, `tui_gateway/entry.py`, `tui_gateway/ws.py` | verified：stdio child 或 WebSocket attach，共用 dispatcher |
+| Dashboard → TUI | `hermes_cli/web_server.py::_resolve_chat_argv`, `pty_ws` | verified：主聊天通过 POSIX PTY 嵌入真实 Ink TUI |
+| Desktop → Python runtime | `apps/desktop/electron/main.ts`, `electron/backend-command.ts` | verified：通过 headless `hermes serve`/JSON-RPC |
+| API Server → Gateway/AIAgent | `gateway/run.py::_create_adapter`, `gateway/platforms/api_server.py` | verified：Gateway 内 aiohttp platform adapter，不是 Dashboard API |
+| ACP → AIAgent | `acp_adapter/entry.py`, `acp_adapter/session.py::SessionManager` | verified：每个 ACP session 持有 Agent |
+| Batch → AIAgent | `batch_runner.py` | verified：multiprocessing worker 为每个 prompt 建 Agent |
+| Cron → AIAgent | `cron/scheduler_provider.py`, `cron/scheduler.py::run_job` | verified：ticker 寄宿 Gateway/Desktop，每次 job 建 fresh Agent |
 | Agent → Provider runtime | `hermes_cli/runtime_provider.py`, `agent/transports/` | 待 M4 深入 |
 | Agent → Tool runtime | `model_tools.py`, `tools/registry.py` | 待 M5 深入 |
 | Persistence → SessionDB | `hermes_state*.py` | 待 M6 深入 |
@@ -104,16 +111,15 @@ flowchart LR
 
 ## 图中刻意简化的部分
 
-- TUI 并不在同一进程中直接调用 `AIAgent`，图中的边表示产品级请求流；进程级细节将在 `process-model.md` 展开。
+- TUI 并不在同一进程中直接调用 `AIAgent`，图中的边表示产品级请求流；进程级细节见 [process-model.md](./process-model.md)。
 - Dashboard 的配置页面是 React/FastAPI，而主聊天区嵌入 TUI；图中只突出主聊天链路。
 - Desktop 是独立 React 聊天表面，不嵌入 Dashboard 或 TUI。
-- Cron 的投递和 Gateway 会话不是同一 Session，后续需要在端到端时序中表达。
+- API Server 是 Gateway platform adapter；图中单列是为了表达外部 HTTP 入口，而不是独立 daemon。
+- Cron 的投递和 Gateway 会话不是同一 Session；scheduler 默认寄宿 Gateway 或 Desktop backend，但执行使用 fresh Agent。
 - Memory、Skills 和 SessionDB 暂时合并为 Persistence；模块研究时会拆开。
 
 ## 下一轮验证任务
 
-1. 为每个入口定位实际命令和 Agent 构造符号。
-2. 区分常驻 Agent、每请求 Agent、cached Agent 和 child Agent。
-3. 确认 API Server、ACP 和 Batch 是否共享完全相同的 Turn Runtime。
-4. 创建进程/部署图，展开 TUI、Desktop、Dashboard 和 Gateway。
-
+1. 建立一级模块依赖图，明确 Agent Core 的窄腰边界。
+2. 建立顶层数据流图，区分 live state、SessionDB、Memory 和 Skills。
+3. 在 M2 比较各入口传给 `AIAgent` 的构造参数和 callback 差异。

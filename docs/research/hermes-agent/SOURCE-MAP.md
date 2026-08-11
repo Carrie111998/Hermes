@@ -48,3 +48,18 @@ confidence: medium
 | `hermes-agent` | `run_agent:main` |
 | `hermes-acp` | `acp_adapter.entry:main` |
 
+## 入口与运行时边界
+
+| 入口 | 控制入口 | Agent 构造/复用点 | 主要传输或并发模型 |
+|---|---|---|---|
+| Classic CLI | `hermes_cli.main::cmd_chat` → `cli.main` | `HermesCLI` 持有并复用 `AIAgent` | 单 Python 进程 |
+| Standalone TUI | `hermes_cli.main::_launch_tui` | `tui_gateway.server::_make_agent` | Node ↔ Python child，逐行 JSON-RPC/stdin/stdout |
+| Dashboard Chat | `hermes_cli.web_server::pty_ws` | `tui_gateway.server::_make_agent` | Browser ↔ PTY child；TUI ↔ `/api/ws` |
+| Desktop | Electron `startHermes` → `hermes serve` | `tui_gateway.server::_make_agent` | Electron renderer ↔ FastAPI WebSocket/REST |
+| Messaging Gateway | `gateway.run::start_gateway` | turn executor + `_agent_cache` | asyncio adapters、per-session serialization、cached Agent |
+| API Server | `GatewayRunner::_create_adapter` | adapter routes调用 Gateway/Agent runtime | Gateway 进程内 aiohttp/HTTP/SSE |
+| ACP | `acp_adapter.entry::main` | `SessionManager::_make_agent` | ACP stdio JSON-RPC；per-session Agent |
+| Batch | `batch_runner.py` | `_process_single_prompt` | `multiprocessing.Pool`；per-prompt Agent |
+| Cron | Gateway/Desktop scheduler provider | `cron.scheduler::run_job` | ticker thread/provider；per-run fresh Agent |
+
+完整进程图与 ownership 说明见 [architecture/process-model.md](./architecture/process-model.md)。
