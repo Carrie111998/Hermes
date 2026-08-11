@@ -85,7 +85,6 @@ export function ExcalidrawPane({ identity }: ExcalidrawPaneProps) {
     let disposed = false
     let activeController: DrawingController | null = null
     let unregisterCloseBarrier: (() => void) | undefined
-
     ignoreInitializationEcho.current = true
     void loadDrawing(identity)
       .then(drawing => {
@@ -94,7 +93,6 @@ export function ExcalidrawPane({ identity }: ExcalidrawPaneProps) {
         }
         activeController = createDrawingController(drawing)
         unregisterCloseBarrier = registerWindowCloseBarrier(() => activeController?.waitForSave() ?? true)
-
         const loadedState = activeController.getState()
         setController(activeController)
         setDrawingController(identity, activeController)
