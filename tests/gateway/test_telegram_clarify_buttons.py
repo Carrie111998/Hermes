@@ -146,13 +146,15 @@ class TestTelegramClarifyCallback:
         _clear_clarify_state()
 
     @pytest.mark.asyncio
-    async def test_numeric_choice_resolves_with_choice_text(self):
+    async def test_successful_numeric_choice_resumes_typing_for_chat(self):
         from tools import clarify_gateway as cm
 
         adapter = _make_adapter()
         # Pre-register a clarify entry so the callback can look up the choice text
         cm.register("cidA", "sk-cb", "Pick", ["red", "green", "blue"])
         adapter._clarify_state["cidA"] = "sk-cb"
+        adapter.pause_typing_for_chat("12345")
+        assert "12345" in adapter._typing_paused
 
         query = AsyncMock()
         query.data = "cl:cidA:1"  # green
@@ -186,7 +188,60 @@ class TestTelegramClarifyCallback:
         assert entry.event.is_set()
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
+        assert "12345" not in adapter._typing_paused
 
+    @pytest.mark.asyncio
+    async def test_failed_numeric_choice_does_not_resume_typing(self):
+        """A stale adapter entry must not restart typing when resolution fails."""
+        adapter = _make_adapter()
+        adapter._clarify_state["cidStale"] = "sk-stale"
+        adapter.resume_typing_for_chat = MagicMock(wraps=adapter.resume_typing_for_chat)
+
+        query = AsyncMock()
+        query.data = "cl:cidStale:0"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.message.text = "Pick"
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        adapter.resume_typing_for_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_successful_numeric_choice_without_chat_id_does_not_resume_typing(self):
+        """Resolution can succeed without message context, but cannot target typing."""
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        cm.register("cidNoChat", "sk-no-chat", "Pick", ["red"])
+        adapter._clarify_state["cidNoChat"] = "sk-no-chat"
+        adapter.resume_typing_for_chat = MagicMock(wraps=adapter.resume_typing_for_chat)
+
+        query = AsyncMock()
+        query.data = "cl:cidNoChat:0"
+        query.message = None
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, MagicMock())
+
+        adapter.resume_typing_for_chat.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unauthorized_user_rejected(self):
