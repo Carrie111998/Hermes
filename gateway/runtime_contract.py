@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-RUNTIME_PROTOCOL_VERSION = "1"
+RUNTIME_PROTOCOL_VERSION = "2"
 RUNTIME_DRIVER_FRAME_TYPES = (
     "run_started",
     "heartbeat",
