@@ -74,6 +74,21 @@ def test_human_show_reads_graph_before_connection_closes_and_prints_body(
     assert "Body:\n" + body in output
 
 
+def test_create_direct_cli_string_preserves_body_exactly(kanban_home):
+    body = "Direct CLI body with spaces, punctuation, and #42 stays exact."
+
+    output = kc.run_slash(
+        "create 'direct body regression' "
+        "--body 'Direct CLI body with spaces, punctuation, and #42 stays exact.' "
+        "--initial-status blocked"
+    )
+
+    assert output.startswith("Created t_")
+    with kb.connect_closing() as conn:
+        task = kb.list_tasks(conn, limit=1)[0]
+    assert task.body == body
+
+
 def test_create_dash_reads_multiline_stdin_through_real_cli_path(
     kanban_home, monkeypatch
 ):
@@ -90,7 +105,9 @@ def test_create_dash_reads_multiline_stdin_through_real_cli_path(
     assert task.body == body
 
 
-@pytest.mark.parametrize("body", ["", "   ", "-", "--", "n/a", "tbd", "."])
+@pytest.mark.parametrize(
+    "body", ["", "   ", "-", "--", "placeholder", "n/a", "tbd", "."]
+)
 def test_create_rejects_blank_or_placeholder_body_before_db_write(
     kanban_home, monkeypatch, body
 ):
