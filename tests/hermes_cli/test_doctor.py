@@ -1656,3 +1656,122 @@ terminal:
         assert "Deprecated: delegation.max_async_children" in out
         assert "Deprecated: HERMES_TOOL_PROGRESS_MODE" in out
         assert "⚠" in out or "Deprecated" in out
+
+
+class TestStateDbProbeBudget:
+    """`hermes doctor` must terminate on a state.db too large to scan.
+
+    The probe ends in ``PRAGMA integrity_check``, an O(database-size)
+    page-by-page verification. On the 5.1 GB state.db that motivated this it
+    ran >12 minutes with no output and the command never returned.
+    """
+
+    @staticmethod
+    def _isolate_home(monkeypatch, home):
+        monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+        monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def _run_with_probe(self, monkeypatch, tmp_path, probe):
+        import hermes_state
+
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        self._isolate_home(monkeypatch, home)
+        # A real (small) state.db so doctor reaches the health probe at all.
+        db = hermes_state.SessionDB(db_path=home / "state.db")
+        db.create_session(session_id="probe-budget-test", source="cli")
+        db.close()
+
+        monkeypatch.setattr(hermes_state, "_db_opens_cleanly", probe)
+        repaired = []
+        monkeypatch.setattr(
+            hermes_state,
+            "repair_state_db_schema",
+            lambda *a, **k: repaired.append(a) or {"repaired": True},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=False))
+        return buf.getvalue(), repaired
+
+    def test_probe_is_called_with_a_bounded_budget(self, monkeypatch, tmp_path):
+        """Doctor must never call the probe unbounded — that is the hang."""
+        seen = {}
+
+        def probe(path, *, timeout_seconds=None):
+            seen["timeout_seconds"] = timeout_seconds
+            return None
+
+        self._run_with_probe(monkeypatch, tmp_path, probe)
+
+        assert seen, "doctor never reached the state.db health probe"
+        budget = seen["timeout_seconds"]
+        assert budget is not None, "doctor ran the probe unbounded"
+        assert 0 < budget <= 60
+
+    def test_timeout_renders_a_warn_and_does_not_claim_corruption(
+        self, monkeypatch, tmp_path
+    ):
+        import hermes_state
+
+        def probe(path, *, timeout_seconds=None):
+            raise hermes_state.StateDbProbeTimeout(
+                "PRAGMA integrity_check", float(timeout_seconds or 5)
+            )
+
+        out, _ = self._run_with_probe(monkeypatch, tmp_path, probe)
+
+        assert "health probe did not finish in budget" in out
+        assert "not a corruption report" in out
+        # It must not be reported through the corruption wording/remediation.
+        # (The generic "Tip: run 'hermes doctor --fix'" footer is always
+        # printed, so assert on the state.db-specific strings.)
+        assert "FTS index may be corrupt" not in out
+        assert "state.db FTS write corruption" not in out
+        assert "schema is malformed" not in out
+
+    def test_timeout_under_fix_does_not_trigger_repair(self, monkeypatch, tmp_path):
+        """--fix must not "repair" a database we never found damage in."""
+        import hermes_state
+
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True, exist_ok=True)
+        self._isolate_home(monkeypatch, home)
+        db = hermes_state.SessionDB(db_path=home / "state.db")
+        db.create_session(session_id="probe-budget-fix", source="cli")
+        db.close()
+
+        def probe(path, *, timeout_seconds=None):
+            raise hermes_state.StateDbProbeTimeout(
+                "PRAGMA integrity_check", float(timeout_seconds or 5)
+            )
+
+        repaired = []
+        monkeypatch.setattr(hermes_state, "_db_opens_cleanly", probe)
+        monkeypatch.setattr(
+            hermes_state,
+            "repair_state_db_schema",
+            lambda *a, **k: repaired.append(a) or {"repaired": True},
+        )
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(Namespace(fix=True))
+
+        assert repaired == [], "a probe timeout must never escalate to repair"
+
+    def test_budget_is_env_overridable(self, monkeypatch):
+        default = doctor_mod._STATE_DB_PROBE_TIMEOUT_DEFAULT
+
+        monkeypatch.delenv(doctor_mod._STATE_DB_PROBE_TIMEOUT_ENV, raising=False)
+        assert doctor_mod._state_db_probe_budget() == default
+
+        monkeypatch.setenv(doctor_mod._STATE_DB_PROBE_TIMEOUT_ENV, "120")
+        assert doctor_mod._state_db_probe_budget() == 120.0
+
+        # Garbage and non-positive values fall back rather than disabling it.
+        for bad in ("nonsense", "0", "-1", ""):
+            monkeypatch.setenv(doctor_mod._STATE_DB_PROBE_TIMEOUT_ENV, bad)
+            assert doctor_mod._state_db_probe_budget() == default
