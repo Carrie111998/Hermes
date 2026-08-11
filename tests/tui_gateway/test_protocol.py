@@ -90,6 +90,83 @@ def test_shared_fixture_cleanup_uses_full_session_teardown(server, monkeypatch):
     assert closed == {"worker": 1, "agent": 1, "lease": 1}
 
 
+def test_release_slot_retains_exact_lease_until_retry_succeeds(server):
+    class _Lease:
+        def __init__(self):
+            self.calls = 0
+
+        def release(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("transient")
+
+    lease = _Lease()
+    session = {"active_session_lease": lease}
+    server._release_active_session_slot(session)
+    assert session["active_session_lease"] is lease
+    server._release_active_session_slot(session)
+    assert "active_session_lease" not in session
+    assert lease.calls == 2
+
+
+def test_release_slot_retries_transient_registry_write_with_temp_home(
+    server, tmp_path, monkeypatch
+):
+    from hermes_cli import active_sessions
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="retry-tui",
+        surface="desktop",
+        config={"max_concurrent_sessions": 1},
+    )
+    assert message is None and lease is not None
+    session = {"active_session_lease": lease}
+    real_write = active_sessions._write_entries
+    calls = 0
+
+    def fail_once(path, entries):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("transient registry write failure")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_once)
+    server._release_active_session_slot(session)
+    assert session["active_session_lease"] is lease
+    server._release_active_session_slot(session)
+    assert session == {}
+    assert active_sessions.active_session_registry_snapshot() == []
+
+
+def test_transfer_retries_failed_old_lease_on_next_cleanup(server, monkeypatch):
+    class _Lease:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.calls = 0
+
+        def release(self):
+            self.calls += 1
+            if self.fail:
+                self.fail = False
+                raise OSError("transient")
+
+    old = _Lease(fail=True)
+    new = _Lease()
+    session = {"active_session_lease": old}
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (new, None))
+    monkeypatch.setattr("hermes_cli.active_sessions.transfer_active_session", lambda *a, **k: False)
+
+    assert server._transfer_active_session_slot("sid", session, new_session_id="new")
+    assert session["active_session_lease"] is new
+    assert session["_pending_active_session_leases"] == [old]
+    server._release_active_session_slot(session)
+    assert "active_session_lease" not in session
+    assert "_pending_active_session_leases" not in session
+    assert old.calls == 2 and new.calls == 1
+
+
 @pytest.fixture()
 def capture(server):
     """Redirect server's real stdout to a StringIO and return (server, buf)."""
@@ -739,4 +816,3 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-

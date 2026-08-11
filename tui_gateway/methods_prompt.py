@@ -401,7 +401,7 @@ def _(rid, params: dict) -> dict:
                         session, refresh_reservation["token"], attempted=False
                     )
                 return
-        _run_prompt_submit(
+        _run_prompt_submit_compat(
             rid,
             sid,
             session,

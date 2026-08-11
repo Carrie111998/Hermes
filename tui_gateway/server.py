@@ -556,16 +556,56 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return None
 
 
+_retryable_active_session_releases: dict[int, Any] = {}
+
+
+def _retry_failed_active_session_releases(*, exclude: Any = None) -> None:
+    for key, stale in list(_retryable_active_session_releases.items()):
+        if stale is exclude:
+            continue
+        try:
+            stale.release()
+        except Exception:
+            logger.debug("Failed to retry active session slot release", exc_info=True)
+            continue
+        if _retryable_active_session_releases.get(key) is stale:
+            _retryable_active_session_releases.pop(key, None)
+
+
 def _release_active_session_slot(session: dict | None) -> None:
     if not session:
+        _retry_failed_active_session_releases()
         return
-    lease = session.pop("active_session_lease", None)
+    current_lease = session.get("active_session_lease")
+    _retry_failed_active_session_releases(exclude=current_lease)
+    pending = session.get("_pending_active_session_leases")
+    if isinstance(pending, list):
+        for stale in list(pending):
+            try:
+                stale.release()
+            except Exception:
+                logger.debug("Failed to release pending active session slot", exc_info=True)
+                _retryable_active_session_releases[id(stale)] = stale
+                continue
+            _retryable_active_session_releases.pop(id(stale), None)
+            try:
+                pending.remove(stale)
+            except ValueError:
+                pass
+        if not pending:
+            session.pop("_pending_active_session_leases", None)
+    lease = current_lease
     if lease is None:
         return
     try:
         lease.release()
     except Exception:
         logger.debug("Failed to release active session slot", exc_info=True)
+        _retryable_active_session_releases[id(lease)] = lease
+        return
+    _retryable_active_session_releases.pop(id(lease), None)
+    if session.get("active_session_lease") is lease:
+        session.pop("active_session_lease", None)
 
 
 def _transfer_active_session_slot(
@@ -602,13 +642,14 @@ def _transfer_active_session_slot(
         surface=_session_source(session),
     )
     if new_lease is not None:
-        old_lease = session.pop("active_session_lease", None)
+        old_lease = session.get("active_session_lease")
+        session["active_session_lease"] = new_lease
         if old_lease is not None:
             try:
                 old_lease.release()
             except Exception:
                 logger.debug("Failed to release stale active session slot", exc_info=True)
-        session["active_session_lease"] = new_lease
+                session.setdefault("_pending_active_session_leases", []).append(old_lease)
         return True
     # Reserve failed — retain the existing lease rather than dropping it.
     if limit_message:
@@ -1197,7 +1238,9 @@ def _reclaim_orphaned_leases() -> None:
             live = {
                 lease.lease_id
                 for session in _sessions.values()
-                if (lease := session.get("active_session_lease")) is not None
+                for lease in [session.get("active_session_lease")]
+                + list(session.get("_pending_active_session_leases") or [])
+                if lease is not None
             }
         if dropped := release_orphaned_leases(live):
             logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
@@ -1839,9 +1882,17 @@ def _submit_prompt_to_compute_host(
         _on_compute_host_turn_done(rid, sid, session, done)
 
     try:
-        _get_compute_host_supervisor(cfg).submit_turn(
-            frame, on_complete=_complete, on_dispatch=_dispatched
-        )
+        supervisor = _get_compute_host_supervisor(cfg)
+        try:
+            submit_params = inspect.signature(supervisor.submit_turn).parameters
+        except (TypeError, ValueError):
+            submit_params = {}
+        submit_kwargs = {"on_complete": _complete}
+        if "on_dispatch" in submit_params:
+            submit_kwargs["on_dispatch"] = _dispatched
+        supervisor.submit_turn(frame, **submit_kwargs)
+        if "on_dispatch" not in submit_params:
+            _dispatched({"type": "turn.dispatched", "request_id": rid})
     except Exception as exc:
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
@@ -7589,11 +7640,10 @@ def _enqueue_prompt(
     sent it even if the session transport is rebound meanwhile.
     """
     image_paths = list(image_paths or [])
-    queued = {
-        "text": text,
-        "transport": transport,
-        "generation": int(session.get("_queued_prompt_generation", 0)),
-    }
+    queued = {"text": text, "transport": transport}
+    generation = int(session.get("_queued_prompt_generation", 0))
+    if generation or refresh_reservation:
+        queued["generation"] = generation
     if refresh_reservation:
         queued["refresh_reservation"] = refresh_reservation
     if image_paths:
@@ -7632,10 +7682,26 @@ def _queue_pending_refresh_note(session: dict, note: str) -> dict:
 
 def _claim_pending_refresh_note_locked(session: dict) -> dict | None:
     """Reserve the oldest refresh record; caller must own ``history_lock``."""
-    for record in session.get("pending_refresh_notes", []):
-        if not record.get("reserved"):
-            record["reserved"] = True
-            return {"token": record["token"], "note": record["note"]}
+    records = session.get("pending_refresh_notes", [])
+    if not isinstance(records, list):
+        return None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        token = record.get("token")
+        note = record.get("note")
+        reserved = record.get("reserved")
+        if (
+            not isinstance(token, str)
+            or not token
+            or not isinstance(note, str)
+            or not note
+            or not isinstance(reserved, bool)
+            or reserved
+        ):
+            continue
+        record["reserved"] = True
+        return {"token": token, "note": note}
     return None
 
 
@@ -7650,8 +7716,14 @@ def _finish_pending_refresh_note_locked(
 ) -> bool:
     """Finish one refresh reservation; caller must own ``history_lock``."""
     records = session.get("pending_refresh_notes", [])
+    if not isinstance(records, list) or not isinstance(token, str) or not token:
+        return False
     for index, record in enumerate(records):
-        if record.get("token") != token or not record.get("reserved"):
+        if (
+            not isinstance(record, dict)
+            or record.get("token") != token
+            or record.get("reserved") is not True
+        ):
             continue
         if attempted:
             records.pop(index)
@@ -7671,6 +7743,24 @@ def _finish_pending_refresh_note(
         return _finish_pending_refresh_note_locked(
             session, token, attempted=attempted
         )
+
+
+def _run_prompt_submit_compat(*args, **optional_kwargs) -> Any:
+    """Pass additive turn kwargs only when the active interface declares them."""
+    try:
+        parameters = inspect.signature(_run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    supported = {
+        key: value
+        for key, value in optional_kwargs.items()
+        if value is not None and (accepts_kwargs or key in parameters)
+    }
+    return _run_prompt_submit(*args, **supported)
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7866,7 +7956,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     )
         else:
             if queued.get("image_paths"):
-                _run_prompt_submit(
+                _run_prompt_submit_compat(
                     rid,
                     sid,
                     session,
@@ -7876,7 +7966,7 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     refresh_reservation=queued.get("refresh_reservation"),
                 )
             else:
-                _run_prompt_submit(
+                _run_prompt_submit_compat(
                     rid,
                     sid,
                     session,

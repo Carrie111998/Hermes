@@ -1370,7 +1370,13 @@ class CLICommandsMixin:
         from agent.skill_commands import get_skill_commands
 
         cli_module._skill_commands = get_skill_commands()
-        self._pending_refresh_note = result.context_note
+        queue = getattr(self, "_pending_refresh_notes", None)
+        if not isinstance(queue, list):
+            queue = []
+            self._pending_refresh_notes = queue
+        queue.append(
+            {"token": uuid.uuid4().hex, "note": result.context_note, "reserved": False}
+        )
         _cprint(f"  {result.report}")
 
     def _handle_personality_command(self, cmd: str):

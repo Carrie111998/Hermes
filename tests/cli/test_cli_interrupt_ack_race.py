@@ -241,6 +241,95 @@ def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
     assert api_parts[1] == clean_parts[1]
 
 
+def test_chat_refresh_note_keeps_multimodal_transcript_input_clean():
+    cli = _make_cli()
+
+    class _NoteAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.captured = None
+
+        def run_conversation(self, **kwargs):
+            self.captured = kwargs
+            return {
+                "final_response": "done", "messages": [], "api_calls": 1,
+                "completed": True, "partial": True, "response_previewed": True,
+            }
+
+    clean_parts = [
+        {"type": "text", "text": "Inspect"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    agent = _NoteAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "refresh", "note": "REFRESH-NOTE", "reserved": False}
+    ]
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat(clean_parts)
+
+    assert agent.captured["persist_user_message"] == clean_parts
+    assert agent.captured["user_message"][0]["text"] == "REFRESH-NOTE\n\nInspect"
+    assert cli._pending_refresh_notes == []
+
+
+def test_refresh_note_rolls_back_before_model_attempt_and_retries_once():
+    cli = _make_cli()
+
+    class _RetryAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.inputs = []
+
+        def run_conversation(self, **kwargs):
+            self.inputs.append(kwargs["user_message"])
+            if len(self.inputs) == 1:
+                raise RuntimeError("pre-dispatch")
+            return {
+                "final_response": "done", "messages": [], "api_calls": 1,
+                "completed": True, "partial": True, "response_previewed": True,
+            }
+
+    agent = _RetryAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "one", "note": "NOTE-1", "reserved": False},
+        {"token": "two", "note": "NOTE-2", "reserved": False},
+    ]
+    common = (
+        patch.object(cli, "_ensure_runtime_credentials", return_value=True),
+        patch.object(cli, "_resolve_turn_agent_config", return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None, "runtime": None, "request_overrides": None,
+        }),
+        patch.object(cli, "_init_agent", return_value=True),
+    )
+    with common[0], common[1], common[2]:
+        cli.chat("first")
+        cli.chat("retry")
+        cli.chat("next")
+
+    assert agent.inputs == [
+        "NOTE-1\n\nfirst",
+        "NOTE-1\n\nretry",
+        "NOTE-2\n\nnext",
+    ]
+    assert cli._pending_refresh_notes == []
+
+
 def test_chat_multimodal_note_persists_clean_input_once(tmp_path, monkeypatch):
     """The real CLI-to-agent path stores clean image parts, never the queued note."""
     from hermes_state import SessionDB

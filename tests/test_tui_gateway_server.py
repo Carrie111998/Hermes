@@ -272,6 +272,39 @@ def test_prompt_submit_dispatches_to_compute_host_when_turn_isolation_enabled(mo
         server._sessions.pop("iso-sid", None)
 
 
+def test_compute_host_new_dispatch_callback_is_capability_aware(monkeypatch):
+    dispatched = []
+
+    class NewSupervisor:
+        def submit_turn(self, frame, *, on_complete=None, on_dispatch=None):
+            dispatched.append("new")
+            on_dispatch({"type": "turn.dispatched"})
+
+    session = _session()
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: NewSupervisor())
+    response = server._submit_prompt_to_compute_host("r", "s", session, "hello")
+    assert response["result"]["turn_isolation"] is True
+    assert dispatched == ["new"]
+
+
+def test_compute_host_runtime_type_error_is_reported_not_retried_as_legacy(monkeypatch):
+    calls = []
+
+    class BrokenNewSupervisor:
+        def submit_turn(self, frame, *, on_complete=None, on_dispatch=None):
+            calls.append(frame["request_id"])
+            raise TypeError("implementation bug")
+
+    session = _session()
+    monkeypatch.setattr(
+        server, "_get_compute_host_supervisor", lambda _cfg=None: BrokenNewSupervisor()
+    )
+    response = server._submit_prompt_to_compute_host("r", "s", session, "hello")
+    assert response["error"]["code"] == 5019
+    assert "implementation bug" in response["error"]["message"]
+    assert calls == ["r"]
+
+
 def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch):
     class _Supervisor:
         def submit_turn(self, _frame, *, on_complete=None):

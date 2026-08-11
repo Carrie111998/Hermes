@@ -107,6 +107,48 @@ def test_public_prompt_submit_reserves_refresh_without_recursive_lock(monkeypatc
         server._sessions.pop("sid", None)
 
 
+def test_public_prompt_submit_skips_malformed_refresh_records_and_claims_later_valid(monkeypatch):
+    import tui_gateway.server as server
+
+    session = {
+        "agent": object(),
+        "session_key": "refresh-malformed-key",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "pending_refresh_notes": [
+            None,
+            {},
+            {"token": "", "note": "empty token", "reserved": False},
+            {"token": "missing-note", "reserved": False},
+            {"token": "empty-note", "note": "", "reserved": False},
+            {"token": "bad-reserved", "note": "bad", "reserved": "no"},
+            {"token": "valid-token", "note": "VALID-NOTE", "reserved": False},
+            {"token": "later-token", "note": "LATER-NOTE", "reserved": False},
+        ],
+    }
+    _install_public_submit_probe(monkeypatch, server, session)
+    delivered = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: delivered.append(kwargs["refresh_reservation"]),
+    )
+    try:
+        response = server._methods["prompt.submit"](
+            "rid", {"session_id": "sid", "text": "hello"}
+        )
+        assert response["result"]["status"] == "streaming"
+        assert session["running"] is True
+        _DeferredThread.targets[0]()
+        assert delivered == [{"token": "valid-token", "note": "VALID-NOTE"}]
+        assert session["pending_refresh_notes"][-1]["reserved"] is False
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_cancel_before_agent_ready_unreserves_refresh_for_retry(monkeypatch):
     import tui_gateway.server as server
 

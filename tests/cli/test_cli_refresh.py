@@ -30,9 +30,25 @@ def test_soft_refresh_preserves_session_and_history_and_queues_tail_context(caps
 
     assert cli.session_id == "session-original"
     assert cli.conversation_history == before_history
-    assert cli._pending_refresh_note == result.context_note
+    assert [record["note"] for record in cli._pending_refresh_notes] == [result.context_note]
     cli.agent._invalidate_system_prompt.assert_not_called()
     assert "Gateway not restarted" in capsys.readouterr().out
+
+
+def test_repeated_soft_refreshes_queue_fifo_without_overwrite():
+    cli = _make_cli()
+    results = [
+        SimpleNamespace(context_note="NOTE-1", report="first"),
+        SimpleNamespace(context_note="NOTE-2", report="second"),
+    ]
+    with patch("agent.session_refresh.build_soft_refresh", side_effect=results):
+        cli._handle_refresh_command("/refresh")
+        cli._handle_refresh_command("/refresh")
+
+    assert [record["note"] for record in cli._pending_refresh_notes] == [
+        "NOTE-1",
+        "NOTE-2",
+    ]
 
 
 def test_refresh_branch_reuses_existing_branch_handler():

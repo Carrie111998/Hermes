@@ -4786,6 +4786,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
+        self._pending_refresh_notes = []
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -4866,7 +4867,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             lease.release()
         except Exception:
             logger.debug("Failed to release active session slot", exc_info=True)
-        finally:
+            return
+        if getattr(self, "_active_session_lease", None) is lease:
             self._active_session_lease = None
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
@@ -14344,10 +14346,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if _srn:
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
-                _refresh_note = getattr(self, '_pending_refresh_note', None)
-                if _refresh_note:
-                    agent_message = _prepend_note_to_message(agent_message, _refresh_note)
-                    self._pending_refresh_note = None
+                _refresh_reservation = None
+                _refresh_queue = getattr(self, "_pending_refresh_notes", None)
+                if isinstance(_refresh_queue, list):
+                    for _record in _refresh_queue:
+                        if (
+                            isinstance(_record, dict)
+                            and isinstance(_record.get("token"), str)
+                            and _record.get("token")
+                            and isinstance(_record.get("note"), str)
+                            and _record.get("note")
+                            and _record.get("reserved") is False
+                        ):
+                            _record["reserved"] = True
+                            _refresh_reservation = _record
+                            agent_message = _prepend_note_to_message(
+                                agent_message, _record["note"]
+                            )
+                            break
                 # Barged mid-speech (VAD or record key)? Tell the model it was
                 # cut off — same one-shot, API-local note channel as above.
                 from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
@@ -14377,6 +14393,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                     )
+                    if _refresh_reservation is not None:
+                        try:
+                            _refresh_queue.remove(_refresh_reservation)
+                        except ValueError:
+                            pass
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -14386,6 +14407,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._pending_moa_restore_model = None
                         self._pending_moa_disable_after_turn = False
                 except Exception as exc:
+                    if _refresh_reservation is not None:
+                        _refresh_reservation["reserved"] = False
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
                     result = {

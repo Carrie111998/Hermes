@@ -484,7 +484,7 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(
+            server._run_prompt_submit_compat(
                 request_id,
                 sid,
                 session,
