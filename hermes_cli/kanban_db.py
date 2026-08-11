@@ -95,6 +95,7 @@ from hermes_cli.kanban_repository import (
     RepositoryConfigurationError,
     RepositoryContract,
     load_repository_contract,
+    resolve_commit,
 )
 from hermes_cli.kanban_product_outcomes import (
     ApprovedCandidate,
@@ -13128,6 +13129,9 @@ def _epic_base_start_point(
     epic_id = epic_id_for_task(conn, task.id)
     if epic_id is None:
         return None, None
+    contract = repository_contract_for_board(
+        _board_slug_for_connection(conn), repo_root=repo_root
+    )
     recovered = (
         _latest_epic_integration_sha(conn, epic_id)
         or _epic_base_pinned_sha(conn, epic_id)
@@ -13136,7 +13140,10 @@ def _epic_base_start_point(
         return epic_id, recovered
     if _epic_has_materialization_history(conn, epic_id, excluding=task.id):
         return epic_id, None
-    # Genuinely fresh epic: this story is the first, so HEAD really is the base.
+    if contract is not None:
+        return epic_id, resolve_commit(repo_root, contract.base_ref)
+    # Legacy boards without a repository policy retain their historical
+    # behavior. Configured boards never consult ambient checkout state.
     return epic_id, _git_head_sha(repo_root)
 
 
@@ -13721,22 +13728,28 @@ def _fast_forward_target(candidate: IntegrationCandidate) -> bool:
     return True
 
 
-def _default_epic_verify(epic_branch: str) -> bool:
+def _default_epic_verify(
+    epic_branch: str, *, board: Optional[str] = None
+) -> bool:
     """Run the project's test suite against ``epic_branch`` and report green.
 
-    The real (slow) verify path for :func:`epic_ready`. Resolves the active
+    The legacy (slow) verify path for :func:`epic_ready`. Resolves the active
     board's repo root the same way :func:`_resolve_worktree_workspace` does
     (board ``default_workdir`` -> :func:`_git_toplevel`), materializes/locates
     a worktree checked out to ``epic_branch``, then shells out to
-    ``scripts/run_tests.sh`` in that worktree.
+    ``scripts/run_tests.sh`` in that worktree. Boards with a repository
+    contract refuse this legacy fallback until the configured verification
+    service is used.
 
     Defensive: any exception, or a missing ``run_tests.sh``, means "not
     green" -- this never raises. Exercised by the dogfood checkpoint, not by
     unit tests (which inject ``verify_fn`` instead).
     """
     try:
+        if repository_contract_for_board(board) is not None:
+            return False
         board_default = (
-            read_board_metadata(get_current_board()).get("default_workdir") or ""
+            read_board_metadata(board or get_current_board()).get("default_workdir") or ""
         ).strip()
         if not board_default:
             return False
@@ -13810,7 +13823,9 @@ def epic_ready(
         child = get_task(conn, child_id)
         if child is None or child.status != "done":
             return False
-    verify = verify_fn or _default_epic_verify
+    verify = verify_fn or (
+        lambda branch: _default_epic_verify(branch, board=board)
+    )
     return bool(verify(epic_branch_for(epic_id)))
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from types import MappingProxyType
 from typing import Any
 
 
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 _REPOSITORY_KEYS = frozenset(
     {
@@ -414,3 +416,36 @@ def load_repository_contract(
         ci_workflows=ci_workflows,
         digest=digest,
     )
+
+
+def resolve_commit(repo_root: Path, ref: str) -> str:
+    """Resolve a configured ref to one full commit SHA.
+
+    Ambiguous short names are rejected even when Git happens to return a
+    result, because accepting them would make a board depend on local ref
+    layout.  No shell is involved and no ref is written.
+    """
+
+    if not isinstance(ref, str) or not ref or ref != ref.strip() or "\x00" in ref:
+        raise _error("missing_ref", "invalid ref")
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(Path(repo_root).expanduser().resolve(strict=False)),
+            "rev-parse",
+            "--verify",
+            f"{ref}^{{commit}}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    sha = completed.stdout.strip()
+    if (
+        completed.returncode != 0
+        or "ambiguous" in completed.stderr.lower()
+        or not FULL_SHA.fullmatch(sha)
+    ):
+        raise _error("missing_ref", ref)
+    return sha

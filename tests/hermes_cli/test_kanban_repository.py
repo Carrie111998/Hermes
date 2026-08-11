@@ -8,6 +8,7 @@ import pytest
 from hermes_cli.kanban_repository import (
     RepositoryConfigurationError,
     load_repository_contract,
+    resolve_commit,
 )
 
 
@@ -34,6 +35,16 @@ def repository(tmp_path: Path) -> Path:
         ["git", "-C", str(repo), "commit", "-m", "initial"],
         check=True,
         capture_output=True,
+    )
+    sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(repo), "update-ref", "refs/remotes/origin/main", sha],
+        check=True,
     )
     return repo
 
@@ -171,3 +182,41 @@ def test_contract_rejects_workdir_escape(repository: Path):
         load_repository_contract(metadata, repo_root=repository)
 
     assert exc_info.value.code == "invalid_workdir"
+
+
+def test_resolve_commit_uses_configured_ref_not_checked_out_head(repository: Path):
+    (repository / "later.txt").write_text("later\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repository), "add", "later.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "later"],
+        check=True,
+        capture_output=True,
+    )
+
+    configured = resolve_commit(repository, "refs/remotes/origin/main")
+    head = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    assert configured != head
+    assert len(configured) == 40
+
+
+def test_resolve_commit_rejects_missing_ref(repository: Path):
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        resolve_commit(repository, "refs/remotes/origin/missing")
+
+    assert exc_info.value.code == "missing_ref"
+
+
+def test_resolve_commit_rejects_ambiguous_ref(repository: Path):
+    subprocess.run(["git", "-C", str(repository), "branch", "shared"], check=True)
+    subprocess.run(["git", "-C", str(repository), "tag", "shared"], check=True)
+
+    with pytest.raises(RepositoryConfigurationError) as exc_info:
+        resolve_commit(repository, "shared")
+
+    assert exc_info.value.code == "missing_ref"
