@@ -141,7 +141,11 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
                     "method": "event",
                     "params": {
                         "type": "gateway.ready",
-                        "payload": {"skin": skin_payload, "change_events": True},
+                        "payload": {
+                            "skin": skin_payload,
+                            "change_events": True,
+                            "heartbeat": True,
+                        },
                     },
                 }
             )
@@ -150,12 +154,52 @@ def test_handle_ws_ready_payload_wires_skin_through_to_thread():
 
     assert frames[0]["params"]["payload"]["skin"] == {"palette": "wired"}
     assert frames[0]["params"]["payload"]["change_events"] is True
+    assert frames[0]["params"]["payload"]["heartbeat"] is True
     assert idents["skin_thread"] != idents["loop_thread"]
     # Belt and braces: the production site must still route through
     # to_thread — assert against the live source so a revert to inline
     # resolve_skin() cannot slip past the behavioral stub above.
     source = inspect.getsource(ws_mod.handle_ws)
     assert "to_thread(server.resolve_skin)" in source
+    assert '"heartbeat": True' in source
+
+
+def test_real_gateway_ready_frame_advertises_heartbeat():
+    import json
+
+    import tui_gateway.server as server_mod
+    import tui_gateway.ws as ws_mod
+
+    class _Socket:
+        scope = {}
+
+        def __init__(self):
+            self.frames = []
+
+        async def accept(self):
+            return None
+
+        async def send_text(self, frame):
+            self.frames.append(json.loads(frame))
+
+        async def receive_text(self):
+            raise RuntimeError("test disconnect")
+
+        async def close(self):
+            return None
+
+    socket = _Socket()
+    with (
+        patch.object(server_mod, "resolve_skin", return_value={"palette": "wired"}),
+        patch.object(server_mod, "_ensure_skin_watcher"),
+        patch.object(server_mod, "register_live_transport"),
+        patch.object(server_mod, "unregister_live_transport"),
+        patch.object(server_mod, "_release_wake_for_transport"),
+        patch.object(server_mod, "_close_sessions_for_transport", return_value=(0, 0)),
+    ):
+        asyncio.run(ws_mod.handle_ws(socket))
+
+    assert socket.frames[0]["params"]["payload"]["heartbeat"] is True
 
 
 # ─── Fix 3: _warm_gateway_module pre-imports heavy chains ──────────────

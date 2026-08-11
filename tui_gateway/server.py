@@ -5524,7 +5524,11 @@ def _on_tool_progress(
         # catch-all. The mirror keys off the child sid and is unaffected.
         if event_type != "subagent.text":
             _emit(event_type, sid, payload)
-        _mirror_subagent_to_child(event_type, payload)
+        with _sessions_lock:
+            parent = _sessions.get(sid) or {}
+            profile_home = str(parent.get("profile_home") or "")
+        child_profile = Path(profile_home).name if profile_home else _current_profile_name()
+        _mirror_subagent_to_child(event_type, payload, profile_name=child_profile)
 
 
 # ── Child-session live mirror ────────────────────────────────────────
@@ -5543,6 +5547,7 @@ _child_mirrors_lock = threading.Lock()
 # watch resume report running=true so the window shows a busy indicator even
 # while the child is silent inside a long tool call (no events for 25s+).
 _active_child_runs: dict[str, float] = {}
+_active_child_profiles: dict[str, str] = {}
 # Staleness bound for the registry: entries refresh on every relayed event, so
 # anything this quiet means the completion event was lost (callback raised,
 # parent crashed) — don't let a leaked entry pin "running" forever.
@@ -5554,7 +5559,18 @@ def _child_run_active(child_key: str) -> bool:
     return ts is not None and (time.time() - ts) < _CHILD_RUN_STALE_S
 
 
-def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
+def _child_run_profile(child_key: str) -> str | None:
+    if not _child_run_active(child_key):
+        return None
+    return _active_child_profiles.get(child_key)
+
+
+def _mirror_subagent_to_child(
+    event_type: str,
+    payload: dict,
+    *,
+    profile_name: str,
+) -> None:
     child_key = str(payload.get("child_session_id") or "")
     if not child_key:
         return
@@ -5562,8 +5578,10 @@ def _mirror_subagent_to_child(event_type: str, payload: dict) -> None:
     # open, so a window opened mid-run can immediately know the child is busy.
     if event_type == "subagent.complete":
         _active_child_runs.pop(child_key, None)
+        _active_child_profiles.pop(child_key, None)
     else:
         _active_child_runs[child_key] = time.time()
+        _active_child_profiles[child_key] = profile_name
     # Mirror only into a live watch session (keyed by session_key; its live sid
     # differs from the stored id) that has NOT been upgraded to a full agent.
     # No window / closed → nothing to mirror; an upgraded session owns a real

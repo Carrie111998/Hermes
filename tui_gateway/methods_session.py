@@ -335,6 +335,7 @@ def _(rid, params: dict) -> dict:
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
+    lazy_child_profile = None
     found = db.get_session(target)
     if not found:
         found = db.get_session_by_title(target)
@@ -353,13 +354,16 @@ def _(rid, params: dict) -> dict:
             # so proceed into the lazy branch with empty history; the live mirror
             # streams the whole turn anyway and the row exists by upgrade time.
             found = {}
+            lazy_child_profile = _child_run_profile(target)
         else:
             return _err(rid, 4007, "session not found")
 
     from hermes_cli.profile_scope import require_session_profile
 
     try:
-        require_session_profile(found.get("profile_name") if found else None)
+        require_session_profile(
+            found.get("profile_name") if found else lazy_child_profile
+        )
     except PermissionError:
         return _err(rid, 4003, "session profile is not authorized")
 

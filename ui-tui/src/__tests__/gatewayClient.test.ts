@@ -541,6 +541,25 @@ describe('GatewayClient websocket attach mode', () => {
     }
   })
 
+  it('does not bypass the spawned-gateway recovery budget', async () => {
+    vi.useFakeTimers()
+    const gw = new GatewayClient()
+    const start = vi.spyOn(gw, 'start').mockImplementation(() => {})
+
+    try {
+      ;(
+        gw as unknown as {
+          handleTransportExit: (code: null | number, reason?: string) => void
+        }
+      ).handleTransportExit(1, 'spawned gateway failed')
+      await vi.advanceTimersByTimeAsync(RECONNECT_MAX_MS)
+      expect(start).not.toHaveBeenCalled()
+    } finally {
+      gw.kill()
+      vi.useRealTimers()
+    }
+  })
+
   it('does not double-reconnect when the exit subscriber restarts immediately', async () => {
     vi.useFakeTimers()
     process.env.HERMES_TUI_GATEWAY_URL = 'ws://gateway.test/api/ws?token=abc'

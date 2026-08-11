@@ -1,6 +1,7 @@
 """Tests for hermes_cli.web_server and related config utilities."""
 
 import asyncio
+import inspect
 import os
 import json
 import shutil
@@ -20,6 +21,31 @@ from hermes_cli.config import (
     OPTIONAL_ENV_VARS,
     DEFAULT_CONFIG,
 )
+
+
+def test_web_startup_initializes_managed_profile_scope(monkeypatch):
+    from agent import secret_scope
+    from gateway import config as gateway_config
+    from hermes_cli import web_server
+
+    observed = []
+    monkeypatch.setattr(
+        gateway_config,
+        "load_gateway_config",
+        lambda: SimpleNamespace(multiplex_profiles=True),
+    )
+    monkeypatch.setattr(
+        secret_scope,
+        "set_multiplex_active",
+        lambda active: observed.append(active),
+    )
+
+    web_server._initialize_managed_profile_scope()
+
+    assert observed == [True]
+    assert "_initialize_managed_profile_scope()" in inspect.getsource(
+        web_server._lifespan
+    )
 
 
 # ---------------------------------------------------------------------------

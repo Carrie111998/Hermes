@@ -375,7 +375,9 @@ export class GatewayClient extends EventEmitter {
     // Schedule before the synchronous 'exit' emission: useMainApp's existing
     // recovery subscriber may call start() immediately, and start() cancels this
     // timer so there is only one recovery owner.
-    this.scheduleReconnect()
+    if (this.attachUrl) {
+      this.scheduleReconnect()
+    }
 
     if (this.subscribed) {
       this.emit('exit', code)

@@ -214,6 +214,14 @@ def _resolve_restart_drain_timeout() -> float:
         return DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
 
 
+def _initialize_managed_profile_scope() -> None:
+    """Bind dashboard authorization to the configured multiplex topology."""
+    from agent.secret_scope import set_multiplex_active
+    from gateway.config import load_gateway_config
+
+    set_multiplex_active(bool(load_gateway_config().multiplex_profiles))
+
+
 @asynccontextmanager
 async def _lifespan(app: "FastAPI"):
     app.state.event_channels = {}  # dict[str, set]
@@ -232,6 +240,7 @@ async def _lifespan(app: "FastAPI"):
     # run_in_executor still froze the event loop for 15-22 s, causing the
     # Desktop's 10-second WebSocket ready-probe to time out (GH-73083).
     _warm_gateway_module()
+    _initialize_managed_profile_scope()
 
     # Desktop-spawned backends (HERMES_DESKTOP=1) fire cron jobs themselves,
     # since the app has no gateway running the scheduler. Server `hermes
