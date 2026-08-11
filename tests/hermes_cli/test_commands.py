@@ -742,6 +742,67 @@ class TestTelegramMenuCommands:
         assert "hub_backup_skill" in menu_names
         assert "hub_other_skill" in menu_names
 
+    @pytest.mark.require_symlinks
+    def test_symlinked_local_skill_outside_root_stays_in_gateway_menus(
+        self, tmp_path, monkeypatch
+    ):
+        """A trusted lexical skill path may target a checkout outside the root."""
+        from unittest.mock import patch
+
+        from agent.skill_utils import iter_skill_index_files
+        from hermes_cli.commands import discord_skill_commands_by_category
+
+        local_dir = tmp_path / "skills"
+        local_dir.mkdir()
+        checkout_dir = tmp_path / "checked-out-skills" / "symlinked-skill"
+        checkout_dir.mkdir(parents=True)
+        (checkout_dir / "SKILL.md").write_text(
+            "---\nname: symlinked-skill\ndescription: Linked checkout\n---\n",
+            encoding="utf-8",
+        )
+        linked_dir = local_dir / "symlinked-skill"
+        linked_dir.symlink_to(checkout_dir, target_is_directory=True)
+
+        discovered = list(iter_skill_index_files(local_dir, "SKILL.md"))
+        assert discovered == [linked_dir / "SKILL.md"]
+        assert discovered[0].resolve() == checkout_dir / "SKILL.md"
+        assert not checkout_dir.is_relative_to(local_dir)
+
+        fake_cmds = {
+            "/symlinked-skill": {
+                "name": "symlinked-skill",
+                "description": "Linked checkout",
+                "skill_md_path": str(discovered[0]),
+                "skill_dir": str(linked_dir),
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", local_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            telegram_menu, _ = telegram_menu_commands(max_commands=100)
+            discord_entries, hidden = discord_skill_commands(
+                max_slots=50, reserved_names=set()
+            )
+            categories, uncategorized, category_hidden = (
+                discord_skill_commands_by_category(reserved_names=set())
+            )
+
+        assert "symlinked_skill" in {
+            name for name, _description in telegram_menu
+        }
+        assert "symlinked-skill" in {
+            name for name, _description, _key in discord_entries
+        }
+        assert categories == {}
+        assert [name for name, _description, _key in uncategorized] == [
+            "symlinked-skill"
+        ]
+        assert hidden == 0
+        assert category_hidden == 0
+
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
         from unittest.mock import patch
