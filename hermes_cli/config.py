@@ -2471,6 +2471,14 @@ OPTIONAL_ENV_VARS = {
         "category": "provider",
         "advanced": True,
     },
+    "OPENAI_API_KEY": {
+        "description": "OpenAI API key (api.openai.com)",
+        "prompt": "OpenAI API key",
+        "url": "https://platform.openai.com/api-keys",
+        "password": True,
+        "category": "provider",
+        "advanced": True,
+    },
     "OPENROUTER_API_KEY": {
         "description": "OpenRouter API key (for vision, web scraping helpers, and MoA)",
         "prompt": "OpenRouter API key",

@@ -62,6 +62,7 @@ const PROVIDER_GROUPS: { prefix: string; name: string; priority: number }[] = [
   { prefix: "MINIMAX_", name: "MiniMax", priority: 8 },
   { prefix: "OPENCODE_GO_", name: "OpenCode Go", priority: 10 },
   { prefix: "OPENCODE_ZEN_", name: "OpenCode Zen", priority: 11 },
+  { prefix: "OPENAI_", name: "OpenAI", priority: 11.5 },
   { prefix: "OPENROUTER_", name: "OpenRouter", priority: 12 },
   { prefix: "XIAOMI_", name: "Xiaomi MiMo", priority: 13 },
 ];
