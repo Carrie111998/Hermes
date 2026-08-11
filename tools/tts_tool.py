@@ -13,6 +13,7 @@ Built-in TTS providers:
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
+- Kokoro (local, free, no API key): 82M open-weight neural TTS, 9 languages
 
 Custom command providers:
 - Users can declare any number of named providers with ``type: command``
@@ -203,6 +204,19 @@ def _import_piper():
     return PiperVoice
 
 
+def _import_kokoro():
+    """Lazy import Kokoro. Returns the KPipeline class or raises ImportError.
+
+    Kokoro is an optional, fully-local 82M-parameter neural TTS engine
+    (Apache-2.0 weights). ``pip install kokoro`` provides the package; the
+    ``espeak-ng`` system binary is required for English out-of-dictionary
+    fallback and several non-English languages. Models download from
+    HuggingFace on first use.
+    """
+    from kokoro import KPipeline
+    return KPipeline
+
+
 # ===========================================================================
 # Defaults
 # ===========================================================================
@@ -220,6 +234,8 @@ MANAGED_OPENAI_TTS_MODELS = frozenset({"gpt-4o-mini-tts"})
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-libritts-high"  # high-quality tier; ~120MB model
+DEFAULT_KOKORO_VOICE = "af_heart"  # American English, female; see docs for the full voice list
+DEFAULT_KOKORO_LANG_CODE = "a"  # 'a' = American English; 'b' = British; 'e' = Spanish; 'f' = French; 'h' = Hindi; 'i' = Italian; 'j' = Japanese; 'p' = Brazilian Portuguese; 'z' = Mandarin
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MINIMAX_MODEL = "speech-02-hd"
@@ -283,6 +299,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
     "piper": 5000,        # local VITS model, phoneme-based; practical cap
+    "kokoro": 2000,       # local 82M model, quality falls off on long text
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -779,6 +796,7 @@ BUILTIN_TTS_PROVIDERS = frozenset({
     "neutts",
     "kittentts",
     "piper",
+    "kokoro",
     "deepinfra",
 })
 
@@ -2896,6 +2914,15 @@ def _check_piper_available() -> bool:
         return False
 
 
+def _check_kokoro_available() -> bool:
+    """Check whether the kokoro package is importable."""
+    try:
+        import importlib.util
+        return importlib.util.find_spec("kokoro") is not None
+    except Exception:
+        return False
+
+
 def _get_piper_voices_dir() -> Path:
     """Return the directory where Hermes caches Piper voice models.
 
@@ -3221,6 +3248,100 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Provider: Kokoro (local, 82M neural TTS)
+# ===========================================================================
+
+# Module-level cache for Kokoro KPipeline instances. A pipeline holds the
+# loaded 82M model plus its voice packs — constructing one costs seconds of
+# torch/model load, so it is keyed on (lang_code, device) and reused across
+# requests (LRU-bounded like the other model caches).
+_kokoro_pipeline_cache: Dict[str, Any] = {}
+
+
+def _generate_kokoro_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using the local Kokoro TTS engine.
+
+    Kokoro is an 82M-parameter open-weight (Apache-2.0) neural TTS model
+    that runs fully locally on CPU or GPU. Requires ``pip install kokoro``
+    (torch-based) plus the ``espeak-ng`` system binary for English
+    out-of-dictionary fallback and some non-English languages. The model
+    downloads from HuggingFace on first use.
+
+    Args:
+        text: Text to convert to speech.
+        output_path: Where to save the audio file.
+        tts_config: TTS config dict (``tts.kokoro`` sub-block).
+
+    Returns:
+        Path to the saved audio file.
+    """
+    KPipeline = _import_kokoro()
+    kk_config = tts_config.get("kokoro") or {} if isinstance(tts_config, dict) else {}
+    if not isinstance(kk_config, dict):
+        kk_config = {}
+    lang_code = kk_config.get("lang_code") or DEFAULT_KOKORO_LANG_CODE
+    voice = kk_config.get("voice") or DEFAULT_KOKORO_VOICE
+    speed = float(kk_config.get("speed", 1.0))
+    # Empty string = auto (Kokoro picks CUDA when available, else CPU);
+    # "cpu"/"cuda" pin explicitly, mirroring tts.neutts.device.
+    device = (kk_config.get("device") or "").strip() or None
+
+    cache_key = f"{lang_code}::device={device}"
+
+    def _load_pipeline():
+        logger.info("[Kokoro] Loading pipeline (lang=%s, device=%s)", lang_code, device)
+        pipeline = KPipeline(lang_code=lang_code, device=device)
+        logger.info("[Kokoro] Pipeline loaded")
+        return pipeline
+
+    pipeline = _tts_cache_get_or_load(_kokoro_pipeline_cache, cache_key, _load_pipeline)
+
+    logger.info("[Kokoro] Synthesizing (voice=%s, lang=%s)", voice, lang_code)
+    chunks = []
+    for result in pipeline(text, voice=voice, speed=speed):
+        audio = result.audio
+        if audio is None:
+            continue
+        # KPipeline yields torch tensors; detach+move to numpy so we can
+        # concatenate without importing torch here (torch is a kokoro dep,
+        # numpy is universal).
+        if hasattr(audio, "detach"):
+            audio = audio.detach().cpu().numpy()
+        chunks.append(audio)
+    if not chunks:
+        raise RuntimeError("Kokoro produced no audio output")
+    if len(chunks) == 1:
+        audio = chunks[0]
+    else:
+        import numpy as np
+        audio = np.concatenate(chunks)
+
+    # Kokoro outputs 24kHz mono float32. Caller handles downstream
+    # MP3/Opus conversion via ffmpeg (same contract as Piper/KittenTTS).
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    import soundfile as sf
+    sf.write(wav_path, audio, 24000)
+
+    if wav_path != output_path:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+            subprocess.run(conv_cmd, check=True, timeout=30, stdin=subprocess.DEVNULL, creationflags=windows_hide_flags())
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
+        else:
+            # No ffmpeg — keep WAV and return that path
+            os.rename(wav_path, output_path)
+
+    return output_path
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def _text_to_speech_single(
@@ -3461,6 +3582,20 @@ def _text_to_speech_single(
             logger.info("Generating speech with Piper (local)...")
             _generate_piper_tts(text, file_str, tts_config)
 
+        elif provider == "kokoro":
+            try:
+                _import_kokoro()
+            except ImportError:
+                return json.dumps({
+                    "success": False,
+                    "error": "Kokoro provider selected but 'kokoro' package not installed. "
+                             "Run 'hermes tools' and select Kokoro under TTS, or install "
+                             "manually: pip install kokoro (requires the espeak-ng system "
+                             "binary for English OOD fallback)",
+                }, ensure_ascii=False)
+            logger.info("Generating speech with Kokoro (local)...")
+            _generate_kokoro_tts(text, file_str, tts_config)
+
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
             edge_available = True
@@ -3534,7 +3669,7 @@ def _text_to_speech_single(
                 voice_compatible = file_str.endswith(".ogg")
         elif (
             want_opus
-            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper"}
+            and provider in {"edge", "neutts", "minimax", "xai", "kittentts", "piper", "kokoro"}
             and not file_str.endswith(".ogg")
         ):
             opus_path = _convert_to_opus(file_str)
@@ -3861,6 +3996,8 @@ def check_tts_requirements() -> bool:
         return _check_kittentts_available()
     if provider == "piper":
         return _check_piper_available()
+    if provider == "kokoro":
+        return _check_kokoro_available()
 
     try:
         from agent.tts_registry import get_provider
@@ -4573,7 +4710,7 @@ TTS_SCHEMA = {
                 "description": (
                     "Optional TTS provider override. Accepts built-in names "
                     "(edge, openai, elevenlabs, minimax, xai, mistral, gemini, "
-                    "neutts, kittentts, piper), user-declared command provider "
+                    "neutts, kittentts, piper, kokoro), user-declared command provider "
                     "names from tts.providers.<name>, or plugin-registered names. "
                     "When omitted, the configured tts.provider from config.yaml is used."
                 )

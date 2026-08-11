@@ -40,7 +40,7 @@ GROQ_MODELS_URL = "https://api.groq.com/openai/v1/models"
 ELEVENLABS_VOICES_URL = "https://api.elevenlabs.io/v1/voices"
 
 # TTS/STT providers that never touch the network (nothing to probe).
-_LOCAL_AUDIO_PROVIDERS = {"", "local", "edge", "neutts", "kittentts", "piper"}
+_LOCAL_AUDIO_PROVIDERS = {"", "local", "edge", "neutts", "kittentts", "piper", "kokoro"}
 
 
 @dataclass

@@ -14,7 +14,7 @@ If you have a paid [Nous Portal](https://portal.nousresearch.com) subscription, 
 
 ## Text-to-Speech
 
-Convert text to speech with eleven providers:
+Convert text to speech with twelve providers:
 
 | Provider | Quality | Cost | API Key |
 |----------|---------|------|---------|
@@ -29,6 +29,7 @@ Convert text to speech with eleven providers:
 | **NeuTTS** | Good | Free (local) | None needed |
 | **KittenTTS** | Good | Free (local) | None needed |
 | **Piper** | Good | Free (local) | None needed |
+| **Kokoro** | Excellent | Free (local) | None needed |
 
 ### Platform Delivery
 
@@ -44,7 +45,7 @@ Convert text to speech with eleven providers:
 ```yaml
 # In ~/.hermes/config.yaml
 tts:
-  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper"
+  provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper" | "kokoro"
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -258,6 +259,57 @@ tts:
 ```
 
 **Advanced knobs** (`tts.piper.length_scale` / `noise_scale` / `noise_w_scale` / `volume` / `normalize_audio`, `use_cuda`) correspond 1:1 to Piper's `SynthesisConfig`. They're ignored on older `piper-tts` versions.
+
+### Kokoro (local, 82M, 9 languages)
+
+Kokoro is an open-weight (Apache-2.0) neural TTS model with 82M parameters. It runs fully locally on CPU or GPU, needs no API key, and punches well above its size — often compared to far larger commercial models.
+
+**Install:** `pip install kokoro` plus the `espeak-ng` system binary (needed for English out-of-dictionary fallback and some non-English languages):
+
+```bash
+pip install kokoro
+# Debian/Ubuntu:
+sudo apt-get install espeak-ng
+```
+
+The model (~300MB) downloads from HuggingFace on first use.
+
+**Switch to Kokoro:**
+
+```yaml
+tts:
+  provider: kokoro
+  kokoro:
+    voice: af_heart        # af_* = US English female, am_* = US English male, bf_*/bm_* = British, …
+    lang_code: a           # must match the voice prefix; 'a' = US English (default)
+    speed: 1.0             # 0.5–2.0
+    # device: ""           # "" = auto (CUDA when available, else CPU); "cpu" or "cuda" to pin
+```
+
+The `lang_code` must match the voice prefix: `a` (American English: `af_*`/`am_*`), `b` (British: `bf_*`/`bm_*`), `e` (Spanish), `f` (French), `h` (Hindi), `i` (Italian), `j` (Japanese), `p` (Brazilian Portuguese), `z` (Mandarin). Popular voices include `af_heart`, `af_bella`, `af_nicole`, `am_adam`, `am_michael`, `bf_emma`, `bm_george`. The pipeline (model + voices) is cached per process, so repeated calls don't reload it.
+
+### Self-hosted OpenAI-compatible TTS endpoints
+
+The `openai` provider is not limited to OpenAI's API — point `tts.openai.base_url` at any self-hosted or third-party server that implements the OpenAI `/v1/audio/speech` contract, and it just works:
+
+```yaml
+tts:
+  provider: openai
+  openai:
+    base_url: "http://localhost:8880/v1"   # e.g. a local kokoro-fastapi server
+    api_key: "not-needed"                  # most self-hosted servers ignore it
+    model: "kokoro"                        # whatever model id the server exposes
+    voice: "af_heart"
+    # language: "a"                        # sent as lang_code for servers that support it (Kokoro)
+```
+
+Popular self-hosted options:
+
+- **[kokoro-fastapi](https://github.com/remsky/Kokoro-FastAPI)** — serves Kokoro-82M over an OpenAI-compatible API with one command: `docker run -p 8880:8880 remsky/kokoro-fastapi`
+- **Kokoro-TTS-Local** — a local Kokoro server with an OpenAI-compatible `/v1/audio/speech` route (CPU-first Docker setup available)
+- **Anything else that implements `/v1/audio/speech`** — LocalAI, XTTS-compatible servers, etc. — anything that accepts `{model, voice, input}` and returns audio bytes
+
+The managed-Nous-gateway resolution is skipped entirely when `base_url` is set, so a self-hosted endpoint never requires an OpenAI key.
 
 ### Custom command providers
 

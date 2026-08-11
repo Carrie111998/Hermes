@@ -398,10 +398,18 @@ TOOL_CATEGORIES = {
             {
                 "name": "Piper",
                 "badge": "local · free",
-                "tag": "Local neural TTS, 44 languages (voices ~20-90MB)",
+                "tag": "Local neural TTS, 44 languages (voices ~20-120MB)",
                 "env_vars": [],
                 "tts_provider": "piper",
                 "post_setup": "piper",
+            },
+            {
+                "name": "Kokoro",
+                "badge": "local · free",
+                "tag": "Local 82M open-weight neural TTS, 9 languages (Apache-2.0)",
+                "env_vars": [],
+                "tts_provider": "kokoro",
+                "post_setup": "kokoro",
             },
             {
                 "name": "DeepInfra TTS",
@@ -1883,6 +1891,29 @@ def _run_post_setup(post_setup_key: str):
         _print_info("    Default voice: en_US-libritts-high (downloaded on first TTS call)")
         _print_info("    Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md")
         _print_info("    Switch voices by setting tts.piper.voice in ~/.hermes/config.yaml")
+
+    elif post_setup_key == "kokoro":
+        try:
+            __import__("kokoro")
+            _print_success("    kokoro is already installed")
+        except ImportError:
+            _print_info("    Installing kokoro (torch + 82M model, downloads on first use)...")
+            try:
+                result = _pip_install(["-U", "kokoro", "--quiet"], timeout=600)
+                if result.returncode == 0:
+                    _print_success("    kokoro installed")
+                else:
+                    _print_warning("    kokoro install failed:")
+                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                    _print_info("    Run manually: uv pip install -U kokoro")
+                    return
+            except subprocess.TimeoutExpired:
+                _print_warning("    kokoro install timed out (>10min)")
+                _print_info("    Run manually: uv pip install -U kokoro")
+                return
+        _print_info("    Default voice: af_heart (American English). espeak-ng is required for English OOD fallback:")
+        _print_info("      sudo apt-get install espeak-ng  (Debian/Ubuntu)")
+        _print_info("    Switch voices by setting tts.kokoro.voice in ~/.hermes/config.yaml")
 
     elif post_setup_key == "ddgs":
         try:

@@ -25,6 +25,7 @@ describe('voiceProviderKeys', () => {
       'gemini',
       'kittentts',
       'piper',
+      'kokoro',
       'deepinfra',
       'minimax'
     ]) {
