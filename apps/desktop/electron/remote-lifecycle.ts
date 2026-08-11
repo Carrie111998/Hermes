@@ -368,8 +368,8 @@ async function remotePidAlive(ssh, pid) {
 // the exact delegated entrypoint that appears in /proc/<pid>/cmdline.
 async function resolveHermesOwnershipPath(ssh, hermesPath) {
   const script =
-    'import os,shlex,stat\n' +
-    `p=os.path.expanduser(${shq(hermesPath)})\n` +
+    'import os,shlex,stat,sys\n' +
+    'p=os.path.expanduser(sys.argv[1])\n' +
     'process_path=p\n' +
     'try:\n' +
     ' s=os.stat(p,follow_symlinks=False)\n' +
@@ -377,22 +377,23 @@ async function resolveHermesOwnershipPath(ssh, hermesPath) {
     ' safe=stat.S_ISREG(s.st_mode) and owner_ok and not (s.st_mode&0o022)\n' +
     ' if safe:\n' +
     '  data=open(p,"r",encoding="utf-8",errors="ignore").read(4096)\n' +
-    '  for line in data.splitlines():\n' +
-    '   words=shlex.split(line)\n' +
+    '  lines=data.splitlines()\n' +
+    '  canonical=len(lines)==4 and lines[:3]==["#!/usr/bin/env bash","unset PYTHONPATH","unset PYTHONHOME"]\n' +
+    '  if canonical:\n' +
+    '   words=shlex.split(lines[3])\n' +
     '   target=None\n' +
-    '   if len(words)==3 and words[0]=="exec" and words[2]=="$@":target=words[1]\n' +
-    '   elif len(words)==4 and words[0]=="exec" and os.path.basename(words[1]).startswith("python") and words[3]=="$@":target=words[2]\n' +
-    '   if target:\n' +
-    '    target=os.path.expanduser(target)\n' +
-    '    if os.path.isabs(target):\n' +
-    '     ts=os.stat(target,follow_symlinks=False)\n' +
-    '     target_owner_ok=not hasattr(os,"getuid") or ts.st_uid==os.getuid()\n' +
-    '     if stat.S_ISREG(ts.st_mode) and target_owner_ok and not (ts.st_mode&0o022):process_path=target\n' +
-    '    break\n' +
+    '   delegated=[]\n' +
+    '   if len(words)==3 and words[0]=="exec" and words[2]=="$@":target=words[1];delegated=[words[1]]\n' +
+    '   elif len(words)==4 and words[0]=="exec" and os.path.basename(words[1]).startswith("python") and words[3]=="$@":target=words[2];delegated=[words[1],words[2]]\n' +
+    '   delegated=[os.path.expanduser(x) for x in delegated]\n' +
+    '   if target and all(os.path.isabs(x) for x in delegated):\n' +
+    '    stats=[os.stat(x,follow_symlinks=False) for x in delegated]\n' +
+    '    all_safe=all(stat.S_ISREG(x.st_mode) and (not hasattr(os,"getuid") or x.st_uid==os.getuid()) and not (x.st_mode&0o022) for x in stats)\n' +
+    '    if all_safe:process_path=os.path.expanduser(target)\n' +
     'except (OSError,ValueError):pass\n' +
     'print("PROCESS_PATH="+process_path)'
 
-  const out = String((await ssh.exec(`python3 -c ${shq(script)}`)) || '').trim()
+  const out = String((await ssh.exec(`python3 -c ${shq(script)} ${shq(hermesPath)}`)) || '').trim()
   const processPath = out.startsWith('PROCESS_PATH=') ? out.slice('PROCESS_PATH='.length) : ''
 
   if (processPath) {
@@ -401,7 +402,7 @@ async function resolveHermesOwnershipPath(ssh, hermesPath) {
     return processPath
   }
 
-  return hermesPath
+  return null
 }
 
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
@@ -414,11 +415,15 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
   try {
     const processHermesPath = await resolveHermesOwnershipPath(ssh, hermesPath)
 
+    if (!processHermesPath) {
+      return false
+    }
+
     const script =
       'import os,shlex,subprocess,sys\n' +
-      `pid=${Number(pid)}\n` +
-      `expected=os.path.expanduser(${shq(processHermesPath)})\n` +
-      `nonce=${shq(spawnNonce)}\n` +
+      'pid=int(sys.argv[1])\n' +
+      'expected=os.path.expanduser(sys.argv[2])\n' +
+      'nonce=sys.argv[3]\n' +
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
@@ -435,7 +440,9 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'
 
-    const out = await ssh.exec(`python3 -c ${shq(script)}`)
+    const out = await ssh.exec(
+      `python3 -c ${shq(script)} ${shq(String(Number(pid)))} ${shq(processHermesPath)} ${shq(spawnNonce)}`
+    )
 
     return String(out || '').trim() === 'OWNED'
   } catch (cause) {
