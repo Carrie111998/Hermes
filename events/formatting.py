@@ -106,6 +106,24 @@ EVENT_TYPE_EMOJI = {
     EventType.DEVFLOW_BUILD_STARTED:    "🔨",
     EventType.DEVFLOW_BUILD_SUCCEEDED:  "🟢",
     EventType.DEVFLOW_BUILD_FAILED:     "🧨",
+    # DevFlow work-intake, merge and deploy telemetry. These 12 EventTypes
+    # were added to events/schema.py without icons, which is precisely what
+    # test_event_icons_cover_all_types exists to catch — it was failing on
+    # DEVFLOW_WORK_REQUESTED. Intake states read as a triage funnel; merge
+    # and deploy reuse the established convention (🟣 merged, 🟢 up, 🔴 down)
+    # rather than inventing a second vocabulary for the same idea.
+    EventType.DEVFLOW_WORK_REQUESTED:   "📥",
+    EventType.DEVFLOW_WORK_TRIAGED:     "🗂️",
+    EventType.DEVFLOW_WORK_PLANNED:     "🗺️",
+    EventType.DEVFLOW_WORK_DUPLICATE:   "♊",
+    EventType.DEVFLOW_WORK_DECLINED:    "🙅",
+    EventType.DEVFLOW_WORK_SUPPRESSED:  "🔕",
+    EventType.DEVFLOW_MERGE_PENDING:    "⏳",
+    EventType.DEVFLOW_MERGED:           "🟣",
+    EventType.DEVFLOW_AUTO_MERGED:      "🤖",
+    EventType.DEVFLOW_DEPLOY_STARTED:   "🚀",
+    EventType.DEVFLOW_DEPLOYED:         "🟢",
+    EventType.DEVFLOW_DEPLOY_FAILED:    "🔴",
     # Notification delivery reverse-signal (2026-04-30) — visibility
     # for whether a notification reached the user. Distinct from generic
     # green/red so an operator scanning watchdog_alerts can tell a
