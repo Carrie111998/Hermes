@@ -820,6 +820,86 @@ describe('resumeSession failure recovery', () => {
     expect(resumedState?.messages).toBe(messagesAfterEarlyPaint)
   })
 
+  it('falls back to REST when resume omits messages and the initial prefetch fails', async () => {
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockRejectedValueOnce(new Error('initial prefetch failed'))
+      .mockResolvedValueOnce({
+        messages: [{ content: 'history recovered by bound key', role: 'user', timestamp: 1 }],
+        session_id: 'stored-1'
+      } as never)
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return {
+          info: {},
+          message_count: 1,
+          messages: [],
+          messages_omitted: true,
+          resumed: 'stored-1',
+          session_id: 'runtime-1',
+          session_key: 'stored-1'
+        } as never
+      }
+
+      return {} as never
+    })
+
+    await runResume(requestGateway)
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(2)
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(2, 'stored-1', undefined)
+    expect(JSON.stringify($messages.get())).toContain('history recovered by bound key')
+    expect($activeSessionId.get()).toBe('runtime-1')
+  })
+
+  it('replaces an identity-mismatched early prefetch using the resume-bound key', async () => {
+    const resumeDeferred = deferred<SessionResumeResponse>()
+    vi.mocked(getLatestSessionMessages)
+      .mockReset()
+      .mockResolvedValueOnce({
+        messages: [{ content: 'parent session history', role: 'user', timestamp: 1 }],
+        session_id: 'stored-1'
+      } as never)
+      .mockResolvedValueOnce({
+        messages: [{ content: 'continuation session history', role: 'user', timestamp: 2 }],
+        session_id: 'stored-continuation'
+      } as never)
+
+    const requestGateway = vi.fn((method: string) => {
+      if (method === 'session.resume') {
+        return resumeDeferred.promise as Promise<never>
+      }
+
+      return Promise.resolve({} as never)
+    })
+
+    let resume: ((storedSessionId: string, replaceRoute?: boolean) => Promise<unknown>) | null = null
+    render(<ResumeHarness onReady={ready => (resume = ready)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(resume).not.toBeNull())
+
+    const resumeResult = resume!('stored-1', true)
+    await waitFor(() => expect(JSON.stringify($messages.get())).toContain('parent session history'))
+
+    resumeDeferred.resolve({
+      info: {},
+      message_count: 1,
+      messages: [],
+      messages_omitted: true,
+      resumed: 'stored-continuation',
+      session_id: 'runtime-continuation',
+      session_key: 'stored-continuation'
+    })
+    await resumeResult
+
+    expect(getLatestSessionMessages).toHaveBeenCalledTimes(2)
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(1, 'stored-1', undefined)
+    expect(getLatestSessionMessages).toHaveBeenNthCalledWith(2, 'stored-continuation', undefined)
+    expect(JSON.stringify($messages.get())).toContain('continuation session history')
+    expect(JSON.stringify($messages.get())).not.toContain('parent session history')
+    expect($activeSessionId.get()).toBe('runtime-continuation')
+  })
+
   it('arms $resumeFailedSessionId when resume RPC and REST fallback both fail', async () => {
     // session.resume rejects (e.g. timeout against a wedged backend)...
     const requestGateway = vi.fn(async (method: string) => {

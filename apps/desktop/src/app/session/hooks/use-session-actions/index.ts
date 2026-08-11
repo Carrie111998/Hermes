@@ -896,12 +896,34 @@ export function useSessionActions({
       try {
         const watchWindow = isWatchWindow()
 
-        let localSnapshot = resumedSameSelectedSession
-          ? preserveLocalPendingTurnMessages($messages.get(), resumeStartMessages)
-          : $messages.get()
-
         let prefetchApplied = false
         let prefetchedStoredSessionId: string | null = null
+
+        const publishPersistedMessages = (
+          persisted: { messages: SessionMessage[]; session_id?: string },
+          discardSettledCandidate = false
+        ): ChatMessage[] | null => {
+          if (!isCurrentResume()) {
+            return null
+          }
+
+          const currentMessages = $messages.get()
+          const previousMessages = discardSettledCandidate
+            ? preserveLocalPendingTurnMessages([], currentMessages)
+            : resumedSameSelectedSession
+              ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
+              : currentMessages
+          const reconciledMessages = reconcileAuthoritativeMessages(persisted.messages, previousMessages)
+          const messagesForView = chatMessageArraysEquivalent(currentMessages, reconciledMessages)
+            ? currentMessages
+            : reconciledMessages
+
+          if (messagesForView !== currentMessages) {
+            setMessages(messagesForView)
+          }
+
+          return messagesForView
+        }
 
         // REST transcript prefetch and the gateway resume RPC are independent
         // — run them concurrently so a big session's wall time is
@@ -947,22 +969,9 @@ export function useSessionActions({
         }
 
         if (prefetchedResult) {
-          const currentMessages = $messages.get()
-          const previousMessages = resumedSameSelectedSession
-            ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
-            : currentMessages
-
-          const prefetchedMessages = reconcileAuthoritativeMessages(prefetchedResult.messages, previousMessages)
-
-          localSnapshot = chatMessageArraysEquivalent(currentMessages, prefetchedMessages)
-            ? currentMessages
-            : prefetchedMessages
+          publishPersistedMessages(prefetchedResult)
           prefetchApplied = true
           prefetchedStoredSessionId = prefetchedResult.session_id || storedSessionId
-
-          if (localSnapshot !== currentMessages) {
-            setMessages(localSnapshot)
-          }
         }
 
         const resumed = await resumePromise
@@ -971,9 +980,7 @@ export function useSessionActions({
           return
         }
 
-        const currentMessages = $messages.get()
-
-        // Keep the local snapshot when resume would only reshuffle runtime
+        // Keep the current view when resume would only reshuffle runtime
         // projection. When the REST prefetch already hydrated the transcript,
         // skip converting/reconciling the resume payload entirely — on a
         // 1000+-message session that second conversion plus the deep
@@ -983,23 +990,61 @@ export function useSessionActions({
         const prefetchMatchesResumedSession =
           !prefetchedStoredSessionId || !resumedStoredSessionId || prefetchedStoredSessionId === resumedStoredSessionId
 
+        const usablePrefetch = prefetchApplied && prefetchMatchesResumedSession
+
+        if (resumed.messages_omitted && !usablePrefetch) {
+          try {
+            const fallback = await getLatestSessionMessages(
+              resumedStoredSessionId || storedSessionId,
+              sessionProfile
+            )
+
+            if (!isCurrentResume()) {
+              return
+            }
+
+            // A mismatched candidate belongs to another stored identity. Drop
+            // its settled rows before publishing the resume-bound transcript;
+            // only local optimistic/pending rows may survive the correction.
+            publishPersistedMessages(fallback, prefetchApplied && !prefetchMatchesResumedSession)
+          } catch {
+            if (!isCurrentResume()) {
+              return
+            }
+
+            if (prefetchApplied && !prefetchMatchesResumedSession) {
+              const currentMessages = $messages.get()
+              const pendingMessages = preserveLocalPendingTurnMessages([], currentMessages)
+
+              if (!chatMessageArraysEquivalent(currentMessages, pendingMessages)) {
+                setMessages(pendingMessages)
+              }
+            }
+          }
+        }
+
+        const currentMessages = $messages.get()
+
         const hasLiveProjection = Boolean(resumed.inflight || resumed.queued)
+        // Older/partial gateway responses may omit the echo flag even though
+        // this client requested omit_messages. A matching successful prefetch
+        // is sufficient proof that REST is the transcript authority.
+        const persistedTranscriptIsAuthority = resumed.messages_omitted || usablePrefetch
 
         const preferredMessages =
-          prefetchApplied && prefetchMatchesResumedSession && !hasLiveProjection
+          persistedTranscriptIsAuthority && !hasLiveProjection
             ? currentMessages
             : (() => {
                 const previousMessages = resumedSameSelectedSession
                   ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
                   : currentMessages
 
-                // Omitted, not empty — same trap as the activate path above.
-                // The REST prefetch IS the transcript here; the resume payload
-                // only contributes the live tail, so graft rather than rebuild.
-                // (Without a usable prefetch there is nothing better to stand
-                // on, so the projection alone remains the degraded fallback.)
+                // Omitted, not empty — the REST load is the transcript
+                // authority, while the resume payload can only contribute its
+                // live projection. Never reconcile the omitted empty array as
+                // an authoritative transcript.
                 const resumedMessages =
-                  resumed.messages_omitted && prefetchApplied && prefetchMatchesResumedSession
+                  persistedTranscriptIsAuthority
                     ? appendLiveSessionProjection(currentMessages, resumed)
                     : reconcileAuthoritativeMessages(resumed.messages, previousMessages, resumed)
 
