@@ -18565,6 +18565,21 @@ def main(
         )
         cli._preload_skills_thread.start()
 
+    # Warm the local Piper TTS voice in the background (when configured).
+    # The model load otherwise sits on the critical path of the first TTS
+    # request; preloading at boot makes every request — including the first —
+    # serve from the in-process voice cache. Fire-and-forget: skips itself
+    # unless tts.provider is piper, preload is enabled, and the voice is
+    # already downloaded.
+    try:
+        from tools.tts_tool import preload_piper_voice
+
+        threading.Thread(
+            target=preload_piper_voice, name="tts-piper-preload", daemon=True
+        ).start()
+    except Exception:
+        logger.debug("piper TTS preload not available", exc_info=True)
+
     # Join the background worktree creation (started above) before anything
     # consumes TERMINAL_CWD / wt_info — the HermesCLI construction it
     # overlapped with is done. Setup failure keeps the old abort semantics.

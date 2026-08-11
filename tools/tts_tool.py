@@ -219,7 +219,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4o-mini-tts"
 MANAGED_OPENAI_TTS_MODELS = frozenset({"gpt-4o-mini-tts"})
 DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
-DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
+DEFAULT_PIPER_VOICE = "en_US-libritts-high"  # high-quality tier; ~120MB model
 DEFAULT_OPENAI_VOICE = "alloy"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MINIMAX_MODEL = "speech-02-hd"
@@ -2913,7 +2913,7 @@ def _resolve_piper_voice_path(voice: str, download_dir: Path) -> str:
 
     Accepts any of:
       - Absolute / expanded path to an .onnx file the user already has
-      - A voice *name* like ``en_US-lessac-medium`` (downloads to
+      - A voice *name* like ``en_US-libritts-high`` (downloads to
         ``download_dir`` on first use via ``python -m piper.download_voices``)
 
     Raises RuntimeError if the model can't be located or downloaded.
@@ -3059,6 +3059,102 @@ def _generate_piper_tts(text: str, output_path: str, tts_config: Dict[str, Any])
             os.rename(wav_path, output_path)
 
     return output_path
+
+
+# ===========================================================================
+# Provider: Piper — startup preload
+# ===========================================================================
+#
+# The voice model is cached per-process (see _piper_voice_cache above), so a
+# long-lived gateway/CLI process only pays the model load once. That load is
+# still on the critical path of the FIRST TTS request (~1-3s for a CPU
+# high-quality voice, and Piper's libritts-high default is one of the bigger
+# models). ``preload_piper_voice`` warms the cache at startup in a background
+# thread so the first request is served from memory.
+
+# Guards the preload path only — the cache itself stays lock-free for the
+# normal tool-call path (a duplicate load on a rare tool-call race is cheap;
+# a duplicate load at every startup is not).
+_piper_preload_lock = threading.Lock()
+
+
+def preload_piper_voice(tts_config: Optional[Dict[str, Any]] = None) -> bool:
+    """Warm the configured Piper voice so the first TTS request is instant.
+
+    Reads the live TTS config: preload only fires when ``tts.provider`` is
+    ``piper`` and ``tts.piper.preload`` is enabled (default ``True``). The
+    load runs in a background daemon thread so startup is never blocked.
+
+    Startup never triggers a voice *download* — if the configured voice
+    isn't already cached locally, preload is skipped and the first TTS call
+    downloads it as before. Returns True when the voice is already resident
+    or a warm-up load was started; False when preload is not applicable
+    (wrong provider, preload disabled, voice not downloaded, piper missing).
+    """
+    try:
+        if tts_config is None:
+            tts_config = _load_tts_config()
+        if not isinstance(tts_config, dict):
+            return False
+        if (tts_config.get("provider") or "edge") != "piper":
+            return False
+        if not _check_piper_available():
+            return False
+        piper_config = tts_config.get("piper") or {}
+        if not isinstance(piper_config, dict):
+            piper_config = {}
+        if not bool(piper_config.get("preload", True)):
+            return False
+
+        voice_name = piper_config.get("voice") or DEFAULT_PIPER_VOICE
+        download_dir = Path(
+            piper_config.get("voices_dir") or _get_piper_voices_dir()
+        ).expanduser()
+        use_cuda = bool(piper_config.get("use_cuda", False))
+
+        # Resolve WITHOUT downloading (unlike _resolve_piper_voice_path):
+        # a missing model must defer to the normal first-call download path.
+        candidate = Path(voice_name).expanduser()
+        if candidate.suffix.lower() == ".onnx" and candidate.exists():
+            model_path = str(candidate)
+        else:
+            cached = download_dir / f"{voice_name}.onnx"
+            if not (cached.exists() and (download_dir / f"{voice_name}.onnx.json").exists()):
+                logger.info(
+                    "[Piper] Voice '%s' not downloaded yet — skipping preload "
+                    "(first TTS call will download it)", voice_name,
+                )
+                return False
+            model_path = str(cached)
+
+        cache_key = f"{model_path}::cuda={use_cuda}"
+        if cache_key in _piper_voice_cache:
+            return True
+
+        def _warm() -> None:
+            with _piper_preload_lock:
+                if cache_key in _piper_voice_cache:
+                    return
+                logger.info("[Piper] Preloading voice: %s", model_path)
+                try:
+                    _tts_cache_get_or_load(
+                        _piper_voice_cache,
+                        cache_key,
+                        lambda: _import_piper().load(model_path, use_cuda=use_cuda),
+                    )
+                    logger.info("[Piper] Voice preloaded")
+                except Exception:
+                    # Never take startup down with the TTS engine — the
+                    # first TTS call will retry the load and surface errors.
+                    logger.exception(
+                        "[Piper] Voice preload failed — first TTS call will load it"
+                    )
+
+        threading.Thread(target=_warm, name="piper-voice-preload", daemon=True).start()
+        return True
+    except Exception:
+        logger.debug("[Piper] Preload skipped", exc_info=True)
+        return False
 
 
 # ===========================================================================

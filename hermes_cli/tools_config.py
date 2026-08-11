@@ -1880,7 +1880,7 @@ def _run_post_setup(post_setup_key: str):
                 _print_warning("    piper-tts install timed out (>5min)")
                 _print_info("    Run manually: uv pip install -U piper-tts")
                 return
-        _print_info("    Default voice: en_US-lessac-medium (downloaded on first TTS call)")
+        _print_info("    Default voice: en_US-libritts-high (downloaded on first TTS call)")
         _print_info("    Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md")
         _print_info("    Switch voices by setting tts.piper.voice in ~/.hermes/config.yaml")
 

@@ -27887,6 +27887,23 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     except Exception as e:
         logger.debug("MCP tool discovery failed: %s", e)
 
+    # Warm the local Piper TTS voice in the background (when configured).
+    # The ONNX model load is seconds of CPU on the critical path of the
+    # first TTS request; preloading at boot makes every request — including
+    # the first — serve from the in-process voice cache. Runs on a daemon
+    # thread (never blocks the event loop) and skips itself unless
+    # tts.provider is piper, preload is enabled, and the voice is already
+    # downloaded.
+    try:
+        import threading as _threading
+        from tools.tts_tool import preload_piper_voice
+
+        _threading.Thread(
+            target=preload_piper_voice, name="tts-piper-preload", daemon=True
+        ).start()
+    except Exception:
+        logger.debug("piper TTS preload not available", exc_info=True)
+
     # Start the gateway
     try:
         success = await runner.start()

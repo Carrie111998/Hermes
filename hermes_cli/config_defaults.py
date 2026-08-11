@@ -1542,10 +1542,14 @@ DEFAULT_CONFIG = {
             "device": "cpu",  # cpu, cuda, or mps
         },
         "piper": {
-            # Voice name (e.g. "en_US-lessac-medium") downloaded on first
+            # Voice name (e.g. "en_US-libritts-high") downloaded on first
             # use, OR an absolute path to a pre-downloaded .onnx file.
             # Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md
-            "voice": "en_US-lessac-medium",
+            "voice": "en_US-libritts-high",
+            # Preload the voice into memory at startup (gateway/CLI boot) so
+            # the first TTS request doesn't pay the model-load latency. The
+            # load is skipped until the voice is downloaded locally.
+            "preload": True,
             # "voices_dir": "",        # Override voice cache dir; default = ~/.hermes/cache/piper-voices/
             # "use_cuda": False,       # Requires onnxruntime-gpu
             # "length_scale": 1.0,     # 2.0 = twice as slow

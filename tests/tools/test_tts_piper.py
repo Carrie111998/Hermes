@@ -8,6 +8,7 @@ without requiring the ``piper-tts`` package to actually be installed
 
 import json
 import sys
+import time
 import types
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -22,6 +23,7 @@ from tools.tts_tool import (
     _check_piper_available,
     _resolve_piper_voice_path,
     check_tts_requirements,
+    preload_piper_voice,
     text_to_speech_tool,
 )
 
@@ -177,6 +179,106 @@ class TestGeneratePiperTts:
             tts_tool._generate_piper_tts("hi", str(tmp_path / f"out-{speaker}.wav"), config)
 
         # Only one PiperVoice.load() call across four calls with different speakers.
+        assert _StubPiperVoice.loaded == [str(model)]
+
+
+# ---------------------------------------------------------------------------
+# preload_piper_voice
+# ---------------------------------------------------------------------------
+
+class TestPreloadPiperVoice:
+    def _wait_for_load(self, timeout=5.0):
+        """Wait for the background preload thread to finish loading."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if _StubPiperVoice.loaded:
+                return True
+            time.sleep(0.02)
+        return bool(_StubPiperVoice.loaded)
+
+    def test_skips_when_provider_not_piper(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+        cfg = {"provider": "edge", "piper": {"voice": "en_US-libritts-high"}}
+
+        assert preload_piper_voice(cfg) is False
+        assert _StubPiperVoice.loaded == []
+
+    def test_skips_when_preload_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+        cfg = {"provider": "piper", "piper": {"voice": "en_US-libritts-high", "preload": False}}
+
+        assert preload_piper_voice(cfg) is False
+        assert _StubPiperVoice.loaded == []
+
+    def test_skips_when_voice_not_downloaded(self, tmp_path, monkeypatch):
+        # Empty voices dir — the model was never downloaded. Preload must
+        # NOT trigger a download; the first TTS call handles that.
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+        cfg = {
+            "provider": "piper",
+            "piper": {"voice": "en_US-libritts-high", "voices_dir": str(tmp_path)},
+        }
+
+        assert preload_piper_voice(cfg) is False
+        assert _StubPiperVoice.loaded == []
+
+    def test_skips_when_piper_missing(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: False)
+        cfg = {"provider": "piper", "piper": {"voice": "en_US-libritts-high"}}
+
+        assert preload_piper_voice(cfg) is False
+        assert _StubPiperVoice.loaded == []
+
+    def test_loads_configured_voice_in_background(self, tmp_path, monkeypatch):
+        model = tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx"
+        model.write_bytes(b"model")
+        (tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx.json").write_text("{}")
+        monkeypatch.setattr(tts_tool, "_import_piper", lambda: _StubPiperVoice)
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+
+        cfg = {
+            "provider": "piper",
+            "piper": {"voice": DEFAULT_PIPER_VOICE, "voices_dir": str(tmp_path)},
+        }
+
+        assert preload_piper_voice(cfg) is True
+        assert self._wait_for_load()
+        assert _StubPiperVoice.loaded == [str(model)]
+        # Voice is resident in the process cache — a later TTS call reuses it.
+        assert len(tts_tool._piper_voice_cache) == 1
+
+    def test_noop_when_already_cached(self, tmp_path, monkeypatch):
+        model = tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx"
+        model.write_bytes(b"model")
+        (tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx.json").write_text("{}")
+        monkeypatch.setattr(tts_tool, "_import_piper", lambda: _StubPiperVoice)
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+
+        cfg = {
+            "provider": "piper",
+            "piper": {"voice": DEFAULT_PIPER_VOICE, "voices_dir": str(tmp_path)},
+        }
+
+        assert preload_piper_voice(cfg) is True
+        assert self._wait_for_load()
+        loaded_count = len(_StubPiperVoice.loaded)
+
+        # Second preload (e.g. another startup hook) must not reload.
+        assert preload_piper_voice(cfg) is True
+        time.sleep(0.1)
+        assert _StubPiperVoice.loaded == _StubPiperVoice.loaded[:loaded_count]
+
+    def test_uses_default_voice_when_unconfigured(self, tmp_path, monkeypatch):
+        model = tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx"
+        model.write_bytes(b"model")
+        (tmp_path / f"{DEFAULT_PIPER_VOICE}.onnx.json").write_text("{}")
+        monkeypatch.setattr(tts_tool, "_import_piper", lambda: _StubPiperVoice)
+        monkeypatch.setattr(tts_tool, "_check_piper_available", lambda: True)
+
+        cfg = {"provider": "piper", "piper": {"voices_dir": str(tmp_path)}}
+
+        assert preload_piper_voice(cfg) is True
+        assert self._wait_for_load()
         assert _StubPiperVoice.loaded == [str(model)]
 
 

@@ -239,10 +239,13 @@ Piper is a fast, local neural TTS engine from the Open Home Foundation (the Home
 tts:
   provider: piper
   piper:
-    voice: en_US-lessac-medium
+    voice: en_US-libritts-high
+    preload: true   # load the voice at startup so the first request is instant
 ```
 
-On the first TTS call for a voice that isn't cached locally, Hermes runs `python -m piper.download_voices <name>` and downloads the model (~20-90MB depending on quality tier) into `~/.hermes/cache/piper-voices/`. Subsequent calls reuse the cached model.
+The default voice is `en_US-libritts-high` — Piper's highest-quality English tier. On the first TTS call for a voice that isn't cached locally, Hermes runs `python -m piper.download_voices <name>` and downloads the model (~20-120MB depending on quality tier) into `~/.hermes/cache/piper-voices/`. Subsequent calls reuse the cached model.
+
+**Kept loaded for serving.** Once a voice has been downloaded, Hermes preloads it into memory in the background at startup (CLI or gateway boot) when `tts.piper.preload` is `true` (the default). The first TTS request is then served from the in-memory model instead of paying the multi-second ONNX load, so voice replies are consistently fast. Set `preload: false` to disable (e.g. to keep the process footprint small when Piper is rarely used).
 
 **Picking a voice.** The [full voice catalog](https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md) covers English, Spanish, French, German, Italian, Dutch, Portuguese, Russian, Polish, Turkish, Chinese, Arabic, Hindi, and more — each with `x_low` / `low` / `medium` / `high` quality tiers. Sample voices at [rhasspy.github.io/piper-samples](https://rhasspy.github.io/piper-samples/).
 
