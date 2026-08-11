@@ -48,6 +48,80 @@ def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
     assert _default_workers() == 8
 
 
+def test_compute_host_turn_frame_preserves_multiplex_mode(
+    monkeypatch, tmp_path
+):
+    import hermes_state
+    from agent.secret_scope import (
+        is_multiplex_active,
+        set_multiplex_active,
+    )
+
+    sid = "profile-compute-host"
+    profile_home = tmp_path / "jane"
+    profile_home.mkdir()
+    parent_session = {
+        "session_key": sid,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "attached_images": [],
+        "cols": 80,
+        "cwd": str(tmp_path),
+        "profile_home": str(profile_home),
+    }
+    previous_multiplex = is_multiplex_active()
+    seen = []
+    initialized_profile_homes = []
+
+    class _Agent:
+        pass
+
+    def _make_agent(*_args, **_kwargs):
+        seen.append(is_multiplex_active())
+        return _Agent()
+
+    def _init_session(
+        session_id,
+        key,
+        agent,
+        history,
+        profile_home=None,
+        **_kwargs,
+    ):
+        initialized_profile_homes.append(profile_home)
+        server._sessions[session_id] = {
+            "agent": agent,
+            "session_key": key,
+            "history": list(history),
+        }
+
+    monkeypatch.setattr(server, "_make_agent", _make_agent)
+    monkeypatch.setattr(server, "_init_session", _init_session)
+    monkeypatch.setattr(hermes_state, "SessionDB", lambda db_path: object())
+
+    try:
+        set_multiplex_active(True)
+        frame = server._compute_host_turn_frame(
+            "request-profile",
+            sid,
+            parent_session,
+            "hello",
+        )
+        assert frame["multiplex_active"] is True
+
+        # Model the subprocess: its module global starts at the default False.
+        set_multiplex_active(False)
+        fake_host = type("_Host", (), {"_transport": None})()
+        ComputeHost._ensure_server_session(fake_host, server, frame)
+
+        assert seen == [True]
+        assert initialized_profile_homes == [str(profile_home)]
+    finally:
+        server._sessions.pop(sid, None)
+        set_multiplex_active(previous_multiplex)
+
+
 def test_mutator_route_table_matches_prd_inventory():
     assert MUTATOR_ROUTE_TABLE == {
         "prompt.submit": "turn-path",

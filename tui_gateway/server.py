@@ -20,6 +20,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
+    is_multiplex_active,
     reset_secret_scope,
     set_secret_scope,
 )
@@ -1657,6 +1658,7 @@ def _compute_host_turn_frame(
         "cols": int(session.get("cols", 80) or 80),
         "cwd": _session_cwd(session),
         "profile_home": session.get("profile_home") or "",
+        "multiplex_active": is_multiplex_active(),
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
@@ -6201,40 +6203,57 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
     if not mcp_discovery_in_flight():
         return
 
-    def _wait_then_refresh() -> None:
-        # Bounded but generous — a server still not connected after this is
-        # genuinely slow/dead; the user can /reload-mcp once it recovers.
-        if not join_mcp_discovery(timeout=30.0):
-            return
-        with _sessions_lock:
-            session = _sessions.get(sid)
-            # Session may have been closed/reset while we waited.
-            if session is None or session.get("agent") is not agent:
-                return
-            # Cache safety: never rebuild the tool list once the conversation
-            # has started — that would invalidate the cached prompt prefix.
-            if (
-                int(getattr(agent, "_user_turn_count", 0) or 0) > 0
-                or int(getattr(agent, "_api_call_count", 0) or 0) > 0
-            ):
-                return
-            try:
-                from tools.mcp_tool import refresh_agent_mcp_tools
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        profile_home = str((session or {}).get("profile_home") or "")
 
-                added = refresh_agent_mcp_tools(agent, quiet_mode=True)
-            except Exception as exc:
-                logger.warning(
-                    "Late MCP refresh: tool snapshot rebuild failed for %s: %s",
-                    sid,
-                    exc,
+    def _wait_then_refresh() -> None:
+        home_token = None
+        secret_token = None
+        try:
+            if profile_home:
+                home_token = set_hermes_home_override(profile_home)
+                secret_token = set_secret_scope(
+                    build_profile_secret_scope(Path(profile_home))
                 )
+            # Bounded but generous — a server still not connected after this is
+            # genuinely slow/dead; the user can /reload-mcp once it recovers.
+            if not join_mcp_discovery(timeout=30.0):
                 return
-            # No new tools landed (discovery added nothing) → don't churn the client.
-            if not added:
-                return
-            info = _session_info(agent, session)
-        # Emit outside the lock — write_json must not block under _sessions_lock.
-        _emit("session.info", sid, info)
+            with _sessions_lock:
+                session = _sessions.get(sid)
+                # Session may have been closed/reset while we waited.
+                if session is None or session.get("agent") is not agent:
+                    return
+                # Cache safety: never rebuild the tool list once the conversation
+                # has started — that would invalidate the cached prompt prefix.
+                if (
+                    int(getattr(agent, "_user_turn_count", 0) or 0) > 0
+                    or int(getattr(agent, "_api_call_count", 0) or 0) > 0
+                ):
+                    return
+                try:
+                    from tools.mcp_tool import refresh_agent_mcp_tools
+
+                    added = refresh_agent_mcp_tools(agent, quiet_mode=True)
+                except Exception as exc:
+                    logger.warning(
+                        "Late MCP refresh: tool snapshot rebuild failed for %s: %s",
+                        sid,
+                        exc,
+                    )
+                    return
+                # No new tools landed → don't churn the client.
+                if not added:
+                    return
+                info = _session_info(agent, session)
+            # Emit outside the lock — write_json must not block under _sessions_lock.
+            _emit("session.info", sid, info)
+        finally:
+            if secret_token is not None:
+                reset_secret_scope(secret_token)
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
     threading.Thread(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
@@ -6333,8 +6352,15 @@ def _make_agent(
     # block. Dashboard /api/ws uses hermes_cli.mcp_startup; TUI stdio keeps
     # its existing tui_gateway.entry-owned thread.
     try:
-        from hermes_cli.mcp_startup import wait_for_mcp_discovery
+        from hermes_cli.mcp_startup import (
+            start_background_mcp_discovery,
+            wait_for_mcp_discovery,
+        )
 
+        start_background_mcp_discovery(
+            logger=logger,
+            thread_name="tui-mcp-discovery",
+        )
         wait_for_mcp_discovery()
     except Exception:
         pass

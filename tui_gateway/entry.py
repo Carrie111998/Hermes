@@ -407,9 +407,9 @@ def ensure_mcp_discovery_started() -> None:
     the process-wide start lock, the retry-after-zero-connected allowance,
     and interactive-OAuth suppression.
 
-    Known limitation: MCP tool registration is process-global, so in a
-    multi-profile process the FIRST profile that builds an agent wins the
-    discovery slot. Full per-profile MCP registries are tracked in #67605.
+    In multiplex mode the shared owner keys its lazy discovery slot by the
+    effective profile home, matching the MCP connection and registry isolation
+    boundary. Single-profile processes retain one process-wide slot.
     """
     global _mcp_discovery_enabled
 

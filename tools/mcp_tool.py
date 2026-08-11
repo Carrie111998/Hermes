@@ -5071,12 +5071,17 @@ def _load_mcp_config() -> Dict[str, dict]:
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
     """
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli import managed_scope
+        from hermes_cli.config import read_raw_config
         from utils import env_var_enabled as _env_enabled
 
         if _env_enabled("HERMES_SAFE_MODE"):
             return {}
-        config = load_config()
+        # Keep user MCP placeholders intact until the active profile's secret
+        # scope is available below. load_config() expands against os.environ
+        # first, which can substitute the launch profile's credential in a
+        # multiplex process before _interpolate_env_vars() can isolate it.
+        config = managed_scope.apply_managed_overlay(read_raw_config() or {})
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
             return {}
@@ -6329,6 +6334,31 @@ def _existing_tool_names() -> List[str]:
         ]
     names.extend(lazy_names)
     return names
+
+
+def has_mcp_state_for_current_profile() -> bool:
+    """Whether multiplex discovery has published state for this profile.
+
+    Process-global MCP entries from before multiplex activation are
+    intentionally ignored: they cannot prove that the active profile's own
+    config was discovered.
+    """
+    current_key = _server_state_key("")
+    if isinstance(current_key, str):
+        return any(get_mcp_status())
+    current_home = current_key[0]
+    with _lock:
+        connected = any(
+            isinstance(state_key, tuple)
+            and state_key[0] == current_home
+            and getattr(server, "session", None) is not None
+            for state_key, server in _servers.items()
+        )
+        lazy_registered = any(
+            isinstance(state_key, tuple) and state_key[0] == current_home
+            for state_key in _lazy_server_tool_names
+        )
+        return connected or lazy_registered
 
 
 def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> List[str]:
