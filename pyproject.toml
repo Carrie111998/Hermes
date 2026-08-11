@@ -2,7 +2,7 @@
 
 [project]
 name = "hermes-agent"
-version = "0.20.0"
+version = "0.20.1"
 description = "The self-improving AI agent — creates skills from experience, improves them during use, and runs anywhere"
 readme = "README.md"
 # Upper bound is load-bearing, not cosmetic. uv resolves the project's
@@ -368,7 +368,7 @@ override-dependencies = [
   # remove this when we update discord.py
   "pynacl>=1.6,<1.7",
 ]
-exclude-newer = "14 days"
+exclude-newer = "2026-08-11T21:47:48.879648000Z"
 exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false }
 
 [tool.setuptools]
