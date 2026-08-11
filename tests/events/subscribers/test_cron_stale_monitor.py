@@ -14,6 +14,52 @@ from events.bus import EventBus
 from events.schema import EventType
 from events.subscribers.cron_stale_monitor import CronStaleMonitor
 
+# The deployed production thresholds, relative to the Hermes root.
+# `notifications/` is a canonical `~/.hermes` root directory — it lives in the
+# *outer* Hermes checkout, not in `agent-src`.
+_THRESHOLDS_REL = Path("notifications") / "cron_stale_thresholds.json"
+
+
+def _find_hermes_root() -> Path | None:
+    """Return the Hermes root (the checkout holding `notifications/`), or None.
+
+    Searches upward from this file for the directory that actually contains
+    the thresholds file. Deliberately *not* a fixed count of `.parent` hops:
+    this file sits three levels deeper inside a git worktree
+    (`agent-src/.claude/worktrees/<name>/tests/events/subscribers/`) than in
+    the main checkout (`agent-src/tests/events/subscribers/`), so any fixed
+    count that escapes the checkout is right in exactly one of the two
+    layouts. The previous `parents[4]` was correct only from the main checkout
+    and silently resolved to `agent-src/.claude/worktrees` otherwise.
+
+    Git cannot anchor this either: `rev-parse --show-toplevel` returns the
+    *worktree* path rather than `agent-src`, and `events.paths`'
+    `get_default_hermes_root()` reads `HERMES_HOME`, which the suite redirects
+    to a per-test tempdir (see `tests/conftest.py`) — the very reason this path
+    is hand-derived. Searching for the artifact itself is correct at any
+    nesting depth and needs neither a subprocess nor the environment.
+    """
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / _THRESHOLDS_REL).is_file():
+            return candidate
+    return None
+
+
+_HERMES_ROOT = _find_hermes_root()
+THRESHOLDS_CONFIG = None if _HERMES_ROOT is None else _HERMES_ROOT / _THRESHOLDS_REL
+
+# Only the production-threshold test needs the deployed file; every other test
+# in this module is hermetic, so this skips that one test rather than the whole
+# module.
+requires_thresholds_config = pytest.mark.skipif(
+    THRESHOLDS_CONFIG is None,
+    reason=(
+        f"Hermes root not found: no ancestor of {Path(__file__).resolve()} "
+        f"contains {_THRESHOLDS_REL.as_posix()}. The deployed thresholds live "
+        "in the outer ~/.hermes checkout, which is absent from this tree."
+    ),
+)
+
 
 @pytest.fixture
 def bus(tmp_path):
@@ -160,6 +206,7 @@ class TestCronStaleMonitor:
 
         assert _stale_events(bus) == []
 
+    @requires_thresholds_config
     @pytest.mark.parametrize(
         ("job_name", "threshold"),
         [
@@ -170,12 +217,7 @@ class TestCronStaleMonitor:
         ],
     )
     def test_production_threshold_boundaries(self, bus, job_name, threshold):
-        config_path = (
-            Path(__file__).resolve().parents[4]
-            / "notifications"
-            / "cron_stale_thresholds.json"
-        )
-        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config = json.loads(THRESHOLDS_CONFIG.read_text(encoding="utf-8"))
 
         assert config["default_seconds"] == 1200
         assert config["per_job"][job_name] == threshold

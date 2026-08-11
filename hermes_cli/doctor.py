@@ -774,6 +774,24 @@ def run_doctor(args):
     # (a git conflict resolution can silently revert one but not the other).
     _check_version_consistency(issues)
 
+    _section("Install Integrity")
+    try:
+        from hermes_cli.install_doctor import doctor_section_lines
+
+        rows, remediation = doctor_section_lines()
+        for status, text, detail in rows:
+            if status == "ok":
+                check_ok(text, detail)
+            elif status == "warn":
+                check_warn(text, detail)
+            else:
+                check_fail(text, detail)
+        if remediation:
+            manual_issues.append(remediation)
+    except Exception as e:
+        # Never let a bug in the install check block the rest of doctor.
+        check_warn(f"Install integrity check failed: {e}")
+
     _section("SSL / CA Certificates")
     check_certificates()
 

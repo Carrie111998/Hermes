@@ -126,6 +126,76 @@ class TestSubscribe:
         assert len(events_b2) == 2  # both events (never acked)
 
 
+class TestSubscribeBootstrapsCursorForDirectConsumers:
+    """A consumer that calls bus.subscribe() DIRECTLY — not via BaseSubscriber,
+    which seeds its cursor at construction (events/subscribers/base.py) — must
+    still bootstrap a persisted cursor on its first poll.
+
+    Without persistence, subscribe() recomputes the head-default MAX(rowid) on
+    EVERY poll for a subscriber that has no cursor row, so it re-jumps to head
+    each time and silently drops any event emitted between polls — the caller
+    can never receive (and therefore never ack) it, and the cursor is never
+    persisted. This is the devflow-bridge fresh-bus deadlock (2026-07-18): the
+    standalone bridge cron drives bus.subscribe() directly.
+
+    The fix mirrors BaseSubscriber's seed-at-construction: on first poll,
+    persist the head-default cursor row (INSERT OR IGNORE at head). ADR-0018
+    flood prevention is preserved because we seed at HEAD, not zero, so
+    pre-first-poll history is still skipped.
+    """
+
+    def test_direct_consumer_receives_event_emitted_between_polls(self, bus):
+        # Pre-existing history that must NOT be replayed (flood prevention).
+        bus.emit(EventType.CRON_STARTED, "scout", {"old": 1})
+
+        # First poll for a never-seen subscriber: head-default => no backlog.
+        first = bus.subscribe("devflow-bridge")
+        assert first == []
+
+        # An event lands AFTER the first poll but BEFORE the second.
+        between = bus.emit(EventType.CRON_COMPLETED, "scout", {"new": 1})
+
+        # Second poll must deliver the between-poll event — not re-jump to head
+        # and drop it.
+        second = bus.subscribe("devflow-bridge")
+        assert [e.event_id for e in second] == [between]
+
+    def test_first_direct_poll_persists_cursor_at_head(self, bus):
+        # Two events of pre-poll history establish a non-zero head.
+        bus.emit(EventType.CRON_STARTED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        head = bus._get_conn().execute("SELECT MAX(rowid) FROM events").fetchone()[0]
+
+        bus.subscribe("devflow-bridge")
+
+        row = bus._get_conn().execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            ("devflow-bridge",),
+        ).fetchone()
+        assert row is not None, "first poll must bootstrap a persisted cursor row"
+        # Seeded at head (flood prevention preserved), not zero (no replay).
+        assert row["last_rowid"] == head
+
+    def test_first_poll_does_not_clobber_a_preexisting_cursor(self, bus):
+        # A cursor already advanced by a prior ack / explicit backfill seed must
+        # win over the head-default — INSERT OR IGNORE, never overwrite.
+        bus.emit(EventType.CRON_STARTED, "scout", {})
+        bus.emit(EventType.CRON_COMPLETED, "scout", {})
+        bus._execute(
+            "INSERT INTO subscriber_cursors (subscriber_id, last_rowid) VALUES (?, 0)",
+            ("devflow-bridge",),
+        )
+
+        events = bus.subscribe("devflow-bridge")
+        # Cursor was 0, so BOTH events backfill (opt-in behaviour preserved).
+        assert len(events) == 2
+        row = bus._get_conn().execute(
+            "SELECT last_rowid FROM subscriber_cursors WHERE subscriber_id = ?",
+            ("devflow-bridge",),
+        ).fetchone()
+        assert row["last_rowid"] == 0
+
+
 class TestQuery:
     def test_query_skips_unknown_event_type(self, bus):
         """A row whose event_type isn't in the EventType enum (cross-version

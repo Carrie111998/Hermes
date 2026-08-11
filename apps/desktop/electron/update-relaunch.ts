@@ -58,17 +58,25 @@ function unpackedDirName(platform) {
  *
  * Match is a path-segment-aware prefix check (not a bare string startsWith) so
  * `.../release/linux-unpacked-evil` can't masquerade as `.../release/linux-unpacked`.
+ *
+ * All path work follows the *injected* `platform`, not the host's: a caller that
+ * asks about a POSIX install must get POSIX join/resolve/sep semantics even when
+ * this runs on Windows (where host `path.resolve` would prepend the current
+ * drive to an absolute POSIX execPath and no prefix could ever match). Real
+ * callers pass process.platform alongside process.execPath, so production
+ * behavior is unchanged.
  */
 function resolveUnpackedRelease(execPath, updateRoot, platform) {
   if (!execPath || !updateRoot) {
     return null
   }
 
-  const releaseDir = path.join(updateRoot, 'apps', 'desktop', 'release')
-  const unpacked = path.join(releaseDir, unpackedDirName(platform))
-  const normalizedExec = path.resolve(String(execPath))
+  const platformPath = platform === 'win32' ? path.win32 : path.posix
+  const releaseDir = platformPath.join(updateRoot, 'apps', 'desktop', 'release')
+  const unpacked = platformPath.join(releaseDir, unpackedDirName(platform))
+  const normalizedExec = platformPath.resolve(String(execPath))
   // execPath must be the unpacked dir itself or a descendant of it.
-  const withSep = unpacked.endsWith(path.sep) ? unpacked : unpacked + path.sep
+  const withSep = unpacked.endsWith(platformPath.sep) ? unpacked : unpacked + platformPath.sep
 
   if (normalizedExec === unpacked || normalizedExec.startsWith(withSep)) {
     return unpacked
