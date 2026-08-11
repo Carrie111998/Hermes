@@ -316,7 +316,8 @@ def uninstall_gateway_service():
 #      don't live in ~/.bashrc — they're in the Windows registry at
 #      HKCU\Environment.
 #   2. Prepends to User-scope ``PATH`` (same registry location) entries
-#      like ``%LOCALAPPDATA%\hermes\git\cmd``, ``%LOCALAPPDATA%\hermes\git\bin``,
+#      like ``%LOCALAPPDATA%\hermes\bin`` (Hermes .cmd shims; #83797),
+#      ``%LOCALAPPDATA%\hermes\git\cmd``, ``%LOCALAPPDATA%\hermes\git\bin``,
 #      ``%LOCALAPPDATA%\hermes\git\usr\bin``, ``%LOCALAPPDATA%\hermes\node``.
 #      Again not in any rc file — only accessible via the registry or the
 #      .NET [Environment] API.
@@ -340,8 +341,9 @@ def _hermes_path_markers(hermes_home: Path) -> list[str]:
     """Path-entry substrings that identify Hermes-owned User-PATH entries."""
     root = str(hermes_home).rstrip("\\/")
     # Match on prefix so sub-entries (git\cmd, git\bin, git\usr\bin, node, etc.)
-    # all get swept.  Also match the bare hermes-agent install dir.
-    markers = [root + "\\hermes-agent", root + "\\git", root + "\\node", root + "\\venv"]
+    # all get swept.  Also match the bare hermes-agent install dir and the
+    # Hermes-owned bin dir (hermes\bin) that ships .cmd shims (#83797).
+    markers = [root + "\\hermes-agent", root + "\\bin", root + "\\git", root + "\\node", root + "\\venv"]
     # Also match if HERMES_HOME was customised to somewhere else — find-and-nuke
     # any entry whose path component contains "hermes".  We don't want to catch
     # unrelated entries like "chermes-foo" or "ephermeral", so we look for
