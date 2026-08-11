@@ -55,6 +55,9 @@ class SleepPolicy:
     negative_valence_threshold: float = -0.60
     negative_reinforcement_multiplier: float = 0.25
     negative_prefetch_min_score: float = 0.28
+    recent_replay_limit: int = 4
+    remote_integration_limit: int = 4
+    max_negative_replay_per_budget: int = 0
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "rehearse_threshold", _clamp01(self.rehearse_threshold, name="rehearse_threshold"))
@@ -100,6 +103,41 @@ class SleepPolicy:
             "negative_prefetch_min_score",
             _clamp01(self.negative_prefetch_min_score, name="negative_prefetch_min_score"),
         )
+        recent_limit = _positive_int(
+            self.recent_replay_limit,
+            name="recent_replay_limit",
+            minimum=0,
+        )
+        if recent_limit > 32:
+            raise PolicyConfigError(
+                f"recent_replay_limit must be <= 32, got {recent_limit}"
+            )
+        object.__setattr__(self, "recent_replay_limit", recent_limit)
+        remote_limit = _positive_int(
+            self.remote_integration_limit,
+            name="remote_integration_limit",
+            minimum=0,
+        )
+        if remote_limit > 32:
+            raise PolicyConfigError(
+                f"remote_integration_limit must be <= 32, got {remote_limit}"
+            )
+        object.__setattr__(self, "remote_integration_limit", remote_limit)
+        negative_limit = _positive_int(
+            self.max_negative_replay_per_budget,
+            name="max_negative_replay_per_budget",
+            minimum=0,
+        )
+        if negative_limit > max(recent_limit, remote_limit):
+            raise PolicyConfigError(
+                "max_negative_replay_per_budget must not exceed either enabled "
+                f"replay budget, got {negative_limit}"
+            )
+        object.__setattr__(
+            self,
+            "max_negative_replay_per_budget",
+            negative_limit,
+        )
         if self.forget_threshold >= self.rehearse_threshold:
             raise PolicyConfigError(
                 "forget_threshold must be < rehearse_threshold "
@@ -133,6 +171,21 @@ class SleepPolicy:
             ),
             negative_prefetch_min_score=float(
                 data.get("negative_prefetch_min_score", base.negative_prefetch_min_score)
+            ),
+            recent_replay_limit=int(
+                data.get("recent_replay_limit", base.recent_replay_limit)
+            ),
+            remote_integration_limit=int(
+                data.get(
+                    "remote_integration_limit",
+                    base.remote_integration_limit,
+                )
+            ),
+            max_negative_replay_per_budget=int(
+                data.get(
+                    "max_negative_replay_per_budget",
+                    base.max_negative_replay_per_budget,
+                )
             ),
         )
 

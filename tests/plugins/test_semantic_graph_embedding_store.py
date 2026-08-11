@@ -1,4 +1,4 @@
-"""SQLite v2 embedding migration and invalidation tests."""
+"""SQLite embedding migration and invalidation tests."""
 
 from __future__ import annotations
 
@@ -7,7 +7,12 @@ from pathlib import Path
 
 import pytest
 
-from plugins.semantic_graph.store import DDL_CORE, DB_SCHEMA_VERSION, SemanticGraphStore
+from plugins.semantic_graph.store import (
+    DB_SCHEMA_VERSION,
+    DDL_CORE,
+    GRAPH_SCHEMA_VERSION,
+    SemanticGraphStore,
+)
 
 
 _NODE = {
@@ -91,13 +96,13 @@ def _embedding_count(path: Path, node_id: str = "node-existing") -> int:
         conn.close()
 
 
-def test_fresh_database_is_created_at_v2(tmp_path: Path) -> None:
+def test_fresh_database_is_created_at_current_schema(tmp_path: Path) -> None:
     db = tmp_path / "semantic_graph.db"
     SemanticGraphStore(db).ensure_ready()
 
     conn = sqlite3.connect(db)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == DB_SCHEMA_VERSION == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == DB_SCHEMA_VERSION
         assert conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='node_embeddings'"
         ).fetchone() == ("node_embeddings",)
@@ -115,7 +120,7 @@ def test_v1_database_migrates_without_losing_nodes(tmp_path: Path) -> None:
     conn = sqlite3.connect(db)
     try:
         assert conn.execute("SELECT COUNT(*) FROM graph_runs").fetchone()[0] == 0
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == DB_SCHEMA_VERSION
     finally:
         conn.close()
 
@@ -126,12 +131,12 @@ def test_graph_schema_version_is_separate_from_db_version(tmp_path: Path) -> Non
     run = store.create_run(objective="test")
     status = store.get_status_counts()
 
-    assert status["schema_version"] == 2
-    assert status["graph_schema_version"] == 1
-    assert store.get_run(run["run_id"])["schema_version"] == 1
+    assert status["schema_version"] == DB_SCHEMA_VERSION
+    assert status["graph_schema_version"] == GRAPH_SCHEMA_VERSION
+    assert store.get_run(run["run_id"])["schema_version"] == GRAPH_SCHEMA_VERSION
 
 
-def test_v2_migration_is_idempotent(tmp_path: Path) -> None:
+def test_database_migrations_are_idempotent(tmp_path: Path) -> None:
     db = tmp_path / "semantic_graph.db"
     _create_v1_database(db)
     SemanticGraphStore(db).ensure_ready()

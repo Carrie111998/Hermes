@@ -70,6 +70,11 @@ def forgetting_retention(elapsed_days: float, stability_days: float) -> float:
     return _clamp(math.exp(-float(elapsed_days) / stability), 0.0, 1.0)
 
 
+def _dream_idempotency_key(source_ids: Sequence[int]) -> str:
+    canonical = ",".join(str(value) for value in sorted({int(x) for x in source_ids}))
+    return f"dream:{canonical}"
+
+
 def _normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text or "")
     return _SPACE_RE.sub(" ", text).strip()
@@ -503,6 +508,163 @@ class EbbinghausMemoryStore:
         )
         return max(0.05, self.base_stability_days * strength * multiplier)
 
+    def _select_replay_budgets(
+        self,
+        candidates: Sequence[sqlite3.Row],
+    ) -> dict[str, dict[str, Any]]:
+        """Select recent and remote replay independently with fixed work caps."""
+        policy = self.policies.sleep
+        provenance_counts: dict[int, int] = {}
+        candidate_ids = [int(row["memory_id"]) for row in candidates]
+        for offset in range(0, len(candidate_ids), _MAX_IN_CLAUSE):
+            chunk = candidate_ids[offset : offset + _MAX_IN_CLAUSE]
+            if not chunk:
+                continue
+            placeholders = _placeholders(len(chunk))
+            provenance_rows = self._conn.execute(
+                f"""
+                SELECT memory_id, SUM(link_count) AS link_count
+                FROM (
+                    SELECT source_memory_id AS memory_id, COUNT(*) AS link_count
+                    FROM memory_provenance
+                    WHERE source_memory_id IN ({placeholders})
+                    GROUP BY source_memory_id
+                    UNION ALL
+                    SELECT semantic_memory_id AS memory_id, COUNT(*) AS link_count
+                    FROM memory_provenance
+                    WHERE semantic_memory_id IN ({placeholders})
+                    GROUP BY semantic_memory_id
+                )
+                GROUP BY memory_id
+                """,
+                [*chunk, *chunk],
+            ).fetchall()
+            for row in provenance_rows:
+                memory_id = int(row["memory_id"])
+                provenance_counts[memory_id] = (
+                    provenance_counts.get(memory_id, 0)
+                    + int(row["link_count"] or 0)
+                )
+        now = self._now()
+        weak_stability_ceiling = max(2.0, self.base_stability_days * 4.0)
+        recent_ranked: list[tuple[tuple[float, ...], sqlite3.Row]] = []
+        remote_ranked: list[tuple[tuple[float, ...], sqlite3.Row]] = []
+        for row in candidates:
+            memory_id = int(row["memory_id"])
+            created_at = _timestamp_value(row["created_at"], default=now)
+            age_days = max(0.0, (now - created_at) / 86_400.0)
+            salience = float(row["salience"] or 0.0)
+            retrievals = int(row["retrieval_count"] or 0)
+            stability = self._stability_days(row)
+            if (
+                age_days <= 7.0
+                and stability <= weak_stability_ceiling
+                and (
+                    salience >= policy.salience_keep_threshold
+                    or retrievals > 0
+                )
+            ):
+                utility = float(retrievals) + salience
+                recent_ranked.append(
+                    ((-utility, stability, -salience, float(memory_id)), row)
+                )
+            provenance_count = provenance_counts.get(memory_id, 0)
+            if age_days >= 30.0 and retrievals >= 2 and provenance_count >= 1:
+                remote_ranked.append(
+                    (
+                        (
+                            -float(provenance_count),
+                            -float(retrievals),
+                            -salience,
+                            float(memory_id),
+                        ),
+                        row,
+                    )
+                )
+
+        def select(
+            ranked: list[tuple[tuple[float, ...], sqlite3.Row]],
+            limit: int,
+        ) -> dict[str, Any]:
+            selected: list[sqlite3.Row] = []
+            negative_suppressed: list[int] = []
+            if limit <= 0:
+                return {
+                    "budget": 0,
+                    "rows": selected,
+                    "selected": [],
+                    "negative_suppressed": negative_suppressed,
+                }
+            negative_count = 0
+            for _rank, row in sorted(ranked, key=lambda item: item[0]):
+                strongly_negative = (
+                    float(row["valence"] or 0.0)
+                    <= policy.negative_valence_threshold
+                )
+                if strongly_negative:
+                    if negative_count >= policy.max_negative_replay_per_budget:
+                        negative_suppressed.append(int(row["memory_id"]))
+                        continue
+                    negative_count += 1
+                selected.append(row)
+                if len(selected) >= limit:
+                    break
+            return {
+                "budget": limit,
+                "rows": selected,
+                "selected": [int(row["memory_id"]) for row in selected],
+                "negative_suppressed": negative_suppressed,
+            }
+
+        return {
+            "recent_replay": select(
+                recent_ranked,
+                policy.recent_replay_limit,
+            ),
+            "remote_integration": select(
+                remote_ranked,
+                policy.remote_integration_limit,
+            ),
+        }
+
+    def _apply_replay_rows(
+        self,
+        rows: Sequence[sqlite3.Row],
+        *,
+        now: float,
+        max_sleep_rehearsals: int,
+        max_negative_sleep_rehearsals: int,
+    ) -> tuple[list[int], list[int]]:
+        replayed: list[int] = []
+        cap_suppressed: list[int] = []
+        negative_threshold = self.policies.sleep.negative_valence_threshold
+        for row in rows:
+            memory_id = int(row["memory_id"])
+            strongly_negative = float(row["valence"] or 0.0) <= negative_threshold
+            cap = (
+                max_negative_sleep_rehearsals
+                if strongly_negative
+                else max_sleep_rehearsals
+            )
+            if int(row["sleep_rehearsal_count"] or 0) >= cap:
+                cap_suppressed.append(memory_id)
+                continue
+            gain = self._reinforcement_gain(row, kind="rehearsal")
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET rehearsal_count = rehearsal_count + 1,
+                    strength = MIN(?, strength + ?),
+                    last_rehearsed_at = ?, updated_at = ?,
+                    last_anchor_at = ?,
+                    sleep_rehearsal_count = sleep_rehearsal_count + 1
+                WHERE memory_id = ?
+                """,
+                (_MAX_STRENGTH, gain, now, now, now, memory_id),
+            )
+            replayed.append(memory_id)
+        return replayed, cap_suppressed
+
     def _retention(self, row: sqlite3.Row) -> float:
         now = self._now()
         anchor = _timestamp_value(row["last_anchor_at"])
@@ -799,6 +961,79 @@ class EbbinghausMemoryStore:
                 **self.get(result.new_memory_id),
             }
         return dict(result)
+
+    def record_prediction_error(
+        self,
+        memory_id: int,
+        *,
+        source: str,
+        expected_hash: str,
+        observed_hash: str,
+        severity: float,
+        requires_revision: bool,
+        new_content: str = "",
+        reason: str = "",
+        confidence: float | None = None,
+        test_query: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        current = self.get(int(memory_id))
+        event = self.experience.record_prediction_error(
+            memory_id=int(memory_id),
+            source=source,
+            expected_hash=expected_hash,
+            observed_hash=observed_hash,
+            severity=float(severity),
+            requires_revision=bool(requires_revision),
+            session_id=session_id,
+        )
+        if not requires_revision:
+            return event
+
+        content = _normalize_text(new_content)
+        if not content:
+            return {**event, "status": "revision_required"}
+        revision = self.revise_memory(
+            int(memory_id),
+            content,
+            reason=str(reason or f"prediction error from {event['source']}"),
+            evidence=[
+                {
+                    "event_id": event["event_id"],
+                    "expected_hash": event["expected_hash"],
+                    "observed_hash": event["observed_hash"],
+                    "severity": event["severity"],
+                }
+            ],
+            confidence=(
+                float(current.get("confidence") or 0.0)
+                if confidence is None
+                else float(confidence)
+            ),
+            test_query=test_query,
+            source=event["source"],
+            session_id=session_id,
+        )
+        return {
+            "status": "revised",
+            "prediction_error": event,
+            "revision": revision,
+        }
+
+    def stabilize_memory(
+        self,
+        memory_id: int,
+        *,
+        evidence_type: str,
+        evidence_hash: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        return self.experience.stabilize_memory(
+            memory_id=int(memory_id),
+            evidence_type=evidence_type,
+            evidence_hash=evidence_hash,
+            session_id=session_id,
+        )
 
     def retract_memory(
         self,
@@ -1294,12 +1529,31 @@ class EbbinghausMemoryStore:
             rescued_memory_id=memory_id,
             rescue_score=rescue_score,
             direct_best_score=direct_best_score,
+            current_attempt_id=attempt_id,
         )
         matched_miss_id = None
         if resolved:
             matched_miss_id = int(resolved.get("matched_miss_id") or resolved.get("attempt_id") or 0) or None
             if "surprise" in resolved:
                 surprise = float(resolved["surprise"])
+            if (
+                attempt_id is not None
+                and matched_miss_id is not None
+                and matched_miss_id != attempt_id
+                and resolution_gain > 0.0
+            ):
+                self.experience.record_event(
+                    "forgotten_then_recalled",
+                    memory_id=memory_id,
+                    belief_id=str(row["belief_id"] or ""),
+                    payload={
+                        "prior_attempt_id": matched_miss_id,
+                        "current_attempt_id": attempt_id,
+                        "current_query_hash": query_hash,
+                        "resolution_gain": resolution_gain,
+                        "surprise": surprise,
+                    },
+                )
 
         result = self.get(memory_id) | {"score": round(float(rescue_score), 4)}
         state_note = (
@@ -1492,14 +1746,38 @@ class EbbinghausMemoryStore:
         scored.sort(key=lambda t: (t[0], -t[1]))
 
         now = self._now()
-        rehearsed: list[int] = []
+        replay_budgets = self._select_replay_budgets(candidates)
+        recent_replayed, recent_cap_suppressed = self._apply_replay_rows(
+            replay_budgets["recent_replay"]["rows"],
+            now=now,
+            max_sleep_rehearsals=max_sr,
+            max_negative_sleep_rehearsals=max_neg_sr,
+        )
+        remote_replayed, remote_cap_suppressed = self._apply_replay_rows(
+            replay_budgets["remote_integration"]["rows"],
+            now=now,
+            max_sleep_rehearsals=max_sr,
+            max_negative_sleep_rehearsals=max_neg_sr,
+        )
+        replayed_ids = set(recent_replayed) | set(remote_replayed)
+        rehearsed: list[int] = [*recent_replayed, *remote_replayed]
         forgotten_ids: list[int] = []
         latent_ids: list[int] = []
         archived_ids: list[int] = []
         dream_candidate_ids: list[int] = []
-        negative_rehearsal_suppressed: list[int] = []
+        negative_rehearsal_suppressed: list[int] = list(
+            dict.fromkeys(
+                [
+                    *replay_budgets["recent_replay"]["negative_suppressed"],
+                    *replay_budgets["remote_integration"]["negative_suppressed"],
+                ]
+            )
+        )
         protected_skipped: list[int] = []
-        reviewed_ids: list[int] = []
+        reviewed_ids: list[int] = list(
+            dict.fromkeys([*recent_replayed, *remote_replayed])
+        )
+        reviewed_id_set = set(reviewed_ids)
         processed = 0
 
         xp = self.policies.experience
@@ -1513,11 +1791,16 @@ class EbbinghausMemoryStore:
                 break
             processed += 1
             mid = int(row["memory_id"])
-            reviewed_ids.append(mid)
+            if mid not in reviewed_id_set:
+                reviewed_ids.append(mid)
+                reviewed_id_set.add(mid)
             valence = float(row["valence"] or 0.0)
             prot = self._is_row_protected(row)
             src = int(row["sleep_rehearsal_count"] or 0)
             access_state = str(row["access_state"] or "accessible")
+
+            if mid in replayed_ids:
+                continue
 
             if prot:
                 if (
@@ -1679,6 +1962,24 @@ class EbbinghausMemoryStore:
                 "failed": list(correction_report.get("failed") or []),
             },
             "negative_rehearsal_suppressed": negative_rehearsal_suppressed,
+            "recent_replay": {
+                "budget": replay_budgets["recent_replay"]["budget"],
+                "selected": replay_budgets["recent_replay"]["selected"],
+                "replayed": recent_replayed,
+                "negative_suppressed": replay_budgets["recent_replay"][
+                    "negative_suppressed"
+                ],
+                "cap_suppressed": recent_cap_suppressed,
+            },
+            "remote_integration": {
+                "budget": replay_budgets["remote_integration"]["budget"],
+                "selected": replay_budgets["remote_integration"]["selected"],
+                "replayed": remote_replayed,
+                "negative_suppressed": replay_budgets["remote_integration"][
+                    "negative_suppressed"
+                ],
+                "cap_suppressed": remote_cap_suppressed,
+            },
             "dream_candidates": dream_candidate_ids,
             "capacity_archived": capacity_archived,
             "purged": purged,
@@ -2065,11 +2366,35 @@ class EbbinghausMemoryStore:
                     semantic_id = int(
                         existing["memory_id"] if existing else by_sources  # type: ignore[index]
                     )
+                    provenance_rows = self._conn.execute(
+                        "SELECT source_memory_id, relation, created_at "
+                        "FROM memory_provenance WHERE semantic_memory_id = ? "
+                        "ORDER BY source_memory_id",
+                        (semantic_id,),
+                    ).fetchall()
+                    source_ids = [
+                        int(row["source_memory_id"]) for row in provenance_rows
+                    ]
+                    applied_at = max(
+                        (float(row["created_at"]) for row in provenance_rows),
+                        default=now,
+                    )
                     results.append({
                         "cluster_id": cluster_id,
                         "status": "idempotent",
                         "semantic_memory_id": semantic_id,
                         "archived_sources": [],
+                        "source_memory_ids": source_ids,
+                        "provenance": [
+                            {
+                                "source_memory_id": int(row["source_memory_id"]),
+                                "relation": str(row["relation"]),
+                            }
+                            for row in provenance_rows
+                        ],
+                        "applied_at": applied_at,
+                        "validation_state": "apply_validated",
+                        "idempotency_key": _dream_idempotency_key(source_ids),
                     })
                     continue
 
@@ -2153,6 +2478,17 @@ class EbbinghausMemoryStore:
                     "status": "applied",
                     "semantic_memory_id": semantic_id,
                     "archived_sources": archived_sources,
+                    "source_memory_ids": source_ids,
+                    "provenance": [
+                        {
+                            "source_memory_id": sid,
+                            "relation": "dream-derived",
+                        }
+                        for sid in source_ids
+                    ],
+                    "applied_at": now,
+                    "validation_state": "apply_validated",
+                    "idempotency_key": _dream_idempotency_key(source_ids),
                 })
                 # Drop durable preview after successful apply (idempotent re-apply
                 # still works via content / source-set provenance checks).

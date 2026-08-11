@@ -6,9 +6,11 @@ hybrid retrieval. Live HTTP execution is opt-in only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import sqlite3
 import statistics
 import subprocess
 import time
@@ -17,6 +19,21 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Sequence
 
+from plugins.memory.ebbinghaus.semantic_graph_bridge import project_retention
+from plugins.semantic_graph.abstention import (
+    DENSE_FLOOR,
+    DENSE_MARGIN_FLOOR,
+    DENSE_STRONG_FLOOR,
+    RETENTION_FLOOR,
+    RRF_MARGIN_FLOOR,
+    SOURCE_COUNT_FLOOR,
+    decide_abstention,
+    extract_retrieval_features,
+)
+from plugins.semantic_graph.cognitive import (
+    activate_cognitive_rerank,
+    observe_cognitive_rerank,
+)
 from plugins.semantic_graph.embedding import EmbeddingModelIdentity, serialize_embedding_node, source_text_hash
 from plugins.semantic_graph.fusion import reciprocal_rank_fusion
 from plugins.semantic_graph.retrieval import render_context, search_and_rank
@@ -24,6 +41,12 @@ from plugins.semantic_graph.sanitize import normalize_text, sanitize_text
 from plugins.semantic_graph.store import SemanticGraphStore
 
 FIXTURE = Path(__file__).parents[1] / "tests" / "fixtures" / "semantic_graph_retrieval_benchmark.json"
+COGNITIVE_FIXTURE = (
+    Path(__file__).parents[1]
+    / "tests"
+    / "fixtures"
+    / "semantic_graph_cognitive_benchmark.json"
+)
 CONTROL_CODE_REVISION = "0c89ef566343dbed810cedff81c9ac405febf0da"
 CONTROL = {
     "repo": os.environ.get("BGE_M3_REPO", "KGESH/nsfw-bge-m3"),
@@ -62,6 +85,118 @@ def benchmark_code_revision() -> str:
 
 def load_fixture() -> dict[str, Any]:
     return json.loads(FIXTURE.read_text(encoding="utf-8"))
+
+
+def load_cognitive_fixture() -> dict[str, Any]:
+    return json.loads(COGNITIVE_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _evaluation_split(seed: int, fixture_id: str) -> str:
+    digest = hashlib.sha256(f"{seed}:{fixture_id}".encode("utf-8")).digest()
+    return "holdout" if int.from_bytes(digest[:4], "big") % 5 == 0 else "development"
+
+
+def build_cognitive_evaluation_fixture(
+    base: dict[str, Any],
+    spec: dict[str, Any],
+) -> dict[str, Any]:
+    seed = int(spec["seed"])
+    queries: list[dict[str, Any]] = []
+
+    def add(
+        fixture_id: str,
+        query: str,
+        expected: list[str],
+        group: str,
+    ) -> None:
+        queries.append({
+            "fixture_id": fixture_id,
+            "query": query,
+            "expected": expected,
+            "group": group,
+            "split": _evaluation_split(seed, fixture_id),
+        })
+
+    for index, query in enumerate(base["queries"], start=1):
+        add(
+            f"base-{index:03d}",
+            str(query["query"]),
+            list(query["expected"]),
+            str(query["group"]),
+        )
+    for topic_index, topic in enumerate(spec["negative_topics"], start=1):
+        for template_index, template in enumerate(
+            spec["negative_templates"], start=1
+        ):
+            add(
+                f"negative-{topic_index:02d}-{template_index}",
+                str(template).format(topic=topic),
+                [],
+                "negative_no_memory",
+            )
+    for index in range(1, 21):
+        add(
+            f"cue-disconnect-{index:02d}",
+            str(spec["cue_disconnect_template"]).format(index=index),
+            [],
+            "cue_trigger_disconnect",
+        )
+    for index, query in enumerate(spec["tool_actions"], start=1):
+        add(
+            f"tool-grounding-{index:02d}",
+            str(query),
+            [],
+            "tool_action_grounding",
+        )
+    correction_groups = (
+        ("temporal_update", "temporal_update_templates"),
+        ("contradiction", "contradiction_templates"),
+        ("memory_poisoning_repair", "poisoning_repair_templates"),
+    )
+    for group, template_key in correction_groups:
+        for correction_index, correction in enumerate(
+            base["correction_nodes"], start=1
+        ):
+            token = str(correction["new_summary"]).rsplit(" ", 1)[-1].rstrip(".")
+            for template_index, template in enumerate(
+                spec[template_key], start=1
+            ):
+                add(
+                    f"{group}-{correction_index:02d}-{template_index}",
+                    str(template).format(token=token),
+                    [str(correction["new_identity"])],
+                    group,
+                )
+    return {
+        **base,
+        "cognitive_fixture_schema_version": int(spec["schema_version"]),
+        "cognitive_fixture_seed": seed,
+        "queries": queries,
+    }
+
+
+def select_evaluation_fixture(evaluation_split: str) -> dict[str, Any]:
+    selected = str(evaluation_split or "baseline").strip().lower()
+    if selected == "baseline":
+        return load_fixture()
+    complete = build_cognitive_evaluation_fixture(
+        load_fixture(),
+        load_cognitive_fixture(),
+    )
+    if selected == "all":
+        return complete
+    if selected not in {"development", "holdout"}:
+        raise ValueError(
+            "evaluation_split must be baseline, development, holdout, or all"
+        )
+    return {
+        **complete,
+        "queries": [
+            query
+            for query in complete["queries"]
+            if query["split"] == selected
+        ],
+    }
 
 
 def serialize_bge_query(query: str) -> str:
@@ -113,6 +248,49 @@ def make_store(db_path: Path) -> tuple[SemanticGraphStore, str, str]:
         "status": "asserted", "authority": "user", "confidence": 0.99, "salience": 0.99,
     })
     store.link_run_node(run_b, "run-b-only")
+
+    synced_at = time.time()
+    cognitive_nodes = sorted(
+        store.list_nodes_for_run(
+            run_a,
+            statuses=["asserted", "accepted"],
+            limit=5000,
+        ),
+        key=lambda row: str(row["node_id"]),
+    )
+    for index, row in enumerate(cognitive_nodes, start=1):
+        memory_id = 10_000 + index
+        belief_id = f"benchmark-belief-{index}"
+        access_state = (
+            "latent"
+            if index % 7 == 0
+            else "reactivated"
+            if index % 11 == 0
+            else "accessible"
+        )
+        store.upsert_memory_node_link({
+            "memory_id": memory_id,
+            "node_id": row["node_id"],
+            "belief_id": belief_id,
+            "belief_version": 1,
+            "relation": "represents",
+        })
+        store.upsert_memory_state_cache({
+            "memory_id": memory_id,
+            "belief_id": belief_id,
+            "belief_version": 1,
+            "access_state": access_state,
+            "belief_status": "current",
+            "memory_state": "active",
+            "retention_at_sync": 0.55 + 0.10 * (index % 5),
+            "stability_days": 30.0 + float(index % 7),
+            "salience": float(row["salience"]),
+            "valence": 0.0,
+            "confidence": float(row["confidence"]),
+            "protected": False,
+            "source_updated_at": synced_at,
+            "synced_at": synced_at,
+        })
     return store, run_a, run_b
 
 
@@ -191,6 +369,32 @@ def _candidate_observations(
     return observations
 
 
+def _cognitive_inputs(
+    store: SemanticGraphStore,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[int, dict[str, Any]]]:
+    links_by_node: dict[str, list[dict[str, Any]]] = {}
+    for link in store.get_memory_node_links(limit=5000):
+        links_by_node.setdefault(str(link["node_id"]), []).append(link)
+    states_by_memory: dict[int, dict[str, Any]] = {}
+    for cache in store.list_memory_state_cache(limit=5000):
+        state = dict(cache)
+        state["projected_retention"] = project_retention(
+            cache,
+            expected_belief_version=int(cache["belief_version"]),
+        )
+        states_by_memory[int(cache["memory_id"])] = state
+    return links_by_node, states_by_memory
+
+
+def _database_snapshot(store: SemanticGraphStore) -> tuple[str, ...]:
+    uri = Path(store.db_path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return tuple(conn.iterdump())
+    finally:
+        conn.close()
+
+
 def _query_observation(
     *, expected: Sequence[str], lexical_ids: Sequence[str], dense_ids: Sequence[str],
     dense_similarities: dict[str, float], fused_node_ids: Sequence[str], top_k: int,
@@ -230,29 +434,138 @@ def _summary(
 ) -> dict[str, Any]:
     groups: dict[str, dict[str, Any]] = {}
     for result in results:
-        group = groups.setdefault(result["group"], {"count": 0, "hits": 0, "mrr_sum": 0.0})
+        group = groups.setdefault(
+            result["group"],
+            {"count": 0, "hits": 0, "gated_hits": 0, "mrr_sum": 0.0},
+        )
         group["count"] += 1
         group["hits"] += int(result["hit"])
+        group["gated_hits"] += int(result["gated_hit"])
         group["mrr_sum"] += result["reciprocal_rank"]
     for group in groups.values():
         count = group.pop("count")
         group["recall_at_8"] = group.pop("hits") / count
+        group["gated_recall_at_8"] = group.pop("gated_hits") / count
         group["mrr_at_8"] = group.pop("mrr_sum") / count
-    negatives = [result for result in results if result["group"] == "negative"]
+    negatives = [result for result in results if not result["expected"]]
+    positives = [result for result in results if result["expected"]]
+    true_abstain = sum(
+        int(result["effective_no_result"]) for result in negatives
+    )
+    false_recall = len(negatives) - true_abstain
+    false_abstain = sum(
+        int(result["effective_no_result"]) for result in positives
+    )
+    true_allow = len(positives) - false_abstain
+    predicted_no_result = true_abstain + false_abstain
+    ungated_positive_recall = (
+        sum(int(result["hit"]) for result in positives) / len(positives)
+        if positives
+        else 0.0
+    )
+    active_positive_recall = (
+        sum(int(result["active_hit"]) for result in positives) / len(positives)
+        if positives
+        else 0.0
+    )
+    gated_positive_recall = (
+        sum(int(result["gated_hit"]) for result in positives) / len(positives)
+        if positives
+        else 0.0
+    )
     return {
         "query_count": len(results), "groups": groups,
         "overall_recall_at_8": sum(int(result["hit"]) for result in results) / len(results),
         "overall_mrr_at_8": sum(result["reciprocal_rank"] for result in results) / len(results),
-        "negative_false_recall_rate": sum(int(result["returned_any"]) for result in negatives) / len(negatives),
-        "negative_no_result_precision": sum(int(not result["returned_any"]) for result in negatives) / len(negatives),
+        "negative_false_recall_rate": (
+            false_recall / len(negatives) if negatives else 0.0
+        ),
+        "negative_no_result_precision": (
+            true_abstain / predicted_no_result if predicted_no_result else 0.0
+        ),
+        "abstention": {
+            "confusion_matrix": {
+                "true_abstain": true_abstain,
+                "false_recall": false_recall,
+                "false_abstain": false_abstain,
+                "true_allow": true_allow,
+            },
+            "ungated_positive_recall_at_8": ungated_positive_recall,
+            "active_positive_recall_at_8": active_positive_recall,
+            "gated_positive_recall_at_8": gated_positive_recall,
+            "cognitive_active_degradation": (
+                ungated_positive_recall - active_positive_recall
+            ),
+            "abstention_incremental_degradation": (
+                active_positive_recall - gated_positive_recall
+            ),
+            "positive_recall_degradation": (
+                ungated_positive_recall - gated_positive_recall
+            ),
+        },
         "context_chars_max": max((result["context_chars"] for result in results), default=0),
         "latency_ms": {name: _latency_summary(values) for name, values in latencies.items()},
         "rejected_or_superseded_leak_count": rejected_or_superseded,
         "cross_run_leak_count": cross_run,
         "secret_recall_count": secret_recall,
         "state_mutation_count": 0,
+        "cognitive_shadow_observation_count": sum(
+            len(result["candidates"]) for result in results
+        ),
+        "cognitive_rank_change_count": sum(
+            int(candidate["cognitive_shadow"]["rank_changed"])
+            for result in results
+            for candidate in result["candidates"]
+        ),
+        "cognitive_would_filter_count": sum(
+            int(candidate["cognitive_shadow"]["would_filter"])
+            for result in results
+            for candidate in result["candidates"]
+        ),
         "query_results": results,
     }
+
+
+def assess_abstention_acceptance(summary: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate only the fixed Phase 5 holdout acceptance contract."""
+    correction_groups = (
+        "correction_history",
+        "temporal_update",
+        "contradiction",
+        "memory_poisoning_repair",
+    )
+    groups = summary.get("groups") or {}
+    correction_history_no_regression = all(
+        group in groups
+        and float(groups[group].get("gated_recall_at_8", -1.0))
+        >= float(groups[group].get("recall_at_8", 0.0))
+        for group in correction_groups
+    )
+    checks = {
+        "positive_recall_degradation": float(
+            summary.get("abstention", {}).get(
+                "positive_recall_degradation", float("inf")
+            )
+        )
+        <= 0.02,
+        "correction_history_no_regression": correction_history_no_regression,
+        "rejected_or_superseded_leak": int(
+            summary.get("rejected_or_superseded_leak_count", -1)
+        )
+        == 0,
+        "cross_run_leak": int(summary.get("cross_run_leak_count", -1)) == 0,
+        "secret_recall": int(summary.get("secret_recall_count", -1)) == 0,
+        "state_mutation": int(summary.get("state_mutation_count", -1)) == 0,
+        "negative_false_recall_rate": float(
+            summary.get("negative_false_recall_rate", float("inf"))
+        )
+        <= 0.20,
+        "negative_no_result_precision": float(
+            summary.get("negative_no_result_precision", float("-inf"))
+        )
+        >= 0.80,
+    }
+    return {"checks": checks, "pass": all(checks.values())}
 
 
 def _eligible(store: SemanticGraphStore, run_a: str, query: dict[str, Any]) -> list[dict[str, Any]]:
@@ -272,9 +585,9 @@ def run_variant(
     latencies = {name: [] for name in (
         "query_embedding_ms", "lexical_ms", "dense_scan_ms", "rrf_ms", "end_to_end_ms",
     )}
-    before = {row["node_id"]: (row["status"], row["authority"], row["confidence"])
-              for row in store.list_nodes(limit=5000)}
-    for query in fixture["queries"]:
+    before = _database_snapshot(store)
+    links_by_node, states_by_memory = _cognitive_inputs(store)
+    for query_index, query in enumerate(fixture["queries"], start=1):
         started = time.perf_counter()
         query_vector = None
         if dense:
@@ -315,11 +628,25 @@ def run_variant(
             k=RRF_K,
             dense_similarities=dense_similarities,
         )
-        candidates = _candidate_observations(
+        base_candidates = _candidate_observations(
             fused,
             lexical_ids=[row["node_id"] for row in lexical_safe],
             dense_ids=[row["node_id"] for row in dense_rows],
             top_k=TOP_K,
+        )
+        candidates = observe_cognitive_rerank(
+            base_candidates,
+            links_by_node=links_by_node,
+            states_by_memory=states_by_memory,
+            query_mode="normal",
+        )
+        active_candidates = activate_cognitive_rerank(
+            observe_cognitive_rerank(
+                base_candidates[:TOP_K],
+                links_by_node=links_by_node,
+                states_by_memory=states_by_memory,
+                query_mode="normal",
+            )
         )
         observation = _query_observation(
             expected=query["expected"],
@@ -332,29 +659,57 @@ def run_variant(
         by_id = {row["node_id"]: row for row in (eligible or lexical)}
         by_id.update({row["node_id"]: row for row in lexical})
         rows = [by_id[item.node_id] for item in fused[:TOP_K] if item.node_id in by_id]
+        active_rows = [
+            by_id[str(candidate["node_id"])]
+            for candidate in active_candidates
+            if str(candidate["node_id"]) in by_id
+        ]
         if dense:
             latencies["rrf_ms"].append((time.perf_counter() - rrf_started) * 1000)
 
         rank = _rank(query["expected"], rows)
-        rejected_or_superseded += sum(
-            int(row.get("status") in {"rejected", "superseded"}) for row in rows
+        active_rank = _rank(query["expected"], active_rows)
+        features = extract_retrieval_features(
+            active_candidates,
+            query_length=len(str(query["query"])),
         )
-        cross_run += sum(int(row.get("node_id") == "run-b-only") for row in rows)
-        secret_recall += sum(int("opaque-secret" in json.dumps(row, ensure_ascii=False)) for row in rows)
+        abstention = decide_abstention(features)
+        production_rows = [] if abstention["abstain"] else active_rows
+        effective_no_result = not production_rows
+        rejected_or_superseded += sum(
+            int(row.get("status") in {"rejected", "superseded"})
+            for row in production_rows
+        )
+        cross_run += sum(
+            int(row.get("node_id") == "run-b-only")
+            for row in production_rows
+        )
+        secret_recall += sum(
+            int("opaque-secret" in json.dumps(row, ensure_ascii=False))
+            for row in production_rows
+        )
         results.append({
-            "query": query["query"],
+            "fixture_id": str(query.get("fixture_id") or f"q-{query_index:03d}"),
+            "split": str(query.get("split") or "baseline"),
             "group": query["group"], "expected": query["expected"],
             "returned": [row["identity_key"] for row in rows], "hit": rank is not None,
+            "active_returned": [row["identity_key"] for row in active_rows],
+            "active_hit": active_rank is not None,
+            "active_reciprocal_rank": 1.0 / active_rank if active_rank else 0.0,
+            "active_returned_any": bool(active_rows),
+            "gated_hit": active_rank is not None and not effective_no_result,
             "returned_any": bool(rows), "reciprocal_rank": 1.0 / rank if rank else 0.0,
-            "context_chars": len(render_context(rows, 3500) or ""),
+            "effective_no_result": effective_no_result,
+            "context_chars": len(render_context(production_rows, 3500) or ""),
             "latency_ms": (time.perf_counter() - started) * 1000,
             "candidates": candidates,
             "observation": observation,
+            "features": features,
+            "abstention": abstention,
         })
         latencies["end_to_end_ms"].append(results[-1]["latency_ms"])
 
-    after = {row["node_id"]: (row["status"], row["authority"], row["confidence"])
-             for row in store.list_nodes(limit=5000)}
+    after = _database_snapshot(store)
     summary = _summary(
         results,
         latencies,
@@ -366,10 +721,18 @@ def run_variant(
     return summary
 
 
-def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, output: Path) -> dict[str, Any]:
+def run_benchmark(
+    *,
+    base_url: str,
+    model: str,
+    db_path: Path,
+    live: bool,
+    output: Path,
+    evaluation_split: str = "baseline",
+) -> dict[str, Any]:
     if not live:
         raise RuntimeError("live benchmark requires --live or SEMANTIC_GRAPH_LIVE_BENCHMARK=1")
-    fixture = load_fixture()
+    fixture = select_evaluation_fixture(evaluation_split)
     store, run_a, _ = make_store(db_path)
     client = HttpEmbeddingClient(base_url, model)
     node_rows = store.list_nodes(limit=5000)
@@ -384,8 +747,10 @@ def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, outpu
     backfill_ms = (time.perf_counter() - backfill_started) * 1000
     lexical = run_variant(store, fixture, run_a, dense=False, client=None)
     hybrid = run_variant(store, fixture, run_a, dense=True, client=client)
+    acceptance = assess_abstention_acceptance(hybrid)
     result = {
-        "benchmark_schema_version": 1,
+        "benchmark_schema_version": 3,
+        "evaluation_split": evaluation_split,
         "control_code_revision": CONTROL_CODE_REVISION,
         "benchmark_code_revision": benchmark_code_revision(),
         "control": CONTROL,
@@ -393,12 +758,33 @@ def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, outpu
                       "dense_candidates": DENSE_CANDIDATES, "rrf_k": RRF_K},
         "backfill": {"document_count": len(documents), "duration_ms": backfill_ms},
         "variants": {"A_lexical": lexical, "B_hybrid_bge_m3": hybrid},
+        "cognitive_shadow": {
+            "mode": "shadow",
+            "formula": "fixed-v1",
+            "query_mode": "normal",
+            "ebbinghaus_db_accessed": False,
+        },
+        "abstention_gate": {
+            "dense_floor": DENSE_FLOOR,
+            "dense_strong_floor": DENSE_STRONG_FLOOR,
+            "dense_margin_floor": DENSE_MARGIN_FLOOR,
+            "rrf_margin_floor": RRF_MARGIN_FLOOR,
+            "source_count_floor": SOURCE_COUNT_FLOOR,
+            "retention_floor": RETENTION_FLOOR,
+        },
+        "phase5_acceptance": {
+            "evaluation_split": evaluation_split,
+            **acceptance,
+        },
         "gates": {
             "japanese_to_english_recall_no_regression": hybrid["groups"].get("japanese_to_english", {}).get("recall_at_8") == 1.0,
             "leak_free": hybrid["rejected_or_superseded_leak_count"] == 0
             and hybrid["cross_run_leak_count"] == 0
             and hybrid["secret_recall_count"] == 0
             and hybrid["state_mutation_count"] == 0,
+            "shadow_read_only": lexical["state_mutation_count"] == 0
+            and hybrid["state_mutation_count"] == 0,
+            "phase5_acceptance": acceptance["pass"],
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -412,10 +798,22 @@ def main() -> int:
     parser.add_argument("--model", default=os.environ.get("BGE_M3_MODEL", "nsfw-bge-m3-v4.gguf"))
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--evaluation-split",
+        choices=["baseline", "development", "holdout", "all"],
+        default="baseline",
+    )
     parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
     live = args.live or os.environ.get("SEMANTIC_GRAPH_LIVE_BENCHMARK") == "1"
-    result = run_benchmark(base_url=args.base_url, model=args.model, db_path=args.db, live=live, output=args.output)
+    result = run_benchmark(
+        base_url=args.base_url,
+        model=args.model,
+        db_path=args.db,
+        live=live,
+        output=args.output,
+        evaluation_split=args.evaluation_split,
+    )
     print(json.dumps({
         "control_code_revision": result["control_code_revision"],
         "benchmark_code_revision": result["benchmark_code_revision"],
@@ -430,6 +828,9 @@ if __name__ == "__main__":
 
 __all__ = [
     "CONTROL_CODE_REVISION", "CONTROL", "HttpEmbeddingClient", "benchmark_code_revision",
+    "assess_abstention_acceptance",
+    "build_cognitive_evaluation_fixture", "load_cognitive_fixture",
+    "select_evaluation_fixture",
     "make_store", "run_benchmark", "run_variant", "serialize_bge_query",
     "_candidate_observations", "_query_observation",
 ]

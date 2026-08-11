@@ -182,6 +182,72 @@ def test_provider_exposes_sleep_cycle_tool_action(tmp_path):
     provider.shutdown()
 
 
+def test_provider_exposes_prediction_error_revision_and_stabilization(tmp_path):
+    provider = EbbinghausMemoryProvider({"db_path": str(tmp_path / "provider.db")})
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+    first = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {"action": "remember", "content": "Current tool port is 9000."},
+        )
+    )
+    expected_hash = "a" * 64
+    observed_hash = "b" * 64
+    revised = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {
+                "action": "prediction_error",
+                "memory_id": first["memory_id"],
+                "source": "tool_result",
+                "expected_hash": expected_hash,
+                "observed_hash": observed_hash,
+                "severity": 0.8,
+                "requires_revision": True,
+                "new_content": "Current tool port is 9001.",
+                "test_query": "current tool port 9001",
+            },
+        )
+    )
+    assert revised["status"] == "revised"
+    assert revised["revision"]["old_memory_id"] == first["memory_id"]
+
+    second = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {"action": "remember", "content": "Current mode is shadow."},
+        )
+    )
+    labile = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {
+                "action": "prediction_error",
+                "memory_id": second["memory_id"],
+                "source": "validation_failure",
+                "expected_hash": expected_hash,
+                "observed_hash": observed_hash,
+                "severity": 0.6,
+                "requires_revision": False,
+            },
+        )
+    )
+    assert labile["status"] == "labile"
+    stabilized = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {
+                "action": "stabilize",
+                "memory_id": second["memory_id"],
+                "evidence_type": "manual_validation",
+                "evidence_hash": "c" * 64,
+            },
+        )
+    )
+    assert stabilized["status"] == "stabilized"
+    provider.shutdown()
+
+
 def test_provider_tools_and_prefetch(tmp_path):
     provider = EbbinghausMemoryProvider(
         {
@@ -304,6 +370,108 @@ def test_max_sleep_rehearsals_and_negative_cap(tmp_path):
     assert pos_row["sleep_rehearsal_count"] <= 2
     assert neg_row["sleep_rehearsal_count"] <= 1
     store.close()
+
+
+def test_sleep_replay_budgets_are_separate_deterministic_and_negative_bounded(tmp_path):
+    from plugins.memory.ebbinghaus.policies import EbbinghausPolicies, SleepPolicy
+
+    def run_once(db_path):
+        clock = {"now": 1_700_000_000.0}
+        policies = EbbinghausPolicies(
+            base_stability_days=0.2,
+            sleep=SleepPolicy(
+                prune_mode="none",
+                recent_replay_limit=2,
+                remote_integration_limit=2,
+                max_negative_replay_per_budget=0,
+            ),
+        )
+        store = EbbinghausMemoryStore(
+            db_path,
+            time_fn=lambda: clock["now"],
+            policies=policies,
+        )
+        remote_a = store.remember("Remote source A", salience=0.8)
+        remote_b = store.remember("Remote source B", salience=0.75)
+        remote_negative = store.remember(
+            "Remote negative source", salience=0.99, valence=-0.9
+        )
+        semantic = store.remember(
+            "Provenance anchor",
+            tags=["semantic"],
+            memory_type="semantic",
+        )
+        store._conn.executemany(  # noqa: SLF001 - deterministic policy fixture
+            "INSERT INTO memory_provenance(semantic_memory_id, source_memory_id, relation, created_at) "
+            "VALUES (?, ?, 'dream-derived', ?)",
+            [
+                (semantic["memory_id"], remote_a["memory_id"], clock["now"]),
+                (semantic["memory_id"], remote_b["memory_id"], clock["now"]),
+                (
+                    semantic["memory_id"],
+                    remote_negative["memory_id"],
+                    clock["now"],
+                ),
+            ],
+        )
+        store._conn.executemany(  # noqa: SLF001 - deterministic utility fixture
+            "UPDATE memories SET retrieval_count = ? WHERE memory_id = ?",
+            [
+                (4, remote_a["memory_id"]),
+                (2, remote_b["memory_id"]),
+                (20, remote_negative["memory_id"]),
+            ],
+        )
+        store._conn.commit()  # noqa: SLF001
+
+        clock["now"] += 40 * 86_400
+        recent_a = store.remember("Recent useful A", salience=0.9)
+        recent_b = store.remember("Recent useful B", salience=0.85)
+        recent_negative = store.remember(
+            "Recent negative source", salience=1.0, valence=-0.95
+        )
+
+        report = store.sleep_cycle(limit=100, prune_mode="none")
+        expected = {
+            "recent": [recent_a["memory_id"], recent_b["memory_id"]],
+            "remote": [remote_a["memory_id"], remote_b["memory_id"]],
+            "negative": {
+                recent_negative["memory_id"],
+                remote_negative["memory_id"],
+            },
+        }
+        store.close()
+        return report, expected
+
+    first, expected = run_once(tmp_path / "first.db")
+    second, _ = run_once(tmp_path / "second.db")
+
+    assert first["recent_replay"]["selected"] == expected["recent"]
+    assert first["remote_integration"]["selected"] == expected["remote"]
+    assert first["recent_replay"]["replayed"] == expected["recent"]
+    assert first["remote_integration"]["replayed"] == expected["remote"]
+    assert set(first["recent_replay"]["selected"]).isdisjoint(
+        first["remote_integration"]["selected"]
+    )
+    assert expected["negative"].isdisjoint(first["recent_replay"]["selected"])
+    assert expected["negative"].isdisjoint(first["remote_integration"]["selected"])
+    assert first["recent_replay"]["selected"] == second["recent_replay"]["selected"]
+    assert first["remote_integration"]["selected"] == second["remote_integration"]["selected"]
+
+
+def test_sleep_replay_policy_rejects_unsafe_budgets():
+    from plugins.memory.ebbinghaus.policies import PolicyConfigError, SleepPolicy
+
+    with pytest.raises(PolicyConfigError, match="recent_replay_limit must be <= 32"):
+        SleepPolicy(recent_replay_limit=33)
+    with pytest.raises(PolicyConfigError, match="remote_integration_limit must be <= 32"):
+        SleepPolicy(remote_integration_limit=33)
+    with pytest.raises(PolicyConfigError, match="max_negative_replay_per_budget"):
+        SleepPolicy(
+            recent_replay_limit=1,
+            remote_integration_limit=1,
+            max_negative_replay_per_budget=2,
+        )
 
 
 def test_protected_capacity_error(tmp_path):
@@ -527,6 +695,9 @@ def test_plugin_config_defaults_and_tool_overrides(tmp_path):
                 "forget_threshold": 0.15,
                 "salience_keep_threshold": 0.85,
                 "prune_mode": "archive",
+                "recent_replay_limit": 2,
+                "remote_integration_limit": 1,
+                "max_negative_replay_per_budget": 0,
             },
         }
     )
@@ -534,6 +705,9 @@ def test_plugin_config_defaults_and_tool_overrides(tmp_path):
     defaults = provider._sleep_defaults()
     assert defaults["limit"] == 7
     assert defaults["rehearse_threshold"] == 0.4
+    assert defaults["recent_replay_limit"] == 2
+    assert defaults["remote_integration_limit"] == 1
+    assert defaults["max_negative_replay_per_budget"] == 0
     result = json.loads(
         provider.handle_tool_call(
             "ebbinghaus_memory",

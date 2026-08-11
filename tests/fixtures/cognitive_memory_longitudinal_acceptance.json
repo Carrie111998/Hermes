@@ -1,0 +1,76 @@
+{
+  "fixture_schema_version": 1,
+  "artifact_schema_version": 1,
+  "seed": 20260812,
+  "top_k": 8,
+  "max_context_chars": 3500,
+  "soak_repetitions": 3,
+  "active_gate_state": "HOLD",
+  "required_scenarios": {
+    "A": "ordinary_fact_recall",
+    "B": "temporal_update_and_history",
+    "C": "latent_cue_rescue",
+    "D": "bounded_graph_multi_hop",
+    "E": "irrelevant_query_abstention",
+    "F": "correction_and_dependent_contesting",
+    "G": "dream_semantic_provenance",
+    "H": "untrusted_instruction_lifecycle",
+    "I": "implicit_constraint_tool_grounding",
+    "J": "embedding_unavailable_lexical_fallback",
+    "K": "stale_projection_base_rank_fallback",
+    "L": "embedding_namespace_isolation"
+  },
+  "negative_queries": [
+    "chlorophyll photon conversion",
+    "medieval cathedral buttress",
+    "ocean salinity thermocline",
+    "volcanic basalt crystallization"
+  ],
+  "action_case": {
+    "task": "plan local embedding benchmark",
+    "expected_tool": "terminal",
+    "memories": [
+      {
+        "key": "local_only",
+        "text": "Embedding benchmarks must use local-only processing."
+      },
+      {
+        "key": "gpu",
+        "text": "The current GPU is an RTX 5060 Ti with 16GB VRAM."
+      },
+      {
+        "key": "embedding_endpoint",
+        "text": "The local embedding endpoint is 127.0.0.1:8082."
+      },
+      {
+        "key": "generation_endpoint",
+        "text": "The separate generation endpoint is 127.0.0.1:8080 and is not for embeddings."
+      },
+      {
+        "key": "gpu_schedule",
+        "text": "Embedding work must mention shared GPU scheduling."
+      },
+      {
+        "key": "temporary_database",
+        "text": "Benchmarks must use a temporary database and never mutate production data."
+      }
+    ],
+    "expected_parameters": {
+      "embedding_endpoint": "127.0.0.1:8082",
+      "excluded_generation_endpoint": "127.0.0.1:8080",
+      "gpu_device": "RTX 5060 Ti 16GB",
+      "remote_api": false,
+      "shared_gpu_scheduling": true,
+      "production_db_mutation": false
+    }
+  },
+  "thresholds": {
+    "recall_at_8": 1.0,
+    "mrr_at_8": 0.75,
+    "ndcg_at_8": 0.8,
+    "negative_false_recall_rate": 0.0,
+    "negative_no_result_precision": 1.0,
+    "memory_to_action_tool_selection_accuracy": 1.0,
+    "memory_to_action_parameter_grounding_accuracy": 1.0
+  }
+}

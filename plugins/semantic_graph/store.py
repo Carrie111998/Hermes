@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sqlite3
 import threading
@@ -25,7 +26,7 @@ from .embedding.vectors import (
 
 logger = logging.getLogger("hermes.plugins.semantic_graph")
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 GRAPH_SCHEMA_VERSION = 1
 # Backwards-compatible alias retained for existing importers.
 SCHEMA_VERSION = DB_SCHEMA_VERSION
@@ -251,10 +252,64 @@ MIGRATION_V2_STATEMENTS = (
     """,
 )
 
+MIGRATION_V3_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS memory_node_links (
+        memory_id INTEGER NOT NULL CHECK(memory_id > 0),
+        node_id TEXT NOT NULL,
+        belief_id TEXT NOT NULL DEFAULT '',
+        belief_version INTEGER NOT NULL DEFAULT 1 CHECK(belief_version > 0),
+        relation TEXT NOT NULL DEFAULT 'represents',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(memory_id, node_id, relation),
+        FOREIGN KEY(node_id) REFERENCES nodes(node_id) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory_node_links_node
+        ON memory_node_links(node_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_memory_node_links_belief
+        ON memory_node_links(belief_id, belief_version)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS memory_state_cache (
+        memory_id INTEGER PRIMARY KEY CHECK(memory_id > 0),
+        belief_id TEXT NOT NULL DEFAULT '',
+        belief_version INTEGER NOT NULL DEFAULT 1 CHECK(belief_version > 0),
+        access_state TEXT NOT NULL,
+        belief_status TEXT NOT NULL,
+        memory_state TEXT NOT NULL,
+        retention_at_sync REAL NOT NULL
+            CHECK(retention_at_sync >= 0.0 AND retention_at_sync <= 1.0),
+        stability_days REAL NOT NULL CHECK(stability_days > 0.0),
+        salience REAL NOT NULL CHECK(salience >= 0.0 AND salience <= 1.0),
+        valence REAL NOT NULL CHECK(valence >= -1.0 AND valence <= 1.0),
+        confidence REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
+        protected INTEGER NOT NULL DEFAULT 0 CHECK(protected IN (0, 1)),
+        source_updated_at REAL NOT NULL,
+        synced_at REAL NOT NULL
+    )
+    """,
+)
+
 _NODE_EMBEDDING_COLUMNS = {
     "node_id", "namespace", "provider", "model", "revision",
     "serializer_version", "dimensions", "dtype", "vector_blob",
     "source_text_hash", "created_at", "updated_at",
+}
+
+_MEMORY_NODE_LINK_COLUMNS = {
+    "memory_id", "node_id", "belief_id", "belief_version", "relation",
+    "created_at", "updated_at",
+}
+_MEMORY_STATE_CACHE_COLUMNS = {
+    "memory_id", "belief_id", "belief_version", "access_state",
+    "belief_status", "memory_state", "retention_at_sync", "stability_days",
+    "salience", "valence", "confidence", "protected", "source_updated_at",
+    "synced_at",
 }
 
 
@@ -350,6 +405,13 @@ class SemanticGraphStore:
                 target_version=2,
                 statements=MIGRATION_V2_STATEMENTS,
             )
+            version = 2
+        if version < 3:
+            self._apply_migration(
+                conn,
+                target_version=3,
+                statements=MIGRATION_V3_STATEMENTS,
+            )
 
         self._detect_fts(conn)
 
@@ -375,6 +437,8 @@ class SemanticGraphStore:
             for statement in statements:
                 conn.execute(statement)
             self._validate_node_embeddings_schema(conn)
+            if target_version >= 3:
+                self._validate_cognitive_memory_schema(conn)
             conn.execute(f"PRAGMA user_version = {int(target_version)}")
             conn.execute("COMMIT")
         except Exception:
@@ -430,6 +494,52 @@ class SemanticGraphStore:
                 "node_embeddings must reference nodes(node_id) with ON DELETE CASCADE"
             )
 
+    def _validate_cognitive_memory_schema(self, conn: sqlite3.Connection) -> None:
+        for table, expected in (
+            ("memory_node_links", _MEMORY_NODE_LINK_COLUMNS),
+            ("memory_state_cache", _MEMORY_STATE_CACHE_COLUMNS),
+        ):
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            actual = {str(row["name"]) for row in rows}
+            if actual != expected:
+                raise RuntimeError(
+                    f"invalid {table} schema: "
+                    f"missing={sorted(expected - actual)}, "
+                    f"extra={sorted(actual - expected)}"
+                )
+
+        link_rows = conn.execute("PRAGMA table_info(memory_node_links)").fetchall()
+        link_pk = sorted(
+            (int(row["pk"]), str(row["name"]))
+            for row in link_rows
+            if int(row["pk"])
+        )
+        if link_pk != [
+            (1, "memory_id"),
+            (2, "node_id"),
+            (3, "relation"),
+        ]:
+            raise RuntimeError(
+                "memory_node_links must have "
+                "PRIMARY KEY(memory_id, node_id, relation)"
+            )
+
+        fk_rows = conn.execute(
+            "PRAGMA foreign_key_list(memory_node_links)"
+        ).fetchall()
+        has_node_fk = any(
+            str(row["table"]) == "nodes"
+            and str(row["from"]) == "node_id"
+            and str(row["to"]) == "node_id"
+            and str(row["on_delete"]).upper() == "CASCADE"
+            for row in fk_rows
+        )
+        if not has_node_fk:
+            raise RuntimeError(
+                "memory_node_links must reference "
+                "nodes(node_id) with ON DELETE CASCADE"
+            )
+
     def _detect_fts(self, conn: sqlite3.Connection) -> None:
         row = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='nodes_fts'"
@@ -453,6 +563,8 @@ class SemanticGraphStore:
                 "artifacts": _c("artifacts"),
                 "fragments": _c("fragments"),
                 "evaluations": _c("evaluations"),
+                "memory_node_links": _c("memory_node_links"),
+                "memory_state_cache": _c("memory_state_cache"),
             }
 
     def create_run(
@@ -999,6 +1111,151 @@ class SemanticGraphStore:
                                 "similarity": score, "source_text_hash": row["source_text_hash"]})
         results.sort(key=lambda item: (-float(item["similarity"]), str(item["node_id"])))
         return results[:top_k]
+
+    def upsert_memory_node_link(self, link: dict[str, Any]) -> None:
+        self.ensure_ready()
+        memory_id = int(link["memory_id"])
+        belief_version = int(link.get("belief_version", 1))
+        if memory_id <= 0 or belief_version <= 0:
+            raise ValueError("memory_id and belief_version must be positive")
+        node_id = str(link["node_id"])
+        belief_id = str(link.get("belief_id", ""))
+        if not node_id or "\x00" in node_id or len(node_id) > 128:
+            raise ValueError("memory node link node_id must be a valid opaque identifier")
+        if not belief_id or "\x00" in belief_id or len(belief_id) > 256:
+            raise ValueError("memory node link belief_id must be a valid opaque identifier")
+        relation = sanitize_value(
+            link.get("relation", "represents"),
+            max_chars=64,
+        )
+        now = _utcnow()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_node_links(
+                    memory_id, node_id, belief_id, belief_version, relation,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id, node_id, relation) DO UPDATE SET
+                    belief_id = excluded.belief_id,
+                    belief_version = excluded.belief_version,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    memory_id,
+                    node_id,
+                    belief_id,
+                    belief_version,
+                    relation,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_memory_node_links(
+        self,
+        *,
+        memory_id: int | None = None,
+        node_id: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        self.ensure_ready()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if memory_id is not None:
+            clauses.append("memory_id = ?")
+            params.append(int(memory_id))
+        if node_id is not None:
+            clauses.append("node_id = ?")
+            params.append(str(node_id))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_node_links"
+                f"{where} ORDER BY memory_id, node_id, relation LIMIT ?",
+                (*params, max(1, int(limit))),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_memory_state_cache(self, state: dict[str, Any]) -> None:
+        self.ensure_ready()
+        memory_id = int(state["memory_id"])
+        belief_version = int(state.get("belief_version", 1))
+        if memory_id <= 0 or belief_version <= 0:
+            raise ValueError("memory_id and belief_version must be positive")
+        numeric: dict[str, float] = {}
+        for key in (
+            "retention_at_sync",
+            "stability_days",
+            "salience",
+            "valence",
+            "confidence",
+            "source_updated_at",
+            "synced_at",
+        ):
+            value = float(state[key])
+            if not math.isfinite(value):
+                raise ValueError(f"{key} must be finite")
+            numeric[key] = value
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_state_cache(
+                    memory_id, belief_id, belief_version, access_state,
+                    belief_status, memory_state, retention_at_sync,
+                    stability_days, salience, valence, confidence, protected,
+                    source_updated_at, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET
+                    belief_id = excluded.belief_id,
+                    belief_version = excluded.belief_version,
+                    access_state = excluded.access_state,
+                    belief_status = excluded.belief_status,
+                    memory_state = excluded.memory_state,
+                    retention_at_sync = excluded.retention_at_sync,
+                    stability_days = excluded.stability_days,
+                    salience = excluded.salience,
+                    valence = excluded.valence,
+                    confidence = excluded.confidence,
+                    protected = excluded.protected,
+                    source_updated_at = excluded.source_updated_at,
+                    synced_at = excluded.synced_at
+                """,
+                (
+                    memory_id,
+                    sanitize_value(state.get("belief_id", ""), max_chars=256),
+                    belief_version,
+                    sanitize_value(state["access_state"], max_chars=32),
+                    sanitize_value(state["belief_status"], max_chars=32),
+                    sanitize_value(state["memory_state"], max_chars=32),
+                    numeric["retention_at_sync"],
+                    numeric["stability_days"],
+                    numeric["salience"],
+                    numeric["valence"],
+                    numeric["confidence"],
+                    int(bool(state.get("protected", False))),
+                    numeric["source_updated_at"],
+                    numeric["synced_at"],
+                ),
+            )
+
+    def get_memory_state_cache(self, memory_id: int) -> Optional[dict[str, Any]]:
+        self.ensure_ready()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM memory_state_cache WHERE memory_id = ?",
+                (int(memory_id),),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_memory_state_cache(self, *, limit: int = 5000) -> list[dict[str, Any]]:
+        self.ensure_ready()
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM memory_state_cache ORDER BY memory_id LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def get_edge(self, edge_id: str) -> Optional[dict[str, Any]]:
         self.ensure_ready()

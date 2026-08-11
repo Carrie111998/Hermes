@@ -6,17 +6,31 @@ import hashlib
 import json
 import logging
 import uuid
+from collections.abc import Sequence
 from typing import Any, Optional
 
 from . import graph as _graph
+from .abstention import decide_abstention, extract_retrieval_features
 from .config import SemanticGraphConfig, load_config
+from .cognitive import activate_cognitive_rerank, observe_cognitive_rerank
+from .embedding import (
+    EmbeddingBackend,
+    EmbeddingBackendError,
+    LlamaCppEmbeddingBackend,
+    serialize_embedding_node,
+    source_text_hash,
+)
 from .exporter import ExportPathError, export_graph
 from .inference import SemanticGraphInference, SemanticGraphInferenceError
-from .retrieval import render_context, search_and_rank
+from .retrieval import hybrid_search_and_rank, render_context
 from .sanitize import normalize_text, sanitize_metadata, sanitize_text
 from .store import SemanticGraphStore, new_id
 
 logger = logging.getLogger("hermes.plugins.semantic_graph")
+
+_EMBEDDING_BACKFILL_BATCH_SIZE = 16
+_POST_TURN_EMBED_LIMIT = 3
+_POST_TURN_EMBED_SCAN_LIMIT = 32
 
 
 def _json(payload: dict[str, Any]) -> str:
@@ -34,6 +48,10 @@ class SemanticGraphRuntime:
         self._store: Optional[SemanticGraphStore] = None
         self._inference = SemanticGraphInference(llm=llm)
         self._turn_seen: set[str] = set()
+        self._embedding_backend: EmbeddingBackend | None = None
+        self._embedding_backend_initialized = False
+        self._embedding_backend_error = ""
+        self._cognitive_bridge: Any = None
 
     def check_available(self) -> bool:
         return True
@@ -47,6 +65,100 @@ class SemanticGraphRuntime:
             self._store = SemanticGraphStore(self._config.db_path())
             self._store.ensure_ready()
         return self._store
+
+    def _get_embedding_backend(self) -> EmbeddingBackend | None:
+        if not self._config.embedding.enabled:
+            return None
+        if self._embedding_backend_initialized:
+            return self._embedding_backend
+        self._embedding_backend_initialized = True
+        cfg = self._config.embedding
+        try:
+            self._embedding_backend = LlamaCppEmbeddingBackend(
+                endpoint=cfg.endpoint,
+                model=cfg.model,
+                revision=cfg.revision,
+                dimensions=cfg.dimensions,
+                serializer_version=cfg.serializer_version,
+                timeout_seconds=cfg.timeout_seconds,
+                allow_remote=cfg.allow_remote,
+            )
+        except (EmbeddingBackendError, ValueError) as exc:
+            self._embedding_backend_error = str(exc)
+            logger.warning("semantic-graph embedding backend unavailable: %s", exc)
+        return self._embedding_backend
+
+    def _get_cognitive_bridge(self) -> Any:
+        if self._cognitive_bridge is None:
+            from plugins.memory.ebbinghaus.semantic_graph_bridge import (
+                EbbinghausSemanticGraphBridge,
+            )
+
+            if self._store is None:
+                self._store = SemanticGraphStore(self._config.db_path())
+            self._cognitive_bridge = EbbinghausSemanticGraphBridge(self._store)
+        return self._cognitive_bridge
+
+    def _apply_cognitive_retrieval(
+        self,
+        hits: list[dict[str, Any]],
+        *,
+        query_mode: str,
+        query_length: int,
+    ) -> list[dict[str, Any]]:
+        config = self._config.cognitive_memory
+        if (
+            not hits
+            or not config.rerank_enabled
+            or config.mode not in {"shadow", "active"}
+        ):
+            return hits
+        try:
+            from plugins.memory.ebbinghaus.semantic_graph_bridge import (
+                project_retention,
+            )
+
+            store = self.store()
+            links_by_node: dict[str, list[dict[str, Any]]] = {}
+            states_by_memory: dict[int, dict[str, Any]] = {}
+            for hit in hits:
+                node_id = str(hit.get("node_id") or "")
+                links = store.get_memory_node_links(node_id=node_id, limit=100)
+                links_by_node[node_id] = links
+                for link in links:
+                    memory_id = int(link["memory_id"])
+                    if memory_id in states_by_memory:
+                        continue
+                    cache = store.get_memory_state_cache(memory_id)
+                    if cache is None:
+                        continue
+                    state = dict(cache)
+                    state["projected_retention"] = project_retention(
+                        cache,
+                        expected_belief_version=int(link["belief_version"]),
+                    )
+                    states_by_memory[memory_id] = state
+            observed = observe_cognitive_rerank(
+                hits,
+                links_by_node=links_by_node,
+                states_by_memory=states_by_memory,
+                query_mode=query_mode,
+            )
+            if config.mode == "shadow":
+                return observed
+            active = activate_cognitive_rerank(observed)
+            if not active or not config.abstention_enabled:
+                return active
+            features = extract_retrieval_features(
+                active,
+                query_length=query_length,
+            )
+            if decide_abstention(features)["abstain"]:
+                return []
+            return active
+        except Exception as exc:
+            logger.warning("semantic-graph cognitive retrieval failed open: %s", exc)
+            return hits
 
     # ------------------------------------------------------------------ tools
 
@@ -63,6 +175,315 @@ class SemanticGraphRuntime:
                     "auto_extract": self._config.auto_extract,
                     "retrieval_enabled": self._config.retrieval_enabled,
                 }
+            )
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
+
+    def handle_embedding_status(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        del args
+        cfg = self._config.embedding
+        backend = self._get_embedding_backend()
+        return _json(
+            {
+                "success": True,
+                "enabled": cfg.enabled,
+                "backend": cfg.backend,
+                "endpoint": cfg.endpoint,
+                "model": cfg.model,
+                "revision": cfg.revision,
+                "dimensions": cfg.dimensions,
+                "serializer_version": cfg.serializer_version,
+                "namespace": backend.identity.namespace if backend else None,
+                "available": bool(backend and backend.available()),
+                "availability_scope": "configured_only",
+                "error": self._embedding_backend_error or None,
+            }
+        )
+
+    @staticmethod
+    def _failed_node_ids_hash(node_ids: Sequence[str]) -> str:
+        joined = "\n".join(sorted(set(node_ids)))
+        return hashlib.sha256(joined.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _embedding_source(node: dict[str, Any]) -> tuple[str, str] | None:
+        if node.get("status") in {
+            "candidate",
+            "rejected",
+            "retracted",
+            "superseded",
+        }:
+            return None
+        if node.get("node_type") == "Artifact" and str(
+            node.get("subtype") or ""
+        ).startswith("tool."):
+            return None
+        try:
+            text = serialize_embedding_node(node)
+        except ValueError:
+            return None
+        if "REDACTED" in text:
+            return None
+        return text, source_text_hash(text)
+
+    def _embed_pending_nodes_after_turn(self) -> None:
+        """Embed at most a few recent memory nodes after the answer, fail-open."""
+        if not self._config.embedding.enabled:
+            return
+        try:
+            backend = self._get_embedding_backend()
+            if backend is None:
+                return
+            store = self.store()
+            candidates: list[tuple[str, str, str]] = []
+            for node in store.list_nodes(
+                statuses=list(self._config.recall_statuses),
+                limit=_POST_TURN_EMBED_SCAN_LIMIT,
+            ):
+                if node.get("node_type") == "Actor" or (
+                    node.get("node_type") == "Event"
+                    and node.get("subtype") == "Turn"
+                ):
+                    continue
+                source = self._embedding_source(node)
+                if source is None:
+                    continue
+                text, text_hash = source
+                node_id = str(node["node_id"])
+                if store.get_node_embedding(
+                    node_id=node_id,
+                    namespace=backend.identity.namespace,
+                    expected_source_text_hash=text_hash,
+                ) is not None:
+                    continue
+                candidates.append((node_id, text, text_hash))
+                if len(candidates) >= _POST_TURN_EMBED_LIMIT:
+                    break
+            if not candidates:
+                return
+            vectors = backend.embed_documents([item[1] for item in candidates])
+            if len(vectors) != len(candidates):
+                raise EmbeddingBackendError(
+                    "embedding response count does not match input count"
+                )
+            for (node_id, _text, expected_hash), vector in zip(
+                candidates,
+                vectors,
+            ):
+                current = store.get_node(node_id)
+                current_source = self._embedding_source(current or {})
+                if current_source is None or current_source[1] != expected_hash:
+                    continue
+                store.upsert_node_embedding(
+                    node_id=node_id,
+                    identity=backend.identity,
+                    vector=vector,
+                    source_text_hash=expected_hash,
+                )
+        except Exception as exc:
+            logger.warning(
+                "semantic-graph post-turn embedding failed open: %s",
+                type(exc).__name__,
+            )
+
+    def handle_embedding_backfill(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        args = args or {}
+        try:
+            limit = int(args.get("limit"))
+        except (TypeError, ValueError):
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        if limit <= 0:
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        dry_run = bool(args.get("dry_run"))
+        apply = bool(args.get("apply"))
+        if dry_run == apply:
+            return _json(
+                {"success": False, "error": "choose exactly one of dry_run or apply"}
+            )
+        if not self._config.embedding.enabled:
+            return _json({"success": False, "error": "embedding is disabled"})
+        backend = self._get_embedding_backend()
+        if backend is None:
+            return _json(
+                {
+                    "success": False,
+                    "error": self._embedding_backend_error
+                    or "embedding backend is unavailable",
+                }
+            )
+
+        store = self.store()
+        rows = store.list_nodes(
+            statuses=list(self._config.recall_statuses),
+            limit=min(5000, max(100, limit * 4)),
+        )
+        rows.sort(key=lambda row: str(row.get("node_id") or ""))
+        excluded = 0
+        skipped_existing = 0
+        candidates: list[tuple[dict[str, Any], str, str]] = []
+        for row in rows:
+            source = self._embedding_source(row)
+            if source is None:
+                excluded += 1
+                continue
+            text, text_hash = source
+            node_id = str(row["node_id"])
+            if store.get_node_embedding(
+                node_id=node_id,
+                namespace=backend.identity.namespace,
+                expected_source_text_hash=text_hash,
+            ) is not None:
+                skipped_existing += 1
+                continue
+            candidates.append((row, text, text_hash))
+            if len(candidates) >= limit:
+                break
+
+        result: dict[str, Any] = {
+            "success": True,
+            "dry_run": dry_run,
+            "namespace": backend.identity.namespace,
+            "selected": len(candidates),
+            "would_embed": len(candidates),
+            "embedded": 0,
+            "skipped_existing": skipped_existing,
+            "excluded": excluded,
+            "source_changed": 0,
+            "failed": 0,
+            "failed_node_ids_hash": None,
+        }
+        if dry_run or not candidates:
+            return _json(result)
+
+        failed_node_ids: list[str] = []
+        for offset in range(0, len(candidates), _EMBEDDING_BACKFILL_BATCH_SIZE):
+            batch = candidates[offset : offset + _EMBEDDING_BACKFILL_BATCH_SIZE]
+            try:
+                vectors = backend.embed_documents([item[1] for item in batch])
+                if len(vectors) != len(batch):
+                    raise EmbeddingBackendError(
+                        "embedding response count does not match input count"
+                    )
+            except (EmbeddingBackendError, ValueError, TypeError):
+                failed_node_ids.extend(str(item[0]["node_id"]) for item in batch)
+                continue
+
+            writes: list[tuple[str, Any, str]] = []
+            for (row, _text, expected_hash), vector in zip(batch, vectors):
+                node_id = str(row["node_id"])
+                current = store.get_node(node_id)
+                current_source = self._embedding_source(current or {})
+                if current_source is None or current_source[1] != expected_hash:
+                    result["source_changed"] += 1
+                    failed_node_ids.append(node_id)
+                    continue
+                writes.append((node_id, vector, expected_hash))
+
+            if not writes:
+                continue
+            try:
+                with store.transaction():
+                    for node_id, vector, text_hash in writes:
+                        store.upsert_node_embedding(
+                            node_id=node_id,
+                            identity=backend.identity,
+                            vector=vector,
+                            source_text_hash=text_hash,
+                        )
+            except (EmbeddingBackendError, ValueError, TypeError, KeyError):
+                failed_node_ids.extend(node_id for node_id, _vector, _hash in writes)
+                continue
+            result["embedded"] += len(writes)
+
+        result["failed"] = len(failed_node_ids)
+        if failed_node_ids:
+            result["success"] = False
+            result["failed_node_ids_hash"] = self._failed_node_ids_hash(
+                failed_node_ids
+            )
+        return _json(result)
+
+    def handle_cognitive_status(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        del args
+        config = self._config.cognitive_memory
+        try:
+            status = self._get_cognitive_bridge().status()
+            return _json(
+                {
+                    **status,
+                    "bridge_enabled": config.bridge_enabled,
+                    "rerank_enabled": config.rerank_enabled,
+                    "mode": config.mode,
+                    "abstention_enabled": config.abstention_enabled,
+                }
+            )
+        except Exception as exc:
+            return _json(
+                {
+                    "success": False,
+                    "bridge_enabled": config.bridge_enabled,
+                    "error": str(exc),
+                }
+            )
+
+    def handle_cognitive_sync(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        args = args or {}
+        if not self._config.cognitive_memory.bridge_enabled:
+            return _json({"success": False, "error": "cognitive bridge is disabled"})
+        try:
+            limit = int(args.get("limit"))
+        except (TypeError, ValueError):
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        if limit <= 0:
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        dry_run = bool(args.get("dry_run"))
+        apply = bool(args.get("apply"))
+        if dry_run == apply:
+            return _json(
+                {"success": False, "error": "choose exactly one of dry_run or apply"}
+            )
+        try:
+            return _json(
+                self._get_cognitive_bridge().sync(
+                    limit=limit,
+                    dry_run=dry_run,
+                )
+            )
+        except Exception as exc:
+            return _json({"success": False, "error": str(exc)})
+
+    def handle_cognitive_repair(
+        self, args: Optional[dict] = None, **_kw: Any
+    ) -> str:
+        args = args or {}
+        if not self._config.cognitive_memory.bridge_enabled:
+            return _json({"success": False, "error": "cognitive bridge is disabled"})
+        try:
+            limit = int(args.get("limit"))
+        except (TypeError, ValueError):
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        if limit <= 0:
+            return _json({"success": False, "error": "limit must be a positive integer"})
+        dry_run = bool(args.get("dry_run"))
+        apply = bool(args.get("apply"))
+        if dry_run == apply:
+            return _json(
+                {"success": False, "error": "choose exactly one of dry_run or apply"}
+            )
+        try:
+            return _json(
+                self._get_cognitive_bridge().repair(
+                    limit=limit,
+                    dry_run=dry_run,
+                )
             )
         except Exception as exc:
             return _json({"success": False, "error": str(exc)})
@@ -188,9 +609,11 @@ class SemanticGraphRuntime:
         top_k = max(1, min(20, top_k))
         statuses = args.get("statuses") or list(self._config.recall_statuses)
         try:
-            hits = search_and_rank(
+            hits = hybrid_search_and_rank(
                 self.store(),
                 query,
+                backend=self._get_embedding_backend(),
+                embedding_enabled=self._config.embedding.enabled,
                 top_k=top_k,
                 min_confidence=self._config.min_recall_confidence,
                 statuses=list(statuses),
@@ -198,6 +621,17 @@ class SemanticGraphRuntime:
                 subtypes=args.get("subtypes"),
                 authorities=args.get("authorities"),
                 run_id=args.get("run_id"),
+            )
+            requested_mode = str(args.get("query_mode") or "").strip().lower()
+            query_mode = requested_mode or (
+                "history"
+                if {"rejected", "superseded"} & set(statuses)
+                else "normal"
+            )
+            hits = self._apply_cognitive_retrieval(
+                hits,
+                query_mode=query_mode,
+                query_length=len(query),
             )
             if args.get("include_artifacts"):
                 for hit in hits:
@@ -481,12 +915,19 @@ class SemanticGraphRuntime:
             )
             if len(message.strip()) < 2:
                 return None
-            hits = search_and_rank(
+            hits = hybrid_search_and_rank(
                 self.store(),
                 message,
+                backend=self._get_embedding_backend(),
+                embedding_enabled=self._config.embedding.enabled,
                 top_k=self._config.retrieval_top_k,
                 min_confidence=self._config.min_recall_confidence,
                 statuses=list(self._config.recall_statuses),
+            )
+            hits = self._apply_cognitive_retrieval(
+                hits,
+                query_mode="normal",
+                query_length=len(message),
             )
             ctx = render_context(hits, self._config.retrieval_max_chars)
             if not ctx:
@@ -498,12 +939,13 @@ class SemanticGraphRuntime:
 
     def on_post_llm_call(self, **kwargs: Any) -> None:
         try:
-            if not self._config.capture_turns:
-                return
-            user_message = str(kwargs.get("user_message") or "")
             assistant_response = str(kwargs.get("assistant_response") or "")
             if not assistant_response.strip():
                 return
+            if not self._config.capture_turns:
+                self._embed_pending_nodes_after_turn()
+                return
+            user_message = str(kwargs.get("user_message") or "")
             session_id = str(kwargs.get("session_id") or "")
             turn_id = str(kwargs.get("turn_id") or kwargs.get("task_id") or new_id())
             model = str(kwargs.get("model") or "")
@@ -615,6 +1057,7 @@ class SemanticGraphRuntime:
                     )
                 except Exception as exc:
                     logger.warning("semantic-graph auto_extract failed open: %s", exc)
+            self._embed_pending_nodes_after_turn()
         except Exception as exc:
             logger.warning("semantic-graph post_llm_call failed open: %s", exc)
 

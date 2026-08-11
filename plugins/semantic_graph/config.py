@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -17,9 +18,55 @@ logger = logging.getLogger("hermes.plugins.semantic_graph")
 PLUGIN_ID = "semantic-graph"
 DB_FILENAME = "semantic_graph.db"
 _AUTO_EXTRACT_ALLOWED = frozenset({"off", "explicit", "all"})
+_COGNITIVE_MEMORY_MODES = frozenset({"off", "shadow", "active"})
 
 _warn_lock = threading.Lock()
 _auto_extract_warned = False
+
+
+@dataclass(frozen=True)
+class SemanticGraphEmbeddingConfig:
+    """Typed operator configuration for the single Phase 1 embedding adapter."""
+
+    enabled: bool = False
+    backend: str = "llama_cpp"
+    endpoint: str = "http://127.0.0.1:8082"
+    model: str = "nsfw-bge-m3-v5-q6_k"
+    revision: str = ""
+    dimensions: int = 1024
+    serializer_version: int = 1
+    timeout_seconds: float = 5.0
+    allow_remote: bool = False
+
+    def __post_init__(self) -> None:
+        if self.backend != "llama_cpp":
+            raise ValueError("embedding.backend must be llama_cpp")
+        if not self.endpoint.strip():
+            raise ValueError("embedding.endpoint must not be empty")
+        if not self.model.strip():
+            raise ValueError("embedding.model must not be empty")
+        if isinstance(self.dimensions, bool) or self.dimensions <= 0:
+            raise ValueError("embedding.dimensions must be positive")
+        if isinstance(self.serializer_version, bool) or self.serializer_version <= 0:
+            raise ValueError("embedding.serializer_version must be positive")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0.0:
+            raise ValueError("embedding.timeout_seconds must be positive")
+
+
+@dataclass(frozen=True)
+class SemanticGraphCognitiveMemoryConfig:
+    """Operator-owned cognitive-memory rollout switches."""
+
+    bridge_enabled: bool = False
+    rerank_enabled: bool = False
+    mode: str = "shadow"
+    abstention_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        if self.mode not in _COGNITIVE_MEMORY_MODES:
+            raise ValueError(
+                "cognitive_memory.mode must be off, shadow, or active"
+            )
 
 
 @dataclass(frozen=True)
@@ -40,6 +87,12 @@ class SemanticGraphConfig:
     full_tool_result_allowlist: frozenset[str] = field(default_factory=frozenset)
     tool_capture_denylist: frozenset[str] = field(
         default_factory=lambda: frozenset(DEFAULT_TOOLS)
+    )
+    embedding: SemanticGraphEmbeddingConfig = field(
+        default_factory=SemanticGraphEmbeddingConfig
+    )
+    cognitive_memory: SemanticGraphCognitiveMemoryConfig = field(
+        default_factory=SemanticGraphCognitiveMemoryConfig
     )
 
     def db_path(self) -> Path:
@@ -85,6 +138,32 @@ def _coerce_float(value: Any, default: float) -> float:
         return default
 
 
+def _embedding_positive_int(raw: dict[str, Any], key: str, default: int) -> int:
+    value = raw.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"embedding.{key} must be positive")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"embedding.{key} must be positive") from exc
+    if result <= 0:
+        raise ValueError(f"embedding.{key} must be positive")
+    return result
+
+
+def _embedding_positive_float(raw: dict[str, Any], key: str, default: float) -> float:
+    value = raw.get(key, default)
+    if isinstance(value, bool):
+        raise ValueError(f"embedding.{key} must be positive")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"embedding.{key} must be positive") from exc
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"embedding.{key} must be positive")
+    return result
+
+
 def _raw_plugin_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config_readonly
@@ -124,6 +203,51 @@ def load_config(overrides: dict[str, Any] | None = None) -> SemanticGraphConfig:
     if not isinstance(allowlist, (list, tuple)):
         allowlist = []
 
+    embedding_raw = raw.get("embedding") or {}
+    if not isinstance(embedding_raw, dict):
+        raise ValueError("embedding must be a mapping")
+    embedding = SemanticGraphEmbeddingConfig(
+        enabled=_coerce_bool(embedding_raw.get("enabled"), False),
+        backend=str(embedding_raw.get("backend") or "llama_cpp").strip(),
+        endpoint=str(
+            embedding_raw.get("endpoint") or "http://127.0.0.1:8082"
+        ).strip(),
+        model=str(embedding_raw.get("model") or "nsfw-bge-m3-v5-q6_k").strip(),
+        revision=str(embedding_raw.get("revision") or "").strip(),
+        dimensions=_embedding_positive_int(embedding_raw, "dimensions", 1024),
+        serializer_version=_embedding_positive_int(
+            embedding_raw,
+            "serializer_version",
+            1,
+        ),
+        timeout_seconds=_embedding_positive_float(
+            embedding_raw,
+            "timeout_seconds",
+            5.0,
+        ),
+        allow_remote=_coerce_bool(embedding_raw.get("allow_remote"), False),
+    )
+
+    cognitive_raw = raw.get("cognitive_memory") or {}
+    if not isinstance(cognitive_raw, dict):
+        raise ValueError("cognitive_memory must be a mapping")
+    cognitive_mode = str(cognitive_raw.get("mode") or "shadow").strip().lower()
+    cognitive_memory = SemanticGraphCognitiveMemoryConfig(
+        bridge_enabled=_coerce_bool(
+            cognitive_raw.get("bridge_enabled"),
+            False,
+        ),
+        rerank_enabled=_coerce_bool(
+            cognitive_raw.get("rerank_enabled"),
+            False,
+        ),
+        mode=cognitive_mode,
+        abstention_enabled=_coerce_bool(
+            cognitive_raw.get("abstention_enabled"),
+            False,
+        ),
+    )
+
     return SemanticGraphConfig(
         db_subdir=str(raw.get("db_subdir") or "semantic-graph"),
         capture_turns=_coerce_bool(raw.get("capture_turns"), True),
@@ -144,4 +268,6 @@ def load_config(overrides: dict[str, Any] | None = None) -> SemanticGraphConfig:
         recall_statuses=tuple(str(x) for x in recall),
         full_tool_result_allowlist=frozenset(str(x) for x in allowlist),
         tool_capture_denylist=frozenset(denylist),
+        embedding=embedding,
+        cognitive_memory=cognitive_memory,
     )

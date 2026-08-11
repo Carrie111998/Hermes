@@ -7,11 +7,45 @@ import json
 from typing import Any
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def register_cli(ctx: Any, runtime: Any) -> None:
     def setup_fn(parser: argparse.ArgumentParser) -> None:
         subs = parser.add_subparsers(dest="semantic_graph_command", required=True)
 
         subs.add_parser("status", help="Show DB path, schema, FTS, and counts")
+        subs.add_parser(
+            "embedding-status",
+            help="Show configured embedding backend and namespace",
+        )
+
+        backfill = subs.add_parser(
+            "embedding-backfill",
+            help="Explicitly inspect or apply a bounded embedding backfill",
+        )
+        backfill.add_argument("--limit", type=_positive_int, required=True)
+        mode = backfill.add_mutually_exclusive_group(required=True)
+        mode.add_argument("--dry-run", action="store_true")
+        mode.add_argument("--apply", action="store_true")
+
+        subs.add_parser(
+            "cognitive-status",
+            help="Show Ebbinghaus bridge and projection status",
+        )
+        for name, help_text in (
+            ("cognitive-sync", "Explicitly sync Ebbinghaus memories to the graph"),
+            ("cognitive-repair", "Retry pending Ebbinghaus bridge events"),
+        ):
+            operation = subs.add_parser(name, help=help_text)
+            operation.add_argument("--limit", type=_positive_int, required=True)
+            operation_mode = operation.add_mutually_exclusive_group(required=True)
+            operation_mode.add_argument("--dry-run", action="store_true")
+            operation_mode.add_argument("--apply", action="store_true")
 
         search = subs.add_parser("search", help="Search graph nodes")
         search.add_argument("query")
@@ -42,6 +76,34 @@ def register_cli(ctx: Any, runtime: Any) -> None:
         cmd = getattr(args, "semantic_graph_command", None)
         if cmd == "status":
             print(runtime.handle_status({}))
+            return 0
+        if cmd == "embedding-status":
+            print(runtime.handle_embedding_status({}))
+            return 0
+        if cmd == "embedding-backfill":
+            print(
+                runtime.handle_embedding_backfill(
+                    {
+                        "limit": int(args.limit),
+                        "dry_run": bool(args.dry_run),
+                        "apply": bool(args.apply),
+                    }
+                )
+            )
+            return 0
+        if cmd == "cognitive-status":
+            print(runtime.handle_cognitive_status({}))
+            return 0
+        if cmd in {"cognitive-sync", "cognitive-repair"}:
+            payload = {
+                "limit": int(args.limit),
+                "dry_run": bool(args.dry_run),
+                "apply": bool(args.apply),
+            }
+            if cmd == "cognitive-sync":
+                print(runtime.handle_cognitive_sync(payload))
+            else:
+                print(runtime.handle_cognitive_repair(payload))
             return 0
         if cmd == "search":
             print(

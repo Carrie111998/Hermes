@@ -62,6 +62,8 @@ EBBINGHAUS_MEMORY_SCHEMA = {
                     "stats",
                     "dream",
                     "revise",
+                    "prediction_error",
+                    "stabilize",
                     "retract",
                     "history",
                     "events",
@@ -100,6 +102,34 @@ EBBINGHAUS_MEMORY_SCHEMA = {
             "test_query": {
                 "type": "string",
                 "description": "Correction rehearsal probe query for revise.",
+            },
+            "source": {
+                "type": "string",
+                "description": "Provenance source for remember, revise, or prediction_error.",
+            },
+            "expected_hash": {
+                "type": "string",
+                "description": "SHA-256 of the expected observation for prediction_error.",
+            },
+            "observed_hash": {
+                "type": "string",
+                "description": "SHA-256 of the observed outcome for prediction_error.",
+            },
+            "severity": {
+                "type": "number",
+                "description": "Prediction error severity from 0.0 to 1.0.",
+            },
+            "requires_revision": {
+                "type": "boolean",
+                "description": "Whether prediction_error should create a new belief version.",
+            },
+            "evidence_type": {
+                "type": "string",
+                "description": "Validated evidence class for stabilize.",
+            },
+            "evidence_hash": {
+                "type": "string",
+                "description": "SHA-256 of the evidence used for stabilize.",
             },
             "allow_rescue": {
                 "type": "boolean",
@@ -267,6 +297,7 @@ class EbbinghausMemoryProvider(MemoryProvider):
             logger.error("Invalid Ebbinghaus plugin config: %s", exc)
             raise
         self._store: EbbinghausMemoryStore | None = None
+        self._bridge: Any = None
         self._session_id = ""
         self._max_prefetch = int(self._policies.max_prefetch)
         self._min_prefetch_score = float(self._policies.min_prefetch_score)
@@ -320,7 +351,71 @@ class EbbinghausMemoryProvider(MemoryProvider):
             db_path,
             policies=self._policies,
         )
+        try:
+            from plugins.semantic_graph.config import load_config
+            from plugins.semantic_graph.store import SemanticGraphStore
+
+            from .semantic_graph_bridge import (
+                EbbinghausSemanticGraphBridge,
+                bridge_is_enabled,
+            )
+
+            if bridge_is_enabled():
+                graph_config = load_config()
+                self._bridge = EbbinghausSemanticGraphBridge(
+                    SemanticGraphStore(graph_config.db_path()),
+                    memory_store=self._store,
+                )
+        except Exception as exc:
+            logger.warning(
+                "Ebbinghaus semantic graph bridge initialization skipped: %s",
+                type(exc).__name__,
+            )
         self._session_id = session_id
+
+    def _bridge_remember(self, result: dict[str, Any]) -> None:
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.after_remember(result)
+        except Exception as exc:
+            logger.warning(
+                "Ebbinghaus remember bridge invocation failed: %s",
+                type(exc).__name__,
+            )
+
+    def _bridge_revision(self, result: dict[str, Any]) -> None:
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.after_revision(result)
+        except Exception as exc:
+            logger.warning(
+                "Ebbinghaus revision bridge invocation failed: %s",
+                type(exc).__name__,
+            )
+
+    def _bridge_retraction(self, result: dict[str, Any]) -> None:
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.after_retraction(result)
+        except Exception as exc:
+            logger.warning(
+                "Ebbinghaus retraction bridge invocation failed: %s",
+                type(exc).__name__,
+            )
+
+    def _bridge_dream(self, result: dict[str, Any]) -> None:
+        if self._bridge is None:
+            return
+        try:
+            self._bridge.after_dream_apply(result)
+        except Exception as exc:
+            logger.warning(
+                "Ebbinghaus dream bridge invocation failed: %s",
+                type(exc).__name__,
+            )
 
     def system_prompt_block(self) -> str:
         if not self._store:
@@ -390,13 +485,14 @@ class EbbinghausMemoryProvider(MemoryProvider):
             return
         for content, salience in _extract_candidate_memories(user_content):
             try:
-                self._store.remember(
+                result = self._store.remember(
                     content,
                     tags=["auto", "user"],
                     salience=salience,
                     source="sync_turn",
                     session_id=session_id or self._session_id,
                 )
+                self._bridge_remember(result)
             except Exception as exc:
                 logger.debug("Ebbinghaus sync_turn encode failed: %s", exc)
 
@@ -411,13 +507,14 @@ class EbbinghausMemoryProvider(MemoryProvider):
                 continue
             for memory, salience in _extract_candidate_memories(content):
                 try:
-                    self._store.remember(
+                    result = self._store.remember(
                         memory,
                         tags=["auto", "session"],
                         salience=salience,
                         source="session_end",
                         session_id=self._session_id,
                     )
+                    self._bridge_remember(result)
                 except Exception as exc:
                     logger.debug("Ebbinghaus session encode failed: %s", exc)
 
@@ -435,13 +532,14 @@ class EbbinghausMemoryProvider(MemoryProvider):
             tags = ["built-in-memory", target]
             if metadata.get("platform"):
                 tags.append(str(metadata["platform"]))
-            self._store.remember(
+            result = self._store.remember(
                 content,
                 tags=tags,
                 salience=0.8 if target == "user" else 0.7,
                 source="memory_tool",
                 session_id=str(metadata.get("session_id") or self._session_id),
             )
+            self._bridge_remember(result)
         except Exception as exc:
             logger.debug("Ebbinghaus memory_write mirror failed: %s", exc)
 
@@ -458,6 +556,11 @@ class EbbinghausMemoryProvider(MemoryProvider):
             "prune_mode": sleep.prune_mode,
             "max_sleep_rehearsals": sleep.max_sleep_rehearsals,
             "max_negative_sleep_rehearsals": sleep.max_negative_sleep_rehearsals,
+            "recent_replay_limit": sleep.recent_replay_limit,
+            "remote_integration_limit": sleep.remote_integration_limit,
+            "max_negative_replay_per_budget": (
+                sleep.max_negative_replay_per_budget
+            ),
         }
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -468,15 +571,17 @@ class EbbinghausMemoryProvider(MemoryProvider):
         try:
             action = str(args.get("action", "")).lower()
             if action == "remember":
+                result = self._store.remember(
+                    args.get("content", ""),
+                    tags=args.get("tags"),
+                    salience=float(args.get("salience", 0.65)),
+                    valence=float(args.get("valence", 0.0)),
+                    source=str(args.get("source", "tool")),
+                    session_id=self._session_id,
+                )
+                self._bridge_remember(result)
                 return json.dumps(
-                    self._store.remember(
-                        args.get("content", ""),
-                        tags=args.get("tags"),
-                        salience=float(args.get("salience", 0.65)),
-                        valence=float(args.get("valence", 0.0)),
-                        source=str(args.get("source", "tool")),
-                        session_id=self._session_id,
-                    ),
+                    result,
                     ensure_ascii=False,
                 )
             if action == "recall":
@@ -508,26 +613,57 @@ class EbbinghausMemoryProvider(MemoryProvider):
                     )
                 return json.dumps({"results": attempt.results}, ensure_ascii=False)
             if action == "revise":
+                result = self._store.revise_memory(
+                    int(args["memory_id"]),
+                    str(args.get("new_content") or args.get("content") or ""),
+                    reason=str(args.get("reason") or ""),
+                    evidence=args.get("evidence") or [],
+                    confidence=float(args.get("confidence", 0.95)),
+                    test_query=str(args.get("test_query") or ""),
+                    source=str(args.get("source") or "explicit_correction"),
+                    session_id=self._session_id,
+                )
+                self._bridge_revision(result)
                 return json.dumps(
-                    self._store.revise_memory(
-                        int(args["memory_id"]),
-                        str(args.get("new_content") or args.get("content") or ""),
-                        reason=str(args.get("reason") or ""),
-                        evidence=args.get("evidence") or [],
-                        confidence=float(args.get("confidence", 0.95)),
-                        test_query=str(args.get("test_query") or ""),
-                        source=str(args.get("source") or "explicit_correction"),
-                        session_id=self._session_id,
-                    ),
+                    result,
                     ensure_ascii=False,
                 )
+            if action == "prediction_error":
+                confidence = args.get("confidence")
+                result = self._store.record_prediction_error(
+                    int(args["memory_id"]),
+                    source=str(args.get("source") or ""),
+                    expected_hash=str(args.get("expected_hash") or ""),
+                    observed_hash=str(args.get("observed_hash") or ""),
+                    severity=float(args.get("severity", 0.0)),
+                    requires_revision=bool(args.get("requires_revision", False)),
+                    new_content=str(args.get("new_content") or ""),
+                    reason=str(args.get("reason") or ""),
+                    confidence=(None if confidence is None else float(confidence)),
+                    test_query=str(args.get("test_query") or ""),
+                    session_id=self._session_id,
+                )
+                revision = result.get("revision")
+                if isinstance(revision, dict):
+                    self._bridge_revision(revision)
+                return json.dumps(result, ensure_ascii=False)
+            if action == "stabilize":
+                result = self._store.stabilize_memory(
+                    int(args["memory_id"]),
+                    evidence_type=str(args.get("evidence_type") or ""),
+                    evidence_hash=str(args.get("evidence_hash") or ""),
+                    session_id=self._session_id,
+                )
+                return json.dumps(result, ensure_ascii=False)
             if action == "retract":
+                result = self._store.retract_memory(
+                    int(args["memory_id"]),
+                    reason=str(args.get("reason") or ""),
+                    session_id=self._session_id,
+                )
+                self._bridge_retraction(result)
                 return json.dumps(
-                    self._store.retract_memory(
-                        int(args["memory_id"]),
-                        reason=str(args.get("reason") or ""),
-                        session_id=self._session_id,
-                    ),
+                    result,
                     ensure_ascii=False,
                 )
             if action == "history":
@@ -570,14 +706,19 @@ class EbbinghausMemoryProvider(MemoryProvider):
                     ensure_ascii=False,
                 )
             if action == "insight_validate":
+                result = self._store.validate_insight(
+                    candidate_id=str(args.get("candidate_id") or ""),
+                    validation_method=str(args.get("validation_method") or "manual"),
+                    evidence=args.get("evidence") or [],
+                    validated_confidence=float(args.get("confidence", 0.8)),
+                    summary=str(args.get("summary") or ""),
+                )
+                if result.get("promoted_memory_id") is not None:
+                    self._bridge_remember(
+                        {"memory_id": int(result["promoted_memory_id"])}
+                    )
                 return json.dumps(
-                    self._store.validate_insight(
-                        candidate_id=str(args.get("candidate_id") or ""),
-                        validation_method=str(args.get("validation_method") or "manual"),
-                        evidence=args.get("evidence") or [],
-                        validated_confidence=float(args.get("confidence", 0.8)),
-                        summary=str(args.get("summary") or ""),
-                    ),
+                    result,
                     ensure_ascii=False,
                 )
             if action == "insight_reject":
@@ -670,10 +811,9 @@ class EbbinghausMemoryProvider(MemoryProvider):
                         ensure_ascii=False,
                     )
                 if mode == "apply":
-                    return json.dumps(
-                        self._store.dream_apply(args.get("dreams")),
-                        ensure_ascii=False,
-                    )
+                    result = self._store.dream_apply(args.get("dreams"))
+                    self._bridge_dream(result)
+                    return json.dumps(result, ensure_ascii=False)
                 return tool_error(
                     "dream mode must be preview, apply, or association_preview"
                 )
@@ -687,6 +827,7 @@ class EbbinghausMemoryProvider(MemoryProvider):
             return tool_error(str(exc))
 
     def shutdown(self) -> None:
+        self._bridge = None
         if self._store:
             self._store.close()
             self._store = None
