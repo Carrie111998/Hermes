@@ -2316,7 +2316,8 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
                     "Review runner health: "
                     f"dry-run={'ready' if readiness['dry_run_ready'] else 'blocked'}, "
                     f"shadow={'ready' if readiness['shadow_ready'] else 'disabled'}, "
-                    f"live={'ready' if readiness['live_ready'] else 'disabled'}"
+                    f"live={'ready' if readiness['live_ready'] else 'disabled'}, "
+                    f"human_review={'ready' if readiness['human_review_ready'] else 'blocked'}"
                 )
                 print(
                     "Providers: "

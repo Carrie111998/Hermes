@@ -15,6 +15,7 @@ import re
 import secrets
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Literal, Mapping, Optional, Sequence, cast
 
@@ -22,6 +23,7 @@ from hermes_constants import display_hermes_home
 from hermes_cli import kanban_coderabbit as coderabbit
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_github as github
+from hermes_cli import kanban_human_review as human_review
 from hermes_cli import kanban_reconciliation as reconciliation
 from hermes_cli import kanban_slack as slack
 from utils import is_truthy_value
@@ -137,10 +139,12 @@ class ReviewRunnerConfig:
     github_adapter: str = "disabled"
     github_mcp_server: str = "github"
     github_repositories: tuple[str, ...] = ()
+    github_reviewer_logins: tuple[str, ...] = ()
     coderabbit_logins: tuple[str, ...] = ("coderabbitai[bot]", "coderabbitai")
     slack_adapter: str = "disabled"
     slack_mcp_server: str = "slack"
     slack_channel_ids: tuple[str, ...] = ()
+    slack_notification_channel_id: str = ""
     slack_acknowledgement_user_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -195,8 +199,15 @@ class ReviewRunnerConfig:
             if not normalized:
                 raise ReviewRunnerError(f"{field_name} must be a non-empty string")
             object.__setattr__(self, field_name, normalized)
+        notification_channel = str(self.slack_notification_channel_id or "").strip()
+        object.__setattr__(
+            self,
+            "slack_notification_channel_id",
+            notification_channel,
+        )
         for field_name in (
             "github_repositories",
+            "github_reviewer_logins",
             "coderabbit_logins",
             "slack_channel_ids",
             "slack_acknowledgement_user_ids",
@@ -218,6 +229,14 @@ class ReviewRunnerConfig:
                 self,
                 field_name,
                 is_truthy_value(getattr(self, field_name), default=False),
+            )
+        if (
+            notification_channel
+            and notification_channel not in self.slack_channel_ids
+        ):
+            raise ReviewRunnerError(
+                "providers.slack.notification_channel_id must appear in "
+                "providers.slack.channel_ids"
             )
         if self.github_delivery_enabled and not self.github_provider_enabled:
             raise ReviewRunnerError(
@@ -267,6 +286,10 @@ class ReviewRunnerConfig:
                 github_cfg.get("repositories"),
                 "providers.github.repositories",
             ),
+            github_reviewer_logins=_string_tuple(
+                github_cfg.get("reviewer_logins"),
+                "providers.github.reviewer_logins",
+            ),
             coderabbit_logins=_string_tuple(
                 github_cfg.get(
                     "coderabbit_logins",
@@ -280,10 +303,31 @@ class ReviewRunnerConfig:
                 slack_cfg.get("channel_ids"),
                 "providers.slack.channel_ids",
             ),
+            slack_notification_channel_id=str(
+                slack_cfg.get("notification_channel_id") or ""
+            ),
             slack_acknowledgement_user_ids=_string_tuple(
                 slack_cfg.get("acknowledgement_user_ids"),
                 "providers.slack.acknowledgement_user_ids",
             ),
+        )
+
+    def human_review_runtime_ready(self) -> bool:
+        """Return whether the full QA-to-human MCP boundary is explicitly live."""
+        return bool(
+            self.enabled
+            and self.mode == "live"
+            and self.github_provider_enabled
+            and self.github_delivery_enabled
+            and self.github_adapter == "mcp"
+            and self.github_repositories
+            and self.github_reviewer_logins
+            and self.slack_provider_enabled
+            and self.slack_delivery_enabled
+            and self.slack_adapter == "mcp"
+            and self.slack_channel_ids
+            and self.slack_notification_channel_id
+            and self.slack_acknowledgement_user_ids
         )
 
     def with_overrides(
@@ -552,6 +596,277 @@ def _build_configured_mcp_adapters(
     )
 
 
+def _configured_principal(
+    principal: Optional[str],
+    *,
+    prefix: str,
+    allowed: Sequence[str],
+    field: str,
+) -> str:
+    raw = str(principal or "").strip()
+    expected_prefix = f"{prefix}:"
+    if not raw.casefold().startswith(expected_prefix):
+        raise ReviewRunnerError(f"{field} must use the {expected_prefix} principal form")
+    value = raw[len(expected_prefix):].strip()
+    allowlist = {str(item).strip().casefold() for item in allowed}
+    if not value or value.casefold() not in allowlist:
+        raise ReviewRunnerError(f"{field} is outside the configured allowlist")
+    return value
+
+
+def enqueue_human_review_gate_outboxes(
+    conn: sqlite3.Connection,
+    *,
+    gate_id: str,
+    snapshot: github.GitHubPullRequestSnapshot,
+    config: ReviewRunnerConfig,
+    now: Optional[int] = None,
+    _within_transaction: bool = False,
+) -> dict[str, Any]:
+    """Bridge one QA gate into the typed exact-head MCP outboxes.
+
+    This only persists local intents. External writes remain the live runner's
+    responsibility and therefore stay behind its independent enable/mode/
+    delivery gates.
+    """
+    if not config.human_review_runtime_ready():
+        raise ReviewRunnerError("the complete live human-review runtime is not enabled")
+    gate = human_review.get_human_review_gate(conn, gate_id)
+    if gate is None:
+        raise ReviewRunnerError(f"human-review gate {gate_id!r} does not exist")
+    repository = snapshot.repository
+    if repository not in {item.casefold() for item in config.github_repositories}:
+        raise ReviewRunnerError("gate repository is outside the configured GitHub allowlist")
+    reviewer = _configured_principal(
+        gate.reviewer_principal,
+        prefix="github",
+        allowed=config.github_reviewer_logins,
+        field="reviewer_principal",
+    )
+    slack_user = _configured_principal(
+        gate.notification_principal,
+        prefix="slack",
+        allowed=config.slack_acknowledgement_user_ids,
+        field="notification_principal",
+    )
+    changed_at = int(time.time()) if now is None else int(now)
+    github_body = "\n".join((
+        f"Human review requested from @{reviewer}.",
+        f"Linear: {gate.linear_issue_id or 'not linked'}",
+        f"PR: {gate.pr_url}",
+        f"Approved head: {gate.approved_head_sha}",
+        f"Gate: {gate.id}",
+        "Review and merge remain human-only. Any new push invalidates this gate.",
+    ))
+    github_receipt = github.enqueue_intent(
+        conn,
+        gate_id=gate.id,
+        snapshot=snapshot,
+        expected_repository=gate.repo,
+        expected_pr_number=gate.pr_number,
+        expected_head_sha=gate.approved_head_sha,
+        surface="pull_request_comments",
+        operation="create_comment",
+        payload={"body": github_body},
+        max_attempts=config.retry_ceiling,
+        now=changed_at,
+        _within_transaction=_within_transaction,
+    )
+    slack_body = "\n".join((
+        f"<@{slack_user}> exact-head GitHub review is ready.",
+        f"Linear: {gate.linear_issue_id or 'not linked'}",
+        f"PR: {gate.pr_url}",
+        f"Approved head: {gate.approved_head_sha}",
+        f"Gate: {gate.id}",
+        "Slack acknowledgement is receipt-only; approve or request changes in GitHub.",
+    ))
+    slack_receipt = slack.enqueue_intent(
+        conn,
+        gate_id=gate.id,
+        snapshot=snapshot,
+        expected_repository=gate.repo,
+        expected_pr_number=gate.pr_number,
+        expected_head_sha=gate.approved_head_sha,
+        channel_id=config.slack_notification_channel_id,
+        thread_ts=None,
+        surface="channel",
+        operation="notify_human_review",
+        payload={"body": slack_body},
+        max_attempts=config.retry_ceiling,
+        now=changed_at,
+        _within_transaction=_within_transaction,
+    )
+    slack_ids = [slack_receipt.intent.id]
+
+    # The configured GitHub MCP has no request-reviewer write operation. Keep
+    # the legacy row as audit evidence, but never misreport it as delivered.
+    if _within_transaction and not conn.in_transaction:
+        raise ReviewRunnerError("internal bridge enqueue requires an active transaction")
+    scope = nullcontext() if _within_transaction else kb.write_txn(conn)
+    with scope:
+        conn.execute(
+            "UPDATE review_gate_deliveries SET state='superseded', "
+            "next_attempt_at=NULL, last_error=?, updated_at=? "
+            "WHERE gate_id=? AND channel='github_review_request' "
+            "AND state NOT IN ('sent', 'superseded')",
+            ("unsupported_by_configured_github_mcp", changed_at, gate.id),
+        )
+        kb._append_event(
+            conn,
+            gate.task_id,
+            "human_gate_mcp_outboxes_enqueued",
+            {
+                "gate_id": gate.id,
+                "github_intent_id": github_receipt.intent.id,
+                "slack_intent_ids": slack_ids,
+                "approved_head_sha": gate.approved_head_sha,
+                "external_write": False,
+            },
+        )
+    return {
+        "github_intent_id": github_receipt.intent.id,
+        "slack_intent_ids": slack_ids,
+        "created": bool(github_receipt.created),
+    }
+
+
+def _legacy_delivery_state(states: Sequence[str]) -> str:
+    if states and all(state == "sent" for state in states):
+        return "sent"
+    if "permanent_failure" in states:
+        return "failed"
+    if "superseded" in states:
+        return "superseded"
+    if "retry" in states:
+        return "retry"
+    return "pending"
+
+
+def refresh_human_review_gate_from_outboxes(
+    conn: sqlite3.Connection,
+    *,
+    gate_id: str,
+    now: int,
+) -> str:
+    """Project typed MCP outbox outcomes onto the gate state machine."""
+    gate = human_review.get_human_review_gate(conn, gate_id)
+    if gate is None:
+        raise ReviewRunnerError(f"human-review gate {gate_id!r} does not exist")
+    github_rows = conn.execute(
+        "SELECT state, external_id FROM github_human_review_outbox "
+        "WHERE gate_id=? ORDER BY id",
+        (gate_id,),
+    ).fetchall()
+    slack_rows = conn.execute(
+        "SELECT state, external_message_ts FROM slack_human_review_outbox "
+        "WHERE gate_id=? ORDER BY id",
+        (gate_id,),
+    ).fetchall()
+    if not github_rows or not slack_rows:
+        return gate.state
+    states = [row["state"] for row in github_rows + slack_rows]
+    if "superseded" in states:
+        human_review.supersede_human_review_gate(
+            conn,
+            gate_id,
+            reason="authoritative PR readback superseded an exact-head delivery intent",
+            now=now,
+        )
+        refreshed = human_review.get_human_review_gate(conn, gate_id)
+        return refreshed.state if refreshed is not None else "superseded"
+
+    github_state = _legacy_delivery_state([row["state"] for row in github_rows])
+    slack_state = _legacy_delivery_state([row["state"] for row in slack_rows])
+    target = (
+        "delivery_failed"
+        if "permanent_failure" in states
+        else "awaiting_human"
+        if all(state == "sent" for state in states)
+        else "pending_delivery"
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE review_gate_deliveries SET state=?, external_id=?, updated_at=? "
+            "WHERE gate_id=? AND channel='github_comment'",
+            (
+                github_state,
+                next((row["external_id"] for row in github_rows if row["external_id"]), None),
+                now,
+                gate_id,
+            ),
+        )
+        conn.execute(
+            "UPDATE review_gate_deliveries SET state=?, external_id=?, updated_at=? "
+            "WHERE gate_id=? AND channel='slack'",
+            (
+                slack_state,
+                next((row["external_message_ts"] for row in slack_rows if row["external_message_ts"]), None),
+                now,
+                gate_id,
+            ),
+        )
+        if gate.state in {"pending_delivery", "delivery_failed"} and target != gate.state:
+            updated = conn.execute(
+                "UPDATE human_review_gates SET state=?, updated_at=? "
+                "WHERE id=? AND state=?",
+                (target, now, gate_id, gate.state),
+            )
+            if updated.rowcount:
+                kb._append_event(
+                    conn,
+                    gate.task_id,
+                    "human_gate_delivery_state_changed",
+                    {"gate_id": gate_id, "state": target},
+                )
+    refreshed = human_review.get_human_review_gate(conn, gate_id)
+    return refreshed.state if refreshed is not None else target
+
+
+def _mark_gate_seen_from_slack(
+    conn: sqlite3.Connection,
+    *,
+    intent: slack.SlackOutboxIntent,
+    receipt: slack.SlackAcknowledgementReceipt,
+    now: int,
+) -> bool:
+    gate = human_review.get_human_review_gate(conn, intent.gate_id)
+    if (
+        gate is None
+        or gate.approved_head_sha != intent.head_sha
+        or receipt.gate_id != gate.id
+        or receipt.head_sha != gate.approved_head_sha
+        or receipt.channel_id != intent.channel_id
+        or not receipt.acknowledged
+    ):
+        return False
+    notification = str(gate.notification_principal or "").strip()
+    if not notification.casefold().startswith("slack:"):
+        return False
+    expected_user = notification.split(":", 1)[1].strip()
+    if not expected_user or receipt.user_id.casefold() != expected_user.casefold():
+        return False
+    with kb.write_txn(conn):
+        updated = conn.execute(
+            "UPDATE human_review_gates SET state='seen', updated_at=? "
+            "WHERE id=? AND state='awaiting_human'",
+            (now, gate.id),
+        )
+        if not updated.rowcount:
+            return False
+        kb._append_event(
+            conn,
+            gate.task_id,
+            "human_gate_seen",
+            {
+                "gate_id": gate.id,
+                "actor_principal": f"slack:{receipt.user_id}",
+                "acknowledgement_action": receipt.normalized_action,
+                "decision_authority": "github_only",
+            },
+        )
+    return True
+
+
 def _ingest_slack_acknowledgements(
     conn: sqlite3.Connection,
     *,
@@ -562,6 +877,7 @@ def _ingest_slack_acknowledgements(
     deadline: float,
     provider_timeout_seconds: int,
     allowed_channel_ids: Sequence[str] = (),
+    advance_human_gate: bool = False,
 ) -> list[dict[str, Any]]:
     """Read existing stored Slack threads and persist replay-safe local acks."""
 
@@ -610,12 +926,105 @@ def _ingest_slack_acknowledgements(
                 now=now,
             )
             created += int(receipt.created)
+            if (
+                advance_human_gate
+                and receipt.created
+                and receipt.receipt.acknowledged
+            ):
+                _mark_gate_seen_from_slack(
+                    conn,
+                    intent=intent,
+                    receipt=receipt.receipt,
+                    now=now,
+                )
         results.append({
             "surface": "slack_acknowledgement",
             "intent_id": intent.id,
             "outcome": "recorded" if created else "replayed_or_empty",
             "observed_count": len(events),
             "created_count": created,
+            "external_write": False,
+        })
+    return results
+
+
+def _ingest_github_human_decisions(
+    conn: sqlite3.Connection,
+    *,
+    provider: reconciliation.ReconciliationSnapshotProvider,
+    allowed_reviewer_logins: Sequence[str],
+    max_items: int,
+    now: int,
+) -> list[dict[str, Any]]:
+    """Apply exact-head GitHub decisions from explicitly allowlisted reviewers."""
+    rows = conn.execute(
+        "SELECT * FROM human_review_gates "
+        "WHERE state IN ('awaiting_human', 'seen') "
+        "ORDER BY updated_at, id LIMIT ?",
+        (max_items,),
+    ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        gate = human_review.HumanReviewGate.from_row(row)
+        reviewer = _configured_principal(
+            gate.reviewer_principal,
+            prefix="github",
+            allowed=allowed_reviewer_logins,
+            field="reviewer_principal",
+        )
+        snapshot = provider.read_snapshot(
+            repository=gate.repo,
+            pr_number=gate.pr_number,
+        )
+        if snapshot is None:
+            raise ReviewRunnerError("GitHub provider returned no human-review snapshot")
+        github.validate_snapshot_freshness(snapshot, now=now)
+        try:
+            github.validate_exact_head(
+                snapshot,
+                expected_head_sha=gate.approved_head_sha,
+            )
+        except github.GitHubHeadMismatch:
+            human_review.supersede_human_review_gate(
+                conn,
+                gate.id,
+                reason="authoritative GitHub review readback observed a new head",
+                observed_head_sha=snapshot.head_sha,
+                now=now,
+            )
+            results.append({
+                "surface": "github_human_decision",
+                "gate_id": gate.id,
+                "outcome": "superseded",
+                "external_write": False,
+            })
+            continue
+        decisions = github.read_human_review_decisions(
+            snapshot,
+            expected_head_sha=gate.approved_head_sha,
+            reviewer_login=reviewer,
+        )
+        if not decisions:
+            continue
+        decision = decisions[-1]
+        if decision.submitted_at < gate.qa_approved_at:
+            # A current-head review can predate the QA gate. It remains valid
+            # GitHub history, but it is not the post-QA human decision this
+            # state machine is waiting for.
+            continue
+        changed = human_review.record_human_review_decision(
+            conn,
+            gate.id,
+            reviewer_principal=gate.reviewer_principal,
+            review_state=decision.state.upper(),
+            review_head_sha=decision.head_sha,
+            external_review_id=decision.review_id,
+            now=now,
+        )
+        results.append({
+            "surface": "github_human_decision",
+            "gate_id": gate.id,
+            "outcome": decision.state if changed else "replayed",
             "external_write": False,
         })
     return results
@@ -1118,6 +1527,7 @@ def diagnose_review_runner(
         and slack_read_registered
         and timeout_bounded
     )
+    human_review_policy_ready = config.human_review_runtime_ready()
     all_enabled_reads_ready = (
         enabled_provider_count > 0
         and (not config.github_provider_enabled or github_shadow_ready)
@@ -1144,6 +1554,8 @@ def diagnose_review_runner(
             blockers.append("github_mcp_adapter_not_selected")
         if not config.github_repositories:
             blockers.append("github_repository_allowlist_required")
+        if not config.github_reviewer_logins:
+            blockers.append("github_reviewer_login_allowlist_required")
         if not github_read_registered:
             blockers.append("github_read_adapter_not_registered")
         blockers.append("github_private_repository_authorization_unprobed")
@@ -1156,6 +1568,8 @@ def diagnose_review_runner(
             blockers.append("slack_mcp_adapter_not_selected")
         if not config.slack_channel_ids:
             blockers.append("slack_channel_allowlist_required")
+        if not config.slack_notification_channel_id:
+            blockers.append("slack_notification_channel_id_required")
         if not config.slack_acknowledgement_user_ids:
             blockers.append("slack_acknowledgement_user_allowlist_required")
         if not slack_read_registered:
@@ -1186,6 +1600,7 @@ def diagnose_review_runner(
             "external_writes_enabled": (
                 github_write_registered or slack_write_registered
             ),
+            "human_review_policy_ready": human_review_policy_ready,
         },
         "providers": {
             "github": {
@@ -1195,6 +1610,9 @@ def diagnose_review_runner(
                 "read_registered": github_read_registered,
                 "write_registered": github_write_registered,
                 "repository_allowlist_count": len(config.github_repositories),
+                "reviewer_login_allowlist_count": len(
+                    config.github_reviewer_logins
+                ),
                 "connectivity": github_connectivity,
                 "connectivity_probe_performed": False,
                 "ready": (
@@ -1210,6 +1628,9 @@ def diagnose_review_runner(
                 "read_registered": slack_read_registered,
                 "write_registered": slack_write_registered,
                 "channel_allowlist_count": len(config.slack_channel_ids),
+                "notification_channel_configured": bool(
+                    config.slack_notification_channel_id
+                ),
                 "acknowledgement_user_allowlist_count": len(
                     config.slack_acknowledgement_user_ids
                 ),
@@ -1232,6 +1653,12 @@ def diagnose_review_runner(
             "live_ready": config.enabled
             and all_enabled_writes_ready
             and timeout_bounded,
+            "human_review_ready": human_review_policy_ready
+            and github_read_registered
+            and github_write_registered
+            and slack_read_registered
+            and slack_write_registered
+            and timeout_bounded,
             "production_ready": False,
             "blockers": blockers,
         },
@@ -1251,7 +1678,8 @@ def diagnose_review_runner(
         },
         "operator_input_checklist": [
             "approved private repository owner/name allowlist",
-            "approved Slack staging channel ID",
+            "approved GitHub reviewer login allowlist",
+            "one approved Slack notification channel ID included in the read allowlist",
             "approved Slack acknowledgement user IDs",
             "GitHub and Slack credentials stored as env/OAuth references, never plaintext config",
             "resource probes proving private-repo and Slack channel/thread access",
@@ -1338,6 +1766,11 @@ def _process_candidate(
                 "intent_id": candidate.intent_id,
                 "reason": "adapter_not_registered",
             }
+        intent = github.get_intent(conn, candidate.intent_id)
+        if intent is None:
+            raise ReviewRunnerError(
+                f"GitHub outbox intent {candidate.intent_id!r} does not exist"
+            )
         result = github.process_intent(
             conn,
             candidate.intent_id,
@@ -1367,6 +1800,11 @@ def _process_candidate(
                 "intent_id": candidate.intent_id,
                 "reason": "adapter_not_registered",
             }
+        intent = slack.get_intent(conn, candidate.intent_id)
+        if intent is None:
+            raise ReviewRunnerError(
+                f"Slack outbox intent {candidate.intent_id!r} does not exist"
+            )
         result = slack.process_intent(
             conn,
             candidate.intent_id,
@@ -1374,8 +1812,16 @@ def _process_candidate(
             delivery_transport=adapters.slack_delivery_transport,
             now=now,
         )
+    gate_state = None
+    if human_review.get_human_review_gate(conn, intent.gate_id) is not None:
+        gate_state = refresh_human_review_gate_from_outboxes(
+            conn,
+            gate_id=intent.gate_id,
+            now=now,
+        )
     return {
         "surface": candidate.surface,
+        "gate_state": gate_state,
         **asdict(result),
     }, None
 
@@ -1498,7 +1944,10 @@ def run_review_runner(
     status: RunnerStatus = "no_op"
     lease_owner = lease.owner_id if lease is not None else None
     try:
-        if effective_adapters.slack_acknowledgement_provider is not None:
+        if (
+            mode != "dry-run"
+            and effective_adapters.slack_acknowledgement_provider is not None
+        ):
             assert effective_adapters.provider_timeout_seconds is not None
             results.extend(
                 _ingest_slack_acknowledgements(
@@ -1512,6 +1961,9 @@ def run_review_runner(
                         effective_adapters.provider_timeout_seconds
                     ),
                     allowed_channel_ids=config.slack_channel_ids,
+                    advance_human_gate=(
+                        mode == "live" and config.human_review_runtime_ready()
+                    ),
                 )
             )
         provider = effective_adapters.reconciliation_snapshot_provider
@@ -1535,6 +1987,28 @@ def run_review_runner(
                 deadline,
                 int(effective_adapters.provider_timeout_seconds),
                 effective_adapters.reconciliation_provider_call_count,
+            )
+        if (
+            mode == "live"
+            and effective_adapters.github_snapshot_provider is not None
+            and config.human_review_runtime_ready()
+        ):
+            assert effective_adapters.provider_timeout_seconds is not None
+            decision_provider = _DeadlineSnapshotProvider(
+                effective_adapters.github_snapshot_provider,
+                monotonic,
+                deadline,
+                int(effective_adapters.provider_timeout_seconds),
+                effective_adapters.reconciliation_provider_call_count,
+            )
+            results.extend(
+                _ingest_github_human_decisions(
+                    conn,
+                    provider=decision_provider,
+                    allowed_reviewer_logins=config.github_reviewer_logins,
+                    max_items=config.max_items,
+                    now=started_at,
+                )
             )
         completed_execution = reconciliation.reconcile(
             conn,

@@ -1056,6 +1056,7 @@ def test_cli_health_human_output_uses_read_and_write_registration_keys(
 
     assert "github enabled=False read_registered=False write_registered=False" in output
     assert "slack enabled=False read_registered=False write_registered=False" in output
+    assert "human_review=blocked" in output
     assert "Blockers: runner_disabled" in output
 
 

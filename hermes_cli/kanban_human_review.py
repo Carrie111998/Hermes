@@ -517,6 +517,11 @@ def _validate_pr_snapshot(
                 actual = int(actual)
             except (TypeError, ValueError):
                 pass
+        elif key == "repo" and isinstance(actual, str):
+            # GitHub owner/repository identity is case-insensitive and the
+            # typed MCP boundary canonicalizes it to lowercase.
+            actual = actual.casefold()
+            expected_value = str(expected_value).casefold()
         if actual != expected_value:
             label = "head" if key == "head_sha" else key
             raise PRSnapshotMismatch(
@@ -888,12 +893,16 @@ def advance_linear_pr_after_qa(
     pr_snapshot: Mapping[str, Any],
     board: str,
     worker_session_id: Optional[str] = None,
+    outbox_enqueuer: Optional[
+        Callable[[sqlite3.Connection, HumanReviewGate, int], None]
+    ] = None,
 ) -> AdvanceResult:
     """Atomically complete trusted QA into one current-head human-review gate.
 
     ``pr_snapshot`` must come from a read-only GitHub adapter. The kernel checks
     it before opening the write transaction and re-checks every DB invariant
-    inside ``BEGIN IMMEDIATE``. Network delivery is intentionally post-commit.
+    inside ``BEGIN IMMEDIATE``. An injected enqueuer may persist additional local
+    outbox rows in that same transaction; network delivery remains post-commit.
     """
     if not isinstance(board, str) or not board.strip():
         raise ValueError("board is required")
@@ -958,6 +967,8 @@ def advance_linear_pr_after_qa(
                 raise ValueError(
                     f"exact-head gate is already terminal ({existing.state}); fresh QA is required"
                 )
+            if outbox_enqueuer is not None:
+                outbox_enqueuer(conn, existing, now)
             return AdvanceResult(
                 gate_id=existing.id,
                 task_id=existing.task_id,
@@ -1053,6 +1064,10 @@ def advance_linear_pr_after_qa(
             packet=packet,
             created_at=now,
         )
+        if outbox_enqueuer is not None:
+            created_gate = get_human_review_gate(conn, gate_id)
+            assert created_gate is not None
+            outbox_enqueuer(conn, created_gate, now)
 
         completion_result = f"Advanced exact head to human review gate {gate_id}"
         updated = conn.execute(

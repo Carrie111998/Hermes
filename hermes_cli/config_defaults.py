@@ -2402,10 +2402,16 @@ DEFAULT_CONFIG = {
         # to the TTL/crash/stale recovery paths. Set false to keep orphans
         # frozen for manual forensics.
         "reconcile_orphans": True,
-        # Script-only exact-head reconciliation/outbox runner. No cron job or
-        # live provider adapter is registered automatically. Dry-run remains
-        # available for deterministic read-only audits; shadow/live require
-        # enabled=true, and gateway invocation has its own opt-in gate.
+        # Exact-head QA-to-human gate. The model-facing transition remains
+        # hidden unless this flag and the complete live review-runner provider
+        # policy below are enabled. Provider credentials remain MCP-managed.
+        "human_review": {
+            "enabled": False,
+        },
+        # Script-only exact-head reconciliation/outbox runner. No cron job is
+        # installed automatically. Dry-run remains available for deterministic
+        # read-only audits; shadow/live require enabled=true, and gateway
+        # invocation has its own opt-in gate.
         "review_runner": {
             "enabled": False,
             "gateway_enabled": False,
@@ -2430,6 +2436,9 @@ DEFAULT_CONFIG = {
                     "mcp_server": "github",
                     # Required when adapter=mcp. Exact owner/name entries only.
                     "repositories": [],
+                    # Exact GitHub logins allowed to make the terminal human
+                    # review decision for an MCP-created gate.
+                    "reviewer_logins": [],
                     "coderabbit_logins": ["coderabbitai[bot]", "coderabbitai"],
                 },
                 "slack": {
@@ -2441,6 +2450,10 @@ DEFAULT_CONFIG = {
                     # Both allowlists are mandatory when adapter=mcp. Reads are
                     # restricted to existing stored threads on these channels.
                     "channel_ids": [],
+                    # One exact QA-to-human notification destination. It must
+                    # also appear in channel_ids; the runner never broadcasts
+                    # a gate to every channel in the read allowlist.
+                    "notification_channel_id": "",
                     "acknowledgement_user_ids": [],
                 },
             },

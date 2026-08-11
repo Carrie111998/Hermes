@@ -152,11 +152,29 @@ def _human_review_enabled() -> bool:
         return False
 
 
+def _human_review_runner_config():
+    """Load the operator policy that gates the production MCP boundary."""
+    from hermes_cli.kanban_review_runner import ReviewRunnerConfig
+
+    runtime = load_config() or {}
+    kanban = runtime.get("kanban") if isinstance(runtime, dict) else {}
+    kanban = kanban if isinstance(kanban, dict) else {}
+    return ReviewRunnerConfig.from_mapping(kanban.get("review_runner"))
+
+
+def _redacted_human_review_failure(exc: BaseException) -> dict[str, str]:
+    try:
+        from hermes_cli.kanban_review_runner import _redacted_adapter_setup_failure
+
+        return _redacted_adapter_setup_failure(exc)
+    except Exception:
+        return {"type": "Exception", "kind": "unknown"}
+
+
 def _check_human_review_qa_mode() -> bool:
     """Expose exact-head advancement only to the pinned Echlon QA worker."""
     try:
-        from hermes_cli import kanban_human_review as human_review
-        provider_ready = human_review.pr_snapshot_provider_available()
+        provider_ready = _human_review_runner_config().human_review_runtime_ready()
     except Exception:
         provider_ready = False
     return bool(
@@ -696,8 +714,8 @@ def _handle_advance_linear_pr_after_qa(args: dict, **kw) -> str:
     if not _human_review_enabled():
         return tool_error(
             "kanban_advance_linear_pr_after_qa is disabled; an operator must "
-            "set kanban.human_review.enabled=true after wiring a trusted "
-            "read-only PR snapshot source"
+            "set kanban.human_review.enabled=true only after wiring the complete "
+            "live GitHub/Slack MCP review-runner policy"
         )
     if os.environ.get("HERMES_PROFILE") != "echlon-qa":
         return tool_error(
@@ -740,6 +758,7 @@ def _handle_advance_linear_pr_after_qa(args: dict, **kw) -> str:
     try:
         from hermes_cli import kanban_db as kb
         from hermes_cli import kanban_human_review as human_review
+        from hermes_cli import kanban_review_runner as review_runner
 
         # A dispatcher pins HERMES_KANBAN_DB. Verify that override resolves to
         # the explicit engineering board instead of trusting a stale/wrong env.
@@ -753,15 +772,50 @@ def _handle_advance_linear_pr_after_qa(args: dict, **kw) -> str:
 
         conn = kb.connect(db_path=expected_path)
         try:
-            snapshot = human_review.read_trusted_pr_snapshot(packet)
+            runtime_config = _human_review_runner_config()
+            if not runtime_config.human_review_runtime_ready():
+                return tool_error(
+                    "kanban_advance_linear_pr_after_qa requires the complete live "
+                    "GitHub/Slack MCP review-runner configuration"
+                )
+            adapters = review_runner._build_configured_mcp_adapters(runtime_config)
+            provider = adapters.github_snapshot_provider
+            if provider is None:
+                return tool_error(
+                    "kanban_advance_linear_pr_after_qa: configured GitHub read "
+                    "adapter is unavailable"
+                )
+            snapshot = provider.read_snapshot(
+                repository=str(packet.get("repo") or ""),
+                pr_number=int(packet.get("pr_number") or 0),
+            )
+            outboxes: dict[str, Any] = {}
+
+            def enqueue_typed_outboxes(
+                transaction_conn,
+                gate,
+                changed_at: int,
+            ) -> None:
+                outboxes.update(
+                    review_runner.enqueue_human_review_gate_outboxes(
+                        transaction_conn,
+                        gate_id=gate.id,
+                        snapshot=snapshot,
+                        config=runtime_config,
+                        now=changed_at,
+                        _within_transaction=True,
+                    )
+                )
+
             result = human_review.advance_linear_pr_after_qa(
                 conn,
                 qa_task_id=tid,
                 expected_run_id=expected_run_id,
                 approval_packet=packet,
-                pr_snapshot=snapshot,
+                pr_snapshot=snapshot.to_human_review_mapping(),
                 board=ECHLON_LINEAR_FIXES_BOARD,
                 worker_session_id=os.environ.get("HERMES_SESSION_ID") or None,
+                outbox_enqueuer=enqueue_typed_outboxes,
             )
         finally:
             conn.close()
@@ -773,14 +827,24 @@ def _handle_advance_linear_pr_after_qa(args: dict, **kw) -> str:
                 "approval_packet_sha256": result.approval_packet_sha256,
                 "created": result.created,
                 "delivery_state": "pending_delivery",
-                "live_delivery_enabled": False,
+                "live_delivery_enabled": True,
+                "github_intent_id": outboxes["github_intent_id"],
+                "slack_intent_ids": outboxes["slack_intent_ids"],
             }
         )
     except ValueError as exc:
         return tool_error(f"kanban_advance_linear_pr_after_qa: {exc}")
     except Exception as exc:
-        logger.exception("kanban_advance_linear_pr_after_qa failed")
-        return tool_error(f"kanban_advance_linear_pr_after_qa: {exc}")
+        failure = _redacted_human_review_failure(exc)
+        logger.error(
+            "kanban_advance_linear_pr_after_qa failed: %s (%s)",
+            failure["type"],
+            failure["kind"],
+        )
+        return tool_error(
+            "kanban_advance_linear_pr_after_qa: provider boundary failed: "
+            f"{failure['type']} ({failure['kind']})"
+        )
 
 
 def _handle_complete(args: dict, **kw) -> str:

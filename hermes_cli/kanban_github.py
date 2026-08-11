@@ -19,6 +19,7 @@ import json
 import re
 import sqlite3
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Optional, Protocol, cast
 
@@ -1177,6 +1178,7 @@ def enqueue_intent(
     payload: Mapping[str, Any],
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     now: Optional[int] = None,
+    _within_transaction: bool = False,
 ) -> EnqueueReceipt:
     """Create one exact-head intent, deduplicated by semantic GitHub identity."""
     changed_at = int(time.time()) if now is None else int(now)
@@ -1234,7 +1236,10 @@ def enqueue_intent(
     )
     intent_id = _intent_id(key)
 
-    with kb.write_txn(conn):
+    if _within_transaction and not conn.in_transaction:
+        raise GitHubBoundaryError("internal enqueue requires an active transaction")
+    scope = nullcontext() if _within_transaction else kb.write_txn(conn)
+    with scope:
         _supersede_stale_intents_in_txn(
             conn,
             repository=snapshot.repository,

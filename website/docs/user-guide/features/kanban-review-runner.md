@@ -13,6 +13,7 @@ The current production-readiness status is **conditional / blocked for live deli
 - Linear, GitHub, CodeRabbit, and Slack acknowledgement reads have typed, allowlisted MCP boundaries.
 - `dry-run` performs no writes. `shadow` performs no provider writes and may persist only immutable local reconciliation or acknowledgement audit rows.
 - Restricted GitHub review-comment and Slack message/reply transports are available behind independent `delivery_enabled: false` gates. They are not reviewer-request, approval, merge, branch, file, or channel-management authority.
+- Exact-head QA advancement is hidden unless `kanban.human_review.enabled` and the complete live GitHub/Slack policy are enabled. When enabled, it reads the PR through the configured GitHub MCP adapter and atomically persists the gate plus typed GitHub/Slack outbox intents before any network delivery.
 - `production_ready` remains false until the exact private GitHub PR/head and Slack channel/thread probes pass with the production credentials and the operator approves each destination. Do not create a production cron or enable gateway routing from this runbook.
 
 ## Authority and safety contract
@@ -32,11 +33,12 @@ A Slack `approve`, `lgtm`, or approval-looking reaction is stored only as acknow
 Do not guess any identifier. Obtain and approve all of the following before enabling a provider:
 
 1. Private GitHub repository in exact `owner/name` form.
-2. Slack staging channel ID (not a channel name).
-3. Slack acknowledgement user IDs.
-4. Linear team name/key and a known issue ID for the resource probe.
-5. GitHub and Slack credentials in approved credential storage.
-6. A known private PR/head and, for Slack acknowledgement testing, an existing approved staging thread.
+2. Exact GitHub login allowed to make the terminal human-review decision.
+3. One Slack notification channel ID (not a channel name), also present in the Slack read allowlist.
+4. Slack acknowledgement user IDs.
+5. Linear team name/key and a known issue ID for the resource probe.
+6. GitHub and Slack credentials in approved credential storage.
+7. A known private PR/head and, for Slack acknowledgement testing, an existing approved staging thread.
 
 If any value is unavailable, leave the corresponding provider disabled. Health will report the missing allowlist rather than discovering or guessing it.
 
@@ -67,6 +69,8 @@ Do not paste secret values into logs, Kanban comments, health output, runbooks, 
 
 ```yaml
 kanban:
+  human_review:
+    enabled: false
   review_runner:
     enabled: false
     gateway_enabled: false
@@ -83,6 +87,7 @@ kanban:
         adapter: disabled
         mcp_server: github
         repositories: []
+        reviewer_logins: []
         coderabbit_logins: ["coderabbitai[bot]", "coderabbitai"]
       slack:
         enabled: false
@@ -90,6 +95,7 @@ kanban:
         adapter: disabled
         mcp_server: slack
         channel_ids: []
+        notification_channel_id: ""
         acknowledgement_user_ids: []
 ```
 
@@ -113,6 +119,7 @@ Required signals:
 - selected provider credential preflight `ready=true`
 - `configuration.external_writes_enabled=false` while delivery gates are disabled
 - `readiness.live_ready=false` while any enabled provider lacks its delivery gate/transport
+- `readiness.human_review_ready=false` until the complete live provider, destination, reviewer, and acknowledgement policy is explicit
 - `readiness.production_ready=false`
 - no `adapter_setup_failed:*` blocker
 
@@ -208,6 +215,8 @@ Delivery is gated independently from provider reads:
 
 `mode: live` does not create authority. Candidates are skipped when the required snapshot + delivery transport pair is absent, and delivery remains disabled by default.
 
+The model-facing `kanban_advance_linear_pr_after_qa` tool is stricter than the runner alone: it is exposed only to an `echlon-qa` worker on the engineering board when `kanban.human_review.enabled=true` and the complete live GitHub/Slack policy is ready. It does not accept model-supplied snapshot truth and performs no network write while creating the gate/outboxes.
+
 ## Timeout, retry, and idempotency behavior
 
 - Each MCP call has a bounded provider timeout; the runner also has a larger wall-clock deadline and lease.
@@ -219,21 +228,21 @@ Delivery is gated independently from provider reads:
 ## Rollout sequence
 
 1. Keep runner, providers, and both delivery gates disabled.
-2. Add credential references and exact allowlists.
+2. Add credential references, exact repository/reviewer/channel/user allowlists, and one approved Slack notification destination; keep `kanban.human_review.enabled: false`.
 3. Set `enabled: true`, `mode: shadow`, and enable one read provider with `adapter: mcp`; leave its `delivery_enabled: false`.
 4. Run health, the deterministic `staging` resource probe, and the Linear OAuth resource probe. Stop on any auth, permission, head, channel, or thread failure.
 5. Run one known Linear issue in shadow and repeat the same input to prove deterministic/idempotent local results.
 6. Resolve every health blocker and known provider limitation.
 7. Obtain explicit approval for the exact provider, repository/PR or channel/thread, production integration, cron routing, gateway routing, and live-delivery window.
 8. Enable exactly one provider's `delivery_enabled: true` while remaining in `mode: shadow`; rerun health and staging. Verify the discovered tool allowlist contains only the documented restricted delivery tools.
-9. Change to `mode: live` only for the approved destination/window. Inspect the provider receipt and outbox attempt before enabling a second destination.
+9. Change to `mode: live` only for the approved destination/window. Enable `kanban.human_review.enabled` only after the complete QA-to-human policy has been reviewed. Inspect the provider receipt and outbox attempt before enabling a second destination.
 10. Deploy code, restart the gateway only if gateway-hosted code changed, then rerun health and staging verification.
 
 This repository does not perform steps 7–10 automatically.
 
 ## Rollback
 
-1. Set `kanban.review_runner.mode: shadow` (or `dry-run`) and both provider `delivery_enabled` values to `false`.
+1. Set `kanban.human_review.enabled: false`, set `kanban.review_runner.mode: shadow` (or `dry-run`), and set both provider `delivery_enabled` values to `false`.
 2. Set `kanban.review_runner.enabled: false`, then set both provider `enabled` values to `false` and adapters to `disabled`.
 3. Disable/remove the external cron or gateway route using the same operator surface that created it.
 4. Restart the gateway only if its loaded code/config requires it.
