@@ -9699,7 +9699,7 @@ def _cold_start_windows_gateway_after_update() -> None:
         return
 
     try:
-        pid = gateway_windows._spawn_detached()
+        pid = gateway_windows._spawn_detached(reason="update:windows-cold-start")
     except Exception as exc:
         logger.debug("Could not cold-start Windows gateway after update: %s", exc)
         return

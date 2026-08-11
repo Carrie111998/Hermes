@@ -660,7 +660,7 @@ def test_resume_cold_starts_gateway_when_token_requests_it(
     monkeypatch.setattr(
         gateway_windows,
         "_spawn_detached",
-        lambda: spawned.append(True) or 4242,
+        lambda *_a, reason="", **_kw: spawned.append(reason) or 4242,
     )
 
     token = {
@@ -674,7 +674,10 @@ def test_resume_cold_starts_gateway_when_token_requests_it(
     cli_main._resume_windows_gateways_after_update(token)
 
     assert token["resume_needed"] is False
-    assert spawned == [True]
+    # Not just "a spawn happened": the diag log has to be able to name this
+    # site, because a post-update cold start racing an autostart entry is the
+    # classic way two gateways appear at once.
+    assert spawned == ["update:windows-cold-start"]
     assert "Starting Windows gateway after update (PID 4242)" in capsys.readouterr().out
 
 
@@ -694,7 +697,7 @@ def test_resume_cold_start_skips_when_gateway_already_running(
     monkeypatch.setattr(
         gateway_windows,
         "_spawn_detached",
-        lambda: spawned.append(True) or 4242,
+        lambda *_a, **_kw: spawned.append(True) or 4242,
     )
 
     token = {

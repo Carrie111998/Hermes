@@ -34,6 +34,8 @@ from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
 # Shared with hermes_cli.main, which writes the earlier `gateway.spawn` record
 # from a point where importing this module would itself cost seconds.
 from hermes_cli.gateway_diag import (
+    SPAWN_SITE_ENV as GATEWAY_SPAWN_SITE_ENV,
+    launch_identity as _launch_identity,
     process_start_age_s as _process_start_age_s,
     write_diag as _gateway_exit_diag,
 )
@@ -4114,6 +4116,11 @@ def _spawn_detached_gateway() -> bool:
                 stdin=subprocess.DEVNULL,
                 stdout=out,
                 stderr=err,
+                # Inherit the ambient environment, plus the spawn-site stamp the
+                # child echoes into its gateway.start diag record. Without it
+                # this path would report a null site, which is supposed to mean
+                # "launched by something that isn't ours".
+                env={**os.environ, GATEWAY_SPAWN_SITE_ENV: "launchd-fallback:detached"},
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
@@ -5023,6 +5030,12 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     # Every field here is knowable at entry: the two console-control values
     # are pure reads of env + stdin, so they're computed now and reused by
     # the handler-installation block below rather than splitting the record.
+    #
+    # The launch-attribution fields (_launch_identity) are repeated here rather
+    # than left to `gateway.spawn` alone: this record is what double-spawn
+    # analysis keys on, and it must stand on its own when the earlier record is
+    # missing — a gateway launched by something that never imports
+    # hermes_cli.main writes no `gateway.spawn` at all.
     try:
         _stdin_is_tty = bool(sys.stdin and sys.stdin.isatty())
     except (ValueError, OSError):
@@ -5031,7 +5044,8 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     _gateway_exit_diag(
         "gateway.start",
         replace=replace,
-        argv=sys.argv,
+        argv=list(sys.argv),
+        **_launch_identity(),
         stdin_is_tty=_stdin_is_tty,
         absorb_windows_console_controls=_absorb_windows_console_controls,
         proc_age_s=_process_start_age_s(),

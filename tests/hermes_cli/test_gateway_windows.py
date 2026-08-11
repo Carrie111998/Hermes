@@ -181,7 +181,7 @@ def _arrange_startup_fallback(monkeypatch, tmp_path, running_pids):
         return startup_entry
 
     monkeypatch.setattr(gateway_windows, "_install_startup_entry", fake_install_startup_entry)
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next_steps", None)))
     monkeypatch.setattr(gateway, "find_gateway_pids", lambda: running_pids)
@@ -402,7 +402,7 @@ def test_install_scheduled_task_success_start_now_uses_direct_spawn_not_task_run
     )
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(("schtasks", tuple(args))) or (0, "", ""))
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next_steps", None)))
 
@@ -431,7 +431,7 @@ def test_install_scheduled_task_success_does_not_auto_start(monkeypatch, tmp_pat
         lambda task_name, script_path: (True, "Created Scheduled Task 'Hermes_Gateway_alice'"),
     )
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(("schtasks", tuple(args))) or (0, "", ""))
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next_steps", None)))
 
@@ -470,7 +470,7 @@ def test_install_access_denied_launches_elevated_install_before_startup_fallback
     )
     monkeypatch.setattr(setup, "prompt_yes_no", lambda prompt, default=True: calls.append(("prompt", prompt, default)) or True)
     monkeypatch.setattr(gateway_windows, "_install_startup_entry", lambda path: calls.append(("install_startup", path)) or path)
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
 
     gateway_windows.install(force=True)
 
@@ -524,7 +524,7 @@ def test_install_start_now_without_login_autostart_never_escalates(monkeypatch, 
     monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
     monkeypatch.setattr(gateway_windows, "_prompt_install_choices", lambda *args, **kwargs: (True, False))
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
     monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report_start", via)))
     monkeypatch.setattr(gateway_windows, "_install_scheduled_task", lambda *args, **kwargs: calls.append(("install_task", args)) or (True, "should not happen"))
     monkeypatch.setattr(gateway_windows, "_launch_elevated_install", lambda *args, **kwargs: calls.append(("elevate", args, kwargs)) or True)
@@ -546,7 +546,7 @@ def test_start_noops_when_gateway_already_running(monkeypatch, capsys):
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [27128])
     monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: calls.append("task_check") or True)
     monkeypatch.setattr(gateway_windows, "_exec_schtasks", lambda args: calls.append(("schtasks", tuple(args))) or (0, "", ""))
-    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None: calls.append(("spawn", path)) or 12345)
+    monkeypatch.setattr(gateway_windows, "_spawn_detached", lambda path=None, **_kw: calls.append(("spawn", path)) or 12345)
 
     gateway_windows.start()
 
@@ -580,7 +580,7 @@ def test_restart_relaunches_manual_gateway_without_persistence(monkeypatch):
     monkeypatch.setattr(
         gateway_windows,
         "_spawn_detached",
-        lambda: calls.append("spawn") or 12345,
+        lambda *_a, **_kw: calls.append("spawn") or 12345,
     )
     monkeypatch.setattr(
         gateway_windows,

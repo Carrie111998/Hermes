@@ -47,6 +47,16 @@ DIAG_LOG_NAME = "gateway-exit-diag.log"
 # suppression strictly per-process.
 SPAWN_LOGGED_PID_VAR = "HERMES_GATEWAY_SPAWN_DIAG_PID"
 
+# Stamped by whichever code path launches a gateway (see
+# ``gateway_windows._spawn_detached`` and the generated .cmd/.vbs launchers),
+# and echoed back into that gateway's own lifecycle records as ``spawn_site``.
+# Call-site attribution has to be *carried* rather than inferred: a detached
+# gateway outlives its spawner, so by the time anyone reads the log the parent
+# is usually gone. An absent value is meaningful too — it means the launcher
+# was not one of ours. Lives here, not in ``gateway.restart``, so that
+# ``gateway_windows`` can reach it without paying a heavy import.
+SPAWN_SITE_ENV = "HERMES_GATEWAY_SPAWN_SITE"
+
 
 def diag_enabled() -> bool:
     """Whether lifecycle records should be written (default: on)."""
@@ -97,6 +107,101 @@ def process_start_age_s() -> float | None:
         return None
 
 
+# ── launch attribution ───────────────────────────────────────────────────────
+# ``argv`` alone cannot identify a launcher. ``run_gateway()`` reads sys.argv
+# after ``_apply_profile_override()`` has stripped the global ``--profile``, so
+# a gateway whose real command line is
+#     pythonw.exe -m hermes_cli.main --profile main gateway run
+# logs only ["...\\hermes_cli\\main.py", "gateway", "run"]. An August 2026
+# double-spawn investigation eliminated two candidate launchers on exactly that
+# mismatch and never found the real second spawner.
+#
+# The helpers below add what argv cannot carry: the OS command line, the parent
+# chain, and the carried spawn-site stamp. All are best-effort by construction —
+# psutil raises AccessDenied for processes we don't own, NoSuchProcess for a
+# parent that already exited, and can be absent from a stripped install. They
+# degrade to None / [] rather than raise, because a diagnostic must never be the
+# reason a gateway fails to start.
+
+
+def raw_cmdline() -> list[str] | None:
+    """The process's real OS command line, or None if it can't be read."""
+    try:
+        import psutil  # type: ignore
+
+        return list(psutil.Process().cmdline())
+    except Exception:
+        return None
+
+
+def parent_pid() -> int | None:
+    """The parent PID, or None if the platform won't say."""
+    try:
+        return os.getppid()
+    except Exception:
+        return None
+
+
+def _proc_entry(proc) -> dict[str, object]:
+    """Describe one ancestor, per field, so a denied field can't blank the rest.
+
+    Windows routinely allows ``name()`` on a process whose ``cmdline()`` is
+    access-denied (services, elevated parents). A name alone still narrows a
+    launcher down, so each field is captured independently.
+    """
+    entry: dict[str, object] = {"pid": None, "name": None, "cmdline": None}
+    for field in ("pid", "name", "cmdline"):
+        try:
+            value = getattr(proc, field)
+            entry[field] = value if field == "pid" else value()
+        except Exception:
+            continue
+    if isinstance(entry["cmdline"], (list, tuple)):
+        entry["cmdline"] = list(entry["cmdline"])
+    return entry
+
+
+def parent_chain(depth: int = 3) -> list[dict[str, object]]:
+    """Walk up to ``depth`` ancestors, nearest first.
+
+    This is the field that names a spawner we never instrumented: a
+    ``wscript.exe``/``svchost.exe`` ancestor means Task Scheduler, a
+    ``powershell.exe`` one means a startup script, and so on.
+    """
+    chain: list[dict[str, object]] = []
+    try:
+        import psutil  # type: ignore
+
+        proc = psutil.Process().parent()
+    except Exception:
+        return chain
+
+    for _ in range(max(0, depth)):
+        if proc is None:
+            break
+        chain.append(_proc_entry(proc))
+        try:
+            proc = proc.parent()
+        except Exception:
+            break
+    return chain
+
+
+def launch_identity() -> dict[str, object]:
+    """The launch-attribution fields shared by both lifecycle records.
+
+    Adds no import cost over ``process_start_age_s()``, which already pays for
+    psutil on the same code paths. A null ``spawn_site`` is evidence in its own
+    right: it means the launch did not come through any of our spawn paths.
+    """
+    return {
+        "raw_cmdline": raw_cmdline(),
+        "ppid": parent_pid(),
+        "parent_chain": parent_chain(),
+        "spawn_site": os.environ.get(SPAWN_SITE_ENV),
+    }
+
+
 def argv_selects_gateway_run(argv: list[str]) -> bool:
     """Whether ``argv`` invokes ``hermes [flags] gateway [run] [flags]``.
 
@@ -137,5 +242,15 @@ def emit_gateway_spawn_diag(argv: list[str]) -> bool:
     if os.environ.get(SPAWN_LOGGED_PID_VAR) == pid:
         return False  # this process already logged its spawn; see the var's docs
     os.environ[SPAWN_LOGGED_PID_VAR] = pid
-    write_diag("gateway.spawn", argv=list(argv), proc_age_s=process_start_age_s())
+    # Attribution belongs here more than anywhere else: this is the earliest
+    # record, so it is the one most likely to catch the parent process still
+    # alive — a detached spawner returns the moment CreateProcess does, and the
+    # ~50s of CLI startup that follows is long enough for it to be gone by the
+    # time ``gateway.start`` is written.
+    write_diag(
+        "gateway.spawn",
+        argv=list(argv),
+        **launch_identity(),
+        proc_age_s=process_start_age_s(),
+    )
     return True
