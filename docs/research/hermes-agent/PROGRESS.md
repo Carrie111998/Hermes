@@ -9,17 +9,17 @@ updated_at: 2026-08-11
 
 ## 当前里程碑
 
-**M1 — 系统全景架构**
+**M2 — Canonical Turn**
 
-当前目标：逐边验证系统上下文图，并建立真实进程、传输和部署模型。
+当前目标：沿 Classic CLI 追踪一次最小真实回合，定位每个状态突变、持久化点和错误边界。
 
 ## 里程碑状态
 
 | 里程碑 | 状态 | 置信度 | 说明 |
 |---|---|---:|---|
 | M0 研究基线与工作协议 | completed | high | 分支、恢复协议、计划、基线、模板和索引已建立 |
-| M1 系统全景架构 | in progress | high | 已逐入口验证进程/传输模型；模块依赖图和顶层数据流图待完成 |
-| M2 Canonical Turn | pending | — | — |
+| M1 系统全景架构 | completed | high | 系统上下文、进程模型、一级模块图与顶层数据流均已有源码证据 |
+| M2 Canonical Turn | in progress | medium | 已有顶层数据流骨架，待逐 symbol 追踪 Classic CLI 回合 |
 | M3 Agent Loop | pending | — | — |
 | M4 Prompt/Context/Provider | pending | — | — |
 | M5 Tool Runtime | pending | — | — |
@@ -34,8 +34,9 @@ updated_at: 2026-08-11
 
 ## 当前研究单元
 
-- 完成一级模块依赖图，区分 product surfaces、runtime services、Agent narrow waist 和 extension edges。
-- 完成顶层数据流图，标出 live object、canonical SessionDB、Memory、Skills、配置和外部后端。
+- 从 `hermes_cli.main::cmd_chat`、`cli.main` 和 `HermesCLI` 定位用户输入到 `AIAgent.run_conversation` 的调用链。
+- 追踪 `build_turn_context → conversation_loop → finalize_turn` 的最小无工具回合。
+- 再增加一次单工具调用，验证 assistant intent、handler side effect 和 tool result 的增量持久化顺序。
 
 ## 已确认事实
 
@@ -48,15 +49,19 @@ updated_at: 2026-08-11
 - Desktop 是独立 Electron/React surface，默认启动 headless `hermes serve`，不嵌入 TUI 或 Dashboard SPA。
 - API Server 是 Gateway 进程内的平台 adapter；Cron 的内建 ticker 寄宿 Gateway 或 Desktop backend。
 - `dashboard.turn_isolation` 默认关闭，compute-host 是可选隔离层而非固定路径。
+- `AIAgent` 是共享 façade/live-state owner；初始化、turn prologue、主循环和 finalization 已拆到四个职责模块。
+- Agent Core 的一级协作面是 Prompt/Context、Provider、Tool Runtime 与 Persistence；插件、Skills、MCP 和执行后端主要位于边缘。
+- 同一回合存在展示视图、API 视图和持久化视图；`api_content` 保存模型实际看到的当前 user content，同时保持 clean transcript。
+- Tool 调用遵循“先持久化 assistant intent，再执行 handler，再持久化匹配 result”的恢复顺序。
 - 系统架构研究必须把 prompt-cache stability、role alternation 和 narrow-waist tool surface 作为跨模块约束。
 
 ## 待回答问题
 
-1. Agent Core、Provider、Tool Runtime、Persistence 和 Extension 边缘的一级依赖方向是什么？
-2. Prompt、message、tool result、memory 与 session metadata 的顶层数据流如何区分？
-3. 哪些插件类别由通用 `PluginManager` 加载，哪些使用专用 loader？
-4. Gateway routing state 与 canonical SessionDB 的准确写入/恢复边界是什么？
+1. Classic CLI 的输入方法、conversation history owner 和 `run_conversation` 调用点分别在哪里？
+2. 一个无工具回合从 user row 到 final assistant row 的准确 append/flush 顺序是什么？
+3. 一个工具回合在 parallel batch、interrupt 和 persistence failure 下如何保持 call/result 配对？
+4. `final_response`、streamed preview 与 durable assistant row 如何去重并保持一致？
 
 ## 下一步
 
-创建 `architecture/module-map.md` 和 `architecture/data-flow.md`，完成 M1 后进入 M2 Canonical Turn。
+创建 M2 的 `flows/canonical-cli-turn.md`，先完成无工具回合，再叠加单工具回合。

@@ -118,8 +118,9 @@ flowchart LR
 - Cron 的投递和 Gateway 会话不是同一 Session；scheduler 默认寄宿 Gateway 或 Desktop backend，但执行使用 fresh Agent。
 - Memory、Skills 和 SessionDB 暂时合并为 Persistence；模块研究时会拆开。
 
-## 下一轮验证任务
+## 配套视图与后续验证
 
-1. 建立一级模块依赖图，明确 Agent Core 的窄腰边界。
-2. 建立顶层数据流图，区分 live state、SessionDB、Memory 和 Skills。
-3. 在 M2 比较各入口传给 `AIAgent` 的构造参数和 callback 差异。
+- [进程与部署模型](./process-model.md) 展开真实 OS 进程和 stdio/PTY/WS 边界。
+- [一级模块依赖](./module-map.md) 展开 Agent Core 的窄腰与扩展边缘。
+- [顶层数据流](./data-flow.md) 区分 live、API-bound 和 canonical persistence 视图。
+- M2 将比较各入口传给 `AIAgent` 的构造参数，并逐 symbol 验证 Classic CLI canonical turn。

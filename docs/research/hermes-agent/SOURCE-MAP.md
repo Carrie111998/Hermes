@@ -63,3 +63,10 @@ confidence: medium
 | Cron | Gateway/Desktop scheduler provider | `cron.scheduler::run_job` | ticker thread/provider；per-run fresh Agent |
 
 完整进程图与 ownership 说明见 [architecture/process-model.md](./architecture/process-model.md)。
+
+## 顶层架构视图
+
+- [系统上下文](./architecture/system-context.md)：参与者、产品入口和外部依赖。
+- [进程与部署模型](./architecture/process-model.md)：OS 进程、stdio/PTY/WS 和 state ownership。
+- [一级模块依赖](./architecture/module-map.md)：入口编排、Agent façade、核心协作面和扩展边缘。
+- [顶层数据流](./architecture/data-flow.md)：展示/API/持久化视图、tool-call 回路和失败边界。
