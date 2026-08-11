@@ -566,9 +566,15 @@ def _resolve_relay_identity_token() -> str:
         token = ""
         if body.startswith("{"):
             try:
-                token = str((json.loads(body) or {}).get("access_token") or "").strip()
+                envelope_token = (json.loads(body) or {}).get("access_token")
             except ValueError:
-                token = ""
+                envelope_token = None
+            # Same contract as the client_credentials path below: the value
+            # must be a non-empty STRING. No shape gate here — a JSON envelope
+            # is a deliberate token response (and opaque tokens may use the
+            # standard-base64 alphabet the raw-body gate would reject).
+            if isinstance(envelope_token, str):
+                token = envelope_token.strip()
         elif _AMBIENT_TOKEN_SHAPE.fullmatch(body):
             token = body
         if not token:

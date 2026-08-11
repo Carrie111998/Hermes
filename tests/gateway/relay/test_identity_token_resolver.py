@@ -123,6 +123,31 @@ def test_ambient_accepts_json_envelope(monkeypatch):
     assert relay._resolve_relay_identity_token() == _FAKE_JWT
 
 
+@pytest.mark.parametrize(
+    "envelope",
+    [
+        {"access_token": 12345678901234567890123456789012},  # number, not string
+        {"access_token": True},  # boolean: str() would coerce to 'True'
+        {"access_token": {"nested": "x"}},  # object
+        {"access_token": ""},  # empty string
+        {"access_token": None},
+        {"token": "wrong-field-name"},
+    ],
+)
+def test_ambient_rejects_non_string_envelope_values(monkeypatch, envelope):
+    """access_token in a JSON envelope must be a non-empty STRING — the same
+    contract as the client_credentials path. No str() coercion of numbers,
+    booleans, or objects into 'tokens'."""
+    monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://proxy.local/access-token")
+
+    def fake_urlopen(req, timeout=None):
+        return io.BytesIO(json.dumps(envelope).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="ambient"):
+        relay._resolve_relay_identity_token()
+
+
 def test_ambient_rejects_non_token_body(monkeypatch):
     """A body that is neither a JWT-ish string nor a token envelope fails loudly."""
     monkeypatch.setenv("GATEWAY_RELAY_IDP_TOKEN_URL", "https://proxy.local/access-token")
