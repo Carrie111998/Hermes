@@ -1351,16 +1351,7 @@ def _runtime_tool_middleware(**kwargs: Any) -> Any:
             if resolved_path not in session.allowed_image_paths:
                 return _image_analysis_scope_error()
     if tool_name == "video_analyze":
-        requested_path = str(args.get("video_url") or "").strip()
-        try:
-            resolved_path = str(Path(requested_path).resolve(strict=True))
-        except (OSError, RuntimeError):
-            resolved_path = ""
-        if resolved_path not in session.allowed_video_paths:
-            return json.dumps({
-                "success": False,
-                "error": "video_analyze may only read video attachments owned by this run.",
-            })
+        return session._invoke_video_analyze(args, next_call)
     if tool_name in _RUNTIME_NATIVE_TOOLS:
         return next_call(args) if callable(next_call) else args
 
@@ -1482,6 +1473,8 @@ class RuntimeBridgeSession:
         self.local_activities: dict[str, str] = {}
         self.pending: dict[str, _PendingTool] = {}
         self.non_retryable_failures: dict[str, str] = {}
+        self.native_non_retryable_failures: dict[str, str] = {}
+        self.video_analyze_lock = threading.Lock()
         self.argument_correction_failures: dict[str, int] = {}
         self.model_parameter_contracts: dict[str, dict[str, dict[str, Any]]] = {}
         self.model_contract_digests: dict[str, str] = {}
@@ -1549,6 +1542,71 @@ class RuntimeBridgeSession:
             count=count,
             signature=ToolCallSignature.from_call(name, args),
         ))
+
+    def _invoke_video_analyze(self, args: dict[str, Any], next_call: Any) -> Any:
+        """Execute at most one terminally failing video analysis per Run."""
+        with self.video_analyze_lock:
+            with self.lock:
+                prior_code = self.native_non_retryable_failures.get("video_analyze", "")
+            if prior_code:
+                message = (
+                    "Blocked video_analyze: an earlier call in this Run failed with "
+                    f"non-retryable error {prior_code}."
+                )
+                self._halt_tool_loop(
+                    "video_analyze",
+                    args,
+                    "repeated_non_retryable_tool_call",
+                    message,
+                    2,
+                )
+                return json.dumps({
+                    "error": {
+                        "code": "repeated_non_retryable_tool_call",
+                        "message": message,
+                        "retryable": False,
+                    },
+                }, ensure_ascii=False, separators=(",", ":"))
+
+            requested_path = str(args.get("video_url") or "").strip()
+            try:
+                resolved_path = str(Path(requested_path).resolve(strict=True))
+            except (OSError, RuntimeError):
+                resolved_path = ""
+            if resolved_path not in self.allowed_video_paths:
+                result: Any = json.dumps({
+                    "success": False,
+                    "error": (
+                        "video_analyze may only read video attachments owned by this run."
+                    ),
+                    "error_code": "video_analysis_scope_denied",
+                    "retryable": False,
+                })
+            else:
+                result = next_call(args) if callable(next_call) else args
+
+            code = self._native_non_retryable_failure_code(result)
+            if code:
+                with self.lock:
+                    self.native_non_retryable_failures["video_analyze"] = code
+            return result
+
+    @staticmethod
+    def _native_non_retryable_failure_code(result: Any) -> str:
+        payload = result
+        if isinstance(result, str):
+            try:
+                payload = json.loads(result)
+            except (TypeError, ValueError):
+                return ""
+        if not isinstance(payload, dict):
+            return ""
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("retryable") is False:
+            return str(error.get("code") or "native_tool_failed")
+        if payload.get("success") is False and payload.get("retryable") is False:
+            return str(payload.get("error_code") or "native_tool_failed")
+        return ""
 
     def _ensure_model_parameter_contracts(
         self,

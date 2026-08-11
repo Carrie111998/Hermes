@@ -585,9 +585,74 @@ def test_runtime_video_tool_is_scoped_to_materialized_attachment(tmp_path):
         assert json.loads(denied) == {
             "success": False,
             "error": "video_analyze may only read video attachments owned by this run.",
+            "error_code": "video_analysis_scope_denied",
+            "retryable": False,
         }
     finally:
         runtime_module._SESSIONS.pop("agent_video", None)
+        session.loop.close()
+
+
+def test_runtime_video_tool_blocks_changed_retry_after_terminal_failure(tmp_path):
+    allowed = tmp_path / "asset_video.mp4"
+    allowed.write_bytes(b"video")
+    queue = asyncio.Queue()
+    session = RuntimeBridgeSession(
+        "run_video_terminal",
+        asyncio.new_event_loop(),
+        queue,
+        [],
+        1_000,
+        "agent_video_terminal",
+        allowed_video_paths={str(allowed)},
+    )
+    halt_decisions = []
+    session.agent_ref[0] = SimpleNamespace(
+        _set_tool_guardrail_halt=halt_decisions.append,
+    )
+    runtime_module._SESSIONS["agent_video_terminal"] = session
+    calls = []
+
+    def fail_once(args):
+        calls.append(args)
+        return json.dumps({
+            "success": False,
+            "error": "upstream model rejected the request",
+            "error_code": "video_analysis_model_incompatible",
+            "retryable": False,
+        })
+
+    try:
+        first = _runtime_tool_middleware(
+            tool_name="video_analyze",
+            args={"video_url": str(allowed), "question": "Summarize it"},
+            session_id="agent_video_terminal",
+            tool_call_id="video_first",
+            next_call=fail_once,
+        )
+        assert json.loads(first)["error_code"] == "video_analysis_model_incompatible"
+
+        second = _runtime_tool_middleware(
+            tool_name="video_analyze",
+            args={"video_url": str(allowed), "question": "Try a different prompt"},
+            session_id="agent_video_terminal",
+            tool_call_id="video_second",
+            next_call=fail_once,
+        )
+        assert json.loads(second)["error"] == {
+            "code": "repeated_non_retryable_tool_call",
+            "message": (
+                "Blocked video_analyze: an earlier call in this Run failed with "
+                "non-retryable error video_analysis_model_incompatible."
+            ),
+            "retryable": False,
+        }
+        assert len(calls) == 1
+        assert len(halt_decisions) == 1
+        assert halt_decisions[0].code == "repeated_non_retryable_tool_call"
+        assert halt_decisions[0].should_halt is True
+    finally:
+        runtime_module._SESSIONS.pop("agent_video_terminal", None)
         session.loop.close()
 
 

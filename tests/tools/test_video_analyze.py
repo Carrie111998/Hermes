@@ -212,6 +212,8 @@ class TestVideoAnalyzeTool:
         data = json.loads(result)
         assert data["success"] is False
         assert "invalid video source" in data["analysis"].lower()
+        assert data["error_code"] == "video_analysis_failed"
+        assert data["retryable"] is False
 
     def test_unsupported_format(self, tmp_path):
         """Unsupported extension raises error."""
@@ -222,6 +224,7 @@ class TestVideoAnalyzeTool:
         data = json.loads(result)
         assert data["success"] is False
         assert "unsupported video format" in data["analysis"].lower()
+        assert data["retryable"] is False
 
     def test_video_too_large(self, tmp_path, monkeypatch):
         """Video exceeding max size is rejected."""
@@ -237,6 +240,8 @@ class TestVideoAnalyzeTool:
         data = json.loads(result)
         assert data["success"] is False
         assert "too large" in data["analysis"].lower()
+        assert data["error_code"] == "video_analysis_input_too_large"
+        assert data["retryable"] is False
 
     def test_interrupt_check(self, tmp_path):
         """Tool respects interrupt flag."""
@@ -248,9 +253,11 @@ class TestVideoAnalyzeTool:
 
         data = json.loads(result)
         assert data["success"] is False
+        assert data["error_code"] == "video_analysis_interrupted"
+        assert data["retryable"] is False
 
-    def test_empty_response_retries(self, tmp_path):
-        """Retries once on empty model response."""
+    def test_empty_response_is_terminal(self, tmp_path):
+        """An empty paid response fails closed instead of calling the model again."""
         video = tmp_path / "test.mp4"
         video.write_bytes(b"\x00" * 100)
 
@@ -265,12 +272,14 @@ class TestVideoAnalyzeTool:
             return mock_response
 
         with patch("tools.vision_tools.async_call_llm", side_effect=fake_llm):
-            with patch("tools.vision_tools.extract_content_or_reasoning", side_effect=["", "Video analysis result."]):
+            with patch("tools.vision_tools.extract_content_or_reasoning", return_value=""):
                 result = self._run(video_analyze_tool(str(video), "What?"))
 
         data = json.loads(result)
-        assert data["success"] is True
-        assert call_count == 2  # Initial call + retry
+        assert data["success"] is False
+        assert data["error_code"] == "video_analysis_failed"
+        assert data["retryable"] is False
+        assert call_count == 1
 
     def test_file_scheme_stripped(self, tmp_path):
         """file:// prefix is stripped correctly."""

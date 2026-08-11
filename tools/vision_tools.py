@@ -1173,7 +1173,12 @@ async def video_analyze_tool(
     try:
         from tools.interrupt import is_interrupted
         if is_interrupted():
-            return tool_error("Interrupted", success=False)
+            return tool_error(
+                "Interrupted",
+                success=False,
+                error_code="video_analysis_interrupted",
+                retryable=False,
+            )
 
         logger.info("Analyzing video: %s", video_url[:60])
         logger.info("User prompt: %s", user_prompt[:100])
@@ -1274,9 +1279,7 @@ async def video_analyze_tool(
         analysis = extract_content_or_reasoning(response)
 
         if not analysis:
-            logger.warning("Empty video response, retrying once")
-            response = await async_call_llm(**call_kwargs)
-            analysis = extract_content_or_reasoning(response)
+            raise RuntimeError("Video analysis model returned an empty response")
 
         analysis_length = len(analysis) if analysis else 0
         logger.info("Video analysis completed (%s characters)", analysis_length)
@@ -1320,9 +1323,11 @@ async def video_analyze_tool(
         logger.error("%s", error_msg, exc_info=True)
 
         err_str = str(e).lower()
+        error_code = "video_analysis_failed"
         if any(hint in err_str for hint in (
             "402", "insufficient", "payment required", "credits", "billing",
         )):
+            error_code = "video_analysis_insufficient_credits"
             analysis = (
                 "Insufficient credits or payment required. Please top up your "
                 f"API provider account and try again. Error: {e}"
@@ -1333,6 +1338,7 @@ async def video_analyze_tool(
             "unrecognized request argument", "video input",
             "video_url",
         )):
+            error_code = "video_analysis_model_incompatible"
             analysis = (
                 f"The model does not support video analysis or the request was "
                 f"rejected. Ensure you're using a video-capable model "
@@ -1342,6 +1348,7 @@ async def video_analyze_tool(
             "too large", "payload", "413", "content_too_large",
             "request_too_large", "exceeds", "size limit",
         )):
+            error_code = "video_analysis_input_too_large"
             analysis = (
                 "The video is too large for the API. Try compressing or trimming "
                 f"the video (max ~50 MB). Error: {e}"
@@ -1355,6 +1362,8 @@ async def video_analyze_tool(
         result = {
             "success": False,
             "error": error_msg,
+            "error_code": error_code,
+            "retryable": False,
             "analysis": analysis,
         }
 
