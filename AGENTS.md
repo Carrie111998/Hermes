@@ -4,6 +4,15 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 **Never give up on the right solution.**
 
+## Hermes Architecture Research
+
+When continuing the Hermes architecture deep-dive on its documentation branch,
+first read `docs/research/hermes-agent/README.md`, `PROGRESS.md`, and
+`HANDOFF.md` in that directory. Then read only the current module document
+linked from `HANDOFF.md`. Before ending the research session, update
+`PROGRESS.md` and `HANDOFF.md`; keep detailed historical notes under `journal/`
+so they are not loaded into every continuation.
+
 ## What Hermes Is
 
 Hermes is a personal AI agent that runs the same agent core across a CLI, a
