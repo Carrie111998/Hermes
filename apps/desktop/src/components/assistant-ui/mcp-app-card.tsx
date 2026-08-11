@@ -90,7 +90,7 @@ function buildCsp(csp: McpUiCsp): string {
         `img-src data: blob: ${res}`.trim(),
         `font-src data: ${res}`.trim(),
         `media-src ${res || "'none'"}`.trim(),
-        `connect-src ${conn || "'self'"}`.trim(),
+        `connect-src ${conn || "'none'"}`.trim(),
         "base-uri 'none'",
         'form-action *'
     ].join('; ')

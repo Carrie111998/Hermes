@@ -316,6 +316,8 @@ class TestBridgeProxy:
                 structuredContent={"id": "p1"},
             )
         )
+        server = mcp_tool._servers["test-server"]
+        server._registered_tool_names = ["utp_catalog_product"]
         out = mcp_tool.call_mcp_app_request(
             "test-server", "tools/call", {"name": "utp_catalog_product",
                                           "arguments": {"product_id": "p1"}}
@@ -365,6 +367,49 @@ class TestBridgeSecurity:
         assert out["error"]["code"] == -32601
         assert "not registered" in out["error"]["message"]
         # The real tool was never invoked — the bridge blocked the call.
+        session.call_tool.assert_not_called()
+
+    def test_tools_call_blocks_when_registered_tool_names_empty(self, _patch_mcp_server):
+        """Guard: a card cannot call tools when _registered_tool_names is empty.
+
+        Before the fix, ``registered = []`` short-circuited the whitelist check
+        (empty list is falsy), allowing any tool to bypass validation. Now
+        empty or unpopulated lists block ALL tools.
+        """
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock()
+        server = mcp_tool._servers["test-server"]
+        # Simulate a server whose tools haven't been discovered yet (empty list)
+        # or were reset after disconnect.
+        server._registered_tool_names = []
+
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "tools/call",
+            {"name": "utp_catalog_search", "arguments": {}}
+        )
+
+        assert set(out.keys()) == {"error"}
+        assert out["error"]["code"] == -32601
+        session.call_tool.assert_not_called()
+
+    def test_tools_call_blocks_when_registered_tool_names_unset(self, _patch_mcp_server):
+        """Guard: a card cannot call tools when _registered_tool_names is None.
+
+        A server that hasn't completed its initial tools/list discovery should
+        reject all bridge tool calls — None means "unknown", not "empty + OK".
+        """
+        session = _patch_mcp_server
+        session.call_tool = AsyncMock()
+        server = mcp_tool._servers["test-server"]
+        server._registered_tool_names = None
+
+        out = mcp_tool.call_mcp_app_request(
+            "test-server", "tools/call",
+            {"name": "utp_catalog_search", "arguments": {}}
+        )
+
+        assert set(out.keys()) == {"error"}
+        assert out["error"]["code"] == -32601
         session.call_tool.assert_not_called()
 
     def test_tools_call_permits_registered_tool(self, _patch_mcp_server):

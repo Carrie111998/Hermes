@@ -5210,8 +5210,8 @@ def call_mcp_app_request(
             name = params.get("name")
             # Validate the tool is registered on this server — prevents a
             # sandboxed card from calling arbitrary or internal methods.
-            registered = getattr(server, "_registered_tool_names", None) or []
-            if name and registered and name not in registered:
+            registered = getattr(server, "_registered_tool_names", None)
+            if name and (registered is None or name not in registered):
                 return {"error": {"code": -32601,
                         "message": f"tool '{name}' not registered on server '{server_name}'"}}
             arguments = params.get("arguments") or {}
