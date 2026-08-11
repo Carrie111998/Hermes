@@ -2542,11 +2542,22 @@ async function checkUpdates() {
       }
     }
 
+    // Direction matters: local commits (unpushed fixes) make HEAD diverge
+    // from origin/main — that is NOT "an update is available". Only report
+    // when HEAD is strictly behind. origin/main ancestor of HEAD → ahead.
+    let ahead = false
+    try {
+      await runGit(['fetch', '--quiet', 'origin', branch], { cwd: updateRoot })
+      ahead = (await runGit(['merge-base', '--is-ancestor', `origin/${branch}`, 'HEAD'], { cwd: updateRoot })).code === 0
+    } catch {
+      ahead = false
+    }
+
     return {
       supported: true,
       branch,
       currentBranch,
-      behind: currentSha && currentSha === targetSha ? 0 : 1,
+      behind: currentSha && currentSha === targetSha ? 0 : ahead ? 0 : 1,
       currentSha,
       targetSha,
       commits: [],
