@@ -7201,7 +7201,7 @@ def run_conversation(
                     # Prose next to a required call is only a candidate; it is
                     # neither final nor safe to persist/stream before results.
                     _sanitize_required_assistant_candidate(assistant_msg)
-                
+
                 turn_content = assistant_message.content or ""
 
                 # Some local tool-call templates emit a bare bracketed token
