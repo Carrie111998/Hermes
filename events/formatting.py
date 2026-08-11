@@ -106,24 +106,28 @@ EVENT_TYPE_EMOJI = {
     EventType.DEVFLOW_BUILD_STARTED:    "🔨",
     EventType.DEVFLOW_BUILD_SUCCEEDED:  "🟢",
     EventType.DEVFLOW_BUILD_FAILED:     "🧨",
-    # DevFlow work-intake, merge and deploy telemetry. These 12 EventTypes
-    # were added to events/schema.py without icons, which is precisely what
-    # test_event_icons_cover_all_types exists to catch — it was failing on
-    # DEVFLOW_WORK_REQUESTED. Intake states read as a triage funnel; merge
-    # and deploy reuse the established convention (🟣 merged, 🟢 up, 🔴 down)
-    # rather than inventing a second vocabulary for the same idea.
+    # DevFlow work-intake + merge/deploy lifecycle. These 12 members were
+    # registered in events/schema.py (f911b6090) so the routing table would be
+    # total, but no icon was paired at the same time — which is exactly what
+    # EVENT_TYPE_EMOJI's completeness test exists to catch, and it has been
+    # failing on main ever since. Paired here 2026-08-11.
+    # The merge/deploy members land in Stage 2/3 and are not emitted yet; the
+    # entries keep test_event_icons_cover_all_types honest and give a sane
+    # fallback render the moment a producer starts emitting them.
     EventType.DEVFLOW_WORK_REQUESTED:   "📥",
-    EventType.DEVFLOW_WORK_TRIAGED:     "🗂️",
+    EventType.DEVFLOW_WORK_TRIAGED:     "🏷️",
     EventType.DEVFLOW_WORK_PLANNED:     "🗺️",
-    EventType.DEVFLOW_WORK_DUPLICATE:   "♊",
+    EventType.DEVFLOW_WORK_DUPLICATE:   "👯",
     EventType.DEVFLOW_WORK_DECLINED:    "🙅",
     EventType.DEVFLOW_WORK_SUPPRESSED:  "🔕",
     EventType.DEVFLOW_MERGE_PENDING:    "⏳",
-    EventType.DEVFLOW_MERGED:           "🟣",
+    # Distinct from DEVFLOW_PR_MERGED's 🟣: that is a GitHub PR merging,
+    # these are the devflow pipeline's own merge outcomes.
+    EventType.DEVFLOW_MERGED:           "🔀",
     EventType.DEVFLOW_AUTO_MERGED:      "🤖",
     EventType.DEVFLOW_DEPLOY_STARTED:   "🚀",
-    EventType.DEVFLOW_DEPLOYED:         "🟢",
-    EventType.DEVFLOW_DEPLOY_FAILED:    "🔴",
+    EventType.DEVFLOW_DEPLOYED:         "🛰️",
+    EventType.DEVFLOW_DEPLOY_FAILED:    "💔",
     # Notification delivery reverse-signal (2026-04-30) — visibility
     # for whether a notification reached the user. Distinct from generic
     # green/red so an operator scanning watchdog_alerts can tell a
