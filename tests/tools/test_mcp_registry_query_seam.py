@@ -2,19 +2,27 @@
 
 ``has_registered_mcp_tools`` and ``get_registered_mcp_server_names`` were
 moved byte-verbatim from ``tools/mcp_tool.py`` into
-``tools/mcp_registry_query.py``; ``tools/mcp_tool`` now re-exports the same
-function objects. These tests pin the seam contract:
+``tools/mcp_registry_query.py``; ``tools.mcp_tool`` lazily re-exports the
+same function objects through a PEP 562 module ``__getattr__``. These
+tests pin the seam contract:
 
-* object identity: the names re-exported by ``tools.mcp_tool`` ARE the
+* object identity: the names exposed by ``tools.mcp_tool`` ARE the
   objects defined in ``tools.mcp_registry_query`` (a re-export, not
   wrappers), so existing callers in ``agent/turn_context.py`` /
   ``gateway/session.py`` keep resolving the same callables;
 * shared state: the moved functions read the SAME ``_lock`` /
-  ``_mcp_tool_server_names`` objects owned by ``tools.mcp_tool`` — writes
-  made through the original module are visible through the new module and
-  vice versa (the lazy-import seam binds the original module's objects);
+  ``_mcp_tool_server_names`` objects owned by ``tools.mcp_tool`` — the
+  module-scope import in ``tools.mcp_registry_query`` binds the original
+  module's objects (identity, not copies), so writes made through the
+  original module are visible through the new module and vice versa;
 * behavior: empty-registry and populated-registry results match the
   pre-extraction semantics.
+
+PEP 562 note: a module ``__getattr__`` does NOT make the resolved names
+``dir()``-visible. No consumer enumerates ``tools.mcp_tool`` via ``dir()``
+or ``__all__`` (the module defines neither for these names); resolution is
+always via attribute access / ``getattr`` / ``hasattr`` / from-import,
+all of which route through the hook.
 """
 
 import threading
@@ -73,18 +81,24 @@ class TestReexportIdentity:
             assert mcp_impl is query_impl
             assert mcp_impl.__code__.co_filename.endswith("mcp_registry_query.py")
 
-    def test_lazy_seam_reads_state_from_original_module(self, mcp_state, monkeypatch):
-        """The aggressive identity proof: swap the original module's state
-        objects for sentinels and prove the moved functions resolve them
-        through ``tools.mcp_tool`` at call time (a stale import-time copy
-        would keep reporting the cleared fixture state and fail this)."""
+    def test_module_scope_seam_binds_original_state_objects(self, mcp_state, monkeypatch):
+        """The aggressive identity proof for the module-scope seam: the
+        moved functions' module globals ARE the owner module's state
+        objects (bound at import time by the module-scope ``from
+        tools.mcp_tool import ...``). A stale import-time copy would fail
+        the identity assertions below, and the sentinel swap proves the
+        byte-identical bodies read through those module globals."""
         import tools.mcp_tool as mcp_tool
         import tools.mcp_registry_query as mcp_registry_query
 
+        # Module-scope import binds the owner module's exact objects.
+        assert mcp_registry_query._lock is mcp_tool._lock
+        assert mcp_registry_query._mcp_tool_server_names is mcp_tool._mcp_tool_server_names
+
         sentinel_lock = threading.Lock()
         sentinel_map = {"mcp__sentinel__x": "sentinel"}
-        monkeypatch.setattr(mcp_tool, "_lock", sentinel_lock)
-        monkeypatch.setattr(mcp_tool, "_mcp_tool_server_names", sentinel_map)
+        monkeypatch.setattr(mcp_registry_query, "_lock", sentinel_lock)
+        monkeypatch.setattr(mcp_registry_query, "_mcp_tool_server_names", sentinel_map)
 
         assert mcp_registry_query.has_registered_mcp_tools() is True
         assert mcp_registry_query.get_registered_mcp_server_names() == {"sentinel"}

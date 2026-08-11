@@ -4,11 +4,18 @@
 the cheap per-turn registry signal used by the agent refresh hook and by
 capability-aware prompt building. Their implementations were extracted
 byte-verbatim from ``tools/mcp_tool.py`` (mcp_tool R5 slice, lines
-7192-7217 at pin ee4bb75b). The shared registry state they read
-(``_lock`` / ``_mcp_tool_server_names``) remains owned by
-:mod:`tools.mcp_tool` and is resolved lazily at call time so the moved
-functions keep operating on the exact same runtime objects as before.
+7192-7217 at pin ee4bb75b): the two function bodies are byte-identical
+to that pin window (sha256
+cf77c60fde9b35e42fff26ee608e7937486330071a62e996575f0905267e1fd8).
+The shared registry state they read (``_lock`` / ``_mcp_tool_server_names``)
+remains owned by :mod:`tools.mcp_tool` and is imported here at module
+scope, so the moved functions operate on the exact same runtime objects
+as before.  :mod:`tools.mcp_tool` re-exports these names lazily through
+its PEP 562 module ``__getattr__`` (never at module scope), which keeps
+the state-ownership edge acyclic.
 """
+
+from tools.mcp_tool import _lock, _mcp_tool_server_names
 
 
 def has_registered_mcp_tools() -> bool:
@@ -21,9 +28,6 @@ def has_registered_mcp_tools() -> bool:
     registered TOOLS, not connected servers, so a server that registers no tools
     doesn't keep the hook firing every turn.
     """
-    # Seam: resolve the shared registry state from the owning module at call
-    # time so the extracted functions keep reading the same runtime objects.
-    from tools.mcp_tool import _lock, _mcp_tool_server_names
     with _lock:
         return bool(_mcp_tool_server_names)
 
@@ -38,8 +42,5 @@ def get_registered_mcp_server_names() -> set:
     Slack platform note) to detect an MCP server that provides a given
     platform's capability regardless of what its config key is named.
     """
-    # Seam: resolve the shared registry state from the owning module at call
-    # time so the extracted functions keep reading the same runtime objects.
-    from tools.mcp_tool import _lock, _mcp_tool_server_names
     with _lock:
         return set(_mcp_tool_server_names.values())

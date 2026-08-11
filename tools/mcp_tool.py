@@ -254,6 +254,20 @@ _MCP_SDK_LAZY_SYMBOLS = frozenset({
     "PromptListChangedNotification", "ResourceListChangedNotification",
 })
 
+# Registry-query helpers extracted into tools/mcp_registry_query (mcp_tool
+# R5 slice, byte-verbatim from lines 7192-7217 at pin ee4bb75b). They read
+# _lock/_mcp_tool_server_names back from THIS module, so resolving them
+# must stay lazy — a module-scope import here would be circular with
+# mcp_registry_query's own module-scope state import. PEP 562 __getattr__
+# below resolves them on first attribute access; note that, like the SDK
+# symbols, these names are NOT dir()-visible (PEP 562 does not add them to
+# dir()), but attribute access, getattr(), hasattr(), and from-imports all
+# route through the hook and resolve to the identical objects.
+_MCP_REGISTRY_QUERY_LAZY_SYMBOLS = frozenset({
+    "has_registered_mcp_tools",
+    "get_registered_mcp_server_names",
+})
+
 
 def __getattr__(name: str):
     if name in _MCP_SDK_LAZY_SYMBOLS:
@@ -262,6 +276,9 @@ def __getattr__(name: str):
             return globals()[name]
         except KeyError:
             pass  # SDK missing or symbol absent on this SDK build
+    if name in _MCP_REGISTRY_QUERY_LAZY_SYMBOLS:
+        import tools.mcp_registry_query as _mcp_registry_query
+        return getattr(_mcp_registry_query, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
@@ -7189,7 +7206,12 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
 _agent_tools_lock = threading.Lock()
 
 
-from tools.mcp_registry_query import has_registered_mcp_tools, get_registered_mcp_server_names # noqa: F401
+# has_registered_mcp_tools / get_registered_mcp_server_names were moved
+# byte-verbatim to tools/mcp_registry_query (mcp_tool R5 slice); they are
+# re-exported lazily through the PEP 562 module __getattr__ near the top of
+# this file (see _MCP_REGISTRY_QUERY_LAZY_SYMBOLS), so attribute access,
+# getattr(), and from-imports keep resolving the identical objects without
+# a module-scope import (which would be circular).
 
 
 
