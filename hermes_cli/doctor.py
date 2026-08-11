@@ -224,6 +224,151 @@ def _state_db_probe_budget() -> float:
     return value if value > 0 else _STATE_DB_PROBE_TIMEOUT_DEFAULT
 
 
+# Wall-clock budget for a single `npm audit --json`. This was nominally
+# bounded before, by `subprocess.run(..., timeout=30)` — but that does not
+# bound the call on Windows: `npm` resolves to `npm.cmd`, so the real work
+# runs in a `node.exe` GRANDCHILD which inherits the capture pipes. On
+# timeout `subprocess.run` kills only the direct child and then blocks
+# re-draining a pipe the surviving grandchild still holds open, so it waits
+# out the grandchild regardless of the timeout. Measured: the four audits
+# together spent 6m44s as a single silent gap in an ~11 minute `hermes
+# doctor`, and swallowed every result. The bound is real now (see
+# `_run_npm_audit`), but the audits are also no longer part of a default run:
+# 40-120s per target is too slow to finish inside any budget a diagnostic can
+# reasonably hold, so paying it on every run bought four "not checked"
+# warnings. `hermes doctor --audit` opts in with a budget long enough that
+# they actually complete. HERMES_DOCTOR_NPM_AUDIT_TIMEOUT overrides either
+# budget (0 or invalid falls back).
+_NPM_AUDIT_TIMEOUT_ENV = "HERMES_DOCTOR_NPM_AUDIT_TIMEOUT"
+_NPM_AUDIT_TIMEOUT_DEFAULT = 30.0
+# `--audit` was asked for explicitly, so the useful failure there is "it took
+# ages" rather than "it gave up" — long enough for the slowest measured target
+# (122s) with headroom, short enough to still terminate.
+_NPM_AUDIT_TIMEOUT_ON_DEMAND = 300.0
+
+
+def _npm_audit_budget(on_demand: bool = False) -> float:
+    """Return the per-target `npm audit` budget in seconds (env-overridable)."""
+    default = (
+        _NPM_AUDIT_TIMEOUT_ON_DEMAND if on_demand else _NPM_AUDIT_TIMEOUT_DEFAULT
+    )
+    raw = os.getenv(_NPM_AUDIT_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _run_npm_audit(argv, *, cwd, timeout: float) -> subprocess.CompletedProcess:
+    """Run one `npm audit --json`, bounded for real.
+
+    Delegates to ``run_text_capture``, which captures into temp files rather
+    than pipes. That is what makes the bound hold when npm's ``node.exe``
+    grandchild outlives its parent: with no capture pipe there is no reader
+    thread to drain and no handle whose close can block, so the budget does
+    not depend on the tree-kill landing. Raises
+    :class:`subprocess.TimeoutExpired` at ``timeout`` like ``subprocess.run``.
+    """
+    from hermes_cli._subprocess_compat import run_text_capture
+
+    return run_text_capture(list(argv), cwd=cwd, timeout=timeout)
+
+
+def _audit_npm_target(
+    npm_bin, npm_dir, label, audit_extra, issues: list[str], *, on_demand: bool = False
+) -> None:
+    """Audit one npm target and render its result; append any finding to `issues`.
+
+    A budget hit renders a WARN rather than nothing: the audit that motivated
+    the bound spent six minutes producing no output at all, because the
+    exception was swallowed by a bare `except`. It is not appended to `issues`
+    — a diagnostic that could not answer is not a vulnerability finding.
+    """
+    budget = _npm_audit_budget(on_demand)
+    try:
+        # Use resolved absolute path so Windows can execute
+        # npm.cmd (CreateProcessW can't run bare .cmd names).
+        audit_result = _run_npm_audit(
+            [npm_bin, "audit", "--json", *audit_extra],
+            cwd=str(npm_dir),
+            timeout=budget,
+        )
+    except subprocess.TimeoutExpired:
+        check_warn(
+            f"{label} deps",
+            f"(npm audit exceeded its {budget:.0f}s budget — not checked; "
+            f"raise {_NPM_AUDIT_TIMEOUT_ENV} to wait longer)",
+        )
+        return
+    except Exception:
+        return
+
+    try:
+        import json as _json
+        audit_data = _json.loads(audit_result.stdout) if audit_result.stdout.strip() else {}
+        vuln_count = audit_data.get("metadata", {}).get("vulnerabilities", {})
+        critical = vuln_count.get("critical", 0)
+        high = vuln_count.get("high", 0)
+        moderate = vuln_count.get("moderate", 0)
+        total = critical + high + moderate
+        # Determine a scoped fix command for the remediation hint.
+        if audit_extra and audit_extra[0] == "--workspace":
+            # Detection (`npm audit --workspace <name>`) is read-only and
+            # safe, but `npm audit fix --workspace <name>` crashes on
+            # current npm with "Cannot read properties of null (reading
+            # 'edgesOut')" — an arborist bug with workspace-filtered
+            # audit fix. The root-level `npm audit fix` can crash on the
+            # same tree with "isDescendantOf", so do not hand the user a
+            # manual fix command for these build-tool advisories.
+            fix_cmd = None
+        elif audit_extra == ["--workspaces=false"]:
+            fix_cmd = f"cd {npm_dir} && npm audit fix --workspaces=false"
+        else:
+            fix_cmd = f"cd {npm_dir} && npm audit fix"
+        if total == 0:
+            check_ok(f"{label} deps", "(no known vulnerabilities)")
+        elif critical > 0 or high > 0:
+            if fix_cmd:
+                vuln_detail = (
+                    f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
+                )
+            else:
+                vuln_detail = (
+                    f"{critical} critical, {high} high, {moderate} moderate — "
+                    "build-tool advisory; clears via lockfile bump"
+                )
+            check_warn(
+                f"{label} deps",
+                f"({vuln_detail})"
+            )
+            if audit_extra and audit_extra[0] == "--workspace":
+                # The web/ui-tui workspace advisories are in build-time
+                # tooling (esbuild/vite, etc.), not runtime code that ships
+                # to users. Manual npm remediation may error with a known
+                # arborist crash (edgesOut / isDescendantOf) on this monorepo
+                # tree — in that case it is an npm bug, not a Hermes one.
+                check_info(
+                    "  ^ build-time tooling (not runtime); if manual npm remediation "
+                    "errors with an arborist crash it's a known npm bug — clears "
+                    "via a lockfile bump"
+                )
+            issues.append(
+                f"{label} has {total} npm "
+                f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
+            )
+        else:
+            check_ok(
+                f"{label} deps",
+                f"({moderate} moderate "
+                f"{'vulnerability' if moderate == 1 else 'vulnerabilities'})",
+            )
+    except Exception:
+        pass
+
+
 # Deprecated / legacy config keys still read for back-compat. Doctor surfaces
 # them as non-failing warnings with the modern replacement — it does not
 # auto-migrate or delete (migrations live in config.py version steps).
@@ -1838,9 +1983,19 @@ def run_doctor(args):
     else:
         check_warn("Node.js not found", "(optional, needed for browser tools)")
     
-    # npm audit for all Node.js packages
+    # npm audit for all Node.js packages — opt-in via `--audit`. Measured at
+    # 40-120s per target here, which made it the single largest cost in
+    # `hermes doctor` (6m44s of an ~11 minute run) while reliably running out
+    # of budget before it could report anything. Say so rather than dropping
+    # the check silently.
+    _npm_audit_requested = bool(getattr(args, "audit", False))
     _npm_bin = _safe_which("npm")
-    if _npm_bin:
+    if _npm_bin and not _npm_audit_requested:
+        check_info(
+            "npm dependency audit skipped (slow) — run 'hermes doctor --audit' "
+            "to check Node.js deps for vulnerabilities"
+        )
+    elif _npm_bin:
         # Each entry: (cwd, label, extra_audit_args)
         # PROJECT_ROOT is audited with --workspaces=false so that the apps/*
         # glob (which pulls in Electron, node-pty, etc.) is never resolved
@@ -1868,74 +2023,9 @@ def run_doctor(args):
             check_dir = PROJECT_ROOT if audit_extra else npm_dir
             if not (check_dir / "node_modules").exists():
                 continue
-            try:
-                # Use resolved absolute path so Windows can execute
-                # npm.cmd (CreateProcessW can't run bare .cmd names).
-                audit_result = subprocess.run(
-                    [_npm_bin, "audit", "--json", *audit_extra],
-                    cwd=str(npm_dir),
-                    capture_output=True, text=True, timeout=30,
-                )
-                import json as _json
-                audit_data = _json.loads(audit_result.stdout) if audit_result.stdout.strip() else {}
-                vuln_count = audit_data.get("metadata", {}).get("vulnerabilities", {})
-                critical = vuln_count.get("critical", 0)
-                high = vuln_count.get("high", 0)
-                moderate = vuln_count.get("moderate", 0)
-                total = critical + high + moderate
-                # Determine a scoped fix command for the remediation hint.
-                if audit_extra and audit_extra[0] == "--workspace":
-                    # Detection (`npm audit --workspace <name>`) is read-only and
-                    # safe, but `npm audit fix --workspace <name>` crashes on
-                    # current npm with "Cannot read properties of null (reading
-                    # 'edgesOut')" — an arborist bug with workspace-filtered
-                    # audit fix. The root-level `npm audit fix` can crash on the
-                    # same tree with "isDescendantOf", so do not hand the user a
-                    # manual fix command for these build-tool advisories.
-                    fix_cmd = None
-                elif audit_extra == ["--workspaces=false"]:
-                    fix_cmd = f"cd {npm_dir} && npm audit fix --workspaces=false"
-                else:
-                    fix_cmd = f"cd {npm_dir} && npm audit fix"
-                if total == 0:
-                    check_ok(f"{label} deps", "(no known vulnerabilities)")
-                elif critical > 0 or high > 0:
-                    if fix_cmd:
-                        vuln_detail = (
-                            f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
-                        )
-                    else:
-                        vuln_detail = (
-                            f"{critical} critical, {high} high, {moderate} moderate — "
-                            "build-tool advisory; clears via lockfile bump"
-                        )
-                    check_warn(
-                        f"{label} deps",
-                        f"({vuln_detail})"
-                    )
-                    if audit_extra and audit_extra[0] == "--workspace":
-                        # The web/ui-tui workspace advisories are in build-time
-                        # tooling (esbuild/vite, etc.), not runtime code that ships
-                        # to users. Manual npm remediation may error with a known
-                        # arborist crash (edgesOut / isDescendantOf) on this monorepo
-                        # tree — in that case it is an npm bug, not a Hermes one.
-                        check_info(
-                            "  ^ build-time tooling (not runtime); if manual npm remediation "
-                            "errors with an arborist crash it's a known npm bug — clears "
-                            "via a lockfile bump"
-                        )
-                    issues.append(
-                        f"{label} has {total} npm "
-                        f"{'vulnerability' if total == 1 else 'vulnerabilities'}"
-                    )
-                else:
-                    check_ok(
-                        f"{label} deps",
-                        f"({moderate} moderate "
-                        f"{'vulnerability' if moderate == 1 else 'vulnerabilities'})",
-                    )
-            except Exception:
-                pass
+            _audit_npm_target(
+                _npm_bin, npm_dir, label, audit_extra, issues, on_demand=True
+            )
 
     if _is_termux():
         check_info("Termux compatibility fallbacks:")

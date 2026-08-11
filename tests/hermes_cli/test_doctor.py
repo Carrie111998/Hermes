@@ -4,7 +4,10 @@ import os
 import sys
 import types
 import io
+import json
 import contextlib
+import subprocess
+import time
 from argparse import Namespace
 from types import SimpleNamespace
 
@@ -1449,28 +1452,26 @@ def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path
         doctor_mod.shutil, "which", lambda cmd: "/usr/bin/npm" if cmd == "npm" else None
     )
 
-    def mock_run(cmd, **kwargs):
-        if "audit" in cmd and "--workspace" in cmd:
+    def mock_audit(cmd, *, cwd, timeout):
+        if "--workspace" in cmd:
             payload = (
                 '{"metadata": {"vulnerabilities": '
                 '{"critical": 0, "high": 2, "moderate": 0}}}'
             )
             return SimpleNamespace(returncode=1, stdout=payload, stderr="")
-        if "audit" in cmd:
-            payload = (
-                '{"metadata": {"vulnerabilities": '
-                '{"critical": 0, "high": 0, "moderate": 0}}}'
-            )
-            return SimpleNamespace(returncode=0, stdout=payload, stderr="")
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
+        payload = (
+            '{"metadata": {"vulnerabilities": '
+            '{"critical": 0, "high": 0, "moderate": 0}}}'
+        )
+        return SimpleNamespace(returncode=0, stdout=payload, stderr="")
 
-    import subprocess
-
-    monkeypatch.setattr(subprocess, "run", mock_run)
+    monkeypatch.setattr(doctor_mod, "_run_npm_audit", mock_audit)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        doctor_mod.run_doctor(Namespace(fix=False))
+        # The audits are opt-in now (they cost 40-120s per target), so this
+        # regression needs `--audit` to reach the code path it guards.
+        doctor_mod.run_doctor(Namespace(fix=False, audit=True))
     out = buf.getvalue()
 
     # The workspace vulnerability is still reported ...
@@ -1775,3 +1776,141 @@ class TestStateDbProbeBudget:
         for bad in ("nonsense", "0", "-1", ""):
             monkeypatch.setenv(doctor_mod._STATE_DB_PROBE_TIMEOUT_ENV, bad)
             assert doctor_mod._state_db_probe_budget() == default
+
+
+class TestNpmAuditBudget:
+    """`hermes doctor` must terminate on an `npm audit` that wedges.
+
+    ``subprocess.run(capture_output=True, timeout=30)`` does NOT bound the
+    call on Windows: ``npm`` resolves to ``npm.cmd``, so the real work runs
+    in a ``node.exe`` GRANDCHILD that inherits the capture pipes. On timeout
+    ``subprocess.run`` kills only the direct child and then blocks re-draining
+    a pipe whose write end the surviving grandchild still holds. One audit
+    measured 93s against that 30s timeout, and the four audits together
+    accounted for a 6m34s silent gap in an ~11 minute doctor run.
+    """
+
+    @pytest.mark.timeout(90)  # backstop only; a bounded impl returns in ~timeout
+    def test_audit_aborts_at_its_budget_when_a_grandchild_holds_the_pipe(
+        self, tmp_path
+    ):
+        """The measured hang: the child outlives its parent holding the pipe."""
+        wedged = tmp_path / "wedged_npm.py"
+        wedged.write_text(
+            "import subprocess, sys, time\n"
+            # Stands in for npm.cmd's node.exe grandchild: inherits the capture
+            # pipes and lingers, so the write end never reaches EOF.
+            "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "time.sleep(60)\n",
+            encoding="utf-8",
+        )
+
+        start = time.monotonic()
+        with pytest.raises(subprocess.TimeoutExpired):
+            doctor_mod._run_npm_audit(
+                [sys.executable, str(wedged)], cwd=tmp_path, timeout=3
+            )
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 30, (
+            f"raised TimeoutExpired but took {elapsed:.1f}s — "
+            "the npm process tree was not killed"
+        )
+
+    def test_budget_is_env_overridable(self, monkeypatch):
+        default = doctor_mod._NPM_AUDIT_TIMEOUT_DEFAULT
+        on_demand = doctor_mod._NPM_AUDIT_TIMEOUT_ON_DEMAND
+
+        monkeypatch.delenv(doctor_mod._NPM_AUDIT_TIMEOUT_ENV, raising=False)
+        assert doctor_mod._npm_audit_budget() == default
+        # `--audit` was asked for explicitly, so it gets room to finish.
+        assert doctor_mod._npm_audit_budget(on_demand=True) == on_demand
+        assert on_demand > default
+
+        monkeypatch.setenv(doctor_mod._NPM_AUDIT_TIMEOUT_ENV, "120")
+        assert doctor_mod._npm_audit_budget() == 120.0
+        assert doctor_mod._npm_audit_budget(on_demand=True) == 120.0
+
+        # Garbage and non-positive values fall back rather than disabling it.
+        for bad in ("nonsense", "0", "-1", ""):
+            monkeypatch.setenv(doctor_mod._NPM_AUDIT_TIMEOUT_ENV, bad)
+            assert doctor_mod._npm_audit_budget() == default
+            assert doctor_mod._npm_audit_budget(on_demand=True) == on_demand
+
+    def test_timeout_renders_a_warn_and_is_not_a_blocking_issue(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """A budget hit must be visible — the old code swallowed it silently."""
+
+        def _timeout(argv, *, cwd, timeout):
+            raise subprocess.TimeoutExpired(argv, timeout)
+
+        monkeypatch.setattr(doctor_mod, "_run_npm_audit", _timeout)
+        issues: list[str] = []
+        doctor_mod._audit_npm_target(
+            "npm", tmp_path, "web workspace", ["--workspace", "web"], issues
+        )
+
+        out = capsys.readouterr().out
+        assert "web workspace deps" in out
+        assert "budget" in out
+        # A diagnostic that could not answer is not a vulnerability finding.
+        assert issues == []
+
+    def test_successful_audit_still_reports_vulnerabilities(
+        self, monkeypatch, tmp_path, capsys
+    ):
+        """The bound must not change what a completed audit reports."""
+        payload = json.dumps(
+            {"metadata": {"vulnerabilities": {"critical": 1, "high": 2, "moderate": 3}}}
+        )
+
+        def _ok(argv, *, cwd, timeout):
+            return subprocess.CompletedProcess(argv, 1, payload, "")
+
+        monkeypatch.setattr(doctor_mod, "_run_npm_audit", _ok)
+        issues: list[str] = []
+        doctor_mod._audit_npm_target(
+            "npm", tmp_path, "WhatsApp bridge", [], issues
+        )
+
+        out = capsys.readouterr().out
+        assert "WhatsApp bridge deps" in out
+        assert "1 critical, 2 high, 3 moderate" in out
+        assert issues == ["WhatsApp bridge has 6 npm vulnerabilities"]
+
+
+class TestNpmAuditIsOptIn:
+    """The audits cost 40-120s per target and are off unless asked for.
+
+    They were the single largest cost in `hermes doctor` (6m44s of an ~11
+    minute run) and reliably ran out of budget before reporting anything, so
+    they moved behind `--audit`. A dropped check must still be *visible*.
+    """
+
+    def _run(self, monkeypatch, args):
+        audited = []
+        monkeypatch.setattr(
+            doctor_mod,
+            "_audit_npm_target",
+            lambda *a, **k: audited.append((a, k)),
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            doctor_mod.run_doctor(args)
+        return buf.getvalue(), audited
+
+    def test_default_run_skips_the_audits_but_says_so(self, monkeypatch):
+        out, audited = self._run(monkeypatch, Namespace(fix=False))
+
+        assert audited == [], "a default `hermes doctor` must not run npm audit"
+        assert "hermes doctor --audit" in out, "the skip must be discoverable"
+
+    def test_audit_flag_runs_them_with_the_on_demand_budget(self, monkeypatch):
+        _, audited = self._run(monkeypatch, Namespace(fix=False, audit=True))
+
+        if not audited:
+            pytest.skip("no npm on PATH / no node_modules in this checkout")
+        assert all(kwargs.get("on_demand") for _, kwargs in audited), (
+            "an explicitly requested audit must get the budget that lets it finish"
+        )
