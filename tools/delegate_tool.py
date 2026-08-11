@@ -1893,7 +1893,11 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
+        # 当前上下文占用（state，API 实测、压缩后保留旧值），不是会话累积
+        # 消费（counter）。session_prompt_tokens 每次 API 响应都 += 含缓存命中
+        # 的 prompt_tokens，长会话轻松破千万——把它当 used 会让 headroom
+        # 永远 ≤ 0，所有子代理摘要被压到 _MIN_SUMMARY_CHARS 地板。
+        used_tokens = getattr(compressor, "last_real_prompt_tokens", 0) or 0
         if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
             used_tokens = 0
 
