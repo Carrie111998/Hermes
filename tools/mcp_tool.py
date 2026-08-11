@@ -7189,32 +7189,7 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
 _agent_tools_lock = threading.Lock()
 
 
-def has_registered_mcp_tools() -> bool:
-    """True if any MCP server has actually registered tools into the registry.
-
-    Cheap — checks the global MCP-tool→server name map under ``_lock``, no
-    registry walk.  Used by the per-turn refresh hook so a session with no MCP
-    tools (the common case, and also a connected-but-zero-tool/prompt-only
-    server) skips the ``get_tool_definitions`` rebuild entirely.  Checks
-    registered TOOLS, not connected servers, so a server that registers no tools
-    doesn't keep the hook firing every turn.
-    """
-    with _lock:
-        return bool(_mcp_tool_server_names)
-
-
-def get_registered_mcp_server_names() -> set:
-    """Return the set of MCP server names that have actually registered at
-    least one tool into the registry (post-connection, post check_fn/include-
-    exclude filtering) -- i.e. the real, availability-filtered signal, not
-    just what's present in config.yaml under ``mcp_servers``.
-
-    Used by capability-aware prompt building (e.g. gateway/session.py's
-    Slack platform note) to detect an MCP server that provides a given
-    platform's capability regardless of what its config key is named.
-    """
-    with _lock:
-        return set(_mcp_tool_server_names.values())
+from tools.mcp_registry_query import has_registered_mcp_tools, get_registered_mcp_server_names # noqa: F401
 
 
 
