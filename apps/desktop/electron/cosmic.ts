@@ -1,31 +1,36 @@
 // cosmic.ts — window enumeration for the COSMIC desktop (cosmic-comp).
 //
-// `read_window_below` normally enumerates through `get-windows`, whose Linux
-// backend shells out to `xprop` and reads `_NET_CLIENT_LIST_STACKING`. That is
-// an X11 protocol, and Wayland deliberately refuses to tell one application
-// about another's windows — so under a native-Wayland COSMIC session the X11
-// path enumerates nothing. COSMIC does not expose a native window-enumeration
-// IPC the way Hyprland does (no socket, no D-Bus window list, no
-// `foreign-toplevel-management` in cosmic-comp 1.0), so there is no Wayland
-// protocol we can speak to read other clients.
+// COSMIC does not expose X11-style `_NET_CLIENT_LIST`, and it runs every app as
+// a native-Wayland client — so the generic `get-windows`/xprop path enumerates
+// nothing under a native-Wayland session. Instead COSMIC speaks the Wayland
+// protocol `ext_foreign_toplevel_list_v1` (plus its own
+// `zcosmic_toplevel_info_v1`). Hermes ships a small helper,
+// `cosmic-toplevel-list`, that connects to the compositor and prints every
+// open toplevel as JSON (`title`, `app_id`, `identifier`; `geometry` is null
+// because cosmic-comp 1.0 does not serve geometry over Wayland).
 //
-// The working path on COSMIC is therefore XWayland: when Hermes Desktop runs
-// under XWayland, `get-windows`/`xprop` answers normally. Hermes already lets
-// a COSMIC user opt into that via `desktop.ozone_platform_hint: x11` (see
-// issue #84011 / PR #84013), which bridges `ELECTRON_OZONE_PLATFORM_HINT` at
-// launch. This module is the provider for COSMIC: it only ever answers on
-// COSMIC, and it reuses the existing X11 enumerator (the right tool under
-// XWayland). Everywhere else it returns null so the established path stays
-// the default — same contract as `hyprland.ts`.
+// Two COSMIC paths therefore exist, and the user may choose either:
 //
-// Why not just let the X11 fallback run? Two reasons. First, the failure note
-// differs: a native-Wayland COSMIC user should be told to set
-// `ozone_platform_hint: x11`, not "log into an X11 session" (which COSMIC
-// barely supports). Second, naming COSMIC explicitly in the provider chain
-// makes the support surface self-documenting and testable, matching how
-// Hyprland is handled.
+//   1. Native Wayland (default on COSMIC): `cosmic-toplevel-list` is shelled
+//      out and returns title/app_id/identifier. Geometry is unavailable, so the
+//      HUD uses name-based awareness. This is what makes COSMIC a first-class,
+//      fully-working platform without forcing X11.
+//
+//   2. XWayland: when Hermes is launched with `desktop.ozone_platform_hint: x11`
+//      (see issue #84011 / PR #84013, which bridges
+//      `ELECTRON_OZONE_PLATFORM_HINT`), it becomes an X11 client and the shared
+//      `get-windows`/xprop enumerator returns *full* geometry. Use this when the
+//      HUD needs pixel-exact positions under COSMIC.
+//
+// This provider only ever answers on COSMIC and otherwise returns null, so the
+// established Hyprland → COSMIC → X11 fallback chain is preserved everywhere
+// else. Same contract as `hyprland.ts`.
 
+import { execFile } from 'node:child_process'
+import { promisify } from 'node:util'
 import type { EnumeratedWindow } from './window-below'
+
+const execFileAsync = promisify(execFile)
 
 /** True when the active session is the COSMIC desktop. */
 export function isCosmic(env: NodeJS.ProcessEnv): boolean {
@@ -35,16 +40,44 @@ export function isCosmic(env: NodeJS.ProcessEnv): boolean {
   return current.includes('cosmic') || session.includes('cosmic')
 }
 
+interface CosmicToplevel {
+  title: string | null
+  app_id: string | null
+  identifier: string | null
+  geometry: null
+}
+
+function toEnumerated(w: CosmicToplevel): EnumeratedWindow {
+  // COSMIC reliably gives `app_id` (the stable launcher id) and `title`. It does
+  // not serve geometry or pid over Wayland in 1.0, so bounds/pid are
+  // placeholders; the HUD's name-based awareness still works, and pixel-exact
+  // positioning is available under XWayland (see ozone_platform_hint).
+  const id = w.identifier ? hashString(w.identifier) : 0
+  return {
+    app: w.app_id ?? '',
+    bounds: { x: 0, y: 0, width: 0, height: 0 },
+    id: id || 0,
+    pid: 0,
+    title: w.title ?? w.app_id ?? '',
+  }
+}
+
+function hashString(s: string): number {
+  let h = 0
+  for (let i = 0; i < s.length; i++) {
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0
+  }
+  return h >>> 0
+}
+
 /**
- * Enumerate every window COSMIC can see, front-to-back, or null when this is
- * not a COSMIC session (so the caller falls through to the generic path).
+ * Enumerate COSMIC windows via the `cosmic-toplevel-list` helper, or null when
+ * this is not a COSMIC session or the helper is unavailable.
  *
- * On COSMIC the only viable enumeration is the X11 one, which speaks to
- * XWayland. We hand the work to the shared `get-windows` enumerator rather than
- * reimplementing its platform quirks (e.g. its Linux list arrives back-to-front
- * and must be reversed). When Hermes is a native-Wayland client there is
- * nothing to enumerate and `get-windows` returns null — the caller then
- * surfaces the COSMIC-specific guidance from `enumerationFailureNote`.
+ * The helper is optional: it is built from `apps/desktop/cosmic-toplevel-list`
+ * and placed on PATH (or next to the app binary) by the packager. If it is
+ * missing we return null and the caller falls through to `get-windows`
+ * (which works under XWayland) and finally to the COSMIC guidance note.
  */
 export async function readCosmicWindows(
   selfPid: number,
@@ -54,6 +87,26 @@ export async function readCosmicWindows(
 ): Promise<EnumeratedWindow[] | null> {
   if (!isCosmic(env)) {
     return null
+  }
+
+  // Native Wayland: try the COSMIC helper first. It speaks the compositor's own
+  // Wayland protocol and needs no X11.
+  try {
+    const { stdout } = await execFileAsync('cosmic-toplevel-list', [], {
+      env,
+      timeout: 5000,
+      maxBuffer: 10 * 1024 * 1024,
+    })
+    const parsed = JSON.parse(stdout) as CosmicToplevel[]
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const windows = parsed.map(toEnumerated).filter((w) => w.title.length > 0)
+      if (windows.length > 0) {
+        return windows
+      }
+    }
+  } catch {
+    // Helper missing or failed — fall through to the X11 enumerator (works
+    // under XWayland) and ultimately to the COSMIC guidance note.
   }
 
   return enumerate(titlesAvailable)
