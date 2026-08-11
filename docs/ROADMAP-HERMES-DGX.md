@@ -72,6 +72,8 @@ docs/plans/2026-08-10-hermes-skills-roadmap.md.
 | Plugin skill discovery | repository evidence | klib manifest exists in commit 674a4fb72; add isolated discovery and authorized smoke evidence separately. |
 | HERMES-SKILLCLAW-001 | proposed | Client + Hermes integration first; marketplace remains separate. |
 | HERMES-SKILLS-001 | documentation | This consolidation; no runtime or DGX mutation. |
+| HERMES-INTAKE-001 | in review | Reconcile DGX HermesHub skill notes and external T0156 Drive-watch evidence; no runtime import. |
+| HERMES-SKILLS-004 | proposed | Reconcile pinned HermesHub skill bytes, scanner evidence, and HH-005 installed-state mismatch. |
 
 ## Ticket status
 
@@ -82,6 +84,8 @@ docs/plans/2026-08-10-hermes-skills-roadmap.md.
 | CI-BASELINE-001 | complete | PR #3 merged as 7a14e3f…; latest required checks were green and Codex/AGY review reconciled READY. |
 | ARCH-002 | proposed | Draft the runtime-state contract ticket and review it before implementation. |
 | HERMES-SKILLS-001 | in progress | Consolidate the long-term skill roadmap in this branch; documentation only. |
+| HERMES-INTAKE-001 | in review | Record DGX HermesHub and Drive-watch artifact boundaries before merge. |
+| HERMES-SKILLS-004 | proposed | Reconcile pinned HermesHub skill bytes, scanner evidence, and HH-005 installed-state mismatch. |
 | HERMES-SKILLS-002 to HERMES-SKILLCLAW-001 | proposed | Select only after the relevant contract and evidence gates are reviewed. |
 
 ## Runtime and deployment boundary

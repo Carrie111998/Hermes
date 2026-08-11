@@ -44,7 +44,9 @@
 - **Deferred / not goals:** No DGX deployment or service restart for
   CI-BASELINE-001, HERMES-SKILLS-001, or any proposed SkillClaw work.
 - **Next candidates:** ARCH-002, then skills inventory/catalog, teach
-  durability, klib discovery evidence, and HERMES-SKILLCLAW-001.
+  durability, klib discovery evidence, HERMES-SKILLS-004, and
+  HERMES-SKILLCLAW-001. HERMES-INTAKE-001 is the current documentation
+  reconciliation being reviewed for merge.
 
 ## 3. Verified state
 
@@ -69,7 +71,7 @@
 - **Status:** proposed; no ARCH-002 ticket file exists yet.
 - **Separate long-term lane:** HERMES-SKILLS-002 inventory/catalog
   reconciliation, followed by HERMES-SKILLS-003, HERMES-PLUGIN-001, and
-  HERMES-SKILLCLAW-001.
+  HERMES-SKILLS-004 and HERMES-SKILLCLAW-001.
 - **Acceptance gates:** Each ticket requires explicit scope, focused tests or
   verifier evidence, documentation consistency, CI, recursive review,
   independent cross-review, reconciliation, and only then merge. DGX
