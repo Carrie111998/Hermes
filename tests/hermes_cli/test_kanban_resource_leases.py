@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 
 import pytest
 
@@ -39,6 +41,20 @@ def _create(board: str, title: str, keys=()):
             resource_keys=keys,
             board=board,
         )
+
+
+def _spawn_sleeper() -> subprocess.Popen:
+    return subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _stop_sleeper(proc: subprocess.Popen) -> None:
+    if proc.poll() is None:
+        proc.kill()
+    proc.wait(timeout=5)
 
 
 def test_resource_keys_are_normalized_bounded_and_round_trip(kanban_home):
@@ -557,6 +573,38 @@ def test_expired_legacy_pid_row_is_reclaimed_without_signalling(kanban_home, mon
     assert kb.list_resource_leases() == []
 
 
+def test_legacy_leased_stale_reclaim_does_not_signal_live_unrelated_process(
+    kanban_home,
+):
+    holder = _create("default", "legacy stale holder", ["gpu:0"])
+    proc = _spawn_sleeper()
+    try:
+        with kb.connect_closing(board="default") as conn:
+            claimed = kb.claim_task(conn, holder, board="default")
+            assert claimed is not None
+            old_started_at = int(time.time()) - 60
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ?, worker_start_time = NULL, "
+                    "started_at = ?, last_heartbeat_at = NULL WHERE id = ?",
+                    (proc.pid, old_started_at, holder),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ?, worker_start_time = NULL, "
+                    "started_at = ? WHERE id = ?",
+                    (proc.pid, old_started_at, claimed.current_run_id),
+                )
+
+            assert kb.detect_stale_running(conn, stale_timeout_seconds=1) == [holder]
+            reclaimed = kb.get_task(conn, holder)
+            assert reclaimed is not None and reclaimed.status == "ready"
+
+        assert proc.poll() is None, "legacy PID must never authenticate a signal target"
+        assert kb.list_resource_leases() == []
+    finally:
+        _stop_sleeper(proc)
+
+
 def test_worker_start_time_columns_are_added_to_existing_boards(kanban_home):
     db_path = kb.kanban_db_path("default")
     with kb.connect_closing(board="default"):
@@ -636,6 +684,32 @@ def test_dashboard_direct_running_transition_releases_resource_lease_immediately
         assert kb.claim_task(conn, contender, board="other") is not None
 
 
+def test_dashboard_direct_status_does_not_signal_reused_pid_successor(kanban_home):
+    from plugins.kanban.dashboard.plugin_api import _set_status_direct
+
+    holder = _create("default", "holder", ["browser:shared"])
+    proc = _spawn_sleeper()
+    try:
+        with kb.connect_closing(board="default") as conn:
+            claimed = kb.claim_task(conn, holder, board="default")
+            assert claimed is not None
+            kb._set_worker_pid(conn, holder, proc.pid)
+            recorded = kb.get_task(conn, holder)
+            assert recorded is not None and recorded.worker_start_time is not None
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_start_time = ? WHERE id = ?",
+                    (int(recorded.worker_start_time) - 1, holder),
+                )
+
+            assert _set_status_direct(conn, holder, "ready")
+
+        assert proc.poll() is None, "recycled PID successor must not receive SIGTERM"
+        assert kb.list_resource_leases() == []
+    finally:
+        _stop_sleeper(proc)
+
+
 def test_review_dry_run_reports_cross_board_resource_conflict(
     kanban_home, all_assignees_spawnable
 ):
@@ -689,6 +763,44 @@ def test_timeout_transition_releases_resource_lease_immediately(
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
         assert kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None) == [holder]
     assert kb.list_resource_leases() == []
+
+
+def test_legacy_leased_max_runtime_does_not_signal_live_unrelated_process(
+    kanban_home,
+):
+    with kb.connect_closing(board="default") as conn:
+        holder = kb.create_task(
+            conn,
+            title="legacy timeout holder",
+            assignee="worker",
+            max_runtime_seconds=1,
+            resource_keys=["gpu:0"],
+            board="default",
+        )
+        claimed = kb.claim_task(conn, holder, board="default")
+        assert claimed is not None
+        proc = _spawn_sleeper()
+        try:
+            old_started_at = int(time.time()) - 10
+            with kb.write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET worker_pid = ?, worker_start_time = NULL, "
+                    "started_at = ? WHERE id = ?",
+                    (proc.pid, old_started_at, holder),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid = ?, worker_start_time = NULL, "
+                    "started_at = ? WHERE id = ?",
+                    (proc.pid, old_started_at, claimed.current_run_id),
+                )
+
+            assert kb.enforce_max_runtime(conn) == [holder]
+            timed_out = kb.get_task(conn, holder)
+            assert timed_out is not None and timed_out.status == "ready"
+            assert proc.poll() is None, "legacy PID must never authenticate a signal target"
+            assert kb.list_resource_leases() == []
+        finally:
+            _stop_sleeper(proc)
 
 
 def test_stale_transition_releases_resource_lease_immediately(

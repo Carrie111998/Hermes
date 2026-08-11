@@ -95,10 +95,15 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     parent_id = kb.create_task(conn, title="ancestor", assignee="planner")
     assert kb.complete_task(conn, parent_id)
     child_id = kb.create_task(
-        conn, title="running child", assignee="builder", parents=[parent_id],
+        conn,
+        title="running child",
+        assignee="builder",
+        parents=[parent_id],
+        resource_keys=["gpu:0"],
     )
     claimed = kb.claim_task(conn, child_id)
     assert claimed is not None and claimed.status == "running"
+    monkeypatch.setattr(kb, "_process_start_time", lambda _pid: 101)
     kb._set_worker_pid(conn, child_id, 424242)
 
     kills: list[tuple] = []
@@ -112,7 +117,7 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
         finally:
             side.close()
         assert "descendant_invalidated" in kinds
-        kills.append((pid, claim_lock))
+        kills.append((pid, claim_lock, kwargs))
         return {"terminated": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", fake_terminate)
@@ -123,7 +128,9 @@ def test_running_descendant_event_precedes_termination_via_reclaim_helper(
     )
 
     assert kills and kills[0][0] == 424242
-    assert result["terminations"] == kills
+    assert kills[0][2]["worker_start_time"] is not None
+    assert kills[0][2]["require_identity"] is True
+    assert result["terminations"][0][:2] == kills[0][:2]
     child = kb.get_task(conn, child_id)
     assert child is not None
     assert child.status == "todo"

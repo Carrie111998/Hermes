@@ -7363,12 +7363,15 @@ def invalidate_descendants_for_parent_reopen(
 
     Returns ``{"invalidated": [...], "terminations": [...]}`` where each
     invalidated entry is ``{id, prior_status, new_status, resume_status}``
-    and each termination is a ``(worker_pid, claim_lock)`` tuple.
+    and each termination is a ``(worker_pid, claim_lock, worker_start_time,
+    require_identity)`` tuple.
     """
     caller_owns_txn = bool(getattr(conn, "in_transaction", False))
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
-    terminations: list[tuple[Optional[int], Optional[str]]] = []
+    terminations: list[
+        tuple[Optional[int], Optional[str], Optional[int], bool]
+    ] = []
     with write_txn(conn, allow_nested=True):
         rows = conn.execute(
             """
@@ -7379,7 +7382,8 @@ def invalidate_descendants_for_parent_reopen(
                 FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
             )
-            SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock
+            SELECT t.id, t.status, t.current_run_id, t.worker_pid,
+                   t.worker_start_time, t.claim_lock, t.resource_keys
             FROM descendants d
             JOIN tasks t ON t.id = d.id
             ORDER BY t.id
@@ -7398,7 +7402,14 @@ def invalidate_descendants_for_parent_reopen(
                 resume_status = _retry_status_for_run(
                     conn, row["id"], row["current_run_id"]
                 )
-                terminations.append((row["worker_pid"], row["claim_lock"]))
+                terminations.append(
+                    (
+                        row["worker_pid"],
+                        row["claim_lock"],
+                        row["worker_start_time"],
+                        bool(_parse_resource_keys_json(row["resource_keys"])),
+                    )
+                )
                 run_id = _end_run(
                     conn,
                     row["id"],
@@ -7411,6 +7422,7 @@ def invalidate_descendants_for_parent_reopen(
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, "
+                "worker_start_time = NULL, "
                 "current_run_id = NULL, consecutive_failures = 0 WHERE id = ?",
                 (row["id"],),
             )
@@ -7469,8 +7481,13 @@ def invalidate_descendants_for_parent_reopen(
         # Standalone call: we committed above, so the audit trail is durable
         # — safe to kill workers now. Composed calls leave this to the
         # caller (post-commit), preserving events-before-termination.
-        for pid, claim_lock in terminations:
-            _terminate_reclaimed_worker(pid, claim_lock)
+        for pid, claim_lock, worker_start_time, require_identity in terminations:
+            _terminate_reclaimed_worker(
+                pid,
+                claim_lock,
+                worker_start_time=worker_start_time,
+                require_identity=require_identity,
+            )
     return {"invalidated": invalidated, "terminations": terminations}
 
 
@@ -8580,7 +8597,7 @@ def _worker_identity_matches(
 ) -> bool:
     """Return whether ``pid`` is safe to signal as the recorded generation."""
     if expected_start_time is None:
-        return True
+        return False
     current = _process_start_time(int(pid))
     return current is not None and int(current) == int(expected_start_time)
 
