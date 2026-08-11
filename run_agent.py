@@ -506,6 +506,8 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        persist_session: bool = True,
+        private_no_store: bool = False,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -546,6 +548,8 @@ class AIAgent:
             provider_data_collection=provider_data_collection,
             openrouter_min_coding_score=openrouter_min_coding_score,
             session_id=session_id,
+            persist_session=persist_session,
+            private_no_store=private_no_store,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -1894,6 +1898,16 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        # Private workers keep the live transcript available to their caller
+        # for the lifetime of this process, but must never copy it to a JSON
+        # snapshot, state.db, or token-accounting store.  This needs to sit at
+        # the outer persistence funnel: guarding only the DB flush still leaves
+        # the JSON snapshot path open.
+        if getattr(self, "_persist_disabled", False):
+            self._drop_trailing_empty_response_scaffolding(messages)
+            self._session_messages = messages
+            return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -2326,7 +2340,7 @@ class AIAgent:
             user_query (str): Original user query
             completed (bool): Whether the conversation completed successfully
         """
-        if not self.save_trajectories:
+        if getattr(self, "_persist_disabled", False) or not self.save_trajectories:
             return
         
         trajectory = self._convert_to_trajectory_format(messages, user_query, completed)
@@ -2880,6 +2894,8 @@ class AIAgent:
         error: Optional[Exception] = None,
     ) -> Optional[Path]:
         """Forwarder — see ``agent.agent_runtime_helpers.dump_api_request_debug``."""
+        if getattr(self, "_persist_disabled", False):
+            return None
         from agent.agent_runtime_helpers import dump_api_request_debug
         return dump_api_request_debug(self, api_kwargs, reason=reason, error=error)
 

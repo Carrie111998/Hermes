@@ -529,6 +529,8 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    persist_session: bool = True,
+    private_no_store: bool = False,
 ):
     """
     Initialize the AI Agent.
@@ -557,6 +559,8 @@ def init_agent(
             openrouter/pareto-code router. Only applied when model == "openrouter/pareto-code".
             None or empty = let OpenRouter pick the strongest available coder.
         session_id (str): Pre-generated session ID for logging (optional, auto-generated if not provided)
+        persist_session (bool): When False, retain the turn only in process memory and
+            disable session DB, JSON snapshots, trajectories, and API request dumps.
         tool_progress_callback (callable): Callback function(tool_name, args_preview) for progress notifications
         clarify_callback (callable): Callback function(question, choices) -> str for interactive user questions.
             Provided by the platform layer (CLI or gateway). If None, the clarify tool returns an error.
@@ -581,14 +585,48 @@ def init_agent(
     """
     _install_safe_stdio()
 
+    # Private workers handle body-bearing turns in process memory only. This is
+    # intentionally stronger than ``persist_session=False``: callers cannot
+    # re-enable tools, memory, context engines, callbacks, checkpoints, or
+    # durable session artifacts by supplying conflicting construction options.
+    private_no_store = bool(private_no_store)
+    if private_no_store:
+        persist_session = False
+        save_trajectories = False
+        verbose_logging = False
+        quiet_mode = True
+        enabled_toolsets = []
+        disabled_toolsets = None
+        skip_memory = True
+        skip_context_files = True
+        load_soul_identity = False
+        checkpoints_enabled = False
+        tool_progress_callback = None
+        tool_start_callback = None
+        tool_complete_callback = None
+        thinking_callback = None
+        reasoning_callback = None
+        clarify_callback = None
+        read_terminal_callback = None
+        step_callback = None
+        stream_delta_callback = None
+        interim_assistant_callback = None
+        tool_gen_callback = None
+        status_callback = None
+        notice_callback = None
+        notice_clear_callback = None
+        event_callback = None
+        reaction_callback = None
+
     agent.model = model
     agent.max_iterations = max_iterations
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)
-    agent.save_trajectories = save_trajectories
+    agent.save_trajectories = bool(save_trajectories and persist_session)
     agent.verbose_logging = verbose_logging
     agent.quiet_mode = quiet_mode
+    agent._private_no_store = private_no_store
     agent.tool_progress_mode = tool_progress_mode
     agent.ephemeral_system_prompt = ephemeral_system_prompt
     agent.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
@@ -1500,27 +1538,31 @@ def init_agent(
     # reference their own session for --resume commands, cross-session
     # coordination, and logging. Keep the ContextVar and os.environ
     # fallback synchronized because different tool paths still read both.
-    try:
-        from gateway.session_context import set_current_session_id
-
-        set_current_session_id(agent.session_id)
-    except Exception:
-        # Preserve the root-agent legacy fallback, but never let delegated
-        # construction publish a child ID process-wide even if the ContextVar
-        # bridge itself failed to import.
+    if not private_no_store:
         try:
-            from agent.delegation_context import is_delegated_child_context
+            from gateway.session_context import set_current_session_id
 
-            delegated_child = is_delegated_child_context()
+            set_current_session_id(agent.session_id)
         except Exception:
-            delegated_child = False
-        if not delegated_child:
-            os.environ["HERMES_SESSION_ID"] = agent.session_id
+            # Preserve the root-agent legacy fallback, but never let delegated
+            # construction publish a child ID process-wide even if the ContextVar
+            # bridge itself failed to import.
+            try:
+                from agent.delegation_context import is_delegated_child_context
 
-    # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
+                delegated_child = is_delegated_child_context()
+            except Exception:
+                delegated_child = False
+            if not delegated_child:
+                os.environ["HERMES_SESSION_ID"] = agent.session_id
+
+    # Private runs do not create a session-artifact directory.  The None
+    # sentinel makes accidental writers fail closed; their public entrypoints
+    # are separately guarded by ``_persist_disabled``.
     hermes_home = get_hermes_home()
-    agent.logs_dir = hermes_home / "sessions"
-    agent.logs_dir.mkdir(parents=True, exist_ok=True)
+    agent.logs_dir = None if private_no_store else hermes_home / "sessions"
+    if agent.logs_dir is not None:
+        agent.logs_dir.mkdir(parents=True, exist_ok=True)
     # Per-session JSON snapshot writer (~/.hermes/sessions/session_{sid}.json)
     # is opt-in via sessions.write_json_snapshots (default False).  state.db
     # is canonical — the snapshot is only useful for external tooling that
@@ -1529,7 +1571,11 @@ def init_agent(
     try:
         from hermes_cli.config import load_config_readonly as _load_sess_cfg
         _sess_cfg = (_load_sess_cfg().get("sessions") or {})
-        agent._session_json_enabled = bool(_sess_cfg.get("write_json_snapshots", False))
+        agent._session_json_enabled = bool(
+            not private_no_store
+            and persist_session
+            and _sess_cfg.get("write_json_snapshots", False)
+        )
     except Exception:
         pass
     # logs_dir is retained unconditionally for request_dump_*.json (debug
@@ -1563,7 +1609,7 @@ def init_agent(
     )
     
     # SQLite session store (optional -- provided by CLI or gateway)
-    agent._session_db = session_db
+    agent._session_db = session_db if persist_session else None
     agent._parent_session_id = parent_session_id
     # A close flush and the worker's turn-start flush can overlap. The durable
     # marker is attached to each in-memory message dict, so its test-and-append
@@ -1580,12 +1626,12 @@ def init_agent(
     # background-review forks) rotate or share the session forward to a
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
-    agent._end_session_on_close = True
+    agent._end_session_on_close = bool(persist_session)
     # When True, this agent NEVER persists to the canonical session store
     # (state.db) or the JSON snapshot, regardless of session_id. Set on the
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
-    agent._persist_disabled = False
+    agent._persist_disabled = not bool(persist_session)
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1891,7 +1937,10 @@ def init_agent(
         )
     except Exception:
         pass
-    compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    compression_enabled = (
+        not private_no_store
+        and str(_compression_cfg.get("enabled", True)).lower() in {"true", "1", "yes"}
+    )
     compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
     compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
     # Minimum REAL (actionable) user messages guaranteed to survive in the
@@ -2389,6 +2438,9 @@ def init_agent(
         _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
     except Exception:
         pass
+    if private_no_store:
+        # Third-party context engines can observe or persist the full turn.
+        _engine_name = "compressor"
 
     if _engine_name != "compressor":
         # Try loading from plugins/context_engine/<name>/
@@ -2619,7 +2671,11 @@ def init_agent(
             _existing_tool_names.add(_tname)
 
     # Notify context engine of session start
-    if hasattr(agent, "context_compressor") and agent.context_compressor:
+    if (
+        not private_no_store
+        and hasattr(agent, "context_compressor")
+        and agent.context_compressor
+    ):
         try:
             agent.context_compressor.on_session_start(
                 agent.session_id,

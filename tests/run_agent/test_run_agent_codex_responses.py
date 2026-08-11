@@ -688,6 +688,37 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_private_no_store_bypasses_llm_middleware(monkeypatch):
+    """No extension receives the raw provider request for a private turn."""
+    agent = _build_agent(monkeypatch)
+    agent._private_no_store = True
+    setattr(agent, "_disable_streaming", True)
+
+    def _unexpected_middleware(*_args, **_kwargs):
+        raise AssertionError("private turn reached middleware")
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.apply_llm_request_middleware",
+        _unexpected_middleware,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_llm_execution_middleware",
+        _unexpected_middleware,
+    )
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _event: True)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", _unexpected_middleware)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda _api_kwargs: _codex_message_response("OK"),
+    )
+
+    result = agent.run_conversation("private body")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "OK"
+
+
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
     """Both mutable request boundaries must reject literal Harmony wire tokens."""
     agent = _build_agent(monkeypatch)

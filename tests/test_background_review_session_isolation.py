@@ -137,3 +137,127 @@ class TestPersistDisabledHardStop:
                 assert db.get_messages("s-review") == []
             finally:
                 db.close()
+
+
+class TestPersistSessionConstructor:
+    def test_persist_session_false_never_touches_session_db_or_json_snapshot(self):
+        """An opt-in private worker keeps its turn in memory only."""
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            try:
+                with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+                    from run_agent import AIAgent
+                    agent = AIAgent(
+                        api_key="test-key",
+                        base_url="https://openrouter.ai/api/v1",
+                        model="test/model",
+                        quiet_mode=True,
+                        session_db=db,
+                        session_id="s-private",
+                        skip_context_files=True,
+                        skip_memory=True,
+                        persist_session=False,
+                    )
+
+                assert agent._persist_disabled is True
+                assert agent._session_db is None
+                assert agent._session_json_enabled is False
+                assert agent._end_session_on_close is False
+
+                messages = [
+                    {"role": "user", "content": "private customer body"},
+                    {"role": "assistant", "content": "private draft"},
+                ]
+                with patch.object(agent, "_save_session_log") as save_log:
+                    agent._persist_session(messages, [])
+
+                save_log.assert_not_called()
+                assert agent._session_messages == messages
+                assert db.get_messages("s-private") == []
+            finally:
+                db.close()
+
+    def test_private_no_store_forces_an_empty_tool_memory_and_artifact_surface(self, monkeypatch):
+        """The stricter worker mode cannot be weakened by caller options."""
+        import os
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes-home"
+            with patch.dict(
+                os.environ,
+                {"OPENROUTER_API_KEY": "test-key", "HERMES_HOME": str(home)},
+            ):
+                from run_agent import AIAgent
+                agent = AIAgent(
+                    api_key="test-key",
+                    base_url="https://openrouter.ai/api/v1",
+                    model="test/model",
+                    session_id="s-private-strict",
+                    enabled_toolsets=["memory", "terminal"],
+                    skip_memory=False,
+                    save_trajectories=True,
+                    checkpoints_enabled=True,
+                    private_no_store=True,
+                )
+
+            assert agent._private_no_store is True
+            assert agent._persist_disabled is True
+            assert agent._session_db is None
+            assert agent._session_json_enabled is False
+            assert agent.logs_dir is None
+            assert agent.enabled_toolsets == []
+            assert agent.tools == []
+            assert agent._memory_store is None
+            assert agent._memory_manager is None
+            assert agent.compression_enabled is False
+            assert agent.save_trajectories is False
+            assert agent._checkpoint_mgr.enabled is False
+            assert not list(home.glob("sessions/session_s-private-strict*"))
+
+    def test_persist_session_false_blocks_trajectory_and_request_dump_artifacts(self):
+        """No-store must hold even when optional diagnostic writers are enabled."""
+        import os
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+            from run_agent import AIAgent
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_id="s-private-artifacts",
+                skip_context_files=True,
+                skip_memory=True,
+                save_trajectories=True,
+                persist_session=False,
+            )
+
+        assert agent.save_trajectories is False
+        with patch("run_agent._save_trajectory_to_file") as save_trajectory:
+            agent._save_trajectory(
+                [{"role": "user", "content": "private customer body"}],
+                "private customer body",
+                True,
+            )
+        save_trajectory.assert_not_called()
+
+        with patch(
+            "agent.agent_runtime_helpers.dump_api_request_debug",
+            return_value=Path("/tmp/private-request.json"),
+        ) as dump_request:
+            assert agent._dump_api_request_debug(
+                {"messages": [{"role": "user", "content": "private customer body"}]},
+                reason="test",
+            ) is None
+        dump_request.assert_not_called()

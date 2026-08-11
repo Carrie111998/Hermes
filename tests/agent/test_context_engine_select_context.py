@@ -247,6 +247,19 @@ def test_on_turn_complete_called_with_snapshot_and_meta():
     assert captured["kwargs"]["api_call_count"] == 1
 
 
+def test_private_no_store_does_not_observe_the_completed_turn():
+    """A private body-bearing turn never reaches a context-engine hook."""
+    engine = MagicMock()
+    agent = _agent_with(engine)
+    agent._private_no_store = True
+
+    _notify_context_engine_turn_complete(
+        agent, HISTORY, usage={"total_tokens": 12}, logger=MagicMock(), turn_id="t-private"
+    )
+
+    assert not engine.on_turn_complete.called
+
+
 
 
 
