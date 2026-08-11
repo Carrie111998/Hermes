@@ -38,6 +38,12 @@ name: Desktop install (Windows)
 # `process.platform !== 'win32'`, which had been silently turning them into
 # no-mux connections here.
 #
+# That file list is also read by the desktop ESLint config, which applies
+# `hermes/no-posix-path-literals` to exactly these suites — the defect that
+# broke three of them (a hard-coded POSIX path meeting a `path.join`ed one)
+# is now a lint error rather than something this job has to discover. Adding
+# a name below therefore turns the rule on for that file too.
+#
 # ── What this does NOT catch, deliberately stated ───────────────────────────
 #
 # It cannot reproduce the `ERR_DLOPEN_FAILED loading index.win32-x64-msvc.node`

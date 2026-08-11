@@ -113,6 +113,11 @@ test('resolveVenvHermesCommand: probes the venv python before trusting it (retur
   const deps = makeDeps({
     canImportHermesCli: (python: string) => {
       probed = true
+      // Host-independent, so the POSIX literal is safe on the Windows lane:
+      // every path helper this resolver touches is injected by makeDeps and
+      // joins with '/', so the value under test is POSIX on Windows too. Not
+      // the #177 defect, where the expectation met a real path.join.
+      // eslint-disable-next-line hermes/no-posix-path-literals -- injected POSIX helpers, see above
       assert.equal(python, '/root/venv/Scripts/python.exe')
 
       return false
@@ -130,6 +135,9 @@ test('resolveVenvHermesCommand: returns the resolved python backend descriptor w
   const result = resolveVenvHermesCommand('/root/venv/Scripts/hermes.exe', ['serve', '--port', '0'], deps)
 
   assert.ok(result, 'a passing probe must return a backend descriptor, not null')
+  // `command` comes from the injected getVenvPython, which interpolates '/'
+  // regardless of platform — host-independent, as in the test above.
+  // eslint-disable-next-line hermes/no-posix-path-literals -- injected POSIX helpers, see above
   assert.equal(result.command, '/root/venv/Scripts/python.exe')
   assert.deepEqual(result.args, ['-m', 'hermes_cli.main', 'serve', '--port', '0'])
   assert.equal(result.bootstrap, false)

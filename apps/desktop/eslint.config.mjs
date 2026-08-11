@@ -1,8 +1,31 @@
 import shared from '../../eslint.config.shared.mjs'
 import globals from 'globals'
 
+import noPosixPathLiterals from './eslint-rules/no-posix-path-literals.mjs'
+import { readLaneTestGlobs } from './eslint-rules/windows-lane.mjs'
+
 export default [
   ...shared,
+  {
+    // Cross-platform correctness for the suites that actually run on Windows.
+    //
+    // The same defect was found three times in three files — a hard-coded
+    // absolute POSIX path meeting a `path.join`ed one, which cannot match on
+    // Windows — and each time only after the lane went red. The rule turns
+    // that search into a lint error. See the rule file for why it keys on the
+    // comparison rather than on leading-slash literals: a blanket ban would
+    // flag 71 legitimate inputs across these same seven files.
+    //
+    // Scoped to the lane and nowhere else. Files that only ever run on Linux
+    // keep their POSIX literals; this is a portability rule, not a style one.
+    // The list comes from `test:desktop:win-install` in package.json, so
+    // adding a suite to the lane turns the rule on for it in the same edit.
+    files: readLaneTestGlobs(),
+    plugins: { hermes: { rules: { 'no-posix-path-literals': noPosixPathLiterals } } },
+    rules: {
+      'hermes/no-posix-path-literals': 'error'
+    }
+  },
   {
     // Desktop is an Electron renderer — it legitimately uses browser globals
     // (window, document, etc). Re-add them here; the shared config omits

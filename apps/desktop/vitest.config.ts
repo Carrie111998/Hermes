@@ -20,7 +20,9 @@ const electronNative: TestProjectConfiguration = {
   test: {
     name: 'electron',
     environment: 'node',
-    include: ['electron/**/*.test.ts', 'scripts/**.test.{ts,mjs}']
+    // eslint-rules/ holds the custom lint rule and its tests. Node env, no
+    // transform needed — it is plain .mjs, same as scripts/.
+    include: ['electron/**/*.test.ts', 'eslint-rules/**.test.mjs', 'scripts/**.test.{ts,mjs}']
   }
 }
 
