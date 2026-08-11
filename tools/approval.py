@@ -1974,9 +1974,42 @@ def _scan_dollar_paren_end(command: str, start: int) -> int | None:
         if ch == "\\" and i + 1 < len(command):
             i += 2
             continue
-        if command.startswith("$(", i):
+        if command.startswith("#", i) and (
+            i == start + 2 or command[i - 1].isspace() or command[i - 1] in ";&|("
+        ):
+            # A comment runs to the newline, and its parens are text. Counting
+            # them would push the depth past the real closer and swallow
+            # whatever follows the substitution.
+            newline = command.find("\n", i)
+            if newline == -1:
+                return None
+            i = newline
+            continue
+        if command.startswith("${", i):
+            # `${x:-(}` holds a literal paren, not a group.
+            end = _scan_brace_expansion_end(command, i)
+            if end is None:
+                return None
+            i = end
+            continue
+        if command.startswith("$((", i) or command.startswith("$[", i):
+            # Arithmetic parens are operators, not grouping.
+            end = _scan_arithmetic_end(command, i)
+            if end is None:
+                return None
+            i = end
+            continue
+        if command.startswith("<<", i) and not command.startswith("<<<", i):
+            # A heredoc inside the substitution puts its body's parens beyond
+            # this scanner's reach. Refusing to guess keeps the operand from
+            # swallowing a command word; the caller treats None as malformed
+            # and blocks.
+            return None
+        if ch == "(":
+            # Every unquoted paren the shell treats as grouping counts, so
+            # `<(`, `>(` and plain subshells balance under one rule.
             depth += 1
-            i += 2
+            i += 1
             continue
         if ch == ")":
             depth -= 1
@@ -1984,6 +2017,57 @@ def _scan_dollar_paren_end(command: str, start: int) -> int | None:
             if depth == 0:
                 return i
             continue
+        i += 1
+    return None
+
+
+def _scan_brace_expansion_end(command: str, start: int) -> int | None:
+    """Return the offset after a balanced ``${...}`` expansion."""
+    depth = 0
+    i = start + 1
+    quote: str | None = None
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(command):
+            i += 2
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _scan_arithmetic_end(command: str, start: int) -> int | None:
+    """Return the offset after ``$((...))`` or the legacy ``$[...]``."""
+    if command.startswith("$[", start):
+        end = command.find("]", start + 2)
+        return None if end == -1 else end + 1
+    depth = 0
+    i = start + 1
+    while i < len(command):
+        ch = command[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
         i += 1
     return None
 

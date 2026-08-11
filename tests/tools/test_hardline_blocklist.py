@@ -781,9 +781,28 @@ _ABS_PATH_BLOCK = [
     # Whitespace inside a redirection operand's command substitution must not
     # terminate the operand scan before the following executable.
     ">$(printf '%s' a) /sbin/shutdown",
+    # Every paren the shell treats as grouping balances the operand's
+    # substitution, so a nested process substitution cannot close it early and
+    # leave the executable outside the scanned range.
+    ">$(echo <(true) tail >/dev/null; printf /dev/null) /sbin/shutdown -h now",
+    ">$(echo >(cat) ; printf /dev/null) /sbin/shutdown",
+    ">$(echo <(true)) /sbin/shutdown",
+    # Parens the shell does NOT treat as grouping must not count, or the scan
+    # runs past the real closer and swallows the command word behind it. The
+    # `#` in `$(true)#` is glued to the word and starts no comment.
+    "( > $(echo /tmp/f # (\n) shutdown -h now )",
+    "( > $(echo /tmp/f # (\n) rm -rf /etc )",
+    "( >$(echo $(true)#) /sbin/shutdown -h now\n)",
+    "> $(echo $((1 + (2))) ) /sbin/shutdown",
+    # A heredoc inside the operand's substitution puts its body beyond this
+    # scanner, so the operand is malformed rather than guessed at.
+    "( > $(cat <<'E'\n(\nE\n) shutdown -h now )",
 ]
 
 _ABS_PATH_ALLOW = [
+    # A paren inside a parameter expansion is literal text, so counting it
+    # would end the operand early and block an ordinary command.
+    "> $(echo ${d:-(}) cat /etc/hosts",
     "echo /sbin/shutdown",
     "ls -la /sbin/shutdown",
     "grep 'shutdown' /var/log/syslog",
