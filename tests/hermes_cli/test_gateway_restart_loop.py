@@ -310,6 +310,28 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
 
+    @pytest.mark.parametrize("form", [". {path}", "source {path}"])
+    def test_blocks_lifecycle_command_in_a_dot_sourced_script(
+        self, monkeypatch, tmp_path, form
+    ):
+        """Sourcing runs the script in the CURRENT shell, so it restarts the
+        gateway just as surely as executing it. `.` and `source` are the same
+        builtin and must both be caught — `.` was not (Path(".").name == "")."""
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "delayed-ops.sh"
+        script.write_text(
+            "#!/bin/bash\nsleep 45\nhermes gateway restart\n", encoding="utf-8"
+        )
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(
+            tt.terminal_tool(command=form.format(path=script))
+        )
+
+        assert result["exit_code"] == 1
+        assert "referenced script" in result["error"]
+
     def test_blocks_launchctl_submit_inside_gateway(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
@@ -895,6 +917,64 @@ class TestLifecycleGuardModule:
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
 # ---------------------------------------------------------------------------
+
+class TestDotSourceIsScannedLikeSource:
+    """`.` and `source` are the same POSIX builtin and must scan alike.
+
+    `Path(".").name` is "" — pathlib has no name component for a pure-path
+    token — so keying the sourced-script branch on it left the `.` spelling
+    unreachable. `source ./helper.sh` was scanned while `. ./helper.sh`
+    walked straight past both the cron guard and the in-gateway terminal
+    guard, carrying whatever the sourced script contained.
+    """
+
+    def _scan(self, command, cwd):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        return contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=cwd
+        )
+
+    @pytest.fixture
+    def helper(self, tmp_path):
+        script = tmp_path / "helper.sh"
+        script.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+        return script
+
+    @pytest.mark.parametrize("form", [". {path}", "source {path}"])
+    def test_both_spellings_block_a_referenced_script(self, tmp_path, helper, form):
+        assert self._scan(form.format(path=helper), cwd=str(tmp_path)) is True
+
+    @pytest.mark.parametrize("form", [". ./helper.sh", "source ./helper.sh"])
+    def test_both_spellings_block_a_relative_reference(self, tmp_path, helper, form):
+        assert self._scan(form, cwd=str(tmp_path)) is True
+
+    def test_env_assignment_prefix_does_not_hide_dot_source(self, tmp_path, helper):
+        assert self._scan(f"FOO=1 . {helper}", cwd=str(tmp_path)) is True
+
+    def test_dot_source_nested_in_shell_c_is_blocked(self, tmp_path, helper):
+        assert self._scan(f"sh -c '. {helper}'", cwd=str(tmp_path)) is True
+
+    @pytest.mark.parametrize("command", [
+        # `.` as a plain path argument is not a source and must stay allowed —
+        # this is the #77131 false-positive class the guard already carries
+        # scar tissue for.
+        "find . -name '*.py'",
+        "git add .",
+        "cd . && make",
+        "tar -czf out.tgz .",
+        "cp -r . /tmp/backup",
+    ])
+    def test_dot_as_an_argument_is_not_treated_as_a_source(self, tmp_path, command):
+        assert self._scan(command, cwd=str(tmp_path)) is False
+
+    def test_sourcing_a_clean_script_is_allowed(self, tmp_path):
+        clean = tmp_path / "ok.sh"
+        clean.write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+        assert self._scan(f". {clean}", cwd=str(tmp_path)) is False
+
 
 class TestCreateJobBlocksLifecycleCommands:
     """The regression the CLI-layer-only guard could not catch: the agent's

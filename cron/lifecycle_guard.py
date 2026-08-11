@@ -179,6 +179,22 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
             yield segment
 
 
+def _executable_name(token: str) -> str:
+    """Return the command name for a tokenized executable token.
+
+    ``Path(token).name`` is right for real paths (``/usr/bin/bash`` →
+    ``bash``), but pathlib has no name component for the pure-path tokens
+    ``.``, ``..`` and ``/``, so it returns "" for them. The POSIX
+    dot-source builtin is spelled ``.``, so keying the sourced-script
+    branch on ``Path(token).name`` alone made it unreachable: ``source
+    ./helper.sh`` was scanned but its exact synonym ``. ./helper.sh`` was
+    not, letting a referenced script carrying a lifecycle command through
+    both the cron guard and the in-gateway terminal guard. Fall back to the
+    raw token so ``.`` survives.
+    """
+    return Path(token).name or token
+
+
 def _command_token_index(segment: list[str]) -> Optional[int]:
     """Return the executable token index after simple env assignments."""
     for index, token in enumerate(segment):
@@ -354,7 +370,7 @@ def _iter_referenced_shell_scripts(
         if index is None:
             continue
         executable = segment[index]
-        executable_name = Path(executable).name
+        executable_name = _executable_name(executable)
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
