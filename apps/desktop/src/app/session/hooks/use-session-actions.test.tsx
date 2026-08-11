@@ -770,6 +770,7 @@ describe('resumeSession failure recovery', () => {
 
   it('keeps a pending row that arrives after the early REST paint', async () => {
     const resumeDeferred = deferred<SessionResumeResponse>()
+
     const persistedMessages = [
       { content: 'persisted question', role: 'user', timestamp: 1 },
       { content: 'persisted answer', role: 'assistant', timestamp: 2 }
@@ -810,6 +811,7 @@ describe('resumeSession failure recovery', () => {
         parts: [{ type: 'text' as const, text: 'arrived while resume was pending' }]
       }
     ]
+
     act(() => setMessages(messagesAfterEarlyPaint))
 
     resumeDeferred.resolve({
@@ -1119,6 +1121,7 @@ describe('resumeSession failure recovery', () => {
     vi.mocked(getLatestSessionMessages).mockResolvedValue({ messages: storedMessages, session_id: 'stored-1' } as never)
 
     const resumeDeferred = deferred<SessionResumeResponse>()
+
     const requestGateway = vi.fn((method: string) => {
       if (method === 'session.resume') {
         return resumeDeferred.promise as Promise<never>

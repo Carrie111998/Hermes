@@ -908,12 +908,15 @@ export function useSessionActions({
           }
 
           const currentMessages = $messages.get()
+
           const previousMessages = discardSettledCandidate
             ? preserveLocalPendingTurnMessages([], currentMessages)
             : resumedSameSelectedSession
               ? preserveLocalPendingTurnMessages(currentMessages, resumeStartMessages)
               : currentMessages
+
           const reconciledMessages = reconcileAuthoritativeMessages(persisted.messages, previousMessages)
+
           const messagesForView = chatMessageArraysEquivalent(currentMessages, reconciledMessages)
             ? currentMessages
             : reconciledMessages
@@ -1082,6 +1085,7 @@ export function useSessionActions({
         // ever appends, so this matches the final transcript's emptiness.
         const responseClaimsHistory =
           !createdThisRun.has(storedSessionId) && (resumed.message_count ?? 0) > 0
+
         const shouldHaveTranscript = sessionShouldHaveTranscript(stored) || responseClaimsHistory
 
         if (shouldHaveTranscript && preferredMessages.length === 0) {
