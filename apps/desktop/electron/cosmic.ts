@@ -28,6 +28,7 @@
 
 import { execFile } from 'node:child_process'
 import { promisify } from 'node:util'
+import path from 'node:path'
 import type { EnumeratedWindow } from './window-below'
 
 const execFileAsync = promisify(execFile)
@@ -62,6 +63,18 @@ function toEnumerated(w: CosmicToplevel): EnumeratedWindow {
   }
 }
 
+function resolveCosmicHelperPath(): string {
+  // electron-builder extraResources place the binary in process.resourcesPath
+  // (e.g. <app>/resources/cosmic-toplevel-list on Linux). Prefer that so a
+  // stock `hermes desktop` produced by this repo's own build finds it; fall
+  // back to a bare name resolved via PATH for dev builds and manual installs.
+  const name = 'cosmic-toplevel-list'
+  if (typeof process !== 'undefined' && process.resourcesPath) {
+    return path.join(process.resourcesPath, name)
+  }
+  return name
+}
+
 function hashString(s: string): number {
   let h = 0
   for (let i = 0; i < s.length; i++) {
@@ -74,10 +87,11 @@ function hashString(s: string): number {
  * Enumerate COSMIC windows via the `cosmic-toplevel-list` helper, or null when
  * this is not a COSMIC session or the helper is unavailable.
  *
- * The helper is optional: it is built from `apps/desktop/cosmic-toplevel-list`
- * and placed on PATH (or next to the app binary) by the packager. If it is
- * missing we return null and the caller falls through to `get-windows`
- * (which works under XWayland) and finally to the COSMIC guidance note.
+ // The helper is built from `apps/desktop/cosmic-toplevel-list` by the desktop
+ // pack pipeline (scripts/stage-native-deps.mjs -> cargo build) and shipped via
+ // electron-builder `extraResources` into `process.resourcesPath`. If it is
+ // missing we return null and the caller falls through to `get-windows`
+ // (which works under XWayland) and finally to the COSMIC guidance note.
  */
 export async function readCosmicWindows(
   selfPid: number,
@@ -90,9 +104,12 @@ export async function readCosmicWindows(
   }
 
   // Native Wayland: try the COSMIC helper first. It speaks the compositor's own
-  // Wayland protocol and needs no X11.
+  // Wayland protocol and needs no X11. The binary is shipped via electron-builder
+  // extraResources into process.resourcesPath; fall back to a bare name (PATH)
+  // for dev builds / manual installs.
+  const helperPath = resolveCosmicHelperPath()
   try {
-    const { stdout } = await execFileAsync('cosmic-toplevel-list', [], {
+    const { stdout } = await execFileAsync(helperPath, [], {
       env,
       timeout: 5000,
       maxBuffer: 10 * 1024 * 1024,

@@ -27,9 +27,11 @@ cargo build --release
 ```
 
 Place the binary on `PATH` (or next to the Hermes Desktop executable) when
-packaging. `apps/desktop/electron/cosmic.ts` shells out to it on COSMIC; if it
-is missing, Hermes falls back to the X11 enumerator (which works under
-XWayland, see `desktop.ozone_platform_hint`).
+packaging. The desktop pack does this automatically: `scripts/stage-native-deps.mjs`
+runs `cargo build --release` and copies the binary into
+`dist/node_modules/cosmic-toplevel-list`, and electron-builder's
+`extraResources` ships it into `process.resourcesPath` (where `cosmic.ts`
+resolves it at runtime). On non-Linux targets the stage is a no-op.
 
 ## Why a separate binary?
 
