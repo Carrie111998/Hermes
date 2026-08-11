@@ -37,7 +37,12 @@ from hermes_cli.dev_pipeline import (
     scan_diff_for_secrets,
     validate_plan_contract,
 )
-from tools.cursor_agent_tool import resolve_cursor_agent_binary
+try:  # cursor_agent_tool lands via a separate PR; degrade to "unavailable".
+    from tools.cursor_agent_tool import resolve_cursor_agent_binary
+except ImportError:  # pragma: no cover
+    def resolve_cursor_agent_binary() -> Optional[str]:
+        return None
+
 from tools.moa_tool import consult_moa
 
 logger = logging.getLogger(__name__)

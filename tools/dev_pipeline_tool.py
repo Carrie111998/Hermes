@@ -30,8 +30,13 @@ from hermes_cli.dev_pipeline import (
     resolve_default_branch,
     validate_repo_input,
 )
-from tools.cursor_agent_tool import check_cursor_agent_requirements
 from tools.registry import registry
+
+try:  # cursor_agent_tool lands via a separate PR; degrade to "unavailable".
+    from tools.cursor_agent_tool import check_cursor_agent_requirements
+except ImportError:  # pragma: no cover
+    def check_cursor_agent_requirements() -> bool:
+        return False
 
 logger = logging.getLogger(__name__)
 
