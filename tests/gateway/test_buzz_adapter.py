@@ -42,6 +42,10 @@ _ENV_VARS = (
     "BUZZ_HOME_CHANNEL",
     "BUZZ_ALLOWED_USERS",
     "BUZZ_ALLOW_ALL_USERS",
+    "BUZZ_REQUIRE_MENTION",
+    "BUZZ_MENTION_REQUIRED_USERS",
+    "BUZZ_MENTION_ALIASES",
+    "BUZZ_MAX_AGENT_HOPS",
     "BUZZ_POLL_INTERVAL",
     "BUZZ_CLI_PATH",
     "BUZZ_CREDENTIALS_FILE",
@@ -142,6 +146,22 @@ class TestBuzzAdapterInit:
         adapter = BuzzAdapter(PlatformConfig(enabled=True, extra={"relay_url": "https://cfg.relay"}))
         assert adapter.relay_url == "https://env.relay"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "extra",
+        [
+            {"mention_required_users": ["not-a-pubkey"], "max_agent_hops": 4},
+            {"mention_required_users": [OTHER_PUBKEY], "max_agent_hops": 0},
+            {"mention_aliases": {"Warren": "not-a-pubkey"}},
+        ],
+    )
+    async def test_invalid_mutual_agent_config_fails_closed(self, extra):
+        adapter = _make_adapter(extra)
+
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "config_invalid"
+        assert adapter.fatal_error_retryable is False
+
 
 # ── CLI error contract ────────────────────────────────────────────────────
 
@@ -185,6 +205,43 @@ class TestPollingDedupe:
         assert set(state["seen"]) == {"e1", "e2"}
         # Seeding must never replay history into the agent
         assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_seed_reconstructs_agent_reply_hops(self):
+        second_agent = "b" * 64
+        adapter = _make_adapter({"mention_required_users": [OTHER_PUBKEY, second_agent]})
+        adapter._dispatched = []
+
+        first = _event("e1", pubkey=OTHER_PUBKEY, content="@Chip first", created_at=100)
+        second = _event("e2", pubkey=second_agent, content="@Chip second", created_at=101)
+        second["tags"].append(["e", "e1", "", "reply"])
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [first, second])
+        adapter._run_cli = cli
+
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        assert adapter._agent_hops["e1"] == 1
+        assert adapter._agent_hops["e2"] == 2
+
+    @pytest.mark.asyncio
+    async def test_seed_counts_own_profile_events_as_agent_hops(self):
+        adapter = _make_adapter({
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        first = _event("e1", pubkey=OTHER_PUBKEY, content="@Chip first", created_at=100)
+        own_reply = _event("e2", pubkey=SELF_PUBKEY, content="reply", created_at=101)
+        own_reply["tags"].append(["e", "e1", "", "reply"])
+        third = _event("e3", pubkey=OTHER_PUBKEY, content="@Chip third", created_at=102)
+        third["tags"].append(["e", "e2", "", "reply"])
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [first, own_reply, third])
+        adapter._run_cli = cli
+
+        await adapter._seed_channel(CHANNEL, chat_type="group")
+
+        assert adapter._agent_hops == {"e1": 1, "e2": 2, "e3": 3}
 
     @pytest.mark.asyncio
     async def test_new_event_dispatched_once(self, adapter):
@@ -249,6 +306,155 @@ class TestMentionGating:
         adapter._allowed_pubkeys = {"b" * 64}
         await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
         assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_configured_bot_sender_requires_tagged_mention(self):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        cli = _ScriptedCli()
+        text_only = _event("e1", content="@Chip text without a p-tag", created_at=10)
+        bare = _event("e2", content="Chip bare name with a p-tag", created_at=11)
+        bare["tags"].append(["p", SELF_PUBKEY])
+        tagged = _event("e3", content="@Chip tagged", created_at=12)
+        tagged["tags"].append(["p", SELF_PUBKEY])
+        cli.script("messages", "get", [text_only, bare, tagged])
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["e3"]
+
+    @pytest.mark.asyncio
+    async def test_configured_self_alias_counts_as_visible_mention(self):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Warren": SELF_PUBKEY},
+        })
+        adapter._display_name = "Warren · Hermes"
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        event = _event("e1", content="@Warren please review", created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [event])
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    def test_configured_self_alias_is_stripped_from_leading_prompt(self):
+        adapter = _make_adapter({"mention_aliases": {"Warren": SELF_PUBKEY}})
+        adapter._display_name = "Warren · Hermes"
+
+        assert adapter._strip_mention("@Warren please review") == "please review"
+
+    @pytest.mark.asyncio
+    async def test_agent_reply_chain_stops_after_configured_hop_limit(self):
+        second_agent = "b" * 64
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY, second_agent],
+            "max_agent_hops": 2,
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        first = _event("e1", pubkey=OTHER_PUBKEY, content="@Chip first", created_at=10)
+        first["tags"].append(["p", SELF_PUBKEY])
+        second = _event("e2", pubkey=second_agent, content="@Chip second", created_at=11)
+        second["tags"] += [["e", "e1", "", "reply"], ["p", SELF_PUBKEY]]
+        third = _event("e3", pubkey=OTHER_PUBKEY, content="@Chip third", created_at=12)
+        third["tags"] += [["e", "e2", "", "reply"], ["p", SELF_PUBKEY]]
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [first, second, third])
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1", "e2"]
+
+    @pytest.mark.asyncio
+    async def test_reverse_order_poll_still_enforces_agent_hop_limit(self):
+        second_agent = "b" * 64
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY, second_agent],
+            "max_agent_hops": 2,
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        first = _event("e1", pubkey=OTHER_PUBKEY, content="@Chip first", created_at=10)
+        first["tags"].append(["p", SELF_PUBKEY])
+        second = _event("e2", pubkey=second_agent, content="@Chip second", created_at=10)
+        second["tags"] += [["e", "e1", "", "reply"], ["p", SELF_PUBKEY]]
+        third = _event("e3", pubkey=OTHER_PUBKEY, content="@Chip third", created_at=10)
+        third["tags"] += [["e", "e2", "", "reply"], ["p", SELF_PUBKEY]]
+        cli = _ScriptedCli()
+        cli.script("messages", "get", [third, second, first])
+        adapter._run_cli = cli
+
+        await adapter._poll_channel(CHANNEL)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1", "e2"]
+
+    @pytest.mark.asyncio
+    async def test_push_event_with_unknown_reply_parent_fails_closed(self):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 2,
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+
+        child = _event("child", content="@Chip child", created_at=11)
+        child["tags"] += [["e", "missing-parent", "", "reply"], ["p", SELF_PUBKEY]]
+        parent = _event("parent", content="@Chip parent", created_at=10)
+        parent["tags"].append(["p", SELF_PUBKEY])
+
+        await adapter._handle_event(CHANNEL, state, child)
+        await adapter._handle_event(CHANNEL, state, parent)
+
+        assert [d["message_id"] for d in adapter._dispatched] == ["parent"]
 
 
 # ── DM classification via p-tags (issue #68871) ──────────────────────────
@@ -407,6 +613,100 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_adds_explicit_pubkey_for_configured_agent_alias(self):
+        adapter = _make_adapter({"mention_aliases": {"Warren": OTHER_PUBKEY}})
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-mention"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "Please ask @Warren to review this.")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        mention_index = args.index("--mention")
+        assert args[mention_index + 1] == OTHER_PUBKEY
+
+    @pytest.mark.asyncio
+    async def test_send_with_agent_mention_recovers_missing_reply_parent(self):
+        adapter = _make_adapter({
+            "mention_aliases": {"Warren": OTHER_PUBKEY},
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._active_agent_events[CHANNEL] = ("agent-parent", 2)
+        adapter._agent_hops["agent-parent"] = 2
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-recovered-parent"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Warren continue this delegation")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "agent-parent"
+        assert adapter._agent_hops["evt-recovered-parent"] == 3
+
+    @pytest.mark.asyncio
+    async def test_send_with_agent_mention_overrides_stale_lower_hop_parent(self):
+        adapter = _make_adapter({
+            "mention_aliases": {"Warren": OTHER_PUBKEY},
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._active_agent_events[CHANNEL] = ("current-agent-parent", 4)
+        adapter._agent_hops.update({"stale-parent": 1, "current-agent-parent": 4})
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-safe-parent"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            CHANNEL,
+            "@Warren continue this delegation",
+            reply_to="stale-parent",
+        )
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "current-agent-parent"
+        assert adapter._agent_hops["evt-safe-parent"] == 5
+
+    @pytest.mark.asyncio
+    async def test_authorized_human_message_clears_active_agent_chain(self):
+        adapter = _make_adapter({
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {"Self": SELF_PUBKEY},
+            "max_agent_hops": 4,
+            "require_mention": False,
+        })
+        adapter._active_agent_events[CHANNEL] = ("old-agent-event", 3)
+        adapter._allowed_pubkeys = set()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+
+        await adapter._handle_event(CHANNEL, state, _event("human-root", "human-key", "new request"))
+
+        assert CHANNEL not in adapter._active_agent_events
+
+    @pytest.mark.asyncio
+    async def test_send_records_outbound_agent_hop_from_reply_parent(self):
+        adapter = _make_adapter({
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._agent_hops["parent-event"] = 2
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-hop"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "reply", reply_to="parent-event")
+
+        assert result.success is True
+        assert adapter._agent_hops["evt-hop"] == 3
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
@@ -420,6 +720,31 @@ class TestBuzzAdapterSend:
         assert result.success is True
         args, _stdin = cli.calls[0]
         assert args[args.index("--file") + 1] == str(img)
+
+    @pytest.mark.asyncio
+    async def test_send_image_applies_agent_mentions_and_hop_accounting(self, tmp_path):
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"\x89PNG fake")
+        adapter = _make_adapter({
+            "mention_aliases": {"Warren": OTHER_PUBKEY},
+            "max_agent_hops": 4,
+        })
+        adapter._agent_hops["parent-event"] = 2
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-image-hop"})
+        adapter._run_cli = cli
+
+        result = await adapter.send_image(
+            CHANNEL,
+            str(img),
+            caption="@Warren review this",
+            reply_to="parent-event",
+        )
+
+        assert result.success is True
+        args, _stdin = cli.calls[0]
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+        assert adapter._agent_hops["evt-image-hop"] == 3
 
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -537,4 +862,28 @@ class TestStandaloneSend:
         # The private key must never be part of argv
         assert all("nsec1x" not in str(a) for a in captured["args"])
 
+    @pytest.mark.asyncio
+    async def test_standalone_send_resolves_configured_agent_alias(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
 
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-cron"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"mention_aliases": {"Warren": OTHER_PUBKEY}},
+        )
+
+        result = await _standalone_send(config, CHANNEL, "@Warren review")
+
+        assert result == {"success": True, "message_id": "evt-cron"}
+        assert captured["args"][captured["args"].index("--mention") + 1] == OTHER_PUBKEY

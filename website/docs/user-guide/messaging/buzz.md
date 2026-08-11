@@ -34,6 +34,9 @@ gateway:
         cli_path: ""               # buzz binary (default: PATH, then ~/bin/buzz)
         credentials_file: ""       # JSON file with the nsec (BUZZ_PRIVATE_KEY fallback)
         allowed_users: []          # empty = allow all; hex pubkeys or npubs
+        mention_required_users: [] # selected senders must explicitly mention this agent
+        mention_aliases: {}        # outbound @alias -> pubkey mapping for real p-tags
+        max_agent_hops: 0          # bound consecutive agent replies; 0 = unlimited
 ```
 
 Plus, in `~/.hermes/.env`:
@@ -52,6 +55,9 @@ BUZZ_PRIVATE_KEY=nsec1...
 | `BUZZ_HOME_CHANNEL` | — | Channel UUID for cron / notification delivery (defaults to the first watched channel) |
 | `BUZZ_ALLOWED_USERS` | — | Comma-separated npubs or hex pubkeys allowed to talk to the agent |
 | `BUZZ_ALLOW_ALL_USERS` | — | Allow any community member to talk to the agent |
+| `BUZZ_MENTION_REQUIRED_USERS` | — | Comma-separated senders that must explicitly mention this agent |
+| `BUZZ_MENTION_ALIASES` | — | Comma-separated `Alias=pubkey` mappings used to create outbound p-tags |
+| `BUZZ_MAX_AGENT_HOPS` | — | Maximum consecutive agent-authored reply hops (`0` = unlimited) |
 | `BUZZ_POLL_INTERVAL` | — | Seconds between inbound poll sweeps (default: 4) |
 | `BUZZ_CLI_PATH` | — | Path to the `buzz` binary (default: `buzz` on PATH, then `~/bin/buzz`) |
 | `BUZZ_CREDENTIALS_FILE` | — | JSON credentials file holding the nsec, used when `BUZZ_PRIVATE_KEY` is unset |
@@ -98,8 +104,14 @@ gateway:
 ## Mentions, channels, and DMs
 
 - In shared channels the agent only responds when **addressed** — by `@name`, its npub, or its hex pubkey. Everything else is ignored.
-- Direct messages always reach the agent, no mention needed.
+- Direct messages always reach the agent without a mention, except from identities listed in `mention_required_users`; those senders must still use an explicit tagged mention.
 - The agent's own messages are never dispatched back to it (self-echo suppression by pubkey), and every event is de-duplicated by event id against a per-channel high-water mark.
+
+### Bounded agent-to-agent interaction
+
+To preserve ambient human conversation while requiring explicit bot delegation, keep `require_mention: false`, list the bot identities in both `allowed_users` and `mention_required_users`, configure `mention_aliases`, and set a small positive `max_agent_hops` such as `4`. Senders in `mention_required_users` must provide both visible `@alias` text and a real Nostr `p` tag; ordinary allowed humans can still speak without a mention. Outbound alias mappings add explicit `--mention` pubkeys so model-authored names become real mention tags.
+
+`max_agent_hops` counts consecutive agent-authored events linked by Buzz reply tags. Events beyond the configured limit remain visible in Buzz but are not dispatched into another Hermes turn. Configure the same agent identity set and hop limit on every mutually interacting profile.
 
 ## Access control
 
