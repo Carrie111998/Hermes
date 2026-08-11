@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
+import { usageDashboardZhHant } from './usage-dashboard-zh-hant'
 
 export const zhHant = defineLocale({
   common: {
@@ -1212,6 +1213,8 @@ export const zhHant = defineLocale({
     noSkillActivity: '暫無技能活動。',
     actions: count => `${count} 次動作`
   },
+
+  usageDashboard: usageDashboardZhHant,
 
   messaging: {
     search: '搜尋訊息平台…',

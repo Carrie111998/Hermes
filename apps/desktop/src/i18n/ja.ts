@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import { defineLocale } from './define-locale'
+import { usageDashboardJa } from './usage-dashboard-ja'
 
 export const ja = defineLocale({
   common: {
@@ -1247,6 +1248,8 @@ export const ja = defineLocale({
     noSkillActivity: 'スキルのアクティビティはまだありません。',
     actions: count => `${count} アクション`
   },
+
+  usageDashboard: usageDashboardJa,
 
   messaging: {
     search: 'メッセージングを検索...',

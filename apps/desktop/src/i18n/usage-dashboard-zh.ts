@@ -1,0 +1,181 @@
+import type { UsageDashboardTranslations } from './usage-dashboard-types'
+
+export const usageDashboardZh: UsageDashboardTranslations = {
+  eyebrow: '用量 // 本地账本',
+  title: '用量控制台',
+  subtitle: '一眼掌握消耗；需要追根溯源时，可检查每一次已捕获调用。',
+  rangeAria: '用量时间范围',
+  days: count => `${count} 天`,
+  sync: '同步',
+  syncing: '同步中…',
+  generated: when => `生成于 ${when}`,
+  partialData: '计量数据不完整',
+  unknown: '未知',
+  loading: '加载中…',
+  emptyDaily: '此时间范围内没有每日活动。',
+  status: { active: '账本在线', empty: '账本已就绪 · 暂无记录', degraded: '账本状态异常' },
+  sources: { session: '会话洞察', install: '全局用量计量' },
+  deckAria: '用量控制台视图',
+  decks: { overview: '总览', routes: '路由', ledger: '调用账本' },
+  deckHints: {
+    overview: '总体消耗 · 词元构成 · 来源压力',
+    routes: '提供商 × 模型 × API 模式',
+    ledger: '最新调用 · 完整词元向量'
+  },
+  macro: {
+    marketCost: '市场等值成本',
+    rangeEstimate: days => `${days} 天会话估算`,
+    capturedCost: '已捕获估算',
+    captureUnavailable: '全局计量不可用',
+    pricingCoverage: (priced, included, unpriced) => `${priced} 次计价 · ${included} 次已包含 · ${unpriced} 次未定价`,
+    tokens: '词元流量',
+    inputOutput: (input, output) => `${input} 输入 · ${output} 输出`,
+    calls: 'API 调用',
+    sessions: '会话',
+    range: days => `最近 ${days} 天`,
+    cacheLeverage: '缓存利用率',
+    cacheRead: tokens => `${tokens} 个缓存读取词元`
+  },
+  chart: {
+    title: '消耗图谱',
+    description: '按日显示压力，并叠加独立累计轨迹。聚焦柱形可查看精确数值。',
+    metricAria: '消耗图谱指标',
+    cost: '成本',
+    tokens: '词元',
+    calls: '会话',
+    periodTotal: days => `${days} 天合计`,
+    cumulativeTrace: '虚线 = 累计',
+    aria: (metric, days) => `${days} 天内每日${metric}`
+  },
+  token: {
+    title: '词元拓扑',
+    description: '显示完整流量构成，包括缓存和推理，而不仅是输入与输出。',
+    input: '未缓存输入',
+    cacheRead: '缓存读取',
+    cacheWrite: '缓存写入',
+    output: '输出',
+    reasoning: '推理',
+    tokensShort: '词元'
+  },
+  cost: {
+    title: '成本真值',
+    description: '会话提供商实报费用与本地捕获估算、已包含用量和未定价调用始终分开显示。',
+    captureUnavailable: '全局用量计量不可用；上方的会话估算仍可查看。',
+    actual: '会话提供商实报费用',
+    estimated: '本地捕获估算',
+    included: '已包含用量',
+    unavailable: '价格不可用',
+    capturedAllTime: '全局已捕获估算',
+    cacheSavings: '预计缓存节省',
+    calls: count => `${count} 次调用`,
+    rangeComparison: (cost, days) => `${days} 天会话市场等值为 ${cost}。这是不同范围，不会叠加到已捕获总额。`
+  },
+  models: {
+    title: '模型压力栈',
+    description: '按模型查看会话流量、缓存效率、推理负载和明确的成本状态。',
+    empty: '此时间范围内没有模型流量。'
+  },
+  sort: { aria: '排序用量行', cost: '成本', tokens: '词元', calls: '调用', cache: '缓存' },
+  table: {
+    model: '模型',
+    route: '提供商 / 模型',
+    apiMode: 'API 模式',
+    calls: '调用',
+    input: '输入',
+    cacheRead: '缓存读取',
+    cacheWrite: '缓存写入',
+    output: '输出',
+    reasoning: '推理',
+    cost: '成本',
+    inspect: '检查',
+    profile: '配置档 / 平台',
+    tokens: '词元',
+    time: '时间'
+  },
+  costStatus: {
+    actual: '实际',
+    estimated: '估算',
+    included: '已包含',
+    unknown: '未知',
+    unpriced: '未定价',
+    unavailable: '不可用',
+    mixed: '混合'
+  },
+  platform: {
+    title: '来源压力',
+    description: '按词元流量排序，显示会话从何处进入 Hermes。',
+    empty: '此时间范围内没有平台流量。'
+  },
+  activity: {
+    title: '时钟热力',
+    aria: '按一天中小时统计的会话活动',
+    cell: (hour, sessions) => `${hour}:00 · ${sessions} 个会话`,
+    peak: (hour, sessions) => `峰值时段 ${hour}:00 · ${sessions} 个会话`
+  },
+  sessions: {
+    title: '高负载会话',
+    description: '所选时间范围内用量最高的会话记录。',
+    empty: '此时间范围内没有高负载会话。'
+  },
+  workload: {
+    title: '工作负载信号',
+    description: '高频工具和技能可帮助解释流量形状。',
+    skill: '技能',
+    tool: '工具',
+    empty: '此时间范围内没有工具或技能活动。',
+    disclaimer: '活动次数仅作背景信息，不代表按工具归因的词元或成本。'
+  },
+  footer: { sessionInsights: '会话遥测', installLedger: '捕获遥测', localData: '仅本地数据' },
+  scope: { all: '全部时间', month: '本月' },
+  routes: {
+    title: '路由矩阵',
+    description: '按提供商、模型和 API 模式汇总全局用量。点击准星可追踪该路由的最新调用。',
+    scopeAria: '路由矩阵范围',
+    loadFailed: '无法加载路由遥测；会话分析不受影响。',
+    visible: (visible, total) => `${visible}/${total} 条路由`,
+    calls: count => `${count} 次调用`,
+    tokens: count => `${count} 个词元`,
+    cost: cost => `估算 ${cost}`,
+    inspect: route => `检查 ${route} 的最近调用`,
+    noMatch: '没有路由符合这些条件。',
+    empty: '尚无已捕获路由。启用用量计量并进行一次模型调用即可填充矩阵。',
+    disclaimer: '路由总计从用量计量开始捕获时计算，其时间跨度可能与会话洞察不同。'
+  },
+  filters: {
+    searchAria: '搜索用量路由',
+    searchRoutes: '搜索路由…',
+    searchLedgerAria: '搜索已捕获调用',
+    searchLedger: '搜索 ID、路由、配置档或平台…',
+    provider: '提供商筛选',
+    model: '模型筛选',
+    apiMode: 'API 模式筛选',
+    platform: '平台筛选',
+    profile: '配置档筛选',
+    costStatus: '成本状态筛选',
+    allProviders: '全部提供商',
+    allModels: '全部模型',
+    allModes: '全部 API 模式',
+    allPlatforms: '全部平台',
+    allProfiles: '全部配置档',
+    allCostStates: '全部成本状态',
+    clear: '清除筛选'
+  },
+  ledger: {
+    title: '已捕获调用账本',
+    description: '查看最新全局调用。精细筛选后展开一行，可检查完整词元与身份向量。',
+    limitAria: '调用记录数量限制',
+    loadFailed: '无法加载调用记录；会话分析不受影响。',
+    scopeNotice: '本月范围应用于最新捕获窗口。由于近期账本受数量限制，更早的本月调用可能缺失。',
+    visible: (visible, total) => `显示 ${visible}/${total} 次调用`,
+    filterCount: count => `${count} 个有效筛选`,
+    sessionId: '会话 ID',
+    turnId: '任务 ID',
+    eventId: '事件 ID',
+    costSource: '成本来源',
+    timestamp: '时间戳',
+    noMatch: '没有调用符合这些筛选条件。',
+    empty: '尚无已捕获调用。启用的用量计量事件到达后，账本会自动填充。',
+    disclaimer: '账本覆盖安装中的所有配置档。数量限制先于本地筛选，因此旧路由可能不在最新窗口中。'
+  },
+  error: { title: '用量遥测不可用', description: 'Hermes 无法读取本地会话账本。', retry: '重试' }
+}

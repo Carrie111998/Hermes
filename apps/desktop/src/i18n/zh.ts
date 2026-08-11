@@ -1,6 +1,7 @@
 import { defineFieldCopy } from '@/app/settings/field-copy'
 
 import type { Translations } from './types'
+import { usageDashboardZh } from './usage-dashboard-zh'
 
 export const zh: Translations = {
   common: {
@@ -1530,6 +1531,8 @@ export const zh: Translations = {
       viewLog: '操作日志'
     }
   },
+
+  usageDashboard: usageDashboardZh,
 
   messaging: {
     search: '搜索消息平台…',

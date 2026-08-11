@@ -1,0 +1,181 @@
+import type { UsageDashboardTranslations } from './usage-dashboard-types'
+
+export const usageDashboardZhHant: UsageDashboardTranslations = {
+  eyebrow: '用量 // 本機帳本',
+  title: '用量控制台',
+  subtitle: '一眼掌握消耗；需要追根究柢時，可檢查每一次已擷取呼叫。',
+  rangeAria: '用量時間範圍',
+  days: count => `${count} 天`,
+  sync: '同步',
+  syncing: '同步中…',
+  generated: when => `產生於 ${when}`,
+  partialData: '計量資料不完整',
+  unknown: '未知',
+  loading: '載入中…',
+  emptyDaily: '此時間範圍內沒有每日活動。',
+  status: { active: '帳本在線', empty: '帳本已就緒 · 暫無記錄', degraded: '帳本狀態異常' },
+  sources: { session: '工作階段洞察', install: '全域用量計量' },
+  deckAria: '用量控制台檢視',
+  decks: { overview: '總覽', routes: '路由', ledger: '呼叫帳本' },
+  deckHints: {
+    overview: '整體消耗 · 詞元構成 · 來源壓力',
+    routes: '提供方 × 模型 × API 模式',
+    ledger: '最新呼叫 · 完整詞元向量'
+  },
+  macro: {
+    marketCost: '市場等值成本',
+    rangeEstimate: days => `${days} 天工作階段估算`,
+    capturedCost: '已擷取估算',
+    captureUnavailable: '全域計量無法使用',
+    pricingCoverage: (priced, included, unpriced) => `${priced} 次計價 · ${included} 次已包含 · ${unpriced} 次未定價`,
+    tokens: '詞元流量',
+    inputOutput: (input, output) => `${input} 輸入 · ${output} 輸出`,
+    calls: 'API 呼叫',
+    sessions: '工作階段',
+    range: days => `最近 ${days} 天`,
+    cacheLeverage: '快取利用率',
+    cacheRead: tokens => `${tokens} 個快取讀取詞元`
+  },
+  chart: {
+    title: '消耗圖譜',
+    description: '按日顯示壓力，並疊加獨立累計軌跡。聚焦柱形可查看精確數值。',
+    metricAria: '消耗圖譜指標',
+    cost: '成本',
+    tokens: '詞元',
+    calls: '工作階段',
+    periodTotal: days => `${days} 天合計`,
+    cumulativeTrace: '虛線 = 累計',
+    aria: (metric, days) => `${days} 天內每日${metric}`
+  },
+  token: {
+    title: '詞元拓撲',
+    description: '顯示完整流量構成，包括快取和推理，而不只是輸入與輸出。',
+    input: '未快取輸入',
+    cacheRead: '快取讀取',
+    cacheWrite: '快取寫入',
+    output: '輸出',
+    reasoning: '推理',
+    tokensShort: '詞元'
+  },
+  cost: {
+    title: '成本真值',
+    description: '工作階段提供方實報費用與本機擷取估算、已包含用量和未定價呼叫始終分開顯示。',
+    captureUnavailable: '全域用量計量無法使用；上方的工作階段估算仍可查看。',
+    actual: '工作階段提供方實報費用',
+    estimated: '本機擷取估算',
+    included: '已包含用量',
+    unavailable: '價格無法取得',
+    capturedAllTime: '全域已擷取估算',
+    cacheSavings: '預估快取節省',
+    calls: count => `${count} 次呼叫`,
+    rangeComparison: (cost, days) => `${days} 天工作階段市場等值為 ${cost}。這是不同範圍，不會加到已擷取總額。`
+  },
+  models: {
+    title: '模型壓力堆疊',
+    description: '按模型查看工作階段流量、快取效率、推理負載和明確的成本狀態。',
+    empty: '此時間範圍內沒有模型流量。'
+  },
+  sort: { aria: '排序用量列', cost: '成本', tokens: '詞元', calls: '呼叫', cache: '快取' },
+  table: {
+    model: '模型',
+    route: '提供方 / 模型',
+    apiMode: 'API 模式',
+    calls: '呼叫',
+    input: '輸入',
+    cacheRead: '快取讀取',
+    cacheWrite: '快取寫入',
+    output: '輸出',
+    reasoning: '推理',
+    cost: '成本',
+    inspect: '檢查',
+    profile: '設定檔 / 平台',
+    tokens: '詞元',
+    time: '時間'
+  },
+  costStatus: {
+    actual: '實際',
+    estimated: '估算',
+    included: '已包含',
+    unknown: '未知',
+    unpriced: '未定價',
+    unavailable: '無法取得',
+    mixed: '混合'
+  },
+  platform: {
+    title: '來源壓力',
+    description: '按詞元流量排序，顯示工作階段從何處進入 Hermes。',
+    empty: '此時間範圍內沒有平台流量。'
+  },
+  activity: {
+    title: '時鐘熱度',
+    aria: '按一天中小時統計的工作階段活動',
+    cell: (hour, sessions) => `${hour}:00 · ${sessions} 個工作階段`,
+    peak: (hour, sessions) => `高峰時段 ${hour}:00 · ${sessions} 個工作階段`
+  },
+  sessions: {
+    title: '高負載工作階段',
+    description: '所選時間範圍內用量最高的工作階段記錄。',
+    empty: '此時間範圍內沒有高負載工作階段。'
+  },
+  workload: {
+    title: '工作負載訊號',
+    description: '高頻工具和技能可協助解釋流量形狀。',
+    skill: '技能',
+    tool: '工具',
+    empty: '此時間範圍內沒有工具或技能活動。',
+    disclaimer: '活動次數僅作背景資訊，不代表按工具歸因的詞元或成本。'
+  },
+  footer: { sessionInsights: '工作階段遙測', installLedger: '擷取遙測', localData: '僅本機資料' },
+  scope: { all: '全部時間', month: '本月' },
+  routes: {
+    title: '路由矩陣',
+    description: '按提供方、模型和 API 模式彙總全域用量。點擊準星可追蹤該路由的最新呼叫。',
+    scopeAria: '路由矩陣範圍',
+    loadFailed: '無法載入路由遙測；工作階段分析不受影響。',
+    visible: (visible, total) => `${visible}/${total} 條路由`,
+    calls: count => `${count} 次呼叫`,
+    tokens: count => `${count} 個詞元`,
+    cost: cost => `估算 ${cost}`,
+    inspect: route => `檢查 ${route} 的最近呼叫`,
+    noMatch: '沒有路由符合這些條件。',
+    empty: '尚無已擷取路由。啟用用量計量並進行一次模型呼叫即可填入矩陣。',
+    disclaimer: '路由總計從用量計量開始擷取時計算，其時間跨度可能與工作階段洞察不同。'
+  },
+  filters: {
+    searchAria: '搜尋用量路由',
+    searchRoutes: '搜尋路由…',
+    searchLedgerAria: '搜尋已擷取呼叫',
+    searchLedger: '搜尋 ID、路由、設定檔或平台…',
+    provider: '提供方篩選',
+    model: '模型篩選',
+    apiMode: 'API 模式篩選',
+    platform: '平台篩選',
+    profile: '設定檔篩選',
+    costStatus: '成本狀態篩選',
+    allProviders: '所有提供方',
+    allModels: '所有模型',
+    allModes: '所有 API 模式',
+    allPlatforms: '所有平台',
+    allProfiles: '所有設定檔',
+    allCostStates: '所有成本狀態',
+    clear: '清除篩選'
+  },
+  ledger: {
+    title: '已擷取呼叫帳本',
+    description: '查看最新全域呼叫。精細篩選後展開一列，可檢查完整詞元與識別向量。',
+    limitAria: '呼叫記錄數量限制',
+    loadFailed: '無法載入呼叫記錄；工作階段分析不受影響。',
+    scopeNotice: '本月範圍套用於最新擷取視窗。由於近期帳本受數量限制，更早的本月呼叫可能缺漏。',
+    visible: (visible, total) => `顯示 ${visible}/${total} 次呼叫`,
+    filterCount: count => `${count} 個有效篩選`,
+    sessionId: '工作階段 ID',
+    turnId: '任務 ID',
+    eventId: '事件 ID',
+    costSource: '成本來源',
+    timestamp: '時間戳記',
+    noMatch: '沒有呼叫符合這些篩選條件。',
+    empty: '尚無已擷取呼叫。啟用的用量計量事件抵達後，帳本會自動填入。',
+    disclaimer: '帳本涵蓋安裝中的所有設定檔。數量限制先於本機篩選，因此舊路由可能不在最新視窗中。'
+  },
+  error: { title: '用量遙測無法使用', description: 'Hermes 無法讀取本機工作階段帳本。', retry: '重試' }
+}
