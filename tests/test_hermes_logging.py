@@ -417,6 +417,30 @@ class TestRecoveredTransportRetrySeverity:
         )
         assert record.levelno == logging.ERROR
 
+    def test_hostile_level_equality_is_not_evaluated(self):
+        class HostileLevel(int):
+            __hash__ = int.__hash__
+
+            def __eq__(self, other):
+                raise AssertionError("level equality must not run")
+
+            def __ne__(self, other):
+                raise AssertionError("level inequality must not run")
+
+        factory = logging.getLogRecordFactory()
+        record = factory(
+            "discord.client",
+            logging.ERROR,
+            __file__,
+            1,
+            "Attempting a reconnect in %.2fs",
+            (1.0,),
+            None,
+        )
+        record.levelno = HostileLevel(logging.ERROR)
+        hermes_logging._normalize_recovered_transport_retry_severity(record)
+        assert type(record.levelno) is HostileLevel
+
 
 class TestComponentFilter:
     """Unit tests for _ComponentFilter."""

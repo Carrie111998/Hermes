@@ -211,7 +211,7 @@ def _normalize_recovered_transport_retry_severity(record: logging.LogRecord) -> 
     as WARNINGs; adapter exhaustion, authentication failures, and every unknown
     SDK error remain ERROR.
     """
-    if record.levelno != logging.ERROR:
+    if type(record.levelno) is not int or record.levelno != logging.ERROR:
         return
     args = record.args
     discord_retry = (
