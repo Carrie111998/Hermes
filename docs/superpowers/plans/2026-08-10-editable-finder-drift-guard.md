@@ -846,10 +846,13 @@ def test_analyze_skips_breadth_without_declarations_and_says_so():
 def test_remedy_names_the_command_the_root_and_the_console_script_trap():
     from hermes_cli.install_doctor import remedy_lines
 
-    text = "\n".join(remedy_lines(_install_root_with({}, root=Path("/agent-src"))))
+    root_path = Path("/agent-src")
+    text = "\n".join(remedy_lines(_install_root_with({}, root=root_path)))
 
     assert "pip install -e . --no-deps" in text
-    assert "/agent-src" in text
+    # Compare against str(Path(...)), NOT the literal "/agent-src":
+    # remedy_lines renders str(path), which is "\agent-src" on Windows.
+    assert str(root_path) in text
     assert "WinError 32" in text
     assert "python -m hermes_cli.main" in text
 
