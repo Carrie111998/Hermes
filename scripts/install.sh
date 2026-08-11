@@ -636,25 +636,26 @@ check_python() {
             fi
             PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
             log_warn "Termux has $PYTHON_FOUND_VERSION but Hermes requires 3.11–3.13 (<3.14)."
-            log_info "Reinstalling via pkg in case a newer slot is available..."
         fi
 
         log_info "Installing Python via pkg..."
         pkg install -y python >/dev/null
         PYTHON_PATH="$(command -v python)"
-        PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         if _termux_py_ok "$PYTHON_PATH"; then
+            PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
             log_success "Python installed: $PYTHON_FOUND_VERSION"
             return 0
         fi
-        # pkg gave us 3.14+ — Hermes' requires-python cap is the real blocker.
+        # pkg only ships the current CPython slot; if that is 3.14+ the
+        # project's requires-python cap ("<3.14") is the real blocker.
+        PYTHON_FOUND_VERSION="$("$PYTHON_PATH" --version 2>/dev/null)"
         log_error "Termux pkg installed $PYTHON_FOUND_VERSION but Hermes requires Python 3.11–3.13."
-        log_info "The current Termux repository only ships Python 3.14; older 3.12/3.13"
-        log_info "binaries are available bundled with the aws-cli package. To use one:"
-        log_info "  pkg install aws-cli"
-        log_info "  ln -sf \$PREFIX/lib/aws-cli/python3 \$PREFIX/bin/python3"
-        log_info "  ln -sf \$PREFIX/bin/python3 \$PREFIX/bin/python"
-        log_info "Then re-run this script. See issue #76901 for context."
+        log_info "The Termux python package tracks only the current CPython release, so there"
+        log_info "is no pkg-provided 3.12/3.13 interpreter to switch to. Workarounds:"
+        log_info "  - Track issue #76901 for a Python-3.14-compatible Hermes release."
+        log_info "  - Run Hermes inside proot-distro (e.g. Ubuntu 24.04), where python3.12"
+        log_info "    is available: pkg install proot-distro && proot-distro install ubuntu"
+        log_info "See https://github.com/NousResearch/hermes-agent/issues/76901 for details."
         exit 1
     fi
 
