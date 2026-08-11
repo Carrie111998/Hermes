@@ -1094,6 +1094,44 @@ class TestOpenRouterPaidLaneGuard:
         assert not _is_free_model("")
         assert not _is_free_model(None)
 
+    def test_is_free_model_catalog_entry_without_suffix(self):
+        """A catalogued free model with no ``:free`` suffix counts as free.
+
+        Suffix-only matching classified these as paid. Under free_only
+        that does not just over-warn — it skips the OpenRouter fallback
+        entirely for a model that costs nothing.
+        """
+        from agent.auxiliary_client import _is_free_model
+        from hermes_cli.models import OPENROUTER_MODELS
+
+        suffixless_free = [
+            mid for mid, desc in OPENROUTER_MODELS
+            if "free" in (desc or "").lower() and not mid.endswith(":free")
+        ]
+        assert suffixless_free, "catalog fixture changed: expected a free entry without a :free suffix"
+        for mid in suffixless_free:
+            assert _is_free_model(mid), f"{mid} is catalogued free but read as paid"
+
+    def test_is_free_model_is_openrouter_scoped(self):
+        """Free on another provider is still paid on OpenRouter.
+
+        NVIDIA NIM publishes a free tier for models whose OpenRouter twin
+        is paid — the bare ``nvidia/nemotron-3-ultra-550b-a55b`` against
+        its ``:free`` sibling. ``_try_openrouter`` bills OpenRouter, so
+        the bare slug must keep warning.
+        """
+        from agent.auxiliary_client import _is_free_model
+        assert _is_free_model("nvidia/nemotron-3-ultra-550b-a55b:free")
+        assert not _is_free_model("nvidia/nemotron-3-ultra-550b-a55b")
+
+    def test_is_free_model_fails_closed_when_catalog_unavailable(self):
+        """A catalog import failure must over-warn, never hide real spend."""
+        from agent.auxiliary_client import _is_free_model
+        with patch.dict("sys.modules", {"hermes_cli.models": None}):
+            assert _is_free_model("openrouter/elephant-alpha") is False
+            # The suffix path needs no catalog and must still work.
+            assert _is_free_model("tencent/hy3:free") is True
+
 
 class TestGetTextAuxiliaryClient:
     """Test the full resolution chain for get_text_auxiliary_client."""

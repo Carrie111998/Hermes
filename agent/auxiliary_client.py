@@ -2451,8 +2451,37 @@ _paid_lane_warned: set = set()
 
 
 def _is_free_model(model: Optional[str]) -> bool:
-    """True when ``model`` is an OpenRouter free SKU (``:free`` suffix)."""
-    return bool(model) and str(model).strip().endswith(":free")
+    """True when ``model`` is a free OpenRouter SKU.
+
+    The ``:free`` suffix is the common marker but not the only one — the
+    curated catalog carries free entries without it (e.g.
+    ``openrouter/elephant-alpha``). Suffix-only matching misclassified
+    those as paid, which under ``free_only`` skips the OpenRouter fallback
+    entirely for a model that costs nothing.
+
+    Scoped deliberately to OpenRouter, since that is the endpoint
+    ``_try_openrouter`` bills against: a slug that is free on another
+    provider (NVIDIA NIM publishes free tiers whose OpenRouter twin is
+    paid — the bare ``nvidia/nemotron-3-ultra-550b-a55b`` vs its
+    ``:free`` sibling) is still paid here, and must keep warning.
+    """
+    if not model:
+        return False
+    slug = str(model).strip()
+    if slug.endswith(":free"):
+        return True
+    try:
+        from hermes_cli.models import OPENROUTER_MODELS
+
+        return any(
+            mid == slug and "free" in (desc or "").lower()
+            for mid, desc in OPENROUTER_MODELS
+        )
+    except Exception as exc:  # noqa: BLE001 — catalog optional, never fatal
+        # Fail closed: an unknown model is treated as paid, so a catalog
+        # import failure can only over-warn, never hide real spend.
+        logger.debug("free-model catalog lookup failed for %s: %s", slug, exc)
+        return False
 
 
 def _aux_openrouter_settings() -> Tuple[bool, str]:
