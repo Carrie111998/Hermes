@@ -32,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 from typing import Sequence
 
 __all__ = [
@@ -279,6 +280,7 @@ def run_text_capture(
     argv: Sequence[str],
     *,
     timeout: float,
+    cwd: str | os.PathLike | None = None,
 ) -> subprocess.CompletedProcess:
     """``subprocess.run(argv, capture_output=True, text=True, timeout=timeout)``
     that reliably honours ``timeout`` on Windows.
@@ -291,14 +293,32 @@ def run_text_capture(
     join because the pipe never reaches EOF. A wedged CLI therefore hangs the
     caller indefinitely instead of timing out at ``timeout`` seconds.
 
-    The fix: launch the child in its own process group, and on timeout
-    tree-kill the whole group (``taskkill /T /F`` on Windows, ``killpg`` on
-    POSIX) so EVERY write end of the pipe closes before we drain. Returns a
-    :class:`subprocess.CompletedProcess`; raises
+    The fix: **capture into temporary files rather than pipes.** A tree-kill
+    alone is not enough — measured against a real wedged `npm audit` on
+    Windows, a nominal 30s budget still cost 75s: `taskkill /T /F` itself ran
+    11.6s and was abandoned at its own cap, the post-kill drain burned its full
+    10s because the surviving grandchild still held the pipe, and
+    ``Popen.__exit__`` then blocked a further 22.8s merely *closing* a pipe
+    whose reader thread was still parked in a blocking read. Every one of
+    those costs is a property of the capture pipes and its reader threads, so
+    the pipes have to go. With file-backed stdio there are no reader threads,
+    nothing to drain, and closing a file handle cannot block — a grandchild
+    that outlives its parent just writes into a temp file nobody reads.
+
+    On timeout we still tree-kill (``taskkill /T /F`` on Windows, ``killpg``
+    on POSIX) as a best effort not to leak the process, but correctness of the
+    bound no longer depends on that kill succeeding: we raise as soon as it
+    returns and never wait on the child again.
+
+    Returns a :class:`subprocess.CompletedProcess`; raises
     :class:`subprocess.TimeoutExpired` on timeout (same as ``subprocess.run``)
     so existing ``except (OSError, subprocess.TimeoutExpired)`` handlers keep
     working. May raise ``OSError`` / ``FileNotFoundError`` at spawn, also like
     ``subprocess.run``.
+
+    ``cwd`` is passed straight through to :class:`subprocess.Popen` for callers
+    that must run the command from a particular directory (``npm audit`` in
+    ``hermes doctor``, for one).
     """
     if IS_WINDOWS:
         popen_kwargs: dict = {"creationflags": _CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW}
@@ -306,29 +326,33 @@ def run_text_capture(
         # Own session/process group so killpg() on timeout reaches grandchildren.
         popen_kwargs = {"start_new_session": True}
 
-    with subprocess.Popen(
-        list(argv),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        **popen_kwargs,
-    ) as proc:
+    # Binary temp files + an explicit decode rather than text=True: we own the
+    # handles, so the decoding is ours to make deterministic (utf-8 with
+    # replacement, \r\n normalized) instead of locale-dependent.
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+        proc = subprocess.Popen(
+            list(argv),
+            stdout=out_f,
+            stderr=err_f,
+            cwd=cwd,
+            **popen_kwargs,
+        )
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
+            # Best effort — we do NOT wait on the child again afterwards, so a
+            # kill that fails costs us nothing but a lingering process.
             _tree_kill(proc)
-            # The whole tree is now dead, so every pipe write end is closed and
-            # this drain reaches EOF promptly instead of blocking. Bounded by a
-            # second timeout regardless, so a stubborn descendant can never make
-            # this hang — we drop the output and re-raise instead.
-            try:
-                stdout, stderr = proc.communicate(timeout=10)
-            except subprocess.TimeoutExpired:
-                stdout = stderr = None
-            raise subprocess.TimeoutExpired(
-                proc.args, timeout, output=stdout, stderr=stderr,
-            )
-        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+            raise subprocess.TimeoutExpired(proc.args, timeout)
+        return subprocess.CompletedProcess(
+            proc.args, proc.returncode, _read_text(out_f), _read_text(err_f),
+        )
+
+
+def _read_text(handle) -> str:
+    """Rewind a captured temp file and decode it the way ``text=True`` would."""
+    handle.seek(0)
+    return handle.read().decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
 def _tree_kill(proc: subprocess.Popen) -> None:
@@ -340,8 +364,11 @@ def _tree_kill(proc: subprocess.Popen) -> None:
     through a process group, and ``/T`` without ``/F`` won't reach a windowless
     child. POSIX: ``killpg(SIGKILL)`` reaches the grandchildren because the
     child was started in its own session (``start_new_session=True``). Either
-    way the goal is to close EVERY write end of the capture pipe so a blocked
-    reader-thread drain can reach EOF.
+    way this is best effort: ``run_text_capture`` captures into files, not
+    pipes, so its budget holds whether or not the kill lands — the point here
+    is only to avoid leaving an abandoned process tree behind. Measured at
+    11.6s against a real ``npm audit`` tree on a loaded Windows host, which is
+    why the ``taskkill`` call carries its own timeout.
     """
     if IS_WINDOWS:
         try:

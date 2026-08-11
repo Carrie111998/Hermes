@@ -23,6 +23,17 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         "--fix", action="store_true", help="Attempt to fix issues automatically"
     )
     doctor_parser.add_argument(
+        "--audit",
+        action="store_true",
+        help=(
+            "Also run `npm audit` against the Node.js dependency trees. Off by "
+            "default: a single audit takes 40-120s per target (four targets), "
+            "which dominated the runtime of every `hermes doctor` while rarely "
+            "finishing. With this flag each audit gets a budget generous enough "
+            "to complete (override with HERMES_DOCTOR_NPM_AUDIT_TIMEOUT)."
+        ),
+    )
+    doctor_parser.add_argument(
         "--ack",
         metavar="ADVISORY_ID",
         default=None,
