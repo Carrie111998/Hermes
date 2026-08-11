@@ -17701,6 +17701,31 @@ def _is_serve_orphaned(original_ppid: int, getppid=os.getppid) -> bool:
     return getppid() != original_ppid
 
 
+def _is_windows_process_alive(pid: int) -> bool:
+    """Check if a Windows process with the given PID is still running.
+
+    Uses OpenProcess + GetExitCodeProcess — more reliable than ppid
+    comparison on Windows where intermediate launcher processes can
+    change the apparent parent PID.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return False
+    exit_code = wintypes.DWORD()
+    result = kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))
+    kernel32.CloseHandle(handle)
+    if not result:
+        return False
+    return exit_code.value == STILL_ACTIVE
+
+
 def _start_parent_death_watchdog() -> None:
     """Exit when the desktop parent that spawned this backend dies.
 
@@ -17724,10 +17749,21 @@ def _start_parent_death_watchdog() -> None:
     except (TypeError, ValueError):
         poll = 2.0
 
-    def _loop() -> None:
-        while not _is_serve_orphaned(original_ppid):
-            time.sleep(poll)
-        os._exit(0)
+    if sys.platform == "win32":
+        # On Windows, getppid() can differ from HERMES_PARENT_PID even when
+        # the parent is alive (e.g. intermediate launcher/shell processes).
+        # Use direct process-aliveness check instead, with a grace period
+        # to let the process tree stabilise after spawn.
+        def _loop() -> None:
+            time.sleep(poll * 2)
+            while _is_windows_process_alive(original_ppid):
+                time.sleep(poll)
+            os._exit(0)
+    else:
+        def _loop() -> None:
+            while not _is_serve_orphaned(original_ppid):
+                time.sleep(poll)
+            os._exit(0)
 
     threading.Thread(target=_loop, daemon=True, name="serve-parent-watchdog").start()
 
