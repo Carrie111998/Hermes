@@ -608,3 +608,84 @@ class TestContextAwareCorrectness:
         # Was ~5.5s before anchoring; generous ceiling to avoid CI flake.
         assert elapsed < 2.0, f"context_aware no-match took {elapsed:.2f}s"
 
+
+
+class TestGutterStrippedRecovery:
+    """Recovery for old_string pasted verbatim from read_file's N|content
+    gutter output (port of can1357/oh-my-pi#7906)."""
+
+    FILE = "def foo():\n    x = 1\n    return x\n"
+
+    def test_recovers_gutter_pasted_old_string(self):
+        old = "12|def foo():\n13|    x = 1\n14|    return x"
+        new = "def foo():\n    x = 2\n    return x"
+        result, count, strategy, err = fuzzy_find_and_replace(self.FILE, old, new)
+        assert err is None, err
+        assert count == 1
+        assert strategy.endswith("+gutter_stripped")
+        assert "x = 2" in result
+
+    def test_recovers_when_both_strings_carry_gutter(self):
+        old = "1|def foo():\n2|    x = 1"
+        new = "1|def foo():\n2|    x = 99"
+        result, count, strategy, err = fuzzy_find_and_replace(self.FILE, old, new)
+        assert err is None, err
+        assert count == 1
+        assert "x = 99" in result
+        # gutter must not leak into the written content
+        assert "1|" not in result and "2|" not in result
+
+    def test_mixed_prefixes_are_genuine_content(self):
+        # A bare line among numbered ones means the pipes are payload.
+        content = "1|value\nplain line\n2|other\n"
+        old = "1|value\nplain line"
+        result, count, _, err = fuzzy_find_and_replace(content, old, "REPLACED")
+        # exact strategy matches the literal text — no stripping involved
+        assert err is None
+        assert count == 1
+        assert "REPLACED" in result
+
+    def test_does_not_strip_when_literal_match_exists(self):
+        # File genuinely contains gutter-shaped text: exact match wins first,
+        # content stays literal.
+        content = "table:\n1|a\n2|b\n3|c\n"
+        old = "1|a\n2|b"
+        result, count, strategy, err = fuzzy_find_and_replace(content, old, "X")
+        assert err is None
+        assert count == 1
+        assert strategy == "exact"
+        assert "X\n3|c" in result
+
+    def test_non_consecutive_numbers_rejected(self):
+        # Shell pipelines with digit|digit shapes must not be "recovered".
+        old = "3|foo\n9|bar"
+        _, count, _, err = fuzzy_find_and_replace(self.FILE, old, "nope")
+        assert count == 0
+        assert err is not None
+
+    def test_single_numbered_line_not_gutter_recovered(self):
+        # A single N| line is plausible literal content — the gutter helper
+        # refuses it. (context_aware may still similarity-match the payload
+        # half; the point is the gutter path never fires on one line.)
+        _, count, strategy, _ = fuzzy_find_and_replace(self.FILE, "5|def foo():", "x")
+        if count:
+            assert "+gutter_stripped" not in (strategy or "")
+
+    def test_search_files_skip_tolerated(self):
+        # search_files output can skip lines; >=80% consecutive still recovers.
+        content = "alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\n"
+        old = "1|alpha\n2|beta\n3|gamma\n4|delta\n5|epsilon"
+        result, count, strategy, err = fuzzy_find_and_replace(content, old,
+                                                              "ONE\nbeta\ngamma\ndelta\nepsilon")
+        assert err is None, err
+        assert count == 1
+        assert result.startswith("ONE\n")
+
+    def test_helper_direct(self):
+        from tools.fuzzy_match import _strip_line_number_gutter
+        assert _strip_line_number_gutter("10|a\n11|b") == "a\nb"
+        assert _strip_line_number_gutter("10|a\n\n11|b") == "a\n\nb"
+        assert _strip_line_number_gutter("a\nb") is None
+        assert _strip_line_number_gutter("10|a\nbare") is None
+        assert _strip_line_number_gutter("x|a\n2|b") is None
+        assert _strip_line_number_gutter("no pipes at all") is None

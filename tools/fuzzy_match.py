@@ -117,7 +117,8 @@ def _format_match_locations(content: str, matches: List[Tuple[int, int]],
 
 
 def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
-                            replace_all: bool = False) -> Tuple[str, int, Optional[str], Optional[str]]:
+                            replace_all: bool = False,
+                            _gutter_retry: bool = True) -> Tuple[str, int, Optional[str], Optional[str]]:
     """
     Find and replace text using a chain of increasingly fuzzy matching strategies.
 
@@ -249,8 +250,81 @@ def fuzzy_find_and_replace(content: str, old_string: str, new_string: str,
             )
             return new_content, len(matches), strategy_name, None
 
-    # No strategy found a match
+    # No strategy found a match. Last-resort recovery: models sometimes paste
+    # old_string (and new_string context lines) straight from read_file /
+    # search_files output, which prefixes every line with a ``N|`` gutter
+    # (``42|code here``).  The file itself has no such prefixes, so every
+    # strategy above fails.  When ALL non-empty lines of old_string carry a
+    # uniform, mostly-consecutive line-number gutter — the signature of a
+    # verbatim paste, per the mirrored write_file guard in
+    # ``tools/file_tools.py`` — strip the gutter from both strings and retry
+    # the full chain once.  A mixed set means the prefixes are genuine file
+    # content and must stay.  (port of can1357/oh-my-pi#7906)
+    if _gutter_retry:
+        stripped_old = _strip_line_number_gutter(old_string)
+        if stripped_old is not None:
+            stripped_new = _strip_line_number_gutter(new_string)
+            new_content, count, strategy, error = fuzzy_find_and_replace(
+                content, stripped_old,
+                stripped_new if stripped_new is not None else new_string,
+                replace_all, _gutter_retry=False,
+            )
+            if count > 0 and error is None:
+                return new_content, count, f"{strategy}+gutter_stripped", None
+
     return content, 0, None, "Could not find a match for old_string in the file"
+
+
+def _strip_line_number_gutter(text: str) -> Optional[str]:
+    """Strip a uniform ``N|`` read_file gutter from every line of ``text``.
+
+    Returns the recovered text when every non-empty line carries a
+    ``digits|`` prefix and the numbers are mostly consecutive (>= 80% of
+    adjacent pairs increment by 1 — search_files output may skip lines).
+    Returns ``None`` when the text does not look like a verbatim paste of
+    line-numbered tool output: any bare line, a non-numeric prefix, or a
+    non-consecutive number sequence means the pipes are genuine content
+    (tables, shell pipelines, ``||`` operators) and must not be touched.
+
+    Deliberately conservative:
+    - requires at least 2 numbered lines (a single ``1|value`` line is
+      plausible literal content, mirroring the write_file guard);
+    - empty/whitespace-only lines are passed through unchanged (read_file
+      renders blank file lines as ``N|`` with empty content, but models
+      sometimes collapse them when re-pasting);
+    - the gutter must be at the very start of the line (read_file emits no
+      leading indent before the number).
+    """
+    if "|" not in text:
+        return None
+
+    lines = text.split("\n")
+    numbers: List[int] = []
+    stripped_lines: List[str] = []
+    numbered_count = 0
+
+    for line in lines:
+        if not line.strip():
+            stripped_lines.append(line)
+            continue
+        prefix, sep, rest = line.partition("|")
+        if not sep or not prefix.isdigit():
+            return None  # a bare content line — not a uniform paste
+        numbers.append(int(prefix))
+        stripped_lines.append(rest)
+        numbered_count += 1
+
+    if numbered_count < 2:
+        return None
+
+    consecutive_pairs = sum(
+        1 for prev, current in zip(numbers, numbers[1:])
+        if current == prev + 1
+    )
+    if consecutive_pairs < 0.8 * (len(numbers) - 1):
+        return None
+
+    return "\n".join(stripped_lines)
 
 
 def _detect_escape_drift(content: str, matches: List[Tuple[int, int]],
