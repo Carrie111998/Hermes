@@ -10,7 +10,7 @@
  *   POST /send           - Send a message { chatId, message, replyTo? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName? }
- *   POST /send-album     - Send a native media album { chatId, items[], delayMs? }
+ *   POST /send-album     - Send a native media album { chatId, items[] }
  *   POST /send-location  - Send location pin { chatId, latitude, longitude, name?, address? }
  *   POST /typing         - Send typing indicator { chatId }
  *   GET  /chat/:id       - Get chat info
@@ -1001,6 +1001,11 @@ registerAlbumRoute(app, {
   enqueueSend,
   trackSentMessageId,
   messageStore,
+  sendTimeoutMs: SEND_TIMEOUT_MS,
+  onFatalTimeout: error => {
+    console.error(`[bridge] fatal album send timeout: ${error.message}; restarting bridge`);
+    process.exit(1);
+  },
 });
 
 // Send poll primitive. Approval UX is intentionally not wired here; gateway

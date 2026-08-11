@@ -194,3 +194,34 @@ async def test_native_album_preserves_windows_file_uri_paths():
     ]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (207, {"success": False, "attempted": True, "status": "partial_failure"}),
+        (502, {"success": False, "attempted": True, "status": "parent_failure"}),
+    ],
+)
+async def test_attempted_album_failures_never_fall_back_to_individual_media(
+    tmp_path, status, body,
+):
+    adapter = _make_adapter()
+    session = adapter._http_session
+    assert session is not None
+    first = tmp_path / "first.jpg"
+    second = tmp_path / "second.jpg"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+    resp = MagicMock(status=status)
+    resp.json = AsyncMock(return_value=body)
+    session.post = MagicMock(return_value=_AsyncCM(resp))
+
+    await adapter.send_multiple_images(
+        "15551234567",
+        [(first.as_uri(), ""), (second.as_uri(), "")],
+    )
+
+    session.post.assert_called_once()
+    assert session.post.call_args.args[0] == "http://127.0.0.1:3000/send-album"
+
+

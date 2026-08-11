@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import express from 'express';
 
-import { registerAlbumRoute } from './album_route.js';
+import { registerAlbumRoute, sendAlbumMessageWithWatchdog } from './album_route.js';
 
 function createQueue() {
   let tail = Promise.resolve();
@@ -34,6 +34,32 @@ async function withServer(socket, fn) {
   } finally {
     await new Promise(resolve => server.close(resolve));
   }
+}
+
+{
+  let fatalCalls = 0;
+  let sendOptions;
+  const socket = {
+    sendMessage: async (_chatId, _payload, options) => {
+      sendOptions = options;
+      return new Promise(() => {});
+    },
+  };
+
+  await assert.rejects(
+    () => sendAlbumMessageWithWatchdog({
+      socket,
+      chatId: '15551234567@s.whatsapp.net',
+      payload: { image: Buffer.from('stuck') },
+      mediaUploadTimeoutMs: 10,
+      watchdogTimeoutMs: 20,
+      onFatalTimeout: async () => { fatalCalls += 1; },
+    }),
+    /timed out after 20ms/,
+  );
+  assert.equal(fatalCalls, 1);
+  assert.deepEqual(sendOptions, { mediaUploadTimeoutMs: 10 });
+  console.log('  ✓ hung album sends trigger the fatal watchdog within a bounded time');
 }
 
 {
