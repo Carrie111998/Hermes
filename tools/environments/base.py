@@ -1181,7 +1181,7 @@ class BaseEnvironment(ABC):
             pass
 
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
-        """Transform sudo commands if SUDO_PASSWORD is available."""
+        """Pass the command through unchanged (see _transform_sudo_command)."""
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)

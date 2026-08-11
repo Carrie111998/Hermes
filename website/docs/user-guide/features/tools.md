@@ -200,8 +200,8 @@ PTY mode (`pty=true`) enables interactive CLI tools like Codex and Claude Code.
 
 ## Sudo Support
 
-If a command needs sudo, you'll be prompted for your password (cached for the session). Or set `SUDO_PASSWORD` in `~/.hermes/.env`.
+If a command needs sudo, it behaves like a normal non-interactive shell: it fails with "sudo: a password is required" unless the host has a NOPASSWD sudoers rule configured for the specific commands Hermes needs. Configure that with `visudo` under `/etc/sudoers.d/`, scoped to the commands you actually want automated.
 
 :::warning
-On messaging platforms, if sudo fails, the output includes a tip to add `SUDO_PASSWORD` to `~/.hermes/.env`.
+Hermes previously supported piping a password via a `SUDO_PASSWORD` environment variable. That mechanism was removed: it stored a process-global secret that every agent-spawned command could read. `SUDO_PASSWORD` is no longer read by Hermes at all — do not set it. Use a scoped NOPASSWD sudoers rule instead.
 :::

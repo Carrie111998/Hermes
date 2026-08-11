@@ -1001,6 +1001,12 @@ def clear_ticker_error() -> None:
     store = _current_cron_store()
     try:
         (store.cron_dir / "ticker_last_error").unlink()
+    except FileNotFoundError:
+        # No marker to clear is the common/expected case -- most ticks never
+        # record an error in the first place, so this isn't a failure and
+        # must stay silent. Warning here was firing on essentially every
+        # successful tick, drowning out real signal in the gateway logs.
+        pass
     except OSError as e:
         logger.warning(
             "Could not clear stale ticker_last_error marker — a resolved "
