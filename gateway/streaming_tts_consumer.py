@@ -44,6 +44,7 @@ import queue
 import threading
 from typing import Any, Dict, Optional
 
+from agent.async_utils import safe_schedule_threadsafe
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
 
 logger = logging.getLogger("gateway.streaming_tts_consumer")
@@ -402,13 +403,24 @@ class StreamingTTSConsumer:
         else:
             logger.debug("streaming TTS _ABORT sentinel could not be enqueued")
         if self._handle is not None and not self._handle.aborted:
-            try:
-                self._loop.call_soon_threadsafe(
-                    asyncio.create_task,
-                    self._safe_abort(reason),
-                )
-            except Exception:
-                pass
+            # The abort has to reach the adapter: ``abort_streaming_tts`` is
+            # what restores the adapter to "not streaming" (see
+            # gateway/platforms/base.py).  A bare
+            # ``call_soon_threadsafe(asyncio.create_task, coro)`` wrapped in a
+            # swallowing ``except Exception`` drops the coroutine on the floor
+            # whenever scheduling raises — most obviously
+            # ``RuntimeError: Event loop is closed`` on the teardown path,
+            # where ``abort("cleanup")`` runs.  The coroutine is then neither
+            # awaited nor closed, so its frame leaks and Python emits
+            # ``coroutine '_safe_abort' was never awaited``.  Route it through
+            # the leak-safe bridge instead, which closes the coroutine on
+            # every failure path.
+            safe_schedule_threadsafe(
+                self._safe_abort(reason),
+                self._loop,
+                logger=logger,
+                log_message="streaming TTS abort could not be scheduled",
+            )
 
     async def wait_complete(self, timeout: float = 10.0) -> bool:
         """Wait for the drain task to finish. Returns True only on full success."""
