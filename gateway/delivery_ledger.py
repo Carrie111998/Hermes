@@ -80,7 +80,7 @@ def _connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
-        _initialize_schema(conn)
+        _ensure_schema(conn)
     except Exception:
         # A PRAGMA/DDL failure after a successful connect() must not leak the
         # just-opened connection back to the caller.
@@ -89,7 +89,7 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
+def _ensure_schema(conn: sqlite3.Connection) -> None:
     from hermes_state import apply_wal_with_fallback
 
     apply_wal_with_fallback(conn, db_label="state.db (delivery_ledger)")
@@ -107,9 +107,20 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             updated_at REAL NOT NULL,
             owner_pid INTEGER,
             owner_started_at INTEGER,
+            platform_message_id TEXT,
             last_error TEXT
         )"""
     )
+    try:
+        conn.execute(
+            "ALTER TABLE delivery_obligations ADD COLUMN platform_message_id TEXT"
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
+def _initialize_schema(conn: sqlite3.Connection) -> None:
+    _ensure_schema(conn)
 
 
 @contextmanager
@@ -216,7 +227,21 @@ def mark_attempting(obligation_id: str) -> None:
 
 
 def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+    mark_delivered_with_platform_id(obligation_id, None)
+
+
+def mark_delivered_with_platform_id(
+    obligation_id: str,
+    platform_message_id: Optional[str],
+) -> None:
+    """Mark an obligation delivered and persist the platform message ID."""
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='delivered', updated_at=?, platform_message_id=?
+               WHERE obligation_id=?""",
+            (time.time(), platform_message_id, obligation_id),
+        )
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:

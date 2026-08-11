@@ -8,10 +8,12 @@ and thread participation tracking.
 import asyncio
 import json
 import logging
+import random
 import re
+import sqlite3
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Optional
 
 from utils import atomic_json_write
 
@@ -89,6 +91,97 @@ class MessageDeduplicator:
     def clear(self):
         """Clear all tracked messages."""
         self._seen.clear()
+
+
+class DurableVoiceDeduplicator:
+    """SQLite-backed dedup for Discord voice-message attachments.
+
+    Survives bot restarts. Key: (discord_message_id, attachment_id).
+    Falls back to in-memory if the shared state DB is unavailable.
+    """
+
+    _TABLE = (
+        "CREATE TABLE IF NOT EXISTS discord_voice_dedup ("
+        "key TEXT PRIMARY KEY, seen_at REAL NOT NULL)"
+    )
+    _TTL: float = 86400 * 7
+
+    def __init__(self, db_path: Optional[Path] = None):
+        if db_path is None:
+            from hermes_constants import get_hermes_home
+
+            db_path = get_hermes_home() / "state.db"
+        self._db_path = db_path
+        self._fallback: set[str] = set()
+        try:
+            self._init_db()
+            self._use_db = True
+        except Exception:
+            logger.debug(
+                "[DurableVoiceDeduplicator] Failed to initialize %s; using in-memory fallback",
+                self._db_path,
+                exc_info=True,
+            )
+            self._use_db = False
+
+    def _init_db(self) -> None:
+        with sqlite3.connect(str(self._db_path), timeout=10) as conn:
+            try:
+                from hermes_state import apply_wal_with_fallback
+
+                apply_wal_with_fallback(
+                    conn,
+                    db_label="state.db (discord_voice_dedup)",
+                )
+            except Exception:
+                logger.debug(
+                    "[DurableVoiceDeduplicator] WAL setup unavailable for %s",
+                    self._db_path,
+                    exc_info=True,
+                )
+            conn.execute(self._TABLE)
+
+    def _prune(self, conn: sqlite3.Connection, *, now: Optional[float] = None) -> None:
+        cutoff = (time.time() if now is None else now) - self._TTL
+        conn.execute(
+            "DELETE FROM discord_voice_dedup WHERE seen_at < ?",
+            (cutoff,),
+        )
+
+    def is_duplicate(self, message_id: str, attachment_id: str) -> bool:
+        if not message_id or not attachment_id:
+            return False
+        key = f"{message_id}:{attachment_id}"
+        if not self._use_db:
+            if key in self._fallback:
+                return True
+            self._fallback.add(key)
+            return False
+
+        now = time.time()
+        try:
+            with sqlite3.connect(str(self._db_path), timeout=10) as conn:
+                if random.random() < 0.01:
+                    self._prune(conn, now=now)
+                conn.execute(
+                    "DELETE FROM discord_voice_dedup WHERE key=? AND seen_at < ?",
+                    (key, now - self._TTL),
+                )
+                inserted = conn.execute(
+                    "INSERT OR IGNORE INTO discord_voice_dedup (key, seen_at) VALUES (?, ?)",
+                    (key, now),
+                ).rowcount
+                return inserted == 0
+        except Exception:
+            logger.debug(
+                "[DurableVoiceDeduplicator] DB unavailable for %s; using in-memory fallback",
+                self._db_path,
+                exc_info=True,
+            )
+            if key in self._fallback:
+                return True
+            self._fallback.add(key)
+            return False
 
 
 # ─── Text Batch Aggregation ──────────────────────────────────────────────────

@@ -5583,12 +5583,16 @@ class BasePlatformAdapter(ABC):
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
-                                mark_delivered,
+                                mark_delivered_with_platform_id,
                                 mark_failed,
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                platform_msg_id = getattr(result, "message_id", None)
+                                mark_delivered_with_platform_id(
+                                    _obligation_id,
+                                    str(platform_msg_id) if platform_msg_id else None,
+                                )
                             else:
                                 mark_failed(
                                     _obligation_id,
