@@ -2059,7 +2059,8 @@ def _append_durable_todo_snapshot(agent: Any, messages: list) -> None:
     if callable(has_durable_state):
         should_preserve = bool(has_durable_state())
     else:
-        should_preserve = bool(store.has_items())
+        has_items = getattr(store, "has_items", None)
+        should_preserve = bool(has_items()) if callable(has_items) else False
     if not should_preserve:
         return
 

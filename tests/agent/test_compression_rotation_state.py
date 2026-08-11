@@ -531,6 +531,17 @@ class TestCooldownPersistFailureIsNotAClearedRow:
 
 
 class TestDurableTodoTimingCompression:
+    def test_store_without_durable_capability_is_ignored(self):
+        from agent.conversation_compression import _append_durable_todo_snapshot
+
+        agent = MagicMock()
+        agent._todo_store = object()
+        messages = []
+
+        _append_durable_todo_snapshot(agent, messages)
+
+        assert messages == []
+
     def test_maximum_valid_store_keeps_durable_pair(self):
         from agent.conversation_compression import _append_durable_todo_snapshot
 
