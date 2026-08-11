@@ -1603,7 +1603,7 @@ def test_close_workspace_processes_empty_dir(tmp_path):
     ws.mkdir()
     result = kb.close_workspace_processes(ws)
     assert result["signalled"] == 0
-    assert result["self_pgid_excluded"] is False
+    assert result["skipped_self"] == 0
     assert result["dry_run"] is False
 
 
@@ -1616,18 +1616,18 @@ def test_close_workspace_processes_dry_run(tmp_path):
     assert result["signalled"] == 0
 
 
-def test_close_workspace_processes_excludes_self_pgid(tmp_path):
-    """Caller's own process group is excluded even when cwd is inside workspace."""
+def test_close_workspace_processes_excludes_self(tmp_path):
+    """Caller's own PID is excluded even when cwd is inside workspace."""
     ws = tmp_path / "ws"
     ws.mkdir()
     # The test process's cwd is not inside ws by default, but
-    # close_workspace_processes should never signal os.getpgid(0).
+    # close_workspace_processes should never signal os.getpid().
     import os as _os
-    self_pgid = _os.getpgid(0)
+    my_pid = _os.getpid()
     result = kb.close_workspace_processes(ws)
-    # We shouldn't see our own PGID in the signalled set.
-    signalled_pgids = {pgid for pgid, _, _ in result["pids"]}
-    assert self_pgid not in signalled_pgids
+    # We shouldn't see our own PID in the signalled set.
+    signalled_pids = {pid for _, pid, _, _ in result["pids"]}
+    assert my_pid not in signalled_pids
 
 
 def test_close_workspace_processes_kills_child(tmp_path):
@@ -1639,14 +1639,14 @@ def test_close_workspace_processes_kills_child(tmp_path):
     child = _sp.Popen(
         ["sleep", "60"],
         cwd=str(ws),
-        preexec_fn=os.setpgrp,
     )
     try:
         _time.sleep(0.2)
         result = kb.close_workspace_processes(ws)
         assert result["signalled"] >= 1
-        child.wait(timeout=2)
-        assert child.returncode != 0  # killed by SIGTERM
+        # TERM→KILL ladder: 0.5s TERM grace + 1.5s KILL wait = 2s max
+        child.wait(timeout=5)
+        assert child.returncode != 0  # killed by SIGTERM or SIGKILL
     finally:
         if child.poll() is None:
             child.kill()
@@ -1657,6 +1657,144 @@ def test_close_workspace_processes_missing_dir():
     """Non-existent path returns zero without error."""
     result = kb.close_workspace_processes(Path("/nonexistent/path/xyz"))
     assert result["signalled"] == 0
+
+
+# --- AION-CORE-PR6 CI investigation edge case tests (t_5cf56231) ---
+
+
+def test_close_workspace_processes_owned_pids_gate(tmp_path):
+    """owned_pids gates shared-dir cleanup — unowned PIDs are skipped."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        # Pass owned_pids that does NOT include the child — it should be skipped.
+        result = kb.close_workspace_processes(ws, owned_pids={99999})
+        assert result["skipped_unowned"] >= 1
+        assert result["signalled"] == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_dir_workspace_stale_task_signals_none(tmp_path):
+    """dir workspace with no owned PIDs should signal none (stale task)."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    # Simulate: _cleanup_workspace_on_completion for dir workspace with no
+    # spawn records → should return without signalling anything.
+    # We test this indirectly via close_workspace_processes with empty owned_pids.
+    # When owned_pids is an empty set (no owned PIDs found for stale task),
+    # the function should signal nothing.
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        result = kb.close_workspace_processes(ws, owned_pids=set())
+        assert result["signalled"] == 0
+        assert result["skipped_unowned"] >= 1
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_close_workspace_processes_identity_revalidation(tmp_path):
+    """TOCTOU guard: identity re-read protects against PID recycling."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    # Test _read_process_identity returns valid identity for our own PID.
+    identity = kb._read_process_identity(os.getpid())
+    assert identity is not None
+    assert "starttime" in identity
+    assert "cwd" in identity
+    assert "pgid" in identity
+
+    # Test _revalidate_identity returns True for current process.
+    assert kb._revalidate_identity(os.getpid(), identity) is True
+
+    # Test _revalidate_identity returns False for non-existent PID.
+    assert kb._revalidate_identity(99999999, identity) is False
+
+
+def test_close_workspace_processes_legacy_spawn_no_starttime(tmp_path):
+    """Legacy spawn events (no starttime) still allow owned PID matching.
+
+    The owned_pids set is built from spawn records. When starttime is NULL,
+    the PID alone determines ownership. The TOCTOU revalidation inside
+    close_workspace_processes still runs but a legacy-owned PID that
+    passes identity re-read is legitimately signalled.
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        # Simulate legacy spawn: owned PIDs built from task_spawns with
+        # starttime IS NULL. Ownership is by PID alone.
+        result = kb.close_workspace_processes(ws, owned_pids={child.pid})
+        assert result["signalled"] >= 1
+        child.wait(timeout=5)
+        assert child.returncode != 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_close_workspace_processes_terminated_killed_survivors(tmp_path):
+    """TERM→KILL ladder reports terminated/killed/survivors correctly."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    import subprocess as _sp
+    import time as _time
+
+    child = _sp.Popen(["sleep", "60"], cwd=str(ws))
+    try:
+        _time.sleep(0.2)
+        result = kb.close_workspace_processes(ws)
+        assert result["signalled"] >= 1
+        # The child should be terminated (SIGTERM alone should work for sleep).
+        assert result["terminated"] >= 1
+        child.wait(timeout=5)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+
+
+def test_discover_descendant_pids(tmp_path):
+    """_discover_descendant_pids finds child processes recursively."""
+    import subprocess as _sp
+    import time as _time
+
+    # Start a parent that spawns a child.
+    parent = _sp.Popen(
+        ["sh", "-c", "sleep 60 & sleep 60"],
+        cwd=str(tmp_path),
+    )
+    try:
+        _time.sleep(0.3)
+        descendants = kb._discover_descendant_pids(parent.pid)
+        # Should find at least one descendant.
+        assert len(descendants) >= 1
+        assert all(isinstance(d, int) for d in descendants)
+    finally:
+        if parent.poll() is None:
+            parent.kill()
+            parent.wait()
 
 
 # ---------------------------------------------------------------------------

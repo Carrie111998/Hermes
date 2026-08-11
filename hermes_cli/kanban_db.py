@@ -6142,10 +6142,17 @@ def block_task(
                 _evidence = close_workspace_processes(_wp)
                 _log.info(
                     "block_task workspace cleanup: task=%s path=%s "
-                    "signalled=%s self_pgid_excluded=%s",
+                    "signalled=%s terminated=%s killed=%s survivors=%s "
+                    "skipped_identity_mismatch=%s skipped_unowned=%s "
+                    "skipped_self=%s",
                     task_id, str(_wp),
                     _evidence.get("signalled", 0),
-                    _evidence.get("self_pgid_excluded", False),
+                    _evidence.get("terminated", 0),
+                    _evidence.get("killed", 0),
+                    _evidence.get("survivors", 0),
+                    _evidence.get("skipped_identity_mismatch", 0),
+                    _evidence.get("skipped_unowned", 0),
+                    _evidence.get("skipped_self", 0),
                 )
         except Exception as _exc:
             _log.warning(
@@ -11369,43 +11376,178 @@ def latest_summaries(
 
 
 # ---------------------------------------------------------------------------
+# Process identity helpers (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _read_process_identity(pid: int) -> dict | None:
+    """Capture process identity from /proc for TOCTOU revalidation.
+
+    Reads ``/proc/<pid>/stat`` starttime (field 22; 0-indexed field 21),
+    current cwd, and PGID.  Returns ``None`` when the process has exited or
+    /proc is unreadable.
+
+    The starttime + PID pair is a reliable identity anchor: Linux reuses
+    PIDs but starttime is monotonic per-boot, so a PID-recycled process
+    can never match the captured identity of a prior occupant.
+
+    Returns:
+        ``{"starttime": int, "cwd": str, "pgid": int}`` or ``None``.
+    """
+    import os as _os
+
+    try:
+        stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return None
+
+    # stat format: "pid (comm) state ppid pgrp ..."
+    # comm may contain spaces and parentheses; split at the last ')'
+    close_paren = stat_data.rfind(")")
+    if close_paren == -1:
+        return None
+    fields = stat_data[close_paren + 2:].split()
+    # After "pid (comm) ": field index 0=state, 19=starttime (21st field
+    # in the full stat line minus pid+comm = index 19 in the post-paren split).
+    if len(fields) < 20:
+        return None
+    try:
+        starttime = int(fields[19])
+    except (ValueError, IndexError):
+        return None
+
+    try:
+        cwd = Path(f"/proc/{pid}/cwd").resolve()
+        pgid = _os.getpgid(pid)
+    except (OSError, RuntimeError):
+        return None
+
+    return {"starttime": starttime, "cwd": str(cwd), "pgid": pgid}
+
+
+def _revalidate_identity(pid: int, captured: dict) -> bool:
+    """Return True if *pid* still matches the captured identity.
+
+    Re-reads /proc identity and compares starttime, cwd, and pgid.  A
+    mismatch means the PID was recycled, the process changed working
+    directory, or it moved process groups — in all cases the captured
+    identity is stale and the signal must be withheld.
+    """
+    current = _read_process_identity(pid)
+    if current is None:
+        return False  # process exited — no signal needed
+    return (
+        current["starttime"] == captured["starttime"]
+        and current["cwd"] == captured["cwd"]
+        and current["pgid"] == captured["pgid"]
+    )
+
+
+def _discover_descendant_pids(parent_pid: int) -> set[int]:
+    """Return the set of descendant PIDs for *parent_pid* (recursive).
+
+    Walks /proc/<pid>/task/<tid>/children for every known PID under
+    *parent_pid* to build a transitive closure of child processes.
+    """
+    descendants: set[int] = set()
+    frontier = [parent_pid]
+    while frontier:
+        pid = frontier.pop()
+        try:
+            children_path = Path(f"/proc/{pid}/task/{pid}/children")
+            children_text = children_path.read_text(encoding="utf-8")
+            for child_str in children_text.split():
+                try:
+                    child_pid = int(child_str)
+                except ValueError:
+                    continue
+                if child_pid not in descendants:
+                    descendants.add(child_pid)
+                    frontier.append(child_pid)
+        except (OSError, FileNotFoundError):
+            continue
+    return descendants
+
+
+# ---------------------------------------------------------------------------
 # Workspace process cleanup (AION-RL2-CORE-01 / AION-CORE-PR6)
 # ---------------------------------------------------------------------------
 
 
 def close_workspace_processes(
     workspace_path: Path, *, dry_run: bool = False,
+    owned_pids: set[int] | None = None,
 ) -> dict:
-    """Close process groups whose cwd is inside ``workspace_path``.
+    """Close processes whose cwd is inside ``workspace_path``.
 
-    Only signals process groups whose working directory resolves inside the
+    Only signals processes whose working directory resolves inside the
     exact workspace — never broad-kill, never touches processes outside the
-    workspace, never touches gateway/self/external cwd.  Excludes the
-    caller's own process group to prevent self-kill.
+    workspace, never touches gateway/self/external cwd.
+
+    When *owned_pids* is provided (non-None), cwd containment alone is NOT
+    sufficient: a process must also be in *owned_pids* (or be a descendant of
+    any PID in it) to be eligible for signalling.  This gates shared-directory
+    (``workspace_kind=dir``) cleanup so unrelated processes (YAML LSPs, other
+    task workers) sharing the same directory are never signalled.  For
+    ``scratch`` and ``worktree`` workspaces, *owned_pids* should remain None
+    — those workspaces are exclusive to one task and cwd containment is
+    sufficient.
+
+    Every signal is gated on an immediate identity re-read via
+    ``/proc/<pid>/stat`` (starttime + cwd + pgid).  If the identity has
+    changed since discovery (PID reuse, cwd change, pgid change), the signal
+    is withheld and the mismatch is recorded.  This prevents TOCTOU attacks
+    where a PID is recycled between discovery and signal delivery.
+
+    **Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix):** after
+    SIGTERM, the function waits briefly, re-checks liveness via
+    ``/proc/<pid>/stat`` (starttime match), and escalates to SIGKILL for
+    TERM-ignoring survivors.  It then waits again and reports authoritative
+    survivor counts.  This closes the 八府巡按 audit finding that a single
+    SIGTERM-and-return leaves TERM-ignoring owned children alive.
 
     Args:
         workspace_path: Absolute path to the workspace directory.
         dry_run: When True, report what WOULD be signalled without killing.
+        owned_pids: Optional set of PIDs that are eligible for signalling.
+            When None, cwd containment is the sole eligibility test
+            (suitable for scratch/worktree).  When a non-empty set, only
+            processes whose PID is in this set (or whose ancestor PID is
+            in this set) may be signalled even when their cwd is inside
+            the workspace (suitable for shared-dir workspaces).
 
     Returns a dict with cleanup evidence:
         - ``workspace``: str — resolved workspace path
-        - ``signalled``: int — count of process groups signalled (0 in dry_run)
+        - ``signalled``: int — count of PIDs that received a signal (0 in dry_run)
+        - ``terminated``: int — PIDs that exited after SIGTERM alone
+        - ``killed``: int — PIDs that required SIGKILL escalation
+        - ``survivors``: int — PIDs still alive after TERM→KILL ladder
         - ``would_signal``: int — count that WOULD be signalled (dry_run only)
-        - ``self_pgid_excluded``: bool — True when caller's own PGID was
-          detected inside the workspace and excluded
-        - ``skipped_outside``: int — processes inside workspace-descendant dirs
-          but whose cwd didn't match (negative canary)
+        - ``skipped_outside``: int — processes outside workspace (negative canary)
+        - ``skipped_self``: int — current process (self-preservation)
+        - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
+        - ``skipped_unowned``: int — processes inside workspace but not in *owned_pids*
+          (shared-dir containment gate; always 0 when *owned_pids* is None)
         - ``dry_run``: bool — True if dry-run mode
-        - ``pids``: list of (pgid, pid, cwd) tuples for signalled groups
+        - ``pids``: list of (pgid, pid, cwd, outcome) tuples for signalled PIDs
+          where outcome is one of 'terminated', 'killed', 'survivor'
     """
+    import os as _os
+    import signal as _signal
+    import time as _time
+
     wp = Path(workspace_path).resolve()
-    self_pgid = os.getpgid(0)
     result: dict = {
         "workspace": str(wp),
         "signalled": 0,
+        "terminated": 0,
+        "killed": 0,
+        "survivors": 0,
         "would_signal": 0,
-        "self_pgid_excluded": False,
         "skipped_outside": 0,
+        "skipped_self": 0,
+        "skipped_identity_mismatch": 0,
+        "skipped_unowned": 0,
         "dry_run": dry_run,
         "pids": [],
     }
@@ -11413,11 +11555,19 @@ def close_workspace_processes(
     if not wp.is_dir():
         return result
 
+    # Never signal the completing caller itself — a completion inside
+    # the workspace must not kill the completing caller.  All eligible
+    # children are signalled individually by PID with TOCTOU identity
+    # revalidation.  killpg is never used because a process group can
+    # contain members with different CWDs — signalling the entire group
+    # risks hitting outside-workspace processes (#AION-RL2-CORE-01).
+    my_pid = _os.getpid()
+
     # Walk /proc to find processes whose cwd is inside the workspace.
     wp_str = str(wp)
-    signalled_pgids: set[int] = set()
+    signalled_pids: set[int] = set()  # track PID-scope signals for dedup
 
-    for entry in os.listdir("/proc"):
+    for entry in _os.listdir("/proc"):
         if not entry.isdigit():
             continue
         pid = int(entry)
@@ -11431,33 +11581,91 @@ def close_workspace_processes(
         # Exact workspace check: cwd must be equal to wp or a descendant.
         if cwd_str == wp_str or cwd_str.startswith(wp_str + "/"):
             try:
-                pgid = os.getpgid(pid)
+                pgid = _os.getpgid(pid)
             except OSError:
                 continue
 
-            # Exclude caller's own process group — prevents self-kill
-            # (AION-CORE-PR6).
-            if pgid == self_pgid:
-                result["self_pgid_excluded"] = True
+            # Never signal the completing caller itself.
+            if pid == my_pid:
+                result["skipped_self"] += 1
                 continue
 
-            if pgid in signalled_pgids:
+            # Shared-dir ownership gate: when owned_pids is provided, cwd
+            # containment alone is not sufficient — the PID must be in the
+            # owned set (which already includes all descendants of the
+            # task's worker PID).  This prevents signalling unrelated
+            # processes (YAML LSPs, other task workers) that happen to
+            # share the same directory (#AION-RL2-CORE-01 runtime RED).
+            if owned_pids is not None and pid not in owned_pids:
+                result["skipped_unowned"] += 1
                 continue
 
+            # Signal only by PID with individual identity revalidation —
+            # never killpg.  killpg broadcasts to every member of the
+            # process group, which can hit outside-workspace processes
+            # when a group has mixed CWDs (#AION-RL2-CORE-01 repair,
+            # bafuxunan audit t_bb18e80b at head 2378ac3142).
+            if pid in signalled_pids:
+                continue
             if dry_run:
+                identity = _read_process_identity(pid)
+                if identity is None:
+                    continue
                 result["would_signal"] += 1
-                result["pids"].append((pgid, pid, cwd_str))
-                signalled_pgids.add(pgid)
+                result["pids"].append((pgid, pid, cwd_str, "would_signal"))
+                signalled_pids.add(pid)
             else:
+                # Capture identity BEFORE any signal.
+                identity = _read_process_identity(pid)
+                if identity is None:
+                    continue
+                # Re-validate identity immediately before signal.
+                # If PID was recycled, cwd changed, or pgid moved —
+                # never signal.  This is a best-effort TOCTOU guard.
+                if not _revalidate_identity(pid, identity):
+                    result["skipped_identity_mismatch"] += 1
+                    continue
+
+                # -----------------------------------------------------------
+                # Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix)
+                # -----------------------------------------------------------
                 try:
-                    os.killpg(pgid, signal.SIGTERM)
-                    signalled_pgids.add(pgid)
-                    result["signalled"] += 1
-                    result["pids"].append((pgid, pid, cwd_str))
+                    _os.kill(pid, _signal.SIGTERM)
                 except OSError:
-                    # Process group already gone — count it as cleaned.
-                    signalled_pgids.add(pgid)
+                    # Process already gone — count it as cleaned.
+                    signalled_pids.add(pid)
                     result["signalled"] += 1
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                signalled_pids.add(pid)
+                result["signalled"] += 1
+
+                # Wait for graceful TERM exit; re-check liveness.
+                _time.sleep(0.5)
+                if not _revalidate_identity(pid, identity):
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # TERM-ignoring survivor — escalate to SIGKILL.
+                try:
+                    _os.kill(pid, _signal.SIGKILL)
+                except OSError:
+                    # Already gone between liveness check and KILL.
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # Wait for SIGKILL to take effect; final liveness check.
+                _time.sleep(1.5)
+                if not _revalidate_identity(pid, identity):
+                    result["killed"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "killed"))
+                else:
+                    result["survivors"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "survivor"))
         else:
             result["skipped_outside"] += 1
 
@@ -11472,6 +11680,24 @@ def _cleanup_workspace_on_completion(
     Called after a successful completion. Reads the task's workspace_path
     from the DB, then calls :func:`close_workspace_processes`. Best-effort —
     any error is logged and swallowed so completion is never blocked.
+
+    **AION-CORE-PR6 edge-case fixes (CI investigation t_5cf56231):**
+
+    - **dir workspace stale-task**: for ``workspace_kind=dir`` (shared
+      directory), builds an ``owned_pids`` set from the task's spawn events
+      in ``task_spawns``.  If no owned PIDs are found (stale task with no
+      active worker record), signals *none* — other tasks may still be using
+      the shared workspace.
+
+    - **PID-recycled starttime mismatch**: handled inside
+      :func:`close_workspace_processes` via :func:`_revalidate_identity`,
+      which compares /proc starttime against the captured identity before
+      each signal.
+
+    - **legacy spawn without starttime**: spawn events created before
+      starttime tracking was added have ``starttime IS NULL``.  These are
+      treated as owned (PID match alone) but cannot be revalidated — they
+      are signalled without the starttime guard as a best-effort fallback.
     """
     try:
         row = conn.execute(
@@ -11487,13 +11713,58 @@ def _cleanup_workspace_on_completion(
         path = Path(wp).expanduser().resolve()
         if not path.is_dir():
             return
-        evidence = close_workspace_processes(path)
+
+        # Build owned_pids for shared-dir workspace gating.
+        # For scratch/worktree workspaces, owned_pids stays None — cwd
+        # containment alone is sufficient because the workspace is exclusive
+        # to this task.
+        owned_pids: set[int] | None = None
+        if wk == "dir":
+            # Query spawn events for this task to find owned PIDs.
+            # Handle legacy spawns (starttime IS NULL) as owned but
+            # note they cannot be TOCTOU-revalidated.
+            spawn_rows = conn.execute(
+                "SELECT pid, starttime FROM task_spawns WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            if spawn_rows:
+                owned_pids = set()
+                for srow in spawn_rows:
+                    spid = srow["pid"]
+                    owned_pids.add(spid)
+                    # Include descendants for each owned PID so child
+                    # processes are also eligible for signalling.
+                    try:
+                        descendants = _discover_descendant_pids(spid)
+                        owned_pids.update(descendants)
+                    except Exception:
+                        pass  # best-effort descendant discovery
+            else:
+                # Stale dir workspace — no active spawn records for this
+                # task.  Signal none to avoid hitting another task's
+                # processes in the shared workspace.
+                _log.info(
+                    "complete_task workspace cleanup: task=%s kind=%s "
+                    "path=%s — stale-task, signalling none "
+                    "(shared dir workspace with no owned PIDs)",
+                    task_id, wk, str(path),
+                )
+                return
+
+        evidence = close_workspace_processes(
+            path, owned_pids=owned_pids,
+        )
         _log.info(
             "complete_task workspace cleanup: task=%s kind=%s path=%s "
-            "signalled=%s self_pgid_excluded=%s dry_run=%s",
+            "signalled=%s terminated=%s killed=%s survivors=%s "
+            "skipped_identity_mismatch=%s skipped_unowned=%s dry_run=%s",
             task_id, wk, str(path),
             evidence.get("signalled", 0),
-            evidence.get("self_pgid_excluded", False),
+            evidence.get("terminated", 0),
+            evidence.get("killed", 0),
+            evidence.get("survivors", 0),
+            evidence.get("skipped_identity_mismatch", 0),
+            evidence.get("skipped_unowned", 0),
             evidence.get("dry_run", False),
         )
     except Exception as exc:
