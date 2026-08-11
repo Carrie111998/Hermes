@@ -200,6 +200,43 @@ class TestFetchApiModels:
         assert probe["resolved_base_url"] == "http://localhost:8000/v1"
         assert probe["used_fallback"] is True
 
+    def test_probe_api_models_bearer_fallback_on_401_anthropic_mode(self):
+        """anthropic_messages probe that gets 401 with x-api-key retries Bearer."""
+        class _Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"data": [{"id": "bearer-model"}]}'
+
+        class _HTTPError(Exception):
+            code = 401
+
+        calls = []
+
+        def _fake_urlopen(req, timeout=5.0):
+            hdrs = {k.lower(): v for k, v in req.headers.items()}
+            calls.append((req.full_url, "x-api-key" in hdrs, "authorization" in hdrs))
+            if "x-api-key" in hdrs:
+                raise _HTTPError()
+            return _Resp()
+
+        with patch("hermes_cli.models._urlopen_model_catalog_request", side_effect=_fake_urlopen):
+            probe = probe_api_models(
+                "secret-key",
+                "https://api.example.com/v1",
+                api_mode="anthropic_messages",
+            )
+
+        # First pass: x-api-key on both candidates → 401. Second pass: Bearer.
+        assert probe["models"] == ["bearer-model"]
+        assert len(calls) == 3
+        assert calls[0][1] is True and calls[0][2] is False  # x-api-key, no Bearer
+        assert calls[2][1] is False and calls[2][2] is True  # Bearer retry
+
     def test_probe_api_models_uses_copilot_catalog(self):
         class _Resp:
             def __enter__(self):
