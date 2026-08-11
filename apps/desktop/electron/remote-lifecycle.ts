@@ -362,6 +362,48 @@ async function remotePidAlive(ssh, pid) {
   }
 }
 
+// The installer exposes Hermes through an executable wrapper that delegates to
+// either a console script or `python <checked-in entrypoint>`. Keep using the
+// wrapper for version/capability probes (#74411), but bind process ownership to
+// the exact delegated entrypoint that appears in /proc/<pid>/cmdline.
+async function resolveHermesOwnershipPath(ssh, hermesPath) {
+  const script =
+    'import os,shlex,stat\n' +
+    `p=os.path.expanduser(${shq(hermesPath)})\n` +
+    'process_path=p\n' +
+    'try:\n' +
+    ' s=os.stat(p,follow_symlinks=False)\n' +
+    ' owner_ok=not hasattr(os,"getuid") or s.st_uid==os.getuid()\n' +
+    ' safe=stat.S_ISREG(s.st_mode) and owner_ok and not (s.st_mode&0o022)\n' +
+    ' if safe:\n' +
+    '  data=open(p,"r",encoding="utf-8",errors="ignore").read(4096)\n' +
+    '  for line in data.splitlines():\n' +
+    '   words=shlex.split(line)\n' +
+    '   target=None\n' +
+    '   if len(words)==3 and words[0]=="exec" and words[2]=="$@":target=words[1]\n' +
+    '   elif len(words)==4 and words[0]=="exec" and os.path.basename(words[1]).startswith("python") and words[3]=="$@":target=words[2]\n' +
+    '   if target:\n' +
+    '    target=os.path.expanduser(target)\n' +
+    '    if os.path.isabs(target):\n' +
+    '     ts=os.stat(target,follow_symlinks=False)\n' +
+    '     target_owner_ok=not hasattr(os,"getuid") or ts.st_uid==os.getuid()\n' +
+    '     if stat.S_ISREG(ts.st_mode) and target_owner_ok and not (ts.st_mode&0o022):process_path=target\n' +
+    '    break\n' +
+    'except (OSError,ValueError):pass\n' +
+    'print("PROCESS_PATH="+process_path)'
+
+  const out = String((await ssh.exec(`python3 -c ${shq(script)}`)) || '').trim()
+  const processPath = out.startsWith('PROCESS_PATH=') ? out.slice('PROCESS_PATH='.length) : ''
+
+  if (processPath) {
+    validateRemotePath(processPath)
+
+    return processPath
+  }
+
+  return hermesPath
+}
+
 // A pid is "provably ours" only if its remote cmdline carries our dashboard
 // args — never kill a pid we can't positively identify as our dashboard.
 async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
@@ -370,10 +412,12 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '') {
   }
 
   try {
+    const processHermesPath = await resolveHermesOwnershipPath(ssh, hermesPath)
+
     const script =
       'import os,shlex,subprocess,sys\n' +
       `pid=${Number(pid)}\n` +
-      `expected=os.path.expanduser(${shq(hermesPath)})\n` +
+      `expected=os.path.expanduser(${shq(processHermesPath)})\n` +
       `nonce=${shq(spawnNonce)}\n` +
       'try:\n' +
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +

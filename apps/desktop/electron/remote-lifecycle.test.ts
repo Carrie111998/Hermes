@@ -268,6 +268,23 @@ test('pidIsOurDashboard requires the exact serve ownership nonce', async () => {
   assert.equal(await pidIsOurDashboard(fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']]), 5, SPAWN_NONCE, '/x/hermes'), false)
 })
 
+test('pidIsOurDashboard proves the effective entrypoint behind an installer wrapper', async () => {
+  const wrapperPath = '/home/u/.local/bin/hermes'
+  const entrypointPath = '/home/u/.hermes/hermes-agent/hermes'
+
+  const ssh = fakeSsh([
+    [/print\("PROCESS_PATH="/, `PROCESS_PATH=${entrypointPath}\n`],
+    [
+      /print\("OWNED"/,
+      command =>
+        command.includes(entrypointPath) && !command.includes(`expected='${wrapperPath}'`) ? 'OWNED\n' : 'FOREIGN\n'
+    ]
+  ])
+
+  assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, wrapperPath), true)
+  assert.equal(ssh.calls.length, 2)
+})
+
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
   const notOurs = fakeSsh([[/print\("OWNED"/, 'FOREIGN\n']])
   await cleanupStale(notOurs, OWNERSHIP_ID, {
