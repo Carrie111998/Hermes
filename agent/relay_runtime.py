@@ -26,6 +26,36 @@ RUNTIME_INSTANCE_KEY = "hermes.relay.runtime_instance"
 _PROFILE_KEY_CACHE: dict[str, str] = {}
 
 
+def _consume_task_exception(task: asyncio.Future) -> None:
+    """Log and consume a flush task failure that escaped its own wrapper.
+
+    The scheduled ``flush_async`` wrapper already catches ``Exception``, so
+    this callback only fires for a ``BaseException`` (e.g. cancellation). It
+    exists so the event loop never reports "Task exception was never
+    retrieved" for the fire-and-forget barrier task.
+    """
+    try:
+        exc = task.exception()
+    except (asyncio.CancelledError, Exception):
+        return
+    if exc is not None:
+        logger.warning("Hermes Relay subscriber flush task failed: %s", exc)
+
+
+async def _flush_async_safely(relay: Any) -> None:
+    """Await the relay subscriber barrier, logging failures instead of raising.
+
+    ``close_session`` is synchronous, so when it runs inside a live asyncio
+    loop it can only schedule ``flush_async`` as a task. This wrapper keeps
+    that task from surfacing an unhandled exception while still recording the
+    failure in the log (the sync path records it on the failures list).
+    """
+    try:
+        await relay.subscribers.flush_async()
+    except Exception as exc:
+        logger.warning("Hermes Relay subscriber flush failed: %s", exc)
+
+
 @dataclass
 class RelaySession:
     """One isolated Relay scope stack owned by a Hermes session."""
@@ -327,7 +357,27 @@ class RelayRuntime:
                 except Exception as exc:
                     failures.append(f"session scope close failed: {exc}")
         try:
-            self.relay.subscribers.flush()
+            # subscribers.flush() is a blocking barrier that raises
+            # RuntimeError when an asyncio event loop is running on the
+            # current thread (nemo_relay/subscribers.py). close_session() is
+            # reached both from the gateway's asyncio event loop (session
+            # end / finalize / reset hooks) and from the sync shutdown() /
+            # atexit path. Detect the running loop and schedule flush_async()
+            # as a task instead of blocking the loop; the sync barrier stays
+            # for the shutdown path so captured output is complete before the
+            # process exits. Async failures are logged by the task wrapper
+            # (the sync path still records them on the failures list below).
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+            if running_loop is not None:
+                task = running_loop.create_task(
+                    _flush_async_safely(self.relay)
+                )
+                task.add_done_callback(_consume_task_exception)
+            else:
+                self.relay.subscribers.flush()
         except Exception as exc:
             failures.append(f"subscriber flush failed: {exc}")
         with self._sessions_lock:
