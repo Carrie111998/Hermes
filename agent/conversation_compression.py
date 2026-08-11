@@ -2147,6 +2147,139 @@ def finalize_context_engine_compression_notification(
     return bool(pending())
 
 
+class AtomicCompactionPointcut:
+    """Pre-compression pointcut: save → tail → delegate.
+
+    Prepares a durable execution context for ``compress_context`` so the
+    downstream summary sees an accurate token count and the live in-memory
+    tail is already persisted before the lock is acquired.  Three phases:
+
+    1. **SAVE** — flush the in-memory transcript so the durable copy includes
+       the current turn's un-persisted tail *before* compress_context runs
+       its own pre-adoption flush check.
+    2. **TAIL** — measure the token count of the durable transcript (the one
+       just persisted) so the ``approx_tokens`` passed downstream is an
+       accurate number, not a caller guess.  compress_context logs and the
+       compressor budgets against this.
+    3. **DELEGATE** — call ``compress_context`` with the ORIGINAL in-memory
+       messages, not the durable copy.  compress_context already has
+       mismatch detection: when ``len(durable) > len(in-memory)`` it adopts
+       the durable parent and summarizes from disk.  When they match it uses
+       the in-memory list because legal in-memory mutations (think-tag
+       stripping, multimodal part removal, retry-history replacement) make
+       the durable copy *stale* relative to what the agent actually holds.
+       Forcing disk-as-source on every compaction would silently regress
+       those mutations.
+
+    This class does NOT acquire the compression lock — compress_context owns
+    the entire lock lifecycle (acquire → lease refresh → commit fence →
+    release).  Doing so here would deadlock: compress_context's
+    ``try_acquire_compression_lock`` would see a different holder and abort.
+
+    The value this pointcut adds over calling compress_context directly:
+
+    * **Pre-flush guarantee** — the live tail is persisted *before* the
+      mismatch check, so the adoption path sees the same rows the pointcut
+      measured (no window where a concurrent append happens between flush
+      and lock-acquire inside compress_context).
+    * **Accurate tail** — ``approx_tokens`` is measured from the durable
+      transcript, not estimated from the in-memory list that may lag the DB.
+    """
+
+    __slots__ = ("_agent",)
+
+    def __init__(self, agent: Any) -> None:
+        self._agent = agent
+
+    def compact(
+        self,
+        messages: list,
+        system_message: str,
+        *,
+        task_id: str = "default",
+        focus_topic: Optional[str] = None,
+        force: bool = False,
+        commit_fence: Optional["CompressionCommitFence"] = None,
+    ) -> Tuple[list, str]:
+        """Run the save-tail-delegate cycle.
+
+        Returns ``(compressed_messages, system_prompt)`` — the result of
+        ``compress_context``.  On flush or measurement failure, continues
+        with an unmeasured estimate (``approx_tokens=None``) so the
+        downstream compressor derives its own.
+        """
+        agent = self._agent
+        session_db = getattr(agent, "_session_db", None)
+        session_id = getattr(agent, "session_id", None)
+
+        # No SessionDB — nothing to pre-flush or measure; delegate directly.
+        if session_db is None or not session_id:
+            return compress_context(
+                agent,
+                messages,
+                system_message,
+                task_id=task_id,
+                focus_topic=focus_topic,
+                force=force,
+                commit_fence=commit_fence,
+            )
+
+        measured_tokens: Optional[int] = None
+
+        # --- Phase 1: SAVE — persist the live in-memory tail ---
+        flush_fn = getattr(agent, "_flush_messages_to_session_db", None)
+        if callable(flush_fn):
+            try:
+                flush_fn(messages)
+            except Exception:
+                logger.warning(
+                    "atomic-compaction: flush failed (session=%s); "
+                    "continuing with unmeasured token estimate",
+                    session_id,
+                    exc_info=True,
+                )
+
+        # --- Phase 2: TAIL — measure the durable transcript ---
+        try:
+            durable_messages = session_db.get_messages_as_conversation(
+                session_id
+            )
+            if durable_messages:
+                measured_tokens = estimate_request_tokens_rough(
+                    durable_messages, system_prompt=system_message
+                )
+                logger.info(
+                    "atomic-compaction: session=%s durable_msgs=%d "
+                    "measured_tokens=%d",
+                    session_id,
+                    len(durable_messages),
+                    measured_tokens,
+                )
+        except Exception:
+            logger.warning(
+                "atomic-compaction: durable tail measurement failed "
+                "(session=%s); continuing with unmeasured estimate",
+                session_id,
+                exc_info=True,
+            )
+
+        # --- Phase 3: DELEGATE — pass original messages to compress_context.
+        # compress_context acquires its own lock and decides whether to adopt
+        # the durable transcript (mismatch) or use the in-memory list (match).
+        # We do NOT pass durable_messages here — that would discard legal
+        # in-memory mutations when there is no size mismatch.
+        return compress_context(
+            agent,
+            messages,
+            system_message,
+            approx_tokens=measured_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            commit_fence=commit_fence,
+        )
+
+
 def compress_context(
     agent: Any,
     messages: list,
