@@ -7,6 +7,7 @@ import tempfile
 import time
 import unittest
 from collections import OrderedDict
+from importlib.machinery import PathFinder
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
@@ -14,10 +15,23 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.platforms.base import ProcessingOutcome
 
+# Detect the SDK WITHOUT importing it. lark_oapi is ~10k modules; importing it
+# here cost 23.8s and 10,055 sys.modules entries at collection time — paid by
+# every run of this file, before a single test executed, purely to set the
+# boolean below. ``_HAS_LARK_OAPI`` is only ever read by ``skipUnless``
+# decorators, and the one test that needs the real symbols imports them itself
+# (``from lark_oapi.ws import Client``), so a spec probe is exactly equivalent:
+# with the SDK installed these tests still RUN rather than skip.
+# PathFinder, deliberately NOT ``importlib.util.find_spec``: the latter
+# consults ``sys.modules`` first and raises ``ValueError`` when the name is
+# already there without a ``__spec__`` — exactly what the ``MagicMock`` stub
+# ``test_feishu_approval_buttons.py`` injects looks like. That would silently
+# flip these tests to SKIPPED depending on collection order. PathFinder
+# searches ``sys.path``, so the answer describes the on-disk SDK. Same probe
+# as ``test_feishu_lazy_sdk_import._lark_installed``.
 try:
-    import lark_oapi
-    _HAS_LARK_OAPI = True
-except ImportError:
+    _HAS_LARK_OAPI = PathFinder.find_spec("lark_oapi") is not None
+except (ImportError, ValueError):
     _HAS_LARK_OAPI = False
 
 
