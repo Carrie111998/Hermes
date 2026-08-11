@@ -3515,6 +3515,7 @@ def classify_codex_terminal(
     from agent.conversation_compression import _is_real_user_message
     from agent.terminal_continuation import (
         CONTINUATION_NUDGE,
+        LEGACY_CONTINUATION_NUDGE,
         ContinuationFacts,
         classify_terminal_continuation,
         count_substantive_tools,
@@ -3528,7 +3529,8 @@ def classify_codex_terminal(
                 isinstance(msg, dict)
                 and _is_real_user_message(msg)
                 and not msg.get("_terminal_continuation_scaffold")
-                and msg.get("content") != CONTINUATION_NUDGE
+                and msg.get("content")
+                not in (CONTINUATION_NUDGE, LEGACY_CONTINUATION_NUDGE)
             )
         ),
         default=-1,

@@ -167,6 +167,7 @@ def test_blockers_approval_credentials_questions_and_waits_are_terminal():
         "Waiting for the build to finish. I'm now deploying the remaining changes.",
         "The deploy is in flight; next I'll run the remaining checks.",
         "The background job hasn't returned yet. I'm now applying the next patch.",
+        "Applied the change. Next, I'll wait for your review before deploying.",
         "I am blocked by an unavailable external dependency.",
         "Would you like me to update the README?",
         "Let me know if you want me to run more tests.",

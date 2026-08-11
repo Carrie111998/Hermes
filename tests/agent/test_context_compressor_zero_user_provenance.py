@@ -275,6 +275,11 @@ def test_real_task_wins_over_trailing_max_iterations_nudge(compressor):
             id="codex_ack_continuation_nudge",
         ),
         pytest.param(
+            "[System: Continue now. Execute the required tool calls and only "
+            "send your final answer after completing the task.]",
+            id="codex_ack_continuation_nudge_legacy",
+        ),
+        pytest.param(
             "Your previous turn indicated a tool call but none was "
             "included. Do not narrate a plan or restate intent — issue "
             "the actual tool call now to continue the task.",

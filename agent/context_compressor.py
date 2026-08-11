@@ -4606,6 +4606,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             _LENGTH_CONTINUATION_NETWORK_STUB,
             _LENGTH_CONTINUATION_OUTPUT_LIMIT,
         )
+        from agent.terminal_continuation import LEGACY_CONTINUATION_NUDGE
 
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT,
@@ -4613,6 +4614,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             MAX_ITERATIONS_SUMMARY_REQUEST,
             _CODEX_INCOMPLETE_NUDGE,
             _CODEX_ACK_CONTINUATION_NUDGE,
+            LEGACY_CONTINUATION_NUDGE,
             _DROPPED_TOOLCALL_NUDGE_CONTENT,
             _EMPTY_TOOL_RESPONSE_NUDGE,
             _LENGTH_CONTINUATION_NETWORK_STUB,

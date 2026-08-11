@@ -169,6 +169,34 @@ def test_synthetic_nudge_does_not_reset_current_turn_tool_evidence():
     ) is ContinuationReason.POST_TOOL_EXPLICIT_UNFINISHED
 
 
+def test_legacy_nudge_does_not_reset_current_turn_tool_evidence():
+    a = _agent("auto", "codex_responses")
+    request = "Continue implementing the fix in /app until tests pass."
+    checkpoint = (
+        "The candidate is not promotable. Remaining work: implement the "
+        "workspace fix and rerun the failing tests."
+    )
+    legacy_nudge = (
+        "[System: Continue now. Execute the required tool calls and only send "
+        "your final answer after completing the task.]"
+    )
+    messages = [
+        {"role": "user", "content": request},
+        {"role": "assistant", "tool_calls": [{"id": "t1"}]},
+        {"role": "tool", "tool_call_id": "t1", "content": "25 failed"},
+        {"role": "assistant", "content": "I'm now implementing the remaining fix."},
+        {"role": "user", "content": legacy_nudge},
+    ]
+
+    assert classify_codex_terminal(
+        a,
+        request,
+        checkpoint,
+        messages,
+        continuation_attempts=1,
+    ) is ContinuationReason.POST_TOOL_EXPLICIT_UNFINISHED
+
+
 def test_other_synthetic_user_rows_do_not_reset_current_turn_tool_evidence():
     a = _agent("auto", "codex_responses")
     request = "Continue implementing the fix in /app until tests pass."

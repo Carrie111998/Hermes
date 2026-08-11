@@ -704,6 +704,38 @@ def run_codex_app_server_turn(
     next_input = user_message
     fallback_candidate_text = None
     retry_exception = None
+
+    def _apply_pause_notice(completed_turn) -> None:
+        candidate_text = completed_turn.final_text
+        completed_turn.final_text = (
+            f"{candidate_text.rstrip()}\n\n{BUDGET_EXHAUSTED_NOTICE}"
+        )
+        for projected in reversed(completed_turn.projected_messages):
+            if (
+                isinstance(projected, dict)
+                and projected.get("role") == "assistant"
+                and not projected.get("tool_calls")
+                and projected.get("content") == candidate_text
+            ):
+                projected["content"] = completed_turn.final_text
+                break
+        else:
+            completed_turn.projected_messages.append(
+                {"role": "assistant", "content": completed_turn.final_text}
+            )
+
+    def _merged_projections(completed_turns):
+        return [
+            projected
+            for completed_turn in completed_turns
+            for projected in completed_turn.projected_messages
+            if not (
+                isinstance(projected, dict)
+                and projected.get("role") == "user"
+                and projected.get("content") == CONTINUATION_NUDGE
+            )
+        ]
+
     try:
         for continuation_attempt in range(3):
             native_turn_attempts += 1
@@ -766,26 +798,7 @@ def run_codex_app_server_turn(
             if continuation_reason is ContinuationReason.NONE:
                 break
             if continuation_reason is ContinuationReason.BUDGET_EXHAUSTED:
-                pause_candidate_text = current_turn.final_text
-                current_turn.final_text = (
-                    f"{pause_candidate_text.rstrip()}\n\n"
-                    f"{BUDGET_EXHAUSTED_NOTICE}"
-                )
-                pause_projected = False
-                for projected in reversed(current_turn.projected_messages):
-                    if (
-                        isinstance(projected, dict)
-                        and projected.get("role") == "assistant"
-                        and not projected.get("tool_calls")
-                        and projected.get("content") == pause_candidate_text
-                    ):
-                        projected["content"] = current_turn.final_text
-                        pause_projected = True
-                        break
-                if not pause_projected:
-                    current_turn.projected_messages.append(
-                        {"role": "assistant", "content": current_turn.final_text}
-                    )
+                _apply_pause_notice(current_turn)
                 break
 
             # The app-server path bypasses the outer conversation loop's
@@ -794,26 +807,7 @@ def run_codex_app_server_turn(
             # `native_turn_attempts` above but does not consume this budget.
             iteration_budget = getattr(agent, "iteration_budget", None)
             if iteration_budget is not None and not iteration_budget.consume():
-                pause_candidate_text = current_turn.final_text
-                current_turn.final_text = (
-                    f"{pause_candidate_text.rstrip()}\n\n"
-                    f"{BUDGET_EXHAUSTED_NOTICE}"
-                )
-                pause_projected = False
-                for projected in reversed(current_turn.projected_messages):
-                    if (
-                        isinstance(projected, dict)
-                        and projected.get("role") == "assistant"
-                        and not projected.get("tool_calls")
-                        and projected.get("content") == pause_candidate_text
-                    ):
-                        projected["content"] = current_turn.final_text
-                        pause_projected = True
-                        break
-                if not pause_projected:
-                    current_turn.projected_messages.append(
-                        {"role": "assistant", "content": current_turn.final_text}
-                    )
+                _apply_pause_notice(current_turn)
                 break
 
             # Keep real tool events, but discard the premature assistant
@@ -860,16 +854,7 @@ def run_codex_app_server_turn(
         final_turn = codex_turns[-1]
         turn = SimpleNamespace(
             final_text=final_turn.final_text,
-            projected_messages=[
-                projected
-                for completed_turn in codex_turns
-                for projected in completed_turn.projected_messages
-                if not (
-                    isinstance(projected, dict)
-                    and projected.get("role") == "user"
-                    and projected.get("content") == CONTINUATION_NUDGE
-                )
-            ],
+            projected_messages=_merged_projections(codex_turns),
             tool_iterations=sum(
                 completed_turn.tool_iterations for completed_turn in codex_turns
             ),
@@ -949,16 +934,7 @@ def run_codex_app_server_turn(
             if checkpoint
             else failure_notice
         )
-        projected_messages = [
-            projected
-            for completed_turn in codex_turns
-            for projected in completed_turn.projected_messages
-            if not (
-                isinstance(projected, dict)
-                and projected.get("role") == "user"
-                and projected.get("content") == CONTINUATION_NUDGE
-            )
-        ]
+        projected_messages = _merged_projections(codex_turns)
         projected_messages.append({"role": "assistant", "content": failure_text})
         turn = SimpleNamespace(
             final_text=failure_text,

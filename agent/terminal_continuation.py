@@ -21,6 +21,14 @@ CONTINUATION_NUDGE = (
     "you are genuinely blocked or waiting for user input, state that explicitly.]"
 )
 
+# Persisted by the original Codex acknowledgement-recovery path without an
+# ephemeral metadata flag. Keep recognizing it so pre-upgrade sessions do not
+# mistake transport scaffolding for a new human turn after resume/compaction.
+LEGACY_CONTINUATION_NUDGE = (
+    "[System: Continue now. Execute the required tool calls and only send your "
+    "final answer after completing the task.]"
+)
+
 BUDGET_EXHAUSTED_NOTICE = (
     "PAUSED — automatic continuation budget exhausted while the response still "
     "indicated unfinished work. Say ‘continue’ to resume."
@@ -75,7 +83,8 @@ _UNFINISHED_RE = re.compile(
     re.IGNORECASE,
 )
 _BLOCK_OR_WAIT_RE = re.compile(
-    r"\b(?:awaiting\s+(?:approval|confirmation|input)|blocked\s+(?:on|by)|"
+    r"\b(?:wait(?:ing)?\s+(?:for|on)\s+(?:you|your)\b|"
+    r"awaiting\s+(?:approval|confirmation|input)|blocked\s+(?:on|by)|"
     r"cannot\s+continue|can['’]t\s+continue|need\s+your\s+"
     r"(?:approval|confirmation|credentials?|input|password|token)|"
     r"unable\s+to\s+(?:continue|run|execute|access|complete)|"
