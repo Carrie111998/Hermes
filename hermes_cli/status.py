@@ -450,8 +450,11 @@ def show_status(args):
         print(f"  Persistence:  {'snapshot filesystem' if persist_enabled else 'ephemeral filesystem'}")
         print("  Processes:    live processes do not survive cleanup, snapshots, or sandbox recreation")
 
-    sudo_password = os.getenv("SUDO_PASSWORD", "")
-    print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
+    sudo_password_set = bool(os.getenv("SUDO_PASSWORD", ""))
+    if sudo_password_set:
+        print(f"  Sudo:         {check_mark(False)} SUDO_PASSWORD is set but unused — Hermes no longer reads it; see 'hermes doctor'")
+    else:
+        print(f"  Sudo:         {check_mark(True)} no SUDO_PASSWORD in environment (current)")
 
     # =========================================================================
     # Messaging Platforms
