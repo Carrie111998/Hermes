@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 
 import pytest
 
@@ -276,6 +277,108 @@ def test_normal_subprocess_run_passes_through():
     """Plain non-systemctl subprocess.run should work normally."""
     r = subprocess.run(["echo", "hello"], capture_output=True, text=True)
     assert r.stdout.strip() == "hello"
+
+
+# ──────────────────── package installs ─────────────────────────
+#
+# A test run must never mutate the developer's / gateway's venv.  The live
+# offender was ``tools/lazy_deps.py::_venv_pip_install``: any test that
+# enables a platform (e.g. setting FEISHU_APP_ID) reaches
+# ``gateway/config.py::_apply_env_overrides`` -> ``entry.check_fn()``, whose
+# own comment notes it "lazy-INSTALLS the platform SDK (pip) as a side
+# effect".  One ``pytest tests/gateway`` run installed lark_oapi 1.6.8
+# (101 MB, 21,169 files) into ~/.hermes/agent-src/.venv — the venv the
+# gateway runs from — and timed out mid-install.
+#
+# Installs that redirect somewhere disposable (``--target``/``--prefix``/
+# ``--root``, or a different interpreter) are still allowed: they cannot
+# touch the running environment.
+
+
+def test_uv_pip_install_into_live_venv_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["uv", "pip", "install", "lark-oapi==1.6.8"])
+
+
+def test_python_m_pip_install_into_live_venv_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "lark-oapi==1.6.8"])
+
+
+def test_bare_pip_install_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["pip", "install", "-e", "."])
+
+
+def test_pip_install_user_site_blocked():
+    """``--user`` mutates the developer's user site-packages, not a tmpdir."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "pip", "install", "--user", "pyyaml"])
+
+
+def test_pip_uninstall_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "lark-oapi"])
+
+
+def test_ensurepip_blocked():
+    """``ensurepip --upgrade`` bootstraps pip INTO the live venv."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run([sys.executable, "-m", "ensurepip", "--upgrade", "--default-pip"])
+
+
+def test_shell_string_pip_install_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run("uv pip install lark-oapi==1.6.8", shell=True)
+
+
+def test_pip_install_with_target_passes_through(tmp_path):
+    """``--target <dir>`` cannot touch the live venv, so it is allowed.
+
+    ``tests/tools/test_lazy_deps_durable_target.py`` depends on this: its
+    opt-in real-install test exercises the durable-target wire end to end.
+    A nonexistent executable proves the guard handed the command to the
+    real subprocess machinery (FileNotFoundError) rather than blocking it.
+    """
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(
+            ["hermes-nonexistent-uv", "pip", "install", "--target", str(tmp_path), "isodate"]
+        )
+
+
+def test_pip_install_into_other_interpreter_passes_through():
+    """Installing into a throwaway venv's python is allowed.
+
+    ``tests/test_wheel_locales_e2e.py`` builds a wheel, creates a scratch
+    venv and pip-installs into it — that interpreter is not ours.
+    """
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(
+            ["/hermes/nonexistent/venv/bin/python", "-m", "pip", "install", "pyyaml"]
+        )
+
+
+def test_npm_install_passes_through():
+    """The guard protects the Python venv; ``npm install`` is unrelated."""
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["hermes-nonexistent-npm", "install"])
+
+
+def test_uv_tool_install_passes_through():
+    """``uv tool install`` targets uv's tool dir, not the active venv."""
+    with pytest.raises(FileNotFoundError):
+        subprocess.run(["hermes-nonexistent-uv", "tool", "install", "hermes-agent"])
+
+
+def test_pip_version_probe_passes_through():
+    """Read-only pip probes must still work — lazy_deps uses one."""
+    r = subprocess.run(
+        [sys.executable, "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert r is not None
 
 
 # ──────────────────── bypass marker ─────────────────────────────
