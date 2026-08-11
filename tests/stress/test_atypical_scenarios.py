@@ -996,15 +996,24 @@ def _(home, kb):
     client = TestClient(app)
 
     # Empty title
-    r = client.post("/api/plugins/kanban/tasks", json={"title": ""})
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "", "body": "Exercise the empty-title validation path."},
+    )
     assert r.status_code in {400, 422}, f"empty title should 4xx, got {r.status_code}"
 
     # Title only
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "x"})
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "body": "Exercise the title-only task path."},
+    )
     assert r.status_code == 200, r.text
 
     # Huge title
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "x" * 10000})
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x" * 10000, "body": "Exercise the huge-title path."},
+    )
     # Should succeed — kernel doesn't cap title length
     assert r.status_code == 200
 
@@ -1020,12 +1029,21 @@ def _(home, kb):
 
     # Invalid JSON schema — unknown field, pydantic should either ignore or 422
     r = client.post("/api/plugins/kanban/tasks", json={
-        "title": "fine", "nonexistent_field": "whatever",
+        "title": "fine",
+        "body": "Exercise unknown-field handling.",
+        "nonexistent_field": "whatever",
     })
     assert r.status_code in {200, 422}
 
     # Priority as non-int
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "prio", "priority": "high"})
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "prio",
+            "body": "Exercise invalid-priority handling.",
+            "priority": "high",
+        },
+    )
     assert r.status_code == 422, f"string priority should 422, got {r.status_code}"
 
     # PATCH with empty body (no changes requested)

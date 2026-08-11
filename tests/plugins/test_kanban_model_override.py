@@ -155,7 +155,11 @@ def test_spawn_passes_model_and_provider(monkeypatch, tmp_path, conn):
 
 
 def _create(client, **kwargs):
-    body = {"title": "task", "assignee": "worker"}
+    body = {
+        "title": "task",
+        "body": "Exercise the task model override path.",
+        "assignee": "worker",
+    }
     body.update(kwargs)
     r = client.post("/api/plugins/kanban/tasks", json=body)
     assert r.status_code == 200, r.text
