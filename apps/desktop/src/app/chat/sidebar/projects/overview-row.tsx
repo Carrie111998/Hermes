@@ -69,6 +69,8 @@ interface ProjectOverviewRowProps {
   previewSessions?: SessionInfo[]
   reorderable?: boolean
   dragging?: boolean
+  /** Full dnd-kit handle (role/tabIndex + keyboard + pointer activators) —
+   *  spread ONLY on SidebarRowGrab. The shell must use shellDragProps. */
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
   /** Pointer-only dnd listeners for the row SHELL — never the keyboard
    *  activator or role/tabIndex (see session-row for the full rationale). */

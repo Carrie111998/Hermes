@@ -72,12 +72,12 @@ export function useSortableBindings(id: string) {
   // active dnd-kit's KeyboardSensor arms a window keydown listener whose
   // default `end` codes include Space — swallowing the keystroke in ANY text
   // input (session rename dialog, first composer keystroke after launch).
-  const shellListeners = listeners ? { onPointerDown: listeners.onPointerDown } : undefined
-
   return {
     dragging: isDragging,
     dragHandleProps: { ...attributes, ...listeners },
-    shellDragProps: { ...shellListeners } as React.HTMLAttributes<HTMLElement> | undefined,
+    shellDragProps: (listeners ? { onPointerDown: listeners.onPointerDown } : undefined) as
+      | React.HTMLAttributes<HTMLElement>
+      | undefined,
     ref: setNodeRef,
     reorderable: true as const,
     style: {

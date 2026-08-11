@@ -52,6 +52,8 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   onResume: () => void
   reorderable?: boolean
   dragging?: boolean
+  /** Full dnd-kit handle (role/tabIndex + keyboard + pointer activators) —
+   *  spread ONLY on SidebarRowGrab. The shell must use shellDragProps. */
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
   /** Pointer-only dnd listeners for the row SHELL — never the keyboard
    *  activator or role/tabIndex. The shell contains real controls (⋯ menu,

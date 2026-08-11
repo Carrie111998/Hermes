@@ -1,5 +1,5 @@
-import { cleanup, render } from '@testing-library/react'
-import { DndContext } from '@dnd-kit/core'
+import { cleanup, fireEvent, render } from '@testing-library/react'
+import { DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
 import { afterEach, describe, expect, it } from 'vitest'
 
@@ -57,5 +57,72 @@ describe('useSortableBindings', () => {
     // attributes (role=button / tabIndex) never enter shellDragProps either,
     // so the shell is not a focusable drag activator.
     expect((getByTestId('shell-keys').dataset.keys ?? '').split(',')).toEqual(['onPointerDown'])
+  })
+})
+
+// Behavioral probe with the real sensors the sidebar uses (PointerSensor with
+// the 6px activation constraint + KeyboardSensor with the default codes).
+function ProbeHost({ id }: { id: string }) {
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor)
+  )
+
+  return (
+    <DndContext sensors={sensors} onDragEnd={() => {}}>
+      <SortableContext items={[id]} strategy={verticalListSortingStrategy}>
+        <BehaviorProbe id={id} />
+      </SortableContext>
+    </DndContext>
+  )
+}
+
+function BehaviorProbe({ id }: { id: string }) {
+  const bindings = useSortableBindings(id)
+
+  return (
+    <div data-testid="shell" {...bindings.shellDragProps}>
+      <button data-testid="control" type="button">
+        Control
+      </button>
+      <div data-testid="grabber" {...bindings.dragHandleProps}>
+        Grab
+      </div>
+      <output data-testid="state">{bindings.dragging ? 'DRAGGING' : 'IDLE'}</output>
+    </div>
+  )
+}
+
+const spaceKey = { key: ' ', code: 'Space', bubbles: true, cancelable: true } as const
+
+describe('useSortableBindings keyboard behavior', () => {
+  it('does not swallow Space on the shell nor start a keyboard drag from it', () => {
+    const { getByTestId } = render(<ProbeHost id="a" />)
+
+    // Pre-fix, the shell carried the KeyboardSensor activator: Space here
+    // started a drag (and was preventDefaulted). Post-fix, the shell has only
+    // the pointer activator, so the keydown must pass through untouched.
+    expect(fireEvent.keyDown(getByTestId('shell'), spaceKey)).toBe(true)
+    expect(getByTestId('state').textContent).toBe('IDLE')
+  })
+
+  it('does not swallow Space on a control inside the shell (⋯ menu, row body)', () => {
+    const { getByTestId } = render(<ProbeHost id="a" />)
+
+    expect(fireEvent.keyDown(getByTestId('control'), spaceKey)).toBe(true)
+    expect(getByTestId('state').textContent).toBe('IDLE')
+  })
+
+  it('still starts a keyboard drag from the grabber (screen-reader reorder preserved)', () => {
+    const { getByTestId } = render(<ProbeHost id="a" />)
+
+    // dnd-kit's activator preventDefaults the start key, so fireEvent returns
+    // false here — the drag STARTING is the assertion.
+    fireEvent.keyDown(getByTestId('grabber'), spaceKey)
+    expect(getByTestId('state').textContent).toBe('DRAGGING')
+
+    // Space again on the grabber ends the drag (default `end` codes), so the
+    // test tears down cleanly.
+    fireEvent.keyDown(getByTestId('grabber'), spaceKey)
   })
 })
