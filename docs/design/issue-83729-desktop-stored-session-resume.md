@@ -34,8 +34,9 @@ that change rather than simply revert it.
 `apps/desktop/e2e/large-session-resume.spec.ts` is the performance contract:
 
 - an unchanged cold resume builds the transcript once;
-- a cold resume with a live projection may build the persisted base and then the
-  live tail, for at most two paint bursts;
+- a cold resume with a live projection, an identity correction, or a recovered
+  local journal tail may build the persisted base and then one corrected result,
+  for at most two paint bursts;
 - a third paint is the old eager-prefetch regression.
 
 All existing request-generation and selected-session guards remain mandatory.
@@ -67,25 +68,41 @@ independent completion handler which:
 2. reconciles the REST rows against `$messages.get()` at completion time;
 3. preserves same-session optimistic/pending rows and local assistant errors;
 4. calls `setMessages` only when the result is not content-equivalent; and
-5. retains the successful response for final runtime reconciliation.
+5. retains the successful response as a candidate for final runtime
+   reconciliation.
 
 A stale completion is discarded. It does not paint, bind a runtime, or arm a
 failure latch.
+
+The prefetch cannot be declared usable until the RPC supplies the bound stored
+identity. A **usable prefetch** is therefore exactly one which resolved
+successfully and whose `session_id` matches `resumed.session_key` /
+`resumed.resumed` (with the existing missing-identity compatibility allowance).
+Before the RPC settles, a guarded early publication is only a candidate view.
 
 ### Omitted Messages Are Not Empty Messages
 
 After the RPC settles, `messages_omitted` controls the source of the transcript:
 
-- With a successful, identity-matching prefetch, the already-published REST
-  transcript is the base.
+- With a usable prefetch, the already-published REST transcript is the base.
 - Without a usable prefetch, the hook makes one authoritative REST fallback
-  request. It never passes `resumed.messages` to
+  request using the stored key bound by the resume response (falling back to the
+  requested key only when the response omits its identity). It never passes
+  `resumed.messages` to
   `reconcileAuthoritativeMessages` when `messages_omitted` is true.
 - If the fallback succeeds, it is reconciled and published through the same
   guarded path. This is a transcript recovery, not an RPC failure, so it does
   not emit a synthetic "Resume failed" notification.
 - If the fallback fails, the hook evaluates the empty-transcript failure rule
   below.
+
+An identity mismatch is the important third unusable-prefetch case, alongside a
+failed request and an empty result. The hook discards the candidate REST baseline
+before rebuilding from the fallback response. It may preserve only local
+optimistic/pending rows through the existing pending-turn reconciler; settled
+rows from the mismatched candidate cannot remain in the foreground. Publishing
+the corrected identity is a legitimate second paint and remains inside the
+#69649 budget.
 
 For watch windows, the request remains `lazy: true` without `omit_messages` and
 the current no-prefetch behavior is unchanged.
@@ -102,8 +119,13 @@ that tail onto the latest view. Otherwise the exact current array is written
 into the per-runtime state. The subsequent `syncSessionStateToView` therefore
 sees the same reference/content and does not cause another transcript paint.
 
-This yields one paint for an unchanged cold resume and two for a cold resume
-that adds a real live tail.
+`recoverInFlightTurnJournal` remains after runtime reconciliation. A journaled
+tail recovered after a renderer/app crash is another legitimate second paint;
+it must not be suppressed to make the unchanged-session budget pass.
+
+This yields one paint for an unchanged cold resume and at most two for a cold
+resume that adds a real live tail, corrects a mismatched identity, or restores a
+journal tail.
 
 ## Empty-Transcript Failure Rule
 
@@ -114,14 +136,19 @@ sidebar row message_count > 0
 OR
 (
   resume response message_count > 0
-  AND (session was not created by this renderer run OR resume is not running)
+  AND session was not created by this renderer run
 )
 ```
 
-The second clause avoids treating an unpersisted, newly created live session's
-in-memory projection as proof of a missing REST display transcript. The count is
-used only as a `> 0` signal; its numeric value is never compared with the REST
-row count because the gateway branches expose different projections:
+The second clause absolutely excludes `createdThisRun` from the runtime-count
+source, whether the new session is running or idle. This avoids treating an
+unpersisted first turn that failed or was interrupted as proof of a missing REST
+display transcript. A real persisted count on its sidebar row remains the other
+side of the OR condition.
+
+The response count is used only as a `> 0` signal; its numeric value is never
+compared with the REST row count because the gateway branches expose different
+projections:
 
 - deferred cold resume counts alternation-repaired raw history;
 - lazy/watch resume counts display history;
@@ -151,11 +178,13 @@ this renderer fix.
 
 ## Residual Failure Window
 
-If both REST attempts fail while `session.resume` is still pending, there is no
-transcript to paint and no authoritative response count yet. The shared gateway
-client bounds this state with its existing 120-second request timeout; after the
-timeout, the current catch path arms retry/error recovery when the cached row
-says history exists.
+If the initial REST prefetch fails while `session.resume` is still pending,
+there is no transcript to paint and no resume-bound identity for the second REST
+attempt yet. Although the shared client library defaults to 120 seconds,
+`HermesGateway` overrides Desktop's effective request timeout to 30 seconds.
+After that timeout, the current RPC-failure catch path performs its REST fallback
+and arms retry/error recovery if that also fails while cached metadata says
+history exists.
 
 This change removes the unbounded blank state when REST succeeds, which is the
 reported #83729 case, but it does not shorten the dual-failure window. Starting
@@ -192,12 +221,16 @@ Hook tests in `use-session-actions.test.tsx` must cover:
    absent.
 5. REST failure plus `message_count === 0` binds a legitimate empty session and
    does not arm the latch.
-6. A newly created running session is not falsely latched from its live count.
+6. A newly created session, both running and idle cases, is not falsely latched
+   from its live count.
 7. A stream/pending row arriving after early paint survives final settle.
 8. Same-session reconnect early paint preserves an optimistic user message.
 9. A watch window performs no REST prefetch and keeps its current lazy behavior.
 10. An unchanged resume retains the already-published array through final
     per-runtime state synchronization.
+11. An identity-mismatched early prefetch is replaced from the resume-bound
+    stored key and cannot leave the candidate session's settled rows in the
+    foreground.
 
 The large-session Electron E2E must cover both paint budgets:
 
