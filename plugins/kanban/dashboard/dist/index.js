@@ -113,7 +113,7 @@
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
     scheduled: "Waiting for a scheduled time to arrive",
-    review: "A review agent is checking the work",
+    review: "Implementation complete — awaiting review",
     awaiting_human: "QA approved this exact PR head; the named human reviewer must decide in GitHub",
     done: "Completed",
     archived: "Archived",

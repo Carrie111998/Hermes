@@ -23,6 +23,7 @@ describe('toChatMessages', () => {
     // the backend also ships the full args, and the part must carry them so
     // the expanded `$` transcript shows the whole command.
     const longCommand = `echo ${'x'.repeat(200)}`
+
     const messages = toChatMessages([
       { role: 'user', content: 'run it', timestamp: 1 },
       {
@@ -323,16 +324,23 @@ describe('toChatMessages', () => {
         content: '[System note: Your previous turn was interrupted mid-run…]\n\noriginal prompt',
         display_kind: 'auto_continue',
         timestamp: 6
+      },
+      {
+        role: 'user',
+        content: "[System: The user has changed the assistant's personality…]",
+        display_kind: 'personality_switch',
+        timestamp: 7
       }
     ])
 
-    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system'])
+    expect(messages.map(message => message.role)).toEqual(['user', 'assistant', 'system', 'system', 'system', 'system'])
     expect(messages.map(chatMessageText)).toEqual([
       'real user turn',
       'real assistant reply',
       'model changed',
       'background agent work finished',
-      'resumed interrupted turn'
+      'resumed interrupted turn',
+      'personality changed'
     ])
   })
 
