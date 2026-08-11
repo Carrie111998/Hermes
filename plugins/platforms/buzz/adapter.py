@@ -5,10 +5,9 @@ A plugin-based gateway adapter that connects to a Buzz community relay
 (Block's open-source human+agent collaboration platform, built on the
 Nostr protocol) and relays messages to/from the Hermes agent.
 
-The adapter does not speak Nostr itself — it shells out to the ``buzz``
-CLI binary ("JSON in, JSON out") via ``asyncio.create_subprocess_exec``.
-Inbound delivery uses a poll loop (the CLI is request/response); see the
-"Known limitations" note in the platform docs.
+The adapter shells out to the ``buzz`` CLI for request/response operations
+and uses an authenticated Nostr WebSocket subscription for inbound delivery.
+``transport=auto`` falls back to CLI polling when streaming is unavailable.
 
 Configuration in config.yaml::
 
@@ -21,7 +20,8 @@ Configuration in config.yaml::
             channels:                  # channel UUIDs to watch (empty = all joined)
               - ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
             home_channel: ccc2bc1a-7a82-5a8f-8c4e-57a070cbe7cd
-            poll_interval: 4           # seconds between poll sweeps
+            transport: auto            # WebSocket first; polling fallback
+            poll_interval: 4           # seconds between fallback poll sweeps
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
@@ -353,7 +353,7 @@ def _parse_json_list(stdout: str) -> List[dict]:
 # ---------------------------------------------------------------------------
 
 class BuzzAdapter(BasePlatformAdapter):
-    """Poll-based Buzz adapter implementing the BasePlatformAdapter interface.
+    """WebSocket-first Buzz adapter with a polling fallback.
 
     Instantiated by the adapter_factory passed to register_platform().
     """
@@ -419,9 +419,11 @@ class BuzzAdapter(BasePlatformAdapter):
         # Selected senders (normally other agent identities) must address this
         # profile explicitly even when ambient human messages are allowed with
         # require_mention=false. Entries may be hex pubkeys or npubs.
+        mention_required_env = os.getenv("BUZZ_MENTION_REQUIRED_USERS")
         raw_mention_required = (
-            os.getenv("BUZZ_MENTION_REQUIRED_USERS")
-            or extra.get("mention_required_users", [])
+            mention_required_env
+            if mention_required_env is not None
+            else extra.get("mention_required_users", [])
         )
         if isinstance(raw_mention_required, str):
             raw_mention_required = raw_mention_required.split(",")
@@ -430,8 +432,6 @@ class BuzzAdapter(BasePlatformAdapter):
             raw_mention_required = []
         self._mention_required_pubkeys: set = set()
         for entry in raw_mention_required:
-            if isinstance(entry, str) and not entry.strip():
-                continue
             normalized = _normalize_user_ref(entry) if isinstance(entry, str) else None
             if not normalized:
                 self._config_errors.append("mention_required_users contains an invalid identity")
@@ -457,8 +457,15 @@ class BuzzAdapter(BasePlatformAdapter):
         for alias, user_ref in alias_entries:
             normalized_alias = alias.strip().lstrip("@").lower() if isinstance(alias, str) else ""
             normalized_user = _normalize_user_ref(user_ref) if isinstance(user_ref, str) else None
-            if not normalized_alias or not normalized_user:
+            if (
+                not normalized_alias
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_.-]*", normalized_alias)
+                or not normalized_user
+            ):
                 self._config_errors.append("mention_aliases contains an invalid alias or identity")
+                continue
+            if normalized_alias in self._mention_aliases:
+                self._config_errors.append("mention_aliases contains duplicate case-insensitive aliases")
                 continue
             self._mention_aliases[normalized_alias] = normalized_user
 
@@ -468,14 +475,19 @@ class BuzzAdapter(BasePlatformAdapter):
         max_hops_env = os.getenv("BUZZ_MAX_AGENT_HOPS")
         max_hops_explicit = max_hops_env is not None or "max_agent_hops" in extra
         max_hops_raw = max_hops_env if max_hops_env is not None else extra.get("max_agent_hops", 0)
-        try:
-            parsed_max_hops = int(max_hops_raw)
-        except (TypeError, ValueError):
-            parsed_max_hops = 0
-            if max_hops_explicit:
-                self._config_errors.append("max_agent_hops must be a positive integer")
-        if parsed_max_hops < 0:
-            self._config_errors.append("max_agent_hops must be a positive integer")
+        parsed_max_hops = 0
+        max_hops_valid = False
+        if isinstance(max_hops_raw, int) and not isinstance(max_hops_raw, bool):
+            parsed_max_hops = max_hops_raw
+            max_hops_valid = parsed_max_hops >= 0
+        elif isinstance(max_hops_raw, str) and re.fullmatch(r"[0-9]+", max_hops_raw.strip()):
+            try:
+                parsed_max_hops = int(max_hops_raw.strip())
+                max_hops_valid = True
+            except ValueError:
+                max_hops_valid = False
+        if not max_hops_valid and max_hops_explicit:
+            self._config_errors.append("max_agent_hops must be a non-negative integer")
             parsed_max_hops = 0
         self.max_agent_hops = parsed_max_hops
         if self._mention_required_pubkeys and self.max_agent_hops == 0:
@@ -535,7 +547,7 @@ class BuzzAdapter(BasePlatformAdapter):
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Verify relay credentials, seed high-water marks, start polling."""
+        """Verify credentials, seed high-water marks, and start inbound transport."""
         if self._config_errors:
             message = "; ".join(dict.fromkeys(self._config_errors))
             logger.error("Buzz configuration invalid: %s", message)
@@ -1166,9 +1178,10 @@ class BuzzAdapter(BasePlatformAdapter):
             return
 
         if pubkey in self._mention_required_pubkeys:
-            current = self._active_agent_events.get(channel_id)
-            if current is None or agent_hops >= current[1]:
-                self._active_agent_events[channel_id] = (event_id, agent_hops)
+            # The most recently accepted agent event is the active response
+            # parent even when it starts a fresh lower-hop chain. Keeping the
+            # previous highest-hop event would misthread the new response.
+            self._active_agent_events[channel_id] = (event_id, agent_hops)
         else:
             # A fresh human instruction starts a new interaction root.
             self._active_agent_events.pop(channel_id, None)
@@ -1275,13 +1288,13 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?![\w.-])"
             if re.search(pattern, lowered):
                 return True
         for alias, pubkey in self._mention_aliases.items():
             if pubkey != self._self_pubkey:
                 continue
-            pattern = rf"(?<!\w)@?{re.escape(alias)}(?!\w)"
+            pattern = rf"(?<!\w)@?{re.escape(alias)}(?![\w.-])"
             if re.search(pattern, lowered):
                 return True
         return False
@@ -1301,7 +1314,11 @@ class BuzzAdapter(BasePlatformAdapter):
         if self._self_pubkey:
             candidates.append(self._self_pubkey)
         return any(
-            re.search(rf"(?<![\w@])@{re.escape(candidate)}(?!\w)", content, flags=re.IGNORECASE)
+            re.search(
+                rf"(?<![\w@])@{re.escape(candidate)}(?![\w.-])",
+                content,
+                flags=re.IGNORECASE,
+            )
             for candidate in candidates
         )
 
@@ -1324,7 +1341,7 @@ class BuzzAdapter(BasePlatformAdapter):
         """Resolve configured @aliases in outbound text to explicit pubkeys."""
         mentions = []
         for alias, pubkey in sorted(self._mention_aliases.items(), key=lambda item: -len(item[0])):
-            pattern = rf"(?<![\w@])@{re.escape(alias)}(?!\w)"
+            pattern = rf"(?<![\w@])@{re.escape(alias)}(?![\w.-])"
             if re.search(pattern, content, flags=re.IGNORECASE) and pubkey not in mentions:
                 mentions.append(pubkey)
         return mentions
@@ -1444,8 +1461,10 @@ class BuzzAdapter(BasePlatformAdapter):
         if not candidates:
             return text
         # Optional leading '@', one of the identity forms, optional trailing
-        # ':' or ',' and surrounding whitespace.
-        pattern = rf"^@?(?:{'|'.join(candidates)})[\s:,]*"
+        # ':' or ',' and surrounding whitespace. Prefer longer candidates and
+        # require an alias-token boundary so @bot never strips @bot-2.
+        alternatives = "|".join(sorted(set(candidates), key=len, reverse=True))
+        pattern = rf"^@?(?:{alternatives})(?![\w.-])[\s:,]*"
         stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
         return stripped.strip()
 

@@ -151,12 +151,33 @@ class TestBuzzAdapterInit:
         "extra",
         [
             {"mention_required_users": ["not-a-pubkey"], "max_agent_hops": 4},
+            {"mention_required_users": ["   "], "max_agent_hops": 4},
             {"mention_required_users": [OTHER_PUBKEY], "max_agent_hops": 0},
             {"mention_aliases": {"Warren": "not-a-pubkey"}},
+            {"mention_aliases": {"Bot": OTHER_PUBKEY, "bot": "b" * 64}},
+            {"max_agent_hops": float("inf")},
+            {"max_agent_hops": float("nan")},
+            {"max_agent_hops": 1.5},
+            {"max_agent_hops": -1},
+            {"max_agent_hops": True},
+            {"max_agent_hops": "bad"},
+            {"max_agent_hops": "9" * 5000},
         ],
     )
     async def test_invalid_mutual_agent_config_fails_closed(self, extra):
         adapter = _make_adapter(extra)
+
+        assert await adapter.connect() is False
+        assert adapter.fatal_error_code == "config_invalid"
+        assert adapter.fatal_error_retryable is False
+
+    @pytest.mark.asyncio
+    async def test_blank_mention_required_env_override_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_MENTION_REQUIRED_USERS", "   ")
+        adapter = _make_adapter({
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
 
         assert await adapter.connect() is False
         assert adapter.fatal_error_code == "config_invalid"
@@ -360,6 +381,32 @@ class TestMentionGating:
         await adapter._poll_channel(CHANNEL)
 
         assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_longer_peer_alias_does_not_match_self_alias_prefix(self):
+        second_agent = "b" * 64
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_required_users": [OTHER_PUBKEY],
+            "mention_aliases": {
+                "Bot": SELF_PUBKEY,
+                "Bot-2": second_agent,
+            },
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        event = _event("e-prefix", content="@Bot-2 please review", created_at=10)
+        event["tags"].append(["p", SELF_PUBKEY])
+
+        await adapter._handle_event(CHANNEL, state, event)
+
+        assert adapter._dispatched == []
 
     def test_configured_self_alias_is_stripped_from_leading_prompt(self):
         adapter = _make_adapter({"mention_aliases": {"Warren": SELF_PUBKEY}})
@@ -629,6 +676,27 @@ class TestBuzzAdapterSend:
         assert args[mention_index + 1] == OTHER_PUBKEY
 
     @pytest.mark.asyncio
+    async def test_send_longer_alias_does_not_tag_prefix_alias(self):
+        second_agent = "b" * 64
+        adapter = _make_adapter({
+            "mention_aliases": {
+                "Bot": OTHER_PUBKEY,
+                "Bot-2": second_agent,
+            }
+        })
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-mention"})
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "@Bot-2 please review")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        mentions = [args[index + 1] for index, value in enumerate(args) if value == "--mention"]
+        assert mentions == [second_agent]
+
+    @pytest.mark.asyncio
     async def test_send_with_agent_mention_recovers_missing_reply_parent(self):
         adapter = _make_adapter({
             "mention_aliases": {"Warren": OTHER_PUBKEY},
@@ -673,6 +741,41 @@ class TestBuzzAdapterSend:
         args, _stdin_text = cli.calls[0]
         assert args[args.index("--reply-to") + 1] == "current-agent-parent"
         assert adapter._agent_hops["evt-safe-parent"] == 5
+
+    @pytest.mark.asyncio
+    async def test_new_agent_root_replaces_higher_hop_active_chain(self):
+        adapter = _make_adapter({
+            "require_mention": False,
+            "mention_aliases": {"Self": SELF_PUBKEY, "Peer": OTHER_PUBKEY},
+            "mention_required_users": [OTHER_PUBKEY],
+            "max_agent_hops": 4,
+        })
+        adapter._active_agent_events[CHANNEL] = ("old-chain", 3)
+        adapter._agent_hops["old-chain"] = 3
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        new_root = _event("new-root", content="@Self start another task", created_at=20)
+        new_root["tags"].append(["p", SELF_PUBKEY])
+
+        await adapter._handle_event(CHANNEL, state, new_root)
+
+        assert adapter._active_agent_events[CHANNEL] == ("new-root", 1)
+
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "new-reply"})
+        adapter._run_cli = cli
+        result = await adapter.send(CHANNEL, "@Peer continue", reply_to="new-root")
+
+        assert result.success is True
+        args, _stdin_text = cli.calls[0]
+        assert args[args.index("--reply-to") + 1] == "new-root"
+        assert adapter._agent_hops["new-reply"] == 2
 
     @pytest.mark.asyncio
     async def test_authorized_human_message_clears_active_agent_chain(self):
@@ -887,3 +990,38 @@ class TestStandaloneSend:
 
         assert result == {"success": True, "message_id": "evt-cron"}
         assert captured["args"][captured["args"].index("--mention") + 1] == OTHER_PUBKEY
+
+    @pytest.mark.asyncio
+    async def test_standalone_media_send_resolves_configured_agent_alias(self, monkeypatch, tmp_path):
+        from gateway.config import PlatformConfig
+
+        fake_cli = tmp_path / "buzz"
+        fake_cli.write_text("#!/bin/sh\n", encoding="utf-8")
+        media = tmp_path / "proof.png"
+        media.write_bytes(b"png")
+        monkeypatch.setenv("BUZZ_RELAY_URL", "https://r")
+        monkeypatch.setenv("BUZZ_PRIVATE_KEY", "nsec1x")
+        monkeypatch.setenv("BUZZ_CLI_PATH", str(fake_cli))
+        captured = {}
+
+        async def fake_exec(cli_path, args, *, relay_url, private_key, input_text=None, timeout=30.0):
+            captured["args"] = args
+            return 0, json.dumps({"accepted": True, "event_id": "evt-cron"}), ""
+
+        monkeypatch.setattr(_buzz_mod, "_exec_buzz", fake_exec)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"mention_aliases": {"Warren": OTHER_PUBKEY}},
+        )
+
+        result = await _standalone_send(
+            config,
+            CHANNEL,
+            "@Warren see attachment",
+            media_files=[str(media)],
+        )
+
+        assert result == {"success": True, "message_id": "evt-cron"}
+        args = captured["args"]
+        assert args[args.index("--mention") + 1] == OTHER_PUBKEY
+        assert args[args.index("--file") + 1] == str(media)
