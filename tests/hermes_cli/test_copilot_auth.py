@@ -14,6 +14,32 @@ class TestTokenValidation:
         assert "Classic Personal Access Tokens" in msg
         assert "ghp_" in msg
 
+    def test_oauth_token_accepted(self):
+        from hermes_cli.copilot_auth import validate_copilot_token
+        valid, msg = validate_copilot_token("gho_ab...1234")
+        assert valid is True
+
+    def test_fine_grained_pat_accepted(self):
+        from hermes_cli.copilot_auth import validate_copilot_token
+        valid, msg = validate_copilot_token("github_pat_ab...1234")
+        assert valid is True
+
+    def test_github_app_token_accepted(self):
+        from hermes_cli.copilot_auth import validate_copilot_token
+        valid, msg = validate_copilot_token("ghu_ab...1234")
+        assert valid is True
+
+    def test_empty_token_rejected(self):
+        from hermes_cli.copilot_auth import validate_copilot_token
+        valid, msg = validate_copilot_token("")
+        assert valid is False
+
+    def test_invalid_token_rejected(self):
+        from hermes_cli.copilot_auth import validate_copilot_token
+        valid, msg = validate_copilot_token("not_a_github_token")
+        assert valid is False
+        assert "Supported token prefixes" in msg
+
 
 class TestResolveToken:
     """Token resolution with env var priority."""
