@@ -154,6 +154,26 @@ def test_run_slash_reclaim_running_task(kanban_home):
     assert "ready" in out2.lower()
 
 
+def test_kanban_show_does_not_use_closed_connection(kanban_home):
+    """Regression: text-mode show used to call task_graph_context after
+    connect_closing exited, raising sqlite3.ProgrammingError and aborting
+    diagnostics / remainder of the human-readable view.
+    """
+    import re
+
+    out1 = kc.run_slash("create 'show graph after close' --assignee worker")
+    m = re.search(r"(t_[a-f0-9]+)", out1)
+    assert m, out1
+    tid = m.group(1)
+
+    out = kc.run_slash(f"show {tid}")
+    assert "Traceback" not in out, out
+    assert "closed database" not in out, out
+    assert tid in out
+    assert "show graph after close" in out
+    assert "status:" in out.lower() or "ready" in out.lower()
+
+
 
 
 # ---------------------------------------------------------------------------
