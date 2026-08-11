@@ -142,6 +142,37 @@ class TestBinDirectoryMount:
         assert mounts[0]["host_path"] == str(bin_dir)
         assert mounts[0]["container_path"] == "/root/.hermes/bin"
 
+    def test_symlinks_are_sanitized(self, tmp_path):
+        """Symlinks in bin dir should be excluded from the mount."""
+        hermes_home = tmp_path / ".hermes"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True)
+        tool = bin_dir / "ok"
+        tool.write_text("#!/bin/sh\necho ok\n")
+        secret = tmp_path / "secret.txt"
+        secret.write_text("TOP SECRET")
+        (bin_dir / "evil_link").symlink_to(secret)
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            mounts = get_bin_directory_mount()
+
+        assert len(mounts) == 1
+        safe_path = Path(mounts[0]["host_path"])
+        assert safe_path != bin_dir
+        assert (safe_path / "ok").exists()
+        assert not (safe_path / "evil_link").exists()
+
+    def test_no_symlinks_returns_original_dir(self, tmp_path):
+        hermes_home = tmp_path / ".hermes"
+        bin_dir = hermes_home / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "ok").write_text("#!/bin/sh\n")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            mounts = get_bin_directory_mount()
+
+        assert mounts[0]["host_path"] == str(bin_dir)
+
     def test_empty_when_bin_missing(self, tmp_path):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

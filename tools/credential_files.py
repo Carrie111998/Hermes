@@ -410,19 +410,69 @@ def get_bin_directory_mount(
     The local terminal backend already appends this dir to PATH; docker and
     singularity need an explicit bind mount so the binaries are visible.
 
+    **Security:** Bind mounts follow symlinks, so a malicious symlink in
+    ``bin/`` could expose arbitrary host files.  When symlinks are detected,
+    this function creates a sanitized copy (regular files only) — matching
+    :func:`get_skills_directory_mount`.
+
     Returns a list of dicts with ``host_path`` and ``container_path`` keys
-    (empty when the directory is missing).  Symlinks inside ``bin/`` are
-    followed by the bind mount — operators should only place trusted
-    binaries there.
+    (empty when the directory is missing).
     """
     hermes_home = _resolve_hermes_home()
     bin_dir = hermes_home / "bin"
     if not bin_dir.is_dir():
         return []
     return [{
-        "host_path": str(bin_dir),
+        "host_path": _safe_bin_path(bin_dir),
         "container_path": f"{container_base.rstrip('/')}/bin",
     }]
+
+
+_safe_bin_tempdir: Path | None = None
+
+
+def _safe_bin_path(bin_dir: Path) -> str:
+    """Return *bin_dir* if symlink-free, else a sanitized temp copy."""
+    global _safe_bin_tempdir
+
+    symlinks = [p for p in bin_dir.rglob("*") if p.is_symlink()]
+    if not symlinks:
+        return str(bin_dir)
+
+    for link in symlinks:
+        logger.warning(
+            "credential_files: skipping symlink in bin dir: %s -> %s",
+            link, os.readlink(link),
+        )
+
+    import atexit
+    import shutil
+    import tempfile
+
+    if _safe_bin_tempdir and _safe_bin_tempdir.is_dir():
+        shutil.rmtree(_safe_bin_tempdir, ignore_errors=True)
+
+    safe_dir = Path(tempfile.mkdtemp(prefix="hermes-bin-safe-"))
+    _safe_bin_tempdir = safe_dir
+
+    for item in bin_dir.rglob("*"):
+        if item.is_symlink():
+            continue
+        rel = item.relative_to(bin_dir)
+        target = safe_dir / rel
+        if item.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        elif item.is_file():
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(item), str(target))
+
+    def _cleanup():
+        if safe_dir.is_dir():
+            shutil.rmtree(safe_dir, ignore_errors=True)
+
+    atexit.register(_cleanup)
+    logger.info("credential_files: created symlink-safe bin copy at %s", safe_dir)
+    return str(safe_dir)
 
 
 def iter_bin_files(
@@ -457,6 +507,8 @@ def prepend_bin_to_path(
 
     If PATH is unset, seed a sane Linux container PATH so we do not wipe
     the image default entirely when docker ``-e PATH=`` replaces it.
+    On Windows the local terminal backend already handles PATH via
+    ``os.pathsep``; this helper is for Linux sandbox containers only.
     """
     out = dict(env)
     current = out.get("PATH", "")

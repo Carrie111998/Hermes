@@ -26,7 +26,8 @@ Docker/Podman gateway image.
 1. **Local terminal** — `$HERMES_HOME/bin` is already on the agent subshell PATH.
 2. **Docker / Singularity sandboxes** — if `$HERMES_HOME/bin` exists, Hermes
    bind-mounts it at `/root/.hermes/bin` (read-only) and prepends that path to
-   `PATH` inside the sandbox.
+   `PATH` inside the sandbox. Symlinks inside `bin/` are sanitized (same as
+   skills mounts) so a malicious link cannot expose arbitrary host paths.
 3. **Modal / Daytona / SSH** — files under `$HERMES_HOME/bin` are synced into
    the remote home the same way skills are.
 4. **Gateway container image** — `/opt/data/bin` is on the image `PATH`, so
