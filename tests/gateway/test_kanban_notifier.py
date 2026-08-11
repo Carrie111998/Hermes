@@ -516,3 +516,48 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def test_notifier_review_requested_carries_kanban_review_metadata(tmp_path, monkeypatch):
+    """A review_requested event passes (task_id, run_id, board) to the adapter.
+
+    The kanban_review metadata key is what the Discord adapter reads to
+    construct ReviewDecisionView buttons. Without it the review notification
+    is just text without interactive controls.
+    """
+    db_path = tmp_path / "review-metadata.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="review button test", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        # request_review emits a review_requested event with a run_id
+        assert kb.request_review(
+            conn, tid, summary="ready for eyes", force=True,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1, (
+        "review_requested must produce a notification; got "
+        f"{len(adapter.sent)}"
+    )
+    text = adapter.sent[0]["text"]
+    assert tid in text
+    assert "review" in text.lower()
+
+    kanban_review = adapter.sent[0]["metadata"].get("kanban_review")
+    assert isinstance(kanban_review, dict), (
+        f"Expected kanban_review dict in metadata, got {kanban_review!r}"
+    )
+    assert kanban_review["task_id"] == tid
+    assert isinstance(kanban_review["run_id"], int) and kanban_review["run_id"] > 0
+    assert kanban_review.get("board") is not None
+    assert kanban_review.get("channel_id") is not None

@@ -1364,6 +1364,19 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Exactly one terminal human decision is allowed for a review gate. The
+-- (task_id, run_id) key prevents stale Discord components from acting on a
+-- later retry of the same card.
+CREATE TABLE IF NOT EXISTS kanban_review_decisions (
+    task_id     TEXT NOT NULL,
+    run_id      INTEGER NOT NULL,
+    decision    TEXT NOT NULL CHECK (decision IN ('approve', 'reject')),
+    actor       TEXT NOT NULL,
+    reason      TEXT,
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (task_id, run_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -6283,6 +6296,114 @@ def request_review(
             run_id=run_id,
         )
     return _ret(True)
+
+
+def resolve_review(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    decision: str,
+    actor: str,
+    reason: Optional[str] = None,
+) -> tuple[bool, str]:
+    """Apply one authenticated decision to the exact review run.
+
+    The latest review_requested event must carry ``run_id`` and the card
+    must still be in ``review``. The insert and state transition share one
+    ``BEGIN IMMEDIATE`` transaction, so two concurrent button presses cannot
+    both win. Stale or malformed requests fail closed.
+
+    ``approve`` completes the task (review→done). ``reject`` records the
+    reason and routes the task back to the implementer (review→todo/ready).
+    """
+    decision = str(decision or "").strip().lower()
+    actor = str(actor or "").strip()
+    reason = str(reason or "").strip() or None
+    if decision not in {"approve", "reject"}:
+        raise ValueError("decision must be approve or reject")
+    if not actor:
+        raise ValueError("actor is required")
+    if decision == "reject" and reason is None:
+        raise ValueError("reject reason is required")
+    with write_txn(conn):
+        task = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if task is None:
+            return False, "task_not_found"
+        prior = conn.execute(
+            "SELECT 1 FROM kanban_review_decisions WHERE task_id = ? AND run_id = ?",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if prior is not None:
+            return False, "already_decided"
+        if task["status"] != "review":
+            return False, "not_in_review"
+        latest = conn.execute(
+            """SELECT id, run_id, payload FROM task_events
+               WHERE task_id = ? AND kind = 'review_requested'
+               ORDER BY id DESC LIMIT 1""",
+            (task_id,),
+        ).fetchone()
+        if latest is None:
+            return False, "stale_review"
+        if latest["run_id"] is None or int(latest["run_id"]) != int(run_id):
+            return False, "stale_review"
+        try:
+            conn.execute(
+                """INSERT INTO kanban_review_decisions
+                   (task_id, run_id, decision, actor, reason, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (task_id, int(run_id), decision, actor, reason, int(time.time())),
+            )
+        except sqlite3.IntegrityError:
+            return False, "already_decided"
+        if decision == "approve":
+            now = int(time.time())
+            stale_run = task["current_run_id"]
+            if stale_run:
+                conn.execute(
+                    """UPDATE task_runs SET status='reclaimed', outcome='reclaimed',
+                       ended_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL
+                       WHERE id=? AND ended_at IS NULL""", (now, int(stale_run)),
+                )
+            conn.execute(
+                """UPDATE tasks SET status='done', current_run_id=NULL,
+                   completed_at=?, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL,
+                   consecutive_failures=0, last_failure_error=NULL
+                   WHERE id=? AND status='review'""", (now, task_id),
+            )
+            _append_event(conn, task_id, "completed", {
+                "summary": f"Approved via Discord by actor {actor}",
+                "review_decision": "approve", "actor": actor,
+            }, run_id=int(run_id))
+        else:
+            new_status = _landing_status_after_parents(conn, task_id)
+            requested_event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_requested' "
+                "ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            try:
+                payload = json.loads(requested_event["payload"] or "{}")
+            except (TypeError, ValueError):
+                payload = {}
+            implementer = payload.get("implementer")
+            assignee_sql = ", assignee = ?" if implementer else ""
+            params = (new_status, implementer, task_id) if implementer else (new_status, task_id)
+            conn.execute(
+                "UPDATE tasks SET status = ?, current_run_id = NULL, "
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL"
+                + assignee_sql
+                + " WHERE id = ? AND status = 'review'",
+                params,
+            )
+            _append_event(conn, task_id, "review_rejected", {
+                "review_decision": "reject", "actor": actor, "reason": reason,
+            }, run_id=int(run_id))
+    return True, decision
 
 
 def request_changes(

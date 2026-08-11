@@ -433,6 +433,7 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
+                        needs_review_buttons = False
                         if kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
@@ -488,7 +489,9 @@ class GatewayKanbanWatchersMixin:
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
                         elif kind == "review_requested":
                             # Implementation complete; task moved to the
-                            # first-class review lane. Wake the origin thread.
+                            # first-class review lane. Wake the origin thread
+                            # and surface Approve/Reject buttons.
+                            needs_review_buttons = True
                             handoff = ""
                             if ev.payload and ev.payload.get("summary"):
                                 handoff = f"\n{str(ev.payload['summary'])[:200]}"
@@ -532,6 +535,17 @@ class GatewayKanbanWatchersMixin:
                         )
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                        # Review controls are bound to the event's exact run;
+                        # the adapter validates the operator and the DB performs
+                        # the atomic state transition/deduplication.
+                        if needs_review_buttons and getattr(ev, "run_id", None):
+                            metadata["kanban_review"] = {
+                                "task_id": sub["task_id"],
+                                "run_id": int(ev.run_id),
+                                "board": board_slug,
+                                "channel_id": str(sub.get("thread_id") or sub["chat_id"]),
+                                "guild_id": metadata.get("guild_id"),
+                            }
                         # Adapters with no push channel (the API server —
                         # ``supports_async_delivery = False``) can NEVER
                         # satisfy a text-send: ``send()`` always reports

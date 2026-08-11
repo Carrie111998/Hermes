@@ -3100,8 +3100,17 @@ class DiscordAdapter(BasePlatformAdapter):
                     return SendResult(success=False, error=f"Channel {chat_id} not found")
 
             # Forum channels reject channel.send() — create a thread post instead.
+            review_view = None
+            review_meta = metadata.get("kanban_review") if metadata else None
+            if isinstance(review_meta, dict) and review_meta.get("task_id") and review_meta.get("run_id"):
+                review_view = ReviewDecisionView(
+                    str(review_meta["task_id"]), int(review_meta["run_id"]),
+                    str(review_meta.get("board") or ""),
+                    str(review_meta.get("channel_id") or ""),
+                    str(review_meta.get("guild_id") or ""), self,
+                )
             if self._is_forum_parent(channel):
-                result = await self._send_to_forum(channel, content)
+                result = await self._send_to_forum(channel, content, review_view=review_view)
                 await asyncio.to_thread(
                     self._record_discord_response,
                     reply_to=reply_to,
@@ -3128,6 +3137,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        view=review_view if i == 0 else None,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -3150,6 +3160,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            view=review_view if i == 0 else None,
                         )
                     else:
                         raise
@@ -3190,7 +3201,7 @@ class DiscordAdapter(BasePlatformAdapter):
             )
             return result
 
-    async def _send_to_forum(self, forum_channel: Any, content: str) -> SendResult:
+    async def _send_to_forum(self, forum_channel: Any, content: str, *, review_view=None) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
 
         Forum channels (type 15) don't support direct messages.  Instead we
@@ -3213,6 +3224,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread = await forum_channel.create_thread(
                 name=thread_name,
                 content=starter_content,
+                view=review_view,
             )
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
@@ -8378,7 +8390,99 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView, ReviewDecisionView, ReviewRejectModal
+
+    _review_modal_base = getattr(discord.ui, "Modal", None)
+    if _review_modal_base is not None:
+        class ReviewRejectModal(_review_modal_base, title="Reject review"):
+            def __init__(self, view):
+                super().__init__(timeout=_read_discord_prompt_timeout())
+                self.review_view = view
+                self.reason = discord.ui.TextInput(
+                    label="Reason (required)", style=discord.TextStyle.paragraph,
+                    min_length=1, max_length=1000, required=True,
+                )
+                self.add_item(self.reason)
+
+            async def on_submit(self, interaction):
+                await self.review_view.resolve(interaction, "reject", str(self.reason.value))
+    else:
+        ReviewRejectModal = None
+
+    class ReviewDecisionView(discord.ui.View):
+        """State-bound Approve/Reject controls for one Kanban review run."""
+        def __init__(self, task_id, run_id, board, channel_id, guild_id, adapter):
+            super().__init__(timeout=_read_discord_prompt_timeout())
+            self.task_id = str(task_id)
+            self.run_id = int(run_id)
+            self.board = str(board or "")
+            self.channel_id = str(channel_id or "")
+            self.guild_id = str(guild_id or "")
+            self.adapter = adapter
+            self.resolved = False
+
+        def _authorized(self, interaction):
+            channel = getattr(interaction, "channel", None)
+            actual_channel_id = str(getattr(channel, "id", "") or "")
+            if self.channel_id and actual_channel_id != self.channel_id:
+                return False
+            actual_guild_id = str(getattr(getattr(interaction, "guild", None), "id", "") or "")
+            if self.guild_id and actual_guild_id != self.guild_id:
+                return False
+            return _component_check_auth(
+                interaction,
+                getattr(self.adapter, "_allowed_user_ids", set()),
+                getattr(self.adapter, "_allowed_role_ids", set()),
+            )
+
+        async def resolve(self, interaction, decision, reason=None):
+            if not self._authorized(interaction):
+                await interaction.response.send_message("Not authorized for this review.", ephemeral=True)
+                return
+            if self.resolved:
+                await interaction.response.send_message("This review has already been decided.", ephemeral=True)
+                return
+            actor = str(getattr(getattr(interaction, "user", None), "id", ""))
+            reason = str(reason or "").strip() or None
+            try:
+                from hermes_cli import kanban_db as kb
+                conn = kb.connect(board=self.board or None)
+                try:
+                    ok, result = kb.resolve_review(
+                        conn, self.task_id, self.run_id, decision=decision,
+                        actor=actor, reason=reason,
+                    )
+                finally:
+                    conn.close()
+            except Exception:
+                logger.exception("Kanban review decision failed for %s", self.task_id)
+                ok, result = False, "error"
+            if not ok:
+                await interaction.response.send_message(
+                    f"Decision not applied ({result}); the card may be stale or already decided.",
+                    ephemeral=True,
+                )
+                return
+            self.resolved = True
+            for child in self.children:
+                child.disabled = True
+            label = "Approved" if decision == "approve" else "Rejected"
+            status_line = f"{label} by <@{actor}>."
+            if reason:
+                status_line += f" Reason: {reason}"
+            await interaction.response.edit_message(content=status_line, view=self)
+
+        @discord.ui.button(label="Approve", style=discord.ButtonStyle.green)
+        async def approve(self, interaction, button):
+            await self.resolve(interaction, "approve")
+
+        @discord.ui.button(label="Reject", style=discord.ButtonStyle.red)
+        async def reject(self, interaction, button):
+            await interaction.response.send_modal(ReviewRejectModal(self))
+
+        async def on_timeout(self):
+            for child in self.children:
+                child.disabled = True
 
     class ExecApprovalView(discord.ui.View):
         """
