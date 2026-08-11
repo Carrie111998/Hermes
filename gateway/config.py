@@ -2663,11 +2663,20 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             # awaits this synchronously) — even when the user configured none
             # of them.  That blocked startup until every install finished and
             # caused the desktop app to time out and boot-loop (stuck at 94%).
+            #
+            # Prefer ``deps_available_fn`` when the plugin supplies one.  For
+            # adapters that defer a heavy SDK, ``check_fn`` *is* the loader --
+            # Feishu's ``check_feishu_requirements()`` imports lark_oapi
+            # (~10k modules; measured 413.9s cold here), and it fires for any
+            # user who actually configured Feishu.  We only need "are the deps
+            # installed?" to decide enablement; the real load still happens at
+            # adapter construction (``create_adapter``) and ``connect()``.
+            deps_probe = entry.deps_available_fn or entry.check_fn
             try:
-                if not entry.check_fn():
+                if not deps_probe():
                     continue
             except Exception as e:
-                logger.debug("check_fn for %s raised: %s", entry.name, e)
+                logger.debug("deps probe for %s raised: %s", entry.name, e)
                 continue
             if platform not in config.platforms:
                 config.platforms[platform] = PlatformConfig()
