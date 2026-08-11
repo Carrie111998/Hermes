@@ -664,6 +664,14 @@ def _ensure_current_event_loop(request):
 #    never pip-install into the environment the gateway runs from.
 #    Installs redirected via ``--target``/``--prefix``/``--root``/
 #    ``--python``, or run against another interpreter, pass through.
+#  • The same wrappers reject a DIRECT gateway launch/stop —
+#    ``hermes gateway run``, ``pythonw -m hermes_cli.main gateway run``,
+#    ``python -m gateway.run``. This is the systemd guard's blind spot:
+#    it keys on ``systemctl`` being present, so every detached-spawn path
+#    (the only one Windows ever uses) went unchecked. A test that stubs
+#    part of the launch surface and misses the branch the code actually
+#    takes would silently leave a background gateway behind on the
+#    developer's machine — see _is_gateway_lifecycle_cmd for the history.
 #
 # We intentionally do NOT stub ``find_gateway_pids`` / ``_scan_gateway_pids``
 # here — tests of those functions themselves need the real implementation.
@@ -829,6 +837,13 @@ def _live_system_guard(request, monkeypatch):
         "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
+    # Verbs that, applied to the ``gateway`` subcommand, start or tear down a
+    # REAL gateway process. ``status`` / ``logs`` / ``health`` / ``install``
+    # are deliberately absent — they are read-only or config-only and several
+    # tests exercise them.
+    _GATEWAY_LIFECYCLE_VERBS = (
+        "run", "start", "restart", "replace", "stop", "kill",
+    )
 
     # Package-installer tokens. ``pipx``/``uv tool`` deliberately absent:
     # they install into their own isolated dirs, not the active venv.
@@ -952,7 +967,84 @@ def _live_system_guard(request, monkeypatch):
                     return True
         return False
 
+    def _is_gateway_lifecycle_cmd(cmd) -> bool:
+        """True for a subprocess that would START or STOP a real gateway.
+
+        The systemctl guard above only fires when ``systemctl`` is in the
+        command, so the *direct* spawn paths — the ones actually used on
+        Windows and in every ``--detached`` flow — sailed straight through:
+
+            subprocess.Popen(["hermes", "gateway", "run"])                 # launch_gateway_detached
+            subprocess.Popen([pythonw, "-m", "hermes_cli.main", ...])      # gateway_windows._spawn_detached
+
+        A test that stubs *some* of the launch surface but not all of it
+        (e.g. stubs ``run_gateway`` but not ``launch_gateway_detached``,
+        then hits the Windows branch that defaults to detached) reaches the
+        real Popen and puts a background gateway on the developer's machine.
+        That is exactly what
+        ``test_gateway_restart_on_windows_preserves_failure_fallback`` did on
+        every run until 82b130b6e — invisibly, because the test asserted on a
+        ``calls`` list, so the unstubbed real spawn merely failed an
+        assertion instead of announcing that it had launched a process.
+
+        Detection is token-based rather than substring-based so that an
+        absolute entrypoint (``C:\\...\\hermes.exe gateway run``) is caught as
+        readily as the bare ``hermes gateway run``.
+        """
+        cmd_str = _cmd_to_string(cmd)
+        if not cmd_str:
+            return False
+        low = cmd_str.lower()
+        if "gateway" not in low:
+            return False
+        if "systemctl" in low:
+            return False  # already covered by _is_blocked_systemctl
+
+        # Normalise path separators so basenames are comparable, and avoid
+        # shlex here: on Windows it eats the backslashes in a real argv.
+        tokens = [t.strip("\"'") for t in low.replace("\\", "/").split()]
+        basenames = [t.rsplit("/", 1)[-1] for t in tokens]
+
+        # ``python -m gateway.run`` / ``gateway/run.py`` launch the gateway
+        # with no ``gateway`` subcommand token at all.
+        if "gateway/run.py" in low or "gateway.run" in basenames:
+            return True
+
+        # Otherwise require a Hermes entrypoint AND `gateway <lifecycle-verb>`.
+        has_entry = any(
+            b.startswith("hermes") or b in ("hermes_cli.main", "hermes_cli")
+            for b in basenames
+        )
+        if not has_entry:
+            return False
+        for idx, base in enumerate(basenames):
+            if base != "gateway":
+                continue
+            for nxt in basenames[idx + 1:]:
+                if nxt.startswith("-"):
+                    continue  # skip flags like --replace's leading dashes
+                return nxt in _GATEWAY_LIFECYCLE_VERBS
+        return False
+
     def _check_subprocess_cmd(name, cmd):
+        if _is_gateway_lifecycle_cmd(cmd):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this would start or stop a "
+                "REAL Hermes gateway process on this machine. The test "
+                "reached a genuine launch/stop path, which means part of "
+                "the spawn surface is unstubbed. Stub the specific "
+                "function the code path actually calls — e.g. "
+                "launch_gateway_detached, gateway_windows._spawn_detached, "
+                "_launch_detached_gateway, _spawn_gateway_restart_watcher, "
+                "launch_detached_profile_gateway_restart — and remember "
+                "that the Windows branch of _gateway_command_inner defaults "
+                "the recovery relaunch to DETACHED (`detached = "
+                "is_windows()` when args.detached is None), so stubbing "
+                "run_gateway alone is not enough. Mark with "
+                "@pytest.mark.live_system_guard_bypass only if a real "
+                "gateway process is genuinely required."
+            )
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
