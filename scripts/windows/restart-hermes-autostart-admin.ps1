@@ -83,12 +83,13 @@ try {
     $DesktopScript = Join-Path $ScriptDir "start-hermes-desktop.ps1"
     $DashboardScript = Join-Path $ScriptDir "start-hermes-dashboard.ps1"
     $MemoryGraphScript = Join-Path $ScriptDir "start-obsidian-memory-graph-server.ps1"
+    $GoWatchdogScript = Join-Path $ScriptDir "Start-HermesGoWatchdog.ps1"
     $RepoTailscaleScript = Join-Path $ScriptDir "Update-HermesTailscaleServe.ps1"
     $LineNgrokScript = "C:\Users\downl\AppData\Local\HermesWebUI\Start-HermesLineNgrok.ps1"
     $WebUiScript = "C:\Users\downl\AppData\Local\HermesWebUI\Start-HermesWebUI.ps1"
     $TailscaleScript = "C:\Users\downl\AppData\Local\HermesWebUI\Update-HermesTailscaleServe.ps1"
 
-    foreach ($path in @($GatewayScript, $DesktopScript, $DashboardScript, $MemoryGraphScript, $LineNgrokScript, $WebUiScript)) {
+    foreach ($path in @($GatewayScript, $DesktopScript, $DashboardScript, $MemoryGraphScript, $GoWatchdogScript, $LineNgrokScript, $WebUiScript)) {
         if (-not (Test-Path -LiteralPath $path)) {
             throw "Required script not found: $path"
         }
@@ -194,6 +195,13 @@ try {
         HERMES_DESKTOP_HERMES_ROOT = $RepoRoot
         HERMES_DESKTOP_CWD = $RepoRoot
     }
+
+    Register-HermesBootTask `
+        -TaskName "HermesGoWatchdogBootAutoStart" `
+        -Description "Boot auto-start Hermes Desktop/backend watchdog and configured local embedding server" `
+        -PowerShellCommand "$envPrefix& '$GoWatchdogScript' -HermesRoot '$RepoRoot' -HermesHome '$HermesHome' -ManagedBackendPort 9118" `
+        -WorkingDirectory $RepoRoot `
+        -DelaySeconds 15
 
     Register-HermesBootTask `
         -TaskName "HermesGatewayBootAutoStart" `
@@ -315,6 +323,7 @@ try {
     }
 
     Write-Step "Starting Hermes tasks in order..."
+    Start-HermesTask -TaskName "HermesGoWatchdogBootAutoStart" -WaitSeconds 4
     Start-HermesTask -TaskName "HermesGatewayAutoStart" -WaitSeconds 12
     Start-HermesTask -TaskName "HermesHypuraHarnessAutoStart" -WaitSeconds 6
     Start-HermesTask -TaskName "HermesLineNgrokAutoStart" -WaitSeconds 4
@@ -362,6 +371,7 @@ try {
 
     Write-Step "Verification: boot task triggers"
     foreach ($name in @(
+        "HermesGoWatchdogBootAutoStart",
         "HermesGatewayBootAutoStart",
         "HermesHypuraHarnessBootAutoStart",
         "HermesLineNgrokBootAutoStart",

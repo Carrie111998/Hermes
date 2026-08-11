@@ -35,6 +35,12 @@ func main() {
 	backendStartTimeout := flag.Int("backend-start-timeout", 300, "Seconds to wait for managed serve /api/status")
 	backendReadyTimeout := flag.Int("backend-ready-timeout", 180, "Extra seconds waiting for managed serve readiness")
 	managedPort := flag.Int("managed-backend-port", DefaultManagedBackendPort, "Fixed localhost port for watchdog-managed hermes serve")
+	embeddingEnabled := flag.Bool("embedding-enabled", false, "Supervise the configured local embedding llama-server")
+	embeddingEndpoint := flag.String("embedding-endpoint", "", "Configured local embedding endpoint, for example http://127.0.0.1:8082")
+	embeddingServer := flag.String("embedding-server", "", "Configured llama-server executable for embeddings")
+	embeddingModel := flag.String("embedding-model", "", "Configured GGUF path for embeddings")
+	embeddingArgsJSON := flag.String("embedding-args-json", "[]", "JSON array of fixed embedding llama-server arguments")
+	embeddingStartTimeout := flag.Int("embedding-start-timeout", 180, "Seconds an owned embedding server may initialize before restart")
 	once := flag.Bool("once", false, "Run a single watchdog cycle then exit")
 	noHTTP := flag.Bool("no-http", false, "Disable HTTP control plane (watch loop only)")
 	flag.Parse()
@@ -61,22 +67,28 @@ func main() {
 	}
 
 	cfg := Config{
-		IntervalSec:            *interval,
-		FailThreshold:          *failThreshold,
-		Once:                   *once,
-		PrewarmBackend:         *prewarm,
-		BackendStartTimeoutSec: *backendStartTimeout,
-		BackendReadyTimeoutSec: *backendReadyTimeout,
-		ManagedBackendPort:     *managedPort,
-		ListenAddr:             strings.TrimSpace(*listen),
-		TsnetHostname: *tsnetHost,
-		EnableTsnet:   *enableTsnet,
-		HermesRoot:    root,
-		HermesHome:    home,
-		PackagedExe:   *packagedExe,
-		DataDir:       *dataDir,
-		AdminToken:    loadAdminToken(),
-		TsAuthKey:     loadTsAuthKey(),
+		IntervalSec:              *interval,
+		FailThreshold:            *failThreshold,
+		Once:                     *once,
+		PrewarmBackend:           *prewarm,
+		BackendStartTimeoutSec:   *backendStartTimeout,
+		BackendReadyTimeoutSec:   *backendReadyTimeout,
+		ManagedBackendPort:       *managedPort,
+		EmbeddingEnabled:         *embeddingEnabled,
+		EmbeddingEndpoint:        *embeddingEndpoint,
+		EmbeddingServer:          *embeddingServer,
+		EmbeddingModel:           *embeddingModel,
+		EmbeddingArgsJSON:        *embeddingArgsJSON,
+		EmbeddingStartTimeoutSec: *embeddingStartTimeout,
+		ListenAddr:               strings.TrimSpace(*listen),
+		TsnetHostname:            *tsnetHost,
+		EnableTsnet:              *enableTsnet,
+		HermesRoot:               root,
+		HermesHome:               home,
+		PackagedExe:              *packagedExe,
+		DataDir:                  *dataDir,
+		AdminToken:               loadAdminToken(),
+		TsAuthKey:                loadTsAuthKey(),
 	}
 	if cfg.PackagedExe == "" {
 		cfg.PackagedExe = defaultPackagedExe(root)

@@ -23,6 +23,7 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = if ($HermesRoot) { $HermesRoot } else { (Resolve-Path (Join-Path $ScriptDir "..\..")).Path }
 if (-not $HermesHome) { $HermesHome = Join-Path $env:USERPROFILE ".hermes" }
+$env:HERMES_HOME = $HermesHome
 
 $Exe = Join-Path $ScriptDir "watchdog-go\dist\hermes-watchdog.exe"
 
@@ -128,6 +129,102 @@ function Stop-PsDesktopBackendWatchdog {
     }
 }
 
+function Get-EmbeddingWatchdogArguments {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    $pythonCandidates = @(
+        (Join-Path $Root ".venv\Scripts\python.exe"),
+        (Join-Path $Root "venv\Scripts\python.exe"),
+        (Join-Path $env:USERPROFILE ".hermes\hermes-agent\venv\Scripts\python.exe")
+    )
+    $pythonExe = $pythonCandidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+    if (-not $pythonExe) {
+        Write-Warning "Embedding supervision skipped: no repository Python runtime was found."
+        return @()
+    }
+
+    $configCode = @'
+import json
+import sys
+
+from hermes_cli.config import load_config_readonly
+
+config = load_config_readonly() or {}
+entries = ((config.get("plugins") or {}).get("entries") or {})
+entry = entries.get("semantic-graph") or entries.get("semantic_graph") or {}
+plugin_config = entry.get("config") if isinstance(entry, dict) else {}
+plugin_config = plugin_config if isinstance(plugin_config, dict) else {}
+embedding = plugin_config.get("embedding") or {}
+embedding = embedding if isinstance(embedding, dict) else {}
+runtime = embedding.get("runtime") or {}
+runtime = runtime if isinstance(runtime, dict) else {}
+arguments = runtime.get("arguments") or []
+payload = {
+    "enabled": bool(runtime.get("enabled", False)),
+    "endpoint": str(embedding.get("endpoint") or ""),
+    "executable": str(runtime.get("executable") or ""),
+    "model_path": str(runtime.get("model_path") or ""),
+    "arguments": arguments if isinstance(arguments, list) else [],
+    "startup_timeout_seconds": runtime.get("startup_timeout_seconds", 180),
+}
+json.dump(payload, sys.stdout, ensure_ascii=False)
+'@
+    $raw = $null
+    $configExitCode = 1
+    Push-Location -LiteralPath $Root
+    try {
+        $raw = & $pythonExe -c $configCode 2>$null
+        $configExitCode = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    if ($configExitCode -ne 0) {
+        Write-Warning "Embedding supervision skipped: config.yaml could not be read by the repository runtime."
+        return @()
+    }
+    try {
+        $runtime = $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Warning "Embedding supervision skipped: config.yaml produced invalid runtime data."
+        return @()
+    }
+    if (-not [bool]$runtime.enabled) {
+        return @()
+    }
+    foreach ($name in @("endpoint", "executable", "model_path")) {
+        if ([string]::IsNullOrWhiteSpace([string]$runtime.$name)) {
+            Write-Warning "Embedding supervision skipped: embedding.runtime.$name is required when enabled."
+            return @()
+        }
+    }
+    $argumentValues = @($runtime.arguments | ForEach-Object { [string]$_ })
+    if ($argumentValues | Where-Object { [string]::IsNullOrWhiteSpace($_) }) {
+        Write-Warning "Embedding supervision skipped: embedding.runtime.arguments contains an empty item."
+        return @()
+    }
+    try {
+        $startTimeout = [int]$runtime.startup_timeout_seconds
+    } catch {
+        $startTimeout = 180
+    }
+    if ($startTimeout -le 0) { $startTimeout = 180 }
+    $argumentsJson = if ($argumentValues.Count -eq 0) {
+        "[]"
+    } else {
+        ConvertTo-Json -InputObject ([object[]]$argumentValues) -Compress
+    }
+    return @(
+        "-embedding-enabled=true",
+        "-embedding-endpoint", [string]$runtime.endpoint,
+        "-embedding-server", [string]$runtime.executable,
+        "-embedding-model", [string]$runtime.model_path,
+        "-embedding-args-json", $argumentsJson,
+        "-embedding-start-timeout=$startTimeout"
+    )
+}
+
 Stop-PsDesktopBackendWatchdog
 
 if ($ForceRestart -or $Once) {
@@ -147,9 +244,18 @@ function Format-WatchdogArg([string]$Name, [string]$Value) {
     return ('{0}={1}' -f $Name, $Value)
 }
 
+function Quote-WatchdogArgument([string]$Value) {
+    if ($null -eq $Value) { $Value = "" }
+    if ($Value -match '[\s"]') {
+        return ('"{0}"' -f $Value.Replace('"', '\"'))
+    }
+    return $Value
+}
+
 # Pass flag name and value as separate argv entries so paths with spaces
 # ("New project") are not truncated by Start-Process command-line quoting.
 # Go's flag package accepts both -name=value and -name value.
+$embeddingWatchdogArgs = @(Get-EmbeddingWatchdogArguments -Root $RepoRoot)
 $argList = @(
     "-interval=$IntervalSec",
     "-fail-threshold=$FailThreshold",
@@ -160,11 +266,11 @@ $argList = @(
 if ($Once) { $argList += "-once" }
 if ($NoPrewarm) { $argList += "-prewarm-backend=false" }
 if ($ManagedBackendPort -gt 0) { $argList += "-managed-backend-port=$ManagedBackendPort" }
+if ($embeddingWatchdogArgs.Count -gt 0) { $argList += $embeddingWatchdogArgs }
 if (-not $NoTsnet -and ($env:HERMES_WATCHDOG_TS_AUTHKEY -or $env:TS_AUTHKEY)) {
     $argList += "-tsnet"
 }
 
-$env:HERMES_HOME = $HermesHome
 $workDir = Split-Path -Parent $Exe
 Write-Host "Starting Go watchdog detached: $Exe $($argList -join ' ')"
 
@@ -187,6 +293,9 @@ if (-not $launched) {
     if ($Once) { $shellArgs += "-once" }
     if ($NoPrewarm) { $shellArgs += "-prewarm-backend=false" }
     if ($ManagedBackendPort -gt 0) { $shellArgs += "-managed-backend-port=$ManagedBackendPort" }
+    foreach ($argument in $embeddingWatchdogArgs) {
+        $shellArgs += (Quote-WatchdogArgument ([string]$argument))
+    }
     if (-not $NoTsnet -and ($env:HERMES_WATCHDOG_TS_AUTHKEY -or $env:TS_AUTHKEY)) {
         $shellArgs += "-tsnet"
     }

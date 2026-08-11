@@ -41,6 +41,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\Start-Hermes
 | `-NoTsnet` | off | tsnet を強制 OFF |
 | `-Listen` | 127.0.0.1:9920 | ローカル HTTP |
 
+`plugins.entries.semantic-graph.config.embedding.runtime.enabled: true` の場合、
+Start スクリプトは同じ `config.yaml` から 8082 の llama.cpp 起動情報を読み、Go
+watchdog に渡します。watchdog は `/health` が healthy な既存プロセスを置換せず、
+停止後または自ら起動したプロセスが初期化 timeout を超えた場合だけ stock
+`llama-server` を再起動します。モデル取得、8080 への操作、未知 PID の停止は行いません。
+
 ## Tailscale（tsnet）
 
 1. Tailscale 管理画面で **auth key** を発行（推奨: reusable + タグ付き）
@@ -81,6 +87,11 @@ Admin 認証: `Authorization: Bearer <token>` または `X-Admin-Token: <token>`
 | `-managed-backend-port` | 9118 | watchdog 管理の固定 serve ポート（9120/8787/9119 とは別） |
 | `-backend-start-timeout` | 120 | `/api/status` 待ち (秒) |
 | `-backend-ready-timeout` | 45 | `/api/status` 待ち (秒) |
+| `-embedding-enabled` | off | 設定済み loopback embedding server の監督 |
+| `-embedding-endpoint` | なし | `http://127.0.0.1:8082` のような健康確認先 |
+| `-embedding-server` / `-embedding-model` | なし | 既存 llama-server と GGUF の絶対パス |
+| `-embedding-args-json` | `[]` | `--embedding` を含む固定 llama.cpp 引数配列 |
+| `-embedding-start-timeout` | 180 | watchdog 所有 PID を再起動するまでの初期化待機秒数 |
 
 ## 監視ロジック（旧 PowerShell 版との差分）
 

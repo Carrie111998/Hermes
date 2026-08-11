@@ -9,25 +9,31 @@ import (
 // Config holds runtime paths and secrets loaded from flags/env.
 // This binary is intentionally outside Hermes tool/plugin discovery.
 type Config struct {
-	IntervalSec            int
-	FailThreshold          int
-	Once                   bool
-	PrewarmBackend         bool
-	BackendStartTimeoutSec int
-	BackendReadyTimeoutSec int
-	ManagedBackendPort     int
-	ListenAddr             string
-	TsnetHostname          string
-	EnableTsnet            bool
-	HermesRoot             string
-	HermesHome             string
-	PackagedExe            string
-	DataDir                string
-	LogPath                string
-	LockPath               string
-	StatePath              string
-	AdminToken             string
-	TsAuthKey              string
+	IntervalSec              int
+	FailThreshold            int
+	Once                     bool
+	PrewarmBackend           bool
+	BackendStartTimeoutSec   int
+	BackendReadyTimeoutSec   int
+	ManagedBackendPort       int
+	EmbeddingEnabled         bool
+	EmbeddingEndpoint        string
+	EmbeddingServer          string
+	EmbeddingModel           string
+	EmbeddingArgsJSON        string
+	EmbeddingStartTimeoutSec int
+	ListenAddr               string
+	TsnetHostname            string
+	EnableTsnet              bool
+	HermesRoot               string
+	HermesHome               string
+	PackagedExe              string
+	DataDir                  string
+	LogPath                  string
+	LockPath                 string
+	StatePath                string
+	AdminToken               string
+	TsAuthKey                string
 }
 
 func defaultHermesHome() string {

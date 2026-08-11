@@ -11,22 +11,24 @@ import (
 )
 
 type cycleResult struct {
-	Desktop     string `json:"desktop"`
-	Backend     string `json:"backend"`
-	BackendPID  uint32 `json:"backendPid,omitempty"`
-	BackendPort int    `json:"backendPort,omitempty"`
+	Desktop      string `json:"desktop"`
+	Backend      string `json:"backend"`
+	BackendPID   uint32 `json:"backendPid,omitempty"`
+	BackendPort  int    `json:"backendPort,omitempty"`
+	Embedding    string `json:"embedding"`
+	EmbeddingPID uint32 `json:"embeddingPid,omitempty"`
 }
 
 type WatchdogState struct {
-	UpdatedAt               string       `json:"updatedAt"`
-	WatchdogPID             int          `json:"watchdogPid"`
-	Paused                  bool         `json:"paused"`
-	Result                  cycleResult  `json:"result"`
-	ConsecutiveBackendFails int          `json:"consecutiveBackendFails"`
-	PackagedExe             string       `json:"packagedExe,omitempty"`
-	ListenAddr              string       `json:"listenAddr,omitempty"`
-	TsnetHostname           string       `json:"tsnetHostname,omitempty"`
-	TsnetEnabled            bool         `json:"tsnetEnabled"`
+	UpdatedAt               string      `json:"updatedAt"`
+	WatchdogPID             int         `json:"watchdogPid"`
+	Paused                  bool        `json:"paused"`
+	Result                  cycleResult `json:"result"`
+	ConsecutiveBackendFails int         `json:"consecutiveBackendFails"`
+	PackagedExe             string      `json:"packagedExe,omitempty"`
+	ListenAddr              string      `json:"listenAddr,omitempty"`
+	TsnetHostname           string      `json:"tsnetHostname,omitempty"`
+	TsnetEnabled            bool        `json:"tsnetEnabled"`
 }
 
 type Watchdog struct {
@@ -38,6 +40,10 @@ type Watchdog struct {
 	paused    bool
 	failCount int
 	lastState WatchdogState
+
+	embeddingMu        sync.Mutex
+	embeddingPID       int
+	embeddingStartedAt time.Time
 }
 
 func NewWatchdog(cfg Config, logger *Logger) *Watchdog {
@@ -46,9 +52,9 @@ func NewWatchdog(cfg Config, logger *Logger) *Watchdog {
 		logger: logger,
 		back:   NewBackendManager(cfg, logger),
 		lastState: WatchdogState{
-			WatchdogPID: os.Getpid(),
-			PackagedExe: cfg.PackagedExe,
-			ListenAddr:  cfg.ListenAddr,
+			WatchdogPID:   os.Getpid(),
+			PackagedExe:   cfg.PackagedExe,
+			ListenAddr:    cfg.ListenAddr,
 			TsnetHostname: cfg.TsnetHostname,
 			TsnetEnabled:  cfg.EnableTsnet && cfg.TsAuthKey != "",
 		},
@@ -116,8 +122,14 @@ func (w *Watchdog) saveState(result cycleResult) {
 
 func (w *Watchdog) RunCycle() cycleResult {
 	if w.IsPaused() {
-		res := cycleResult{Desktop: "paused", Backend: "paused"}
+		res := cycleResult{Desktop: "paused", Backend: "paused", Embedding: "paused"}
 		w.saveState(res)
+		return res
+	}
+	embeddingStatus, embeddingPID := w.ensureEmbeddingHealthy()
+	withEmbedding := func(res cycleResult) cycleResult {
+		res.Embedding = embeddingStatus
+		res.EmbeddingPID = embeddingPID
 		return res
 	}
 
@@ -138,7 +150,7 @@ func (w *Watchdog) RunCycle() cycleResult {
 		// prewarm manifest times out at 90s and dies, then we relaunch forever.
 		if w.cfg.PrewarmBackend && !managedReady {
 			w.logger.Infof("Desktop DOWN — defer relaunch until managed backend auth-ok")
-			res := cycleResult{Desktop: "waiting_backend", Backend: "down"}
+			res := withEmbedding(cycleResult{Desktop: "waiting_backend", Backend: "down"})
 			w.saveState(res)
 			return res
 		}
@@ -152,12 +164,12 @@ func (w *Watchdog) RunCycle() cycleResult {
 		w.mu.Lock()
 		w.failCount = 0
 		w.mu.Unlock()
-		res := cycleResult{Desktop: "relaunched", Backend: "pending"}
+		res := withEmbedding(cycleResult{Desktop: "relaunched", Backend: "pending"})
 		w.saveState(res)
 		return res
 	}
 
-		if backend == nil {
+	if backend == nil {
 		w.logger.Infof("Desktop UP but backend DOWN — starting managed serve")
 		if _, err := w.back.EnsureHealthy(); err != nil {
 			w.logger.Infof("managed backend assist failed: %v", err)
@@ -176,11 +188,11 @@ func (w *Watchdog) RunCycle() cycleResult {
 			w.mu.Lock()
 			w.failCount = 0
 			w.mu.Unlock()
-			res := cycleResult{Desktop: "restarted", Backend: "respawning"}
+			res := withEmbedding(cycleResult{Desktop: "restarted", Backend: "respawning"})
 			w.saveState(res)
 			return res
 		}
-		res := cycleResult{Desktop: "up", Backend: "down"}
+		res := withEmbedding(cycleResult{Desktop: "up", Backend: "down"})
 		w.saveState(res)
 		return res
 	}
@@ -189,12 +201,12 @@ func (w *Watchdog) RunCycle() cycleResult {
 	w.failCount = 0
 	w.mu.Unlock()
 	w.logger.Infof("OK backend=pid:%d port:%d", backend.PID, backend.Port)
-	res := cycleResult{
+	res := withEmbedding(cycleResult{
 		Desktop:     "up",
 		Backend:     "up",
 		BackendPID:  backend.PID,
 		BackendPort: backend.Port,
-	}
+	})
 	w.saveState(res)
 	return res
 }
