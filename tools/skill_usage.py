@@ -29,6 +29,7 @@ import logging
 import os
 import tempfile
 from contextlib import contextmanager
+from contextvars import ContextVar, Token
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -37,6 +38,28 @@ from hermes_constants import get_hermes_home
 from agent.skill_utils import is_excluded_skill_path, is_external_skill_path
 
 logger = logging.getLogger(__name__)
+
+# Per-turn attribution accumulator (Layer 2 of failure tracing). The agent
+# arms this at turn start with a reference to its own ``_turn_used_skills``
+# set; ``bump_use`` (the single "skill used" chokepoint) records into it.
+# Instance-scoped by construction: the ContextVar only ever holds a reference
+# to the *active* agent's set, cleared (re-armed) on every new turn, and the
+# authoritative state lives on the instance, not in this module — so a parent
+# agent's ``finalize_turn`` reads its own set even if a subagent ran in the
+# same thread in between.
+_turn_skill_accumulator: ContextVar[Optional[Set[str]]] = ContextVar(
+    "turn_skill_accumulator", default=None
+)
+
+
+def arm_turn_skill_accumulator(used_skills: Set[str]) -> Token:
+    """Point the per-turn accumulator at *used_skills* (the agent's set).
+
+    Called at turn start in ``agent.turn_context``. Returns the ContextVar
+    token so the caller can restore it at turn end.
+    """
+    return _turn_skill_accumulator.set(used_skills)
+
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking.
 msvcrt = None
@@ -655,12 +678,18 @@ def _empty_record() -> Dict[str, Any]:
         "created_at": _now_iso(),
         "state": STATE_ACTIVE,
         "pinned": False,
+        "verify_enabled": False,
         "archived_at": None,
         # Outcome telemetry. Distinct from use_count: use_count answers "was
         # this touched", these answer "did touching it work". A bounded
         # recent-outcomes window lets a skill recover after a fix instead of
         # being haunted by lifetime failures.
         "recent_outcomes": [],
+        # Parallel to recent_outcomes (same window, appended in lockstep):
+        # the reason behind each outcome, so the curator review has something
+        # actionable ("verifier: commit message lacks type prefix") instead of
+        # an anonymous boolean. Empty string when no reason was recorded.
+        "recent_outcome_reasons": [],
         "needs_review": False,
         "needs_review_since": None,
     }
@@ -891,6 +920,13 @@ def bump_use(
 
     Tracks every skill regardless of provenance.
     """
+# Layer 2 attribution: when a turn has armed the accumulator, remember the
+    # skill so finalize_turn can attribute the turn's outcome to it. Pure
+    # sidecar bookkeeping — never raises, never mutates context.
+    _acc = _turn_skill_accumulator.get()
+    if _acc is not None:
+        _acc.add(skill_name)
+
     def _apply(rec: Dict[str, Any]) -> Dict[str, Any]:
         previous_use_count = _non_negative_int(rec.get("use_count"))
         patch_generation = _non_negative_int(rec.get("patch_generation"))
@@ -998,11 +1034,15 @@ def record_installed(skill_name: str) -> None:
         _emit_skill_lifecycle(skill_name, "installed", record=facts)
 
 
-def bump_outcome(skill_name: str, success: bool) -> None:
+def bump_outcome(skill_name: str, success: bool, reason: Optional[str] = None) -> None:
     """Record whether a use of *skill_name* succeeded or failed.
 
     "Failed" means the use could not show that the work held up. Appends to a
     capped recent-outcomes window and re-derives needs_review from it.
+    ``reason`` is the human/verifier text explaining the outcome (mechanical
+    fail reason, eval reason, ...); it is kept alongside the boolean in a
+    parallel capped list so the curator review pass can read *why* a skill
+    failed without having to parse trajectories.
     """
     def _apply(rec: Dict[str, Any]) -> None:
         outcomes = rec.get("recent_outcomes")
@@ -1011,7 +1051,15 @@ def bump_outcome(skill_name: str, success: bool) -> None:
         outcomes.append(bool(success))
         if len(outcomes) > _OUTCOME_WINDOW:
             outcomes = outcomes[-_OUTCOME_WINDOW:]
+
+        reasons = rec.get("recent_outcome_reasons")
+        if not isinstance(reasons, list):
+            reasons = []
+        reasons.append(str(reason) if reason else "")
+        if len(reasons) > _OUTCOME_WINDOW:
+            reasons = reasons[-_OUTCOME_WINDOW:]
         rec["recent_outcomes"] = outcomes
+        rec["recent_outcome_reasons"] = reasons
 
         was_needs_review = bool(rec.get("needs_review"))
         samples = len(outcomes)
@@ -1037,6 +1085,26 @@ def failure_rate(skill_name: str) -> Optional[float]:
     if not isinstance(outcomes, list) or len(outcomes) < _OUTCOME_MIN_SAMPLES:
         return None
     return sum(1 for o in outcomes if not o) / len(outcomes)
+
+
+def recent_failure_reason(rec: Dict[str, Any]) -> str:
+    """Most recent non-empty reason recorded against a failed outcome.
+
+    ``rec`` is a usage record (or backfilled row). ``recent_outcomes`` and
+    ``recent_outcome_reasons`` are parallel capped lists; walk from the newest
+    entry back to the newest *failure* with a reason attached. Returns "" when
+    there isn't one.
+    """
+    outcomes = rec.get("recent_outcomes")
+    reasons = rec.get("recent_outcome_reasons")
+    if not isinstance(outcomes, list) or not isinstance(reasons, list):
+        return ""
+    for i, ok in reversed(list(enumerate(outcomes))):
+        if not ok and i < len(reasons):
+            r = reasons[i]
+            if isinstance(r, str) and r:
+                return r
+    return ""
 
 
 def mark_agent_created(skill_name: str) -> None:
@@ -1110,6 +1178,27 @@ def set_sync(skill_name: str, sync: bool) -> None:
 def is_sync_enabled(skill_name: str) -> bool:
     """Whether a skill is opted into sync (``sync: true`` in its record)."""
     return get_record(skill_name).get("sync") is True
+
+
+def set_verify_enabled(skill_name: str, enabled: bool) -> None:
+    """Set the verify opt-in flag on a skill's usage record.
+
+    VERIFY is OPT-IN: a skill's declared ``metadata.hermes.verify`` block is
+    never auto-run unless the user marks the skill with ``verify_enabled``
+    here. This is the consent half of the trust boundary — frontmatter (the
+    skill author) may DECLARE a capability; only this local sidecar flag (the
+    user) grants permission to execute it. Gated on curation eligibility so a
+    skill the curator can't manage (bundled-by-default, hub-installed,
+    external) can't be switched on by code that doesn't own it.
+    """
+    def _apply(rec: Dict[str, Any]) -> None:
+        rec["verify_enabled"] = bool(enabled)
+    _mutate(skill_name, _apply, require_curation_eligible=True)
+
+
+def is_verify_enabled(skill_name: str) -> bool:
+    """Whether a skill's declared verifier may auto-run (``verify_enabled``)."""
+    return get_record(skill_name).get("verify_enabled") is True
 
 
 def forget(skill_name: str) -> None:

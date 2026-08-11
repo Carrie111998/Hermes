@@ -344,6 +344,36 @@ def test_bump_outcome_returns_none_before_minimum_samples(skills_home):
     assert failure_rate("small-sample") is None
 
 
+def test_bump_outcome_reason_kept_in_lockstep_window(skills_home):
+    """recent_outcome_reasons must mirror recent_outcomes 1:1 — same window,
+    same cap, same order — or reason attribution is wrong by construction."""
+    from tools.skill_usage import _OUTCOME_WINDOW, bump_outcome, get_record
+
+    for i in range(_OUTCOME_WINDOW + 4):
+        bump_outcome("explained", i % 3 == 0, reason=f"reason-{i}")
+
+    rec = get_record("explained")
+    assert len(rec["recent_outcomes"]) == _OUTCOME_WINDOW
+    assert len(rec["recent_outcome_reasons"]) == len(rec["recent_outcomes"])
+    assert rec["recent_outcome_reasons"][-1] == f"reason-{_OUTCOME_WINDOW + 3}"
+    assert rec["recent_outcome_reasons"][0] == "reason-4"  # oldest surviving
+
+
+def test_bump_outcome_empty_reason_stored_as_blank_not_dropped(skills_home):
+    """An outcome without a reason must still hold its slot, keeping the two
+    arrays index-aligned even when reasons arrive sporadically."""
+    from tools.skill_usage import bump_outcome, get_record, recent_failure_reason
+
+    bump_outcome("sparse", False, reason="boom")
+    bump_outcome("sparse", False)  # no reason
+    bump_outcome("sparse", True, reason="fine")
+
+    rec = get_record("sparse")
+    assert rec["recent_outcome_reasons"] == ["boom", "", "fine"]
+    # newest *failure* has no reason -> walk back to "boom"
+    assert recent_failure_reason(rec) == "boom"
+
+
 def test_concurrent_bump_view_preserves_all_updates(skills_home):
     from tools.skill_usage import get_record
 

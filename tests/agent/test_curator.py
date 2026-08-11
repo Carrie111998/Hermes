@@ -294,6 +294,63 @@ def test_unreferenced_skill_is_still_archived(curator_env, monkeypatch):
     usage = u.load_usage()
     assert usage["quarterly-report"]["state"] == u.STATE_ACTIVE
     assert usage["orphan"]["state"] == u.STATE_ARCHIVED
+def test_candidate_list_carries_outcome_quality_signal(curator_env):
+    """The candidate list the LLM review reads must carry the outcome signal:
+    failure_rate, the needs-review flag, and the most recent failure reason —
+    so the review pass is quality-aware, not just activity-aware. A clean skill
+    keeps a compact row (no fabricated outcome tail)."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    _write_skill(skills_dir, "risky")
+    _write_skill(skills_dir, "clean")
+    u.mark_agent_created("risky")
+    u.mark_agent_created("clean")
+    for ok, why in (
+        (False, "verifier: commit message lacks type prefix"),
+        (False, "eval: committed the wrong change"),
+        (False, ""),
+        (True, ""),
+    ):
+        u.bump_outcome("risky", ok, reason=why)
+    u.bump_outcome("clean", True, reason="not a failure")
+
+    listing = c._render_candidate_list()
+    risky_line = next(l for l in listing.splitlines() if l.startswith("- risky"))
+    clean_line = next(l for l in listing.splitlines() if l.startswith("- clean"))
+    assert "review=yes" in risky_line
+    assert "fr=0.75" in risky_line
+    assert "eval: committed the wrong change" in risky_line
+    assert "review=" not in clean_line
+    assert "fr=" not in clean_line
+    assert "reason=" not in clean_line
+
+
+def test_review_prompt_embeds_needs_review_reason(curator_env, monkeypatch):
+    """The prompt handed to the LLM fork must contain the needs-review rule AND
+    the flagged skill's failure reason — otherwise the review pass can't act on
+    the outcome signal and Layer 3 is a dashboard, not self-improvement."""
+    c = curator_env["curator"]
+    u = curator_env["usage"]
+    skills_dir = curator_env["home"] / "skills"
+    _write_skill(skills_dir, "flaky")
+    u.mark_agent_created("flaky")
+    for ok, why in ((False, "verifier: schema violated"),) * 4:
+        u.bump_outcome("flaky", ok, reason=why)
+
+    captured = {}
+
+    def _capture(prompt):
+        captured["prompt"] = prompt
+        return {"summary": "no change", "final": "", "tool_calls": []}
+
+    monkeypatch.setattr(c, "_run_llm_review", _capture)
+    c.run_curator_review(synchronous=True, consolidate=True)
+
+    prompt = captured.get("prompt", "")
+    assert "OUTCOME-QUALITY PRIORITY" in prompt
+    assert "review=yes" in prompt
+    assert "verifier: schema violated" in prompt
 
 
 

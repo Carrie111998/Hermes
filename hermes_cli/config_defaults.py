@@ -1070,6 +1070,24 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Outcome — end-of-turn work verdict (Layer 0 of failure tracing).
+        # Runs an aux-model judgment + any opted-in per-skill verifiers after
+        # a turn and records success/failure to the skill sidecar. Default
+        # OFF: one aux call per turn is real cost, so this is opt-in. When
+        # off, the whole pipeline is inert (zero cost beyond a config read).
+        "outcome": {
+            "enabled": False,      # opt-in: one aux call per turn is real cost
+            "run": "auto",         # auto | always  (auto = signal-gated: only
+                                   # judge when a verifier FAILed or a used
+                                   # skill had no verifier)
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 30,
+            "extra_body": {},
+            "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
         # Curator — skill-usage review fork. Timeout is generous because the
         # review pass can take several minutes on reasoning models (umbrella
         # building over hundreds of candidate skills). "auto" = use main chat

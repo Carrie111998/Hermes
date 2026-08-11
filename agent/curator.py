@@ -470,7 +470,17 @@ CURATOR_REVIEW_PROMPT = (
     "a distinct trigger'. Pairwise distinctness is the wrong bar. The "
     "right bar is: 'would a human maintainer write this as N separate "
     "skills, or as one skill with N labeled subsections?' When the "
-    "answer is the latter, merge.\n\n"
+    "answer is the latter, merge.\n"
+    "6. OUTCOME-QUALITY PRIORITY. A skill marked `review=yes` in the "
+    "candidate list (recent failure rate at or above the needs-review "
+    "threshold, `fr=` shown) is a PRIORITY candidate, ahead of activity-based "
+    "consolidation: its outcome history says its procedure drifted from its "
+    "own contract. When its `reason=` names a deterministic check (commit "
+    "message format, schema validation, linter, file creation/existence), "
+    "treat it as the strongest possible drift signal — inspect that procedure "
+    "and patch it (or fold the fix into an umbrella via absorbed_into) rather "
+    "than leaving the skill flagged. A low-use skill with a failing outcome "
+    "history is MORE suspicious than a zero-use skill, not less.\n\n"
     "How to work — not optional:\n"
     "1. Scan the full candidate list. Identify PREFIX CLUSTERS (skills "
     "sharing a first word or domain keyword). Examples you are likely "
@@ -1480,13 +1490,30 @@ def _render_report_markdown(p: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 def _render_candidate_list() -> str:
-    """Human/agent-readable list of curator-managed skills with usage stats."""
+    """Human/agent-readable list of curator-managed skills with usage stats.
+
+    Each row gains an outcome-quality tail when the signal exists: ``fr=``
+    (recent-window failure rate, only when there are enough samples),
+    ``review=yes`` (the skill is flagged needs-review), and ``reason=`` (the
+    latest verifier/eval failure reason). Rows with no outcome signal stay
+    compact — the tail is purely additive to the activity stats.
+    """
     rows = skill_usage.curated_report()
     if not rows:
         return "No curator-managed skills to review."
     cron_referenced = _cron_referenced_skills()
     lines = [f"Curator-managed skills ({len(rows)}):\n"]
     for r in rows:
+        tail = []
+        fr = r.get("failure_rate")
+        if isinstance(fr, (int, float)):
+            tail.append(f"fr={fr:.2f}")
+        if r.get("needs_review"):
+            tail.append("review=yes")
+        reason = r.get("recent_failure_reason") or ""
+        if reason:
+            tail.append(f'reason="{_clip(reason)}"')
+        tail_str = ("  " + "  ".join(tail)) if tail else ""
         lines.append(
             f"- {r['name']}  "
             f"provenance={r.get('provenance', 'agent')}  "
@@ -1498,8 +1525,15 @@ def _render_candidate_list() -> str:
             f"view={r.get('view_count', 0)}  "
             f"patches={r.get('patch_count', 0)}  "
             f"last_activity={r.get('last_activity_at') or 'never'}"
+            f"{tail_str}"
         )
     return "\n".join(lines)
+
+
+def _clip(text: str, limit: int = 120) -> str:
+    """Single-line truncation for embedding arbitrary reason text in a row."""
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
 def run_curator_review(
@@ -1548,6 +1582,7 @@ def run_curator_review(
                 "marked_stale": 0,
                 "archived": 0,
                 "reactivated": 0,
+                "needs_review": sum(1 for r in report if r.get("needs_review")),
             }
         except Exception:
             counts = {"checked": 0, "marked_stale": 0, "archived": 0, "reactivated": 0}

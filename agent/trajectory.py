@@ -8,7 +8,7 @@ the file-write logic live here.
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -28,13 +28,19 @@ def has_incomplete_scratchpad(content: str) -> bool:
 
 
 def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
-                    completed: bool, filename: str = None):
+                    completed: bool, outcome: Optional[bool] = None,
+                    filename: str = None):
     """Append a trajectory entry to a JSONL file.
 
     Args:
         trajectory: The ShareGPT-format conversation list.
         model: Model name for metadata.
         completed: Whether the conversation completed successfully.
+        outcome: Layer 0 work verdict (did the WORK hold up). Written onto
+            the entry only when provided, so the trajectory format stays
+            byte-identical while the feature is dormant. Orthogonal to
+            ``completed``: a turn can complete (loop ended with text) while
+            its outcome is False (the work didn't hold up).
         filename: Override output filename. Defaults to trajectory_samples.jsonl
                   or failed_trajectories.jsonl based on ``completed``.
     """
@@ -47,6 +53,8 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
         "model": model,
         "completed": completed,
     }
+    if outcome is not None:
+        entry["outcome"] = outcome
 
     try:
         with open(filename, "a", encoding="utf-8") as f:

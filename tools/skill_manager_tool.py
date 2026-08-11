@@ -1770,7 +1770,7 @@ SKILL_MANAGE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "For 'delete' only — declares intent so the curator can "
-                    "tell consolidation from pruning without guessing. "
+                    "tell consolidation  from pruning without guessing. "
                     "Pass the umbrella skill name when this skill's content "
                     "was merged into another (the target must already exist). "
                     "Pass an empty string when the skill is truly stale and "
