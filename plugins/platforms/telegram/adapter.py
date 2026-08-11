@@ -9934,6 +9934,16 @@ class TelegramAdapter(BasePlatformAdapter):
             lock = self._processing_reactions_lock = asyncio.Lock()
         return lock
 
+    def _settle_reaction_key(self, key: tuple[str, str]) -> None:
+        """Remember a terminal message briefly so late activity cannot overwrite it."""
+        settled = getattr(self, "_settled_processing_reactions", None)
+        if settled is None:
+            settled = self._settled_processing_reactions = {}
+        settled.pop(key, None)
+        settled[key] = None
+        if len(settled) > 1024:
+            settled.pop(next(iter(settled)))
+
     async def _set_reaction(
         self,
         chat_id: str,
@@ -9941,6 +9951,9 @@ class TelegramAdapter(BasePlatformAdapter):
         emoji: str,
         *,
         retain_state: bool = True,
+        begin_state: bool = False,
+        activity_state: bool = False,
+        terminal_state: bool = False,
     ) -> bool:
         """Set one reaction, skipping duplicate state updates."""
         key = (str(chat_id), str(message_id))
@@ -9948,8 +9961,15 @@ class TelegramAdapter(BasePlatformAdapter):
             states = getattr(self, "_processing_reactions", None)
             if states is None:
                 states = self._processing_reactions = {}
+            settled = getattr(self, "_settled_processing_reactions", None)
+            if begin_state and settled is not None:
+                settled.pop(key, None)
+            elif activity_state and settled is not None and key in settled:
+                return False
             if states.get(key) == emoji:
-                if not retain_state:
+                if terminal_state:
+                    self._settle_reaction_key(key)
+                if not retain_state or terminal_state:
                     states.pop(key, None)
                 return True
             try:
@@ -9967,10 +9987,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 logger.debug("[%s] set_message_reaction failed (%s): %s", self.name, emoji, _redact_telegram_error_text(e))
                 return False
             finally:
-                if not retain_state:
+                if terminal_state:
+                    self._settle_reaction_key(key)
+                if not retain_state or terminal_state:
                     states.pop(key, None)
 
-    async def _clear_reactions(self, chat_id: str, message_id: str) -> bool:
+    async def _clear_reactions(
+        self, chat_id: str, message_id: str, *, terminal_state: bool = False
+    ) -> bool:
         """Clear all reactions from a Telegram message.
 
         Calling ``set_message_reaction`` with ``reaction=None`` (or an empty
@@ -9996,6 +10020,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 states = getattr(self, "_processing_reactions", None)
                 if states is not None:
                     states.pop(key, None)
+                if terminal_state:
+                    self._settle_reaction_key(key)
 
     async def on_processing_activity(
         self,
@@ -10024,7 +10050,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 emoji = "⚡"
         else:
             return
-        await self._set_reaction(chat_id, message_id, emoji)
+        await self._set_reaction(chat_id, message_id, emoji, activity_state=True)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
@@ -10033,7 +10059,12 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+            await self._set_reaction(
+                chat_id,
+                message_id,
+                "\U0001f440",
+                begin_state=True,
+            )
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction.
@@ -10055,13 +10086,14 @@ class TelegramAdapter(BasePlatformAdapter):
         if not (chat_id and message_id):
             return
         if outcome == ProcessingOutcome.CANCELLED:
-            await self._clear_reactions(chat_id, message_id)
+            await self._clear_reactions(chat_id, message_id, terminal_state=True)
         else:
             await self._set_reaction(
                 chat_id,
                 message_id,
                 "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e",
                 retain_state=False,
+                terminal_state=True,
             )
 
 
