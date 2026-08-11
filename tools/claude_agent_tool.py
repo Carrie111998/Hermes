@@ -5,7 +5,7 @@ Gating
 ------
 The tool registers only when the Claude Code GLM wrapper is resolvable —
 either via the ``CLAUDE_GLM_BIN`` env override, as an executable at
-``~/.local/bin/claude-glm``, or as ``claude-glm``/``claude`` on PATH.
+``~/.local/bin/claude-glm``, or as ``claude-glm`` on PATH.
 
 Credentials
 -----------
@@ -21,16 +21,19 @@ when the process runs as root.
 Log format
 ----------
 Stdout is streamed to ``<HERMES_HOME>/claude-runs/<timestamp>-<pid>.jsonl``.
-With ``--output-format json`` the CLI emits one JSON document per line; the
-handler scans for the last line that is valid JSON with ``"type": "result"``
-and extracts session metadata, cost, model usage, and permission denials
-from it.
+With ``--output-format stream-json`` (plus ``--verbose``) the CLI emits
+NDJSON event objects, one per line, as the run progresses. The handler scans
+every line for valid JSON and keeps the last object with ``"type": "result"``
+to extract session metadata, cost, model usage, and permission denials.
+Long quiet periods between events (e.g. during tool calls) are normal; only
+the caller's hard timeout bounds wall-clock run length.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import shutil
 import signal
@@ -50,7 +53,6 @@ DEFAULT_CLAUDE_MODEL = "glm-5.2"
 DEFAULT_TIMEOUT_SECONDS = 1800
 MIN_TIMEOUT_SECONDS = 60
 MAX_TIMEOUT_SECONDS = 3600
-STALL_WATCHDOG_SECONDS = 180
 
 DEFAULT_ALLOWED_TOOLS = "Read,Write,Edit,Glob,Grep,Bash"
 DEFAULT_PERMISSION_MODE = "acceptEdits"
@@ -58,6 +60,11 @@ _ALLOWED_PERMISSION_MODES = ("acceptEdits", "plan")
 
 _MONITOR_POLL_SECONDS = 0.1
 _TERMINATE_GRACE_SECONDS = 2.0
+
+LOG_HEAD_BYTES = 64 * 1024
+LOG_TAIL_BYTES = 1 * 1024 * 1024
+LOG_TRUNCATION_MARKER_OVERHEAD = 256
+LOG_MAX_FILE_BYTES = LOG_HEAD_BYTES + LOG_TAIL_BYTES + LOG_TRUNCATION_MARKER_OVERHEAD
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +82,6 @@ def resolve_claude_binary() -> Optional[str]:
     1. ``CLAUDE_GLM_BIN`` env override (must be an executable file).
     2. ``~/.local/bin/claude-glm``.
     3. ``claude-glm`` on PATH.
-    4. bare ``claude`` on PATH.
     """
     try:
         override = os.environ.get("CLAUDE_GLM_BIN")
@@ -89,10 +95,6 @@ def resolve_claude_binary() -> Optional[str]:
             return str(local)
 
         found = shutil.which("claude-glm")
-        if found:
-            return found
-
-        found = shutil.which("claude")
         if found:
             return found
     except Exception:
@@ -111,6 +113,52 @@ def check_claude_agent_requirements() -> bool:
 # ---------------------------------------------------------------------------
 # Result parsing
 # ---------------------------------------------------------------------------
+
+def _coerce_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _coerce_session_id(value: Any) -> Optional[str]:
+    if isinstance(value, str):
+        return value
+    return None
+
+
+def _coerce_int_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if math.isfinite(value) and value.is_integer():
+            return int(value)
+        return None
+    return None
+
+
+def _coerce_finite_float_or_none(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        coerced = float(value)
+        if math.isfinite(coerced):
+            return coerced
+        return None
+    return None
+
+
+def _coerce_permission_denials(value: Any) -> List[Any]:
+    if isinstance(value, list):
+        return value
+    return []
+
 
 def parse_claude_agent_log(log_text: str) -> Dict[str, Any]:
     """Parse a Claude Code json log for the final ``type=result`` event.
@@ -138,20 +186,20 @@ def parse_claude_agent_log(log_text: str) -> Dict[str, Any]:
     if isinstance(model_usage, dict):
         models_used = sorted(str(key) for key in model_usage.keys())
 
-    permission_denials = result_event.get("permission_denials")
-    if permission_denials is None:
-        permission_denials = []
-
     return {
         "subtype": result_event.get("subtype"),
         "is_error": result_event.get("is_error"),
-        "result": result_event.get("result"),
-        "session_id": result_event.get("session_id"),
-        "num_turns": result_event.get("num_turns"),
-        "duration_ms": result_event.get("duration_ms"),
-        "total_cost_usd": result_event.get("total_cost_usd"),
+        "result": _coerce_str(result_event.get("result")),
+        "session_id": _coerce_session_id(result_event.get("session_id")),
+        "num_turns": _coerce_int_or_none(result_event.get("num_turns")),
+        "duration_ms": _coerce_finite_float_or_none(result_event.get("duration_ms")),
+        "total_cost_usd": _coerce_finite_float_or_none(
+            result_event.get("total_cost_usd")
+        ),
         "models_used": models_used,
-        "permission_denials": permission_denials,
+        "permission_denials": _coerce_permission_denials(
+            result_event.get("permission_denials")
+        ),
     }
 
 
@@ -242,7 +290,11 @@ def _terminate_process(proc: subprocess.Popen, pgid: Optional[int] = None) -> No
 def _read_log_text(log_path: Path) -> str:
     if not log_path.is_file():
         return ""
-    return log_path.read_text(encoding="utf-8", errors="replace")
+    with open(log_path, "rb") as log_file:
+        data = log_file.read(LOG_MAX_FILE_BYTES + 1)
+    if len(data) > LOG_MAX_FILE_BYTES:
+        data = data[:LOG_MAX_FILE_BYTES]
+    return data.decode("utf-8", errors="replace")
 
 
 def _run_and_stream(
@@ -252,13 +304,16 @@ def _run_and_stream(
     timeout_seconds: int,
     log_dir: Path,
     run_timestamp: str,
-) -> Tuple[Optional[str], str, str, float, Optional[int]]:
-    """Spawn the agent, stream stdout to a log file, enforce watchdogs.
+) -> Tuple[Optional[str], str, str, str, float, Optional[int], bool, int]:
+    """Spawn the agent, stream stdout to a log file, enforce hard timeout.
 
-    Returns ``(error_code, log_path, log_text, duration_seconds, returncode)``.
+    Returns
+    ``(error_code, log_path, log_text, result_parse_text, duration_seconds,
+    returncode, log_truncated, log_bytes_dropped)``. When output is truncated,
+    ``result_parse_text`` contains only the rolling tail so an early result in
+    the retained head cannot be mistaken for the terminal result.
     """
     start_mono = time.monotonic()
-    last_byte_mono = start_mono
 
     # The wrapper runs with `set -u` and dies on an unbound $HOME in bare
     # environments (transient systemd units, cron). Guarantee HOME so any
@@ -288,12 +343,50 @@ def _run_and_stream(
 
     log_path = log_dir / f"{run_timestamp}-{proc.pid}.jsonl"
     reader_done = threading.Event()
+    reader_state: Dict[str, Any] = {
+        "log_truncated": False,
+        "log_bytes_dropped": 0,
+        "result_parse_text": "",
+    }
+
+    def _append_tail(log_file, tail_buf: bytearray, bytes_dropped: int) -> None:
+        if bytes_dropped > 0:
+            marker = f"\n...[truncated {bytes_dropped} bytes]...\n".encode("utf-8")
+            reader_state["log_truncated"] = True
+            reader_state["log_bytes_dropped"] = bytes_dropped
+            reader_state["result_parse_text"] = bytes(tail_buf).decode(
+                "utf-8", errors="replace"
+            )
+        elif tail_buf:
+            marker = b""
+        else:
+            return
+
+        head_size = log_file.tell()
+        available = max(0, LOG_MAX_FILE_BYTES - head_size)
+        if not marker and not tail_buf:
+            return
+
+        payload = marker + bytes(tail_buf)
+        if len(payload) > available:
+            if len(marker) >= available:
+                log_file.write(marker[:available])
+            else:
+                tail_room = available - len(marker)
+                log_file.write(marker + bytes(tail_buf)[-tail_room:])
+        else:
+            log_file.write(payload)
+        log_file.flush()
 
     def _reader() -> None:
-        nonlocal last_byte_mono
         try:
             assert proc.stdout is not None
             with open(log_path, "wb") as log_file:
+                head_written = 0
+                tail_buf = bytearray()
+                bytes_dropped = 0
+                in_tail = False
+
                 while True:
                     try:
                         chunk = proc.stdout.read1(4096)
@@ -301,9 +394,31 @@ def _run_and_stream(
                         break
                     if not chunk:
                         break
-                    log_file.write(chunk)
-                    log_file.flush()
-                    last_byte_mono = time.monotonic()
+
+                    offset = 0
+                    while offset < len(chunk):
+                        if not in_tail:
+                            head_room = LOG_HEAD_BYTES - head_written
+                            if head_room <= 0:
+                                in_tail = True
+                                continue
+                            take = min(head_room, len(chunk) - offset)
+                            log_file.write(chunk[offset : offset + take])
+                            head_written += take
+                            offset += take
+                            if head_written >= LOG_HEAD_BYTES:
+                                in_tail = True
+                            continue
+
+                        take = len(chunk) - offset
+                        tail_buf.extend(chunk[offset : offset + take])
+                        offset += take
+                        if len(tail_buf) > LOG_TAIL_BYTES:
+                            excess = len(tail_buf) - LOG_TAIL_BYTES
+                            bytes_dropped += excess
+                            del tail_buf[:excess]
+
+                _append_tail(log_file, tail_buf, bytes_dropped)
         finally:
             try:
                 if proc.stdout is not None:
@@ -326,9 +441,6 @@ def _run_and_stream(
         if elapsed >= timeout_seconds:
             error_code = "timeout"
             break
-        if now - last_byte_mono >= STALL_WATCHDOG_SECONDS:
-            error_code = "stalled"
-            break
         time.sleep(_MONITOR_POLL_SECONDS)
 
     if error_code is not None:
@@ -339,15 +451,24 @@ def _run_and_stream(
 
     if reader_thread.is_alive():
         _terminate_process(proc, pgid)
+        incomplete_log_text = _read_log_text(log_path)
         return (
             "incomplete_output",
             str(log_path),
-            _read_log_text(log_path),
+            incomplete_log_text,
+            incomplete_log_text,
             duration,
             proc.poll() if proc.poll() is not None else -1,
+            reader_state["log_truncated"],
+            reader_state["log_bytes_dropped"],
         )
 
     log_text = _read_log_text(log_path)
+    result_parse_text = (
+        str(reader_state["result_parse_text"])
+        if reader_state["log_truncated"]
+        else log_text
+    )
 
     returncode = proc.poll()
     if returncode is None:
@@ -356,7 +477,16 @@ def _run_and_stream(
         except Exception:
             returncode = -1
 
-    return error_code, str(log_path), log_text, duration, returncode
+    return (
+        error_code,
+        str(log_path),
+        log_text,
+        result_parse_text,
+        duration,
+        returncode,
+        reader_state["log_truncated"],
+        reader_state["log_bytes_dropped"],
+    )
 
 
 def _make_result(
@@ -382,7 +512,7 @@ def _make_result(
         "num_turns": num_turns,
         "cost_usd": cost_usd,
         "models_used": models_used or [],
-        "permission_denials": permission_denials,
+        "permission_denials": permission_denials or [],
         "log_path": log_path,
     }
     payload.update(extra)
@@ -439,7 +569,7 @@ def delegate_claude_agent(
             error=(
                 "Claude Code (GLM) wrapper binary not found. Install the "
                 "`claude-glm` wrapper at ~/.local/bin/claude-glm (or set "
-                "CLAUDE_GLM_BIN), or place `claude-glm`/`claude` on PATH."
+                "CLAUDE_GLM_BIN), or place `claude-glm` on PATH."
             ),
         )
 
@@ -463,12 +593,22 @@ def delegate_claude_agent(
         "--allowedTools",
         tools_arg,
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         str(task).strip(),
     ]
 
     try:
-        watchdog_error, log_path, log_text, duration, returncode = _run_and_stream(
+        (
+            run_error,
+            log_path,
+            log_text,
+            result_parse_text,
+            duration,
+            returncode,
+            log_truncated,
+            log_bytes_dropped,
+        ) = _run_and_stream(
             cmd,
             workdir=str(workdir_path),
             timeout_seconds=clamped_timeout,
@@ -483,9 +623,9 @@ def delegate_claude_agent(
             duration_seconds=0.0,
         )
 
-    parsed = parse_claude_agent_log(log_text)
-    base_fields = {
-        "final_report": _coerce_str(parsed.get("result")) or "",
+    parsed = parse_claude_agent_log(result_parse_text)
+    base_fields: Dict[str, Any] = {
+        "final_report": parsed.get("result") or "",
         "session_id": parsed.get("session_id"),
         "duration_seconds": round(duration, 3),
         "num_turns": parsed.get("num_turns"),
@@ -494,11 +634,14 @@ def delegate_claude_agent(
         "permission_denials": parsed.get("permission_denials") or [],
         "log_path": log_path,
     }
+    if log_truncated:
+        base_fields["log_truncated"] = True
+        base_fields["log_bytes_dropped"] = log_bytes_dropped
 
-    if watchdog_error:
+    if run_error:
         return _make_result(
             success=False,
-            error=watchdog_error,
+            error=run_error,
             **base_fields,
         )
 
@@ -511,6 +654,15 @@ def delegate_claude_agent(
         )
 
     if not parsed:
+        if log_truncated:
+            return _make_result(
+                success=False,
+                error=(
+                    "log truncated; result event missing or incomplete "
+                    f"({log_bytes_dropped} bytes dropped)"
+                ),
+                **base_fields,
+            )
         return _make_result(
             success=False,
             error="no result event found in Claude Code output",
@@ -530,17 +682,6 @@ def delegate_claude_agent(
     )
 
 
-def _coerce_str(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, str):
-        return value
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except (TypeError, ValueError):
-        return str(value)
-
-
 DELEGATE_CLAUDE_AGENT_SCHEMA = {
     "name": "delegate_claude_agent",
     "description": (
@@ -548,7 +689,7 @@ DELEGATE_CLAUDE_AGENT_SCHEMA = {
         "against Alibaba GLM-5.2 via the local claude-glm wrapper. The CLI "
         "performs code edits, terminal commands, and multi-step dev work "
         "inside the specified repository directory. Stdout is captured as "
-        "JSON in a log under the Hermes home directory. Available only when "
+        "NDJSON in a log under the Hermes home directory. Available only when "
         "the claude-glm wrapper binary is installed."
     ),
     "parameters": {

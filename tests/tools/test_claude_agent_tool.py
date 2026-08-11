@@ -44,6 +44,13 @@ if mode == "sleep":
         pass
     sys.exit(0)
 
+if mode == "sleep_then_result":
+    try:
+        time.sleep(float(os.environ.get("FAKE_CLAUDE_SLEEP", "0.15")))
+    except Exception:
+        pass
+    # Fall through to emit the normal result event after the silent period.
+
 if mode == "garbage":
     sys.stdout.write("not json line 1\\nnot json line 2\\n")
     sys.stdout.flush()
@@ -56,6 +63,51 @@ if mode == "exitnonzero":
     sys.stdout.write('{{"type":"result","subtype":"success","is_error":false,"result":"x"}}\\n')
     sys.stdout.flush()
     sys.exit(2)
+
+if mode == "flood":
+    noise_line = '{{"type":"assistant","message":"noise"}}\\n'
+    target = int(os.environ.get("FAKE_CLAUDE_FLOOD_BYTES", str(3 * 1024 * 1024)))
+    written = 0
+    while written < target:
+        sys.stdout.write(noise_line)
+        written += len(noise_line.encode("utf-8"))
+    sys.stdout.flush()
+    # Fall through to emit the normal result event after the flood.
+
+if mode == "flood_giant_result":
+    pad = "x" * int(os.environ.get("FAKE_CLAUDE_GIANT_PAD", str(2 * 1024 * 1024)))
+    giant = {{
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": pad,
+        "session_id": "sess-giant",
+        "num_turns": 1,
+        "duration_ms": 1,
+        "total_cost_usd": 0.0,
+        "modelUsage": {{}},
+        "permission_denials": [],
+    }}
+    sys.stdout.write(json.dumps(giant) + "\\n")
+    sys.stdout.flush()
+    sys.exit(0)
+
+if mode == "early_result_then_flood":
+    early = {{
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "not terminal",
+    }}
+    sys.stdout.write(json.dumps(early) + "\\n")
+    noise_line = '{{"type":"assistant","message":"trailing noise"}}\\n'
+    target = int(os.environ.get("FAKE_CLAUDE_FLOOD_BYTES", str(3 * 1024 * 1024)))
+    written = 0
+    while written < target:
+        sys.stdout.write(noise_line)
+        written += len(noise_line.encode("utf-8"))
+    sys.stdout.flush()
+    sys.exit(0)
 
 models_str = os.environ.get("FAKE_CLAUDE_MODELS", "glm-5.2")
 model_usage = {{}}
@@ -191,19 +243,18 @@ def test_resolve_path_fallbacks(monkeypatch, tmp_path):
         "tools.claude_agent_tool._local_bin_claude_glm_path",
         lambda: Path("/nope/claude-glm"),
     )
-    # claude-glm on PATH wins over bare claude.
     monkeypatch.setattr(
         "tools.claude_agent_tool.shutil.which",
-        lambda name: "/usr/bin/claude-glm" if name == "claude-glm" else "/usr/bin/claude",
+        lambda name: "/usr/bin/claude-glm" if name == "claude-glm" else None,
     )
     assert resolve_claude_binary() == "/usr/bin/claude-glm"
 
-    # Falls back to bare claude when claude-glm is absent.
+    # Bare `claude` on PATH must NOT resolve — GLM wrapper only.
     monkeypatch.setattr(
         "tools.claude_agent_tool.shutil.which",
         lambda name: "/usr/bin/claude" if name == "claude" else None,
     )
-    assert resolve_claude_binary() == "/usr/bin/claude"
+    assert resolve_claude_binary() is None
 
     # Nothing resolvable → None.
     monkeypatch.setattr("tools.claude_agent_tool.shutil.which", lambda name: None)
@@ -282,6 +333,94 @@ def test_parse_no_result_event_returns_empty():
     assert parse_claude_agent_log('{"type":"assistant","message":{}}') == {}
 
 
+def test_parse_adversarial_metadata_normalization():
+    from tools.claude_agent_tool import parse_claude_agent_log
+
+    line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": {"nested": "report"},
+            "session_id": {"bad": "id"},
+            "num_turns": [1, 2],
+            "duration_ms": "123",
+            "total_cost_usd": {"usd": 1},
+            "modelUsage": {"glm-5.2": {}},
+            "permission_denials": "denied",
+        }
+    )
+    parsed = parse_claude_agent_log(line)
+    assert parsed["result"] == '{"nested": "report"}'
+    assert parsed["session_id"] is None
+    assert parsed["num_turns"] is None
+    assert parsed["duration_ms"] is None
+    assert parsed["total_cost_usd"] is None
+    assert parsed["models_used"] == ["glm-5.2"]
+    assert parsed["permission_denials"] == []
+
+
+@pytest.mark.parametrize(
+    "field_overrides,expected",
+    [
+        ({"num_turns": True}, {"num_turns": None, "success": True}),
+        ({"total_cost_usd": float("nan")}, {"total_cost_usd": None, "success": True}),
+        ({"total_cost_usd": float("inf")}, {"total_cost_usd": None, "success": True}),
+        ({"is_error": "false"}, {"success": False}),
+        ({"subtype": {"not": "string"}}, {"success": False}),
+    ],
+)
+def test_parse_adversarial_fail_closed_success(
+    field_overrides, expected, monkeypatch, repo, fake_binary
+):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    event = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "ok",
+        "session_id": "sess-1",
+        "num_turns": 3,
+        "duration_ms": 100,
+        "total_cost_usd": 0.01,
+        "modelUsage": {},
+        "permission_denials": [],
+    }
+    event.update(field_overrides)
+
+    def _fake_run(*_args, **_kwargs):
+        log_text = json.dumps(event) + "\n"
+        return None, "/tmp/fake.jsonl", log_text, log_text, 1.0, 0, False, 0
+
+    monkeypatch.setattr(claude_agent_tool, "_run_and_stream", _fake_run)
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="x", workdir=str(repo))
+    )
+    assert result["success"] is expected["success"]
+    if "num_turns" in expected:
+        assert result["num_turns"] is expected["num_turns"]
+    if "total_cost_usd" in expected:
+        assert result["cost_usd"] is expected["total_cost_usd"]
+
+
+def test_parse_coerces_integral_float_num_turns():
+    from tools.claude_agent_tool import parse_claude_agent_log
+
+    line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "done",
+            "num_turns": 3.0,
+        }
+    )
+    parsed = parse_claude_agent_log(line)
+    assert parsed["num_turns"] == 3
+
+
 # ---------------------------------------------------------------------------
 # Validation paths (no subprocess spawned)
 # ---------------------------------------------------------------------------
@@ -297,7 +436,7 @@ def test_validation_errors_use_full_result_shape(monkeypatch, tmp_path, fake_bin
     assert empty["log_path"] is None
     assert "final_report" in empty
     assert "models_used" in empty
-    assert "permission_denials" in empty
+    assert empty["permission_denials"] == []
 
     relative = json.loads(
         claude_agent_tool.delegate_claude_agent(task="x", workdir="relative/path")
@@ -388,7 +527,8 @@ def test_happy_path_e2e(monkeypatch, repo, fake_binary, tmp_path):
     assert "--allowedTools" in argv
     assert argv[argv.index("--allowedTools") + 1] == "Read,Write,Edit,Glob,Grep,Bash"
     assert "--output-format" in argv
-    assert argv[argv.index("--output-format") + 1] == "json"
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--verbose" in argv
     assert argv[-1] == "implement feature"
     # --dangerously-skip-permissions must never be passed (refused under root).
     assert "--dangerously-skip-permissions" not in argv
@@ -474,7 +614,6 @@ def test_timeout_kills_process_group(monkeypatch, repo, fake_binary):
         return start + calls["n"] * 40
 
     monkeypatch.setattr("tools.claude_agent_tool.time.monotonic", _fake_monotonic)
-    monkeypatch.setattr(claude_agent_tool, "STALL_WATCHDOG_SECONDS", 9999)
     monkeypatch.setattr(claude_agent_tool, "_MONITOR_POLL_SECONDS", 0.001)
 
     result = json.loads(
@@ -486,6 +625,45 @@ def test_timeout_kills_process_group(monkeypatch, repo, fake_binary):
     )
     assert result["success"] is False
     assert result["error"] == "timeout"
+
+
+@_REAL_SUBPROC
+def test_silent_period_then_final_result_not_stalled(monkeypatch, repo, fake_binary):
+    """Healthy runs that emit nothing until the final result must not die as stalled."""
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "sleep_then_result")
+    monkeypatch.setenv("FAKE_CLAUDE_SLEEP", "0.15")
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_TEXT", "Finished after quiet tool call.")
+
+    # Simulate >180s of stdout silence on the first monitor tick while the hard
+    # timeout (3600s) stays far away. Under the removed stall watchdog the run
+    # completes once the subprocess emits its final result line.
+    start = 1000.0
+    calls = {"n": 0}
+
+    def _fake_monotonic():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return start
+        if calls["n"] == 2:
+            return start + 200.0
+        return start + 200.0 + (calls["n"] - 2) * 0.01
+
+    monkeypatch.setattr("tools.claude_agent_tool.time.monotonic", _fake_monotonic)
+    monkeypatch.setattr(claude_agent_tool, "_MONITOR_POLL_SECONDS", 0.01)
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(
+            task="long quiet tool call",
+            workdir=str(repo),
+            timeout_seconds=3600,
+        )
+    )
+    assert result["success"] is True
+    assert result["error"] is None
+    assert result["final_report"] == "Finished after quiet tool call."
 
 
 @_REAL_SUBPROC
@@ -508,3 +686,74 @@ def test_child_env_guarantees_home_and_local_bin(monkeypatch, repo, fake_binary,
     assert captured["HOME"] == str(Path.home())
     # ~/.local/bin is prepended so binary resolution works under minimal PATH.
     assert captured["PATH"].split(os.pathsep)[0] == str(Path.home() / ".local" / "bin")
+
+
+@_REAL_SUBPROC
+def test_flood_output_bounded_and_parses_final_result(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "flood")
+    monkeypatch.setenv("FAKE_CLAUDE_FLOOD_BYTES", str(3 * 1024 * 1024))
+    monkeypatch.setenv("FAKE_CLAUDE_RESULT_TEXT", "Survived flood.")
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="flood test", workdir=str(repo))
+    )
+
+    assert result["success"] is True
+    assert result["final_report"] == "Survived flood."
+    assert result["log_truncated"] is True
+    assert result["log_bytes_dropped"] > 0
+
+    log_path = Path(result["log_path"])
+    assert log_path.stat().st_size <= claude_agent_tool.LOG_MAX_FILE_BYTES
+    log_text = log_path.read_text(encoding="utf-8", errors="replace")
+    assert "...[truncated " in log_text
+    assert "bytes]..." in log_text
+
+
+@_REAL_SUBPROC
+def test_giant_result_line_fails_closed(monkeypatch, repo, fake_binary):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "flood_giant_result")
+    giant_pad = claude_agent_tool.LOG_TAIL_BYTES + (512 * 1024)
+    monkeypatch.setenv("FAKE_CLAUDE_GIANT_PAD", str(giant_pad))
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(task="giant result", workdir=str(repo))
+    )
+
+    assert result["success"] is False
+    assert result["log_truncated"] is True
+    error = result["error"].lower()
+    assert "truncat" in error
+    log_path = Path(result["log_path"])
+    assert log_path.stat().st_size <= claude_agent_tool.LOG_MAX_FILE_BYTES
+
+
+@_REAL_SUBPROC
+def test_truncated_log_does_not_accept_early_head_result(
+    monkeypatch, repo, fake_binary
+):
+    from tools import claude_agent_tool
+
+    _patch_binary(monkeypatch, fake_binary)
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "early_result_then_flood")
+    monkeypatch.setenv("FAKE_CLAUDE_FLOOD_BYTES", str(3 * 1024 * 1024))
+
+    result = json.loads(
+        claude_agent_tool.delegate_claude_agent(
+            task="early result followed by trailing noise", workdir=str(repo)
+        )
+    )
+
+    assert result["success"] is False
+    assert result["final_report"] == ""
+    assert result["log_truncated"] is True
+    assert "result event missing" in result["error"]
+    assert Path(result["log_path"]).stat().st_size <= (
+        claude_agent_tool.LOG_MAX_FILE_BYTES
+    )
