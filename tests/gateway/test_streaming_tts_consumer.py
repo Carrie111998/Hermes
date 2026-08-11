@@ -9,9 +9,11 @@ suppression, cancellation idempotency, and concurrent-turn isolation.
 from __future__ import annotations
 
 import asyncio
+import gc
 import queue
 import threading
 import time
+import warnings
 
 import pytest
 
@@ -401,6 +403,45 @@ class TestAbortAndCancellation:
             assert adapter.abort_count <= 1
 
         _run_test(run)
+
+    def test_abort_on_a_closed_loop_closes_the_abort_coroutine(self):
+        """A closed loop must not leave the _safe_abort coroutine unawaited.
+
+        ``abort("cleanup")`` runs at turn teardown, which is exactly when the
+        gateway loop is most likely to already be closing.  Scheduling then
+        raises ``RuntimeError: Event loop is closed``; if that is swallowed
+        without closing the coroutine, its frame leaks and Python emits
+        ``coroutine '_safe_abort' was never awaited``.
+        """
+        loop = asyncio.new_event_loop()
+        adapter = FakeVoiceAdapter()
+        consumer = _make_consumer(adapter, "chat1", loop, FakeStreamer())
+        consumer._handle = StreamingTTSHandle(
+            chat_id="chat1", audio_format=consumer._audio_format
+        )
+        loop.close()
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            # Must not raise: abort() is documented as callable from any
+            # thread at any point in the turn.
+            consumer.abort("cleanup")
+            gc.collect()
+
+        leaked = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, RuntimeWarning)
+            and "never awaited" in str(w.message)
+            and "_safe_abort" in str(w.message)
+        ]
+        assert leaked == [], f"abort coroutine leaked unawaited: {leaked}"
+
+        # Scheduling failed, so there is no future to wait on and the adapter
+        # was never reached — but the consumer is still marked aborted.
+        assert consumer._abort_future is None
+        assert adapter.abort_count == 0
+        assert consumer._aborted is True
 
 
 class TestFallbackSafety:
