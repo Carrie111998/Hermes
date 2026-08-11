@@ -17,6 +17,12 @@ from plugins.semantic_graph import config as graph_config_module
 from plugins.semantic_graph.config import (
     SemanticGraphCognitiveMemoryConfig,
     SemanticGraphConfig,
+    SemanticGraphEmbeddingConfig,
+)
+from plugins.semantic_graph.embedding import (
+    EmbeddingModelIdentity,
+    serialize_embedding_node,
+    source_text_hash,
 )
 from plugins.semantic_graph.cli import register_cli
 from plugins.semantic_graph.runtime import SemanticGraphRuntime
@@ -166,6 +172,108 @@ def test_revision_retraction_and_dream_provenance_mapping(tmp_path: Path) -> Non
         ]
         assert len(derived) == 2
         assert len(graph.get_memory_node_links(memory_id=semantic["memory_id"])) == 1
+    finally:
+        memory.close()
+
+
+def test_prediction_error_revision_preserves_old_embedding_and_embeds_only_new_node(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    memory, graph, bridge = _bridge(tmp_path)
+
+    class RecordingBackend:
+        identity = EmbeddingModelIdentity(
+            provider="test",
+            model="phase7",
+            revision="r1",
+            dimensions=4,
+            serializer_version=1,
+        )
+
+        def __init__(self):
+            self.batches: list[list[str]] = []
+
+        def available(self):
+            return True
+
+        def embed_query(self, _text):
+            return [1.0, 0.0, 0.0, 0.0]
+
+        def embed_documents(self, texts):
+            self.batches.append(list(texts))
+            return [[1.0, 0.0, 0.0, 0.0] for _ in texts]
+
+    try:
+        old = memory.remember("The active build is alpha.", tags=["decision"])
+        assert bridge.after_remember(old)["success"] is True
+        old_link = graph.get_memory_node_links(memory_id=old["memory_id"])[0]
+        old_node = graph.get_node(old_link["node_id"])
+        assert old_node is not None
+        old_text = serialize_embedding_node(old_node)
+        backend = RecordingBackend()
+        graph.upsert_node_embedding(
+            node_id=old_link["node_id"],
+            identity=backend.identity,
+            vector=[1.0, 0.0, 0.0, 0.0],
+            source_text_hash=source_text_hash(old_text),
+        )
+
+        reconciled = memory.record_prediction_error(
+            old["memory_id"],
+            source="user_correction",
+            expected_hash="a" * 64,
+            observed_hash="b" * 64,
+            severity=0.9,
+            requires_revision=True,
+            new_content="The active build is beta.",
+            reason="user correction",
+            test_query="active build beta",
+        )
+        revision = reconciled["revision"]
+        assert bridge.after_revision(revision)["success"] is True
+        new_link = graph.get_memory_node_links(
+            memory_id=revision["new_memory_id"]
+        )[0]
+        assert graph.get_node(old_link["node_id"])["status"] == "superseded"
+        assert graph.get_node_embedding(
+            node_id=old_link["node_id"],
+            namespace=backend.identity.namespace,
+        ) is not None
+        assert graph.get_node_embedding(
+            node_id=new_link["node_id"],
+            namespace=backend.identity.namespace,
+        ) is None
+
+        runtime = SemanticGraphRuntime(
+            llm=None,
+            config=SemanticGraphConfig(
+                db_subdir="semantic-graph",
+                capture_turns=True,
+                auto_extract="off",
+                embedding=SemanticGraphEmbeddingConfig(enabled=True, dimensions=4),
+            ),
+        )
+        runtime._store = graph
+        runtime._embedding_backend = backend
+        runtime._embedding_backend_initialized = True
+        runtime.on_post_llm_call(
+            session_id="s",
+            turn_id="revision",
+            user_message="correct the active build",
+            assistant_response="Updated.",
+        )
+        assert len(backend.batches) == 1
+        assert len(backend.batches[0]) == 1
+        assert graph.get_node_embedding(
+            node_id=new_link["node_id"],
+            namespace=backend.identity.namespace,
+        ) is not None
+        assert graph.get_node_embedding(
+            node_id=old_link["node_id"],
+            namespace=backend.identity.namespace,
+        ) is not None
     finally:
         memory.close()
 

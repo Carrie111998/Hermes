@@ -182,6 +182,72 @@ def test_provider_exposes_sleep_cycle_tool_action(tmp_path):
     provider.shutdown()
 
 
+def test_provider_exposes_prediction_error_revision_and_stabilization(tmp_path):
+    provider = EbbinghausMemoryProvider({"db_path": str(tmp_path / "provider.db")})
+    provider.initialize("session-1", hermes_home=str(tmp_path))
+    first = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {"action": "remember", "content": "Current tool port is 9000."},
+        )
+    )
+    expected_hash = "a" * 64
+    observed_hash = "b" * 64
+    revised = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {
+                "action": "prediction_error",
+                "memory_id": first["memory_id"],
+                "source": "tool_result",
+                "expected_hash": expected_hash,
+                "observed_hash": observed_hash,
+                "severity": 0.8,
+                "requires_revision": True,
+                "new_content": "Current tool port is 9001.",
+                "test_query": "current tool port 9001",
+            },
+        )
+    )
+    assert revised["status"] == "revised"
+    assert revised["revision"]["old_memory_id"] == first["memory_id"]
+
+    second = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {"action": "remember", "content": "Current mode is shadow."},
+        )
+    )
+    labile = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {
+                "action": "prediction_error",
+                "memory_id": second["memory_id"],
+                "source": "validation_failure",
+                "expected_hash": expected_hash,
+                "observed_hash": observed_hash,
+                "severity": 0.6,
+                "requires_revision": False,
+            },
+        )
+    )
+    assert labile["status"] == "labile"
+    stabilized = json.loads(
+        provider.handle_tool_call(
+            "ebbinghaus_memory",
+            {
+                "action": "stabilize",
+                "memory_id": second["memory_id"],
+                "evidence_type": "manual_validation",
+                "evidence_hash": "c" * 64,
+            },
+        )
+    )
+    assert stabilized["status"] == "stabilized"
+    provider.shutdown()
+
+
 def test_provider_tools_and_prefetch(tmp_path):
     provider = EbbinghausMemoryProvider(
         {

@@ -62,6 +62,8 @@ EBBINGHAUS_MEMORY_SCHEMA = {
                     "stats",
                     "dream",
                     "revise",
+                    "prediction_error",
+                    "stabilize",
                     "retract",
                     "history",
                     "events",
@@ -100,6 +102,34 @@ EBBINGHAUS_MEMORY_SCHEMA = {
             "test_query": {
                 "type": "string",
                 "description": "Correction rehearsal probe query for revise.",
+            },
+            "source": {
+                "type": "string",
+                "description": "Provenance source for remember, revise, or prediction_error.",
+            },
+            "expected_hash": {
+                "type": "string",
+                "description": "SHA-256 of the expected observation for prediction_error.",
+            },
+            "observed_hash": {
+                "type": "string",
+                "description": "SHA-256 of the observed outcome for prediction_error.",
+            },
+            "severity": {
+                "type": "number",
+                "description": "Prediction error severity from 0.0 to 1.0.",
+            },
+            "requires_revision": {
+                "type": "boolean",
+                "description": "Whether prediction_error should create a new belief version.",
+            },
+            "evidence_type": {
+                "type": "string",
+                "description": "Validated evidence class for stabilize.",
+            },
+            "evidence_hash": {
+                "type": "string",
+                "description": "SHA-256 of the evidence used for stabilize.",
             },
             "allow_rescue": {
                 "type": "boolean",
@@ -598,6 +628,33 @@ class EbbinghausMemoryProvider(MemoryProvider):
                     result,
                     ensure_ascii=False,
                 )
+            if action == "prediction_error":
+                confidence = args.get("confidence")
+                result = self._store.record_prediction_error(
+                    int(args["memory_id"]),
+                    source=str(args.get("source") or ""),
+                    expected_hash=str(args.get("expected_hash") or ""),
+                    observed_hash=str(args.get("observed_hash") or ""),
+                    severity=float(args.get("severity", 0.0)),
+                    requires_revision=bool(args.get("requires_revision", False)),
+                    new_content=str(args.get("new_content") or ""),
+                    reason=str(args.get("reason") or ""),
+                    confidence=(None if confidence is None else float(confidence)),
+                    test_query=str(args.get("test_query") or ""),
+                    session_id=self._session_id,
+                )
+                revision = result.get("revision")
+                if isinstance(revision, dict):
+                    self._bridge_revision(revision)
+                return json.dumps(result, ensure_ascii=False)
+            if action == "stabilize":
+                result = self._store.stabilize_memory(
+                    int(args["memory_id"]),
+                    evidence_type=str(args.get("evidence_type") or ""),
+                    evidence_hash=str(args.get("evidence_hash") or ""),
+                    session_id=self._session_id,
+                )
+                return json.dumps(result, ensure_ascii=False)
             if action == "retract":
                 result = self._store.retract_memory(
                     int(args["memory_id"]),

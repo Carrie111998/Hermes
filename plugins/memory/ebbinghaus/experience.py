@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import threading
 import uuid
@@ -26,10 +27,39 @@ logger = logging.getLogger(__name__)
 
 _MAX_EVENT_FIELD_CHARS = 4000
 _MAX_EVENT_PAYLOAD_CHARS = 32000
+_PREDICTION_ERROR_SOURCES = frozenset(
+    {
+        "user_correction",
+        "explicit_contradiction",
+        "tool_result",
+        "expected_observed_mismatch",
+        "high_surprise_latent_rescue",
+        "new_time_qualified_evidence",
+        "validation_failure",
+    }
+)
+_STABILIZATION_EVIDENCE_TYPES = frozenset(
+    {
+        "user_confirmation",
+        "unit_test",
+        "integration_test",
+        "trusted_tool_result",
+        "external_source_validation",
+        "correction_rehearsal_pass",
+        "manual_validation",
+    }
+)
 
 
 def normalize_query_hash(query: str) -> str:
     return hashlib.sha256(query.encode("utf-8")).hexdigest()
+
+
+def _validated_sha256(value: str, *, name: str) -> str:
+    digest = str(value or "").strip().lower()
+    if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+        raise ValueError(f"{name} must be a SHA-256 hex digest")
+    return digest
 
 
 def _safe_json_payload(payload: Mapping[str, Any] | None) -> str:
@@ -107,6 +137,154 @@ class EbbinghausExperienceLedger:
             self._conn.commit()
             return int(cur.lastrowid)
 
+    def record_prediction_error(
+        self,
+        *,
+        memory_id: int,
+        source: str,
+        expected_hash: str,
+        observed_hash: str,
+        severity: float,
+        requires_revision: bool,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        source_key = str(source or "").strip().lower()
+        if source_key not in _PREDICTION_ERROR_SOURCES:
+            raise ValueError(
+                "prediction error source must be one of "
+                f"{sorted(_PREDICTION_ERROR_SOURCES)}"
+            )
+        expected = _validated_sha256(expected_hash, name="expected_hash")
+        observed = _validated_sha256(observed_hash, name="observed_hash")
+        if expected == observed:
+            raise ValueError("expected_hash and observed_hash must differ")
+        severity_value = float(severity)
+        if not math.isfinite(severity_value) or not 0.0 <= severity_value <= 1.0:
+            raise ValueError("severity must be between 0 and 1")
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT memory_id, belief_id, belief_status, state, access_state "
+                    "FROM memories WHERE memory_id = ?",
+                    (int(memory_id),),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"memory_id {memory_id} not found")
+                if str(row["belief_status"] or "current") != "current":
+                    raise ValueError("prediction error requires the current belief version")
+                if str(row["state"] or "active") != "active":
+                    raise ValueError("prediction error requires an active belief")
+                now = float(self._now_fn())
+                self._conn.execute(
+                    "UPDATE memories SET access_state = 'labile', updated_at = ? "
+                    "WHERE memory_id = ?",
+                    (now, int(memory_id)),
+                )
+                payload = {
+                    "source": source_key,
+                    "expected_hash": expected,
+                    "observed_hash": observed,
+                    "severity": severity_value,
+                    "requires_revision": bool(requires_revision),
+                }
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO memory_events(
+                        event_type, memory_id, related_memory_id, belief_id,
+                        session_id, payload, created_at
+                    ) VALUES ('prediction_error', ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(memory_id),
+                        str(row["belief_id"] or f"memory-{int(memory_id)}"),
+                        str(session_id or ""),
+                        _safe_json_payload(payload),
+                        now,
+                    ),
+                )
+                event_id = int(cur.lastrowid)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return {
+            "status": "labile",
+            "event_id": event_id,
+            "memory_id": int(memory_id),
+            **payload,
+        }
+
+    def stabilize_memory(
+        self,
+        *,
+        memory_id: int,
+        evidence_type: str,
+        evidence_hash: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        evidence_key = str(evidence_type or "").strip().lower()
+        if evidence_key not in _STABILIZATION_EVIDENCE_TYPES:
+            raise ValueError(
+                "stabilization evidence type must be one of "
+                f"{sorted(_STABILIZATION_EVIDENCE_TYPES)}"
+            )
+        digest = _validated_sha256(evidence_hash, name="evidence_hash")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT belief_id, belief_status, state, access_state "
+                    "FROM memories WHERE memory_id = ?",
+                    (int(memory_id),),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"memory_id {memory_id} not found")
+                if (
+                    str(row["belief_status"] or "current") != "current"
+                    or str(row["state"] or "active") != "active"
+                ):
+                    raise ValueError("only an active current belief can be stabilized")
+                if str(row["access_state"] or "accessible") != "labile":
+                    raise ValueError("memory must be labile before stabilization")
+                now = float(self._now_fn())
+                self._conn.execute(
+                    "UPDATE memories SET access_state = 'accessible', updated_at = ? "
+                    "WHERE memory_id = ?",
+                    (now, int(memory_id)),
+                )
+                payload = {
+                    "evidence_type": evidence_key,
+                    "evidence_hash": digest,
+                }
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO memory_events(
+                        event_type, memory_id, related_memory_id, belief_id,
+                        session_id, payload, created_at
+                    ) VALUES ('memory_stabilized', ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(memory_id),
+                        str(row["belief_id"] or f"memory-{int(memory_id)}"),
+                        str(session_id or ""),
+                        _safe_json_payload(payload),
+                        now,
+                    ),
+                )
+                event_id = int(cur.lastrowid)
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+        return {
+            "status": "stabilized",
+            "event_id": event_id,
+            "memory_id": int(memory_id),
+            **payload,
+        }
+
     def record_retrieval_miss(
         self,
         *,
@@ -168,6 +346,7 @@ class EbbinghausExperienceLedger:
         rescue_score: float,
         direct_best_score: float,
         session_id: str = "",
+        current_attempt_id: int | None = None,
     ) -> dict[str, Any] | None:
         current_cue_set = {str(c).strip().lower() for c in current_cues if str(c).strip()}
         cutoff = float(self._now_fn()) - (
@@ -185,7 +364,7 @@ class EbbinghausExperienceLedger:
                 """,
                 (cutoff,),
             ).fetchall()
-            best: tuple[float, float, int] | None = None  # overlap, created_at, id
+            best: tuple[int, float, float, int] | None = None
             for row in rows:
                 attempt_id = int(row["attempt_id"] if isinstance(row, sqlite3.Row) else row[0])
                 old_hash = str(row["query_hash"] if isinstance(row, sqlite3.Row) else row[1])
@@ -204,12 +383,21 @@ class EbbinghausExperienceLedger:
                 )
                 if not (same_hash or overlap >= 0.45):
                     continue
-                rank = (overlap if not same_hash else 1.0, created_at, attempt_id)
+                prior_context = int(
+                    current_attempt_id is not None
+                    and attempt_id != int(current_attempt_id)
+                )
+                rank = (
+                    prior_context,
+                    overlap if not same_hash else 1.0,
+                    created_at,
+                    attempt_id,
+                )
                 if best is None or rank > best:
                     best = rank
             if best is None:
                 return None
-            attempt_id = best[2]
+            attempt_id = best[3]
             resolution_gain = max(0.0, float(rescue_score) - float(direct_best_score))
             surprise = max(0.0, min(1.0, resolution_gain))
             now = float(self._now_fn())
@@ -234,6 +422,32 @@ class EbbinghausExperienceLedger:
                     attempt_id,
                 ),
             )
+            if (
+                current_attempt_id is not None
+                and int(current_attempt_id) != attempt_id
+            ):
+                self._conn.execute(
+                    """
+                    UPDATE retrieval_attempts
+                    SET outcome = 'rescued',
+                        matched_miss_id = ?,
+                        top_memory_id = ?,
+                        result_memory_ids = ?,
+                        rescue_score = ?,
+                        surprise = ?,
+                        resolved_at = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        attempt_id,
+                        int(rescued_memory_id),
+                        json.dumps([int(rescued_memory_id)], ensure_ascii=False),
+                        float(rescue_score),
+                        float(surprise),
+                        now,
+                        int(current_attempt_id),
+                    ),
+                )
             self._conn.execute(
                 """
                 INSERT INTO memory_events(

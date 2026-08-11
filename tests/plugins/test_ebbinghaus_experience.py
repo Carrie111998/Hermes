@@ -6,6 +6,8 @@ operator database under ~/.hermes.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 import time
 from pathlib import Path
@@ -354,12 +356,23 @@ def test_rescue_reactivates_latent_memory_after_prior_miss(tmp_path):
     )
     assert rescued.outcome is RetrievalOutcome.RESCUED
     assert rescued.rescued_memory_id == mid
+    assert rescued.matched_miss_id == miss.attempt_id
     assert rescued.results[0]["memory_id"] == mid
     assert "previously inaccessible" in rescued.state_note.lower()
     row = store.get(mid)
     assert row["access_state"] == "reactivated"
     assert row["state"] == "active"
     assert int(row.get("reactivation_count") or 0) >= 1
+    assert row["confidence"] == remembered["confidence"]
+    aha_events = store.list_events(
+        event_type="forgotten_then_recalled",
+        memory_id=mid,
+        limit=10,
+    )
+    assert len(aha_events) == 1
+    assert aha_events[0]["payload"]["prior_attempt_id"] == miss.attempt_id
+    assert aha_events[0]["payload"]["current_attempt_id"] == rescued.attempt_id
+    assert aha_events[0]["payload"]["resolution_gain"] > 0.0
     store.close()
 
 
@@ -443,6 +456,128 @@ def test_revise_memory_supersedes_old_belief_and_queues_rehearsal(tmp_path):
     ]
     a320 = store.recall("ASRock A320", reinforce=False)
     assert all(item["memory_id"] != old["memory_id"] for item in a320)
+    store.close()
+
+
+def test_prediction_error_is_hash_only_selective_and_stabilization_is_evidence_gated(
+    tmp_path,
+):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    target = store.remember("Private target belief must never enter the event body.")
+    unrelated = store.remember("Unrelated benign belief remains unchanged.")
+    confidence_before = store.get(target["memory_id"])["confidence"]
+
+    store.recall("Private target belief", reinforce=True)
+    assert store.get(target["memory_id"])["access_state"] == "accessible"
+    unrelated_before = store.get(unrelated["memory_id"])
+    expected_hash = hashlib.sha256(b"expected-v1").hexdigest()
+    observed_hash = hashlib.sha256(b"observed-v2").hexdigest()
+
+    with pytest.raises(ValueError, match="prediction error source"):
+        store.record_prediction_error(
+            target["memory_id"],
+            source="normal_recall",
+            expected_hash=expected_hash,
+            observed_hash=observed_hash,
+            severity=0.7,
+            requires_revision=False,
+        )
+    assert store.get(target["memory_id"])["access_state"] == "accessible"
+
+    recorded = store.record_prediction_error(
+        target["memory_id"],
+        source="tool_result",
+        expected_hash=expected_hash,
+        observed_hash=observed_hash,
+        severity=0.7,
+        requires_revision=False,
+    )
+    assert recorded["status"] == "labile"
+    assert store.get(target["memory_id"])["access_state"] == "labile"
+    assert store.get(unrelated["memory_id"]) == unrelated_before
+
+    events = store.list_events(
+        event_type="prediction_error",
+        memory_id=target["memory_id"],
+        limit=10,
+    )
+    assert len(events) == 1
+    assert events[0]["payload"] == {
+        "source": "tool_result",
+        "expected_hash": expected_hash,
+        "observed_hash": observed_hash,
+        "severity": 0.7,
+        "requires_revision": False,
+    }
+    assert "Private target belief" not in json.dumps(events, ensure_ascii=False)
+
+    evidence_hash = hashlib.sha256(b"trusted-tool-evidence").hexdigest()
+    with pytest.raises(ValueError, match="stabilization evidence type"):
+        store.stabilize_memory(
+            target["memory_id"],
+            evidence_type="llm_guess",
+            evidence_hash=evidence_hash,
+        )
+    stabilized = store.stabilize_memory(
+        target["memory_id"],
+        evidence_type="trusted_tool_result",
+        evidence_hash=evidence_hash,
+    )
+    assert stabilized["status"] == "stabilized"
+    assert store.get(target["memory_id"])["access_state"] == "accessible"
+    assert store.get(target["memory_id"])["confidence"] == confidence_before
+    assert store.get(unrelated["memory_id"]) == unrelated_before
+    store.close()
+
+
+def test_prediction_error_uses_existing_revision_and_repairs_only_dependents(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    target = store.remember("Deployment window is Monday.", tags=["decision"])
+    unrelated = store.remember("Unrelated preference is concise output.")
+    dependent = store.remember(
+        "Plan deployment work for Monday.",
+        tags=["semantic"],
+        memory_type="semantic",
+    )
+    store._conn.execute(  # noqa: SLF001 - seed existing dependent contract
+        "INSERT INTO memory_provenance(semantic_memory_id, source_memory_id, relation, created_at) "
+        "VALUES (?, ?, 'dream-derived', ?)",
+        (dependent["memory_id"], target["memory_id"], store._now()),  # noqa: SLF001
+    )
+    store._conn.commit()  # noqa: SLF001
+    unrelated_before = store.get(unrelated["memory_id"])
+    target_confidence = store.get(target["memory_id"])["confidence"]
+
+    result = store.record_prediction_error(
+        target["memory_id"],
+        source="user_correction",
+        expected_hash=hashlib.sha256(b"monday").hexdigest(),
+        observed_hash=hashlib.sha256(b"tuesday").hexdigest(),
+        severity=0.9,
+        requires_revision=True,
+        new_content="Deployment window is Tuesday.",
+        reason="user correction",
+        test_query="deployment window Tuesday",
+    )
+    assert result["status"] == "revised"
+    revision = result["revision"]
+    old_row = store.get(target["memory_id"])
+    new_row = store.get(revision["new_memory_id"])
+    assert old_row["belief_status"] == "superseded"
+    assert new_row["belief_status"] == "current"
+    assert new_row["confidence"] == target_confidence
+    assert store.get(dependent["memory_id"])["belief_status"] == "contested"
+    assert store.get(unrelated["memory_id"]) == unrelated_before
+    assert target["memory_id"] not in {
+        item["memory_id"]
+        for item in store.recall("deployment window Monday", reinforce=False)
+    }
+    history = store.belief_history(memory_id=revision["new_memory_id"])
+    assert [item["belief_version"] for item in history] == [1, 2]
+
+    for _ in range(5):
+        store.recall("deployment window Tuesday", reinforce=True)
+    assert store.get(revision["new_memory_id"])["confidence"] == target_confidence
     store.close()
 
 

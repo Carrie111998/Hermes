@@ -962,6 +962,79 @@ class EbbinghausMemoryStore:
             }
         return dict(result)
 
+    def record_prediction_error(
+        self,
+        memory_id: int,
+        *,
+        source: str,
+        expected_hash: str,
+        observed_hash: str,
+        severity: float,
+        requires_revision: bool,
+        new_content: str = "",
+        reason: str = "",
+        confidence: float | None = None,
+        test_query: str = "",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        current = self.get(int(memory_id))
+        event = self.experience.record_prediction_error(
+            memory_id=int(memory_id),
+            source=source,
+            expected_hash=expected_hash,
+            observed_hash=observed_hash,
+            severity=float(severity),
+            requires_revision=bool(requires_revision),
+            session_id=session_id,
+        )
+        if not requires_revision:
+            return event
+
+        content = _normalize_text(new_content)
+        if not content:
+            return {**event, "status": "revision_required"}
+        revision = self.revise_memory(
+            int(memory_id),
+            content,
+            reason=str(reason or f"prediction error from {event['source']}"),
+            evidence=[
+                {
+                    "event_id": event["event_id"],
+                    "expected_hash": event["expected_hash"],
+                    "observed_hash": event["observed_hash"],
+                    "severity": event["severity"],
+                }
+            ],
+            confidence=(
+                float(current.get("confidence") or 0.0)
+                if confidence is None
+                else float(confidence)
+            ),
+            test_query=test_query,
+            source=event["source"],
+            session_id=session_id,
+        )
+        return {
+            "status": "revised",
+            "prediction_error": event,
+            "revision": revision,
+        }
+
+    def stabilize_memory(
+        self,
+        memory_id: int,
+        *,
+        evidence_type: str,
+        evidence_hash: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        return self.experience.stabilize_memory(
+            memory_id=int(memory_id),
+            evidence_type=evidence_type,
+            evidence_hash=evidence_hash,
+            session_id=session_id,
+        )
+
     def retract_memory(
         self,
         memory_id: int,
@@ -1456,12 +1529,31 @@ class EbbinghausMemoryStore:
             rescued_memory_id=memory_id,
             rescue_score=rescue_score,
             direct_best_score=direct_best_score,
+            current_attempt_id=attempt_id,
         )
         matched_miss_id = None
         if resolved:
             matched_miss_id = int(resolved.get("matched_miss_id") or resolved.get("attempt_id") or 0) or None
             if "surprise" in resolved:
                 surprise = float(resolved["surprise"])
+            if (
+                attempt_id is not None
+                and matched_miss_id is not None
+                and matched_miss_id != attempt_id
+                and resolution_gain > 0.0
+            ):
+                self.experience.record_event(
+                    "forgotten_then_recalled",
+                    memory_id=memory_id,
+                    belief_id=str(row["belief_id"] or ""),
+                    payload={
+                        "prior_attempt_id": matched_miss_id,
+                        "current_attempt_id": attempt_id,
+                        "current_query_hash": query_hash,
+                        "resolution_gain": resolution_gain,
+                        "surprise": surprise,
+                    },
+                )
 
         result = self.get(memory_id) | {"score": round(float(rescue_score), 4)}
         state_note = (
