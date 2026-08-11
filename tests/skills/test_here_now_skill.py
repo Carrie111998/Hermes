@@ -232,6 +232,42 @@ def test_fork_meta_excluded_from_manifest(harness: PublishHarness):
 
 
 @requires_shell_deps
+def test_state_json_excluded_from_manifest(harness: PublishHarness):
+    # publish.sh writes its own .herenow/state.json next to published
+    # directories; it is local cache (and carries claim tokens for anonymous
+    # sites), so collection must never upload it as site content.
+    meta_dir = harness.site / ".herenow"
+    meta_dir.mkdir()
+    (meta_dir / "state.json").write_text('{"publishes": {}}')
+    result = harness.run(str(harness.site))
+    assert result.returncode == 0, result.stderr
+    _, body = harness.request(1)
+    assert [f["path"] for f in body["files"]] == ["index.html"]
+
+
+@requires_shell_deps
+def test_zero_upload_republish_still_finalizes(harness: PublishHarness):
+    # When every file is unchanged the server returns no upload URLs and
+    # lists the files in skipped[]. The script must proceed to finalize:
+    # a BSD-seq loop bug (`seq 0 -1` counts down on macOS) used to crash
+    # between create and finalize here, stranding the site in pending.
+    no_upload = dict(CREATE_RESPONSE)
+    no_upload["upload"] = {
+        **CREATE_RESPONSE["upload"],
+        "uploads": [],
+        "skipped": [{"path": "index.html"}],
+    }
+    (harness.log_dir / "create-response.json").write_text(json.dumps(no_upload))
+    result = harness.run(
+        str(harness.site), "--slug", "test-slug-a1b2", api_key="hn_test_key"
+    )
+    assert result.returncode == 0, result.stderr
+    finalize_args, finalize_body = harness.request(2)
+    assert any(a.endswith("/finalize") for a in finalize_args)
+    assert finalize_body["versionId"] == "ver-1"
+
+
+@requires_shell_deps
 def test_anonymous_update_autoloads_claim_token(harness: PublishHarness):
     harness.write_state("test-slug-a1b2", "state-token")
     result = harness.run(str(harness.site), "--slug", "test-slug-a1b2")
