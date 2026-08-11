@@ -25,7 +25,7 @@ def test_sibling_container_config_sites_carry_docker_network():
     reported on issue #46358).
 
     The sibling tool modules build their container_config through the shared
-    _container_config_from_env_config() helper, so a site is either an inline
+    _container_config_from_config() helper, so a site is either an inline
     dict (which must carry docker_network alongside docker_run_as_host_user)
     or a call to that helper (whose output is asserted below).
     """
@@ -35,9 +35,9 @@ def test_sibling_container_config_sites_carry_docker_network():
     import tools.code_execution_tool as code_execution_tool
     import tools.file_tools as file_tools
 
-    assert terminal_tool._container_config_from_env_config({})["docker_network"] is True
+    assert terminal_tool._container_config_from_config({})["docker_network"] is True
     assert (
-        terminal_tool._container_config_from_env_config({"docker_network": False})[
+        terminal_tool._container_config_from_config({"docker_network": False})[
             "docker_network"
         ]
         is False
@@ -59,7 +59,7 @@ def test_sibling_container_config_sites_carry_docker_network():
             elif isinstance(node, ast.Call):
                 func = node.func
                 name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-                if name == "_container_config_from_env_config":
+                if name == "_container_config_from_config":
                     sites += 1
         assert sites >= 1, f"expected at least one container_config site in {module.__name__}"
 
