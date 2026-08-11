@@ -58,6 +58,12 @@ declare global {
       // renders the complete app against the shared backend, so the user can run
       // multiple GUI windows at once.
       openWindow: () => Promise<{ ok: boolean; error?: string }>
+      /** Main-process close handshake. The renderer must resolve every request
+       * after its registered close-sensitive work has either saved or vetoed. */
+      closeBarrier?: {
+        onRequest: (callback: (requestId: string) => void) => () => void
+        resolve: (requestId: string, allowed: boolean) => void
+      }
       // Claim a one-shot cross-window ambient cue (turn-end sound / spoken
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.

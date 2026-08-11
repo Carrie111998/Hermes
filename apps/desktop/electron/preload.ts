@@ -15,6 +15,20 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openSessionInTerminal: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openInTerminal', sessionId, opts),
   openWindow: () => ipcRenderer.invoke('hermes:window:openInstance'),
+  closeBarrier: {
+    onRequest: callback => {
+      const listener = (_event, payload) => {
+        if (payload && typeof payload.requestId === 'string') {
+          callback(payload.requestId)
+        }
+      }
+      ipcRenderer.on('hermes:window:close-barrier:request', listener)
+
+      return () => ipcRenderer.removeListener('hermes:window:close-barrier:request', listener)
+    },
+    resolve: (requestId, allowed) =>
+      ipcRenderer.send('hermes:window:close-barrier:result', { allowed: allowed === true, requestId })
+  },
   claimAmbientCue: key => ipcRenderer.invoke('hermes:ambient:claim', key),
   wakeIndicator: {
     getState: () => ipcRenderer.invoke('hermes:wake-indicator:get'),

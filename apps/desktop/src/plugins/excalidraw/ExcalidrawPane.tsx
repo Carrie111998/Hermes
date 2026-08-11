@@ -2,6 +2,8 @@ import type { ExcalidrawElement } from '@excalidraw/excalidraw/element/types'
 import type { AppState, BinaryFiles } from '@excalidraw/excalidraw/types'
 import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 
+import { registerWindowCloseBarrier } from '@/lib/window-close-barrier'
+
 import { createDrawingController, type DrawingController, type DrawingState, loadDrawing } from './document'
 import type { ExcalidrawDocumentIdentity } from './identity'
 import { openDrawing, setDrawingController } from './store'
@@ -82,6 +84,8 @@ export function ExcalidrawPane({ identity }: ExcalidrawPaneProps) {
   useEffect(() => {
     let disposed = false
     let activeController: DrawingController | null = null
+    let unregisterCloseBarrier: (() => void) | undefined
+
     ignoreInitializationEcho.current = true
     void loadDrawing(identity)
       .then(drawing => {
@@ -89,6 +93,8 @@ export function ExcalidrawPane({ identity }: ExcalidrawPaneProps) {
           return
         }
         activeController = createDrawingController(drawing)
+        unregisterCloseBarrier = registerWindowCloseBarrier(() => activeController?.waitForSave() ?? true)
+
         const loadedState = activeController.getState()
         setController(activeController)
         setDrawingController(identity, activeController)
@@ -116,8 +122,10 @@ export function ExcalidrawPane({ identity }: ExcalidrawPaneProps) {
 
     return () => {
       disposed = true
-      activeController?.dispose()
       setDrawingController(identity, null)
+      // The close-barrier registry retains this callback until a concurrent
+      // flush has settled, so React cannot drop the only live flush handle.
+      unregisterCloseBarrier?.()
     }
   }, [identity])
 

@@ -14,14 +14,18 @@ vi.mock('@excalidraw/excalidraw/index.css', () => ({}))
 import { act, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { createDrawingController, loadDrawing, onSceneChange, subscribe } = vi.hoisted(() => ({
-  createDrawingController: vi.fn(),
-  loadDrawing: vi.fn(),
-  onSceneChange: vi.fn(),
-  subscribe: vi.fn()
-}))
+const { createDrawingController, loadDrawing, onSceneChange, registerWindowCloseBarrier, subscribe, waitForSave } =
+  vi.hoisted(() => ({
+    createDrawingController: vi.fn(),
+    loadDrawing: vi.fn(),
+    onSceneChange: vi.fn(),
+    registerWindowCloseBarrier: vi.fn(),
+    subscribe: vi.fn(),
+    waitForSave: vi.fn()
+  }))
 
 vi.mock('./document', () => ({ createDrawingController, loadDrawing }))
+vi.mock('@/lib/window-close-barrier', () => ({ registerWindowCloseBarrier }))
 
 import { ExcalidrawPane } from './ExcalidrawPane'
 import type { ExcalidrawDocumentIdentity } from './identity'
@@ -54,10 +58,14 @@ describe('ExcalidrawPane', () => {
         files: { image: { id: 'image' } }
       }),
       onSceneChange,
-      subscribe
+      subscribe,
+      waitForSave
     })
     onSceneChange.mockReset()
     subscribe.mockReset()
+    registerWindowCloseBarrier.mockReset()
+    waitForSave.mockReset()
+    waitForSave.mockResolvedValue(true)
   })
 
   it('does not load the editor before the pane mounts', async () => {
@@ -79,6 +87,21 @@ describe('ExcalidrawPane', () => {
         initialData: { appState: { theme: 'dark' }, elements: [{ id: 'loaded' }], files: { image: { id: 'image' } } }
       })
     )
+  })
+  it('registers its controller flush with the window close barrier', async () => {
+    let flush: (() => boolean | Promise<boolean>) | undefined
+    registerWindowCloseBarrier.mockImplementation((callback: () => boolean | Promise<boolean>) => {
+      flush = callback
+
+      return () => undefined
+    })
+
+    render(<ExcalidrawPane identity={identity} />)
+
+    await screen.findByTestId('editor')
+    expect(registerWindowCloseBarrier).toHaveBeenCalledTimes(1)
+    expect(await flush?.()).toBe(true)
+    expect(waitForSave).toHaveBeenCalledTimes(1)
   })
   it('does not rerender the editor for editor-originated controller updates', async () => {
     let listener: ((origin: 'editor' | 'external') => void) | undefined
