@@ -1275,6 +1275,14 @@ def _make_normalized_request_fingerprint(payload: Dict[str, Any]) -> str:
     return sha256(encoded.encode("utf-8")).hexdigest()
 
 
+def _make_fingerprint_digest(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value:
+        return None
+    return hashlib.sha256(
+        b"hermes-api-idempotency-route-value-v1\0" + value.encode("utf-8")
+    ).hexdigest()
+
+
 _CRON_AVAILABLE = False
 try:
     from cron.jobs import (
@@ -5446,9 +5454,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 "service_tier": None if service_tier is _REQUEST_OPTION_MISSING else service_tier,
             }
             route_identity = {
+                "alias": _clean_request_string(body.get("model")) if route else None,
                 "source": "model_routes" if route else "global",
                 "model": route.get("model") if isinstance(route, dict) else None,
                 "provider": route.get("provider") if isinstance(route, dict) else None,
+                "api_key_digest": _make_fingerprint_digest(route.get("api_key"))
+                if isinstance(route, dict)
+                else None,
+                "base_url_digest": _make_fingerprint_digest(route.get("base_url"))
+                if isinstance(route, dict)
+                else None,
             }
             fp = _make_normalized_request_fingerprint(
                 {

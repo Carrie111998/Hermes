@@ -1724,6 +1724,51 @@ class TestResponsesEndpoint:
         assert first.status == second.status == 200
         assert mock_run.call_count == 1
 
+    @pytest.mark.asyncio
+    async def test_responses_idempotency_partitions_route_credentials(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        auth_adapter._model_routes = {
+            "shared-route": {
+                "model": "provider/model",
+                "provider": "openrouter",
+                "api_key": "route-secret-a",
+                "base_url": "https://route-a.example/v1",
+            }
+        }
+
+        async def run_agent(**kwargs):
+            return (
+                {"final_response": "ok", "session_id": "responses-session", "messages": []},
+                {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            )
+
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(auth_adapter, "_run_agent", side_effect=run_agent) as mock_run:
+                headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "route-retry"}
+                first = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={"model": "shared-route", "input": "hello", "store": False},
+                )
+                auth_adapter._model_routes["shared-route"] = {
+                    "model": "provider/model",
+                    "provider": "openrouter",
+                    "api_key": "route-secret-b",
+                    "base_url": "https://route-b.example/v1",
+                }
+                second = await cli.post(
+                    "/v1/responses",
+                    headers=headers,
+                    json={"model": "shared-route", "input": "hello", "store": False},
+                )
+
+        assert first.status == second.status == 200
+        assert mock_run.call_count == 2
+        assert [call.kwargs["route"]["base_url"] for call in mock_run.call_args_list] == [
+            "https://route-a.example/v1",
+            "https://route-b.example/v1",
+        ]
+
 
     @pytest.mark.asyncio
     async def test_provider_auth_failure_replay_preserves_responses_session_identity(self, auth_adapter):
@@ -3338,4 +3383,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
