@@ -302,7 +302,14 @@ def _run_agent(
 
     session_db = _create_session_db_for_oneshot()
 
+    # AIAgent builds its fallback chain solely from this argument, so omitting
+    # it leaves the chain empty and no failover can ever happen in oneshot mode,
+    # regardless of what fallback_providers says. Same resolution as
+    # cron/scheduler.py.
+    fallback_model = cfg.get("fallback_providers") or cfg.get("fallback_model") or None
+
     agent = AIAgent(
+        fallback_model=fallback_model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
         provider=runtime.get("provider"),
