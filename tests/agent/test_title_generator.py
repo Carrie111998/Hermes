@@ -223,6 +223,63 @@ class TestGenerateTitle:
         assert len(captured) == 1
         assert captured[0] == "title generation"
 
+    def test_catches_vllm_guided_grammar_rejection(self):
+        """vLLM gateways translate json_schema into an uncompilable
+        guided_grammar; the error never mentions response_format, but the
+        grammar/xgrammar marker identifies it as a format rejection."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - {'error': {'message': "
+                    "'guided_grammar has compile_grammar_error: "
+                    "No module named xgrammar'}}"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix grammar"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            title = generate_title("debug grammar issue")
+
+        assert title == "Fix grammar"
+        assert len(calls) == 2
+
+    def test_thinking_off_retries_send_reasoning_config(self):
+        """Retried calls must send reasoning_config={'enabled': False} so
+        that provider profiles (e.g. DeepSeekProfile) which override
+        extra_body.thinking don't silently re-enable thinking and burn the
+        64-token budget on reasoning_content. extra_body.thinking alone is
+        overwritten by the profile — reasoning_config is the channel the
+        profile reads to decide enabled/disabled."""
+        calls = []
+
+        def mock_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "Error code: 400 - 'This response_format type is "
+                    "unavailable now'"
+                )
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix login"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
+            generate_title("fix login")
+
+        assert len(calls) == 2
+        # First attempt: no reasoning_config (thinking not pinned off).
+        assert "reasoning_config" not in calls[0]
+        # Retry: reasoning_config must be {"enabled": False} AND
+        # extra_body.thinking must be {"type": "disabled"} — both channels.
+        assert calls[1]["reasoning_config"] == {"enabled": False}
+        assert calls[1]["extra_body"]["thinking"] == {"type": "disabled"}
+
 
 
 

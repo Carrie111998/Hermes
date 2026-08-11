@@ -127,11 +127,22 @@ def _response_format_rejected(exc: BaseException) -> bool:
 
     Matches on the parameter name appearing in the error message (DeepSeek:
     "This response_format type is unavailable now"; others echo the
-    parameter they reject). Keeps the retry ladder from firing on unrelated
-    failures (auth, quota, network), which are not fixed by changing format.
+    parameter they reject). Also catches vLLM gateways whose error text
+    never mentions ``response_format`` — they fail at the guided-grammar
+    compilation stage with a ``guided_grammar`` / ``grammar`` / ``xgrammar``
+    marker — by keying on the HTTP 400 status plus that grammar marker.
+
+    Keeps the retry ladder from firing on unrelated failures (auth, quota,
+    network), which are not fixed by changing format.
     """
-    text = str(exc)
-    return "response_format" in text or "json_schema" in text
+    text = str(exc).lower()
+    if "response_format" in text or "json_schema" in text:
+        return True
+    # vLLM translates json_schema into a guided_grammar it cannot always
+    # compile; the error mentions grammar/xgrammar but never response_format.
+    if ("guided_grammar" in text or "xgrammar" in text or "compile_grammar" in text):
+        return True
+    return False
 
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
@@ -425,6 +436,12 @@ def generate_title(
     # Failures unrelated to response_format (auth, quota, network) break
     # out immediately — a different format cannot fix those.
     last_exc: Optional[BaseException] = None
+    # Pin thinking off on retries via BOTH channels so the disable lands
+    # whether or not the provider has an active profile. Profiles override
+    # extra_body, so extra_body.thinking alone is silently overwritten back
+    # to "enabled" by DeepSeekProfile (and similar reasoning profiles).
+    # reasoning_config={"enabled": False} is the channel profiles read.
+    _thinking_off_kwargs = {"reasoning_config": {"enabled": False}}
     for response_format, pin_thinking_off in (
         (_TITLE_RESPONSE_FORMAT, False),
         (_TITLE_RESPONSE_FORMAT_JSON_OBJECT, True),
@@ -446,6 +463,7 @@ def generate_title(
                 timeout=timeout,
                 main_runtime=main_runtime,
                 extra_body=extra_body,
+                **(_thinking_off_kwargs if pin_thinking_off else {}),
             )
             content = response.choices[0].message.content or ""
             return _clean_title(_extract_title_text(content))
