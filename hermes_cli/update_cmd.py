@@ -1539,6 +1539,39 @@ def _count_commits_between(git_cmd: list[str], cwd: Path, base: str, head: str) 
         pass
     return -1
 
+def resolve_compare_ref(git_cmd: list[str], cwd: Path, branch: str) -> tuple[str, str]:
+    """Return ``(ref, remote_name)`` to compare ``branch`` against.
+
+    On the default branch ("main"), prefers ``upstream/<branch>`` when an
+    ``upstream`` remote is configured (checked locally, no network cost) —
+    that's what actually determines whether a fork is behind the real
+    project, not just its own origin. Any other branch, or no upstream
+    remote, compares against ``origin/<branch>``.
+
+    This only decides *which ref* to compare against — it does not fetch.
+    Callers remain responsible for fetching the chosen remote/branch and for
+    deciding how to handle a fetch failure (e.g. falling back to origin if
+    the preferred upstream fetch fails).
+    """
+    if branch == "main" and _has_upstream_remote(git_cmd, cwd):
+        return f"upstream/{branch}", "upstream"
+    return f"origin/{branch}", "origin"
+
+def _is_noninteractive_context() -> bool:
+    """True when there's no human available to answer the upstream-remote prompt.
+
+    Checked before ever calling ``input()`` for that prompt: an explicit
+    ``HERMES_NONINTERACTIVE=1`` (dashboard/desktop spawns set both this and
+    stdin=DEVNULL, see ``hermes_cli/setup.py``'s ``is_noninteractive``), OR
+    stdin not being a real tty (the ``hermes update --gateway`` spawn path
+    always sets stdin=DEVNULL without setting the env var, so isatty()-alone
+    must also catch it).
+    """
+    from hermes_cli.setup import is_noninteractive as _env_noninteractive
+
+    return _env_noninteractive() or not sys.stdin.isatty()
+
+
 def _should_skip_upstream_prompt() -> bool:
     """Check if user previously declined to add upstream."""
     from hermes_constants import get_hermes_home
@@ -1586,6 +1619,21 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         if _should_skip_upstream_prompt():
             return
 
+        if _is_noninteractive_context():
+            # No one to ask right now. Defer, don't decide — writing
+            # SKIP_UPSTREAM_PROMPT_FILE here would permanently answer a
+            # question the user was never actually asked (e.g. a dashboard-
+            # spawned update, or `hermes update --gateway`, running before
+            # upstream is configured).
+            logger.info(
+                "Skipping upstream-remote prompt (non-interactive session); "
+                "not recording a decision. Run 'hermes update' from an "
+                "interactive terminal, or 'git remote add upstream %s' "
+                "manually, to set this up.",
+                OFFICIAL_REPO_URL,
+            )
+            return
+
         # Ask user if they want to add upstream
         print()
         print("ℹ Your fork is not tracking the official Hermes repository.")
@@ -1595,9 +1643,21 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
             response = (
                 input("Add official repo as 'upstream' remote? [Y/n]: ").strip().lower()
             )
-        except (EOFError, KeyboardInterrupt, UnicodeDecodeError):
+        except EOFError:
+            # Defensive fallback: isatty() said interactive but input()
+            # still hit EOF (stdin closed mid-prompt). Same treatment as
+            # non-interactive — never a permanent decision.
             print()
-            response = "n"
+            logger.info(
+                "Upstream-remote prompt hit EOF; deferring, not recording a decision."
+            )
+            return
+        except KeyboardInterrupt:
+            # Aborted, not declined — a Ctrl+C is not a typed "n" and must
+            # not permanently record a decision either.
+            print()
+            print("  Cancelled.")
+            return
 
         if response in {"", "y", "yes"}:
             print("→ Adding upstream remote...")
@@ -1642,13 +1702,26 @@ def _sync_with_upstream_if_needed(git_cmd: list[str], cwd: Path) -> None:
         print("  ✗ Could not compare branches. Skipping upstream sync.")
         return
 
-    # If origin/main has commits not on upstream, don't trample
+    # If origin/main has commits not on upstream, don't trample — but never
+    # let "refusing to act" look identical to "nothing to do". A fork can be
+    # ahead AND behind at once; report both counts so that's visible instead
+    # of silently dropped.
     if origin_ahead > 0:
         print()
-        print(f"ℹ Your fork has {origin_ahead} commit(s) not on upstream.")
-        print("  Skipping upstream sync to preserve your changes.")
-        print("  If you want to merge upstream changes, run:")
-        print("    git pull upstream main")
+        if upstream_ahead > 0:
+            print(
+                f"⚠ Fork diverged: {origin_ahead} commit(s) ahead, "
+                f"{upstream_ahead} commit(s) behind upstream."
+            )
+            print("  Not syncing automatically — this needs a manual decision.")
+            print("  To pull in upstream changes:")
+            print("    git pull upstream main")
+        else:
+            print(
+                f"ℹ Your fork has {origin_ahead} commit(s) not on upstream "
+                "(upstream has nothing new)."
+            )
+            print("  Nothing to sync.")
         return
 
     # If upstream is not ahead, fork is up to date
