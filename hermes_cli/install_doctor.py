@@ -303,11 +303,22 @@ def probe(names, entrypoints, python: str | None = None, env: dict | None = None
 
 @dataclass(frozen=True)
 class Findings:
-    """The verdict, plus everything needed to explain it."""
+    """The verdict, plus everything needed to explain it.
+
+    ``finder_is_stale`` disambiguates the two, differently-caused ways a
+    declared name can fail to resolve: ``None`` when no determination was
+    possible (no MAPPING parsed, no declarations, or nothing missing);
+    ``True`` when the finder omits at least one missing name (the finder
+    itself is out of date and reinstalling regenerates it); ``False`` when
+    the finder already LISTS every missing name (the finder is complete but
+    is not being loaded at all -- reinstalling regenerates a finder that is
+    already correct and fixes nothing).
+    """
 
     missing: tuple[str, ...]
     broken_imports: tuple[tuple[str, str], ...]
     diagnosis: str | None
+    finder_is_stale: bool | None
     notes: tuple[str, ...]
     checked_breadth: bool
 
@@ -374,28 +385,76 @@ def analyze(
         if not entry.get("ok", False)
     )
 
+    finder_is_stale: bool | None = None
     diagnosis = None
     if missing and install_root.mapping is not None and declared is not None:
-        held = len(set(install_root.mapping) & declared)
-        diagnosis = (
-            f"The editable finder holds {held} of the {len(declared)} declared "
-            "names. It is generated ONCE at install time and is never "
-            "regenerated as packages are added, so it drifts silently every "
-            "time a new top-level package lands."
-        )
+        absent_from_finder = [name for name in missing if name not in install_root.mapping]
+        finder_is_stale = bool(absent_from_finder)
+        if finder_is_stale:
+            held = len(set(install_root.mapping) & declared)
+            diagnosis = (
+                f"The editable finder holds {held} of the {len(declared)} declared "
+                "names. It is generated ONCE at install time and is never "
+                "regenerated as packages are added, so it drifts silently every "
+                "time a new top-level package lands."
+            )
+        else:
+            diagnosis = (
+                "The editable finder LISTS every name that failed to resolve, so "
+                "it is not stale — it is not being loaded at all. Usual causes: a "
+                "different interpreter than the one that owns the install, user "
+                "site-packages disabled (PYTHONNOUSERSITE=1 or python -s), or a "
+                "deleted .pth file. Reinstalling will NOT fix this."
+            )
 
     return Findings(
         missing=tuple(missing),
         broken_imports=broken,
         diagnosis=diagnosis,
+        finder_is_stale=finder_is_stale,
         notes=tuple(notes),
         checked_breadth=checked_breadth,
     )
 
 
-def remedy_lines(install_root: InstallRoot) -> list[str]:
-    """The fix, the interpreter that must apply it, and the trap that blocks it."""
+def remedy_lines(install_root: InstallRoot, finder_is_stale: bool | None = True) -> list[str]:
+    """The fix, the interpreter that must apply it, and the trap that blocks it.
+
+    ``finder_is_stale`` picks which remedy applies. ``True`` or ``None``
+    (finder genuinely out of date, or no determination was possible) get the
+    reinstall block below — ``None`` defaults to reinstall because that is
+    the right default when undetermined. ``False`` (the finder already lists
+    every missing name — it is complete but not being loaded) gets a
+    different remedy entirely; telling that caller to reinstall would send
+    them down a path that cannot work, since reinstalling regenerates a
+    finder that is already correct.
+    """
     where = str(install_root.path) if install_root.path else "the agent-src checkout"
+    if finder_is_stale is False:
+        return [
+            "Remedy — the editable finder is already complete, so reinstalling",
+            "will NOT fix this. It is not being LOADED by the interpreter that",
+            "ran this check:",
+            "",
+            f"    {sys.executable}",
+            "",
+            "The finder file was found and its MAPPING was read successfully — the",
+            "problem is that this interpreter never imports it. Usual causes:",
+            "",
+            "  - A different interpreter than the one that owns the install is",
+            "    running (check which `python` / `py` resolves to at the call",
+            "    site, e.g. in a service or Scheduled Task definition).",
+            "  - User site-packages is disabled: PYTHONNOUSERSITE=1 is set in the",
+            "    environment, or the interpreter was launched with `python -s`.",
+            "    A scrubbed environment (Windows service, Scheduled Task) is a",
+            "    common way for this to happen without anyone intending it.",
+            "  - The .pth file that points site-packages at the editable finder",
+            "    was deleted or never installed for this interpreter.",
+            "",
+            f"Confirm by checking whether {where} appears on sys.path for the",
+            "interpreter above, and whether its site-packages actually loads",
+            "user site (site.ENABLE_USER_SITE).",
+        ]
     return [
         "Remedy — regenerate the finder by reinstalling the editable package:",
         "",
@@ -441,7 +500,7 @@ def render(findings: Findings, install_root: InstallRoot, probe_result: dict) ->
 
     if findings.diagnosis:
         lines.extend(["", f"Why: {findings.diagnosis}"])
-    lines.extend(["", *remedy_lines(install_root)])
+    lines.extend(["", *remedy_lines(install_root, findings.finder_is_stale)])
     return lines
 
 
@@ -505,7 +564,9 @@ def doctor_section_lines(probe_fn=probe, root: InstallRoot | None = None):
     remediation = None
     if not findings.ok:
         remediation = "Editable install has drifted. " + " ".join(
-            line.strip() for line in remedy_lines(root) if line.strip()
+            line.strip()
+            for line in remedy_lines(root, findings.finder_is_stale)
+            if line.strip()
         )
     return rows, remediation
 

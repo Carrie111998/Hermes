@@ -350,6 +350,88 @@ def test_analyze_still_reports_drift_when_the_diagnosis_is_unavailable():
     assert findings.diagnosis is None
 
 
+def test_analyze_flags_finder_stale_when_it_omits_a_missing_name():
+    """The finder is genuinely missing an entry -> stale diagnosis + reinstall remedy."""
+    from hermes_cli.install_doctor import analyze, remedy_lines
+
+    declared = {"events", "jobflow_dispatch"}
+    mapping = {"events": "/root/events"}  # jobflow_dispatch not in the finder
+    findings = analyze(
+        declared,
+        _probe_result(["events"], ["jobflow_dispatch"]),
+        _install_root_with(mapping),
+    )
+
+    assert findings.finder_is_stale is True
+    assert "holds" in findings.diagnosis
+    assert "generated ONCE at install time" in findings.diagnosis
+    remedy = "\n".join(remedy_lines(_install_root_with(mapping), findings.finder_is_stale))
+    assert "pip install -e . --no-deps" in remedy
+
+
+def test_analyze_flags_finder_not_stale_when_it_lists_every_missing_name():
+    """This reproduces the 2026-08-10 verification defect: finder is complete,
+
+    but every declared name still fails to resolve from a neutral cwd. The
+    finder is not stale -- it is not being loaded at all -- and the remedy
+    must not tell anyone to reinstall.
+    """
+    from hermes_cli.install_doctor import analyze, render
+
+    declared = {"events", "jobflow_dispatch"}
+    mapping = {"events": "/root/events", "jobflow_dispatch": "/root/jobflow_dispatch"}
+    install_root = _install_root_with(mapping)
+    probe_result = _probe_result([], ["events", "jobflow_dispatch"])
+    findings = analyze(declared, probe_result, install_root)
+
+    assert findings.finder_is_stale is False
+    assert "not being loaded" in findings.diagnosis
+    assert "holds" not in findings.diagnosis
+
+    text = "\n".join(render(findings, install_root, probe_result))
+    assert "pip install -e . --no-deps" not in text
+
+
+def test_remedy_lines_defaults_to_reinstall_when_stale_is_undetermined():
+    """No mapping was parseable -> finder_is_stale is None -> reinstall is still the default."""
+    from hermes_cli.install_doctor import analyze, remedy_lines
+
+    declared = {"events", "jobflow_dispatch"}
+    install_root = _install_root_with(None)
+    findings = analyze(
+        declared,
+        _probe_result(["events"], ["jobflow_dispatch"]),
+        install_root,
+    )
+
+    assert findings.finder_is_stale is None
+    remedy = "\n".join(remedy_lines(install_root, findings.finder_is_stale))
+    assert "pip install -e . --no-deps" in remedy
+
+
+def test_doctor_section_lines_remediation_excludes_reinstall_when_finder_not_stale(tmp_path):
+    """The doctor surface must not contradict the standalone surface's remedy choice."""
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\n"
+        'include = ["events", "jobflow_dispatch"]\n',
+        encoding="utf-8",
+    )
+    mapping = {"events": "x", "jobflow_dispatch": "y"}
+    root = InstallRoot(path=root_dir, provenance="test", mapping=mapping)
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result([], ["events", "jobflow_dispatch"])
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert remediation is not None
+    assert "pip install -e . --no-deps" not in remediation
+
+
 def test_analyze_skips_breadth_without_declarations_and_says_so():
     """A sealed wheel install has no source tree to diff against."""
     from hermes_cli.install_doctor import analyze
