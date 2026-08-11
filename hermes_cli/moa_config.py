@@ -338,6 +338,7 @@ def _default_preset() -> dict[str, Any]:
         "reference_max_tokens": None,
         "reference_view": "digest",
         "reference_detail_tools": None,
+        "reference_prose_budget": None,
         "fanout": "user_turn",
         "enabled": True,
     }
@@ -400,6 +401,10 @@ def _normalize_preset(raw: Any) -> dict[str, Any]:
         "reference_detail_tools": _coerce_reference_detail_tools(
             raw.get("reference_detail_tools")
         ),
+        # Optional per-turn cap (chars) on assistant prose in the digest view.
+        # None = the built-in default (~4K). Prose-centric presets (writing,
+        # drafting) raise it so advisors see whole drafts, not excerpts.
+        "reference_prose_budget": _coerce_int_or_none(raw.get("reference_prose_budget")),
         # When the reference fan-out runs. "user_turn" (default) runs the
         # advisors ONCE per user turn (the original MoA shape, and the
         # cheapest cadence — #67199): the aggregator gets their upfront
@@ -463,6 +468,7 @@ def normalize_moa_config(raw: Any) -> dict[str, Any]:
         "reference_max_tokens": active.get("reference_max_tokens"),
         "reference_view": active.get("reference_view", "digest"),
         "reference_detail_tools": active.get("reference_detail_tools"),
+        "reference_prose_budget": active.get("reference_prose_budget"),
         "fanout": active.get("fanout", "user_turn"),
         "enabled": active["enabled"],
         # MoA-level (not per-preset) toggles ride at the top level alongside

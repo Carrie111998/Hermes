@@ -236,3 +236,22 @@ def test_assistant_prose_capped():
     assistant = next(m for m in view if m["role"] == "assistant")
     assert len(assistant["content"]) < 6_000
     assert "chars omitted" in assistant["content"]
+
+
+def test_reference_prose_budget_override():
+    """A prose-centric preset can widen the assistant-prose cap so advisors
+    see whole drafts instead of a head+tail excerpt."""
+    draft = "d" * 10_000
+    messages = [
+        {"role": "user", "content": "write it"},
+        {"role": "assistant", "content": draft},
+        {"role": "user", "content": "revise"},
+    ]
+
+    capped = _reference_messages(messages)
+    wide = _reference_messages(messages, prose_budget=16_000)
+
+    capped_assistant = next(m for m in capped if m["role"] == "assistant")
+    wide_assistant = next(m for m in wide if m["role"] == "assistant")
+    assert "chars omitted" in capped_assistant["content"]
+    assert wide_assistant["content"] == draft

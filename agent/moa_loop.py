@@ -1175,6 +1175,7 @@ def _reference_messages(
     messages: list[dict[str, Any]],
     view: str = "digest",
     detail_tools: Any = None,
+    prose_budget: int | None = None,
 ) -> list[dict[str, Any]]:
     """Build an advisory view of the conversation for reference models.
 
@@ -1195,11 +1196,17 @@ def _reference_messages(
 
     ``detail_tools`` optionally overrides which tools count as substance
     (preset field ``reference_detail_tools``); None uses
-    ``_REFERENCE_SUBSTANCE_TOOLS``.
+    ``_REFERENCE_SUBSTANCE_TOOLS``. ``prose_budget`` optionally overrides the
+    per-turn assistant-prose cap (preset field ``reference_prose_budget``) —
+    prose-centric presets (writing, drafting) raise it so advisors see whole
+    drafts instead of a head+tail excerpt; None uses
+    ``_REFERENCE_ASSISTANT_PROSE_BUDGET``.
     """
     if str(view or "digest").strip().lower() == "transcript":
         return _reference_messages_transcript(messages)
-    return _reference_messages_digest(messages, detail_tools=detail_tools)
+    return _reference_messages_digest(
+        messages, detail_tools=detail_tools, prose_budget=prose_budget
+    )
 
 
 def _reference_messages_transcript(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1334,6 +1341,7 @@ def _reference_messages_transcript(messages: list[dict[str, Any]]) -> list[dict[
 def _reference_messages_digest(
     messages: list[dict[str, Any]],
     detail_tools: Any = None,
+    prose_budget: int | None = None,
 ) -> list[dict[str, Any]]:
     """Digest advisory view: prose narration + quoted substance artifacts.
 
@@ -1397,7 +1405,9 @@ def _reference_messages_digest(
             turns.append({"role": "user", "text": text})
         elif role == "assistant":
             _flush_pending()
-            prose = _truncate_tool_result(text.strip(), _REFERENCE_ASSISTANT_PROSE_BUDGET)
+            prose = _truncate_tool_result(
+                text.strip(), prose_budget or _REFERENCE_ASSISTANT_PROSE_BUDGET
+            )
             pending = _extract_tool_call_entries(msg.get("tool_calls"))
             if prose or pending:
                 turns.append(
@@ -1577,6 +1587,7 @@ def aggregate_moa_context(
     agent: Any = None,
     reference_view: str = "digest",
     reference_detail_tools: Any = None,
+    reference_prose_budget: int | None = None,
 ) -> str:
     """Run configured reference models and synthesize their advice.
 
@@ -1603,7 +1614,10 @@ def aggregate_moa_context(
     reference_models = [slot for slot in reference_models if slot.get("enabled", True)]
     reference_outputs: list[tuple[str, str, Any]] = []
     ref_messages = _reference_messages(
-        api_messages, view=reference_view, detail_tools=reference_detail_tools
+        api_messages,
+        view=reference_view,
+        detail_tools=reference_detail_tools,
+        prose_budget=reference_prose_budget,
     )
     reference_outputs = _run_references_parallel(
         reference_models,
@@ -2344,6 +2358,7 @@ class MoAChatCompletions:
             messages,
             view=str(preset.get("reference_view") or "digest"),
             detail_tools=preset.get("reference_detail_tools"),
+            prose_budget=preset.get("reference_prose_budget"),
         )
 
         # Fan-out cadence. "user_turn" (default — cheapest cadence, #67199):

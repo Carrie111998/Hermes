@@ -236,3 +236,13 @@ def test_reference_view_survives_normalize():
     preset = cfg["presets"]["review"]
     assert preset["reference_view"] == "transcript"
     assert preset["reference_detail_tools"] == ["terminal"]
+
+
+def test_reference_prose_budget_coercion():
+    cfg = normalize_moa_config(
+        {"presets": {"prose": {"reference_prose_budget": 16000}}, "default_preset": "prose"}
+    )
+    assert cfg["presets"]["prose"]["reference_prose_budget"] == 16000
+    assert cfg["reference_prose_budget"] == 16000
+    # Default: None (built-in cap).
+    assert normalize_moa_config({})["presets"][DEFAULT_MOA_PRESET_NAME]["reference_prose_budget"] is None
