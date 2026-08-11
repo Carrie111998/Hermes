@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from plugins.semantic_graph.cognitive import observe_cognitive_rerank
+from plugins.semantic_graph.cognitive import (
+    activate_cognitive_rerank,
+    observe_cognitive_rerank,
+)
 from plugins.semantic_graph.config import (
     SemanticGraphCognitiveMemoryConfig,
     SemanticGraphConfig,
@@ -138,6 +141,29 @@ def test_shadow_marks_latent_and_noncurrent_without_bypassing_query_mode() -> No
     assert normal[1]["cognitive_shadow"]["would_filter"] is True
     assert normal[1]["cognitive_shadow"]["reason"] == "noncurrent_belief"
     assert history[1]["cognitive_shadow"]["would_filter"] is False
+
+
+def test_active_projection_filters_and_uses_observed_cognitive_rank() -> None:
+    observed = [
+        {
+            "node_id": "second",
+            "cognitive_shadow": {"would_filter": False, "cognitive_rank": 2},
+        },
+        {
+            "node_id": "filtered",
+            "cognitive_shadow": {"would_filter": True, "cognitive_rank": 1},
+        },
+        {
+            "node_id": "first",
+            "cognitive_shadow": {"would_filter": False, "cognitive_rank": 1},
+        },
+    ]
+    before = json.loads(json.dumps(observed))
+
+    active = activate_cognitive_rerank(observed)
+
+    assert [row["node_id"] for row in active] == ["first", "second"]
+    assert observed == before
 
 
 def _node(node_id: str, label: str, *, status: str = "asserted") -> dict[str, object]:

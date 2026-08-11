@@ -10,8 +10,9 @@ from collections.abc import Sequence
 from typing import Any, Optional
 
 from . import graph as _graph
+from .abstention import decide_abstention, extract_retrieval_features
 from .config import SemanticGraphConfig, load_config
-from .cognitive import observe_cognitive_rerank
+from .cognitive import activate_cognitive_rerank, observe_cognitive_rerank
 from .embedding import (
     EmbeddingBackend,
     EmbeddingBackendError,
@@ -96,14 +97,19 @@ class SemanticGraphRuntime:
             self._cognitive_bridge = EbbinghausSemanticGraphBridge(self._store)
         return self._cognitive_bridge
 
-    def _observe_cognitive_shadow(
+    def _apply_cognitive_retrieval(
         self,
         hits: list[dict[str, Any]],
         *,
         query_mode: str,
+        query_length: int,
     ) -> list[dict[str, Any]]:
         config = self._config.cognitive_memory
-        if not hits or not config.rerank_enabled or config.mode != "shadow":
+        if (
+            not hits
+            or not config.rerank_enabled
+            or config.mode not in {"shadow", "active"}
+        ):
             return hits
         try:
             from plugins.memory.ebbinghaus.semantic_graph_bridge import (
@@ -130,14 +136,26 @@ class SemanticGraphRuntime:
                         expected_belief_version=int(link["belief_version"]),
                     )
                     states_by_memory[memory_id] = state
-            return observe_cognitive_rerank(
+            observed = observe_cognitive_rerank(
                 hits,
                 links_by_node=links_by_node,
                 states_by_memory=states_by_memory,
                 query_mode=query_mode,
             )
+            if config.mode == "shadow":
+                return observed
+            active = activate_cognitive_rerank(observed)
+            if not active or not config.abstention_enabled:
+                return active
+            features = extract_retrieval_features(
+                active,
+                query_length=query_length,
+            )
+            if decide_abstention(features)["abstain"]:
+                return []
+            return active
         except Exception as exc:
-            logger.warning("semantic-graph cognitive shadow failed open: %s", exc)
+            logger.warning("semantic-graph cognitive retrieval failed open: %s", exc)
             return hits
 
     # ------------------------------------------------------------------ tools
@@ -548,7 +566,11 @@ class SemanticGraphRuntime:
                 if {"rejected", "superseded"} & set(statuses)
                 else "normal"
             )
-            hits = self._observe_cognitive_shadow(hits, query_mode=query_mode)
+            hits = self._apply_cognitive_retrieval(
+                hits,
+                query_mode=query_mode,
+                query_length=len(query),
+            )
             if args.get("include_artifacts"):
                 for hit in hits:
                     hit["artifacts"] = self.store().list_artifacts(
@@ -840,7 +862,11 @@ class SemanticGraphRuntime:
                 min_confidence=self._config.min_recall_confidence,
                 statuses=list(self._config.recall_statuses),
             )
-            hits = self._observe_cognitive_shadow(hits, query_mode="normal")
+            hits = self._apply_cognitive_retrieval(
+                hits,
+                query_mode="normal",
+                query_length=len(message),
+            )
             ctx = render_context(hits, self._config.retrieval_max_chars)
             if not ctx:
                 return None

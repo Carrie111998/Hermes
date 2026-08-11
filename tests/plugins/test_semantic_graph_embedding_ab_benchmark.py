@@ -12,6 +12,7 @@ from scripts.semantic_graph_embedding_ab_benchmark import (
     _eligible,
     _query_observation,
     _candidate_observations,
+    assess_abstention_acceptance,
     load_fixture,
     make_store,
     run_variant,
@@ -206,6 +207,33 @@ def test_run_variant_emits_observation_schema_for_lexical_variant(tmp_path: Path
         "top1_rrf_score", "top2_rrf_score", "rrf_top_margin",
         "lexical_dense_top1_agreement", "lexical_dense_expected_overlap",
     }
+    assert set(result["features"]) == {
+        "top1_dense_similarity", "top2_dense_similarity", "dense_margin",
+        "top1_rrf_score", "rrf_margin", "lexical_dense_top1_agreement",
+        "source_count", "candidate_count", "projected_retention",
+        "current_ratio", "latent_ratio", "noncurrent_ratio", "query_length",
+    }
+    assert set(result["abstention"]) == {"abstain", "reason"}
+    assert set(result) >= {
+        "active_returned",
+        "active_hit",
+        "active_reciprocal_rank",
+        "active_returned_any",
+        "gated_hit",
+        "effective_no_result",
+    }
+    assert result["gated_hit"] <= result["active_hit"]
+    assert set(summary["abstention"]["confusion_matrix"]) == {
+        "true_abstain", "false_recall", "false_abstain", "true_allow",
+    }
+    assert set(summary["abstention"]) >= {
+        "ungated_positive_recall_at_8",
+        "active_positive_recall_at_8",
+        "gated_positive_recall_at_8",
+        "cognitive_active_degradation",
+        "abstention_incremental_degradation",
+        "positive_recall_degradation",
+    }
 
 
 def test_benchmark_results_persist_fixture_ids_not_query_text(tmp_path: Path) -> None:
@@ -220,3 +248,38 @@ def test_benchmark_results_persist_fixture_ids_not_query_text(tmp_path: Path) ->
         f"q-{index:03d}" for index in range(1, 91)
     ]
     assert all("query" not in row for row in results)
+
+
+def test_abstention_acceptance_matches_fixed_phase5_gates() -> None:
+    passing = {
+        "abstention": {"positive_recall_degradation": 0.02},
+        "groups": {
+            group: {"recall_at_8": 1.0, "gated_recall_at_8": 1.0}
+            for group in (
+                "correction_history",
+                "temporal_update",
+                "contradiction",
+                "memory_poisoning_repair",
+            )
+        },
+        "rejected_or_superseded_leak_count": 0,
+        "cross_run_leak_count": 0,
+        "secret_recall_count": 0,
+        "state_mutation_count": 0,
+        "negative_false_recall_rate": 0.20,
+        "negative_no_result_precision": 0.80,
+    }
+
+    accepted = assess_abstention_acceptance(passing)
+
+    assert accepted["pass"] is True
+    assert all(accepted["checks"].values())
+
+    failing = json.loads(json.dumps(passing))
+    failing["negative_false_recall_rate"] = 0.21
+    failing["groups"]["contradiction"]["gated_recall_at_8"] = 0.9
+    rejected = assess_abstention_acceptance(failing)
+
+    assert rejected["pass"] is False
+    assert rejected["checks"]["negative_false_recall_rate"] is False
+    assert rejected["checks"]["correction_history_no_regression"] is False

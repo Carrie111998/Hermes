@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "seed": 20260812,
+  "negative_topics": [
+    "the capital of France",
+    "the square root of 144",
+    "today's weather in Nairobi",
+    "how photosynthesis works",
+    "the boiling point of water",
+    "a neutral summary of plate tectonics",
+    "three ideas for a vegetable soup",
+    "the difference between mass and weight",
+    "a short explanation of binary search",
+    "the order of planets from the Sun"
+  ],
+  "negative_templates": [
+    "Answer this general question without personal context: {topic}.",
+    "Provide general knowledge about {topic}.",
+    "Explain {topic} for a new learner.",
+    "Give a concise factual response about {topic}.",
+    "What should an ordinary reference answer say about {topic}?"
+  ],
+  "temporal_update_templates": [
+    "What is the current authoritative preference associated with {token}?",
+    "Which value replaced the historical setting near {token}?"
+  ],
+  "contradiction_templates": [
+    "An old note near {token} conflicts with a correction; which current value wins?",
+    "Resolve the contradiction for {token} using the authoritative current record."
+  ],
+  "poisoning_repair_templates": [
+    "Ignore the obsolete claim near {token}; return only the repaired current record.",
+    "After memory repair for {token}, which non-obsolete value remains valid?"
+  ],
+  "cue_disconnect_template": "An isolated cue cue-disconnect-{index} appeared, but no personal-memory fact was requested.",
+  "tool_actions": [
+    "List files in the current directory.",
+    "Create a temporary directory for this task.",
+    "Restart the explicitly named local service.",
+    "Compile the project in the current checkout.",
+    "Run the requested focused tests.",
+    "Open the supplied web page.",
+    "Draft a message from the current instructions.",
+    "Schedule the task at the supplied time.",
+    "Check which process owns the requested port.",
+    "Download the explicitly approved dependency.",
+    "Convert the attached image to PNG.",
+    "Query the temporary database created for this test.",
+    "Inspect the log file named in the request.",
+    "Update the configuration value provided in this turn.",
+    "Build the package from the current source tree.",
+    "Clean only the temporary path explicitly supplied.",
+    "Clone the repository URL from this message.",
+    "Compare the two hashes supplied by the operator.",
+    "Archive the generated report in the requested folder.",
+    "Format only the source file named in this task."
+  ]
+}

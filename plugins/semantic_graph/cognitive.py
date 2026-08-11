@@ -154,4 +154,22 @@ def observe_cognitive_rerank(
     return observed
 
 
-__all__ = ["observe_cognitive_rerank"]
+def activate_cognitive_rerank(
+    observed_candidates: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Apply the already-observed filter and rank without mutating input."""
+    active = [
+        dict(candidate)
+        for candidate in observed_candidates
+        if not candidate["cognitive_shadow"]["would_filter"]
+    ]
+    return sorted(
+        active,
+        key=lambda candidate: (
+            int(candidate["cognitive_shadow"]["cognitive_rank"]),
+            str(candidate.get("node_id") or ""),
+        ),
+    )
+
+
+__all__ = ["activate_cognitive_rerank", "observe_cognitive_rerank"]
