@@ -3,6 +3,8 @@
 import asyncio
 import copy
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from collections import OrderedDict
@@ -23,9 +25,12 @@ from plugins.platforms.buzz.replay import (
     ReplayError,
     ReplayLedger,
     dispatch_exact_event,
+    replay_db_path,
     replay_state,
+    run_replay,
     validate_event,
 )
+from gateway.platforms.base import ProcessingOutcome
 
 
 SELF_PRIVATE_KEY = "00" * 31 + "03"
@@ -217,6 +222,10 @@ class _DispatchAdapter:
         self.calls = 0
         self.crash = crash
         self.spawn = spawn
+        self.processing_outcomes = []
+
+    async def on_processing_complete(self, _event, outcome):
+        self.processing_outcomes.append(outcome)
 
     async def _handle_event(self, _channel, _state, _event):
         self.calls += 1
@@ -227,6 +236,7 @@ class _DispatchAdapter:
             await asyncio.sleep(0)
             if self.crash:
                 raise RuntimeError("ambiguous turn failure")
+            await self.on_processing_complete(_event, ProcessingOutcome.SUCCESS)
 
         self._session_tasks["session-key"] = asyncio.create_task(_session())
 
@@ -341,6 +351,186 @@ class ReplayIntegrationTests(unittest.TestCase):
                 if runner._session_db is not None:
                     runner._session_db._db.close()
                 runner.session_store._db.close()
+
+    def test_real_base_handler_failure_is_not_completed(self):
+        """A base-task exception emits FAILURE and cannot become COMPLETED."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import GatewayRunner
+        from gateway.platforms.base import SendResult
+        from plugins.platforms.buzz.adapter import BuzzAdapter
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            buzz_platform = Platform("buzz")
+            config = GatewayConfig(
+                platforms={
+                    buzz_platform: PlatformConfig(
+                        enabled=True,
+                        typing_indicator=False,
+                        extra={"relay_url": "wss://stub.relay"},
+                    )
+                },
+                sessions_dir=home / "sessions",
+            )
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False), patch(
+                "tools.tirith_security.ensure_installed", return_value=None
+            ):
+                runner = GatewayRunner(config)
+                adapter = BuzzAdapter(config.platforms[buzz_platform])
+                adapter.gateway_runner = runner
+                runner.adapters[buzz_platform] = adapter
+
+                async def failing_handler(_message):
+                    await asyncio.sleep(0.05)
+                    raise RuntimeError("handler failure")
+
+                runner._handle_message = failing_handler
+                adapter.set_message_handler(runner._primary_message_handler())
+                adapter.set_session_store(runner.session_store)
+                adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+                adapter.set_authorization_check(lambda *_args: True)
+                adapter._running = True
+                adapter._self_pubkey = SELF_PUBKEY
+                adapter._self_npub = "npub1chip"
+                adapter._display_name = "Chip"
+                adapter._allowed_pubkeys = {AUTHOR_PUBKEY}
+                adapter._channel_meta[CHANNEL] = {
+                    "name": "approvals",
+                    "description": "internal",
+                }
+                adapter._user_names[AUTHOR_PUBKEY] = "Pedro"
+                adapter.send = AsyncMock(return_value=SendResult(success=True))
+
+                event = _event(content="@Chip trigger base failure")
+                state = {
+                    "chat_type": "group",
+                    "last_ts": event["created_at"],
+                    "seen": OrderedDict([(event["id"], None)]),
+                }
+                result = asyncio.run(
+                    dispatch_exact_event(
+                        adapter,
+                        CHANNEL,
+                        event,
+                        event["id"],
+                        state,
+                        wait_timeout=2.0,
+                    )
+                )
+
+                self.assertEqual(result["outcome"]["status"], FAILED)
+                self.assertEqual(result["outcome"]["code"], "processing_failed")
+                runner._running = False
+                if runner._session_db is not None:
+                    runner._session_db._db.close()
+                runner.session_store._db.close()
+
+
+class ReplayLifecycleTests(unittest.TestCase):
+    EVENT_ID = "d" * 64
+
+    @staticmethod
+    def _probe_gateway_lock(home: Path) -> str:
+        script = (
+            "from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock; "
+            "ok=acquire_gateway_runtime_lock(); print(ok); "
+            "release_gateway_runtime_lock() if ok else None"
+        )
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        env["PYTHONPATH"] = str(Path(__file__).parents[2])
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+
+    def _replay_patches(self, replay_module, home, *, fetch_event):
+        adapter = type("ReplayAdapter", (), {"_channel_state": {}})()
+        runner = object()
+
+        async def prepare(_profile):
+            return runner, adapter, None, str(home)
+
+        async def watched(_adapter):
+            return {CHANNEL}
+
+        def validate(*_args, **_kwargs):
+            return {"channel": CHANNEL}
+
+        async def dispatch(*_args, **_kwargs):
+            return {
+                "dispatch": {
+                    "handler": "BuzzAdapter._handle_event",
+                    "accepted": True,
+                    "new_session_dispatches": 1,
+                },
+                "session": {"status": "COMPLETED", "task_observed": True},
+                "processing": {"outcomes": ["success"], "explicit_success": True},
+                "outcome": {"status": COMPLETED},
+            }
+
+        return patch.multiple(
+            replay_module,
+            _prepare_adapter=AsyncMock(side_effect=prepare),
+            _watched_channels=AsyncMock(side_effect=watched),
+            fetch_event=AsyncMock(side_effect=fetch_event),
+            validate_event=validate,
+            dispatch_exact_event=AsyncMock(side_effect=dispatch),
+            _close_runner=AsyncMock(),
+        )
+
+    def test_gateway_start_race_cannot_overlap_replay(self):
+        import plugins.platforms.buzz.replay as replay_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+
+            async def fetch(_adapter, _event_id):
+                self.assertEqual(self._probe_gateway_lock(home), "False")
+                return {"id": self.EVENT_ID, "created_at": 1_700_000_000}, {"found_count": 1}
+
+            patches = self._replay_patches(replay_module, home, fetch_event=fetch)
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False), patch(
+                "hermes_cli.config.get_hermes_home", return_value=home
+            ), patches:
+                result = asyncio.run(run_replay("omar", self.EVENT_ID))
+
+            self.assertEqual(result["outcome"]["status"], COMPLETED)
+            self.assertEqual(self._probe_gateway_lock(home), "True")
+
+    def test_transient_fetch_failure_leaves_no_row_and_controlled_retry_succeeds(self):
+        import plugins.platforms.buzz.replay as replay_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "hermes"
+            calls = 0
+
+            async def fetch(_adapter, _event_id):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    raise ReplayError("relay_fetch_timeout")
+                return {"id": self.EVENT_ID, "created_at": 1_700_000_000}, {"found_count": 1}
+
+            patches = self._replay_patches(replay_module, home, fetch_event=fetch)
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=False), patch(
+                "hermes_cli.config.get_hermes_home", return_value=home
+            ), patches:
+                first = asyncio.run(run_replay("omar", self.EVENT_ID))
+                with ReplayLedger(replay_db_path(home), profile="omar") as ledger:
+                    self.assertIsNone(ledger.get(self.EVENT_ID))
+                second = asyncio.run(run_replay("omar", self.EVENT_ID))
+
+            self.assertEqual(first["outcome"]["status"], FAILED)
+            self.assertTrue(first["outcome"]["retryable"])
+            self.assertEqual(first["claim"]["status"], "UNCLAIMED")
+            self.assertEqual(second["outcome"]["status"], COMPLETED)
+            with ReplayLedger(replay_db_path(home), profile="omar") as ledger:
+                self.assertEqual(ledger.get(self.EVENT_ID)["status"], COMPLETED)
 
 
 class ReplayParserTests(unittest.TestCase):

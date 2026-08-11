@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import inspect
 import json
 import re
 import sqlite3
@@ -159,27 +160,6 @@ class ReplayLedger:
     def fail(self, event_id: str, receipt: dict[str, Any]) -> bool:
         return self._transition(event_id, FAILED, receipt)
 
-    def record_failed_unclaimed(self, event_id: str, receipt: dict[str, Any]) -> bool:
-        """Persist a deterministic pre-claim rejection without dispatching."""
-        now = _utc_now()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._row(event_id)
-            if row is not None:
-                self._conn.execute("COMMIT")
-                return False
-            self._conn.execute(
-                "INSERT INTO buzz_replay(profile,event_id,status,receipt_json,claimed_at,updated_at) "
-                "VALUES(?,?,?,?,?,?)",
-                (self.profile, event_id, FAILED, _safe_json(receipt), now, now),
-            )
-            self._conn.execute("COMMIT")
-            return True
-        except BaseException:
-            with contextlib.suppress(sqlite3.Error):
-                self._conn.execute("ROLLBACK")
-            raise
-
     def _transition(self, event_id: str, status: str, receipt: dict[str, Any]) -> bool:
         if status not in {COMPLETED, FAILED}:
             raise ValueError(f"invalid terminal status: {status}")
@@ -223,6 +203,23 @@ def profile_replay_lock(home: Path) -> Iterator[None]:
 
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+@contextmanager
+def exclusive_replay_lock(home: Path) -> Iterator[None]:
+    """Hold the authoritative profile gateway lock for the whole replay."""
+    from gateway.status import acquire_gateway_runtime_lock, release_gateway_runtime_lock
+
+    acquired = False
+    try:
+        if not acquire_gateway_runtime_lock():
+            raise ReplayError("gateway_running")
+        acquired = True
+        with profile_replay_lock(home):
+            yield
+    finally:
+        if acquired:
+            release_gateway_runtime_lock()
 
 
 def replay_state(state: dict[str, Any], event_id: str) -> dict[str, Any]:
@@ -500,54 +497,171 @@ async def dispatch_exact_event(
     wait_timeout: float = 900.0,
 ) -> dict[str, Any]:
     """Run one event through the adapter and observe its one session task."""
+    from gateway.platforms.base import ProcessingOutcome
+
     replayed_state = replay_state(startup_state, event_id)
     before = set(getattr(adapter, "_session_tasks", {}).keys())
-    dispatch_error: BaseException | None = None
+    processing_outcomes: list[Any] = []
+    missing = object()
+    original_hook = getattr(adapter, "on_processing_complete", missing)
+
+    async def _observe_processing_complete(processing_event: Any, outcome: Any) -> None:
+        if isinstance(processing_event, dict):
+            processing_event_id = processing_event.get("id") or processing_event.get("message_id")
+        else:
+            processing_event_id = getattr(processing_event, "message_id", None)
+        if str(processing_event_id or "").lower() != event_id.lower():
+            return
+        processing_outcomes.append(outcome)
+        if original_hook is missing:
+            return
+        result = original_hook(processing_event, outcome)
+        if inspect.isawaitable(result):
+            await result
+
     try:
-        await adapter._handle_event(channel, replayed_state, event)
-        await asyncio.sleep(0)
-    except BaseException as exc:
-        dispatch_error = exc
-    after_map = getattr(adapter, "_session_tasks", {})
-    new_keys = [key for key in after_map if key not in before]
-    result: dict[str, Any] = {
-        "dispatch": {
-            "handler": "BuzzAdapter._handle_event",
-            "accepted": bool(new_keys),
-            "new_session_dispatches": len(new_keys),
-        },
-        "session": {},
-        "outcome": {},
-    }
-    if dispatch_error is not None:
-        result["dispatch"]["error_type"] = type(dispatch_error).__name__
-    if len(new_keys) != 1:
-        result["outcome"] = {
-            "status": "FAILED",
-            "code": "session_dispatch_not_unique",
+        setattr(adapter, "on_processing_complete", _observe_processing_complete)
+    except Exception:
+        return {
+            "dispatch": {
+                "handler": "BuzzAdapter._handle_event",
+                "accepted": False,
+                "new_session_dispatches": 0,
+            },
+            "session": {},
+            "processing": {
+                "outcomes": [],
+                "explicit_success": False,
+            },
+            "outcome": {
+                "status": CLAIMED,
+                "code": "processing_observer_unavailable",
+            },
         }
-        return result
-    session_key = new_keys[0]
-    result["session"] = {
-        "status": "SPAWNED",
-        "session_key_hash": hashlib.sha256(str(session_key).encode()).hexdigest()[:16],
-        "task_observed": True,
-    }
-    task = after_map[session_key]
+
     try:
-        await asyncio.wait_for(asyncio.shield(task), timeout=wait_timeout)
-    except asyncio.TimeoutError:
-        result["session"]["status"] = "CLAIMED_RUNNING"
-        result["outcome"] = {"status": CLAIMED, "code": "session_timeout"}
+        dispatch_error: BaseException | None = None
+        try:
+            await adapter._handle_event(channel, replayed_state, event)
+            await asyncio.sleep(0)
+        except BaseException as exc:
+            dispatch_error = exc
+        after_map = getattr(adapter, "_session_tasks", {})
+        new_keys = [key for key in after_map if key not in before]
+        result: dict[str, Any] = {
+            "dispatch": {
+                "handler": "BuzzAdapter._handle_event",
+                "accepted": bool(new_keys),
+                "new_session_dispatches": len(new_keys),
+            },
+            "session": {},
+            "processing": {
+                "outcomes": [],
+                "explicit_success": False,
+            },
+            "outcome": {},
+        }
+        if dispatch_error is not None:
+            result["dispatch"]["error_type"] = type(dispatch_error).__name__
+
+        def _processing_result() -> tuple[list[str], Any | None]:
+            names = [
+                str(getattr(outcome, "value", outcome)).lower()
+                for outcome in processing_outcomes
+            ]
+            result["processing"] = {
+                "outcomes": names,
+                "explicit_success": (
+                    len(processing_outcomes) == 1
+                    and (
+                        processing_outcomes[0] is ProcessingOutcome.SUCCESS
+                        or getattr(processing_outcomes[0], "value", None) == "success"
+                    )
+                ),
+            }
+            return names, processing_outcomes[-1] if processing_outcomes else None
+
+        if len(new_keys) != 1:
+            _names, processing_outcome = _processing_result()
+            result["session"] = {
+                "status": "CLAIMED",
+                "task_observed": bool(processing_outcomes),
+            }
+            if dispatch_error is not None:
+                result["outcome"] = {"status": CLAIMED, "code": "dispatch_exception"}
+            elif len(processing_outcomes) != 1:
+                result["outcome"] = {
+                    "status": CLAIMED,
+                    "code": (
+                        "processing_outcome_ambiguous"
+                        if processing_outcomes
+                        else "session_dispatch_not_unique"
+                    ),
+                }
+            elif processing_outcome is ProcessingOutcome.FAILURE or getattr(
+                processing_outcome, "value", None
+            ) == "failure":
+                result["session"]["status"] = "FAILED"
+                result["outcome"] = {"status": FAILED, "code": "processing_failed"}
+            else:
+                result["outcome"] = {
+                    "status": CLAIMED,
+                    "code": "session_dispatch_not_unique",
+                }
+            return result
+
+        session_key = new_keys[0]
+        result["session"] = {
+            "status": "SPAWNED",
+            "session_key_hash": hashlib.sha256(str(session_key).encode()).hexdigest()[:16],
+            "task_observed": True,
+        }
+        task = after_map[session_key]
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=wait_timeout)
+        except asyncio.TimeoutError:
+            result["session"]["status"] = "CLAIMED_RUNNING"
+            _processing_result()
+            result["outcome"] = {"status": CLAIMED, "code": "session_timeout"}
+            return result
+        except BaseException as exc:
+            result["session"]["status"] = "CRASH_AMBIGUOUS"
+            result["dispatch"]["error_type"] = type(exc).__name__
+            _processing_result()
+            result["outcome"] = {"status": CLAIMED, "code": "session_crash_ambiguous"}
+            return result
+
+        _names, processing_outcome = _processing_result()
+        if dispatch_error is not None:
+            result["session"]["status"] = "CLAIMED"
+            result["outcome"] = {"status": CLAIMED, "code": "dispatch_exception"}
+        elif processing_outcome is None:
+            result["session"]["status"] = "CLAIMED"
+            result["outcome"] = {"status": CLAIMED, "code": "processing_outcome_missing"}
+        elif len(processing_outcomes) != 1:
+            result["session"]["status"] = "CLAIMED"
+            result["outcome"] = {"status": CLAIMED, "code": "processing_outcome_ambiguous"}
+        elif processing_outcome is ProcessingOutcome.SUCCESS or getattr(
+            processing_outcome, "value", None
+        ) == "success":
+            result["session"]["status"] = "COMPLETED"
+            result["outcome"] = {"status": COMPLETED}
+        elif processing_outcome is ProcessingOutcome.FAILURE or getattr(
+            processing_outcome, "value", None
+        ) == "failure":
+            result["session"]["status"] = "FAILED"
+            result["outcome"] = {"status": FAILED, "code": "processing_failed"}
+        else:
+            result["session"]["status"] = "CLAIMED"
+            result["outcome"] = {"status": CLAIMED, "code": "processing_outcome_unknown"}
         return result
-    except BaseException as exc:
-        result["session"]["status"] = "CRASH_AMBIGUOUS"
-        result["dispatch"]["error_type"] = type(exc).__name__
-        result["outcome"] = {"status": CLAIMED, "code": "session_crash_ambiguous"}
-        return result
-    result["session"]["status"] = "COMPLETED"
-    result["outcome"] = {"status": COMPLETED}
-    return result
+    finally:
+        if original_hook is missing:
+            with contextlib.suppress(AttributeError):
+                delattr(adapter, "on_processing_complete")
+        else:
+            with contextlib.suppress(Exception):
+                setattr(adapter, "on_processing_complete", original_hook)
 
 
 async def run_replay(
@@ -558,7 +672,6 @@ async def run_replay(
     wait_timeout: float = 900.0,
 ) -> dict[str, Any]:
     """Execute exactly one governed replay and return a non-secret receipt."""
-    from gateway.status import is_gateway_runtime_lock_active
     from hermes_cli.config import get_hermes_home
 
     home = Path(get_hermes_home())
@@ -569,6 +682,10 @@ async def run_replay(
         "expected_parent_event_id": (
             str(expected_parent_event_id).lower() if expected_parent_event_id else None
         ),
+        "runtime_lock": {
+            "authoritative": True,
+            "acquired": False,
+        },
         "fetch": {},
         "validation": {},
         "claim": {},
@@ -576,105 +693,170 @@ async def run_replay(
         "session": {},
         "outcome": {},
     }
-    ledger_path = replay_db_path(home)
-    with profile_replay_lock(home):
-        with ReplayLedger(ledger_path, profile=profile) as ledger:
-            prior = ledger.get(requested_event_id.lower())
-            if prior is not None:
-                receipt["claim"] = {
-                    "claimed": False,
-                    "status": prior["status"],
-                    "reason": (
-                        "already_claimed"
-                        if prior["status"] == CLAIMED
-                        else "already_terminal"
-                    ),
-                }
-                receipt["outcome"] = {"status": "FAILED", "code": "replay_already_recorded"}
-                return receipt
-            if is_gateway_runtime_lock_active():
-                receipt["outcome"] = {"status": "FAILED", "code": "gateway_running"}
-                return receipt
 
-            runner = None
-            try:
-                runner, adapter, _platform, _home = await _prepare_adapter(profile)
-                watched = await _watched_channels(adapter)
-                event, fetch_receipt = await fetch_event(adapter, requested_event_id)
-                receipt["fetch"] = fetch_receipt
-                receipt["validation"] = validate_event(
-                    event,
-                    requested_event_id,
-                    adapter=adapter,
-                    watched_channels=watched,
-                    expected_parent_event_id=expected_parent_event_id,
-                )
-                channel = receipt["validation"]["channel"]
-                created_at = int(event.get("created_at") or 0)
-                startup_state = {
-                    "chat_type": "group",
-                    "last_ts": created_at,
-                    "seen": OrderedDict([(requested_event_id.lower(), None)]),
-                }
-                receipt["claim"] = ledger.claim(requested_event_id.lower(), receipt)
-                if not receipt["claim"].get("claimed"):
-                    receipt["outcome"] = {"status": "FAILED", "code": "replay_already_recorded"}
-                    return receipt
-
-                adapter._channel_state[channel] = startup_state
-                dispatch_receipt = await dispatch_exact_event(
-                    adapter,
-                    channel,
-                    event,
-                    requested_event_id.lower(),
-                    startup_state,
-                    wait_timeout=wait_timeout,
-                )
-                receipt["dispatch"] = dispatch_receipt["dispatch"]
-                receipt["session"] = dispatch_receipt["session"]
-                receipt["outcome"] = dispatch_receipt["outcome"]
-                status = receipt["outcome"].get("status")
-                if status == FAILED:
-                    receipt["claim"]["status"] = FAILED
-                    ledger.fail(requested_event_id.lower(), receipt)
-                    return receipt
-                if status == CLAIMED:
-                    ledger.update_claimed(requested_event_id.lower(), receipt)
-                    return receipt
-                ledger.complete(requested_event_id.lower(), receipt)
-                return receipt
-            except ReplayError as exc:
-                receipt["outcome"] = {"status": "FAILED", "code": exc.code}
-                if receipt["claim"].get("claimed"):
-                    receipt["claim"]["status"] = FAILED
-                    ledger.fail(requested_event_id.lower(), receipt)
-                else:
-                    receipt["claim"] = {"claimed": False, "status": FAILED, "reason": exc.code}
-                    ledger.record_failed_unclaimed(requested_event_id.lower(), receipt)
-                return receipt
-            except Exception as exc:
-                # An exception outside the explicit dispatch observer is
-                # still ambiguous after a claim; never downgrade it to a
-                # retryable failure or silently replay it.
-                status = CLAIMED if receipt["claim"].get("claimed") else FAILED
-                receipt["outcome"] = {
-                    "status": status,
-                    "code": "replay_internal_error",
-                    "error_type": type(exc).__name__,
-                }
-                if status == CLAIMED:
-                    ledger.update_claimed(requested_event_id.lower(), receipt)
-                else:
+    try:
+        with exclusive_replay_lock(home):
+            receipt["runtime_lock"]["acquired"] = True
+            ledger_path = replay_db_path(home)
+            with ReplayLedger(ledger_path, profile=profile) as ledger:
+                prior = ledger.get(requested_event_id.lower())
+                if prior is not None:
                     receipt["claim"] = {
                         "claimed": False,
-                        "status": FAILED,
-                        "reason": "replay_internal_error",
+                        "status": prior["status"],
+                        "reason": (
+                            "already_claimed"
+                            if prior["status"] == CLAIMED
+                            else "already_terminal"
+                        ),
                     }
-                    ledger.record_failed_unclaimed(requested_event_id.lower(), receipt)
-                return receipt
-            finally:
-                if runner is not None:
-                    await _close_runner(runner)
+                    receipt["outcome"] = {
+                        "status": FAILED,
+                        "code": "replay_already_recorded",
+                    }
+                    return receipt
+
+                runner = None
+                try:
+                    runner, adapter, _platform, _home = await _prepare_adapter(profile)
+                    watched = await _watched_channels(adapter)
+                    event, fetch_receipt = await fetch_event(adapter, requested_event_id)
+                    receipt["fetch"] = fetch_receipt
+                    receipt["validation"] = validate_event(
+                        event,
+                        requested_event_id,
+                        adapter=adapter,
+                        watched_channels=watched,
+                        expected_parent_event_id=expected_parent_event_id,
+                    )
+                    channel = receipt["validation"]["channel"]
+                    created_at = int(event.get("created_at") or 0)
+                    startup_state = {
+                        "chat_type": "group",
+                        "last_ts": created_at,
+                        "seen": OrderedDict([(requested_event_id.lower(), None)]),
+                    }
+                    receipt["claim"] = ledger.claim(requested_event_id.lower(), receipt)
+                    if not receipt["claim"].get("claimed"):
+                        receipt["outcome"] = {
+                            "status": FAILED,
+                            "code": "replay_already_recorded",
+                        }
+                        return receipt
+
+                    adapter._channel_state[channel] = startup_state
+                    dispatch_receipt = await dispatch_exact_event(
+                        adapter,
+                        channel,
+                        event,
+                        requested_event_id.lower(),
+                        startup_state,
+                        wait_timeout=wait_timeout,
+                    )
+                    receipt["dispatch"] = dispatch_receipt["dispatch"]
+                    receipt["session"] = dispatch_receipt["session"]
+                    receipt["outcome"] = dispatch_receipt["outcome"]
+                    if dispatch_receipt.get("processing"):
+                        receipt["processing"] = dispatch_receipt["processing"]
+                    status = receipt["outcome"].get("status")
+                    if status == COMPLETED and not dispatch_receipt.get(
+                        "processing", {}
+                    ).get("explicit_success", False):
+                        status = CLAIMED
+                        receipt["outcome"] = {
+                            "status": CLAIMED,
+                            "code": "processing_success_unproven",
+                        }
+                    if status == FAILED:
+                        receipt["claim"]["status"] = FAILED
+                        ledger.fail(requested_event_id.lower(), receipt)
+                        return receipt
+                    if status == CLAIMED:
+                        ledger.update_claimed(requested_event_id.lower(), receipt)
+                        return receipt
+                    if status != COMPLETED:
+                        receipt["claim"]["status"] = CLAIMED
+                        receipt["outcome"] = {
+                            "status": CLAIMED,
+                            "code": "processing_outcome_unknown",
+                        }
+                        ledger.update_claimed(requested_event_id.lower(), receipt)
+                        return receipt
+                    if not ledger.complete(requested_event_id.lower(), receipt):
+                        receipt["claim"]["status"] = CLAIMED
+                        receipt["outcome"] = {
+                            "status": CLAIMED,
+                            "code": "claim_transition_failed",
+                        }
+                        ledger.update_claimed(requested_event_id.lower(), receipt)
+                    return receipt
+                except ReplayError as exc:
+                    claimed = bool(receipt["claim"].get("claimed"))
+                    status = CLAIMED if claimed else FAILED
+                    receipt["outcome"] = {
+                        "status": status,
+                        "code": exc.code,
+                        "retryable": not claimed,
+                    }
+                    if claimed:
+                        receipt["claim"]["status"] = CLAIMED
+                        ledger.update_claimed(requested_event_id.lower(), receipt)
+                    else:
+                        receipt["claim"] = {
+                            "claimed": False,
+                            "status": "UNCLAIMED",
+                            "reason": exc.code,
+                            "retryable": True,
+                        }
+                    return receipt
+                except Exception as exc:
+                    claimed = bool(receipt["claim"].get("claimed"))
+                    status = CLAIMED if claimed else FAILED
+                    receipt["outcome"] = {
+                        "status": status,
+                        "code": "replay_internal_error",
+                        "error_type": type(exc).__name__,
+                        "retryable": not claimed,
+                    }
+                    if claimed:
+                        ledger.update_claimed(requested_event_id.lower(), receipt)
+                    else:
+                        receipt["claim"] = {
+                            "claimed": False,
+                            "status": "UNCLAIMED",
+                            "reason": "replay_internal_error",
+                            "retryable": True,
+                        }
+                    return receipt
+                finally:
+                    if runner is not None:
+                        await _close_runner(runner)
+    except ReplayError as exc:
+        receipt["outcome"] = {
+            "status": FAILED,
+            "code": exc.code,
+            "retryable": True,
+        }
+        receipt["claim"] = {
+            "claimed": False,
+            "status": "UNCLAIMED",
+            "reason": exc.code,
+            "retryable": True,
+        }
+    except Exception as exc:
+        receipt["outcome"] = {
+            "status": FAILED,
+            "code": "replay_internal_error",
+            "error_type": type(exc).__name__,
+            "retryable": True,
+        }
+        receipt["claim"] = {
+            "claimed": False,
+            "status": "UNCLAIMED",
+            "reason": "replay_internal_error",
+            "retryable": True,
+        }
+    return receipt
 
 
 def run_replay_cli(
