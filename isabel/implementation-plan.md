@@ -105,10 +105,12 @@ chat-service POST /v1/chat/completions
   → AIAgent.request_overrides
   → build_api_kwargs() (agent/chat_completion_helpers.py)
   → transport (agent/transports/chat_completions.py)
-  → actual HTTP call to Ollama / OpenAI-compatible endpoint
+  → actual HTTP call to the LLM provider (ollama-cloud)
 ```
 
 `request_overrides` is the established mechanism — `hermes_cli/runtime_provider.py:1042` already injects `extra_body` into it from custom-provider config, and `hermes_cli/models.py:2670` injects service-tier overrides. We're adding one more injection point, from the request body instead of config.
+
+**Architecture note (corrected 2026-08-11):** Hermes speaks to **ollama-cloud** as its LLM provider — that's the endpoint the generation params flow into. Local Ollama was only ever the *alternative* if we removed Hermes entirely (a "hermes-gateway" would have talked to local Ollama, which would have piped to ollama-cloud anyway). With the Hermes patch, we don't need local Ollama at all. The Gemma4 edge model runs on **llama-server** locally — a separate path from Hermes' provider chain, and not involved in this patch.
 
 ---
 
@@ -137,7 +139,7 @@ That's it. **Two files.** The rest of Hermes — skills, tools, MCP, FTS5 sessio
 
 1. **Unit:** `_request_generation_params()` — present/absent/invalid shapes.
 2. **Integration:** POST to the fork's API server with `model_options.generation`, assert the agent's `request_overrides` contains the values (mirror `tests/gateway/test_api_server.py` patterns).
-3. **Live (optional, when stack is ready):** chat-service → Hermes fork → local Ollama; verify the Modulator's temperature actually lands in the Ollama request (check Ollama logs / response metadata).
+3. **Live (optional, when stack is ready):** chat-service → Hermes fork → ollama-cloud; verify the Modulator's temperature actually lands in the provider request (check response metadata / provider logs).
 
 ---
 
