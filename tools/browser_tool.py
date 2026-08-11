@@ -137,6 +137,11 @@ def _build_browser_env() -> dict:
     for _key in _BROWSER_PASSTHROUGH_KEYS:
         if _key in os.environ:
             env[_key] = os.environ[_key]
+    # Strip PYTHONPATH — browser-use runs under its own isolated Python (uvx/pipx),
+    # often a different minor version than Hermes' venv. A leaked PYTHONPATH pointing
+    # at Hermes' site-packages causes cross-version C-extension load failures
+    # (e.g. pydantic_core compiled for 3.11 loaded by 3.14 → ModuleNotFoundError).
+    env.pop("PYTHONPATH", None)
     return env
 
 try:
