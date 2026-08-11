@@ -26,6 +26,17 @@ Usage:
 from typing import List, Dict, Any, Set, Optional
 
 
+# Tools that are meaningful only when an ACP parent turn owns a required
+# delegation. They may be selected explicitly through ``hermes-acp``, but
+# must never leak into broad aliases such as ``all``/``*`` or another
+# platform's inferred schema.
+_ACP_ONLY_TOOLS = frozenset({
+    "delegation_status",
+    "delegation_wait",
+    "delegation_cancel",
+})
+
+
 # Shared tool list for CLI and all messaging platform toolsets.
 # Edit this once to update all platforms simultaneously.
 _HERMES_CORE_TOOLS = [
@@ -70,8 +81,12 @@ _HERMES_CORE_TOOLS = [
     "session_search",
     # Clarifying questions
     "clarify",
-    # Code execution + delegation
+    # Code execution + delegation. The required-delegation controls are
+    # eager so the ACP root can use its controller protocol directly rather
+    # than discovering it behind tool search. Resolution strips them from
+    # every surface except an explicitly selected ``hermes-acp`` toolset.
     "execute_code", "delegate_task",
+    "delegation_status", "delegation_wait", "delegation_cancel",
     # Cronjob management
     "cronjob",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
@@ -90,16 +105,6 @@ _HERMES_CORE_TOOLS = [
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
-
-# Tools that are meaningful only when an ACP parent turn owns a required
-# delegation. They may be selected explicitly through ``hermes-acp``, but
-# must never leak into broad aliases such as ``all``/``*`` or another
-# platform's inferred schema.
-_ACP_ONLY_TOOLS = frozenset({
-    "delegation_status",
-    "delegation_wait",
-    "delegation_cancel",
-})
 
 _HERMES_ACP_TOOLS = [
     "web_search", "web_extract",
@@ -704,9 +709,15 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
         # registry/MCP-only toolsets that have no static counterpart.
         if not toolset:
             return None
+        static_tools = list(toolset.get("tools", []))
+        if name != "hermes-acp":
+            static_tools = [
+                tool_name for tool_name in static_tools
+                if tool_name not in _ACP_ONLY_TOOLS
+            ]
         return {
             **toolset,
-            "tools": list(toolset.get("tools", [])),
+            "tools": static_tools,
             "includes": list(toolset.get("includes", [])),
         }
 
@@ -720,6 +731,11 @@ def get_toolset(name: str, *, include_registry: bool = True) -> Optional[Dict[st
             set(toolset.get("tools", []))
             | set(registry.get_tool_names_for_toolset(name))
         )
+        if name != "hermes-acp":
+            merged_tools = [
+                tool_name for tool_name in merged_tools
+                if tool_name not in _ACP_ONLY_TOOLS
+            ]
         return {**toolset, "tools": merged_tools}
 
     registry_toolset = name
@@ -841,7 +857,7 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
                         )
                     except Exception:
                         pass
-                    return list(plugin_tools)
+                    return list(plugin_tools - _ACP_ONLY_TOOLS)
             except Exception:
                 pass
 
@@ -857,6 +873,12 @@ def resolve_toolset(name: str, visited: Set[str] = None, *, include_registry: bo
         included_tools = resolve_toolset(included_name, visited, include_registry=include_registry)
         tools.update(included_tools)
 
+    # ACP controller tools are a root-only protocol surface. A composite or
+    # derived alias must not accidentally re-export them merely by including
+    # an ACP or shared-core toolset; only direct ``hermes-acp`` selection is
+    # allowed to expose them.
+    if name != "hermes-acp":
+        tools.difference_update(_ACP_ONLY_TOOLS)
     return sorted(tools)
 
 

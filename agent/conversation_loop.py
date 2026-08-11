@@ -3264,7 +3264,7 @@ def run_conversation(
                     else:
                         interrupted = True
                     break
-                
+
                 api_duration = time.time() - api_start_time
                 
                 # Stop thinking spinner silently -- the response box or tool
