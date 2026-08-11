@@ -53,6 +53,11 @@ interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
+  /** Pointer-only dnd listeners for the row SHELL — never the keyboard
+   *  activator or role/tabIndex. The shell contains real controls (⋯ menu,
+   *  row body); those must stay ordinary focus targets whose Space/Enter do
+   *  their own thing, not start or feed a dnd-kit drag. */
+  shellDragProps?: React.HTMLAttributes<HTMLElement>
   /** Tag the row with its owning profile (initial chip + tooltip). Used by
    *  flat cross-profile lists — Pinned and search results in the All-profiles
    *  view — where no group header communicates ownership (#66003). */
@@ -88,6 +93,7 @@ function SidebarSessionRowImpl({
   reorderable = false,
   dragging = false,
   dragHandleProps,
+  shellDragProps,
   showProfile = false,
   className,
   style,
@@ -256,7 +262,12 @@ function SidebarSessionRowImpl({
         // target (the session drop denies: side chrome hosts no main tile);
         // over the tree only the session drop does (no sortable row there).
         // Whichever one the release lands on is the one that commits.
-        {...dragHandleProps}
+        //
+        // The shell gets ONLY the pointer activator (shellDragProps): the
+        // keyboard activator + role/tabIndex stay on the grabber, so a focused
+        // row control can't start a dnd-kit drag or feed its Space/Enter end
+        // codes.
+        {...shellDragProps}
         onPointerDown={event => {
           // The grabber already carries these same listeners, and the ⋯
           // cluster keeps its own gestures.
@@ -269,7 +280,7 @@ function SidebarSessionRowImpl({
           // stay ordinary clicks, so resume / pin / open-in-window are
           // untouched.
           startSessionDrag({ id: session.id, profile: session.profile || 'default', title }, event)
-          dragHandleProps?.onPointerDown?.(event)
+          shellDragProps?.onPointerDown?.(event)
         }}
         // Hovering a row from another profile (the all-profiles view) telegraphs
         // a cross-profile resume — start that backend's spawn now so the click

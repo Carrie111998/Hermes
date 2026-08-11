@@ -70,6 +70,9 @@ interface ProjectOverviewRowProps {
   reorderable?: boolean
   dragging?: boolean
   dragHandleProps?: React.HTMLAttributes<HTMLElement>
+  /** Pointer-only dnd listeners for the row SHELL — never the keyboard
+   *  activator or role/tabIndex (see session-row for the full rationale). */
+  shellDragProps?: React.HTMLAttributes<HTMLElement>
   ref?: React.Ref<HTMLDivElement>
   style?: React.CSSProperties
 }
@@ -84,6 +87,7 @@ export function ProjectOverviewRow({
   reorderable = false,
   dragging = false,
   dragHandleProps,
+  shellDragProps,
   ref,
   style
 }: ProjectOverviewRowProps) {
@@ -139,13 +143,17 @@ export function ProjectOverviewRow({
       // listeners, minus the controls that keep their own gestures. A project
       // row has no rival drag (its title navigates on CLICK), so the sortable
       // owns the press outright.
-      {...dragHandleProps}
+      //
+      // Pointer-only on the shell (shellDragProps): the keyboard activator +
+      // role/tabIndex stay on the grabber, so a focused row control can't
+      // start a dnd-kit drag or feed its Space/Enter end codes.
+      {...shellDragProps}
       onPointerDown={event => {
         if ((event.target as HTMLElement).closest('[data-reorder-handle], [data-row-actions]')) {
           return
         }
 
-        dragHandleProps?.onPointerDown?.(event)
+        shellDragProps?.onPointerDown?.(event)
       }}
       ref={rowRef}
       toggle={
