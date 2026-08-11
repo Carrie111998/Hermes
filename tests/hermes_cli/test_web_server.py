@@ -3353,6 +3353,36 @@ class TestDeleteSessionEndpoint:
             db.close()
 
 
+    def test_patch_archive_uses_the_explicit_owner_profile(self):
+        """An archive mutation targets the owner DB, not the serving backend DB."""
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        profile_home = get_hermes_home() / "profiles" / "worker-beta"
+        profile_home.mkdir(parents=True)
+        profile_db = SessionDB(db_path=profile_home / "state.db")
+        try:
+            profile_db.create_session(session_id="profile-archived", source="cli")
+        finally:
+            profile_db.close()
+
+        # Without profile, the serving (default) DB does not contain this row.
+        missing = self.auth_client.patch("/api/sessions/profile-archived", json={"archived": True})
+        assert missing.status_code == 404
+
+        updated = self.auth_client.patch(
+            "/api/sessions/profile-archived", json={"archived": True, "profile": "worker-beta"}
+        )
+        assert updated.status_code == 200
+        assert updated.json()["archived"] is True
+
+        profile_db = SessionDB(db_path=profile_home / "state.db")
+        try:
+            row = profile_db.get_session("profile-archived")
+            assert row is not None and bool(row["archived"])
+        finally:
+            profile_db.close()
+
     def test_delete_absent_session_is_idempotent(self):
         # PREMISE / regression: deleting a row that no longer exists must NOT
         # 404 — the desktop would resurrect the ghost row and show

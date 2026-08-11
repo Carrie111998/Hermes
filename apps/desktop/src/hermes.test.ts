@@ -20,6 +20,8 @@ import {
   listSessions,
   listSidebarSessions,
   resetSidebarBatchCapability,
+  setSessionArchived,
+  deleteSession,
   setApiRequestProfile,
   speakText,
   transcribeAudio
@@ -385,6 +387,36 @@ describe('Hermes REST helpers', () => {
     await expect(getAllSessionMessages('session-1', null, { maxJsonChars: 1 })).rejects.toThrow(
       'Desktop safe-load limit'
     )
+  })
+
+  it('routes a default-profile archive to the owning root store even when the serving backend differs', async () => {
+    await setSessionArchived('session-1', true, 'default')
+
+    expect(api).toHaveBeenCalledWith({
+      body: { archived: true, profile: 'default' },
+      method: 'PATCH',
+      path: '/api/sessions/session-1',
+      profile: 'default'
+    })
+  })
+
+  it('routes a named-profile delete to the owning store instead of the serving backend', async () => {
+    await deleteSession('session-1', 'tangy-researcher')
+
+    expect(api).toHaveBeenCalledWith({
+      method: 'DELETE',
+      path: '/api/sessions/session-1?profile=tangy-researcher',
+      profile: 'tangy-researcher'
+    })
+  })
+
+  it('keeps unowned session requests unscoped for legacy callers', async () => {
+    await deleteSession('session-1')
+
+    expect(api).toHaveBeenCalledWith({
+      method: 'DELETE',
+      path: '/api/sessions/session-1'
+    })
   })
 
   it('bounds blocking TTS synthesis timeouts by text length', () => {
