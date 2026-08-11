@@ -71,7 +71,16 @@ class TodoStore:
         else:
             # Merge mode: update existing items by id, append new ones
             existing = {item["id"]: item for item in self._items}
-            for t in self._dedupe_by_id(todos):
+            existing_ids = set(existing.keys())
+            deduped = self._dedupe_by_id(todos)
+            # Validate new items before mutating so a bad call is transactional
+            new_items = {}
+            for t in deduped:
+                item_id = str(t.get("id", "")).strip()
+                if item_id and item_id not in existing_ids:
+                    validated = self._validate(t)
+                    new_items[item_id] = validated
+            for t in deduped:
                 item_id = str(t.get("id", "")).strip()
                 if not item_id:
                     continue  # Can't merge without an id
@@ -85,8 +94,8 @@ class TodoStore:
                         if status in VALID_STATUSES:
                             existing[item_id]["status"] = status
                 else:
-                    # New item -- validate fully and append to end
-                    validated = self._validate(t)
+                    # New item -- already validated above
+                    validated = new_items[item_id]
                     existing[validated["id"]] = validated
                     self._items.append(validated)
             # Rebuild _items preserving order for existing items
@@ -177,9 +186,10 @@ class TodoStore:
 
         content = str(item.get("content", "")).strip()
         if not content:
-            content = "(no description)"
-        else:
-            content = TodoStore._cap_content(content)
+            raise ValueError(
+                f"todo item {item_id!r} is missing required 'content' field"
+            )
+        content = TodoStore._cap_content(content)
 
         status = str(item.get("status", "pending")).strip().lower()
         if status not in VALID_STATUSES:
@@ -231,7 +241,10 @@ def todo_tool(
             return tool_error(
                 f"todos must be a list, got {type(todos).__name__}"
             )
-        items = store.write(todos, merge)
+        try:
+            items = store.write(todos, merge)
+        except ValueError as exc:
+            return tool_error(str(exc))
     else:
         items = store.read()
 

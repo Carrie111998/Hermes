@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from tools.todo_tool import TodoStore, todo_tool
 
 
@@ -90,6 +92,66 @@ class TestMergeMode:
         )
         items = store.read()
         assert len(items) == 2
+
+
+class TestEmptyContentValidation:
+    """Issue #44496 — empty/missing content must fail, not silently substitute."""
+
+    def test_validate_raises_on_empty_content(self):
+        with pytest.raises(ValueError, match="missing required 'content'"):
+            TodoStore._validate({"id": "x", "content": "", "status": "pending"})
+
+    def test_validate_raises_on_missing_content(self):
+        with pytest.raises(ValueError, match="missing required 'content'"):
+            TodoStore._validate({"id": "x", "status": "pending"})
+
+    def test_validate_raises_on_whitespace_content(self):
+        with pytest.raises(ValueError, match="missing required 'content'"):
+            TodoStore._validate({"id": "x", "content": "   ", "status": "pending"})
+
+    def test_replace_leaves_list_unchanged_on_empty_content(self):
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Keep me", "status": "pending"}])
+        with pytest.raises(ValueError):
+            store.write([{"id": "2", "content": "", "status": "pending"}])
+        items = store.read()
+        assert len(items) == 1
+        assert items[0]["content"] == "Keep me"
+        assert not any("(no description)" in t["content"] for t in items)
+
+    def test_replace_via_todo_tool_returns_error(self):
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Keep me", "status": "pending"}])
+        result = json.loads(
+            todo_tool(
+                todos=[{"id": "2", "content": "", "status": "pending"}],
+                store=store,
+            )
+        )
+        assert "error" in result
+        assert "content" in result["error"]
+        items = store.read()
+        assert len(items) == 1
+        assert items[0]["content"] == "Keep me"
+
+    def test_merge_status_only_preserves_content(self):
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Original", "status": "pending"}])
+        store.write([{"id": "1", "status": "completed"}], merge=True)
+        items = store.read()
+        assert items[0]["content"] == "Original"
+        assert items[0]["status"] == "completed"
+
+    def test_merge_new_item_without_content_returns_error(self):
+        store = TodoStore()
+        store.write([{"id": "1", "content": "Keep me", "status": "pending"}])
+        result = json.loads(
+            todo_tool(todos=[{"id": "2", "status": "pending"}], merge=True, store=store)
+        )
+        assert "error" in result
+        items = store.read()
+        assert len(items) == 1
+        assert items[0]["content"] == "Keep me"
 
 
 class TestTodoToolFunction:
