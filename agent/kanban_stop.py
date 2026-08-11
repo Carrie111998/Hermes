@@ -25,14 +25,27 @@ _DEFAULT_MAX_ATTEMPTS = 2
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
-    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker) AND
+    this execution actually owns that task, unless ``HERMES_KANBAN_STOP_NUDGE``
+    explicitly disables it.
+
+    The ownership check (sibling of run_agent.py's _touch_activity fix,
+    ccbd462917 / #79657 / #78961) matters because a cron job fired
+    in-process from a kanban worker (cronjob(action="run") -> run_job(),
+    same process) inherits the worker's HERMES_KANBAN_TASK even though it
+    is not that worker. Without it, this guard would inject a synthetic
+    "You are a Hermes kanban worker…" nudge into that unrelated agent's own
+    turn whenever it finishes without a terminal board tool call — which it
+    has no reason to make, since it isn't a kanban worker.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    return is_dispatcher_owned_worker_context()
 
 
 def _tool_call_name(tc: Any) -> str:

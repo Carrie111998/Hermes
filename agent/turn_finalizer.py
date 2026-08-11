@@ -154,6 +154,20 @@ def finalize_turn(
         # consecutive-failure circuit breaker (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
+            # Dispatcher-ownership gate (sibling of run_agent.py's
+            # _touch_activity fix, ccbd462917 / #79657 / #78961): this
+            # ``agent`` instance is whichever AIAgent's own turn just hit
+            # its iteration budget — including a cron job's agent fired
+            # in-process from a kanban worker (cronjob(action="run") ->
+            # run_job(), same process, the worker's HERMES_KANBAN_TASK
+            # still legitimately in os.environ). Without this check, an
+            # unrelated cron agent exhausting ITS OWN budget would mark the
+            # real worker's still-running task "timed_out" and release its
+            # claim out from under it.
+            from agent.delegation_context import is_dispatcher_owned_worker_context
+            if not is_dispatcher_owned_worker_context():
+                _kanban_task = None
+        if _kanban_task:
             try:
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()

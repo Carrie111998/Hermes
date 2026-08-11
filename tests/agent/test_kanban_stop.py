@@ -74,6 +74,20 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_disabled_for_non_dispatcher_owned_context(clear_kanban_env):
+    """A cron job fired in-process from a kanban worker (cronjob(action="run")
+    -> run_job(), same process) inherits the worker's HERMES_KANBAN_TASK even
+    though it is not that worker. The stop-guard must not fire for it —
+    otherwise it would inject a synthetic "You are a Hermes kanban worker…"
+    nudge into that unrelated agent's own turn, which has no reason to call
+    kanban_complete/kanban_block. Sibling of run_agent.py's _touch_activity
+    fix (ccbd462917 / #79657 / #78961)."""
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_46be8aa5")
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[], attempts=0) is None
 
 
 

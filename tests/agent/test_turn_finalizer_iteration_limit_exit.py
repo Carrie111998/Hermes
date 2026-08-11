@@ -196,6 +196,35 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_kanban_timeout_not_recorded_for_non_dispatcher_owned_context(monkeypatch):
+    """A cron job fired in-process from a kanban worker (cronjob(action="run")
+    -> run_job(), same process) inherits the worker's HERMES_KANBAN_TASK even
+    though it is not that worker. If THAT agent's own turn exhausts its
+    iteration budget, this must not mark the real worker's still-running
+    task "timed_out" and release its claim out from under it. Sibling of
+    run_agent.py's _touch_activity fix (ccbd462917 / #79657 / #78961)."""
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    record = MagicMock(name="record_task_failure")
+    conn = SimpleNamespace(close=lambda: None)
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    agent = _LimitAgent()
+
+    with non_dispatcher_owned_context():
+        result = _finalize(
+            agent,
+            final_response=None,
+            exit_reason="unknown",
+            pending_verification_response="composed report",
+        )
+
+    assert result["turn_exit_reason"] == "max_iterations_reached(60/60)"
+    record.assert_not_called()
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
