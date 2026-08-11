@@ -20,6 +20,15 @@ describe('wheelAccel — native path', () => {
     expect(computeWheelStep(s, 1, 1060)).toBeGreaterThanOrEqual(1)
   })
 
+  it('same-direction mechanical wheel events accelerate without encoder bounce', () => {
+    const s = initWheelAccel(false, 1)
+    const rows = [1000, 1080, 1160, 1240, 1320].map(now => computeWheelStep(s, 1, now))
+
+    expect(rows.some(row => row > 1)).toBe(true)
+    expect(rows.every(row => row <= 6)).toBe(true)
+    expect(s.wheelMode).toBe(false)
+  })
+
   it('gap beyond window resets mult to base', () => {
     const s = initWheelAccel(false, 1)
 

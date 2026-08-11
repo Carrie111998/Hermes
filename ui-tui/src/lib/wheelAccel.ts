@@ -5,10 +5,10 @@
 // Heuristic on inter-event gap + direction flips:
 //
 //   gap < 5ms                 → same-batch burst → 1 row/event
-//   gap < 40ms (native)       → ramp +0.3, cap 6
+//   gap ≤ 200ms (native)      → ramp +0.3, cap 6
 //   gap 80-500ms (xterm.js)   → mult = 1 + (mult-1)·0.5^(gap/150) + 5·decay
 //                               cap 3 slow / 6 fast
-//   gap > 500ms               → reset (deliberate click stays responsive)
+//   gap > 200ms native / 500ms xterm.js → reset for deliberate clicks
 //   flip + flip-back ≤200ms   → encoder bounce → engage wheel-mode (sticky cap)
 //   5 consecutive <5ms events → trackpad flick → disengage wheel-mode
 //
@@ -18,7 +18,7 @@
 import { isXtermJs } from '@hermes/ink'
 
 // ── Native (ghostty, iTerm2, WezTerm, …) ───────────────────────────────
-const WHEEL_ACCEL_WINDOW_MS = 40
+const WHEEL_ACCEL_WINDOW_MS = 200
 const WHEEL_ACCEL_STEP = 0.3
 const WHEEL_ACCEL_MAX = 6
 
@@ -146,8 +146,8 @@ function nativeStep(state: WheelAccelState, dir: -1 | 1, now: number): number {
     return Math.floor(state.mult)
   }
 
-  // Trackpad / hi-res native: tight 40ms window — sub-window ramps,
-  // anything slower resets to baseline.
+  // Trackpad, hi-res, or sustained mechanical wheel: ramp while events
+  // remain within the encoder-bounce cadence; slower clicks reset.
   if (gap > WHEEL_ACCEL_WINDOW_MS) {
     state.mult = state.base
   } else {
