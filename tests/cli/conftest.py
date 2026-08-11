@@ -48,3 +48,35 @@ def _reset_prompt_toolkit_output_cache():
     _clear()
     yield
     _clear()
+
+
+def pytest_runtest_setup(item):
+    """Restore ``cli._pt_print`` / ``cli._PT_ANSI`` if a previous test left
+    them bound to MagicMocks.
+
+    Several CLI test helpers (``_make_cli`` in test_cli_init.py,
+    test_cli_user_message_preview.py, test_tool_progress_scrollback.py, …)
+    use ``patch.dict(sys.modules, prompt_toolkit_stubs)`` +
+    ``importlib.reload(cli)`` to exercise HermesCLI under mocked prompt_toolkit.
+    ``patch.dict`` restores ``sys.modules`` on exit, but the reload already
+    rebound ``cli._pt_print`` / ``cli._PT_ANSI`` to MagicMock objects — and
+    those module globals are NOT restored. Every later test that routes output
+    through ``cli._cprint`` then silently no-ops, because ``_pt_print(...)``
+    hits a mock instead of ``print_formatted_text``. This is the mechanism
+    behind the order-dependent ``test_resume_quiet_stderr`` failure: it passes
+    in isolation and in its own file, but fails in a full ``tests/cli`` run
+    when it runs after any of those reload-stubbing tests.
+
+    Detect the mock here (before the test body) and reload cli once with the
+    real modules visible so its globals rebind cleanly.
+    """
+    try:
+        import cli
+        import prompt_toolkit
+
+        if cli._pt_print is not prompt_toolkit.print_formatted_text:
+            import importlib
+
+            importlib.reload(cli)
+    except Exception:
+        pass

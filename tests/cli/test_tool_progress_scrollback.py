@@ -46,16 +46,28 @@ def _make_cli(tool_progress="all", verbose=_UNSET):
         "prompt_toolkit.formatted_text": MagicMock(),
         "prompt_toolkit.auto_suggest": MagicMock(),
     }
-    with patch.dict(sys.modules, prompt_toolkit_stubs), \
-         patch.dict("os.environ", clean_env, clear=False):
-        import cli as mod
-        mod = importlib.reload(mod)
-        _cli_mod = mod
-        with patch.object(mod, "get_tool_definitions", return_value=[]), \
-             patch.dict(mod.__dict__, {"CLI_CONFIG": _clean_config}):
-            if verbose is _UNSET:
-                return mod.HermesCLI()
-            return mod.HermesCLI(verbose=verbose)
+    try:
+        with patch.dict(sys.modules, prompt_toolkit_stubs), \
+             patch.dict("os.environ", clean_env, clear=False):
+            import cli as mod
+            mod = importlib.reload(mod)
+            _cli_mod = mod
+            with patch.object(mod, "get_tool_definitions", return_value=[]), \
+                 patch.dict(mod.__dict__, {"CLI_CONFIG": _clean_config}):
+                if verbose is _UNSET:
+                    return mod.HermesCLI()
+                return mod.HermesCLI(verbose=verbose)
+    finally:
+        # The reload above re-executed cli.py while prompt_toolkit was stubbed
+        # with MagicMocks, permanently rebinding cli's module globals
+        # (``_pt_print``, ``_PT_ANSI``, …) to those mocks. ``patch.dict``
+        # restores ``sys.modules`` on exit, but NOT the names the reloaded
+        # module already bound. Reload once more with the real modules visible
+        # so cli's globals rebind cleanly. See test_cli_init.py::_make_cli for
+        # the full explanation of this order-dependent ``test_resume_quiet_stderr``
+        # failure.
+        import cli as _cli_restore
+        importlib.reload(_cli_restore)
 
 
 class TestToolProgressScrollback:
