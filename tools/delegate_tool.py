@@ -1998,7 +1998,26 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
+        # Live window occupancy. session_prompt_tokens is a monotonic
+        # CUMULATIVE counter (conversation_loop.py `+= prompt_tokens` on
+        # every response, including cache-hit tokens), so on long sessions
+        # with cache hits it exceeds context_length and every summary gets
+        # crushed to the floor (#84020). The compressor tracks the current
+        # window's real prompt_tokens: last_real_prompt_tokens (updated
+        # only when > 0, so it survives usage-less responses and the -1
+        # awaiting-real-usage state) is the freshest reliable reading;
+        # last_prompt_tokens is the raw latest value, where 0 means "no
+        # real usage yet" and -1 means "awaiting real usage after
+        # compression" - both unknown. Fall back to the cumulative counter
+        # only when no real occupancy has ever been recorded.
+        used_tokens = 0
+        for field in ("last_real_prompt_tokens", "last_prompt_tokens"):
+            candidate = getattr(compressor, field, None)
+            if isinstance(candidate, (int, float)) and candidate > 0:
+                used_tokens = candidate
+                break
+        if used_tokens <= 0:
+            used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
         if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
             used_tokens = 0
 

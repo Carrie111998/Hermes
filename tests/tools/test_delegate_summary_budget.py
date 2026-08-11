@@ -16,15 +16,91 @@ import tools.delegate_tool as dt
 
 
 class _FakeCompressor:
-    def __init__(self, context_length, max_tokens):
+    """Mirrors the real ContextCompressor's sentinel semantics: 0 = "no
+    real usage yet", -1 = "awaiting real usage after compression"."""
+
+    def __init__(
+        self,
+        context_length,
+        max_tokens,
+        last_real_prompt_tokens=0,
+        last_prompt_tokens=0,
+    ):
         self.context_length = context_length
         self.max_tokens = max_tokens
+        self.last_real_prompt_tokens = last_real_prompt_tokens
+        self.last_prompt_tokens = last_prompt_tokens
 
 
 class _FakeParent:
-    def __init__(self, context_length, used_tokens, max_tokens):
-        self.context_compressor = _FakeCompressor(context_length, max_tokens)
+    def __init__(
+        self,
+        context_length,
+        used_tokens,
+        max_tokens,
+        last_real_prompt_tokens=0,
+        last_prompt_tokens=0,
+    ):
+        self.context_compressor = _FakeCompressor(
+            context_length,
+            max_tokens,
+            last_real_prompt_tokens=last_real_prompt_tokens,
+            last_prompt_tokens=last_prompt_tokens,
+        )
         self.session_prompt_tokens = used_tokens
+
+
+def test_summary_budget_uses_live_occupancy_not_cumulative_counter():
+    """#84020: session_prompt_tokens is a monotonic cumulative counter that
+    exceeds context_length on long cache-heavy sessions. The budget must
+    size against the compressor's real window occupancy, not the cumulative
+    counter, or every summary is crushed to the 2000-char floor."""
+    # Cumulative counter already exceeds the window (11M cumulative vs 1M
+    # window), but live occupancy is a comfortable 143K of 1M.
+    parent = _FakeParent(
+        context_length=1_000_000,
+        used_tokens=11_000_000,
+        max_tokens=8_000,
+        last_real_prompt_tokens=143_000,
+        last_prompt_tokens=143_000,
+    )
+    budget = dt._parent_summary_char_budget(parent, n_summaries=2)
+    assert budget is not None
+    assert budget > 2_000  # NOT the floor
+    assert budget < 4_000_000  # sane upper bound (fraction of headroom)
+
+
+def test_summary_budget_zero_sentinel_falls_back_to_cumulative():
+    """last_real_prompt_tokens=0 (documented "no real usage yet") must not
+    be treated as empty-window occupancy - fall back to the cumulative
+    counter, which is small pre-first-response."""
+    parent = _FakeParent(
+        context_length=200_000,
+        used_tokens=10_000,
+        max_tokens=8_000,
+        last_real_prompt_tokens=0,
+        last_prompt_tokens=0,
+    )
+    budget = dt._parent_summary_char_budget(parent, n_summaries=1)
+    assert budget is not None
+    assert budget > 2_000
+
+
+def test_summary_budget_negative_sentinel_uses_last_real_occupancy():
+    """After compression, last_prompt_tokens=-1 ("awaiting real usage")
+    while last_real_prompt_tokens keeps the pre-compaction reading. The
+    budget must use that real reading - falling back to the large
+    cumulative counter would crush the summary to the floor."""
+    parent = _FakeParent(
+        context_length=1_000_000,
+        used_tokens=11_000_000,
+        max_tokens=8_000,
+        last_real_prompt_tokens=143_000,
+        last_prompt_tokens=-1,
+    )
+    budget = dt._parent_summary_char_budget(parent, n_summaries=1)
+    assert budget is not None
+    assert budget > 2_000  # NOT the floor
 
 
 def test_small_summaries_pass_through_untouched():
