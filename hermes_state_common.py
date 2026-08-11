@@ -383,6 +383,27 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+-- Cross-process turn lease (#67442). The in-process registry in
+-- gateway/turn_lease.py serializes [load history -> run -> flush] within one
+-- process; it cannot see a CLI process and a gateway process sharing one
+-- session_id via CLI-continuity. This row is the cross-process coordination
+-- point for that pair. Deliberately shaped like compression_locks above:
+-- session_id is the PK, so the row IS the mutex.
+--
+-- run_generation is a fencing token: it identifies WHICH acquisition owns the
+-- lease, so a consumer that needs to reject a stale holder's late write can
+-- compare generations rather than trusting a liveness check that was true at
+-- acquire time and stale by write time.
+CREATE TABLE IF NOT EXISTS turn_leases (
+    session_id TEXT PRIMARY KEY,
+    holder TEXT NOT NULL,
+    surface TEXT NOT NULL DEFAULT '',
+    run_generation INTEGER NOT NULL DEFAULT 0,
+    acquired_at REAL NOT NULL,
+    heartbeat_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS async_delegations (
     delegation_id TEXT PRIMARY KEY,
     origin_session TEXT NOT NULL,
@@ -419,6 +440,7 @@ CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
     ON messages(session_id)
     WHERE role = 'assistant' AND tool_calls IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_turn_leases_expires ON turn_leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery

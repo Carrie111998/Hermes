@@ -5756,6 +5756,165 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return None
         return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
 
+    # ------------------------------------------------------------------
+    # Cross-process turn lease (#67442)
+    #
+    # gateway/turn_lease.py serializes [load history -> run -> flush] within a
+    # single process. It cannot see a CLI process and a gateway process
+    # sharing one session_id through CLI-continuity, which is the route that
+    # produced the #64934 transcript interleaving. These methods are the
+    # cross-process coordination point for that pair, shaped deliberately like
+    # the compression-lock protocol above: the PK row IS the mutex, expiry
+    # reclaims a crashed holder, and every failure path degrades rather than
+    # wedging a turn.
+    # ------------------------------------------------------------------
+
+    def try_acquire_turn_lease(
+        self,
+        session_id: str,
+        holder: str,
+        *,
+        surface: str = "",
+        run_generation: int = 0,
+        ttl_seconds: float = 120.0,
+    ) -> bool:
+        """Atomically acquire the cross-process turn lease. True iff we own it.
+
+        Expired leases are reclaimed transparently, so a crashed holder wedges
+        the session for at most ``ttl_seconds`` rather than forever. A
+        same-holder re-acquire refreshes the row and returns True, keeping
+        retry paths idempotent.
+
+        Mirrors :meth:`try_acquire_compression_lock`'s
+        DELETE-stale-or-own + INSERT-OR-IGNORE + confirm-SELECT shape. SQLite
+        serializes writers, so the sequence is atomic against other processes:
+        exactly one racing caller sees its own holder in the confirming
+        SELECT.
+
+        Returns False — never raises — when the lease subsystem is unusable.
+        Callers treat that as "exclusivity not proven" and decide their own
+        posture: turn serialization proceeds unserialized (no worse than
+        today), while an ownership fence must refuse.
+        """
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        expires_at = now + float(ttl_seconds)
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM turn_leases "
+                "WHERE session_id = ? AND (expires_at < ? OR holder = ?)",
+                (session_id, now, holder),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO turn_leases "
+                "(session_id, holder, surface, run_generation, acquired_at, "
+                " heartbeat_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    holder,
+                    str(surface or ""),
+                    int(run_generation),
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = conn.execute(
+                "SELECT holder FROM turn_leases WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("try_acquire_turn_lease(%s) failed: %s", session_id, exc)
+            return False
+
+    def refresh_turn_lease(
+        self, session_id: str, holder: str, *, ttl_seconds: float = 120.0
+    ) -> bool:
+        """Extend a held lease's expiry. False when we no longer own it.
+
+        A turn outliving ``ttl_seconds`` would otherwise have its row reclaimed
+        by the next acquirer and interleave with it. False is the signal that
+        this already happened — the caller has lost ownership and must not
+        assume exclusivity for the remainder of the turn.
+        """
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        expires_at = now + float(ttl_seconds)
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE turn_leases SET heartbeat_at = ?, expires_at = ? "
+                "WHERE session_id = ? AND holder = ? AND expires_at >= ?",
+                (now, expires_at, session_id, holder, now),
+            )
+            return cur.rowcount > 0
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning("refresh_turn_lease(%s) failed: %s", session_id, exc)
+            return False
+
+    def release_turn_lease(
+        self, session_id: str, holder: str, *, run_generation: Optional[int] = None
+    ) -> None:
+        """Release the lease iff we still own it. Idempotent.
+
+        The ``holder`` check stops a late-returning turn from deleting a fresh
+        lease someone else acquired after ours expired. Pass ``run_generation``
+        to additionally scope the release to one acquisition — needed when a
+        single holder id can hold the lease more than once (a retried run) and
+        the stale attempt must not release the live one.
+        """
+        if not session_id or not holder:
+            return
+
+        def _do(conn):
+            if run_generation is None:
+                conn.execute(
+                    "DELETE FROM turn_leases WHERE session_id = ? AND holder = ?",
+                    (session_id, holder),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM turn_leases "
+                    "WHERE session_id = ? AND holder = ? AND run_generation = ?",
+                    (session_id, holder, int(run_generation)),
+                )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning("release_turn_lease(%s) failed: %s", session_id, exc)
+
+    def get_turn_lease_holder(self, session_id: str) -> Optional[str]:
+        """Return the current (non-expired) lease holder, or None.
+
+        Diagnostic helper — not part of the locking protocol. Do NOT gate a
+        write on this: it is a point-in-time read, and the lease can be
+        reclaimed between the read and the write. Use the acquire result, or
+        compare ``run_generation``, when correctness depends on ownership.
+        """
+        if not session_id:
+            return None
+        row = self._conn.execute(
+            "SELECT holder FROM turn_leases "
+            "WHERE session_id = ? AND expires_at >= ?",
+            (session_id, time.time()),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
     def touch_session_activity(
         self,
         session_id: str,
