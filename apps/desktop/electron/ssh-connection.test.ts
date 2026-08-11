@@ -62,8 +62,11 @@ test('controlSocketPath is stable, short, and host-distinct', () => {
   const b = controlSocketPath('me', 'box2', 22, '/tmp/d')
   assert.equal(a, a2, 'same triple → same socket (ControlMaster reuse)')
   assert.notEqual(a, b, 'different host → different socket')
-  // 16 hex chars + .sock keeps the basename short for sun_path 104-byte limit
-  assert.match(a, /\/[0-9a-f]{16}\.sock$/)
+  // 16 hex chars + .sock keeps the basename short for sun_path 104-byte limit.
+  // Asserted on the basename: `controlSocketPath` builds with `path.join`, so
+  // a leading-slash regex only matched on POSIX and failed on Windows. The
+  // basename is what the sun_path limit is actually about.
+  assert.match(path.basename(a), /^[0-9a-f]{16}\.sock$/)
 })
 
 test('controlSocketPath default base stays under sun_path even with the temp-listener suffix', () => {

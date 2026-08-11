@@ -31,11 +31,12 @@ name: Desktop install (Windows)
 #     `test:desktop:win-install` were seen passing on a Windows runner
 #     (21 tests, 0 failures) in the run that surfaced the other two.
 #
-# It deliberately does NOT run the whole `electron` vitest project: that also
-# holds POSIX-only suites (ssh-connection asserts ControlMaster multiplexing,
-# which Windows OpenSSH lacks — the product runs a no-mux path there instead).
-# Making those cross-platform is a separate change from proving the install
-# path, and is tracked as follow-up rather than bolted on here.
+# It still does NOT run the whole `electron` vitest project — the file list in
+# `test:desktop:win-install` is explicit, and grows only when a suite has been
+# shown to hold on Windows. `ssh-connection` joined it after its ControlMaster
+# tests were made to state `mux: true` instead of inheriting
+# `process.platform !== 'win32'`, which had been silently turning them into
+# no-mux connections here.
 #
 # ── What this does NOT catch, deliberately stated ───────────────────────────
 #
@@ -122,17 +123,12 @@ jobs:
         run: node scripts/assert-win-vcruntime.mjs
         working-directory: apps/desktop
 
-      # Named files, not the whole `electron` vitest project. The project also
-      # contains suites that are POSIX-only by construction — ssh-connection
-      # asserts OpenSSH ControlMaster multiplexing, which Windows OpenSSH never
-      # implemented, so `ssh-connection.ts` deliberately runs a no-mux path
-      # there (see its `this._mux = opts.mux ?? process.platform !== 'win32'`)
-      # and the mux assertions cannot hold. Adopting that suite here would mean
-      # rewriting it, which is a separate change from proving the install path.
+      # Named files, not the whole `electron` vitest project: the pin contract,
+      # the build guards that run in `prebuilder`/`postbuild`, and the suites
+      # that have been made platform-stable. `before-pack` and
+      # `stage-native-deps` stay out because they import `electron-builder`,
+      # which vitest cannot transform on Windows.
       #
-      # What is left is what belongs on Windows: the pin contract that keeps
-      # electron-builder and `npm ci` on the same Electron, and the build
-      # guards that run in `prebuilder`/`postbuild` during real packaging.
       # Named explicitly in `test:desktop:win-install` rather than filtered by
       # directory here: a path filter would have to survive backslash
       # separators, and an explicit list makes "what runs on Windows" reviewable
