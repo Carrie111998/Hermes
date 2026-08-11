@@ -1634,6 +1634,21 @@ class TestExecuteToolCalls:
         assert post_call["status"] == "error"
         assert post_call["error_type"] == "invalid_tool_arguments"
 
+    def test_empty_string_args_execute_as_empty_object(self, agent):
+        tc = _mock_tool_call(name="web_search", arguments=" \n\t", call_id="c1")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value="ok") as mock_hfc:
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        args, _kwargs = mock_hfc.call_args
+        assert args[:3] == ("web_search", {}, "task-1")
+        assert len(messages) == 1
+        assert messages[0]["role"] == "tool"
+        assert messages[0]["tool_call_id"] == "c1"
+        assert messages[0]["content"] == "ok"
+
     def test_concurrent_invalid_json_args_emit_terminal_hook(self, agent, monkeypatch):
         tc = _mock_tool_call(
             name="web_search", arguments="not valid json", call_id="c1"
