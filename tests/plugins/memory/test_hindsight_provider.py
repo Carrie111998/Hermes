@@ -137,8 +137,12 @@ def test_newer_hindsight_client_reports_precise_version_conflict(monkeypatch):
     message = str(exc_info.value)
     assert "0.8.4" in message
     assert "hindsight-client==0.6.1" in message
-    assert "user-site" in message
+    assert "higher-priority" in message
     assert "Library/Python/3.14/site-packages" in message
+    assert "-m pip uninstall hindsight-client" in message
+    assert "remove that distribution directly" in message
+    assert "does not change Python import precedence" in message
+    assert "--force-reinstall" not in message
     assert ensure_calls == []
 
 

@@ -344,7 +344,7 @@ hermes config set memory.provider hindsight
 echo "HINDSIGHT_API_KEY=your-key" >> ~/.hermes/.env
 ```
 
-安装向导会自动安装依赖，并仅安装所选模式所需的内容（云端用 `hindsight-client`，本地用 `hindsight-all`）。需要 `hindsight-client >= 0.4.22`（会话启动时若版本过旧则自动升级）。
+安装向导会自动安装依赖，并仅安装所选模式所需的内容（云端用 `hindsight-client`，本地用 `hindsight-all`）。云端模式必须使用精确版本 `hindsight-client==0.6.1`；会话启动时，旧版本会被替换为该固定版本。如果启动时报告有更高优先级的安装，请先在拥有所报告 `site-packages` 路径的 Python 环境中卸载它（或直接删除该发行版），再重新安装固定版本。仅在优先级较低的 Hermes 环境中强制重装不会改变 Python 的导入优先级。
 
 **本地模式 UI：** `hindsight-embed -p hermes ui start`
 

@@ -172,12 +172,21 @@ def _cloud_client_version_error(installed: str) -> str:
     except Exception:
         pass
     location = f" Loaded from {origin}." if origin else ""
+    owner = (
+        f"the Python environment that owns {origin}"
+        if origin
+        else "the higher-priority Python environment"
+    )
     return (
         f"Incompatible hindsight-client {installed}; Hermes requires "
-        f"{_CLIENT_REQUIREMENT}.{location} A user-site package may be "
-        "shadowing Hermes' pinned dependency. Remove the conflicting package "
-        f"or reinstall with: {sys.executable} -m pip install --force-reinstall "
-        f"'{_CLIENT_REQUIREMENT}'"
+        f"{_CLIENT_REQUIREMENT}.{location} A higher-priority installation may be "
+        "shadowing Hermes' pinned dependency. First uninstall hindsight-client "
+        f"from {owner} (run that environment's Python with "
+        "`-m pip uninstall hindsight-client`) or remove that distribution "
+        "directly. Then install the Hermes pin with: "
+        f"{sys.executable} -m pip install '{_CLIENT_REQUIREMENT}'. "
+        "Reinstalling only the lower-priority Hermes environment does not change "
+        "Python import precedence."
     )
 
 
