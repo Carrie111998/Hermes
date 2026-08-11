@@ -6,6 +6,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from hermes_cli import web_server
+from tests._home_isolation import redirect_home
 
 
 def _client_with_app_state():
@@ -56,7 +57,7 @@ def local_files_client(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
     monkeypatch.delenv("HERMES_HOME", raising=False)
-    monkeypatch.setenv("HOME", str(home))
+    redirect_home(monkeypatch, home)
 
     client, prev_auth_required, prev_bound_host = _client_with_app_state()
     try:
@@ -198,7 +199,7 @@ def test_gated_local_mode_still_defaults_to_home(monkeypatch, tmp_path):
     home.mkdir()
     monkeypatch.delenv("HERMES_DASHBOARD_FILES_ROOT", raising=False)
     monkeypatch.delenv("HERMES_MANAGED", raising=False)
-    monkeypatch.setenv("HOME", str(home))
+    redirect_home(monkeypatch, home)
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
 
     prev_auth_required = getattr(web_server.app.state, "auth_required", None)

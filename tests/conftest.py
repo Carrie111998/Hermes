@@ -378,9 +378,14 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 def _hermetic_environment(tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
-    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
+    Also redirects HERMES_HOME to a per-test tempdir so code that reads
+    ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
     datetime/locale-sensitive tests are deterministic.
+
+    HOME is deliberately *not* redirected here (see step 3). A test that needs
+    its home isolated must do it itself via
+    ``tests._home_isolation.redirect_home`` — setting ``$HOME`` alone does not
+    isolate on Windows.
     """
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):
@@ -404,8 +409,12 @@ def _hermetic_environment(tmp_path, monkeypatch):
     #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
     #    some tests (and their transitive deps) spawn subprocesses that
     #    inherit HOME and expect it to be stable. If a test genuinely
-    #    needs HOME isolated, it should set it explicitly in its own
-    #    fixture. Any code in the codebase reading ``~/.hermes/*`` via
+    #    needs HOME isolated, it should do so in its own fixture via
+    #    ``tests._home_isolation.redirect_home`` -- setting ``$HOME`` on
+    #    its own is NOT isolation on Windows, where ``Path.home()`` and
+    #    ``os.path.expanduser`` read ``USERPROFILE`` and ignore ``HOME``
+    #    (which is typically unset there), so the real home still wins.
+    #    Any code in the codebase reading ``~/.hermes/*`` via
     #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
     #    is a bug to fix at the callsite.
     fake_hermes_home = tmp_path / "hermes_test"
