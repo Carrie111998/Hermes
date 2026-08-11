@@ -4,6 +4,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +56,36 @@ def test_faster_whisper_is_not_a_base_dependency():
 
     voice_extra = data["project"]["optional-dependencies"]["voice"]
     assert any(dep.startswith("faster-whisper") for dep in voice_extra)
+
+
+@pytest.mark.parametrize(
+    ("package", "last_vulnerable", "first_fixed", "next_major"),
+    [
+        ("pydantic-settings", "2.14.1", "2.14.2", "3"),
+        ("pygments", "2.19.2", "2.20.0", "3"),
+    ],
+)
+def test_transitive_security_floors_are_bounded_core_requirements(
+    package: str,
+    last_vulnerable: str,
+    first_fixed: str,
+    next_major: str,
+):
+    """Known-vulnerable transitives must be bounded core requirements."""
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    requirements = {
+        Requirement(spec).name.lower(): Requirement(spec)
+        for spec in data["project"]["dependencies"]
+    }
+
+    assert package in requirements, (
+        f"{package} must be constrained directly in core dependencies so all "
+        "install paths enforce its reviewed security floor"
+    )
+    specifier = requirements[package].specifier
+    assert Version(last_vulnerable) not in specifier
+    assert Version(first_fixed) in specifier
+    assert Version(next_major) not in specifier
 
 
 # Minimum non-vulnerable Starlette: CVE-2026-48710 ("BadHost") was fixed in
