@@ -1756,6 +1756,75 @@ def trigger_job(
     return updated
 
 
+def request_run(
+    job_id: str,
+    *,
+    caller: str,
+    reason: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Schedule an ALREADY-ENABLED job for the next tick. Never enables.
+
+    The non-enabling counterpart to ``trigger_job``, for callers that are
+    activating work on a worker's behalf rather than expressing an operator's
+    "run this now" intent. ``trigger_job`` sets ``enabled: True``, so an
+    automated caller that mis-resolves a job silently revives a worker an
+    operator deliberately disabled — the hazard ``cron.wake_channel`` avoids
+    in-process, and which this function makes available across processes.
+
+    Returns ``None`` — writing nothing at all — when the job is unknown or not
+    enabled. Fails closed on purpose: not activating is recoverable, reviving a
+    disabled worker is not.
+
+    Writes NO LIFECYCLE field — only ``next_run_at`` (``update_job``'s shared
+    normalization may still materialize ``skills``/``skill`` on a legacy record
+    that lacks those keys, which is why the claim above is scoped to lifecycle
+    fields specifically). The due scan gates on ``enabled`` and never reads
+    ``state`` (see ``get_due_and_skipped_jobs``), and ``pause_job`` always sets
+    ``enabled: False`` alongside ``state: "paused"`` — so the single ``enabled``
+    check above already covers paused jobs, and no lifecycle field needs
+    touching. Keeping the write off lifecycle fields is what makes "this cannot
+    change operator-visible state" assertable.
+
+    ``caller`` is required, unlike ``trigger_job``'s warn-and-continue
+    back-compat allowance: this is a new API, and an unattributable automated
+    activation is impossible to reconstruct in a postmortem.
+    """
+    if not isinstance(caller, str) or not caller.strip():
+        raise ValueError("caller must be a non-empty string")
+
+    job = resolve_job_ref(job_id)
+    if not job:
+        return None
+
+    # Intentional asymmetry: a legacy record with no "enabled" key is treated
+    # as not-enabled HERE (fails closed), even though the due scan defaults
+    # missing "enabled" to True (`job.get("enabled", True)`). A record like
+    # that is runnable by the scheduler but permanently refused by this path.
+    if not job.get("enabled"):
+        logger.info(
+            "request_run refused job_id=%s name=%s: not enabled — not reviving "
+            "(caller=%s reason=%s)",
+            job["id"], job.get("name"), caller, reason,
+        )
+        return None
+
+    previous_next_run_at = job.get("next_run_at")
+
+    updated = update_job(job["id"], {"next_run_at": _hermes_now().isoformat()})
+
+    if updated is not None:
+        emit_cron_triggered_safe(
+            job_id=job["id"],
+            job_name=updated.get("name") or job.get("name") or job["id"],
+            caller=caller,
+            reason=reason,
+            previous_next_run_at=previous_next_run_at,
+            new_next_run_at=updated["next_run_at"],
+        )
+
+    return updated
+
+
 def remove_job(job_id: str) -> bool:
     """Remove a job by ID or name."""
     job = resolve_job_ref(job_id)
