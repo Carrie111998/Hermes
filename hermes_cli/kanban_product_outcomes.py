@@ -9,7 +9,7 @@ parsed as lifecycle authority.
 from __future__ import annotations
 
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -76,6 +76,155 @@ class ProductOutcomeError(ValueError):
         self.code = code
         self.qualifier = qualifier
         super().__init__(code)
+
+
+@dataclass(frozen=True)
+class TerminalRunRecord:
+    """Immutable, dispatcher-pinned facts from one ended product run."""
+
+    run_id: int
+    phase: str
+    outcome: TerminalOutcome | None
+    test_branch: str | None = None
+    test_head_sha: str | None = None
+    review_branch: str | None = None
+    review_base_sha: str | None = None
+    review_head_sha: str | None = None
+    writer_provider: str | None = None
+    tester_provider: str | None = None
+    reviewer_provider: str | None = None
+
+
+@dataclass(frozen=True)
+class ApprovedCandidate:
+    run_id: int
+    branch: str
+    base_sha: str
+    source_sha: str
+    reviewer_provider: str
+    writer_provider: str
+
+    def __iter__(self):
+        """Keep the old private DB tuple seam readable during migration."""
+
+        yield self.branch
+        yield self.source_sha
+
+    def __getitem__(self, index: int) -> str:
+        return (self.branch, self.source_sha)[index]
+
+
+@dataclass(frozen=True)
+class PassedTest:
+    run_id: int
+    branch: str
+    source_sha: str
+    tester_provider: str
+    writer_provider: str
+
+
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _full_sha(value: object) -> str | None:
+    text = str(value or "").strip()
+    return text if _FULL_SHA_RE.fullmatch(text) else None
+
+
+def _provider_key(value: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").casefold())
+
+
+def _latest_phase_run(
+    runs: Sequence[TerminalRunRecord], phase: str
+) -> TerminalRunRecord | None:
+    return next((run for run in reversed(runs) if run.phase == phase), None)
+
+
+def _approved_candidate_from_pinned_run(
+    run: TerminalRunRecord,
+) -> ApprovedCandidate | None:
+    if run.outcome is None or run.outcome.verdict != "approved":
+        return None
+    branch = str(run.review_branch or "").strip()
+    base_sha = _full_sha(run.review_base_sha)
+    source_sha = _full_sha(run.review_head_sha)
+    reviewer = str(run.reviewer_provider or "").strip()
+    writer = str(run.writer_provider or "").strip()
+    if (
+        not branch
+        or base_sha is None
+        or source_sha is None
+        or not reviewer
+        or not writer
+        or _provider_key(reviewer) == _provider_key(writer)
+    ):
+        return None
+    return ApprovedCandidate(
+        run_id=run.run_id,
+        branch=branch,
+        base_sha=base_sha,
+        source_sha=source_sha,
+        reviewer_provider=reviewer,
+        writer_provider=writer,
+    )
+
+
+def latest_review_authority(
+    runs: Sequence[TerminalRunRecord],
+) -> ApprovedCandidate | None:
+    """Return authority from exactly the latest ended Review run.
+
+    A later rejection, malformed run, or run with incomplete dispatcher pins
+    invalidates older approvals.  The caller must supply ended runs in their
+    stored chronological order; this function intentionally never searches
+    backward past the latest Review attempt.
+    """
+
+    latest = _latest_phase_run(runs, "review")
+    return _approved_candidate_from_pinned_run(latest) if latest is not None else None
+
+
+def _passed_test_from_pinned_run(
+    run: TerminalRunRecord, source_sha: str
+) -> PassedTest | None:
+    if run.outcome is None or run.outcome.verdict != "passed":
+        return None
+    requested_sha = _full_sha(source_sha)
+    test_sha = _full_sha(run.test_head_sha)
+    branch = str(run.test_branch or "").strip()
+    tester = str(run.tester_provider or "").strip()
+    writer = str(run.writer_provider or "").strip()
+    if (
+        requested_sha is None
+        or test_sha is None
+        or test_sha != requested_sha
+        or not branch
+        or not tester
+        or not writer
+        or _provider_key(tester) == _provider_key(writer)
+    ):
+        return None
+    return PassedTest(
+        run_id=run.run_id,
+        branch=branch,
+        source_sha=test_sha,
+        tester_provider=tester,
+        writer_provider=writer,
+    )
+
+
+def latest_test_authority(
+    runs: Sequence[TerminalRunRecord], source_sha: str
+) -> PassedTest | None:
+    """Return authority from exactly the latest ended Test run."""
+
+    latest = _latest_phase_run(runs, "test")
+    return (
+        _passed_test_from_pinned_run(latest, source_sha)
+        if latest is not None
+        else None
+    )
 
 
 def _has_serialized_parameter_marker(summary: str | None, result: str | None) -> bool:
@@ -238,8 +387,13 @@ def validate_terminal_outcome(
 
 
 __all__ = [
+    "ApprovedCandidate",
     "OutcomeValidationError",
+    "PassedTest",
     "ProductOutcomeError",
     "TerminalOutcome",
+    "TerminalRunRecord",
+    "latest_review_authority",
+    "latest_test_authority",
     "validate_terminal_outcome",
 ]

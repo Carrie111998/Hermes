@@ -13,6 +13,10 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_product_outcomes import (
     OutcomeValidationError,
     ProductOutcomeError,
+    TerminalOutcome,
+    TerminalRunRecord,
+    latest_review_authority,
+    latest_test_authority,
     validate_terminal_outcome,
 )
 
@@ -438,3 +442,96 @@ def test_rejected_completion_then_clean_exit_is_a_protocol_violation(
     protocol = [event for event in events if event.kind == "protocol_violation"]
     assert len(protocol) == 1
     assert protocol[0].run_id == claimed.current_run_id
+
+
+# ---------------------------------------------------------------------------
+# Latest immutable Test/Review authority and candidate eligibility
+# ---------------------------------------------------------------------------
+
+
+_SHA_A = "a" * 40
+_SHA_B = "b" * 40
+_SHA_C = "c" * 40
+
+
+def _authority_outcome(verdict: str) -> TerminalOutcome:
+    if verdict in {"passed", "approved"}:
+        return TerminalOutcome(verdict=verdict, target_step=None, findings=(), observations=())
+    target = "architecture" if verdict == "architecture_invalid" else "development"
+    return TerminalOutcome(
+        verdict=verdict,
+        target_step=target,
+        findings=("needs work",),
+        observations=(),
+    )
+
+
+def _review_record(
+    run_id: int,
+    *,
+    verdict: str = "approved",
+    base_sha: str = _SHA_A,
+    head_sha: str = _SHA_B,
+    branch: str | None = "story/example",
+    reviewer: str = "codex",
+    writer: str = "claude-code",
+) -> TerminalRunRecord:
+    return TerminalRunRecord(
+        run_id=run_id,
+        phase="review",
+        outcome=_authority_outcome(verdict),
+        writer_provider=writer,
+        reviewer_provider=reviewer,
+        review_branch=branch,
+        review_base_sha=base_sha,
+        review_head_sha=head_sha,
+    )
+
+
+def _test_record(
+    run_id: int,
+    *,
+    verdict: str = "passed",
+    head_sha: str = _SHA_B,
+    branch: str | None = "story/example",
+    tester: str = "hermes",
+    writer: str = "claude-code",
+) -> TerminalRunRecord:
+    return TerminalRunRecord(
+        run_id=run_id,
+        phase="test",
+        outcome=_authority_outcome(verdict),
+        writer_provider=writer,
+        tester_provider=tester,
+        test_branch=branch,
+        test_head_sha=head_sha,
+    )
+
+
+def test_later_review_rejection_invalidates_older_approval():
+    runs = [_review_record(1), _review_record(2, verdict="changes_requested")]
+    assert latest_review_authority(runs) is None
+
+
+def test_later_test_rejection_invalidates_older_pass():
+    runs = [_test_record(1), _test_record(2, verdict="changes_requested")]
+    assert latest_test_authority(runs, _SHA_B) is None
+
+
+def test_authority_requires_exact_full_sha():
+    runs = [_review_record(1, head_sha="a" * 12)]
+    assert latest_review_authority(runs) is None
+
+
+def test_review_authority_uses_dispatcher_pinned_branch_not_worker_alias():
+    runs = [_review_record(1, branch=None)]
+    assert latest_review_authority(runs) is None
+
+
+def test_review_authority_rejects_same_provider_writer_and_reviewer():
+    runs = [_review_record(1, reviewer="claude-code", writer="claude-code")]
+    assert latest_review_authority(runs) is None
+
+
+def test_test_authority_requires_exact_requested_source_sha():
+    assert latest_test_authority([_test_record(1, head_sha=_SHA_C)], _SHA_B) is None

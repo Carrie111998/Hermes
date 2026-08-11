@@ -6953,6 +6953,55 @@ def _seed_product_review_worktree(
     return tid, workspace, base_sha, head_sha
 
 
+def _seed_product_test_worktree(conn, board: str, repo: Path):
+    tid = kb.create_task(
+        conn,
+        title="Test committed change",
+        board=board,
+        assignee="tester",
+        workflow_template_id="product",
+        current_step_key="test",
+        workspace_kind="worktree",
+        workspace_path=str(repo),
+        max_retries=5,
+    )
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    workspace, branch = kb._resolve_worktree_workspace(task, board=board, conn=conn)
+    kb.set_workspace_path(conn, tid, str(workspace))
+    kb.set_branch_name(conn, tid, branch)
+    return tid, workspace, branch
+
+
+def test_dispatch_pins_test_target_before_tester_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable,
+):
+    board = "test-target-pinned"
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _v2_product_board_with_repo(board, repo)
+    observed = []
+
+    with kb.connect(board=board) as conn:
+        tid, workspace, branch = _seed_product_test_worktree(conn, board, repo)
+
+        def capture_spawn(task, launched_workspace, board=None):
+            run = kb.get_run(conn, task.current_run_id)
+            observed.append((launched_workspace, run.metadata))
+            return 5252
+
+        result = kb.dispatch_once(conn, board=board, spawn_fn=capture_spawn)
+
+    head_sha = _git_output(workspace, "rev-parse", "HEAD")
+    assert result.spawned[0][0] == tid
+    assert observed == [
+        (
+            str(workspace),
+            {"test_branch": branch, "test_head_sha": head_sha},
+        )
+    ]
+
+
 def test_dispatch_pins_review_target_before_reviewer_spawn(
     kanban_home, tmp_path, all_assignees_spawnable,
 ):
@@ -6978,7 +7027,11 @@ def test_dispatch_pins_review_target_before_reviewer_spawn(
     assert observed == [
         (
             str(workspace),
-            {"review_base_sha": base_sha, "review_head_sha": head_sha},
+            {
+                "review_branch": _git_output(workspace, "branch", "--show-current"),
+                "review_base_sha": base_sha,
+                "review_head_sha": head_sha,
+            },
         )
     ]
 
@@ -6992,7 +7045,7 @@ def test_pinned_review_target_survives_run_completion(
     _v2_product_board_with_repo(board, repo)
 
     with kb.connect(board=board) as conn:
-        tid, _workspace, base_sha, head_sha = _seed_product_review_worktree(
+        tid, workspace, base_sha, head_sha = _seed_product_review_worktree(
             conn, board, repo
         )
         result = kb.dispatch_once(
@@ -7016,6 +7069,7 @@ def test_pinned_review_target_survives_run_completion(
 
     assert run.metadata == {
         "findings": [],
+        "review_branch": _git_output(workspace, "branch", "--show-current"),
         "review_base_sha": base_sha,
         "review_head_sha": head_sha,
     }
@@ -7087,8 +7141,11 @@ def test_review_closure_keeps_dispatcher_pins_over_worker_claims(
                 metadata={
                     "workflow_outcome": {"verdict": "passed"},
                     "ai_provenance": {
+                        "writer": {"agent": writer_executor["provider"]},
                         "tester": {"agent": "hermes", "result": "passed"},
                     },
+                    "test_branch": branch,
+                    "test_head_sha": pinned_head_sha,
                 },
             )
         result = kb.dispatch_once(
@@ -7254,7 +7311,11 @@ def test_dispatch_review_pins_against_board_checkout_branch(
 
     assert result.spawned[0][0] == tid
     assert observed == [
-        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+        {
+            "review_branch": _git_output(workspace, "branch", "--show-current"),
+            "review_base_sha": base_sha,
+            "review_head_sha": head_sha,
+        }
     ]
     assert workspace.name == tid
 
@@ -9653,6 +9714,27 @@ def _add_approved_review_candidate(
     branch: str,
     source_sha: str,
 ) -> None:
+    task = kb.get_task(conn, task_id)
+    assert task is not None
+    assert task.workspace_path is not None
+    epic_id = kb.epic_id_for_task(conn, task_id)
+    assert epic_id is not None
+    base_sha = _git_output(
+        Path(task.workspace_path),
+        "merge-base",
+        branch,
+        kb.epic_branch_for(epic_id),
+    )
+    now = int(time.time())
+    test_metadata = {
+        "workflow_outcome": {"verdict": "passed"},
+        "ai_provenance": {
+            "writer": {"agent": "developer"},
+            "tester": {"agent": "hermes", "result": "passed"},
+        },
+        "test_branch": branch,
+        "test_head_sha": source_sha,
+    }
     metadata = {
         "workflow_outcome": {"verdict": "approved"},
         "ai_provenance": {
@@ -9664,8 +9746,18 @@ def _add_approved_review_candidate(
                 "reviewed_commit": source_sha,
             },
         },
+        "review_branch": branch,
+        "review_base_sha": base_sha,
+        "review_head_sha": source_sha,
     }
-    now = int(time.time())
+    conn.execute(
+        """
+        INSERT INTO task_runs
+            (task_id, step_key, status, started_at, ended_at, outcome, metadata)
+        VALUES (?, 'test', 'done', ?, ?, 'completed', ?)
+        """,
+        (task_id, now, now, json.dumps(test_metadata)),
+    )
     conn.execute(
         """
         INSERT INTO task_runs

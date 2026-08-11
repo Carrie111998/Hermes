@@ -92,9 +92,13 @@ from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Tuple
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from hermes_cli.kanban_intake import DEFAULT_POLICY_VERSION
 from hermes_cli.kanban_product_outcomes import (
+    ApprovedCandidate,
     OutcomeValidationError,
     ProductOutcomeError,
     TerminalOutcome,
+    TerminalRunRecord,
+    latest_review_authority,
+    latest_test_authority,
     validate_terminal_outcome,
 )
 from toolsets import get_toolset_names
@@ -8949,7 +8953,14 @@ def _end_run(
         active_metadata = {}
     dispatcher_metadata_conflicts: dict[str, dict[str, Any]] = {}
     if isinstance(active_metadata, dict):
-        for key in ("review_base_sha", "review_head_sha", "executor"):
+        for key in (
+            "test_branch",
+            "test_head_sha",
+            "review_branch",
+            "review_base_sha",
+            "review_head_sha",
+            "executor",
+        ):
             value = active_metadata.get(key)
             if value is not None:
                 if key in final_metadata and final_metadata[key] != value:
@@ -14102,25 +14113,53 @@ def _reviewer_evidence(metadata: dict) -> tuple[str, str, str]:
     )
 
 
+def _terminal_run_records(
+    conn: sqlite3.Connection, task_id: str
+) -> list[TerminalRunRecord]:
+    """Convert ended runs to the authority kernel's immutable input shape."""
+
+    records: list[TerminalRunRecord] = []
+    ended_runs = sorted(
+        list_runs(conn, task_id, include_active=False),
+        key=lambda run: (int(run.ended_at or 0), int(run.id)),
+    )
+    for run in ended_runs:
+        metadata = run.metadata if isinstance(run.metadata, dict) else {}
+        try:
+            outcome = validate_terminal_outcome(
+                task_id=task_id,
+                run_id=run.id,
+                phase=str(run.step_key or ""),
+                summary=run.summary,
+                result=None,
+                metadata=metadata,
+            )
+        except OutcomeValidationError:
+            outcome = None
+        records.append(
+            TerminalRunRecord(
+                run_id=run.id,
+                phase=str(run.step_key or ""),
+                outcome=outcome,
+                test_branch=str(metadata.get("test_branch") or "").strip() or None,
+                test_head_sha=str(metadata.get("test_head_sha") or "").strip() or None,
+                review_branch=str(metadata.get("review_branch") or "").strip() or None,
+                review_base_sha=str(metadata.get("review_base_sha") or "").strip() or None,
+                review_head_sha=str(metadata.get("review_head_sha") or "").strip() or None,
+                writer_provider=_writer_agent_from_metadata(metadata),
+                tester_provider=_tester_agent_from_metadata(metadata),
+                reviewer_provider=_reviewer_agent_from_metadata(metadata),
+            )
+        )
+    return records
+
+
 def _latest_approved_review_candidate(
     conn: sqlite3.Connection,
     task_id: str,
-) -> Optional[tuple[str, str]]:
+) -> Optional[ApprovedCandidate]:
     """Return the latest immutable branch/SHA approved by independent Review."""
-    for run in reversed(list_runs(conn, task_id, include_active=False)):
-        metadata = run.metadata if isinstance(run.metadata, dict) else {}
-        workflow = metadata.get("workflow_outcome")
-        verdict, branch, commit = _reviewer_evidence(metadata)
-        if (
-            run.step_key == "review"
-            and isinstance(workflow, dict)
-            and workflow.get("verdict") == "approved"
-            and verdict == "approved"
-            and _reviewer_agent_from_metadata(metadata)
-        ):
-            if branch and commit:
-                return branch, commit
-    return None
+    return latest_review_authority(_terminal_run_records(conn, task_id))
 
 
 def _release_run_evidence(
@@ -14129,50 +14168,36 @@ def _release_run_evidence(
     branch: str,
     source_sha: str,
 ) -> dict[str, int]:
-    test_run: Optional[Run] = None
-    review_run: Optional[Run] = None
-    writer_agent: Optional[str] = None
-    reviewer_agent: Optional[str] = None
-    reviewed_writer_agent: Optional[str] = None
-    reviewed_branch: Optional[str] = None
-    reviewed_commit: Optional[str] = None
-
-    for run in list_runs(conn, task_id, include_active=False):
-        metadata = run.metadata if isinstance(run.metadata, dict) else {}
-        run_writer = _writer_agent_from_metadata(metadata)
-        if run_writer:
-            writer_agent = run_writer
-        provenance = _provenance_payload(metadata)
-        workflow = metadata.get("workflow_outcome")
-        if run.step_key == "test":
-            tester = provenance.get("tester")
-            if (
-                isinstance(workflow, dict)
-                and workflow.get("verdict") == "passed"
-                and isinstance(tester, dict)
-                and tester.get("result") == "passed"
-                and _tester_agent_from_metadata(metadata)
-            ):
-                test_run = run
-        if run.step_key == "review":
-            verdict, run_branch, run_commit = _reviewer_evidence(metadata)
-            if (
-                isinstance(workflow, dict)
-                and workflow.get("verdict") == "approved"
-                and verdict == "approved"
-                and _reviewer_agent_from_metadata(metadata)
-            ):
-                review_run = run
-                reviewer_agent = _reviewer_agent_from_metadata(metadata)
-                reviewed_branch = run_branch
-                reviewed_commit = run_commit
-                reviewed_writer_agent = run_writer or writer_agent
+    runs = list_runs(conn, task_id, include_active=False)
+    records = _terminal_run_records(conn, task_id)
+    approved = latest_review_authority(records)
+    passed = latest_test_authority(records, source_sha)
+    test_run = next((run for run in runs if passed and run.id == passed.run_id), None)
+    review_run = next((run for run in runs if approved and run.id == approved.run_id), None)
+    reviewer_agent = approved.reviewer_provider if approved else None
+    reviewed_writer_agent = approved.writer_provider if approved else None
+    reviewed_branch = approved.branch if approved else None
+    reviewed_commit = approved.source_sha if approved else None
 
     missing: list[str] = []
     if test_run is None:
         missing.append("tester_pass")
     if review_run is None:
         missing.append("reviewer_approval")
+        latest_review = next(
+            (record for record in reversed(records) if record.phase == "review"),
+            None,
+        )
+        if (
+            latest_review is not None
+            and latest_review.outcome is not None
+            and latest_review.outcome.verdict == "approved"
+            and latest_review.writer_provider
+            and latest_review.reviewer_provider
+            and _agent_compare_key(latest_review.writer_provider)
+            == _agent_compare_key(latest_review.reviewer_provider)
+        ):
+            missing.append("independent_reviewer")
     if (
         review_run is not None
         and reviewed_writer_agent
@@ -14185,6 +14210,8 @@ def _release_run_evidence(
         reviewed_branch != branch or reviewed_commit != source_sha
     ):
         missing.append("reviewed_candidate")
+    if test_run is not None and passed is not None and passed.branch != branch:
+        missing.append("tester_pass")
     if not reviewed_writer_agent:
         missing.append("writer_evidence")
     if review_run is not None and not reviewer_agent:
@@ -15190,6 +15217,10 @@ class ReviewTargetPreparationError(RuntimeError):
     """Reviewer input could not be pinned safely before worker launch."""
 
 
+class TestTargetPreparationError(RuntimeError):
+    """Tester input could not be pinned safely before worker launch."""
+
+
 class WorkerRuntimeIdentityError(RuntimeError):
     """A governed worker runtime could not be identified canonically."""
 
@@ -15313,10 +15344,17 @@ def _prepare_review_target(
         raise ReviewTargetPreparationError("review base is not a full commit SHA")
     if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
         raise ReviewTargetPreparationError("review head is not a full commit SHA")
+    review_branch = (task.branch_name or _git_current_branch(actual_workspace) or "").strip()
+    if not review_branch:
+        raise ReviewTargetPreparationError("review workspace has no active branch")
 
     metadata = dict(run.metadata or {})
     metadata.update(
-        {"review_base_sha": base_sha, "review_head_sha": head_sha}
+        {
+            "review_branch": review_branch,
+            "review_base_sha": base_sha,
+            "review_head_sha": head_sha,
+        }
     )
     with write_txn(conn):
         cur = conn.execute(
@@ -15328,7 +15366,11 @@ def _prepare_review_target(
             raise ReviewTargetPreparationError(
                 "active review run changed before target pinning"
             )
-    return {"review_base_sha": base_sha, "review_head_sha": head_sha}
+    return {
+        "review_branch": review_branch,
+        "review_base_sha": base_sha,
+        "review_head_sha": head_sha,
+    }
 
 
 def _pin_review_target_or_block(
@@ -15348,6 +15390,103 @@ def _pin_review_target_or_block(
             conn,
             task.id,
             f"review target preparation: {exc}",
+            outcome="spawn_failed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=True,
+            end_run=True,
+        )
+        return False
+
+
+def _prepare_test_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[dict[str, str]]:
+    """Pin the exact clean branch/head that a product Test run verifies."""
+    task = get_task(conn, task_id)
+    if task is None:
+        raise TestTargetPreparationError(f"task {task_id} not found")
+    if task.workflow_template_id != "product" or task.current_step_key != "test":
+        return None
+    if not task.workspace_path:
+        raise TestTargetPreparationError("task has no workspace path")
+    try:
+        expected_workspace = Path(task.workspace_path).expanduser().resolve(strict=True)
+        actual_workspace = Path(workspace).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise TestTargetPreparationError(f"workspace is unavailable: {exc}") from exc
+    if actual_workspace != expected_workspace:
+        raise TestTargetPreparationError(
+            f"launch workspace {actual_workspace} does not match task workspace "
+            f"{expected_workspace}"
+        )
+    if not actual_workspace.is_dir():
+        raise TestTargetPreparationError(
+            f"task workspace is not a directory: {actual_workspace}"
+        )
+    if task.current_run_id is None:
+        raise TestTargetPreparationError("task has no active test run")
+    run = get_run(conn, task.current_run_id)
+    if (
+        run is None
+        or run.task_id != task_id
+        or run.ended_at is not None
+        or run.status != "running"
+        or run.profile != "tester"
+        or run.step_key != "test"
+    ):
+        raise TestTargetPreparationError("active run is not the current test run")
+
+    dirty = _review_git_output(
+        actual_workspace, "status", "--porcelain", "--untracked-files=all"
+    )
+    if dirty:
+        raise TestTargetPreparationError("test workspace is dirty or uncommitted")
+    head_sha = _review_git_output(
+        actual_workspace, "rev-parse", "--verify", "HEAD^{commit}"
+    )
+    test_branch = (task.branch_name or _git_current_branch(actual_workspace) or "").strip()
+    if not test_branch:
+        raise TestTargetPreparationError("test workspace has no active branch")
+    if not _FULL_GIT_SHA_RE.fullmatch(head_sha):
+        raise TestTargetPreparationError("test head is not a full commit SHA")
+
+    metadata = dict(run.metadata or {})
+    metadata.update({"test_branch": test_branch, "test_head_sha": head_sha})
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET metadata = ? "
+            "WHERE id = ? AND task_id = ? AND ended_at IS NULL",
+            (json.dumps(metadata, sort_keys=True), run.id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise TestTargetPreparationError(
+                "active test run changed before target pinning"
+            )
+    return {"test_branch": test_branch, "test_head_sha": head_sha}
+
+
+def _pin_test_target_or_block(
+    conn: sqlite3.Connection,
+    task: Task,
+    workspace: Path | str,
+    *,
+    board: Optional[str] = None,
+) -> bool:
+    if task.workflow_template_id != "product" or task.current_step_key != "test":
+        return True
+    try:
+        _prepare_test_target(conn, task.id, workspace, board=board)
+        return True
+    except Exception as exc:
+        _record_task_failure(
+            conn,
+            task.id,
+            f"test target preparation: {exc}",
             outcome="spawn_failed",
             failure_limit=1,
             force_trip=True,
@@ -15421,6 +15560,10 @@ def _spawn_one_v2(
             conn, claimed.id,
             resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}",
         )
+    if not _pin_test_target_or_block(
+        conn, claimed, workspace, board=board
+    ):
+        return None
     if not _pin_review_target_or_block(
         conn, claimed, workspace, board=board
     ):
@@ -17798,6 +17941,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_test_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         if not _pin_review_target_or_block(
             conn, claimed, workspace, board=board
         ):
@@ -17907,6 +18055,11 @@ def _dispatch_once_locked(
         set_workspace_path(conn, claimed.id, str(workspace))
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
+        if not _pin_test_target_or_block(
+            conn, claimed, workspace, board=board
+        ):
+            result.auto_blocked.append(claimed.id)
+            continue
         if not _pin_review_target_or_block(
             conn, claimed, workspace, board=board
         ):
