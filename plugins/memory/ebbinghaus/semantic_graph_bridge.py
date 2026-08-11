@@ -17,7 +17,7 @@ from plugins.semantic_graph.sanitize import normalize_text, sanitize_text
 from plugins.semantic_graph.store import SemanticGraphStore
 
 from .policies import EbbinghausPolicies, is_protected
-from .store import EbbinghausMemoryStore, _dream_idempotency_key
+from .store import EbbinghausMemoryStore, _dream_idempotency_key, _timestamp_value
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +274,7 @@ class EbbinghausSemanticGraphBridge:
                 tags,
                 memory_store.policies.capacity.protected_tags,
             ),
-            "source_updated_at": float(raw.get("updated_at") or 0.0),
+            "source_updated_at": _timestamp_value(raw.get("updated_at")),
             "synced_at": float(synced_at),
         }
 

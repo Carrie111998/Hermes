@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -447,6 +448,31 @@ def test_sync_dry_run_has_zero_mutation_and_apply_is_idempotent(tmp_path: Path) 
         assert second["synced"] == 2
         assert graph.get_status_counts()["memory_node_links"] == 2
         assert graph.get_status_counts()["memory_state_cache"] == 2
+    finally:
+        memory.close()
+
+
+def test_sync_accepts_existing_iso_updated_at_rows(tmp_path: Path) -> None:
+    memory, graph, bridge = _bridge(tmp_path)
+    try:
+        remembered = memory.remember("Existing timestamp compatibility")
+        updated_at = "2026-08-11T15:55:16.787970+00:00"
+        memory._conn.execute(  # noqa: SLF001 - seed an existing live row shape
+            "UPDATE memories SET updated_at = ? WHERE memory_id = ?",
+            (updated_at, remembered["memory_id"]),
+        )
+        memory._conn.commit()  # noqa: SLF001
+
+        result = bridge.sync(limit=1, dry_run=False)
+
+        assert result["success"] is True
+        assert result["synced"] == 1
+        assert result["failed"] == 0
+        cache = graph.get_memory_state_cache(remembered["memory_id"])
+        assert cache is not None
+        assert cache["source_updated_at"] == pytest.approx(
+            datetime.fromisoformat(updated_at).timestamp()
+        )
     finally:
         memory.close()
 
