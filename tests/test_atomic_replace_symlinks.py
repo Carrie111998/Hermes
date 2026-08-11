@@ -61,6 +61,24 @@ def test_atomic_replace_preserves_symlink(tmp_path: Path) -> None:
     assert link.read_text(encoding="utf-8") == "updated\n"
 
 
+def test_atomic_replace_permission_denied_falls_back_to_copy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "locked.json"
+    target.write_text("old", encoding="utf-8")
+    tmp = _write_tmp(tmp_path, "fresh")
+
+    def deny_replace(src: str, dst: str) -> None:
+        raise OSError(errno.EACCES, "Permission denied", src, dst)
+
+    monkeypatch.setattr(os, "replace", deny_replace)
+    atomic_replace(tmp, target)
+
+    assert target.read_text(encoding="utf-8") == "fresh"
+    assert not tmp.exists()
+
+
+
 def test_atomic_replace_regular_file(tmp_path: Path) -> None:
     target = tmp_path / "plain.yaml"
     target.write_text("old\n", encoding="utf-8")

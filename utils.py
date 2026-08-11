@@ -114,7 +114,7 @@ def atomic_replace(tmp_path: Union[str, Path], target: Union[str, Path]) -> str:
     try:
         os.replace(tmp_str, real_path)
     except OSError as exc:
-        if exc.errno not in (errno.EXDEV, errno.EBUSY):
+        if exc.errno not in (errno.EXDEV, errno.EBUSY, errno.EACCES, errno.EPERM):
             raise
         logger.debug(
             "atomic_replace: %s -> %s failed with %s; falling back to copy",
