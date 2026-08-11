@@ -9924,6 +9924,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Keep the parsed config with the secondary adapters. Authorization
         # occurs after adapter construction and must not fall back to the
         # multiplexer default profile's policy for a stamped source.
+        # Guarded like the sibling sites (:9586 hasattr, :14319 getattr default)
+        # because tests build GatewayRunner via object.__new__, which bypasses
+        # the __init__ that seeds this map.
+        if not hasattr(self, "_profile_gateway_configs"):
+            self._profile_gateway_configs = {}
         self._profile_gateway_configs[profile_name] = profile_cfg
         profile_map = self._profile_adapters.setdefault(profile_name, {})
         connected = 0
@@ -14379,6 +14384,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         config = self._gateway_config_for_source(source)
         if config is None:
+            # Distinguish the two ways the resolver yields None. Only the
+            # multiplex case — a stamped FOREIGN profile whose config has not
+            # loaded yet — is a policy gap that must fail closed. When the
+            # runner has no base config at all, _gateway_config_for_source
+            # simply hands that None straight back, and the historical
+            # contract is that policy_for_source treats it as a disabled
+            # (allow-all) policy. Denying there would gate slash commands on
+            # an unrelated condition.
+            if getattr(self, "config", None) is None:
+                return None
             logger.warning(
                 "Slash command /%s denied for stamped source with no profile config: %s",
                 canonical_cmd,
