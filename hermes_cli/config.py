@@ -3299,12 +3299,22 @@ DEFAULT_CONFIG = {
         # How many days of ended-session history to keep.  Matches the
         # default of ``hermes sessions prune``.
         "retention_days": 90,
-        # VACUUM after a prune that actually deleted rows.  SQLite does not
-        # reclaim disk space on DELETE — freed pages are just reused on
-        # subsequent INSERTs — so without VACUUM the file stays bloated
-        # even after pruning.  VACUUM blocks writes for a few seconds per
-        # 100MB, so it only runs at startup, and only when prune deleted
-        # ≥1 session.
+        # IGNORED BY EVERY ONLINE CALLER — kept only so existing configs that
+        # set it still parse.  Reclaim is on-demand/offline ONLY.
+        #
+        # SQLite does not reclaim disk space on DELETE (freed pages are just
+        # reused by later INSERTs), so pruning alone leaves the file bloated.
+        # But VACUUM needs an EXCLUSIVE lock on the whole database, which a
+        # live multi-process gateway cannot grant: both auto-maintenance
+        # callers therefore hardcode ``vacuum=False`` (see
+        # ``_run_state_db_auto_maintenance`` in cli.py and the state-db
+        # maintenance loop in gateway/run.py).  That hardcoding is deliberate
+        # — do NOT "fix" it by threading this key through to them.
+        #
+        # Reclaim instead via the on-demand ``optimize`` action in the
+        # sessions browser (FTS merge + VACUUM), run while the gateway is
+        # stopped.  Budget for it: on a 5.1 GB state.db, VACUUM measured
+        # ~19.8 min of exclusive lock to reclaim ~3.0% (2026-08-11).
         "vacuum_after_prune": True,
         # Minimum hours between auto-maintenance runs (avoids repeating
         # the sweep on every CLI invocation).  Tracked via state_meta in
