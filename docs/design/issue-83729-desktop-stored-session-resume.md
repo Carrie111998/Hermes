@@ -85,6 +85,10 @@ Before the RPC settles, a guarded early publication is only a candidate view.
 After the RPC settles, `messages_omitted` controls the source of the transcript:
 
 - With a usable prefetch, the already-published REST transcript is the base.
+- A usable prefetch remains the transcript authority when an older gateway
+  honors the client's `omit_messages` request but does not echo
+  `messages_omitted`. Any `inflight` or `queued` projection from that response
+  is grafted onto the REST baseline instead of replacing it.
 - Without a usable prefetch, the hook makes one authoritative REST fallback
   request using the stored key bound by the resume response (falling back to the
   requested key only when the response omits its identity). It never passes
@@ -191,6 +195,18 @@ reported #83729 case, but it does not shorten the dual-failure window. Starting
 automatic retries before the pending RPC ends would create concurrent resumes.
 A follow-up should add cancellable resume requests before adopting a shorter
 deadline.
+
+When `messages_omitted` is true, both REST attempts fail, and the RPC still
+provides `inflight` or `queued`, the existing degraded behavior renders only
+that live projection. Because the foreground is then non-empty, the missing-
+history latch does not arm. This tail-only view predates the fix and remains a
+known residual case rather than broadening this change into partial-history UI.
+
+If an early prefetch paints successfully but `session.resume` later rejects,
+the existing RPC-failure path performs another REST request instead of reusing
+the painted result. Reusing it would remove a redundant request, but requires
+hoisting successful-prefetch state across the catch boundary and is left as a
+separate optimization.
 
 ## Non-Goals
 

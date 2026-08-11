@@ -229,6 +229,7 @@ async function assertUnchangedResume(page: Page, testInfo: TestInfo, budget: Pai
     // A warm session first restores its retained view, then reconciles it with
     // the authoritative transcript. A third paint is the old eager-prefetch +
     // runtime-rebuild regression.
+    expect(paints.bursts, diagnostic).toBeGreaterThanOrEqual(1)
     expect(paints.bursts, diagnostic).toBeLessThanOrEqual(budget.bursts)
   }
 }
@@ -295,6 +296,10 @@ test.describe('large session resume', () => {
       if (resumeKind === 'cold') {
         await fixture.page.waitForTimeout(300)
         const paints = await paintState(fixture.page)
+        expect(
+          paints.bursts,
+          `unexpected cold live-resume paint count: ${JSON.stringify(paints.timeline)}`,
+        ).toBeGreaterThanOrEqual(1)
         expect(
           paints.bursts,
           `unexpected cold live-resume paint count: ${JSON.stringify(paints.timeline)}`,

@@ -699,9 +699,11 @@ describe('resumeSession failure recovery', () => {
     await waitFor(() => expect(resume).not.toBeNull())
 
     const resumeResult = resume!('stored-1', true)
+    let earlyPaintedMessages = $messages.get()
 
     try {
       await waitFor(() => expect(JSON.stringify($messages.get())).toContain('persisted question'))
+      earlyPaintedMessages = $messages.get()
       expect($activeSessionId.get()).toBeNull()
     } finally {
       resumeDeferred.resolve({
@@ -717,6 +719,7 @@ describe('resumeSession failure recovery', () => {
     }
 
     expect($activeSessionId.get()).toBe('runtime-1')
+    expect($messages.get()).toBe(earlyPaintedMessages)
   })
 
   it('does not let a stale REST completion overwrite a newer selected session', async () => {
