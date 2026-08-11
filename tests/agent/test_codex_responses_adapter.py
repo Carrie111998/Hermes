@@ -487,3 +487,142 @@ def _xai_reasoning_only_response(reasoning_text):
             )
         ],
     )
+
+# ---------------------------------------------------------------------------
+# Reasoning following-item placeholder (#75202) — a replayed reasoning item
+# must be followed by another item (else the API returns
+# missing_following_item).  Hermes used to always inject
+# {"role": "assistant", "content": ""} after a reasoning-only assistant turn.
+# OpenAI and xAI tolerate the empty string, but strict providers (Volcano
+# Engine Agent Plan) reject it with HTTP 400 MissingParameter:
+# input.content — and since history is replayed every turn, the bad item
+# bricks the session permanently.  The fix: skip the placeholder when a
+# legal function_call actually follows (it is itself a valid successor),
+# and otherwise emit an explicit message with non-empty output_text.
+# ---------------------------------------------------------------------------
+
+_REASONING_REPLAY_ITEM = {"type": "reasoning", "encrypted_content": "enc-blob-1"}
+
+
+def _assistant_texts(items):
+    """Collect the text payloads of every assistant message item, both the
+    shorthand {"role": "assistant", "content": str} and the explicit
+    {"type": "message", "content": [{"type": "output_text", ...}]} forms."""
+    texts = []
+    for item in items:
+        if item.get("type") == "function_call":
+            continue
+        if item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "output_text":
+                    texts.append(part.get("text", ""))
+    return texts
+
+
+def test_reasoning_with_legal_tool_call_emits_no_placeholder():
+    """reasoning + legal tool_call: the function_call itself is the
+    following item — no assistant placeholder at all."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [_REASONING_REPLAY_ITEM],
+            "tool_calls": [
+                {
+                    "call_id": "call_1",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items[0]["type"] == "reasoning"
+    assert any(i.get("type") == "function_call" for i in items)
+    # No assistant message of any form — the function_call follows the
+    # reasoning item directly.
+    assert _assistant_texts(items) == []
+
+
+def test_reasoning_with_malformed_tool_call_emits_nonempty_followup():
+    """reasoning + tool_call with blank function.name: no function_call is
+    serialized, so a following-item placeholder is still required — and it
+    must not be an empty content string."""
+    for bad_name in ("", "   "):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_reasoning_items": [_REASONING_REPLAY_ITEM],
+                "tool_calls": [
+                    {
+                        "call_id": "call_1",
+                        "function": {"name": bad_name, "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+
+        items = _chat_messages_to_responses_input(messages)
+
+        assert items[0]["type"] == "reasoning"
+        assert not any(i.get("type") == "function_call" for i in items)
+        texts = _assistant_texts(items)
+        assert len(texts) == 1
+        assert texts[0] != ""  # strict providers reject empty content
+
+
+def test_pure_reasoning_emits_nonempty_followup():
+    """reasoning with no visible text and no tool_calls: explicit non-empty
+    following item, never content: ""."""
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "codex_reasoning_items": [_REASONING_REPLAY_ITEM],
+        },
+    ]
+
+    items = _chat_messages_to_responses_input(messages)
+
+    assert items[0]["type"] == "reasoning"
+    texts = _assistant_texts(items)
+    assert len(texts) == 1
+    assert texts[0] != ""
+
+
+def test_no_empty_assistant_content_anywhere():
+    """Blanket guard: whatever the history mix, the serialized request must
+    never contain an assistant message whose content is an empty string —
+    that is the exact payload strict providers 400 on (#75202)."""
+    histories = [
+        # reasoning-only
+        [{"role": "assistant", "content": "", "codex_reasoning_items": [_REASONING_REPLAY_ITEM]}],
+        # reasoning + legal tool call
+        [{
+            "role": "assistant", "content": "",
+            "codex_reasoning_items": [_REASONING_REPLAY_ITEM],
+            "tool_calls": [{"call_id": "c1", "function": {"name": "t", "arguments": "{}"}}],
+        }],
+        # reasoning + malformed tool call
+        [{
+            "role": "assistant", "content": "",
+            "codex_reasoning_items": [_REASONING_REPLAY_ITEM],
+            "tool_calls": [{"call_id": "c1", "function": {"name": "", "arguments": "{}"}}],
+        }],
+        # reasoning + visible text (no placeholder needed at all)
+        [{
+            "role": "assistant", "content": "done",
+            "codex_reasoning_items": [_REASONING_REPLAY_ITEM],
+        }],
+    ]
+    for messages in histories:
+        items = _chat_messages_to_responses_input(messages)
+        for text in _assistant_texts(items):
+            assert text != "", f"empty assistant content leaked for {messages!r}"

@@ -407,6 +407,34 @@ def _normalize_responses_message_status(value: Any, *, default: str = "completed
     return default
 
 
+def _msg_emits_function_call(msg: Dict[str, Any]) -> bool:
+    """Return True when an assistant message's ``tool_calls`` will serialize
+    into at least one Responses ``function_call`` item.
+
+    The predicate mirrors the legality check in the tool_call loop of
+    ``_chat_messages_to_responses_input`` exactly: a tool_call is skipped
+    unless it is a dict whose ``function.name`` is a non-blank string.
+    Callers use this to decide whether a replayed reasoning item still needs
+    an explicit following-item placeholder — deciding on the raw presence of
+    ``msg["tool_calls"]`` instead is wrong when every tool_call is malformed
+    (e.g. empty ``function.name``), because then no ``function_call`` is
+    emitted and the reasoning item would be left without a successor.
+    """
+    tool_calls = msg.get("tool_calls")
+    if not isinstance(tool_calls, list):
+        return False
+    for tc in tool_calls:
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            continue
+        fn_name = fn.get("name")
+        if isinstance(fn_name, str) and fn_name.strip():
+            return True
+    return False
+
+
 def _chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
@@ -598,13 +626,27 @@ def _chat_messages_to_responses_input(
                     items.append({"role": "assistant", "content": content_parts})
                 elif content_text.strip():
                     items.append({"role": "assistant", "content": content_text})
-                elif has_codex_reasoning:
+                elif has_codex_reasoning and not _msg_emits_function_call(msg):
                     # The Responses API requires a following item after each
                     # reasoning item (otherwise: missing_following_item error).
-                    # When the assistant produced only reasoning with no visible
-                    # content, emit an empty assistant message as the required
-                    # following item.
-                    items.append({"role": "assistant", "content": ""})
+                    # A legal function_call serialized below already satisfies
+                    # that requirement, so only emit a placeholder when no
+                    # function_call will follow. The placeholder must carry
+                    # non-empty content: OpenAI and xAI tolerate an empty
+                    # assistant content string here, but strict providers
+                    # (e.g. Volcano Engine Agent Plan) reject it with
+                    # HTTP 400 MissingParameter: input.content (#75202) —
+                    # and because history is replayed every turn, that single
+                    # bad item bricks the whole session. Emit the canonical
+                    # explicit message shape with a single-space output_text:
+                    # the minimal non-empty payload every Responses surface
+                    # accepts.
+                    items.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": " "}],
+                    })
 
                 tool_calls = msg.get("tool_calls")
                 if isinstance(tool_calls, list):
