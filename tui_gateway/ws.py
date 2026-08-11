@@ -106,6 +106,14 @@ class WSTransport:
         # writes need an async boundary because several batches can be queued on
         # the owning loop while it recovers from a stall.
         self._send_lock = asyncio.Lock()
+        # Strong references to the in-flight batch sends started by the coalesce
+        # timer. A bare asyncio.create_task() keeps only a weak reference, so
+        # the loop may garbage-collect a still-pending task mid-flight — and
+        # _flush_tokens has already swapped the batch out of _pending_tokens by
+        # the time it creates that task, so a collected task takes the only
+        # surviving copy of those frames with it. Mutated only on the loop
+        # thread (the timer callback and the done callback below).
+        self._background_tasks: set[asyncio.Task] = set()
 
     @staticmethod
     def _is_streaming_frame(obj: dict) -> bool:
@@ -199,6 +207,11 @@ class WSTransport:
 
         The send is scheduled under the lock so its wire order is fixed relative
         to a concurrent non-streaming flush in :meth:`write`.
+
+        The batch leaves ``_pending_tokens`` before the task exists, so the task
+        holds the only reference to those frames: it is anchored in
+        ``_background_tasks`` until it completes, or the loop can collect it and
+        the tokens are lost with it.
         """
         with self._token_lock:
             self._token_flush_handle = None
@@ -208,7 +221,9 @@ class WSTransport:
                 return
             batch = self._pending_tokens
             self._pending_tokens = []
-            self._loop.create_task(self._safe_send_many(batch))
+            task = self._loop.create_task(self._safe_send_many(batch))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     async def write_async(self, obj: dict) -> bool:
         """Send from the owning event loop. Awaits until the frame is on the wire."""
