@@ -8,6 +8,20 @@ SENDS the request; it never decides or writes to the kernel itself.
 Field/new_value/reason are resolved SERVER-SIDE from the kernel's own ledger (never
 trusted from the agent's own recollection), so the message is accurate even if the
 agent's memory of what it just proposed is imprecise.
+
+Bypass classification (Phase 3, Packet 7A/8): INTENTIONAL STATIC DELIVERY EXCEPTION.
+This tool builds and sends its own Telegram message directly (`telegram.Bot(...)
+.send_message(...)`), bypassing `cron_reply.sanitize_cron_reply` and
+`TelegramAdapter.format_message`/`.send()`. That's deliberate, not an oversight:
+Packet 7A found the cron sanitizer is unsafe for free-form model/interactive text
+but that reasoning doesn't apply here — this message is not free-form model
+output, it's a deterministic approval card built from a fixed template. Routing
+it through the shared renderer was considered and rejected (see the Phase 3 plan,
+Packet 8) in favor of the narrower, lower-risk fix actually needed: every
+interpolated value is escaped for its MarkdownV2 code-span context (see
+`_code_span`) before being placed in the message, so it cannot break the
+message's entity structure — the tool remains an intentional exception,
+not an unexplained one.
 """
 
 import json
@@ -107,16 +121,43 @@ def send_kernel_approval_tool(args, **kw):
         return json.dumps({"error": f"Send failed: {e}"})
 
 
+def _code_span(value) -> str:
+    """Escape *value* for safe interpolation inside a MarkdownV2 code span
+    (single-backtick inline or triple-backtick pre block — both use the same
+    escape set). Only backslash and backtick need escaping inside a code
+    entity per Telegram's MarkdownV2 spec; other characters (*, _, [, etc.)
+    are inert there and must NOT be escaped or they'd render literally
+    (e.g. a project name containing "_" would show a literal backslash).
+
+    Uses python-telegram-bot's own `telegram.helpers.escape_markdown`
+    (already installed, already the library's own tested implementation)
+    rather than a hand-rolled escaper — Phase 3 Packet 8.
+    """
+    from telegram.helpers import escape_markdown
+
+    return escape_markdown(str(value), version=2, entity_type="code")
+
+
 async def _send_approval_request(token, chat_id, project, proposal_id, field, new_value, reason):
     from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
 
+    # Phase 3 Packet 8: every interpolated value is now escaped for its
+    # code-span context and the message uses MarkdownV2 (parse_mode below),
+    # which has an exact, documented escape-character set — unlike legacy
+    # "Markdown", which has no complete official escaping spec and was the
+    # actual cause of the reliability/injection risk this packet fixes.
+    # `reason` moves from unwrapped plain text (previously the single most
+    # exposed field — no code-span protection at all) into a pre block
+    # specifically (not inline single-backtick) because it may legitimately
+    # contain newlines (a multi-sentence kernel-proposal reason), which a
+    # single-backtick inline code span does not reliably support.
     text = (
         f"🔔 *Kernel proposal pending approval*\n\n"
-        f"*Project:* `{project}`\n"
-        f"*Field:* `{field}`\n"
-        f"*New value:* `{json.dumps(new_value)}`\n"
-        f"*Reason:* {reason}\n\n"
-        f"`{proposal_id}`"
+        f"*Project:* `{_code_span(project)}`\n"
+        f"*Field:* `{_code_span(field)}`\n"
+        f"*New value:* `{_code_span(json.dumps(new_value))}`\n"
+        f"*Reason:*\n```\n{_code_span(reason)}\n```\n\n"
+        f"`{_code_span(proposal_id)}`"
     )
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"kp:approve:{proposal_id}"),
@@ -125,7 +166,7 @@ async def _send_approval_request(token, chat_id, project, proposal_id, field, ne
 
     bot = Bot(token=token)
     msg = await bot.send_message(
-        chat_id=int(chat_id), text=text, parse_mode="Markdown", reply_markup=keyboard,
+        chat_id=int(chat_id), text=text, parse_mode="MarkdownV2", reply_markup=keyboard,
     )
     return {"success": True, "platform": "telegram", "chat_id": chat_id, "message_id": str(msg.message_id)}
 
