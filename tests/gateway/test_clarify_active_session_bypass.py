@@ -87,3 +87,50 @@ async def test_active_session_routes_typed_choice_clarify_reply_to_runner_not_bu
     assert adapter._pending_messages == {}
 
 
+class _RecordingSendAdapter(BasePlatformAdapter):
+    """Base-adapter subclass that records the send() kwargs (base fallback)."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.TELEGRAM)
+        self.last_send_kwargs = None
+
+    async def connect(self):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.last_send_kwargs = {
+            "chat_id": chat_id,
+            "content": content,
+            "reply_to": reply_to,
+            "metadata": metadata,
+        }
+        return SendResult(success=True, message_id="text")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "private"}
+
+
+@pytest.mark.asyncio
+async def test_base_send_clarify_forwards_reply_anchor_from_metadata():
+    """Open-ended base send_clarify passes reply_to when the gateway supplied an anchor."""
+    adapter = _RecordingSendAdapter()
+    result = await adapter.send_clarify(
+        "12345", "Pick one", None, "clarify-1", "sk",
+        metadata={"reply_to_message_id": "msg1", "notify": True},
+    )
+    assert result.success
+    assert adapter.last_send_kwargs["reply_to"] == "msg1"
+
+
+@pytest.mark.asyncio
+async def test_base_send_clarify_no_anchor_no_reply_to():
+    """Without reply_to_message_id metadata the base fallback sends reply_to=None."""
+    adapter = _RecordingSendAdapter()
+    await adapter.send_clarify("12345", "Pick one", None, "clarify-1", "sk", metadata=None)
+    assert adapter.last_send_kwargs["reply_to"] is None
+
+
+
