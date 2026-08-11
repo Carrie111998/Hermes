@@ -852,6 +852,15 @@ def _pattern_has_regex_newline(pattern: str) -> bool:
     return "\n" in pattern or bool(_REGEX_NEWLINE_ESCAPE_RE.search(pattern))
 
 
+def _normalize_multiline_pattern(pattern: str) -> str:
+    """Make regex newline matches accept both LF and Windows CRLF."""
+    normalized = _REGEX_NEWLINE_ESCAPE_RE.sub(
+        lambda match: match.group(0)[:-2] + r"\r?\n",
+        pattern,
+    )
+    return normalized.replace("\r\n", r"\r?\n").replace("\n", r"\r?\n")
+
+
 def _is_line_oriented_newline_error(error: Optional[str]) -> bool:
     """Return True for rg's hard error when multiline mode is required."""
     if not error:
@@ -1143,6 +1152,31 @@ class ShellFileOperations(FileOperations):
         arg = _bash_safe_path(arg)
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
+
+    @staticmethod
+    def _quote_shell_text(value: str) -> str:
+        """Quote arbitrary shell text without applying path normalization."""
+        return "'" + value.replace("'", "'\"'\"'") + "'"
+
+    def _escape_native_tool_path(self, path: str) -> str:
+        """Quote a path for a native executable launched through Git Bash.
+
+        LocalEnvironment disables MSYS argv conversion so Windows command-line
+        switches such as ``/FO`` are not rewritten. Consequently a native
+        executable such as ``rg.exe`` must receive ``C:/...`` itself; the
+        shell-safe ``/c/...`` spelling used by test/find/cat is not understood
+        by Win32 filesystem APIs. Remote/container backends retain their POSIX
+        paths unchanged.
+        """
+        if os.name == "nt":
+            try:
+                from tools.environments.local import LocalEnvironment, _msys_to_windows_path
+
+                if isinstance(self.env, LocalEnvironment):
+                    path = _msys_to_windows_path(path).replace("\\", "/")
+            except (ImportError, TypeError):
+                pass
+        return "'" + path.replace("'", "'\"'\"'") + "'"
 
     def _atomic_write(self, path: str, content: str) -> "ExecuteResult":
         """Write ``content`` to ``path`` atomically via temp-file + rename.
@@ -2695,10 +2729,10 @@ class ShellFileOperations(FileOperations):
         """
         if not self._has_command('rg'):
             return None
-        glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        glob_expr = f" --glob {self._quote_shell_text(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{self._quote_shell_text(pattern)} {self._escape_native_tool_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2720,7 +2754,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+            f"{self._quote_shell_text(pattern)} {self._escape_native_tool_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2740,7 +2774,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_shell_arg(path)} "
+                f"{self._quote_shell_text(pattern)} {self._escape_native_tool_path(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -2796,7 +2830,7 @@ class ShellFileOperations(FileOperations):
         if not has_hidden_path_ancestor:
             pagination_expr = f" | tail -n +{offset + 1} | head -n {limit}"
 
-        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+        cmd = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._quote_shell_text(search_pattern)} " \
               f"-printf '%T@ %p\\n' 2>/dev/null | sort -rn{pagination_expr}"
 
         result = self._exec(cmd, timeout=60)
@@ -2804,7 +2838,7 @@ class ShellFileOperations(FileOperations):
 
         if not stdout.strip() and not limit_reason:
             # Try without -printf (BSD find compatibility -- macOS)
-            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._escape_shell_arg(search_pattern)} " \
+            cmd_simple = f"find {self._escape_shell_arg(path)}{hidden_filter_expr} -type f -name {self._quote_shell_text(search_pattern)} " \
                         f"2>/dev/null | sort -rn{pagination_expr}"
             result = self._exec(cmd_simple, timeout=60)
             stdout, limit_reason = _search_stdout_and_limit(result)
@@ -2861,8 +2895,8 @@ class ShellFileOperations(FileOperations):
         fetch_limit = limit + offset
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
+            f"rg --files --sortr=modified -g {self._quote_shell_text(glob_pattern)} "
+            f"{self._escape_native_tool_path(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
         result = self._exec(cmd_sorted, timeout=60)
@@ -2872,8 +2906,8 @@ class ShellFileOperations(FileOperations):
         if not all_files and not limit_reason:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
-                f"{self._escape_shell_arg(path)} 2>/dev/null "
+                f"rg --files -g {self._quote_shell_text(glob_pattern)} "
+                f"{self._escape_native_tool_path(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
             result = self._exec(cmd_plain, timeout=60)
@@ -2938,8 +2972,9 @@ class ShellFileOperations(FileOperations):
         # the pattern clearly wants to cross lines, enable -U/--multiline
         # up front and note it in the result.
         multiline = _pattern_has_regex_newline(pattern)
-        if multiline:
+        if multiline or r"\n" in pattern:
             cmd_parts.append("--multiline")
+        search_pattern = _normalize_multiline_pattern(pattern) if multiline else pattern
 
         # Add context if requested
         if context > 0:
@@ -2947,7 +2982,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--glob", self._quote_shell_text(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -2956,8 +2991,8 @@ class ShellFileOperations(FileOperations):
             cmd_parts.append("-c")  # Count per file
         
         # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._escape_shell_arg(path))
+        cmd_parts.append(self._quote_shell_text(search_pattern))
+        cmd_parts.append(self._escape_native_tool_path(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
@@ -3083,7 +3118,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file pattern filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--include", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--include", self._quote_shell_text(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3092,7 +3127,7 @@ class ShellFileOperations(FileOperations):
             cmd_parts.append("-c")
         
         # Add pattern and path
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        cmd_parts.append(self._quote_shell_text(pattern))
         cmd_parts.append(self._escape_shell_arg(path))
         
         # Fetch generously so we can compute total before slicing
