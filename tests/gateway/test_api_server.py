@@ -1695,6 +1695,10 @@ class TestResponsesEndpoint:
 
         assert first.status == second.status == 200
         assert mock_run.call_count == 2
+        assert [call.kwargs["conversation_history"] for call in mock_run.call_args_list] == [
+            [{"role": "user", "content": "prior"}],
+            [{"role": "user", "content": "prior"}],
+        ]
 
     @pytest.mark.asyncio
     async def test_responses_idempotency_normalizes_equivalent_input_forms(self, auth_adapter):
@@ -1820,6 +1824,10 @@ class TestResponsesEndpoint:
                 patch.object(auth_adapter, "_run_agent", side_effect=chat_run) as chat_mock,
                 patch.object(other_adapter, "_run_agent", side_effect=responses_run) as other_mock,
                 patch("gateway.platforms.api_server._make_request_fingerprint", return_value="same-fp"),
+                patch(
+                    "gateway.platforms.api_server._make_normalized_request_fingerprint",
+                    return_value="same-fp",
+                ),
             ):
                 headers = {"Authorization": "Bearer sk-secret", "Idempotency-Key": "shared-key"}
                 chat_response = await chat_cli.post("/v1/chat/completions", headers=headers, json=chat_body)
