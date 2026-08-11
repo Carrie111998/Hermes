@@ -28,6 +28,7 @@ Design: docs/superpowers/specs/2026-08-10-editable-finder-drift-guard-design.md
 
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import os
@@ -442,3 +443,77 @@ def render(findings: Findings, install_root: InstallRoot, probe_result: dict) ->
         lines.extend(["", f"Why: {findings.diagnosis}"])
     lines.extend(["", *remedy_lines(install_root)])
     return lines
+
+
+def _collect(probe_fn, root: InstallRoot | None):
+    """Shared core for both surfaces: resolve, declare, probe, analyze."""
+    root = root if root is not None else resolve_install_root()
+
+    declared: set[str] | None = None
+    if root.path is not None:
+        pyproject = root.path / "pyproject.toml"
+        if pyproject.is_file():
+            declared = declared_names(pyproject)
+
+    probe_result = probe_fn(sorted(declared) if declared else [], SMOKE_ENTRYPOINTS)
+    return root, analyze(declared, probe_result, root), probe_result
+
+
+def run(probe_fn=probe, root: InstallRoot | None = None, stream=None) -> int:
+    """Standalone surface. Returns 0 when clean, 1 on drift.
+
+    Exit-code semantics match events_doctor, so a laptop-monitor probe or CI
+    step can call this directly.
+    """
+    root, findings, probe_result = _collect(probe_fn, root)
+    lines = render(findings, root, probe_result)
+    if stream is None:
+        for line in lines:
+            print(line)
+    else:
+        stream.extend(lines)
+    return 0 if findings.ok else 1
+
+
+def doctor_section_lines(probe_fn=probe, root: InstallRoot | None = None):
+    """`hermes doctor` surface.
+
+    Does NOT exit on drift — doctor renders the section and funnels a
+    remediation line into its existing summary block alongside every other
+    finding.
+    """
+    root, findings, probe_result = _collect(probe_fn, root)
+
+    rows: list[tuple[str, str, str]] = []
+    if findings.ok:
+        if findings.checked_breadth:
+            rows.append(("ok", "Installed packages match pyproject declarations", ""))
+        else:
+            rows.append(("warn", "Breadth not checked", findings.notes[0] if findings.notes else ""))
+    else:
+        if findings.missing:
+            rows.append((
+                "fail",
+                f"{len(findings.missing)} declared package(s) missing from the install",
+                ", ".join(findings.missing),
+            ))
+        for name, error in findings.broken_imports:
+            rows.append(("fail", f"import {name} failed", error))
+        if findings.diagnosis:
+            rows.append(("warn", findings.diagnosis, ""))
+
+    remediation = None
+    if not findings.ok:
+        remediation = "Editable install has drifted. " + " ".join(
+            line.strip() for line in remedy_lines(root) if line.strip()
+        )
+    return rows, remediation
+
+
+def _cli() -> None:
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    sys.exit(run())
+
+
+if __name__ == "__main__":
+    _cli()

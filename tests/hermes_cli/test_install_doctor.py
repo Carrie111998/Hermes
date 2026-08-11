@@ -440,3 +440,82 @@ def test_render_reports_a_broken_import_even_when_breadth_was_skipped():
     assert "events.gateway_integration" in text
     assert "pip install -e . --no-deps" in text
     assert "[OK]" not in text
+
+
+def test_run_returns_zero_when_clean(tmp_path):
+    from hermes_cli.install_doctor import InstallRoot, run
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\ninclude = [\"events\", \"events.*\"]\n",
+        encoding="utf-8",
+    )
+    root = InstallRoot(path=root_dir, provenance="test", mapping={"events": "x"})
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result(list(names), imports={e: {"ok": True, "error": None} for e in entrypoints})
+
+    assert run(probe_fn=fake_probe, root=root, stream=[]) == 0
+
+
+def test_run_returns_one_on_drift_and_prints_the_remedy(tmp_path):
+    from hermes_cli.install_doctor import InstallRoot, run
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\n"
+        'include = ["events", "jobflow_dispatch"]\n',
+        encoding="utf-8",
+    )
+    root = InstallRoot(path=root_dir, provenance="test", mapping={"events": "x"})
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result(["events"], ["jobflow_dispatch"])
+
+    out = []
+    assert run(probe_fn=fake_probe, root=root, stream=out) == 1
+    text = "\n".join(out)
+    assert "jobflow_dispatch" in text
+    assert "pip install -e . --no-deps" in text
+
+
+def test_doctor_section_lines_yields_a_remediation_on_drift(tmp_path):
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\n"
+        'include = ["events", "jobflow_dispatch"]\n',
+        encoding="utf-8",
+    )
+    root = InstallRoot(path=root_dir, provenance="test", mapping={"events": "x"})
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result(["events"], ["jobflow_dispatch"])
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert any(status == "fail" for status, _, _ in rows)
+    assert remediation and "pip install -e . --no-deps" in remediation
+
+
+def test_doctor_section_lines_is_ok_when_clean(tmp_path):
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    root_dir = tmp_path / "agent-src"
+    root_dir.mkdir()
+    (root_dir / "pyproject.toml").write_text(
+        "[tool.setuptools.packages.find]\ninclude = [\"events\"]\n", encoding="utf-8"
+    )
+    root = InstallRoot(path=root_dir, provenance="test", mapping={"events": "x"})
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result(list(names), imports={e: {"ok": True, "error": None} for e in entrypoints})
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert remediation is None
+    assert all(status != "fail" for status, _, _ in rows)
