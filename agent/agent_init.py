@@ -1208,6 +1208,10 @@ def init_agent(
                 client_kwargs["default_headers"] = {
                     "User-Agent": "claude-code/0.1.0",
                 }
+            elif base_url_host_matches(effective_base, "opencode.ai"):
+                from agent.auxiliary_client import build_opencode_headers
+
+                client_kwargs["default_headers"] = build_opencode_headers()
             elif base_url_host_matches(effective_base, "portal.qwen.ai"):
                 client_kwargs["default_headers"] = _ra()._qwen_portal_headers()
             elif base_url_host_matches(effective_base, "chatgpt.com"):

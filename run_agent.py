@@ -5920,6 +5920,7 @@ class AIAgent:
         from agent.auxiliary_client import (
             _AI_GATEWAY_HEADERS,
             build_nvidia_nim_headers,
+            build_opencode_headers,
             build_or_headers,
         )
 
@@ -5937,6 +5938,8 @@ class AIAgent:
             self._client_kwargs["default_headers"] = copilot_default_headers()
         elif base_url_host_matches(base_url, "api.kimi.com"):
             self._client_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        elif base_url_host_matches(base_url, "opencode.ai"):
+            self._client_kwargs["default_headers"] = build_opencode_headers()
         elif base_url_host_matches(base_url, "portal.qwen.ai"):
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         elif base_url_host_matches(base_url, "chatgpt.com"):

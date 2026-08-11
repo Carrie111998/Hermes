@@ -1136,6 +1136,20 @@ _AI_GATEWAY_HEADERS = {
     "User-Agent": f"HermesAgent/{_HERMES_VERSION}",
 }
 
+
+def build_opencode_headers() -> dict:
+    """Return the User-Agent OpenCode Zen/Go's WAF requires (#15575).
+
+    opencode.ai fronts both ``/zen/v1`` and ``/zen/go/v1`` with a WAF that
+    rejects the OpenAI SDK's default ``OpenAI/Python x.y.z`` User-Agent with a
+    401 even when the API key is valid.  Sending an explicit client UA clears
+    it.  Every opencode.ai client construction path must go through this
+    helper — the WAF applies equally to the initial client, to clients rebuilt
+    on a model switch, and to auxiliary/async clients.
+    """
+    return {"User-Agent": f"hermes-agent/{_HERMES_VERSION}"}
+
+
 # Nous Portal extra_body for product attribution.
 # Callers should pass this as extra_body in chat.completions.create()
 # when the auxiliary client is backed by Nous Portal.
@@ -2589,6 +2603,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             extra = {}
             if base_url_host_matches(base_url, "api.kimi.com"):
                 extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+            elif base_url_host_matches(base_url, "opencode.ai"):
+                extra["default_headers"] = build_opencode_headers()
             elif base_url_host_matches(base_url, "githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
@@ -2629,6 +2645,8 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         extra = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             extra["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        elif base_url_host_matches(base_url, "opencode.ai"):
+            extra["default_headers"] = build_opencode_headers()
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.models import copilot_default_headers
 
@@ -5909,6 +5927,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         )
     elif base_url_host_matches(sync_base_url, "api.kimi.com"):
         async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+    elif base_url_host_matches(sync_base_url, "opencode.ai"):
+        async_kwargs["default_headers"] = build_opencode_headers()
     elif base_url_host_matches(sync_base_url, "integrate.api.nvidia.com"):
         async_kwargs["default_headers"] = build_nvidia_nim_headers(sync_base_url)
     elif base_url_host_matches(sync_base_url, "x.ai"):
@@ -6563,6 +6583,8 @@ def resolve_provider_client(
         headers = {}
         if base_url_host_matches(base_url, "api.kimi.com"):
             headers["User-Agent"] = "claude-code/0.1.0"
+        elif base_url_host_matches(base_url, "opencode.ai"):
+            headers.update(build_opencode_headers())
         elif base_url_host_matches(base_url, "githubcopilot.com"):
             from hermes_cli.copilot_auth import copilot_request_headers
 
