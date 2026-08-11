@@ -488,13 +488,103 @@ class TestDelegateObservability(unittest.TestCase):
         self.assertEqual(tail[1]["preview"], "token=***")
         self.assertNotIn(secret, str(tail))
 
-    def test_output_tail_redaction_error_drops_entire_tail(self):
+    def test_output_tail_redacts_secret_split_across_truncation_boundary(self):
+        """A secret cut below its pattern's minimum length must not leak.
+
+        This is the case that motivates redact-before-truncate, and it only
+        bites for patterns carrying a minimum-length quantifier. The Codex
+        encrypted-token pattern is ``gAAAA[A-Za-z0-9_=-]{20,}``: truncating
+        first can cut the body below 20 chars, at which point the fragment
+        stops matching, passes the redactor untouched, and lands in the
+        preview in the clear.
+
+        The redactor elides the middle of a matched token rather than
+        deleting it (``gAAAAB...BBBB``), so the invariant under test is the
+        length of the surviving RAW body run, not the absence of the prefix.
+
+        Non-vacuity verified: swapping the implementation to
+        ``redact(content[:max_chars])`` makes this assertion fail with
+        ``'credential gAAAABBBBBBBBB'``.
+        """
+        secret = "gAAAA" + "B" * 40
+        content = f"credential {secret} trailing"
+        # Cut inside the token, below the pattern's 20-char body minimum.
+        max_chars = 25
         result = {
             "messages": [
                 {"role": "assistant", "tool_calls": [
                     {"id": "t1", "function": {"name": "terminal", "arguments": "{}"}},
                 ]},
-                {"role": "tool", "tool_call_id": "t1", "content": "sensitive output"},
+                {"role": "tool", "tool_call_id": "t1", "content": content},
+            ]
+        }
+
+        tail = _extract_output_tail(result, max_entries=8, max_chars=max_chars)
+
+        preview = tail[0]["preview"]
+        self.assertLessEqual(len(preview), max_chars)
+        # The token was recognised and collapsed before truncation ran.
+        self.assertIn("...", preview)
+
+        def _longest_run(text: str, ch: str) -> int:
+            best = cur = 0
+            for c in text:
+                cur = cur + 1 if c == ch else 0
+                best = max(best, cur)
+            return best
+
+        # Truncate-first leaves a 9-char raw body run here; redact-first
+        # leaves only the short retained edge of the elided token.
+        self.assertLess(_longest_run(preview, "B"), 8)
+
+    def test_output_tail_redaction_error_skips_only_that_entry_by_default(self):
+        """Default is best-effort: one unredactable result must not blank all.
+
+        ``_extract_output_tail`` is shared with the ordinary delegation
+        Output overlay (the non-timeout success path). Dropping the whole
+        tail on any redactor hiccup would turn a transient failure into a
+        total loss of a working display feature.
+        """
+        poison = "UNREDACTABLE"
+        result = {
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "t1", "function": {"name": "terminal", "arguments": "{}"}},
+                    {"id": "t2", "function": {"name": "terminal", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "t1", "content": "keep me"},
+                {"role": "tool", "tool_call_id": "t2", "content": poison},
+            ]
+        }
+
+        from agent.redact import redact_sensitive_text as real
+
+        def _flaky(text, **kwargs):
+            if poison in text:
+                raise RuntimeError("redactor unavailable")
+            return real(text, **kwargs)
+
+        with patch("agent.redact.redact_sensitive_text", side_effect=_flaky):
+            tail = _extract_output_tail(result, max_entries=8, max_chars=600)
+
+        self.assertEqual([e["preview"] for e in tail], ["keep me"])
+        self.assertNotIn(poison, str(tail))
+
+    def test_output_tail_redaction_error_drops_entire_tail_when_fail_closed(self):
+        """fail_closed=True (timeout evidence) still drops everything.
+
+        Evidence surfaced from a FAILED child is a security boundary rather
+        than a display nicety, so it must emit nothing rather than risk an
+        unredacted preview.
+        """
+        result = {
+            "messages": [
+                {"role": "assistant", "tool_calls": [
+                    {"id": "t1", "function": {"name": "terminal", "arguments": "{}"}},
+                    {"id": "t2", "function": {"name": "terminal", "arguments": "{}"}},
+                ]},
+                {"role": "tool", "tool_call_id": "t1", "content": "harmless"},
+                {"role": "tool", "tool_call_id": "t2", "content": "sensitive output"},
             ]
         }
 
@@ -502,7 +592,9 @@ class TestDelegateObservability(unittest.TestCase):
             "agent.redact.redact_sensitive_text",
             side_effect=RuntimeError("redactor unavailable"),
         ):
-            tail = _extract_output_tail(result, max_entries=8, max_chars=600)
+            tail = _extract_output_tail(
+                result, max_entries=8, max_chars=600, fail_closed=True
+            )
 
         self.assertEqual(tail, [])
 
