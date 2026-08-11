@@ -95,6 +95,16 @@ jobs:
     if: needs.detect.outputs.installer == 'true'
     uses: ./.github/workflows/installer-tests.yml
 
+  desktop-install-windows:
+    name: Desktop install (Windows)
+    needs: detect
+    # The only `npm ci` in CI that runs on Windows. Same `frontend` gate as
+    # js-tests, so Python-only PRs skip it. See the workflow header for what it
+    # does and does not cover — notably it cannot reproduce the missing-VC++
+    # runtime failure, because the runner image always has it.
+    if: needs.detect.outputs.frontend == 'true'
+    uses: ./.github/workflows/desktop-install-windows.yml
+
   e2e-desktop:
     name: Desktop E2E
     needs: detect

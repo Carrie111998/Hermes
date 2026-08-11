@@ -1,0 +1,112 @@
+name: Desktop install (Windows)
+
+# A real `npm ci` on a Windows runner, which nothing else in CI does.
+#
+# Everything JS/TS runs on ubuntu-latest, so the entire Windows dependency
+# path — Electron's postinstall unpacking a dist through `@electron/get` and
+# its native `@electron-internal/extract-zip` addon — has never been exercised
+# by CI. The Windows job that does exist (installer-tests.yml) only runs
+# PowerShell tests against `scripts/install.ps1` and never installs anything.
+#
+# ── What this catches ───────────────────────────────────────────────────────
+#
+#   * A dependency that resolves on Linux but not on Windows: a missing
+#     platform-specific optional package, a lockfile regenerated without the
+#     win32 entries, an engine constraint that only bites here.
+#   * Electron's postinstall failing or silently not producing a binary — the
+#     step below asserts the unpacked executable exists rather than trusting
+#     `npm ci`'s exit code, because a skipped postinstall exits 0.
+#   * The version-pin contract, checked on the platform it is about:
+#     `desktop-electron-pin.test.ts` asserts the dependency, the lockfile and
+#     `build.electronVersion` all agree, which is what keeps electron-builder
+#     from packaging a different Electron than `npm ci` installed.
+#
+# ── What this does NOT catch, deliberately stated ───────────────────────────
+#
+# It cannot reproduce the `ERR_DLOPEN_FAILED loading index.win32-x64-msvc.node`
+# failure that motivated `apps/desktop/scripts/assert-win-vcruntime.mjs`. That
+# addon links against `VCRUNTIME140.dll` from the Visual C++ 2015-2022
+# Redistributable, and the `windows-latest` image ships Visual Studio Build
+# Tools, so the runtime is always present here. This job would stay green on a
+# regression that breaks every clean developer machine. Reproducing that needs
+# a runner image without the redistributable; until then the README
+# prerequisite and the prebuilder guard are what cover it.
+#
+# Gated on the `frontend` lane, so a Python-only PR does not pay for a Windows
+# runner. Windows runners are slower than ubuntu and `npm ci` here is the long
+# pole, hence the wider timeout.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-install-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: npm ci + desktop platform tests
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 26
+          cache: npm
+
+      - name: grab npm 12
+        run: npm i -g npm@12
+
+      # Deliberately NOT --ignore-scripts: the postinstall is the thing under
+      # test. This is the only place in CI where Electron is fetched and
+      # unpacked on Windows.
+      #
+      # Retried inline rather than via .github/actions/retry: that composite is
+      # `shell: bash`, and no Windows job in this repo has ever used it, so
+      # this job would be its first — an unproven path inside a job that is
+      # itself new. The semantics (3 attempts, 10s apart) match the action's
+      # defaults, and an Electron dist download is exactly the flaky-network
+      # case retries exist for.
+      - name: npm ci (with postinstall)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          for ($i = 1; $i -le 3; $i++) {
+            npm ci
+            if ($LASTEXITCODE -eq 0) { exit 0 }
+            if ($i -lt 3) {
+              Write-Host "::warning::npm ci failed (attempt $i of 3); retrying in 10s"
+              Start-Sleep -Seconds 10
+            }
+          }
+          Write-Error 'npm ci failed after 3 attempts'
+          exit 1
+
+      # `npm ci` exits 0 when a postinstall is skipped, so its exit code alone
+      # does not prove Electron was unpacked. Assert the artifact.
+      - name: Electron binary was actually unpacked
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD 'node_modules/electron/dist/electron.exe'
+          if (-not (Test-Path $exe)) {
+            Write-Error "electron.exe missing at $exe — postinstall did not unpack a dist"
+            exit 1
+          }
+          $size = (Get-Item $exe).Length
+          Write-Host "electron.exe present ($([math]::Round($size / 1MB, 1)) MB)"
+
+      # Runs the addon-load guard for real on Windows. Green here only proves
+      # it does not false-positive on a prepared machine (see the header).
+      - name: Native-unpacker guard is satisfied
+        run: node scripts/assert-win-vcruntime.mjs
+        working-directory: apps/desktop
+
+      # The `electron` vitest project: desktop-electron-pin.test.ts plus the
+      # scripts/*.test.mjs build guards.
+      - name: Desktop platform tests
+        run: npm run --prefix apps/desktop check:test:desktop:platforms
