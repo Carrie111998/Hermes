@@ -724,7 +724,7 @@ def test_restart_still_spawns_when_stop_raises(monkeypatch, capsys):
     monkeypatch.setattr(
         gateway_windows,
         "_launch_detached_gateway",
-        lambda: calls.append("launch"),
+        lambda **_kw: calls.append("launch"),
     )
     monkeypatch.setattr(
         gateway_windows, "_wait_for_gateway_ready", lambda **_kw: [4242]
@@ -756,7 +756,7 @@ def test_restart_reports_the_stop_error_when_the_relaunch_fails(monkeypatch):
     monkeypatch.setattr(gateway_windows, "_wait_for_gateway_absent", lambda **_kw: True)
     monkeypatch.setattr(gateway_windows, "_gateway_pids", lambda: [])
     monkeypatch.setattr(gateway_windows.time, "sleep", lambda _s: None)
-    monkeypatch.setattr(gateway_windows, "_launch_detached_gateway", lambda: None)
+    monkeypatch.setattr(gateway_windows, "_launch_detached_gateway", lambda **_kw: None)
     # Nothing came up.
     monkeypatch.setattr(gateway_windows, "_wait_for_gateway_ready", lambda **_kw: [])
 
@@ -798,7 +798,7 @@ def test_restart_does_not_spawn_a_duplicate_when_stop_raises_and_pid_survives(
     monkeypatch.setattr(
         gateway_windows,
         "_launch_detached_gateway",
-        lambda: calls.append("launch"),
+        lambda **_kw: calls.append("launch"),
     )
 
     with pytest.raises(RuntimeError, match="refusing to start a duplicate"):
