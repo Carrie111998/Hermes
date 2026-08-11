@@ -399,6 +399,7 @@ def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "child task",
+        "body": "Implement the child task and report its verified result.",
         "assignee": "peer",
         "parents": [worker_env],
     })
@@ -414,6 +415,63 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("body", [None, "", "   ", "-", "--", "n/a", "tbd", "."])
+def test_create_rejects_blank_and_placeholder_bodies(worker_env, body):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "invalid child task",
+        "body": body,
+        "assignee": "peer",
+        "parents": [worker_env],
+    }))
+
+    assert out.get("ok") is not True
+    assert "no instruction" in out["error"]
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        assert all(
+            task.title != "invalid child task"
+            for task in kb.list_tasks(conn, limit=100)
+        )
+
+
+@pytest.mark.parametrize("body", [None, 0, False, [], {}])
+def test_create_rejects_explicit_null_and_non_string_triage_bodies(
+    worker_env, body
+):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "invalid triage body",
+        "body": body,
+        "assignee": "peer",
+        "parents": [worker_env],
+        "triage": True,
+    }))
+
+    assert out.get("ok") is not True
+    assert "no instruction" in out["error"]
+
+
+def test_create_allows_genuinely_omitted_triage_body(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "triage child task",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "triage": True,
+    }))
+
+    assert out["ok"] is True
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert task.body is None
 
 
 def test_link_happy_path(worker_env):
@@ -509,6 +567,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
+        "body": "Write the integration test described by the parent handoff.",
         "assignee": "qa",
         "parents": [worker_env],
     }))
@@ -577,6 +636,16 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
     assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
+
+
+def test_kanban_guidance_never_prescribes_bodyless_create():
+    """Injected worker guidance must match the create-time body contract."""
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "kanban_create(title=..., body=" in KANBAN_GUIDANCE
+    assert "Every `kanban_create` call must include a substantive `body`" in KANBAN_GUIDANCE
+    assert "use `triage=True` only" in KANBAN_GUIDANCE
+    assert "kanban_create(title=..., assignee=" not in KANBAN_GUIDANCE
 
 
 # ---------------------------------------------------------------------------
@@ -858,6 +927,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "no sub gated",
+        "body": "Create a valid task without an automatic subscription.",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -885,6 +955,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
+        "body": "Create this valid task even when notification setup fails.",
         "assignee": "peer",
     })
     d = json.loads(out)

@@ -91,6 +91,7 @@ def test_create_task_appears_on_board(client):
         "/api/plugins/kanban/tasks",
         json={
             "title": "Research LLM caching",
+            "body": "Research LLM caching and report the verified findings.",
             "assignee": "researcher",
             "priority": 3,
             "tenant": "acme",
@@ -114,6 +115,47 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [None, "", "   ", "-", "--", "placeholder", "n/a", "tbd", "."],
+)
+def test_create_task_rejects_missing_blank_and_placeholder_bodies(client, body):
+    payload = {"title": "invalid body must not persist", "body": body}
+
+    response = client.post("/api/plugins/kanban/tasks", json=payload)
+
+    assert response.status_code == 400
+    assert "refusing to create" in response.json()["detail"]
+    with kb.connect_closing() as conn:
+        assert all(
+            task.title != payload["title"]
+            for task in kb.list_tasks(conn, limit=100)
+        )
+
+
+def test_create_task_preserves_long_multiline_body_in_monitor_detail(client):
+    body = "\n".join(
+        f"Step {index:03d}: verify the exact task brief survives every layer."
+        for index in range(120)
+    )
+
+    created = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "long body API regression", "body": body},
+    )
+
+    assert created.status_code == 200, created.text
+    task_id = created.json()["task"]["id"]
+    assert created.json()["task"]["body"] == body
+    with kb.connect_closing() as conn:
+        stored = kb.get_task(conn, task_id)
+        assert stored is not None
+        assert stored.body == body
+    monitor = client.get(f"/api/plugins/kanban/tasks/{task_id}")
+    assert monitor.status_code == 200, monitor.text
+    assert monitor.json()["task"]["body"] == body
 
 
 def test_patch_board_sets_project_directory(client, tmp_path):
@@ -143,7 +185,11 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
 
     task = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "wait for indexed data", "assignee": "ops"},
+        json={
+            "title": "wait for indexed data",
+            "body": "Wait for the indexed data and verify it is available.",
+            "assignee": "ops",
+        },
     ).json()["task"]
 
     conn = kb.connect()
@@ -164,8 +210,14 @@ def test_scheduled_tasks_have_their_own_column_not_todo(client):
 
 
 def test_tenant_filter(client):
-    client.post("/api/plugins/kanban/tasks", json={"title": "A", "tenant": "t1"})
-    client.post("/api/plugins/kanban/tasks", json={"title": "B", "tenant": "t2"})
+    client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "A", "body": "Run tenant A test task.", "tenant": "t1"},
+    )
+    client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "B", "body": "Run tenant B test task.", "tenant": "t2"},
+    )
 
     r = client.get("/api/plugins/kanban/board?tenant=t1")
     counts = {c["name"]: len(c["tasks"]) for c in r.json()["columns"]}
@@ -197,11 +249,16 @@ def test_dashboard_markdown_html_is_sanitized_before_render():
 
 def test_task_detail_includes_links_and_events(client):
     parent = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "parent"},
+        "/api/plugins/kanban/tasks",
+        json={"title": "parent", "body": "Complete the parent test task."},
     ).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "child", "parents": [parent["id"]]},
+        json={
+            "title": "child",
+            "body": "Complete the child test task after its parent.",
+            "parents": [parent["id"]],
+        },
     ).json()["task"]
     assert child["status"] == "todo"  # parent not done yet
 
@@ -228,7 +285,12 @@ def test_task_detail_includes_links_and_events(client):
 def test_patch_review_lifecycle_preserves_handoff_and_reopens(client):
     secret = "ghp_" + "D" * 40
     task = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "review me", "assignee": "builder"},
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "review me",
+            "body": "Build the review lifecycle test artifact.",
+            "assignee": "builder",
+        },
     ).json()["task"]
 
     response = client.patch(
@@ -280,10 +342,17 @@ def test_reopening_parent_demotes_ready_child(client):
     should not keep showing a stale child as ready after an operator drags
     its parent back out of done for more work.
     """
-    parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
+    parent = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "p", "body": "Complete parent p."},
+    ).json()["task"]
     child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "c", "parents": [parent["id"]]},
+        json={
+            "title": "c",
+            "body": "Complete child c after parent p.",
+            "parents": [parent["id"]],
+        },
     ).json()["task"]
     assert child["status"] == "todo"
 
@@ -462,7 +531,10 @@ def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
 # ---------------------------------------------------------------------------
 
 def test_delete_task(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "to-delete"}).json()["task"]
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "to-delete", "body": "Delete this task in the API test."},
+    ).json()["task"]
     r = client.delete(f"/api/plugins/kanban/tasks/{t['id']}")
     assert r.status_code == 200
     assert r.json()["deleted"] is True
@@ -484,7 +556,10 @@ def test_delete_task(client):
 
 
 def test_add_comment(client):
-    t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
+    t = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "x", "body": "Exercise task comment handling."},
+    ).json()["task"]
     r = client.post(
         f"/api/plugins/kanban/tasks/{t['id']}/comments",
         json={"body": "how's progress?", "author": "teknium"},
@@ -506,7 +581,11 @@ def test_add_comment(client):
 def test_dispatch_dry_run(client):
     client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "work", "assignee": "researcher"},
+        json={
+            "title": "work",
+            "body": "Exercise dry-run dispatch handling.",
+            "assignee": "researcher",
+        },
     )
     r = client.post("/api/plugins/kanban/dispatch?dry_run=true&max=4")
     assert r.status_code == 200
@@ -597,9 +676,18 @@ def test_ws_events_rejects_when_token_required(tmp_path, monkeypatch):
 
 
 def test_bulk_status_ready(client):
-    a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
-    b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]
-    c2 = client.post("/api/plugins/kanban/tasks", json={"title": "c"}).json()["task"]
+    a = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "a", "body": "Exercise bulk status for task a."},
+    ).json()["task"]
+    b = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "b", "body": "Exercise bulk status for task b."},
+    ).json()["task"]
+    c2 = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "c", "body": "Exercise bulk status for task c."},
+    ).json()["task"]
     # Parent-less tasks land in "ready" already; push them to blocked first.
     for tid in (a["id"], b["id"], c2["id"]):
         client.patch(
@@ -625,7 +713,11 @@ def test_bulk_review_assignment_preserves_implementer_provenance(client):
     tasks = [
         client.post(
             "/api/plugins/kanban/tasks",
-            json={"title": title, "assignee": "builder"},
+            json={
+                "title": title,
+                "body": f"Build {title} for review.",
+                "assignee": "builder",
+            },
         ).json()["task"]
         for title in ("review a", "review b")
     ]
@@ -686,7 +778,14 @@ def test_config_reads_dashboard_kanban_section(tmp_path, monkeypatch, client):
 
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
-    r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "e",
+            "body": "Exercise event run-id serialization.",
+            "assignee": "worker",
+        },
+    )
     tid = r.json()["task"]["id"]
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

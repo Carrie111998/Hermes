@@ -113,15 +113,18 @@ hermes kanban runs $SCHEMA
 ```bash
 for lang in Spanish French German; do
     hermes kanban create "Translate homepage to $lang" \
-        --assignee translator --tenant content-ops
+        --assignee translator --tenant content-ops \
+        --body "将主页翻译成 $lang；保留链接、代码和产品名称。"
 done
 for i in 1 2 3 4 5; do
     hermes kanban create "Transcribe Q3 customer call #$i" \
-        --assignee transcriber --tenant content-ops
+        --assignee transcriber --tenant content-ops \
+        --body "逐字转录第 $i 次通话，并标出演讲者和行动项。"
 done
 for sku in 1001 1002 1003 1004; do
     hermes kanban create "Generate product description: SKU-$sku" \
-        --assignee copywriter --tenant content-ops
+        --assignee copywriter --tenant content-ops \
+        --body "根据目录数据为 SKU-$sku 撰写 100 字的事实性产品描述。"
 done
 ```
 
@@ -213,6 +216,7 @@ reviewer 卡的 `worker_context` 包含已完成实现的 handoff。这是独立
 ```bash
 hermes kanban create "Deploy to staging (missing creds)" \
     --assignee deploy-bot --tenant ops \
+    --body "将当前版本部署到 staging，并验证健康检查端点。" \
     --max-retries 3
 ```
 

@@ -113,15 +113,18 @@ Create the work:
 ```bash
 for lang in Spanish French German; do
     hermes kanban create "Translate homepage to $lang" \
-        --assignee translator --tenant content-ops
+        --assignee translator --tenant content-ops \
+        --body "Translate the homepage to $lang; preserve links, code, and product names."
 done
 for i in 1 2 3 4 5; do
     hermes kanban create "Transcribe Q3 customer call #$i" \
-        --assignee transcriber --tenant content-ops
+        --assignee transcriber --tenant content-ops \
+        --body "Transcribe call #$i verbatim and identify speakers and action items."
 done
 for sku in 1001 1002 1003 1004; do
     hermes kanban create "Generate product description: SKU-$sku" \
-        --assignee copywriter --tenant content-ops
+        --assignee copywriter --tenant content-ops \
+        --body "Write a factual 100-word product description for SKU-$sku from the catalog data."
 done
 ```
 
@@ -215,6 +218,7 @@ A deploy task that can't spawn its worker because `AWS_ACCESS_KEY_ID` isn't set 
 ```bash
 hermes kanban create "Deploy to staging (missing creds)" \
     --assignee deploy-bot --tenant ops \
+    --body "Deploy the current release to staging and verify the health endpoint." \
     --max-retries 3
 ```
 
