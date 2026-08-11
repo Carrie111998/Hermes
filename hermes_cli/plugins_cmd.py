@@ -892,7 +892,9 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
 
 def _record_discovered_plugin_integrity(key: str, source: str) -> None:
     """Bind the current user/project entrypoint at the explicit enable gate."""
-    if source not in {"user", "project"}:
+    # CLI discovery labels git-backed user plugins as ``git`` for display,
+    # while PluginManager still loads them from the user trust boundary.
+    if source not in {"user", "git", "project"}:
         return
     for entry in _discover_all_plugins():
         # entry = (name, version, description, source, dir_path, key)
@@ -2062,6 +2064,14 @@ def dashboard_set_agent_plugin_enabled(name: str, *, enabled: bool) -> dict[str,
     if enabled:
         if name in en and name not in dis:
             return {"ok": True, "name": name, "unchanged": True}
+        resolved = _resolve_plugin_key_and_source(name)
+        if resolved is None:
+            return {"ok": False, "error": f"Plugin '{name}' could not be resolved."}
+        key, source = resolved
+        try:
+            _record_discovered_plugin_integrity(key, source)
+        except (OSError, PluginOperationError, RuntimeError) as exc:
+            return {"ok": False, "error": f"Cannot trust plugin '{key}': {exc}"}
         en.add(name)
         dis.discard(name)
         _save_enabled_set(en)
@@ -2112,6 +2122,22 @@ def dashboard_update_user_plugin(name: str) -> dict[str, Any]:
     # Sibling of the CLI ``hermes plugins update`` path: drop bytecode
     # compiled from the pre-pull plugin revision.
     _clear_plugin_bytecode(target)
+
+    if (target / "__init__.py").exists():
+        from hermes_cli.plugin_integrity import (
+            PluginIntegrityError,
+            record_plugin_entrypoint,
+        )
+
+        manifest = _read_manifest(target)
+        key = manifest.get("name") or name
+        try:
+            record_plugin_entrypoint(key, target)
+        except PluginIntegrityError as exc:
+            return {
+                "ok": False,
+                "error": f"Updated plugin integrity could not be recorded: {exc}",
+            }
 
     from rich.console import Console
 
@@ -2183,6 +2209,16 @@ def dashboard_remove_user_plugin(name: str) -> dict[str, Any]:
             "error": f"Plugin '{name}' was not found under {plugins_dir}.",
         }
 
+    from hermes_cli.plugin_integrity import PluginIntegrityError, remove_plugin_evidence
+
+    manifest = _read_manifest(target)
+    try:
+        remove_plugin_evidence(manifest.get("name") or name, target)
+    except PluginIntegrityError as exc:
+        return {
+            "ok": False,
+            "error": f"Plugin integrity evidence could not be removed: {exc}",
+        }
     shutil.rmtree(target)
     return {"ok": True, "name": name}
 

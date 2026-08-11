@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -697,3 +698,78 @@ def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
         "Portable test plugin",
         "portable.test",
     )
+
+
+def _write_dashboard_native_plugin(home: Path, name: str = "guarded") -> Path:
+    plugin = home / "plugins" / name
+    plugin.mkdir(parents=True)
+    (plugin / "plugin.yaml").write_text(
+        f"name: {name}\nversion: 1.0.0\n",
+        encoding="utf-8",
+    )
+    (plugin / "__init__.py").write_text("VALUE = 'old'\n", encoding="utf-8")
+    (plugin / ".git").mkdir()
+    return plugin
+
+
+def test_dashboard_enable_records_git_user_plugin_integrity(tmp_path, monkeypatch):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import verified_entrypoint_bytes
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    (home / "config.yaml").write_text(
+        "_config_version: 35\nplugins:\n  enabled: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(pc, "_toggle_plugin_toolset", lambda *args, **kwargs: None)
+
+    result = pc.dashboard_set_agent_plugin_enabled("guarded", enabled=True)
+
+    assert result == {"ok": True, "name": "guarded", "unchanged": False}
+    assert verified_entrypoint_bytes("guarded", plugin) == (
+        plugin / "__init__.py"
+    ).read_bytes()
+
+
+def test_dashboard_update_refreshes_plugin_integrity(tmp_path, monkeypatch):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import (
+        record_plugin_entrypoint,
+        verified_entrypoint_bytes,
+    )
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record_plugin_entrypoint("guarded", plugin)
+
+    def _pull(target):
+        (target / "__init__.py").write_text("VALUE = 'new'\n", encoding="utf-8")
+        return True, "Updated"
+
+    monkeypatch.setattr(pc, "_git_pull_plugin_dir", _pull)
+
+    result = pc.dashboard_update_user_plugin("guarded")
+
+    assert result["ok"] is True
+    assert verified_entrypoint_bytes("guarded", plugin) == (
+        plugin / "__init__.py"
+    ).read_bytes()
+
+
+def test_dashboard_remove_clears_plugin_integrity(tmp_path, monkeypatch):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import evidence_path, record_plugin_entrypoint
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    record_plugin_entrypoint("guarded", plugin)
+
+    result = pc.dashboard_remove_user_plugin("guarded")
+
+    assert result == {"ok": True, "name": "guarded"}
+    assert not plugin.exists()
+    assert json.loads(evidence_path().read_text(encoding="utf-8"))["plugins"] == []
