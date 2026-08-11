@@ -1,6 +1,15 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
-import { type EnumeratedWindow, enumerationFailureNote, pickWindowBelow } from './window-below'
+import {
+  type EnumeratedWindow,
+  enumerateViaMacJxa,
+  enumerateWindowsWithFallback,
+  enumerationFailureNote,
+  type MacJxaCommand,
+  parseMacWindowEnumeration,
+  pickWindowBelow,
+  readWindowBelow
+} from './window-below'
 
 const win = (pid: number, x = 0, y = 0, width = 800, height = 600, app = `app-${pid}`): EnumeratedWindow => ({
   app,
@@ -12,6 +21,16 @@ const win = (pid: number, x = 0, y = 0, width = 800, height = 600, app = `app-${
 
 const SELF_PID = 42
 const SELF_BOUNDS = { x: 100, y: 100, width: 800, height: 600 }
+
+const MAC_WINDOW_JSON = JSON.stringify([
+  {
+    app: 'Google Chrome',
+    bounds: { x: 20, y: 30, width: 1440, height: 900 },
+    id: 123,
+    pid: 456,
+    title: 'Inbox'
+  }
+])
 
 describe('pickWindowBelow', () => {
   it('picks the first overlapping window behind ours in z-order', () => {
@@ -123,6 +142,151 @@ describe('enumerationFailureNote', () => {
 
       expect(note).not.toMatch(/xprop|Wayland/)
       expect(note.length).toBeGreaterThan(0)
+    }
+  })
+})
+
+describe('enumerateWindowsWithFallback', () => {
+  it('uses the built-in macOS fallback when get-windows cannot run', async () => {
+    const chrome = win(1, 120, 120, 800, 600, 'Google Chrome')
+    const primary = vi.fn(async () => null)
+    const macFallback = vi.fn(async () => [chrome])
+
+    const windows = await enumerateWindowsWithFallback(false, {
+      platform: 'darwin',
+      primary,
+      macFallback
+    })
+
+    expect(windows).toEqual([chrome])
+    expect(primary).toHaveBeenCalledWith(false)
+    expect(macFallback).toHaveBeenCalledWith(false)
+  })
+
+  it('does not run the fallback when the primary enumerator succeeds', async () => {
+    const safari = win(2, 120, 120, 800, 600, 'Safari')
+    const primary = vi.fn(async () => [safari])
+    const macFallback = vi.fn(async () => [win(3)])
+
+    const windows = await enumerateWindowsWithFallback(true, {
+      platform: 'darwin',
+      primary,
+      macFallback
+    })
+
+    expect(windows).toEqual([safari])
+    expect(macFallback).not.toHaveBeenCalled()
+  })
+
+  it('treats an empty primary enumeration as a successful result', async () => {
+    const primary = vi.fn(async () => [])
+    const macFallback = vi.fn(async () => [win(3)])
+
+    const windows = await enumerateWindowsWithFallback(false, {
+      platform: 'darwin',
+      primary,
+      macFallback
+    })
+
+    expect(windows).toEqual([])
+    expect(macFallback).not.toHaveBeenCalled()
+  })
+
+  it('propagates null when both macOS enumerators fail', async () => {
+    const primary = vi.fn(async () => null)
+    const macFallback = vi.fn(async () => null)
+
+    const windows = await enumerateWindowsWithFallback(false, {
+      platform: 'darwin',
+      primary,
+      macFallback
+    })
+
+    expect(windows).toBeNull()
+    expect(macFallback).toHaveBeenCalledWith(false)
+  })
+
+  it('does not run the macOS fallback on another platform', async () => {
+    const primary = vi.fn(async () => null)
+    const macFallback = vi.fn(async () => [win(3)])
+
+    const windows = await enumerateWindowsWithFallback(false, {
+      platform: 'win32',
+      primary,
+      macFallback
+    })
+
+    expect(windows).toBeNull()
+    expect(macFallback).not.toHaveBeenCalled()
+  })
+})
+
+describe('enumerateViaMacJxa', () => {
+  it('executes the built-in CoreGraphics script and parses its response', async () => {
+    let command: MacJxaCommand | null = null
+
+    const execute = vi.fn(async (nextCommand: MacJxaCommand) => {
+      command = nextCommand
+
+      return MAC_WINDOW_JSON
+    })
+
+    const windows = await enumerateViaMacJxa(false, execute)
+
+    expect(command).toEqual({
+      args: ['-l', 'JavaScript', '-e', expect.stringContaining('CGWindowListCopyWindowInfo')],
+      file: '/usr/bin/osascript',
+      options: { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024, timeout: 3000 }
+    })
+    expect(windows?.[0]).toMatchObject({ app: 'Google Chrome', title: '' })
+  })
+
+  it('fails closed when the built-in subprocess rejects', async () => {
+    const execute = vi.fn(async () => {
+      throw new Error('osascript unavailable')
+    })
+
+    await expect(enumerateViaMacJxa(false, execute)).resolves.toBeNull()
+  })
+})
+
+describe('parseMacWindowEnumeration', () => {
+  it('normalizes the CoreGraphics response', () => {
+    expect(parseMacWindowEnumeration(MAC_WINDOW_JSON, true)).toEqual([
+      {
+        app: 'Google Chrome',
+        bounds: { x: 20, y: 30, width: 1440, height: 900 },
+        id: 123,
+        pid: 456,
+        title: 'Inbox'
+      }
+    ])
+  })
+
+  it('drops titles unless Screen Recording was already granted', () => {
+    expect(parseMacWindowEnumeration(MAC_WINDOW_JSON, false)?.[0]?.title).toBe('')
+  })
+
+  it('fails closed on malformed helper output', () => {
+    expect(parseMacWindowEnumeration('not json', true)).toBeNull()
+    expect(parseMacWindowEnumeration('{}', true)).toBeNull()
+  })
+})
+
+describe('readWindowBelow', () => {
+  it('uses the fallback-aware enumerator when Hyprland is unavailable', async () => {
+    const target = win(7, 120, 120, 800, 600, 'Google Chrome')
+    const readHyprland = vi.fn(async () => null)
+    const enumerate = vi.fn(async () => [win(SELF_PID, 100, 100), target])
+
+    const result = await readWindowBelow(SELF_PID, SELF_BOUNDS, false, { enumerate, readHyprland })
+
+    expect(readHyprland).toHaveBeenCalledWith(SELF_PID)
+    expect(enumerate).toHaveBeenCalledWith(false)
+    expect('error' in result).toBe(false)
+
+    if (!('error' in result)) {
+      expect(result.window?.app).toBe('Google Chrome')
     }
   })
 })
