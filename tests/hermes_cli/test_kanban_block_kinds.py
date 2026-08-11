@@ -78,6 +78,131 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
         assert payload.get("kind") == "capability"
 
 
+def test_distinct_reasons_do_not_share_recurrence_lineage(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn,
+            tid,
+            reason="Which saved payment method?",
+            kind="needs_input",
+        )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+
+        kb.block_task(
+            conn,
+            tid,
+            reason="Which controlled QA email?",
+            kind="needs_input",
+        )
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 1
+        assert not [
+            event
+            for event in kb.list_events(conn, tid)
+            if event.kind == "block_loop_detected"
+        ]
+
+
+def test_material_specification_resets_block_recurrence_lineage(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "Which saved payment method?"
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        assert kb.get_task(conn, tid).status == "triage"
+
+        assert kb.specify_triage_task(
+            conn,
+            tid,
+            body="Owner selected the corporate card.",
+            author="owner",
+        )
+        specified = kb.get_task(conn, tid)
+        assert specified.block_kind is None
+        assert specified.block_recurrences == 0
+
+        claimed = kb.claim_task(conn, tid, claimer="worker")
+        assert claimed is not None
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 1
+
+
+def test_block_cause_fingerprint_is_normalized_and_privacy_safe(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "  Which   Controlled QA Email?  "
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        row = conn.execute(
+            "SELECT block_reason_fingerprint FROM tasks WHERE id = ?",
+            (tid,),
+        ).fetchone()
+        fingerprint = row["block_reason_fingerprint"]
+        assert fingerprint
+        assert reason.strip().casefold() not in fingerprint
+
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(
+            conn,
+            tid,
+            reason="which controlled qa email?",
+            kind="needs_input",
+        )
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_status_only_specification_preserves_same_cause_lineage(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "Still waiting for the payment method"
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        assert kb.get_task(conn, tid).status == "triage"
+
+        assert kb.specify_triage_task(conn, tid)
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason=reason, kind="needs_input")
+        task = kb.get_task(conn, tid)
+        assert task.status == "triage"
+        assert task.block_recurrences == 3
+
+
+def test_legacy_recurrence_row_recovers_cause_from_latest_event(
+    kanban_home: Path,
+) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        reason = "Waiting for the same credential"
+        kb.block_task(conn, tid, reason=reason, kind="capability")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_reason_fingerprint = NULL WHERE id = ?",
+                (tid,),
+            )
+        kb.unblock_task(conn, tid)
+        _make_running_again(conn, tid)
+        kb.block_task(conn, tid, reason=reason, kind="capability")
+        assert kb.get_task(conn, tid).status == "triage"
+
+
 # ---------------------------------------------------------------------------
 # Dependency routing
 # ---------------------------------------------------------------------------
