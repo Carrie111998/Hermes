@@ -131,6 +131,8 @@ These invariants apply to all five specifications.
 5. **Git and SQLite use a recoverable two-phase boundary.** A DB transaction
    records intent before Git changes. A retained candidate and pinned SHAs let
    replay finish the DB record after a crash.
+   An integration intent is a request, not evidence; the integrator derives
+   authority again from terminal run data when it claims the intent.
 6. **Story `done` means integrated.** An Epic member reaches `done` only after
    its exact `(epic_id, story_id, source_sha)` integration row is durable, or
    after a separate governance-authored no-change disposition.
@@ -363,8 +365,8 @@ epic_release_members
 
 Only one non-invalidated snapshot may exist per Epic. Any change to the member
 set, an integration key, Epic tip, target pre-SHA, repository contract digest,
-or release candidate invalidates the snapshot and requires aggregate
-verification again.
+release candidate, or a member leaving terminal status invalidates the
+snapshot and requires aggregate verification again.
 
 ### Epic workflow state
 
@@ -435,7 +437,8 @@ Board metadata gains a validated, operator-owned repository contract:
     },
     "boundary_evidence": {
       "test_globs": ["tests/**"],
-      "fixture_globs": ["tests/fixtures/**", "**/*fake*.py", "**/*stub*.py"]
+      "fixture_globs": ["tests/fixtures/**", "**/*fake*.py", "**/*stub*.py"],
+      "generated_paths": ["dashboard/index.html", "dashboard/data.json"]
     }
   }
 }
@@ -456,6 +459,11 @@ Rules:
 - There is no implicit fallback to `scripts/run_tests.sh` after migration.
 - The normalized contract is hashed. Every verification run and release
   snapshot stores that digest.
+- `boundary_evidence.generated_paths` is an explicit allowlist of tracked
+  files that verification may regenerate. At Test completion the engine may
+  restore only those declared paths to the pinned source SHA after recording
+  their mutation; any other tracked mutation fails closed. The allowlist is
+  validated to resolve inside the repository and to match tracked files.
 - Network fetch is not implicit. If a board needs a read-only fetch before
   base resolution, that must be a separately configured read capability. A
   locally stale remote-tracking ref is visible in the pinned base evidence.
@@ -489,10 +497,15 @@ It rejects:
 - fields outside the exact phase-specific schema;
 - verdicts invalid for the active phase;
 - empty findings on rework;
-- the exact marker `<parameter name="workflow_outcome">`, or the paired tool
-  serialization shape `</summary>...<parameter name=`, in `summary` or
-  `result`;
 - contradictory redundant verdicts.
+
+Serialized parameter markup is an observation, not an independent verdict.
+When canonical `workflow_outcome` is present, the exact marker
+`<parameter name="workflow_outcome">` or paired
+`</summary>...<parameter name=` shape emits `serialized_parameter_leak` and
+completion continues. When the canonical outcome is absent and the marker is
+present, completion fails for `missing` qualified by
+`serialized_parameter`; the engine never parses the leaked JSON as authority.
 
 Canonical `workflow_outcome` is the only authority. Redundant fields may
 remain for compatibility but cannot disagree:
@@ -506,10 +519,11 @@ remain for compatibility but cannot disagree:
   synthesize the canonical outcome.
 
 Rejected completion emits `completion_rejected_outcome` with task ID, run ID,
-phase, and a safe reason code. The active run and task remain in the current
-phase so the worker can retry the tool call. If the worker exits without a
-valid retry, the existing worker watcher closes the run through its normal
-protocol-failure path. The engine does not advance, route, or infer intent.
+phase, a safe reason code, and the optional `serialized_parameter` qualifier.
+The active run and task remain in the current phase so the worker can retry
+the tool call. If the worker exits without a valid retry, the existing worker
+watcher closes the run through its normal protocol-failure path. The engine
+does not advance, route, or infer intent.
 
 ### Latest Review authority
 
@@ -527,8 +541,8 @@ independently checks the same exact candidate on the release path.
 The dispatcher also stamps `review_branch` beside the existing
 `review_base_sha` and `review_head_sha`; worker-authored branch aliases are not
 release authority. `latest_test_authority` applies the same latest-terminal
-rule to Test for the current source lineage, so a later Test rejection cannot
-fall back to an older pass.
+rule to Test for the exact source SHA, so a later Test rejection cannot fall
+back to an older pass.
 
 Before Test starts, the dispatcher stamps `test_branch` and `test_head_sha` on
 the run. Test completion requires the branch to remain at that SHA and the
@@ -553,7 +567,7 @@ Before any new integration row can be written:
 - run `git diff --quiet review_base_sha review_head_sha`;
 - reject a quiet diff as `empty_contribution`;
 - require the latest terminal Test to have passed and the latest terminal
-  Review to have approved the same source lineage.
+  Review to have approved the exact same source SHA.
 
 An already-integrated replay is allowed only when the exact composite
 integration row already exists, or when a prepared intent proves a crash
@@ -578,8 +592,10 @@ event/run, change an assignee, or delete evidence.
 
 ### Acceptance tests
 
-- Run-407 shape: missing outcome plus serialized parameter marker leaves the
-  task in Review and emits a safe rejection tied to that run.
+- Production run-407 fixture: missing outcome plus serialized parameter marker
+  leaves the task in Review and emits a safe rejection tied to that run.
+- Production run-410 fixture: canonical `approved` plus the same marker emits
+  `serialized_parameter_leak` and completes normally.
 - Missing outcome without marker also fails closed.
 - Canonical/redundant verdict disagreement fails closed.
 - A valid rejection routes backward and the next worker sees the first-class
@@ -594,6 +610,14 @@ event/run, change an assignee, or delete evidence.
 - A new no-op integration row cannot be written.
 - `_release_run_evidence` still refuses missing, non-independent, stale, or
   non-approved evidence.
+
+The removal of `_commit_worker_diff` from Test/Review is a separate,
+independently bisectable implementation commit. Production measurement before
+planning found six Test handoffs with a SHA and zero Review handoffs; the Test
+cases include both source/generated-file changes and artifact-only additions.
+That change must therefore land with Test/Review pinning, declared generated
+paths, worker guidance, and migration notes—not as part of the outcome-envelope
+commit.
 
 ## Spec 2 — Repository correctness
 
@@ -651,7 +675,7 @@ Use real temporary Git repositories and executable fixture commands:
 - existing clean story branch refreshes to the current Epic tip;
 - dirty worktree is preserved and not refreshed;
 - conflict worktree is retained and a Development directive is produced;
-- refresh changes source lineage and invalidates old Test/Review evidence;
+- refresh changes the exact source SHA and invalidates old Test/Review evidence;
 - configured commands run at the declared workdirs without a wrapper;
 - missing command is configuration error, not test failure;
 - target/source movement loses CAS without mutating the target;
@@ -744,13 +768,20 @@ Development directive and moves the story there. Configuration/infrastructure
 failure leaves the intent retryable/attention-required and does not ask Ole to
 approve an ordinary member commit.
 
+At claim time the integrator independently re-runs latest-Test authority,
+latest-Review authority, exact-SHA equality, provider separation, and
+candidate eligibility from terminal run data. It does not treat cached fields
+on the intent as evidence. A disagreement supersedes/refuses the intent before
+any Git operation. This independent derivation is the Epic-member replacement
+for the release-path `_release_run_evidence` backstop.
+
 ### Epic readiness
 
 The Epic enters aggregate verification only when:
 
 - it has at least one member;
-- every current member has a successful integration fact matching its
-  terminal source lineage; older integration rows remain history and do not
+- every current member has a successful integration fact matching its exact
+  terminal source SHA; older integration rows remain history and do not
   participate in readiness;
 - no member has an active Review, rework directive, integration intent, or
   non-terminal status;
@@ -782,6 +813,11 @@ Dashboard and CLI show:
 - whether the local/remote target has moved;
 - CI workflows that will be observed after push.
 
+Immediately before the release surface presents an actionable merge/push
+handoff, it re-checks local and remote target heads against `target_pre_sha`.
+Movement invalidates the snapshot and refuses the action; it is not first
+discovered after Ole pushes.
+
 Ole performs the local fast-forward/merge to the pinned candidate and the
 remote push. No ordinary worker tool can invoke this action, and no Hermes
 code path receives a push primitive.
@@ -797,6 +833,13 @@ The read-only release observer then behaves as follows:
 - a different pushed SHA, changed target, changed Epic tip/member set, or
   changed repository contract invalidates the snapshot and requires a new
   aggregate verification.
+
+The first implementation does not automatically revert a pushed failure or
+open forward-repair member work. `ci_failed` retains the exact snapshot and
+supports only observation plus a passing rerun of the same SHA. Choosing
+forward repair versus revert after a persistent failure remains an explicit
+Ole decision and requires a separate recovery design; the engine takes no Git
+action meanwhile.
 
 For The Trading Company, required observation is both `CI` and `Deploy Test`.
 The latter already verifies the deployed runtime reports the exact pushed SHA.
@@ -824,9 +867,10 @@ Then, in one migration transaction per board:
 
 - add `integration_pending` and Epic lifecycle columns/configuration;
 - keep standalone `release_measure` cards unchanged;
-- route every nonterminal Epic-member card currently at `release_measure`
-  back to a fresh Review for its current branch SHA, with reviewer assignee and
-  a `story_release_gate_migrated` event;
+- for every nonterminal Epic-member card currently at `release_measure`, first
+  run the dispatcher-owned refresh preflight, then route it to Test for the
+  refreshed/current exact SHA, followed by fresh Review; record a
+  `story_release_gate_migrated` event;
 - never auto-integrate an in-flight card from historical approval;
 - preserve all prior runs, approvals, events, comments, and integration rows;
 - leave already-done members unchanged, but validate their integration facts
@@ -856,8 +900,8 @@ Migration is idempotent and records schema version plus per-task events.
   contract digest, and aggregate verification run.
 - Same-SHA CI rerun can recover `ci_failed`; different SHA invalidates.
 - No engine test double or real path can issue `git push`.
-- Migration returns release-gate members to fresh Review and leaves standalone
-  cards untouched.
+- Migration sends release-gate members through refresh → Test → Review and
+  leaves standalone cards untouched.
 
 ## Spec 5 — External-boundary assurance
 
@@ -967,7 +1011,7 @@ Every failure exposed by these specs uses a stable code and a safe message.
 
 | Domain | Codes |
 |---|---|
-| Outcome | `missing`, `shape`, `phase_mismatch`, `serialized_parameter`, `contradictory_verdict` |
+| Outcome | `missing` (optionally qualified by `serialized_parameter`), `shape`, `phase_mismatch`, `contradictory_verdict`; observation `serialized_parameter_leak` |
 | Candidate | `empty_contribution`, `stale_review`, `source_moved`, `target_moved`, `merge_conflict` |
 | Repository | `missing_contract`, `missing_ref`, `missing_profile`, `missing_executable`, `dirty_worktree`, `timeout`, `io_error` |
 | Intake | `shape`, `canonical_mismatch`, `digest_mismatch`, `signature_mismatch`, `key_unreadable`, `io_error` |
@@ -1002,7 +1046,8 @@ Before enabling automatic integration on a live board:
 - repository contract validates;
 - no affected worker run is active;
 - migration dry-run lists every state change;
-- every `release_measure` Epic member is routed to fresh Review;
+- every `release_measure` Epic member is routed through refresh → Test →
+  Review;
 - integrator concurrency starts at one per repository;
 - `merge_after_green` is disabled for the old reconcile path;
 - operator surfaces show the pinned final release state;
@@ -1020,6 +1065,8 @@ The implementation must preserve:
 - independent writer/tester/reviewer provider checks;
 - exact Review branch/SHA pinning;
 - `_release_run_evidence` as a separate backstop;
+- for Epic members, independently-derived Test/Review/candidate authority at
+  integration claim time; an intent is never evidence;
 - Development's existing commit-first handoff;
 - budgets, rework ceilings, and block-loop limits;
 - resolver preflight/refusal and prominent resolver instructions;
