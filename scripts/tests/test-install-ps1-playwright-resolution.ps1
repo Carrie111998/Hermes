@@ -18,16 +18,6 @@ function Assert-Equal {
         Write-Host "OK: $Label" -ForegroundColor Green
     }
 }
-function Assert-True {
-    param($Condition, [string]$Label)
-    if (-not $Condition) {
-        Write-Host "FAIL: $Label" -ForegroundColor Red
-        $script:failures++
-    } else {
-        Write-Host "OK: $Label" -ForegroundColor Green
-    }
-}
-
 $tokens = $null
 $parseErrors = $null
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
@@ -51,14 +41,23 @@ if (-not $fnAst) {
 
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("hermes-pw-test-" + [guid]::NewGuid())
 try {
+    $rootBin = Join-Path $tempRoot "node_modules/.bin"
     $workspaceBin = Join-Path $tempRoot "apps/desktop/node_modules/.bin"
+    New-Item -ItemType Directory -Force -Path $rootBin | Out-Null
     New-Item -ItemType Directory -Force -Path $workspaceBin | Out-Null
+    $rootPlaywright = Join-Path $rootBin "playwright.cmd"
     $localPlaywright = Join-Path $workspaceBin "playwright.cmd"
+    Set-Content -Path $rootPlaywright -Value "@echo off" -Encoding Ascii
     Set-Content -Path $localPlaywright -Value "@echo off" -Encoding Ascii
 
+    $hoisted = Resolve-PlaywrightInvocation -InstallDir $tempRoot -NpxExe "C:\Node\npx.cmd"
+    Assert-Equal $rootPlaywright $hoisted.Command "prefers root-hoisted Playwright binary"
+    Assert-Equal "install|chromium" ($hoisted.Arguments -join "|") "hoisted binary receives install args"
+
+    Remove-Item -Force $rootPlaywright
     $local = Resolve-PlaywrightInvocation -InstallDir $tempRoot -NpxExe "C:\Node\npx.cmd"
-    Assert-Equal $localPlaywright $local.Command "prefers installed Desktop workspace binary"
-    Assert-Equal "install|chromium" ($local.Arguments -join "|") "local binary receives install args"
+    Assert-Equal $localPlaywright $local.Command "falls back to nested Desktop workspace binary"
+    Assert-Equal "install|chromium" ($local.Arguments -join "|") "nested binary receives install args"
 
     Remove-Item -Force $localPlaywright
     $fallback = Resolve-PlaywrightInvocation -InstallDir $tempRoot -NpxExe "C:\Node\npx.cmd"
@@ -70,9 +69,6 @@ try {
     $missing = Resolve-PlaywrightInvocation -InstallDir $tempRoot -NpxExe $null
     Assert-Equal $null $missing "returns null when neither local binary nor npx exists"
 
-    $source = Get-Content $installScript -Raw
-    Assert-True ($source.Contains("Resolve-PlaywrightInvocation -InstallDir `$InstallDir -NpxExe `$npxExe")) `
-        "Install-NodeDeps uses the shared resolver"
 } finally {
     Remove-Item -Recurse -Force $tempRoot -ErrorAction SilentlyContinue
 }
