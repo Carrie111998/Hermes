@@ -2296,11 +2296,12 @@ def run_doctor(args):
                 if total == 0:
                     check_ok(f"{label} deps", "(no known vulnerabilities)")
                 elif critical > 0 or high > 0:
+                    is_workspace_target = bool(audit_extra and audit_extra[0] == "--workspace")
                     if fix_cmd:
                         vuln_detail = (
                             f"{critical} critical, {high} high, {moderate} moderate — run: {fix_cmd}"
                         )
-                    elif _npm_release_age_unsafe:
+                    elif not is_workspace_target and _npm_release_age_unsafe:
                         vuln_detail = (
                             f"{critical} critical, {high} high, {moderate} moderate — "
                             f"npm {_npm_version} can't fix this here (see note below)"
@@ -2314,23 +2315,29 @@ def run_doctor(args):
                         f"{label} deps",
                         f"({vuln_detail})"
                     )
-                    if _npm_release_age_unsafe:
+                    if is_workspace_target:
+                        # The web/ui-tui workspace advisories are in build-time
+                        # tooling (esbuild/vite, etc.), not runtime code that ships
+                        # to users. Manual npm remediation may error with a known
+                        # arborist crash (edgesOut / isDescendantOf) on this monorepo
+                        # tree — in that case it is an npm bug, not a Hermes one. This
+                        # is unrelated to the min-release-age band, so it takes
+                        # precedence over that (unfixable-either-way) explanation.
+                        check_info(
+                            "  ^ build-time tooling (not runtime); if manual npm remediation "
+                            "errors with an arborist crash it's a known npm bug — clears "
+                            "via a lockfile bump"
+                        )
+                    elif _npm_release_age_unsafe:
+                        # is_workspace_target is already handled above, so this only
+                        # fires for the browser-tools / whatsapp-bridge targets, where
+                        # min-release-age-exclude is the actual reason a fix can't be
+                        # hinted.
                         check_info(
                             f"  ^ npm {_npm_version} honors min-release-age but ignores "
                             "min-release-age-exclude (npm 11.10-11.16) — 'npm audit fix' "
                             "here ETARGETs on packages .npmrc exempts (e.g. "
                             "brace-expansion). Upgrade npm first: npm install -g npm@latest"
-                        )
-                    elif audit_extra and audit_extra[0] == "--workspace":
-                        # The web/ui-tui workspace advisories are in build-time
-                        # tooling (esbuild/vite, etc.), not runtime code that ships
-                        # to users. Manual npm remediation may error with a known
-                        # arborist crash (edgesOut / isDescendantOf) on this monorepo
-                        # tree — in that case it is an npm bug, not a Hermes one.
-                        check_info(
-                            "  ^ build-time tooling (not runtime); if manual npm remediation "
-                            "errors with an arborist crash it's a known npm bug — clears "
-                            "via a lockfile bump"
                         )
                     issues.append(
                         f"{label} has {total} npm "

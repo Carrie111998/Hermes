@@ -1419,7 +1419,7 @@ class TestDoctorNpmAuditMinReleaseAgeBand:
     brace-expansion) — see #83544. On that band, doctor must not hand out a
     command it knows will fail."""
 
-    def _run(self, monkeypatch, tmp_path, npm_version):
+    def _run(self, monkeypatch, tmp_path, npm_version, inject_workspace_vulns=False):
         home = tmp_path / ".hermes"
         home.mkdir(parents=True, exist_ok=True)
         (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
@@ -1448,9 +1448,12 @@ class TestDoctorNpmAuditMinReleaseAgeBand:
             if cmd[:2] == [npm_bin, "--version"]:
                 return _subprocess.CompletedProcess(cmd, 0, f"{npm_version}\n", "")
             if cmd[:3] == [npm_bin, "audit", "--json"]:
+                is_flagged_target = "--workspaces=false" in cmd or (
+                    inject_workspace_vulns and "--workspace" in cmd
+                )
                 vulns = (
                     {"critical": 1, "high": 0, "moderate": 0}
-                    if "--workspaces=false" in cmd
+                    if is_flagged_target
                     else {"critical": 0, "high": 0, "moderate": 0}
                 )
                 payload = {"metadata": {"vulnerabilities": vulns}}
@@ -1487,3 +1490,15 @@ class TestDoctorNpmAuditMinReleaseAgeBand:
         out = self._run(monkeypatch, tmp_path, "11.17.0")
         assert "npm audit fix --workspaces=false" in out
         assert "honors min-release-age" not in out
+
+    def test_bad_band_npm_workspace_advisory_keeps_arborist_message(self, monkeypatch, tmp_path):
+        """web/ui-tui workspace advisories can't be auto-fixed because of a
+        known arborist crash, unrelated to the min-release-age band. That
+        explanation must win even when npm also happens to be in the bad
+        band — see #83544 review."""
+        out = self._run(monkeypatch, tmp_path, "11.12.1", inject_workspace_vulns=True)
+        assert out.count("build-time tooling (not runtime)") == 2
+        # The min-release-age explanation still applies to the non-workspace
+        # (--workspaces=false) target, which has no unrelated arborist issue.
+        assert out.count("can't fix this here") == 1
+        assert "npm install -g npm@latest" in out
