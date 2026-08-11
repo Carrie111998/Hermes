@@ -155,7 +155,13 @@ def test_lazy_cache_registration_restores_annotation_before_tool_handler():
          pytest.raises(RuntimeError, match="stop after metadata"):
         mcp_tool._register_from_cache_sync(
             "pipedream",
-            {"auth": "evaos_lease", "app_slug": "google_sheets"},
+            {
+                "auth": "evaos_lease",
+                "customer_id": "customer-fixture",
+                "agent_runtime": "hermes",
+                "agent_id": "agent-fixture",
+                "app_slug": "google_sheets",
+            },
             entry,
         )
 
@@ -285,7 +291,13 @@ def test_lazy_profile_owned_server_scopes_approval_when_process_is_not_multiplex
     }
     registered = mcp_tool._register_from_cache_sync(
         "pipedream",
-        {"auth": "evaos_lease", "app_slug": "gmail"},
+        {
+            "auth": "evaos_lease",
+            "customer_id": "customer-fixture",
+            "agent_runtime": "hermes",
+            "agent_id": "agent-fixture",
+            "app_slug": "gmail",
+        },
         entry,
     )
     assert len(registered) == 1
