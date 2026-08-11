@@ -102,6 +102,34 @@ class TestResolveToolset:
         assert resolve_toolset("plugin_example") == ["plugin_a", "plugin_b"]
 
 
+class TestBrowserToolsetWebSearch:
+    """Regression harness for #73692.
+
+    ``web_search`` is a web tool, not a browser-automation tool. It must not be
+    bundled into the ``browser`` toolset, otherwise ``agent.disabled_toolsets:
+    [browser]`` silently strips ``web_search`` from the model's tool list even
+    though it remains available through the ``web`` toolset and
+    ``_HERMES_CORE_TOOLS``.
+    """
+
+    def test_browser_toolset_does_not_include_web_search(self):
+        browser_tools = set(resolve_toolset("browser"))
+        assert "web_search" not in browser_tools
+        # The browser toolset should only contain browser-automation tools.
+        assert all(t.startswith("browser_") for t in browser_tools), browser_tools
+
+    def test_disabling_browser_toolset_keeps_web_search(self):
+        # Model the disabled_toolsets subtraction in model_tools.py: disabling
+        # the browser toolset subtracts resolve_toolset("browser") from the
+        # enabled set. web_search must survive that subtraction.
+        enabled = set(resolve_toolset("web")) | set(resolve_toolset("browser"))
+        enabled.difference_update(resolve_toolset("browser"))
+        assert "web_search" in enabled
+
+    def test_web_search_remains_available_via_web_toolset(self):
+        assert "web_search" in resolve_toolset("web")
+
+
 
 
 class TestResolveMultipleToolsets:
