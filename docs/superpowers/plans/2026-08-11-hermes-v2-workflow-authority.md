@@ -12,10 +12,11 @@
 
 - Canonical `metadata.workflow_outcome` is the only lifecycle authority.
 - Serialized parameter markup is never parsed as authority.
-- Run 407 must reject as `missing` with qualifier `serialized_parameter`; run 410 must approve while recording `serialized_parameter_leak`.
+- Runs 304 and 407 must reject as `missing` with qualifier `serialized_parameter`; run 410 must approve while recording `serialized_parameter_leak`.
+- The kernel applies only to ordinary verdict-bearing Test/Review completion through `complete_task`; privileged Resolver finalization remains a separate non-verdict path with persisted outcomes `preflight_repaired`, `preflight_resolved`, and `preflight_escalated`.
 - The latest ended Test/Review run wins; never scan backward for a convenient pass or approval.
 - Authority uses full exact source SHA equality and dispatcher-pinned branch/SHA fields.
-- Validation occurs before provenance repair, run closure, handoff, routing, comments, or task mutation.
+- For ordinary verdict-bearing completion, validation occurs before provenance mutation, run closure, handoff, routing, comments, or task mutation.
 - `_release_run_evidence` remains an independent release-path check.
 - Development keeps `_commit_worker_diff` and its existing no-commit refusal.
 - Removing `_commit_worker_diff` from Test/Review is not part of this plan; it is Task 5 of the repository-correctness plan and must be its own commit.
@@ -23,15 +24,18 @@
 
 ---
 
-### Task 1: Capture the two production outcome envelopes
+### Task 1: Capture the five production completion envelopes
 
 **Files:**
+- Create: `tests/fixtures/kanban/product_outcomes/run_304.json`
+- Create: `tests/fixtures/kanban/product_outcomes/run_354.json`
+- Create: `tests/fixtures/kanban/product_outcomes/run_369.json`
 - Create: `tests/fixtures/kanban/product_outcomes/run_407.json`
 - Create: `tests/fixtures/kanban/product_outcomes/run_410.json`
 - Create: `tests/hermes_cli/test_kanban_product_outcomes.py`
 
 **Interfaces:**
-- Consumes: JSON fields `id`, `task_id`, `step_key`, `summary`, and `metadata` from production runs 407 and 410.
+- Consumes: JSON fields `id`, `task_id`, `epic_id`, `step_key`, `status`, `outcome`, `summary`, and `metadata` from production runs 304, 354, 369, 407, and 410.
 - Produces: `_production_envelope(run_id: int) -> dict[str, object]` test helper and immutable regression fixtures.
 
 - [ ] **Step 1: Extract and check in the exact production rows**
@@ -41,11 +45,14 @@ Read the live evidence database immutably and inspect the exact stored values:
 ```bash
 sqlite3 -json \
   'file:/Users/cloudadvisor/.hermes/kanban/boards/the-trading-company/kanban.db?immutable=1' \
-  "SELECT id, task_id, step_key, status, outcome, summary, metadata
-     FROM task_runs WHERE id IN (407, 410) ORDER BY id;"
+  "SELECT r.id, r.task_id, m.epic_id, r.step_key, r.status, r.outcome,
+          r.summary, r.metadata
+     FROM task_runs AS r
+     LEFT JOIN epic_memberships AS m ON m.task_id = r.task_id
+    WHERE r.id IN (304, 354, 369, 407, 410) ORDER BY r.id;"
 ```
 
-Use `apply_patch` to add that output as the two fixture files, converting only
+Use `apply_patch` to add that output as the five fixture files, converting only
 the `metadata` JSON string into a JSON object so the fixture loader does not
 double-decode it. Preserve the complete `summary` and complete metadata from
 each row byte-for-byte at the string/value level. Do not shorten review prose,
@@ -58,6 +65,23 @@ fields: those irregularities are the regression evidence.
 def test_production_run_407_has_marker_without_canonical_outcome():
     row = _production_envelope(407)
     assert '<parameter name="workflow_outcome">' in row["summary"]
+    assert "workflow_outcome" not in row["metadata"]
+
+
+def test_production_run_304_is_an_independent_missing_canonical_occurrence():
+    row = _production_envelope(304)
+    assert row["task_id"] != _production_envelope(407)["task_id"]
+    assert row["epic_id"] != _production_envelope(407)["epic_id"]
+    assert row["outcome"] == "advanced"
+    assert '<parameter name="workflow_outcome">' in row["summary"]
+    assert "workflow_outcome" not in row["metadata"]
+
+
+@pytest.mark.parametrize("run_id", [354, 369])
+def test_production_preflight_repairs_are_non_verdict_terminal_runs(run_id):
+    row = _production_envelope(run_id)
+    assert row["step_key"] == "test"
+    assert row["outcome"] == "preflight_repaired"
     assert "workflow_outcome" not in row["metadata"]
 
 
@@ -157,6 +181,12 @@ class ProductOutcomeError(ValueError):
         super().__init__(code)
 
 
+VERDICT_BEARING_RUN_OUTCOMES = frozenset({"advanced", "rework_requested"})
+NON_VERDICT_RESOLVER_RUN_OUTCOMES = frozenset({
+    "preflight_repaired", "preflight_resolved", "preflight_escalated",
+})
+
+
 def validate_terminal_outcome(
     *, task_id: str, run_id: int, phase: str, summary: str | None,
     result: str | None, metadata: Mapping[str, object] | None,
@@ -175,9 +205,22 @@ def validate_terminal_outcome(
     )
 ```
 
-- [ ] **Step 4: Put the kernel at the start of `complete_task`'s v2 Test/Review path**
+- [ ] **Step 4: Put the kernel only in `complete_task`'s verdict-bearing v2 Test/Review path**
 
-Load the current task/run read-only, call the kernel, and only then enter existing routing/provenance code. On rejection, append one safe event in its own transaction and raise a typed `ProductOutcomeError`; do not close the run:
+Load the current task/run read-only. When the entrypoint is ordinary
+`complete_task` and the active phase is Test or Review, call the kernel before
+existing routing/provenance code. Do not call the kernel from `_end_run`,
+`handoff`, a generic run finalizer, or `resolve_product_preflight`.
+
+`resolve_product_preflight` is the privileged `kanban_resolve` route: its
+worker is pinned to the exact `resolver_readonly` toolset and cannot call
+`kanban_complete`. It must continue to close non-verdict terminal runs as
+`preflight_repaired`, `preflight_resolved`, or `preflight_escalated` without canonical
+`workflow_outcome`. The two persisted-outcome constants above are for audit
+and migration classification; they are not a bypass inside the validator.
+
+On ordinary-completion rejection, append one safe event in its own transaction
+and raise a typed `ProductOutcomeError`; do not close the run:
 
 ```python
 except OutcomeValidationError as exc:
@@ -195,7 +238,21 @@ For accepted marker-bearing input, append `serialized_parameter_leak` with only 
 
 - [ ] **Step 5: Add mutation-order and tool-safety tests**
 
-Assert a rejected call leaves `tasks.status`, `current_step_key`, `current_run_id`, active run status, rework count, and provenance metadata unchanged. Assert the tool response includes `missing` and `serialized_parameter` but excludes summary, payload, findings, digest, and full metadata. Then simulate a clean worker exit without a successful retry and assert the existing watcher closes the run as `crashed`, appends a run-scoped `protocol_violation`, and leaves the product card in Review/blocked so the missing terminal protocol is attributable.
+Assert runs 304 and 407 both reject without mutation, proving the behavior is
+not card-specific. Assert the tool response includes `missing` and
+`serialized_parameter` but excludes summary, payload, findings, digest, and
+full metadata. Assert run 410 advances and records the leak observation.
+
+Replay the resolver-repair shapes from runs 354 and 369 through
+`resolve_product_preflight`; assert they close as `preflight_repaired`, retain
+no canonical outcome, and route exactly as before without invoking the
+kernel. Add the same behavior assertions for `preflight_resolved` and
+`preflight_escalated` using the existing resolver-resume and escalation
+fixtures. Then simulate an ordinary worker clean exit
+after a rejected `kanban_complete` without successful retry and assert the
+existing watcher closes the run as `crashed`, appends a run-scoped
+`protocol_violation`, and leaves the product card in Review/blocked so the
+missing terminal protocol is attributable.
 
 - [ ] **Step 6: Run focused behavior tests**
 

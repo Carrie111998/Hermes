@@ -20,6 +20,7 @@
 - No engine, worker, API, dashboard, adapter, migration, or test can issue `git push`.
 - Ole alone applies the final pinned local merge/fast-forward and remote push.
 - `ci_failed` supports observation and a later passing workflow rerun for the same SHA only; no automated revert or forward-repair work is created.
+- A persistent `ci_failed` snapshot remains visible while Hermes takes no Git or work-item action; a human handles the repository externally until Ole separately chooses and authorizes revert or forward repair.
 - Member set/state, Epic tip, target head, candidate SHA, integration keys, verification run, or contract digest drift invalidates the release snapshot.
 - Migration runs first against a scratch database and scratch repository; a live Epic is never the migration test.
 - Use `scripts/run_tests.sh`; never invoke `pytest` directly.
@@ -419,6 +420,11 @@ Compare local `refs/heads/<target>` and remote `refs/heads/<target>` to `target_
 
 Persist workflow name, provider run identity/URL, conclusion, observed SHA, and observation time. A later observation may close `ci_failed` only when every required workflow passes for `snapshot.pushed_sha == release_candidate_sha`. Do not create revert or forward-repair cards.
 
+For a persistent failure, return an explicit `manual_recovery_required` safe
+state alongside the retained snapshot. This is the accepted first-release
+boundary, not an omitted automatic transition: Hermes observes but does not
+change Git, reopen a member, or create work.
+
 - [ ] **Step 6: Add capability-surface tests**
 
 Instantiate real adapters with fake transports and assert recorded HTTP methods are all GET. Inject a Git runner and assert allowed subcommands are `rev-parse`, `show-ref`, `merge-base`, `cat-file`, `worktree`, `status`, `diff`, `ls-remote`, and local candidate operations; any `push` invocation raises before subprocess execution.
@@ -497,7 +503,14 @@ git commit -m "feat: show epic integration and final release state"
 
 - [ ] **Step 1: Write failing scratch migration tests**
 
-Build a fixture with standalone and Epic-member `release_measure` cards, active worker, done member with/without fact, existing Epic, histories/comments, and old phase mappings. Assert active affected runs block the whole migration and list exact IDs.
+Build a fixture with standalone and Epic-member `release_measure` cards,
+active worker, done member with/without fact, a done member whose exact
+pre-existing fact rests on pre-envelope Review history, a nonterminal member
+whose latest Test/Review run has no canonical outcome, existing Epic,
+histories/comments, and old phase mappings. Assert active affected runs block
+the whole migration and list exact IDs. Assert the nonterminal authority gap
+is reported for fresh evidence, the valid existing fact is a grandfather
+candidate, and a done member without a valid fact is a blocker.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -507,7 +520,17 @@ Expected: FAIL because the migration module does not exist.
 
 - [ ] **Step 3: Implement a read-only dry-run manifest**
 
-The manifest lists contract validation, blockers, each affected task's before/after state, refresh preflight result, history counts, Epic template changes, and expected schema version. Hash canonical manifest JSON. Dry-run opens DB read-only and performs no ref/task mutation.
+The manifest lists contract validation, blockers, each affected task's
+before/after state, refresh preflight result, history counts, Epic template
+changes, expected schema version, the rolling-50 verdict-bearing outcome
+compatibility measurement from the master plan, and `authority_gaps`.
+
+Each authority gap contains exact `task_id`, current phase/status, latest Test
+run ID/outcome/canonical-presence, latest Review run
+ID/outcome/canonical-presence, integration composite key if present, and one
+disposition: `fresh_test_review`, `legacy_fact_grandfather_candidate`, or
+`blocking_invalid_fact`. Hash canonical manifest JSON. Dry-run opens DB
+read-only and performs no ref/task mutation.
 
 - [ ] **Step 4: Implement guarded apply**
 
@@ -521,13 +544,30 @@ records `story_release_gate_migrated`; Review follows only after fresh Test.
 Existing Epics become `product_epic/collecting_members`; none receives a
 release snapshot.
 
+For an already-done current member, migration may grandfather only an exact
+pre-existing `epic_story_integrations` fact; it never grandfathers an approval
+run or synthesizes canonical outcome from redundant metadata. The fact is
+valid only when its `(epic_id, story_id)` matches current membership,
+`source_sha` equals the latest Development handoff SHA, `candidate_sha` is a
+full existing commit, and that candidate is an ancestor of the current Epic
+tip. Record `legacy_integration_fact_grandfathered` with the composite key and
+migration version. Missing/mismatched facts remain blockers and migration does
+not reopen or manufacture history for them. Every nonterminal member with an
+authority gap goes through fresh Test and Review.
+
 - [ ] **Step 5: Preserve history and make re-run idempotent**
 
-Before/after assertions require identical run/event/comment/integration rows except new migration events and schema objects. Re-running returns zero state changes with the same schema version.
+Before/after assertions require identical run/comment/integration rows and
+identical pre-existing events; only the documented migration and grandfather
+events plus schema objects may be added. Re-running returns zero state changes
+with the same schema version. Add a negative test proving redundant-only
+`approved` metadata cannot create a new fact or authority, and a positive test
+proving a structurally/Git-valid pre-existing fact is retained without
+re-deriving pre-envelope Review evidence.
 
 - [ ] **Step 6: Add CLI safety rails and documentation**
 
-Provide `hermes kanban v2-migrate --board <slug> --dry-run --json` and `--apply --manifest-sha <sha>`. Require explicit scratch DB/repository paths in automated tests. Document copying production-shaped DB/repo to a temporary directory, dry-run review, drain requirement, backup, and apply verification; do not instruct operators to test on a live Epic.
+Provide `hermes kanban v2-migrate --board <slug> --dry-run --json` and `--apply --manifest-sha <sha>`. Require explicit scratch DB/repository paths in automated tests. Document copying production-shaped DB/repo to a temporary directory, dry-run review, drain requirement, backup, authority-gap review, the 5% rolling compatibility stop, grandfathered-fact audit, and apply verification; do not instruct operators to test on a live Epic.
 
 - [ ] **Step 7: Run migration tests**
 

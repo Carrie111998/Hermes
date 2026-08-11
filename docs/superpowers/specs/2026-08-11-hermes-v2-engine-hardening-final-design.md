@@ -472,8 +472,18 @@ Rules:
 
 ### Outcome envelope
 
-For active Test and Review runs, `workflow_outcome` is required at the kernel
-interface even if a caller bypasses the model-facing JSON schema.
+For ordinary verdict-bearing Test and Review completion through
+`complete_task`, `workflow_outcome` is required at the kernel interface even
+if a caller bypasses the model-facing JSON schema.
+
+Privileged Resolver finalization is a separate, non-verdict boundary.
+`resolve_product_preflight` remains outside the kernel and may close a Test or
+Review run as `preflight_repaired`, `preflight_resolved`, or
+`preflight_escalated` without
+`workflow_outcome`. Resolver is pinned to `resolver_readonly`, exposes
+`kanban_resolve`, and cannot call `kanban_complete`; the implementation must
+not move outcome validation into `_end_run`, `handoff`, or another generic run
+finalizer that would collapse these entrypoints.
 
 Accepted canonical shapes remain:
 
@@ -488,8 +498,9 @@ Review architecture: {"verdict":"architecture_invalid",
                       "findings":[non-empty strings...]}
 ```
 
-The validator runs before workflow repair, provenance mutation, run closure,
-handoff, or task-state mutation.
+For ordinary `complete_task`, the validator runs before provenance mutation,
+run closure, handoff, rework routing, or task-state mutation. Resolver repair
+continues through its existing independently-authorized CAS path.
 
 It rejects:
 
@@ -592,10 +603,17 @@ event/run, change an assignee, or delete evidence.
 
 ### Acceptance tests
 
+- Production run-304 fixture: a second card in an earlier Epic reproduces the
+  missing-canonical plus serialized-marker defect and fails closed without a
+  task-specific exception.
 - Production run-407 fixture: missing outcome plus serialized parameter marker
   leaves the task in Review and emits a safe rejection tied to that run.
 - Production run-410 fixture: canonical `approved` plus the same marker emits
   `serialized_parameter_leak` and completes normally.
+- Production runs 354 and 369 remain valid non-verdict
+  `preflight_repaired` Resolver finalizations; the kernel is not invoked.
+- The existing `preflight_resolved` and `preflight_escalated` Resolver routes
+  are likewise unchanged.
 - Missing outcome without marker also fails closed.
 - Canonical/redundant verdict disagreement fails closed.
 - A valid rejection routes backward and the next worker sees the first-class
@@ -839,7 +857,9 @@ open forward-repair member work. `ci_failed` retains the exact snapshot and
 supports only observation plus a passing rerun of the same SHA. Choosing
 forward repair versus revert after a persistent failure remains an explicit
 Ole decision and requires a separate recovery design; the engine takes no Git
-action meanwhile.
+or work-item action meanwhile. The operator surface reports
+`manual_recovery_required`; a human handles the repository outside Hermes
+until that separate decision and authorization exist.
 
 For The Trading Company, required observation is both `CI` and `Deploy Test`.
 The latter already verifies the deployed runtime reports the exact pushed SHA.
@@ -883,6 +903,17 @@ Then, in one migration transaction per board:
 
 Migration is idempotent and records schema version plus per-task events.
 
+The dry-run lists every current member whose latest Test or Review run lacks a
+canonical outcome. A nonterminal member receives disposition
+`fresh_test_review`. A done member is never authorized by a redundant-only
+historical approval: migration may grandfather only its exact pre-existing
+`epic_story_integrations` fact when membership matches, the fact's
+`source_sha` equals the latest Development handoff SHA, its full
+`candidate_sha` exists, and that candidate is contained in the current Epic
+tip. Migration records `legacy_integration_fact_grandfathered`; it does not
+synthesize a canonical outcome or new fact. Missing or mismatched facts are
+explicit blockers and are not repaired automatically.
+
 ### Acceptance tests
 
 - Epic-member approval creates an intent and never enters `release_measure`.
@@ -902,6 +933,9 @@ Migration is idempotent and records schema version plus per-task events.
 - No engine test double or real path can issue `git push`.
 - Migration sends release-gate members through refresh → Test → Review and
   leaves standalone cards untouched.
+- Migration lists latest-run canonical-outcome gaps, retains only validated
+  pre-existing facts under the grandfather rule, and refuses redundant-only
+  approval as authority for any new fact.
 
 ## Spec 5 — External-boundary assurance
 
@@ -1030,7 +1064,9 @@ assert implementation.
 Rollout gates:
 
 1. **Spec 1:** run-407 regression, latest-Review invariant, no-op integration
-   guard, and existing release-evidence suite green.
+   guard, Resolver repair preservation, and existing release-evidence suite
+   green. Run 304 proves the defect is not task-specific; runs 354/369 prove
+   non-verdict Resolver finalization remains outside the kernel.
 2. **Spec 2:** real temporary-repository tests green; board repository contract
    validated for The Trading Company before enabling it.
 3. **Spec 3:** verifier fault-injection, retry ownership/budget, and concurrent
@@ -1046,6 +1082,12 @@ Before enabling automatic integration on a live board:
 - repository contract validates;
 - no affected worker run is active;
 - migration dry-run lists every state change;
+- the 50 most recent completed verdict-bearing Test/Review runs
+  (`outcome IN ('advanced', 'rework_requested')`) are measured for missing
+  canonical outcomes; an absence rate above 5% stops enablement for
+  investigation;
+- every latest-run authority gap and every grandfathered/invalid historical
+  integration fact is listed in the migration report;
 - every `release_measure` Epic member is routed through refresh → Test →
   Review;
 - integrator concurrency starts at one per repository;
@@ -1070,6 +1112,8 @@ The implementation must preserve:
 - Development's existing commit-first handoff;
 - budgets, rework ceilings, and block-loop limits;
 - resolver preflight/refusal and prominent resolver instructions;
+- Resolver's separate non-verdict `preflight_repaired`,
+  `preflight_resolved`, and `preflight_escalated` finalization path;
 - immutable Work Contracts and qualification CAS;
 - auditable break-glass history;
 - candidate verification before any target branch update;

@@ -21,6 +21,7 @@
 - Configuration and infrastructure failures never consume product rework budget.
 - Epic-member commits and integrations require no human approval; only the final pinned Epic merge/push is Ole's action.
 - The first CI-failure behavior is observation plus a passing rerun for the same SHA; automated revert and forward repair are excluded.
+- If CI remains failed, Hermes retains the snapshot and takes no Git or work-item action; recovery is a human-operated external procedure until Ole chooses and separately authorizes a revert or forward-repair design.
 - Spec 5 external-boundary assurance is excluded until the workflow contracts produced by Specs 1, 2, and 4 exist in production code.
 
 ---
@@ -38,9 +39,9 @@
 
 ### Gate A — Critical correctness slice
 
-- [ ] Land only Tasks 1–4 of the workflow-authority plan: production fixtures 407/410, canonical outcome envelope, latest terminal Test/Review authority, and candidate eligibility.
+- [ ] Land only Tasks 1–4 of the workflow-authority plan: production fixtures 304/354/369/407/410, canonical outcome envelope, Resolver-path preservation, latest terminal Test/Review authority, and candidate eligibility.
 - [ ] Run `scripts/run_tests.sh tests/hermes_cli/test_kanban_product_outcomes.py tests/hermes_cli/test_kanban_db.py -q`.
-- [ ] Confirm run-407 behavior rejects without mutation while run-410 behavior records `serialized_parameter_leak` and advances normally.
+- [ ] Confirm runs 304/407 reject without mutation, runs 354/369 retain the privileged non-verdict `preflight_repaired` behavior, and run 410 records `serialized_parameter_leak` while advancing normally.
 - [ ] Commit this slice before the recovery verb or `_commit_worker_diff` change.
 
 ### Gate B — Repository and intake contracts
@@ -54,6 +55,7 @@
 - [ ] Execute the Epic plan only after the authority and repository interfaces are on the branch.
 - [ ] Run migration against a scratch copy of a production-shaped database and scratch Git remotes before any live board is considered.
 - [ ] Route affected `release_measure` Epic members through refresh → Test → Review; never use historical approval to enqueue integration.
+- [ ] Review every latest-run canonical-outcome gap. Nonterminal members require fresh evidence; done members may retain only an exact, Git-validated pre-existing integration fact under the documented grandfather rule. Redundant-only approval never creates authority or a fact.
 - [ ] Verify member integration completes without an approval action and final release still stops at a pinned, human-operated handoff.
 
 ### Gate D — Full verification
@@ -78,6 +80,32 @@ scripts/run_tests.sh \
 - [ ] Run `scripts/run_tests.sh` for CI parity.
 - [ ] Search the implementation diff with `git diff --check` and `rg -n "git push|push --force|update-ref.*refs/remotes" hermes_cli plugins/kanban tests/hermes_cli tests/e2e`; every match must be a refusal assertion or test fixture, never an executable engine path.
 - [ ] Review the scratch migration report, retained histories, repository-contract digests, and immutable release snapshot before proposing live enablement.
+
+### Gate E — Board compatibility before enabling fail-closed
+
+- [ ] On the target board, measure the 50 most recent verdict-bearing Test/Review runs with the exact persisted-outcome classification used by the migration:
+
+```sql
+WITH recent AS (
+  SELECT id, json_type(metadata, '$.workflow_outcome') AS canonical
+    FROM task_runs
+   WHERE status = 'completed'
+     AND ended_at IS NOT NULL
+     AND step_key IN ('test', 'review')
+     AND outcome IN ('advanced', 'rework_requested')
+   ORDER BY id DESC
+   LIMIT 50
+)
+SELECT COUNT(*) AS verdict_bearing_runs,
+       SUM(canonical IS NULL) AS canonical_absent,
+       ROUND(100.0 * SUM(canonical IS NULL) / COUNT(*), 1) AS absent_percent,
+       MIN(id) AS oldest_run_id,
+       MAX(id) AS newest_run_id
+  FROM recent;
+```
+
+- [ ] If `canonical_absent / verdict_bearing_runs` exceeds 5%, stop enablement and investigate every absent run. Do not broaden the Resolver exemption or synthesize authority from redundant fields to make the percentage pass.
+- [ ] Record the baseline in the migration report. The verified TTC baseline is 89 completed Test/Review runs overall with 19 canonical-absent rows; six are privileged non-verdict preflight finalizations. For run IDs ≥300, four of 46 are absent: runs 354/369 are legitimate Resolver repairs and runs 304/407 are the two malformed verdict-bearing completions, so the applicable rate is 2/44 (4.5%). The rolling 50 verdict-bearing query above reports 2/50 (4.0%).
 
 ## Commit Order
 
