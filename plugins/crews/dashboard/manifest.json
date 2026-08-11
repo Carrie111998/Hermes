@@ -1,0 +1,8 @@
+{
+  "name": "crews",
+  "label": "Crews",
+  "description": "Multi-agent crews — named groups of specialised profile agents, one-shot task dispatch, DAG workflow builder and live activity feed",
+  "icon": "People",
+  "version": "1.0.0",
+  "api": "plugin_api.py"
+}
