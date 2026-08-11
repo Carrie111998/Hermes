@@ -14,6 +14,8 @@ import os
 import re
 import stat
 import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +26,7 @@ _STORE_DIR = "plugin-integrity"
 _STORE_FILE = "directory-plugins.json"
 _CONFIG_VERSION_GATE = 35
 _SHA256_RE = re.compile(r"[0-9a-f]{64}\Z")
+_PROCESS_LOCK = threading.RLock()
 
 
 class PluginIntegrityError(RuntimeError):
@@ -207,6 +210,68 @@ def _write_records(records: list[dict[str, str]]) -> None:
         raise
 
 
+@contextmanager
+def _locked_evidence_update():
+    """Serialize evidence read-modify-write across threads and processes."""
+    store = evidence_path()
+    parent = store.parent
+    if parent.exists() and parent.is_symlink():
+        raise PluginIntegrityError(f"refusing symlinked integrity directory: {parent}")
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent.is_symlink() or not parent.is_dir():
+        raise PluginIntegrityError(f"unsafe integrity directory: {parent}")
+
+    lock_path = parent / ".directory-plugins.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    with _PROCESS_LOCK:
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            raise PluginIntegrityError(
+                f"cannot open plugin integrity lock {lock_path}: {exc}"
+            ) from exc
+        handle = os.fdopen(fd, "r+b", buffering=0)
+        try:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode) or lock_path.is_symlink():
+                raise PluginIntegrityError(
+                    f"refusing unsafe plugin integrity lock: {lock_path}"
+                )
+            if os.name == "nt":
+                import msvcrt
+
+                if opened.st_size == 0:
+                    handle.write(b"\0")
+                    handle.flush()
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except PluginIntegrityError:
+            raise
+        except OSError as exc:
+            raise PluginIntegrityError(
+                f"cannot lock plugin integrity evidence: {exc}"
+            ) from exc
+        finally:
+            handle.close()
+
+
 def integrity_enforced() -> bool:
     """Return whether this profile has crossed the host-evidence boundary."""
     store = evidence_path()
@@ -236,34 +301,36 @@ def record_plugin_entrypoint(key: str, plugin_dir: Path) -> None:
         "sha256": hashlib.sha256(data).hexdigest(),
     }
     _validate_record(record)
-    records = _load_records(missing_ok=True)
-    records = [
-        item
-        for item in records
-        if item["key"] != key and item["path"] != canonical
-    ]
-    records.append(record)
-    _write_records(records)
+    with _locked_evidence_update():
+        records = _load_records(missing_ok=True)
+        records = [
+            item
+            for item in records
+            if item["key"] != key and item["path"] != canonical
+        ]
+        records.append(record)
+        _write_records(records)
 
 
 def remove_plugin_evidence(key: str, plugin_dir: Path | None = None) -> None:
     store = evidence_path()
-    if not store.exists() and not store.is_symlink():
-        return
     canonical: str | None = None
     if plugin_dir is not None:
         try:
             canonical = str(plugin_dir.resolve(strict=False))
         except OSError:
             canonical = None
-    records = _load_records(missing_ok=False)
-    kept = [
-        item
-        for item in records
-        if item["key"] != key and (canonical is None or item["path"] != canonical)
-    ]
-    if kept != records:
-        _write_records(kept)
+    with _locked_evidence_update():
+        if not store.exists() and not store.is_symlink():
+            return
+        records = _load_records(missing_ok=False)
+        kept = [
+            item
+            for item in records
+            if item["key"] != key and (canonical is None or item["path"] != canonical)
+        ]
+        if kept != records:
+            _write_records(kept)
 
 
 def verified_entrypoint_bytes(key: str, plugin_dir: Path) -> bytes:

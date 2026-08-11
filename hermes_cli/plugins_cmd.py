@@ -912,6 +912,16 @@ def _record_discovered_plugin_integrity(key: str, source: str) -> None:
     )
 
 
+def _record_newly_enabled_plugin_integrity(keys: set[str]) -> None:
+    """Bind directory entrypoints before a multi-select UI enables them."""
+    for key in sorted(keys):
+        resolved = _resolve_plugin_key_and_source(key)
+        if resolved is None:
+            raise PluginOperationError(f"Cannot resolve plugin '{key}'.")
+        canonical_key, source = resolved
+        _record_discovered_plugin_integrity(canonical_key, source)
+
+
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
     """Write ``plugins.entries.<plugin_id>.<key> = value`` into config.yaml."""
     from hermes_cli.config import load_config, save_config
@@ -1828,6 +1838,11 @@ def _run_composite_ui(curses, plugin_keys, plugin_labels, plugin_selected,
     disabled_changed = new_disabled != disabled
 
     if enabled_changed or disabled_changed:
+        try:
+            _record_newly_enabled_plugin_integrity(new_enabled - prev_enabled)
+        except (OSError, PluginOperationError, RuntimeError) as exc:
+            console.print(f"\n[red]Error:[/red] Cannot trust selected plugin: {exc}")
+            return
         _save_enabled_set(new_enabled)
         _save_disabled_set(new_disabled)
         console.print(
@@ -1895,6 +1910,11 @@ def _run_composite_fallback(plugin_keys, plugin_labels, plugin_selected,
                 new_disabled.add(key)
         prev_enabled = _get_enabled_set()
         if new_enabled != prev_enabled or new_disabled != disabled:
+            try:
+                _record_newly_enabled_plugin_integrity(new_enabled - prev_enabled)
+            except (OSError, PluginOperationError, RuntimeError) as exc:
+                console.print(f"\n[red]Error:[/red] Cannot trust selected plugin: {exc}")
+                return
             _save_enabled_set(new_enabled)
             _save_disabled_set(new_disabled)
 

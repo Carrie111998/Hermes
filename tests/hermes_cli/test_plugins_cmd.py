@@ -733,6 +733,31 @@ def test_dashboard_enable_records_git_user_plugin_integrity(tmp_path, monkeypatc
     ).read_bytes()
 
 
+def test_composite_fallback_records_newly_enabled_plugin_integrity(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import plugins_cmd as pc
+    from hermes_cli.plugin_integrity import verified_entrypoint_bytes
+
+    home = tmp_path / "home"
+    plugin = _write_dashboard_native_plugin(home)
+    (home / "config.yaml").write_text(
+        "_config_version: 35\nplugins:\n  enabled: []\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    answers = iter(["1", ""])
+    monkeypatch.setattr("builtins.input", lambda _prompt: next(answers))
+
+    pc._run_composite_fallback(
+        ["guarded"], ["guarded"], set(), set(), [], MagicMock()
+    )
+
+    assert verified_entrypoint_bytes("guarded", plugin) == (
+        plugin / "__init__.py"
+    ).read_bytes()
+
+
 def test_dashboard_update_refreshes_plugin_integrity(tmp_path, monkeypatch):
     from hermes_cli import plugins_cmd as pc
     from hermes_cli.plugin_integrity import (

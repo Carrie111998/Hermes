@@ -6,6 +6,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -272,3 +274,82 @@ def test_v35_migration_seeds_existing_user_plugin_evidence(
         plugin / "__init__.py"
     ).read_bytes()
     assert results["warnings"] == []
+
+
+def test_concurrent_records_do_not_lose_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_cli.plugin_integrity as integrity
+
+    home = tmp_path / "home"
+    first = _write_plugin(home, "first")
+    second = _write_plugin(home, "second")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_load = integrity._load_records
+
+    def _slow_load(*, missing_ok: bool):
+        records = original_load(missing_ok=missing_ok)
+        time.sleep(0.05)
+        return records
+
+    monkeypatch.setattr(integrity, "_load_records", _slow_load)
+    failures: list[BaseException] = []
+
+    def _record(key: str, path: Path) -> None:
+        try:
+            integrity.record_plugin_entrypoint(key, path)
+        except BaseException as exc:
+            failures.append(exc)
+
+    threads = [
+        threading.Thread(target=_record, args=("first", first)),
+        threading.Thread(target=_record, args=("second", second)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert not failures
+    assert all(not thread.is_alive() for thread in threads)
+    assert integrity.verified_entrypoint_bytes("first", first) == (
+        first / "__init__.py"
+    ).read_bytes()
+    assert integrity.verified_entrypoint_bytes("second", second) == (
+        second / "__init__.py"
+    ).read_bytes()
+
+
+def test_record_waits_for_cross_process_evidence_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    plugin = _write_plugin(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    env = {**os.environ, "HERMES_HOME": str(home)}
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; "
+            "from hermes_cli.plugin_integrity import _locked_evidence_update; "
+            "ctx=_locked_evidence_update(); ctx.__enter__(); "
+            "print('locked', flush=True); time.sleep(0.5); ctx.__exit__(None,None,None)",
+        ],
+        cwd=Path.cwd(),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+    assert child.stdout is not None
+    assert child.stdout.readline().strip() == "locked"
+
+    started = time.monotonic()
+    record_plugin_entrypoint("guarded", plugin)
+    elapsed = time.monotonic() - started
+    _stdout, stderr = child.communicate(timeout=5)
+
+    assert child.returncode == 0, stderr
+    assert elapsed >= 0.2
