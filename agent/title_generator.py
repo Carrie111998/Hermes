@@ -315,6 +315,20 @@ def _extract_title_text(content: str) -> str:
     return raw.strip("\"'").strip()
 
 
+def _is_title_fragment(title: str) -> bool:
+    """True when *title* looks like truncated JSON/markdown, not a real name."""
+    if title.startswith(("{", "}", "*", "```")):
+        return True
+    # Quote-stripped leftover of `"title": "...` (prefix strip leaves `": "...`).
+    if title[:1] in "\"':":
+        return True
+    lowered = title.lower()
+    if lowered == "title" or lowered.startswith(("title\"", "title'")):
+        return True
+    # Only JSON punctuation / quotes / fence markers left.
+    return not re.search(r"[^\s{}\[\]\":,\\'`*]", title)
+
+
 def _clean_title(text: str) -> Optional[str]:
     """Normalize a model-produced title, or None when nothing usable remains."""
     title = " ".join((text or "").split())
@@ -324,6 +338,11 @@ def _clean_title(text: str) -> Optional[str]:
     # Trailing sentence punctuation reads wrong in a sidebar list.
     title = title.rstrip(".!,;:")
     if not title:
+        return None
+    # Truncated JSON / fence output is not a title. max_tokens=64 can cut
+    # {"title": "..."} so json.loads and the closing-quote regex both fail,
+    # and the prose fallback would otherwise persist the fragment.
+    if _is_title_fragment(title):
         return None
     if len(title) > 80:
         title = title[:77].rstrip() + "..."

@@ -90,6 +90,50 @@ class TestGenerateTitle:
             assert len(title) == 80
             assert title.endswith("...")
 
+    def test_rejects_truncated_json_object_key(self):
+        """max_tokens can cut {"title": "..."} to {"title" — not a session name."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"title"'
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("fix the login button") is None
+
+    def test_rejects_bare_markdown_fence(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "```"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("fix the login button") is None
+
+    def test_rejects_truncated_json_title_value(self):
+        """Open-string JSON with no closing quote must not become the title."""
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            '{"title":"Investigate and fix the login butt'
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("fix the login button") is None
+
+    def test_accepts_valid_json_title(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '{"title":"Fix login button"}'
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("the login button is broken") == "Fix login button"
+
+    def test_accepts_plain_prose_title(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Fix login button"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("the login button is broken") == "Fix login button"
+
 
 
     def test_invokes_failure_callback_on_exception(self):
