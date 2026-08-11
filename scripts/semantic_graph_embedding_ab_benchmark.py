@@ -9,6 +9,7 @@ import argparse
 import json
 import math
 import os
+import sqlite3
 import statistics
 import subprocess
 import time
@@ -17,6 +18,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Sequence
 
+from plugins.memory.ebbinghaus.semantic_graph_bridge import project_retention
+from plugins.semantic_graph.cognitive import observe_cognitive_rerank
 from plugins.semantic_graph.embedding import EmbeddingModelIdentity, serialize_embedding_node, source_text_hash
 from plugins.semantic_graph.fusion import reciprocal_rank_fusion
 from plugins.semantic_graph.retrieval import render_context, search_and_rank
@@ -113,6 +116,49 @@ def make_store(db_path: Path) -> tuple[SemanticGraphStore, str, str]:
         "status": "asserted", "authority": "user", "confidence": 0.99, "salience": 0.99,
     })
     store.link_run_node(run_b, "run-b-only")
+
+    synced_at = time.time()
+    cognitive_nodes = sorted(
+        store.list_nodes_for_run(
+            run_a,
+            statuses=["asserted", "accepted"],
+            limit=5000,
+        ),
+        key=lambda row: str(row["node_id"]),
+    )
+    for index, row in enumerate(cognitive_nodes, start=1):
+        memory_id = 10_000 + index
+        belief_id = f"benchmark-belief-{index}"
+        access_state = (
+            "latent"
+            if index % 7 == 0
+            else "reactivated"
+            if index % 11 == 0
+            else "accessible"
+        )
+        store.upsert_memory_node_link({
+            "memory_id": memory_id,
+            "node_id": row["node_id"],
+            "belief_id": belief_id,
+            "belief_version": 1,
+            "relation": "represents",
+        })
+        store.upsert_memory_state_cache({
+            "memory_id": memory_id,
+            "belief_id": belief_id,
+            "belief_version": 1,
+            "access_state": access_state,
+            "belief_status": "current",
+            "memory_state": "active",
+            "retention_at_sync": 0.55 + 0.10 * (index % 5),
+            "stability_days": 30.0 + float(index % 7),
+            "salience": float(row["salience"]),
+            "valence": 0.0,
+            "confidence": float(row["confidence"]),
+            "protected": False,
+            "source_updated_at": synced_at,
+            "synced_at": synced_at,
+        })
     return store, run_a, run_b
 
 
@@ -191,6 +237,32 @@ def _candidate_observations(
     return observations
 
 
+def _cognitive_inputs(
+    store: SemanticGraphStore,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[int, dict[str, Any]]]:
+    links_by_node: dict[str, list[dict[str, Any]]] = {}
+    for link in store.get_memory_node_links(limit=5000):
+        links_by_node.setdefault(str(link["node_id"]), []).append(link)
+    states_by_memory: dict[int, dict[str, Any]] = {}
+    for cache in store.list_memory_state_cache(limit=5000):
+        state = dict(cache)
+        state["projected_retention"] = project_retention(
+            cache,
+            expected_belief_version=int(cache["belief_version"]),
+        )
+        states_by_memory[int(cache["memory_id"])] = state
+    return links_by_node, states_by_memory
+
+
+def _database_snapshot(store: SemanticGraphStore) -> tuple[str, ...]:
+    uri = Path(store.db_path).resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    try:
+        return tuple(conn.iterdump())
+    finally:
+        conn.close()
+
+
 def _query_observation(
     *, expected: Sequence[str], lexical_ids: Sequence[str], dense_ids: Sequence[str],
     dense_similarities: dict[str, float], fused_node_ids: Sequence[str], top_k: int,
@@ -251,6 +323,19 @@ def _summary(
         "cross_run_leak_count": cross_run,
         "secret_recall_count": secret_recall,
         "state_mutation_count": 0,
+        "cognitive_shadow_observation_count": sum(
+            len(result["candidates"]) for result in results
+        ),
+        "cognitive_rank_change_count": sum(
+            int(candidate["cognitive_shadow"]["rank_changed"])
+            for result in results
+            for candidate in result["candidates"]
+        ),
+        "cognitive_would_filter_count": sum(
+            int(candidate["cognitive_shadow"]["would_filter"])
+            for result in results
+            for candidate in result["candidates"]
+        ),
         "query_results": results,
     }
 
@@ -272,8 +357,8 @@ def run_variant(
     latencies = {name: [] for name in (
         "query_embedding_ms", "lexical_ms", "dense_scan_ms", "rrf_ms", "end_to_end_ms",
     )}
-    before = {row["node_id"]: (row["status"], row["authority"], row["confidence"])
-              for row in store.list_nodes(limit=5000)}
+    before = _database_snapshot(store)
+    links_by_node, states_by_memory = _cognitive_inputs(store)
     for query_index, query in enumerate(fixture["queries"], start=1):
         started = time.perf_counter()
         query_vector = None
@@ -321,6 +406,12 @@ def run_variant(
             dense_ids=[row["node_id"] for row in dense_rows],
             top_k=TOP_K,
         )
+        candidates = observe_cognitive_rerank(
+            candidates,
+            links_by_node=links_by_node,
+            states_by_memory=states_by_memory,
+            query_mode="normal",
+        )
         observation = _query_observation(
             expected=query["expected"],
             lexical_ids=[row["node_id"] for row in lexical_safe],
@@ -353,8 +444,7 @@ def run_variant(
         })
         latencies["end_to_end_ms"].append(results[-1]["latency_ms"])
 
-    after = {row["node_id"]: (row["status"], row["authority"], row["confidence"])
-             for row in store.list_nodes(limit=5000)}
+    after = _database_snapshot(store)
     summary = _summary(
         results,
         latencies,
@@ -385,7 +475,7 @@ def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, outpu
     lexical = run_variant(store, fixture, run_a, dense=False, client=None)
     hybrid = run_variant(store, fixture, run_a, dense=True, client=client)
     result = {
-        "benchmark_schema_version": 1,
+        "benchmark_schema_version": 2,
         "control_code_revision": CONTROL_CODE_REVISION,
         "benchmark_code_revision": benchmark_code_revision(),
         "control": CONTROL,
@@ -393,11 +483,19 @@ def run_benchmark(*, base_url: str, model: str, db_path: Path, live: bool, outpu
                       "dense_candidates": DENSE_CANDIDATES, "rrf_k": RRF_K},
         "backfill": {"document_count": len(documents), "duration_ms": backfill_ms},
         "variants": {"A_lexical": lexical, "B_hybrid_bge_m3": hybrid},
+        "cognitive_shadow": {
+            "mode": "shadow",
+            "formula": "fixed-v1",
+            "query_mode": "normal",
+            "ebbinghaus_db_accessed": False,
+        },
         "gates": {
             "japanese_to_english_recall_no_regression": hybrid["groups"].get("japanese_to_english", {}).get("recall_at_8") == 1.0,
             "leak_free": hybrid["rejected_or_superseded_leak_count"] == 0
             and hybrid["cross_run_leak_count"] == 0
             and hybrid["secret_recall_count"] == 0
+            and hybrid["state_mutation_count"] == 0,
+            "shadow_read_only": lexical["state_mutation_count"] == 0
             and hybrid["state_mutation_count"] == 0,
         },
     }

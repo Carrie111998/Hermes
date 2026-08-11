@@ -18,7 +18,7 @@ logger = logging.getLogger("hermes.plugins.semantic_graph")
 PLUGIN_ID = "semantic-graph"
 DB_FILENAME = "semantic_graph.db"
 _AUTO_EXTRACT_ALLOWED = frozenset({"off", "explicit", "all"})
-_COGNITIVE_MEMORY_MODES = frozenset({"shadow", "production"})
+_COGNITIVE_MEMORY_MODES = frozenset({"off", "shadow", "active"})
 
 _warn_lock = threading.Lock()
 _auto_extract_warned = False
@@ -65,7 +65,7 @@ class SemanticGraphCognitiveMemoryConfig:
     def __post_init__(self) -> None:
         if self.mode not in _COGNITIVE_MEMORY_MODES:
             raise ValueError(
-                "cognitive_memory.mode must be shadow or production"
+                "cognitive_memory.mode must be off, shadow, or active"
             )
 
 

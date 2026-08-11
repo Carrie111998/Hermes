@@ -184,7 +184,23 @@ def test_run_variant_emits_observation_schema_for_lexical_variant(tmp_path: Path
     assert set(result["candidates"][0]) >= {
         "node_id", "lexical_rank", "dense_rank", "dense_similarity", "rrf_score",
         "source_count", "best_rank", "final_rank", "selected_into_top8",
+        "cognitive_shadow",
     }
+    assert set(result["candidates"][0]["cognitive_shadow"]) == {
+        "base_rank",
+        "memory_link_count",
+        "representative_memory_id",
+        "projected_retention",
+        "access_state",
+        "belief_status",
+        "cognitive_score",
+        "would_filter",
+        "cognitive_rank",
+        "rank_changed",
+        "reason",
+    }
+    assert summary["cognitive_shadow_observation_count"] > 0
+    assert summary["state_mutation_count"] == 0
     assert set(result["observation"]) >= {
         "top1_dense_similarity", "top2_dense_similarity", "dense_top_margin",
         "top1_rrf_score", "top2_rrf_score", "rrf_top_margin",

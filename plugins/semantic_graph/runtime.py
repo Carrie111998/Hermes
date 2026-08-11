@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from . import graph as _graph
 from .config import SemanticGraphConfig, load_config
+from .cognitive import observe_cognitive_rerank
 from .embedding import (
     EmbeddingBackend,
     EmbeddingBackendError,
@@ -94,6 +95,50 @@ class SemanticGraphRuntime:
                 self._store = SemanticGraphStore(self._config.db_path())
             self._cognitive_bridge = EbbinghausSemanticGraphBridge(self._store)
         return self._cognitive_bridge
+
+    def _observe_cognitive_shadow(
+        self,
+        hits: list[dict[str, Any]],
+        *,
+        query_mode: str,
+    ) -> list[dict[str, Any]]:
+        config = self._config.cognitive_memory
+        if not hits or not config.rerank_enabled or config.mode != "shadow":
+            return hits
+        try:
+            from plugins.memory.ebbinghaus.semantic_graph_bridge import (
+                project_retention,
+            )
+
+            store = self.store()
+            links_by_node: dict[str, list[dict[str, Any]]] = {}
+            states_by_memory: dict[int, dict[str, Any]] = {}
+            for hit in hits:
+                node_id = str(hit.get("node_id") or "")
+                links = store.get_memory_node_links(node_id=node_id, limit=100)
+                links_by_node[node_id] = links
+                for link in links:
+                    memory_id = int(link["memory_id"])
+                    if memory_id in states_by_memory:
+                        continue
+                    cache = store.get_memory_state_cache(memory_id)
+                    if cache is None:
+                        continue
+                    state = dict(cache)
+                    state["projected_retention"] = project_retention(
+                        cache,
+                        expected_belief_version=int(link["belief_version"]),
+                    )
+                    states_by_memory[memory_id] = state
+            return observe_cognitive_rerank(
+                hits,
+                links_by_node=links_by_node,
+                states_by_memory=states_by_memory,
+                query_mode=query_mode,
+            )
+        except Exception as exc:
+            logger.warning("semantic-graph cognitive shadow failed open: %s", exc)
+            return hits
 
     # ------------------------------------------------------------------ tools
 
@@ -497,6 +542,13 @@ class SemanticGraphRuntime:
                 authorities=args.get("authorities"),
                 run_id=args.get("run_id"),
             )
+            requested_mode = str(args.get("query_mode") or "").strip().lower()
+            query_mode = requested_mode or (
+                "history"
+                if {"rejected", "superseded"} & set(statuses)
+                else "normal"
+            )
+            hits = self._observe_cognitive_shadow(hits, query_mode=query_mode)
             if args.get("include_artifacts"):
                 for hit in hits:
                     hit["artifacts"] = self.store().list_artifacts(
@@ -788,6 +840,7 @@ class SemanticGraphRuntime:
                 min_confidence=self._config.min_recall_confidence,
                 statuses=list(self._config.recall_statuses),
             )
+            hits = self._observe_cognitive_shadow(hits, query_mode="normal")
             ctx = render_context(hits, self._config.retrieval_max_chars)
             if not ctx:
                 return None
