@@ -1071,6 +1071,20 @@ def _resolve_named_custom_runtime(
             pass
     if requested_norm == "custom" and explicit_base_url:
         base_url = explicit_base_url.strip().rstrip("/")
+        # An explicit key belongs to this exact endpoint and must win over a
+        # pool entry selected only by host.  Direct model aliases use this
+        # path; reversing the order can silently substitute a different key
+        # for the alias's configured credential (#83612).
+        explicit_key = (explicit_api_key or "").strip()
+        if has_usable_secret(explicit_key):
+            return {
+                "provider": "custom",
+                "api_mode": _detect_api_mode_for_url(base_url) or "chat_completions",
+                "base_url": base_url,
+                "api_key": explicit_key,
+                "source": "direct-alias",
+                "requested_provider": requested_provider,
+            }
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
@@ -1081,7 +1095,6 @@ def _resolve_named_custom_runtime(
         _da_is_openai_url   = base_url_host_matches(base_url, "openai.com") or base_url_host_matches(base_url, "openai.azure.com")
         _da_is_openrouter   = base_url_host_matches(base_url, "openrouter.ai")
         api_key_candidates = [
-            (explicit_api_key or "").strip(),
             # Gate env key fallbacks on authoritative hosts (#28660)
             (_getenv("OPENAI_API_KEY", "").strip()     if _da_is_openai_url else ""),
             (_getenv("OPENROUTER_API_KEY", "").strip() if _da_is_openrouter  else ""),

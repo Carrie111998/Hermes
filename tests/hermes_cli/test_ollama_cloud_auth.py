@@ -45,6 +45,29 @@ class TestOllamaCloudCredentials:
         assert runtime["api_key"] == "test-ollama-key-12345"
         assert runtime["provider"] == "custom"
 
+    def test_explicit_custom_endpoint_key_beats_pool_entry(self, monkeypatch):
+        """An explicit alias key is bound to its endpoint and cannot be
+        replaced by a host-level pool credential (#83612)."""
+        from hermes_cli import runtime_provider as rp
+
+        monkeypatch.setattr(
+            rp,
+            "_try_resolve_from_custom_pool",
+            lambda *args: {
+                "api_key": "pool-key-that-must-not-win",
+                "base_url": "https://theta.example/infer_request",
+                "api_mode": "chat_completions",
+            },
+        )
+
+        runtime = rp.resolve_runtime_provider(
+            requested="custom",
+            explicit_base_url="https://theta.example/infer_request",
+            explicit_api_key="alias-key",
+        )
+
+        assert runtime["api_key"] == "alias-key"
+
 
 # ---------------------------------------------------------------------------
 # Direct alias resolution
@@ -76,6 +99,30 @@ class TestDirectAliases:
         assert aliases["mymodel"].model == "custom-model:latest"
         assert aliases["mymodel"].provider == "custom"
         assert aliases["mymodel"].base_url == "https://example.com/v1"
+
+    def test_direct_alias_loads_credential_fields(self, monkeypatch):
+        """Direct aliases must retain credentials instead of silently
+        discarding the api_key / key_env supplied for their endpoint (#83612)."""
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model_aliases": {
+                    "theta": {
+                        "model": "glm_5_2",
+                        "provider": "custom",
+                        "base_url": "https://theta.example/infer_request",
+                        "api_key": "theta-key",
+                        "key_env": "THETA_API_KEY",
+                    }
+                }
+            },
+        )
+
+        from hermes_cli.model_switch import _load_direct_aliases
+
+        alias = _load_direct_aliases()["theta"]
+        assert alias.api_key == "theta-key"
+        assert alias.key_env == "THETA_API_KEY"
 
     def test_direct_alias_resolved_before_catalog(self, monkeypatch):
         """Direct aliases take priority over models.dev catalog lookup."""
@@ -420,6 +467,63 @@ class TestSwitchModelDirectAliasOverride:
         assert result.success
         assert result.api_key == "no-key-required"
         assert result.base_url == "http://localhost:11434/v1"
+
+    def test_switch_model_binds_alias_key_before_runtime_resolution(self, monkeypatch):
+        """The endpoint and key of a direct alias are one security boundary.
+        A current provider key must never be resolved and then carried to the
+        alias host (#83612)."""
+        from hermes_cli.model_switch import DirectAlias
+        import hermes_cli.model_switch as ms
+
+        monkeypatch.setattr(
+            ms,
+            "DIRECT_ALIASES",
+            {
+                "theta": DirectAlias(
+                    "glm_5_2",
+                    "custom",
+                    "https://theta.example/infer_request",
+                    "theta-key",
+                )
+            },
+        )
+        monkeypatch.setattr(
+            ms,
+            "resolve_alias",
+            lambda raw, provider: ("custom", "glm_5_2", "theta"),
+        )
+        captured = {}
+
+        def fake_resolve_runtime_provider(**kwargs):
+            captured.update(kwargs)
+            return {
+                "api_key": kwargs["explicit_api_key"],
+                "base_url": kwargs["explicit_base_url"],
+                "api_mode": "chat_completions",
+                "provider": "custom",
+            }
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve_runtime_provider,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.models.validate_requested_model",
+            lambda *a, **kw: {"accepted": True, "persist": True, "recognized": True, "message": None},
+        )
+        monkeypatch.setattr("hermes_cli.models.opencode_model_api_mode", lambda *a, **kw: "openai_compat")
+
+        result = ms.switch_model(
+            "theta",
+            "openrouter",
+            "old-model",
+            current_api_key="openrouter-key-that-must-not-leak",
+        )
+
+        assert captured["explicit_base_url"] == "https://theta.example/infer_request"
+        assert captured["explicit_api_key"] == "theta-key"
+        assert result.api_key == "theta-key"
+        assert result.base_url == "https://theta.example/infer_request"
 
 
 # ---------------------------------------------------------------------------
