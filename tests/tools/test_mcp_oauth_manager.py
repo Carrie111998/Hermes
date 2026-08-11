@@ -342,8 +342,8 @@ def test_invalid_client_at_token_endpoint_poisons(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     d = tmp_path / "mcp-tokens"
     d.mkdir(parents=True)
-    (d / "srv.client.json").write_text('{"client_id": "dead"}')
-    (d / "srv.meta.json").write_text("{}")
+    (d / "srv.client.json").write_text('{"client_id": "dead"}', encoding="utf-8")
+    (d / "srv.meta.json").write_text("{}", encoding="utf-8")
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
@@ -364,7 +364,7 @@ def test_invalid_client_metadata_does_not_trip(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     d = tmp_path / "mcp-tokens"
     d.mkdir(parents=True)
-    (d / "srv.client.json").write_text('{"client_id": "live"}')
+    (d / "srv.client.json").write_text('{"client_id": "live"}', encoding="utf-8")
     provider = _provider_with_token_endpoint(
         tmp_path, {}, "https://idp.example.com/oauth/token", monkeypatch
     )
@@ -400,7 +400,7 @@ def test_bridge_forwards_requests_and_poisons_on_token_endpoint_400(
     token_ep = "https://idp.example.com/oauth/token"
     d = tmp_path / "mcp-tokens"
     d.mkdir(parents=True)
-    (d / "srv.client.json").write_text('{"client_id": "dead"}')
+    (d / "srv.client.json").write_text('{"client_id": "dead"}', encoding="utf-8")
 
     forwarded = []
 

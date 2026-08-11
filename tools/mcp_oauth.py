@@ -556,6 +556,10 @@ class HermesTokenStorage:
 
     # -- cleanup -----------------------------------------------------------
 
+    def invalidate_tokens(self) -> None:
+        """Remove the durable bearer after a failed refresh attempt."""
+        self._tokens_path().unlink(missing_ok=True)
+
     def remove(self) -> None:
         """Delete all stored OAuth state for this server."""
         for p in (self._tokens_path(), self._client_info_path(), self._meta_path()):

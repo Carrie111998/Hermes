@@ -3037,7 +3037,14 @@ class MCPServerTask:
             try:
                 from tools.mcp_oauth_manager import get_manager
                 _oauth_auth = get_manager().get_or_build_provider(
-                    self.name, url, config.get("oauth"),
+                    self.name,
+                    url,
+                    config.get("oauth"),
+                    {
+                        "connect_timeout": connect_timeout,
+                        "ssl_verify": ssl_verify,
+                        "client_cert": client_cert,
+                    },
                 )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
