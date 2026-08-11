@@ -221,6 +221,29 @@ class TestExecuteCode(unittest.TestCase):
         self.assertIn("hello world", result["output"])
         self.assertEqual(result["tool_calls_made"], 0)
 
+    def test_convenience_helpers_are_importable(self):
+        """Helpers advertised by the schema must import and execute as shown."""
+        code = """
+from __future__ import annotations
+import json
+from hermes_tools import json_parse, retry, shell_quote
+
+print(json.dumps({
+    "parsed": json_parse('{"value": 7}')["value"],
+    "quoted": shell_quote("two words"),
+    "retried": retry(lambda: "ok"),
+}, sort_keys=True))
+"""
+        result = self._run(code)
+        self.assertEqual(result["status"], "success")
+        payload = json.loads(result["output"])
+        self.assertEqual(payload, {
+            "parsed": 7,
+            "quoted": "'two words'",
+            "retried": "ok",
+        })
+        self.assertEqual(result["tool_calls_made"], 0)
+
     def test_no_tool_call_script_does_not_wait_for_rpc_accept_timeout(self):
         """A no-tool script should not wait seconds for the idle RPC accept thread."""
         start = time.monotonic()
@@ -457,6 +480,12 @@ class TestBuildExecuteCodeSchema(unittest.TestCase):
         self.assertIn("parameters", schema)
         self.assertIn("code", schema["parameters"]["properties"])
         self.assertEqual(schema["parameters"]["required"], ["code"])
+
+    def test_schema_requires_import_for_convenience_helpers(self):
+        desc = build_execute_code_schema()["description"]
+        self.assertIn("Convenience helpers are not preloaded globals", desc)
+        self.assertIn("from hermes_tools import json_parse, shell_quote, retry", desc)
+        self.assertNotIn("Built-in helpers (no import)", desc)
 
     def test_subset_only_lists_enabled_tools(self):
         enabled = {"terminal", "read_file"}
