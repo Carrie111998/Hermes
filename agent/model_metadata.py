@@ -1610,6 +1610,14 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # The input itself fits — this is purely an output-cap error, so reduce
         # max_tokens and retry; do NOT compress.
         "range of max_tokens should be" in error_lower
+    ) or (
+        # SGLang phrasing (#83521): both the input and completion token counts
+        # are reported explicitly, e.g.
+        #   "... maximum context length of 131072 tokens. You requested a
+        #    total of 132528 tokens: 66992 tokens from the input messages and
+        #    65536 tokens for the completion. ..."
+        "tokens from the input messages" in error_lower
+        and "tokens for the completion" in error_lower
     )
     if not is_output_cap_error:
         return None
@@ -1685,6 +1693,21 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         if _available >= 1:
             return _available
 
+    # SGLang style: input tokens and completion (output) tokens are both
+    # reported explicitly, alongside the context window, e.g.
+    #   "Requested token count exceeds the model's maximum context length of
+    #    131072 tokens. You requested a total of 132528 tokens: 66992 tokens
+    #    from the input messages and 65536 tokens for the completion."
+    # Available output = window - input. When the input alone already meets
+    # or exceeds the window this stays None, so the caller falls through to
+    # compression instead of futilely shrinking the output cap.
+    _m_sglang_ctx = re.search(r'maximum context length of (\d+)\s*token', error_lower)
+    _m_sglang_input = re.search(r'(\d+)\s*tokens from the input messages', error_lower)
+    if _m_sglang_ctx and _m_sglang_input:
+        _available = int(_m_sglang_ctx.group(1)) - int(_m_sglang_input.group(1))
+        if _available >= 1:
+            return _available
+
     return None
 
 
@@ -1717,6 +1740,7 @@ def is_output_cap_error(error_msg: str) -> bool:
         "max_tokens" in error_lower
         or "max_output_tokens" in error_lower
         or "max_completion_tokens" in error_lower
+        or "tokens for the completion" in error_lower       # SGLang
     )
     if not mentions_output_param:
         return False
@@ -1730,6 +1754,8 @@ def is_output_cap_error(error_msg: str) -> bool:
             and "maximum context length" in error_lower)
         or ("requested" in error_lower                      # LM Studio / llama.cpp
             and "output tokens" in error_lower)
+        or ("tokens from the input messages" in error_lower  # SGLang
+            and "tokens for the completion" in error_lower)
         or "should be" in error_lower                       # generic "max_tokens should be <= N"
         or "less than or equal" in error_lower
         or "must be" in error_lower
@@ -1749,7 +1775,18 @@ def is_output_cap_error(error_msg: str) -> bool:
         or "prompt contains" in error_lower
         or "reduce the length" in error_lower
     )
-    return not input_overflow_signal
+    if input_overflow_signal:
+        return False
+
+    # SGLang reports both figures explicitly; when the input alone already
+    # meets or exceeds the context window this is a genuine overflow, not an
+    # output-cap error, even though the wording also names a completion cap.
+    _m_ctx = re.search(r'maximum context length of (\d+)\s*token', error_lower)
+    _m_input = re.search(r'(\d+)\s*tokens from the input messages', error_lower)
+    if _m_ctx and _m_input and int(_m_input.group(1)) >= int(_m_ctx.group(1)):
+        return False
+
+    return True
 
 
 def _model_id_matches(candidate_id: str, lookup_model: str) -> bool:
