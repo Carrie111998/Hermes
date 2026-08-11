@@ -37,6 +37,7 @@ environment and is never logged.
 """
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import logging
@@ -115,6 +116,11 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
+
+# Adapter-local task context.  asyncio copies ContextVar state into the
+# background task created by BasePlatformAdapter.handle_message(), so every
+# outbound task send remains bound to its immutable inbound trigger.
+_TURN_CORRELATION = contextvars.ContextVar("buzz_turn_correlation", default=None)
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -363,6 +369,10 @@ class BuzzAdapter(BasePlatformAdapter):
     Instantiated by the adapter_factory passed to register_platform().
     """
 
+    # The pinned Buzz CLI has no edit API. Buffer model output and publish only
+    # the verified terminal response, never a preview kind-9 event.
+    SUPPORTS_MESSAGE_EDITING = False
+
     def __init__(self, config, **kwargs):
         platform = Platform("buzz")
         super().__init__(config=config, platform=platform)
@@ -450,14 +460,79 @@ class BuzzAdapter(BasePlatformAdapter):
         # latched so a caller retry cannot duplicate an unproven publication.
         self._verified_deliveries: OrderedDict[str, SendResult] = OrderedDict()
         self._ambiguous_deliveries: OrderedDict[str, None] = OrderedDict()
+        # correlation_id -> {"delivery_key": str, "result": SendResult | None}
+        self._terminal_deliveries: OrderedDict[str, dict] = OrderedDict()
+
+        # Freeze the isolated profile configuration before gateway work.  A
+        # missing profile file is tolerated for standalone tests, but connect()
+        # requires a frozen snapshot before any relay operation.
+        home = os.environ.get("HERMES_HOME")
+        self._configuration_path = Path(home).expanduser() / "config.yaml" if home else None
+        self._configuration_sha256: Optional[str] = None
+        self._configuration_integrity_state = "NOT_FROZEN"
+        if self._configuration_path is not None and self._configuration_path.is_file():
+            self._freeze_configuration()
 
     @property
     def name(self) -> str:
         return "Buzz"
 
+    @property
+    def configuration_integrity_state(self) -> str:
+        return self._configuration_integrity_state
+
+    def _freeze_configuration(self, *, required: bool = False) -> bool:
+        path = self._configuration_path
+        if path is None or not path.is_file():
+            if required:
+                self._configuration_integrity_state = "FAILED_CLOSED"
+            return False
+        try:
+            self._configuration_sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+        except OSError:
+            self._configuration_integrity_state = "FAILED_CLOSED"
+            return False
+        self._configuration_integrity_state = "FROZEN"
+        return True
+
+    def _configuration_is_intact(self) -> bool:
+        if self._configuration_integrity_state == "NOT_FROZEN":
+            return True
+        if self._configuration_integrity_state != "FROZEN":
+            return False
+        try:
+            current = hashlib.sha256(self._configuration_path.read_bytes()).hexdigest()
+        except (AttributeError, OSError):
+            current = ""
+        if current != self._configuration_sha256:
+            self._configuration_integrity_state = "FAILED_CLOSED"
+            logger.error("Buzz: profile configuration integrity changed; dispatch blocked")
+            return False
+        return True
+
+    def _turn_correlation(self) -> Optional[Tuple[str, str, str]]:
+        value = _TURN_CORRELATION.get()
+        if value is None or value[0] != id(self):
+            return None
+        return value[1], value[2], value[3]
+
+    @staticmethod
+    def _failed_delivery(reason: str, *, correlation_id: str = "") -> SendResult:
+        raw = {"state": "FAILED_DELIVERY"}
+        if correlation_id:
+            raw["correlation_id"] = correlation_id
+        return SendResult(
+            success=False,
+            error=f"FAILED_DELIVERY[{reason}]",
+            retryable=False,
+            raw_response=raw,
+        )
+
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
+        if not self._configuration_is_intact():
+            return 78, "", "configuration_integrity_changed"
         if not self._private_key:
             self._private_key = _resolve_private_key(self._extra)
         return await _exec_buzz(
@@ -472,6 +547,22 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Verify relay credentials, seed high-water marks, start polling."""
+        if self._configuration_integrity_state == "NOT_FROZEN":
+            if not self._freeze_configuration(required=True):
+                logger.error("Buzz: isolated profile config could not be frozen")
+                self._set_fatal_error(
+                    "config_integrity_missing",
+                    "isolated profile config could not be frozen",
+                    retryable=False,
+                )
+                return False
+        if not self._configuration_is_intact():
+            self._set_fatal_error(
+                "config_integrity_changed",
+                "profile configuration changed after validation",
+                retryable=False,
+            )
+            return False
         if not self.relay_url:
             logger.error("Buzz: relay URL must be configured")
             self._set_fatal_error("config_missing", "BUZZ_RELAY_URL must be set", retryable=False)
@@ -657,7 +748,7 @@ class BuzzAdapter(BasePlatformAdapter):
         tags = event.get("tags")
         if not isinstance(tags, list):
             return reply_target is None
-        reply_tags = [
+        thread_tags = [
             tag
             for tag in tags
             if isinstance(tag, (list, tuple))
@@ -666,8 +757,15 @@ class BuzzAdapter(BasePlatformAdapter):
             and (len(tag) < 4 or str(tag[3]) in ("reply", "root"))
         ]
         if reply_target is None:
-            return not reply_tags
-        return any(str(tag[1]) == str(reply_target) for tag in reply_tags)
+            return not thread_tags
+        # Buzz uses distinct NIP-10 root and reply markers. A matching root is
+        # not proof that the event replies to the requested trigger.
+        return any(
+            len(tag) >= 4
+            and str(tag[3]) == "reply"
+            and str(tag[1]) == str(reply_target)
+            for tag in thread_tags
+        )
 
     async def _read_back_delivery(
         self,
@@ -720,6 +818,8 @@ class BuzzAdapter(BasePlatformAdapter):
         args: List[str],
         reply_target: Optional[str],
     ) -> SendResult:
+        if not self._configuration_is_intact():
+            return self._failed_delivery("configuration_integrity_changed")
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
         delivery_key = self._delivery_key(chat_id, content, reply_target)
         cached = self._verified_deliveries.get(delivery_key)
@@ -827,16 +927,63 @@ class BuzzAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if not content:
             return SendResult(success=False, error="Empty message")
+        if not self._configuration_is_intact():
+            return self._failed_delivery("configuration_integrity_changed")
+
+        correlation = self._turn_correlation()
+        correlation_id = ""
+        terminal = bool((metadata or {}).get("notify"))
+        if correlation is not None:
+            correlated_channel, trigger_event_id, correlation_id = correlation
+            if str(chat_id) != correlated_channel:
+                return self._failed_delivery(
+                    "correlation_channel_mismatch", correlation_id=correlation_id
+                )
+            # A task response uses only its immutable inbound trigger. Generic
+            # metadata or a prior thread value can never replace it.
+            reply_to = trigger_event_id
+            if not terminal:
+                return self._failed_delivery(
+                    "non_terminal_publication_suppressed",
+                    correlation_id=correlation_id,
+                )
+
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        reply_target = reply_to if correlation is not None else (
+            reply_to or (metadata or {}).get("thread_id")
+        )
         if reply_target:
             args += ["--reply-to", str(reply_target)]
-        return await self._send_and_verify(
+
+        terminal_slot = None
+        if correlation_id:
+            delivery_key = self._delivery_key(str(chat_id), content, str(reply_target))
+            terminal_slot = self._terminal_deliveries.get(correlation_id)
+            if terminal_slot is not None:
+                if (
+                    terminal_slot.get("delivery_key") == delivery_key
+                    and terminal_slot.get("result") is not None
+                ):
+                    return terminal_slot["result"]
+                return self._failed_delivery(
+                    "terminal_already_attempted", correlation_id=correlation_id
+                )
+            terminal_slot = {"delivery_key": delivery_key, "result": None}
+            self._terminal_deliveries[correlation_id] = terminal_slot
+            self._trim_delivery_cache(self._terminal_deliveries)
+
+        result = await self._send_and_verify(
             chat_id=str(chat_id),
             content=content,
             args=args,
             reply_target=str(reply_target) if reply_target else None,
         )
+        if terminal_slot is not None:
+            terminal_slot["result"] = result
+        if correlation_id and isinstance(result.raw_response, dict):
+            result.raw_response.setdefault("correlation_id", correlation_id)
+            result.raw_response.setdefault("trigger_event_id", correlation[1])
+        return result
 
     async def _send_with_retry(
         self,
@@ -873,6 +1020,8 @@ class BuzzAdapter(BasePlatformAdapter):
         raised — reactions are best-effort and should never block the main
         message flow.
         """
+        if not self._configuration_is_intact():
+            return False
         if not self.cli_path or not emoji or not message_id:
             return False
         # buzz-cli: `reactions add --event <64-char hex event id> --emoji <e>`.
@@ -901,8 +1050,16 @@ class BuzzAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send an image: local files upload via --file, URLs go as a link."""
+        if not self._configuration_is_intact():
+            return self._failed_delivery("configuration_integrity_changed")
         local = Path(image_url).expanduser() if not image_url.startswith(("http://", "https://")) else None
         if local is not None and local.is_file():
+            correlation = self._turn_correlation()
+            if correlation is not None:
+                return self._failed_delivery(
+                    "correlated_local_media_unsupported",
+                    correlation_id=correlation[2],
+                )
             args = [
                 "messages", "send",
                 "--channel", str(chat_id),
@@ -1226,6 +1383,8 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _handle_event(self, channel_id: str, state: dict, event: dict) -> None:
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
+        if not self._configuration_is_intact():
+            return
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
         if not event_id or event_id in state["seen"]:
@@ -1459,7 +1618,19 @@ class BuzzAdapter(BasePlatformAdapter):
             timestamp=datetime.fromtimestamp(created_at) if created_at else datetime.now(),
         )
 
-        await self.handle_message(event)
+        correlation_id = hashlib.sha256(
+            json.dumps(
+                [str(chat_id), str(message_id), self._self_pubkey],
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        token = _TURN_CORRELATION.set(
+            (id(self), str(chat_id), str(message_id), correlation_id)
+        )
+        try:
+            await self.handle_message(event)
+        finally:
+            _TURN_CORRELATION.reset(token)
         
         # Add a "seen" reaction after dispatching — signals to the user that
         # their message was received and is being processed.
