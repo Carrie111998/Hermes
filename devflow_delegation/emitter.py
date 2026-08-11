@@ -206,19 +206,14 @@ class DelegationEmitter:
             return DelegationResult("queued", fingerprint=fingerprint, reason="dry_run")
 
         req = contract.parse_request(payload)
-        # A prior TERMINAL attempt of this fingerprint may already hold the auto
-        # idempotency key: 4b lets terminal rows through so a fingerprint can
-        # re-open once its cooldown expires (policy: "DECLINED rows gate
-        # re-opens"). The auto key is derived from the fingerprint, so a naive
-        # re-open would collide on the UNIQUE idempotency_key and raise
-        # sqlite3.IntegrityError out of delegate() — violating "never raise for
-        # policy outcomes". Give the re-opened request a per-attempt key so it
-        # inserts cleanly; active dedup is fingerprint-based (4b), never idem-key
-        # based, so uniqueness of the auto key is not relied on for dedup. Any
-        # row found here is necessarily terminal (a non-terminal one would have
-        # deduped at 4b), so this only fires on a legitimate post-cooldown reopen.
-        if req.idempotency_key.startswith("auto:") and \
-                self.ledger.find_by_idempotency_key(req.idempotency_key) is not None:
+        # A prior TERMINAL attempt may already hold the supplied idempotency key.
+        # 4b lets terminal rows through so a fingerprint may re-open after its
+        # cooldown. The key must therefore become unique for the new attempt;
+        # otherwise SQLite raises IntegrityError and turns a policy outcome into
+        # a caller crash. Active dedup remains fingerprint-based (4b), so a
+        # per-attempt suffix preserves duplicate detection while recording a
+        # durable new lifecycle attempt for explicit producer keys too.
+        if self.ledger.find_by_idempotency_key(req.idempotency_key) is not None:
             req.idempotency_key = f"{req.idempotency_key}:{req.request_id}"
         self.ledger.insert_request(req)
         try:
@@ -318,23 +313,28 @@ class DelegationEmitter:
         """
         adopted = rewritten = 0
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
+        on_disk_idempotency_keys = set()
 
         for fp in sorted(self.inbox_dir.glob("*.json")):
             try:
                 env = json.loads(fp.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
+            if not isinstance(env, dict):
+                continue
             if env.get("type") == "DEVFLOW_FIX_REQUEST":
                 try:
                     env = contract.parse_v2_fix_request(env)
-                    req = contract.parse_request(env)
                 except contract.ContractError:
                     continue
-                env = req.to_envelope()
             if env.get("type") != contract.MSG_TYPE:
                 continue
-            idem = env.get("idempotency_key")
-            if idem and self.ledger.find_by_idempotency_key(idem) is None:
+            try:
+                req = contract.parse_request(env)
+            except contract.ContractError:
+                continue
+            on_disk_idempotency_keys.add(req.idempotency_key)
+            if self.ledger.find_by_idempotency_key(req.idempotency_key) is None:
                 try:
                     self.ledger.adopt_envelope(env)
                     adopted += 1
@@ -343,7 +343,8 @@ class DelegationEmitter:
 
         on_disk = {f.name for f in self.inbox_dir.glob("*.json")}
         for row in self.ledger.list_requests(state="REQUESTED", limit=1000):
-            if not any(row["request_id"] in name for name in on_disk):
+            if row["idempotency_key"] not in on_disk_idempotency_keys and not any(
+                    row["request_id"] in name for name in on_disk):
                 env = json.loads(row["envelope_json"])
                 req = contract.parse_request(env)
                 req.request_id = row["request_id"]

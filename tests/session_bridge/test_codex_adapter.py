@@ -127,6 +127,43 @@ def test_source_adapter_treats_missing_stderr_accessor_as_empty() -> None:
     assert adapter.stderr_tail(12) == []
 
 
+def test_source_adapter_stderr_tail_bounds_consumption_when_client_ignores_n() -> None:
+    consumed: list[int] = []
+
+    class UnboundedStderrClient(FakeRequestClient):
+        def __init__(self) -> None:
+            super().__init__({})
+
+        def stderr_tail(self, n: int = 20):
+            del n
+            for index in range(100):
+                consumed.append(index)
+                yield f"line-{index}"
+
+    adapter = CodexSourceAdapter(UnboundedStderrClient(), marker_secret=SECRET)
+
+    assert adapter.stderr_tail(3) == ["line-0", "line-1", "line-2"]
+    assert consumed == [0, 1, 2]
+
+
+def test_source_adapter_stderr_tail_non_positive_limit_consumes_nothing() -> None:
+    consumed: list[int] = []
+
+    class UnboundedStderrClient(FakeRequestClient):
+        def __init__(self) -> None:
+            super().__init__({})
+
+        def stderr_tail(self, n: int = 20):
+            del n
+            consumed.append(1)
+            yield "line"
+
+    adapter = CodexSourceAdapter(UnboundedStderrClient(), marker_secret=SECRET)
+
+    assert adapter.stderr_tail(0) == []
+    assert consumed == []
+
+
 class TestInventory:
     def test_recent_inventory_uses_state_db_and_stops_at_watermark(self) -> None:
         client = FakeInitializingClient({

@@ -240,15 +240,22 @@ The bot will **not** automatically join channels. You must invite it to each cha
 
 ## Slash Commands
 
-Every Hermes command (`/btw`, `/stop`, `/new`, `/model`, `/help`, ...)
-is a native Slack slash command — exactly the way they work on Telegram
-and Discord. Type `/` in Slack and the autocomplete picker lists every
-Hermes command with its description.
+Most Hermes commands (`/btw`, `/stop`, `/new`, `/model`, `/help`, ...)
+are native Slack slash commands, matching Telegram and Discord. Type `/` in
+Slack and the autocomplete picker lists those commands with their descriptions.
+
+Slack allows only 50 app slash commands. Commands deliberately held outside
+that native budget remain available through `/hermes <command>`. This currently
+includes the confirmation-sensitive DevFlow decision flow: use
+`/hermes ddp-approve <request-id> <evidence>` followed by
+`/hermes ddp-approve-confirm <token>` (or the matching decline form). The
+unprefixed `/ddp-approve` syntax is available on platforms without Slack's
+manifest limit.
 
 Under the hood: Hermes ships with a generated Slack app manifest (see
-Step 1, Option A) that declares every command in
+Step 1, Option A) that declares the native subset of
 [`COMMAND_REGISTRY`](https://github.com/NousResearch/hermes-agent/blob/main/hermes_cli/commands.py)
-as a slash command. In Socket Mode, Slack routes the command event
+as slash commands. In Socket Mode, Slack routes the command event
 through the WebSocket regardless of the manifest's `url` field.
 
 ### Agent messaging experience

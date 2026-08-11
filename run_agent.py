@@ -508,6 +508,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        activity_recorder=None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -584,6 +585,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            activity_recorder=activity_recorder,
         )
 
     def _get_session_db_for_recall(self):
@@ -2409,6 +2411,29 @@ class AIAgent:
         summary["prompt_tokens"] = cu.prompt_tokens
         summary["total_tokens"] = cu.total_tokens
         return summary
+
+    def _record_activity_response(
+        self,
+        response: Any,
+        usage: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Attribute sanitized response usage without affecting inference."""
+        if self.activity_recorder is None:
+            return
+        usage = usage if usage is not None else self._usage_summary_for_api_request_hook(response)
+        if not usage:
+            return
+        try:
+            self.activity_recorder.record_response(
+                provider=self.provider or "unknown",
+                model=str(getattr(response, "model", None) or self.model or "unknown"),
+                usage=usage,
+            )
+        except Exception as exc:
+            logger.warning(
+                "activity recorder callback failed: %s",
+                type(exc).__name__,
+            )
 
     @staticmethod
     def _hook_payload_max_chars() -> int:

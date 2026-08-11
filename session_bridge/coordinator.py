@@ -79,6 +79,7 @@ from .sidebar_reconciliation import (
 from .preview import build_session_preview
 from .store import (
     SIDEBAR_EXCLUSION_REASONS,
+    LocalSessionOwnsCanonicalId,
     SessionBridgeStore,
     SidebarSource,
     SidebarSourcePage,
@@ -391,6 +392,28 @@ class ClaudeVisibilityCoordinator:
     def discover(self, *, days: int, limit: int) -> ClaudeVisibilityDiscoveryResult:
         return self._discover(days=days, limit=limit, manual=True)
 
+    @staticmethod
+    def _log_visibility_discovery_degraded(stage: str, exc: BaseException) -> None:
+        """Surface the cause behind an otherwise opaque provider_degraded.
+
+        Both discovery handlers collapse every unexpected failure into the same
+        public reason, and previously logged nothing at all. Distinct faults --
+        a duplicate session identity, a transient `database is locked` under
+        WAL contention, an unreachable provider -- were therefore
+        indistinguishable from the outside, and each one only became visible
+        after the previous had been cleared. The public reason code is
+        unchanged; only the operator-facing diagnosis improves.
+        """
+        try:
+            _LOG.warning(
+                "claude_visibility_discovery_degraded stage=%s exc=%s detail=%r",
+                stage,
+                type(exc).__name__,
+                str(exc)[:200],
+            )
+        except Exception:
+            pass
+
     def _discover(
         self, *, days: int, limit: int, manual: bool
     ) -> ClaudeVisibilityDiscoveryResult:
@@ -438,14 +461,16 @@ class ClaudeVisibilityCoordinator:
                 return ClaudeVisibilityDiscoveryResult(
                     enabled=True, degraded=True, reasons=("inventory_invalid",)
                 )
-            except Exception:
+            except Exception as exc:
+                self._log_visibility_discovery_degraded("status_cursor", exc)
                 return ClaudeVisibilityDiscoveryResult(
                     enabled=True, degraded=True, reasons=("provider_degraded",)
                 )
         try:
             inventory = self._inventory if manual else self._continuous_inventory
             sources = tuple(inventory(after))
-        except Exception:
+        except Exception as exc:
+            self._log_visibility_discovery_degraded("inventory", exc)
             return ClaudeVisibilityDiscoveryResult(
                 enabled=True, degraded=True, reasons=("provider_degraded",)
             )
@@ -676,7 +701,8 @@ class ClaudeVisibilityCoordinator:
                     error_code=result.error_code,
                     registrar_result=registrar_result,
                 )
-            except Exception:
+            except Exception as exc:
+                self._log_visibility_discovery_degraded("record_cycle", exc)
                 return ClaudeVisibilityRunResult(
                     enabled=True,
                     status="degraded",
@@ -697,7 +723,8 @@ class ClaudeVisibilityCoordinator:
                 open_reasons, fatal_reasons = _claude_visibility_enqueue_gates(
                     status_before_discovery
                 )
-            except Exception:
+            except Exception as exc:
+                self._log_visibility_discovery_degraded("enqueue_gates", exc)
                 return recorded(
                     ClaudeVisibilityRunResult(
                         enabled=True,
@@ -895,6 +922,7 @@ class _SidebarExecutor(Protocol):
 _ProviderHealth = dict[str, float | str | None]
 _RECENT_ERROR_LIMIT = 20
 _CODEX_SCAN_FAILURE_CODE = "codex_scan_failed"
+_CODEX_SCAN_LOCAL_OWNER_CODE = "codex_local_session_owns_id"
 _CODEX_SCAN_STAGES = frozenset({
     "full_history_project",
     "immediate_project",
@@ -903,6 +931,11 @@ _CODEX_SCAN_STAGES = frozenset({
 _CODEX_STDERR_TAIL_LINES = 12
 _CODEX_DIAGNOSTIC_MAX_LINES = 8
 _CODEX_DIAGNOSTIC_MAX_CHARS = 2048
+_WINDOWS_TERMINAL_PATH_RE = re.compile(
+    r"(?:[A-Za-z]:[\\/]+|[\\/]{2}(?:\?[\\/]+(?:UNC[\\/]+)?|[^\\/\s]+[\\/]+))"
+    r"[^\r\n'\"<>|]*$"
+)
+_POSIX_TERMINAL_PATH_RE = re.compile(r"/(?:[^\r\n'\"<>|/]+/)*[^\r\n'\"<>|]*$")
 _PATH_FRAGMENT_RE = re.compile(
     r"(?:[A-Za-z]:[\\/]|/|(?:\.{1,2}|~)[\\/]|\b[^\s'\"<>|\\/]+[\\/])"
     r"(?:[^\s'\"<>|\\/]+[\\/])*[^\s'\"<>|]*"
@@ -3550,14 +3583,29 @@ class SessionBridgeCoordinator:
         }
 
     async def _after_successful_scan(self, summary: ScanSummary) -> None:
-        if summary.failed or not await self._register_sidebar_after_successful_scan():
+        if summary.failed:
             return
-        if self._any_configured_provider_unhealthy():
-            return
-        if self._sidebar_executor is not None:
+        sidebar_registered = await self._register_sidebar_after_successful_scan()
+        providers_unhealthy = self._any_configured_provider_unhealthy()
+        if (
+            sidebar_registered
+            and not providers_unhealthy
+            and self._sidebar_executor is not None
+        ):
             await self._run_post_scan_worker(
                 self._sidebar_executor, "sidebar_executor_failed"
             )
+        # Claude-side visibility is a separate lane from the Codex sidebar. The
+        # 2026-07-17 claude-native-session-visibility design requires that it
+        # "must not reuse or couple transitions to session_sidebar_jobs, which
+        # remains specific to Codex" -- pausing the Codex sidebar is a supported
+        # state and must not silently stop desktop registry records.
+        #
+        # It is deliberately outside the provider-health gate too: floating and
+        # registering mirrors only reads the local state database and writes
+        # local registry files, so it cannot depend on Codex reachability. Codex
+        # scans hang on this host (codex_scan_failed), which otherwise starves
+        # the Claude lane indefinitely.
         if self._mirror_float is not None:
             await self._run_post_scan_worker(
                 self._mirror_float, "mirror_float_failed"
@@ -4282,6 +4330,7 @@ class SessionBridgeCoordinator:
         indexed = 0
         rebuilt = 0
         failed = 0
+        locally_owned = 0
         for thread_summary in summaries:
             try:
                 projection = await self._provider_call(
@@ -4298,6 +4347,14 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except LocalSessionOwnsCanonicalId:
+                # Hermes materialises its own Codex-provider sessions under the
+                # same canonical id the bridge uses for imported native threads.
+                # The local row is authoritative and is never adopted, but this
+                # is a benign steady state -- counting it as a scan failure
+                # degrades the provider and starves every downstream lane.
+                locally_owned += 1
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="full_history_project",
@@ -4309,6 +4366,17 @@ class SessionBridgeCoordinator:
                 continue
             indexed += 1
             rebuilt += int(not result.first_seen)
+        if locally_owned:
+            # Counted, never silent: these threads stay outside the bridge
+            # catalog by design.
+            try:
+                _LOG.info(
+                    "codex_scan_diagnostic stage=full_history_project code=%s excluded=%d",
+                    _CODEX_SCAN_LOCAL_OWNER_CODE,
+                    locally_owned,
+                )
+            except Exception:
+                pass
         return ScanSummary(
             provider=Provider.CODEX,
             discovered=len(summaries),
@@ -4382,6 +4450,7 @@ class SessionBridgeCoordinator:
         discovered = len(summaries)
         indexed = 0
         failed = 0
+        locally_owned = 0
         for thread_summary in summaries:
             try:
                 projection = await self._provider_call(
@@ -4402,6 +4471,10 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except LocalSessionOwnsCanonicalId:
+                # Hermes owns this canonical id; never adopted, never a failure.
+                locally_owned += 1
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="immediate_project",
@@ -4412,6 +4485,15 @@ class SessionBridgeCoordinator:
                 failed += 1
                 continue
             indexed += 1
+        if locally_owned:
+            try:
+                _LOG.info(
+                    "codex_scan_diagnostic stage=immediate_project code=%s excluded=%d",
+                    _CODEX_SCAN_LOCAL_OWNER_CODE,
+                    locally_owned,
+                )
+            except Exception:
+                pass
         return ScanSummary(
             provider=Provider.CODEX,
             discovered=discovered,
@@ -4753,6 +4835,7 @@ class SessionBridgeCoordinator:
         await self._save_pending(provider, staged_ids)
         selected_ids = staged_ids[: self._scan_batch_size]
         indexed = 0
+        locally_owned = 0
         for native_id in selected_ids:
             try:
                 summary = summaries_by_native_id.get(native_id)
@@ -4783,6 +4866,15 @@ class SessionBridgeCoordinator:
                 )
             except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
                 raise
+            except LocalSessionOwnsCanonicalId:
+                # Hermes owns this canonical id (its own Codex-provider session).
+                # It is never adopted, but it must not poison the batch: this
+                # handler returns on any error, so treating it as a failure
+                # aborts the whole scan AND leaves the id staged, so every
+                # subsequent cycle re-attempts the same thread forever and the
+                # provider never leaves the degraded state.
+                locally_owned += 1
+                continue
             except Exception as exc:
                 self._record_codex_scan_diagnostic(
                     stage="persistent_project",
@@ -4799,6 +4891,16 @@ class SessionBridgeCoordinator:
                     duration_ms=0,
                 )
             indexed += 1
+        if locally_owned:
+            # Counted, never silent: these threads stay outside the catalog.
+            try:
+                _LOG.info(
+                    "codex_scan_diagnostic stage=persistent_project code=%s excluded=%d",
+                    _CODEX_SCAN_LOCAL_OWNER_CODE,
+                    locally_owned,
+                )
+            except Exception:
+                pass
 
         await self._commit_scan_batch(
             provider,
@@ -5038,20 +5140,31 @@ class SessionBridgeCoordinator:
         exc: BaseException,
         adapter: object,
     ) -> None:
-        if stage not in _CODEX_SCAN_STAGES:
-            raise ValueError("invalid Codex scan diagnostic stage")
-        native_tag = redact_codex_thread_id(native_id) or "unknown"
-        exception_detail = _redacted_codex_diagnostic_text(str(exc))
-        stderr = _redacted_codex_stderr_tail(adapter)
-        _LOG.warning(
-            "codex_scan_diagnostic stage=%s code=%s native=%s detail=%r stderr=%r stderr_lines=%d",
-            stage,
-            _CODEX_SCAN_FAILURE_CODE,
-            native_tag,
-            exception_detail,
-            stderr,
-            len(stderr),
-        )
+        safe_stage = stage if stage in _CODEX_SCAN_STAGES else "diagnostic_unavailable"
+        try:
+            native_tag = redact_codex_thread_id(native_id) or "unknown"
+        except Exception:
+            native_tag = "unknown"
+        try:
+            exception_detail = _redacted_codex_diagnostic_text(str(exc))
+        except Exception:
+            exception_detail = "diagnostic_unavailable"
+        try:
+            stderr = _redacted_codex_stderr_tail(adapter)
+        except Exception:
+            stderr = ()
+        try:
+            _LOG.warning(
+                "codex_scan_diagnostic stage=%s code=%s native=%s detail=%r stderr=%r stderr_lines=%d",
+                safe_stage,
+                _CODEX_SCAN_FAILURE_CODE,
+                native_tag,
+                exception_detail,
+                stderr,
+                len(stderr),
+            )
+        except Exception:
+            pass
         self._record_error_code(_CODEX_SCAN_FAILURE_CODE)
 
     def _elapsed_ms(self, started: float) -> float:
@@ -5062,6 +5175,8 @@ def _redacted_codex_diagnostic_text(value: object) -> str:
     if not isinstance(value, str):
         return ""
     redacted = redact_sensitive_text(value, force=True, redact_url_credentials=True)
+    redacted = _WINDOWS_TERMINAL_PATH_RE.sub("[REDACTED_PATH]", redacted)
+    redacted = _POSIX_TERMINAL_PATH_RE.sub("[REDACTED_PATH]", redacted)
     redacted = _PATH_FRAGMENT_RE.sub("[REDACTED_PATH]", redacted)
     return redacted[:_CODEX_DIAGNOSTIC_MAX_CHARS]
 

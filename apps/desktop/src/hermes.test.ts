@@ -70,6 +70,24 @@ describe('Hermes REST helpers', () => {
     )
   })
 
+  it('forwards a profile-page offset and leaves the returned offset and sessions untouched', async () => {
+    const sessions = [{ id: 'session-501', profile: 'default', title: 'Oldest chat' }]
+
+    api.mockResolvedValue({ limit: 500, offset: 500, sessions, total: 501 })
+
+    const result = await listAllProfileSessions(500, 1, 'exclude', 'recent', 'default', { offset: 500 })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path:
+          '/api/profiles/sessions?limit=500&offset=500&min_messages=1&archived=exclude&order=recent&profile=default',
+        timeoutMs: 60_000
+      })
+    )
+    expect(result.offset).toBe(500)
+    expect(result.sessions).toBe(sessions)
+  })
+
   it('batches the sidebar slices into a single request with per-slice limits + excludes', async () => {
     api.mockResolvedValue({ recents: { sessions: [] }, cron: { sessions: [] }, messaging: { sessions: [] } })
 

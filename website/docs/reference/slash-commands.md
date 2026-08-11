@@ -28,6 +28,21 @@ See the per-platform docs for examples — the structure is identical across pla
 
 If `allow_admin_from` is unset for a scope, that scope stays in unrestricted backward-compat mode — every allowed user can run every command.
 
+### DevFlow approval commands
+
+DevFlow Delegation Plane (DDP) lifecycle decisions are deliberately stricter than the general compatibility rule: `/ddp-approve` and `/ddp-decline` are disabled unless the sending platform and chat scope have a non-empty explicit `allow_admin_from` (or `group_allow_admin_from`) list. The gateway derives the recorded actor from the authenticated platform user ID; never put an actor ID in the command arguments.
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      allow_admin_from: ["YOUR_TELEGRAM_USER_ID"]
+```
+
+Use the `group_allow_admin_from` equivalent for group contexts. Configuration changes are an operator-controlled deployment step; no command enables itself. Each stage command requires a visible reason/evidence reference and returns a five-minute, one-time confirmation token bound to that same account. Confirmation tokens are process-local: restarting the gateway invalidates every unconfirmed token, so stage the decision again after restart and confirm the new token. The only legal outcomes are `TRIAGED → PLANNED` for approval and `TRIAGED → DECLINED` for decline. The durable DDP ledger records the decision and lifecycle transition atomically; committed decisions remain durable across restarts and replay-protected. These commands do not invoke the executor, create a PR, merge, deploy, restart a service, or manage cron.
+
+On Slack, use the legacy catch-all form because the four DDP commands deliberately do not consume one of Slack's 50 native slash-command slots: `/hermes ddp-approve <request-id> <evidence>`, then `/hermes ddp-approve-confirm <token>` (and the matching `ddp-decline` forms). Telegram, Discord, and the CLI use the direct forms shown below. In Slack thread replies, use `!ddp-approve …` and then `!ddp-approve-confirm <token>` rather than a slash command.
+
 ## Interactive CLI slash commands
 
 Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-insensitive.
@@ -242,6 +257,9 @@ The messaging gateway supports the following built-in commands inside Telegram, 
 | `/commands [page]` | Browse all commands and skills (paginated). |
 | `/approve [session\|always]` | Approve and execute a pending dangerous command. `session` approves for this session only; `always` adds to permanent allowlist. |
 | `/deny` | Reject a pending dangerous command. |
+| `/ddp-approve <request-id> <evidence>` | **Admin-only, explicit opt-in.** Stage approval of exactly one `TRIAGED` DevFlow request; reply with the returned `/ddp-approve-confirm <token>` from the same authenticated account to transition it to `PLANNED`. |
+| `/ddp-decline <request-id> <evidence>` | **Admin-only, explicit opt-in.** Stage decline of exactly one `TRIAGED` DevFlow request; reply with the returned `/ddp-decline-confirm <token>` from the same authenticated account to transition it to `DECLINED`. |
+| `/ddp-approve-confirm <token>` / `/ddp-decline-confirm <token>` | Execute the corresponding staged DDP decision once. Tokens are actor-bound, expire after five minutes, and are durably replay-protected. These commands cannot build, open a PR, merge, deploy, restart services, or change cron configuration. Telegram also accepts underscore spellings such as `/ddp_approve`. |
 | `/update` | Update Hermes Agent to the latest version. |
 | `/restart` | Gracefully restart the gateway after draining active runs. When the gateway comes back online, it sends a confirmation to the requester's chat/thread. |
 | `/debug` | Upload debug report (system info + logs) and get shareable links. |

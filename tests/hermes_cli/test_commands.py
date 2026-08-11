@@ -120,6 +120,22 @@ class TestResolveCommand:
         assert topic.name == "topic"
         assert "topic" in GATEWAY_KNOWN_COMMANDS
 
+    def test_ddp_commands_and_telegram_aliases_resolve(self):
+        assert resolve_command("ddp-approve").name == "ddp-approve"
+        assert resolve_command("ddp_approve").name == "ddp-approve"
+        assert resolve_command("ddp-decline").name == "ddp-decline"
+        assert resolve_command("ddp_decline").name == "ddp-decline"
+        assert resolve_command("ddp-approve-confirm").name == "ddp-approve-confirm"
+        assert resolve_command("ddp-approve-confirm").gateway_only
+        assert resolve_command("ddp_approve_confirm").name == "ddp-approve-confirm"
+        assert resolve_command("ddp-decline-confirm").name == "ddp-decline-confirm"
+        assert resolve_command("ddp-decline-confirm").gateway_only
+        assert resolve_command("ddp_decline_confirm").name == "ddp-decline-confirm"
+        assert "ddp_approve" in GATEWAY_KNOWN_COMMANDS
+        assert "ddp_decline" in GATEWAY_KNOWN_COMMANDS
+        assert "ddp_approve_confirm" in GATEWAY_KNOWN_COMMANDS
+        assert "ddp_decline_confirm" in GATEWAY_KNOWN_COMMANDS
+
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"
         assert resolve_command("/bg").name == "background"
@@ -277,6 +293,21 @@ class TestSlackSubcommandMap:
         mapping = slack_subcommand_map()
         assert "bg" in mapping
         assert "reset" in mapping
+
+    def test_ddp_decisions_route_through_hermes_on_slack(self):
+        """The four confirmation-sensitive DDP commands intentionally preserve
+        Slack's native-slash budget and remain reachable via /hermes."""
+        mapping = slack_subcommand_map()
+        native_names = {name for name, _desc, _hint in slack_native_slashes()}
+        for command in (
+            "ddp-approve",
+            "ddp-decline",
+            "ddp-approve-confirm",
+            "ddp-decline-confirm",
+        ):
+            assert mapping[command] == f"/{command}"
+            assert command in _SLACK_VIA_HERMES_ONLY
+            assert command not in native_names
 
     def test_excludes_cli_only_without_config_gate(self):
         mapping = slack_subcommand_map()

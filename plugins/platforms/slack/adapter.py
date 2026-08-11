@@ -1170,11 +1170,12 @@ class SlackAdapter(BasePlatformAdapter):
 
             # Register slash command handler(s)
             #
-            # Every gateway command from COMMAND_REGISTRY is a native Slack
-            # slash, matching Discord and Telegram's model (e.g. /btw, /stop,
-            # /model work directly without /hermes prefix). A single regex
-            # matcher dispatches all of them to one handler so we don't need
-            # N identical @app.command() decorators.
+            # Gateway commands included in the generated Slack manifest are
+            # native slashes, matching Discord and Telegram where capacity
+            # permits (e.g. /btw, /stop, /model). Commands intentionally held
+            # for the /hermes catch-all remain available as /hermes <command>.
+            # A single regex matcher dispatches all native slashes to one
+            # handler so we don't need N identical @app.command() decorators.
             #
             # The slash commands must ALSO be declared in the Slack app
             # manifest (see `hermes slack manifest`). In Socket Mode, Slack
@@ -4504,10 +4505,11 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_slash_command(self, command: dict) -> None:
         """Handle Slack slash commands.
 
-        Every gateway command in COMMAND_REGISTRY is registered as a native
-        Slack slash (``/btw``, ``/stop``, ``/model``, etc.), matching the
+        Gateway commands included in the Slack manifest are registered as
+        native slashes (``/btw``, ``/stop``, ``/model``, etc.), matching the
         Discord and Telegram model. The slash name itself is the command;
-        any text after it is the argument list.
+        any text after it is the argument list. Commands excluded from the
+        native manifest remain available through ``/hermes <subcommand>``.
 
         The legacy ``/hermes <subcommand> [args]`` form is preserved for
         backward compatibility with older workspace manifests and for users

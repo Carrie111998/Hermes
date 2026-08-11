@@ -634,6 +634,7 @@ def test_legacy_database_rebuilds_characterization_events_for_launch_abort(
         assert migrations == {
             "claude_characterization_abort_max_attempts_v27",
             "claude_characterization_events_v28",
+            "claude_characterization_event_orphan_quarantine_v29",
         }
         assert _characterization_event_rows(upgraded._conn) == expected_rows
         assert _characterization_trigger_sql(upgraded._conn) == expected_trigger_sql

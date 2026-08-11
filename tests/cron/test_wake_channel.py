@@ -1,0 +1,208 @@
+"""In-memory wake channel between the event dispatcher and the scheduler.
+
+Activation deliberately does NOT go through ``trigger_job``: that writes
+jobs.json on every activation (contending with the scheduler's own ~1/min
+rewrite) and sets ``enabled: True``, which would silently revive a worker an
+operator had disabled.
+
+The channel is intentionally volatile. Wakes are lost on gateway restart, and
+that is safe *only* because the deterministic reconciler re-derives pending
+work from the mailbox. Durability lives in the ledger, not here.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+
+import pytest
+
+from cron import wake_channel
+
+
+@pytest.fixture(autouse=True)
+def _clean():
+    wake_channel.clear_wakes()
+    yield
+    wake_channel.clear_wakes()
+
+
+class TestRequestAndDrain:
+    def test_request_then_drain_yields_the_job(self):
+        assert wake_channel.request_wake("j1", caller="test", reason="score_request") is True
+        assert wake_channel.drain_wakes() == {"j1"}
+
+    def test_drain_is_exhaustive(self):
+        wake_channel.request_wake("j1", caller="test", reason="r")
+        wake_channel.drain_wakes()
+        assert wake_channel.drain_wakes() == set()
+
+    def test_duplicate_requests_collapse(self):
+        assert wake_channel.request_wake("j1", caller="test", reason="r") is True
+        assert wake_channel.request_wake("j1", caller="test", reason="r") is False
+        assert wake_channel.drain_wakes() == {"j1"}
+
+    def test_distinct_jobs_accumulate(self):
+        wake_channel.request_wake("j1", caller="test", reason="r")
+        wake_channel.request_wake("j2", caller="test", reason="r")
+        assert wake_channel.drain_wakes() == {"j1", "j2"}
+
+    def test_pending_is_observable_without_consuming(self):
+        wake_channel.request_wake("j1", caller="test", reason="r")
+        assert wake_channel.pending_wakes() == frozenset({"j1"})
+        assert wake_channel.drain_wakes() == {"j1"}
+
+
+class TestValidation:
+    @pytest.mark.parametrize("bad", ("", "   ", None, 7))
+    def test_blank_job_id_is_rejected(self, bad):
+        with pytest.raises(ValueError, match="job_id"):
+            wake_channel.request_wake(bad, caller="test", reason="r")
+
+    def test_caller_is_required(self):
+        """Anonymous wakes make postmortem attribution impossible."""
+        with pytest.raises(ValueError, match="caller"):
+            wake_channel.request_wake("j1", caller="  ", reason="r")
+
+
+class TestBounded:
+    def test_channel_is_capped_and_drops_loudly(self):
+        """A runaway producer must not grow the channel without bound."""
+        cap = wake_channel.MAX_PENDING
+        for i in range(cap):
+            assert wake_channel.request_wake(f"j{i}", caller="test", reason="r") is True
+        assert wake_channel.request_wake("overflow", caller="test", reason="r") is False
+        assert "overflow" not in wake_channel.pending_wakes()
+
+
+class TestConcurrency:
+    def test_concurrent_requests_and_drain_lose_nothing(self):
+        def _add(i):
+            wake_channel.request_wake(f"j{i}", caller="test", reason="r")
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_add, range(200)))
+        assert len(wake_channel.drain_wakes()) == 200
+
+    def test_only_one_drainer_gets_each_job(self):
+        for i in range(100):
+            wake_channel.request_wake(f"j{i}", caller="test", reason="r")
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            batches = list(pool.map(lambda _: wake_channel.drain_wakes(), range(4)))
+        seen = [j for b in batches for j in b]
+        assert len(seen) == len(set(seen)) == 100
+
+
+# ---------------------------------------------------------------------------
+# Scheduler integration
+# ---------------------------------------------------------------------------
+
+
+class TestSchedulerIntegration:
+    """`_collect_woken_jobs` is what tick() uses to turn wakes into work."""
+
+    def _jobs(self, monkeypatch, rows):
+        from cron import scheduler
+        monkeypatch.setattr(scheduler, "load_jobs", lambda: rows)
+        return scheduler
+
+    def test_woken_enabled_job_is_returned(self, monkeypatch):
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "a", "enabled": True}])
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        got = s._collect_woken_jobs(exclude_ids=set())
+
+        assert [j["id"] for j in got] == ["j1"]
+
+    def test_disabled_job_is_never_revived(self, monkeypatch):
+        """trigger_job would have set enabled=True; this must not."""
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "a", "enabled": False}])
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids=set()) == []
+
+    def test_already_due_job_is_not_run_twice(self, monkeypatch):
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "a", "enabled": True}])
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids={"j1"}) == []
+
+    def test_unknown_job_id_is_dropped(self, monkeypatch):
+        s = self._jobs(monkeypatch, [{"id": "other", "name": "a", "enabled": True}])
+        wake_channel.request_wake("ghost", caller="test", reason="r")
+
+        assert s._collect_woken_jobs(exclude_ids=set()) == []
+
+    def test_wakes_are_consumed_even_when_unusable(self, monkeypatch):
+        """A disabled job's wake must not be redelivered forever."""
+        s = self._jobs(monkeypatch, [{"id": "j1", "name": "a", "enabled": False}])
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        s._collect_woken_jobs(exclude_ids=set())
+
+        assert wake_channel.pending_wakes() == frozenset()
+
+    def test_collection_never_raises_into_the_tick(self, monkeypatch):
+        from cron import scheduler
+
+        def _boom():
+            raise OSError("jobs.json unreadable")
+
+        monkeypatch.setattr(scheduler, "load_jobs", _boom)
+        wake_channel.request_wake("j1", caller="test", reason="r")
+
+        assert scheduler._collect_woken_jobs(exclude_ids=set()) == []
+
+    def test_woken_job_schedule_is_not_advanced(self, monkeypatch):
+        """An event must not shift the job's regular cadence."""
+        from cron import scheduler
+
+        advanced = []
+        monkeypatch.setattr(scheduler, "load_jobs",
+                            lambda: [{"id": "j1", "name": "a", "enabled": True}])
+        monkeypatch.setattr(scheduler, "advance_next_run", lambda jid: advanced.append(jid))
+
+        scheduler._collect_woken_jobs(exclude_ids=set())
+
+        assert advanced == []
+
+
+class TestTickExecutesWokenJobs:
+    """The wiring inside tick() itself, not just the collector.
+
+    Removing `due_jobs = due_jobs + woken_jobs` from tick() left every
+    collector test green — the helper was covered, the seam was not.
+    """
+
+    def test_tick_runs_a_job_that_only_an_event_asked_for(self, monkeypatch, tmp_path):
+        from cron import scheduler
+
+        job = {"id": "j1", "name": "woken-job", "enabled": True, "no_agent": True,
+               "script": "x.py"}
+        ran: list[str] = []
+
+        monkeypatch.setattr(scheduler, "get_due_and_skipped_jobs", lambda: ([], []))
+        monkeypatch.setattr(scheduler, "load_jobs", lambda: [job])
+        monkeypatch.setattr(scheduler, "run_job",
+                            lambda j, **k: (ran.append(j["id"]), (True, "", "", None))[1])
+        monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **k: None)
+        monkeypatch.setattr(scheduler, "save_job_output", lambda *a, **k: None)
+        monkeypatch.setattr(scheduler, "advance_next_run", lambda *a, **k: None)
+        monkeypatch.setattr(scheduler, "_deliver_result", lambda *a, **k: (True, None))
+
+        wake_channel.request_wake("j1", caller="test", reason="score_request")
+        scheduler.tick(verbose=False, sync=True)
+
+        assert ran == ["j1"], "tick did not execute the event-woken job"
+
+    def test_tick_with_nothing_woken_and_nothing_due_runs_nothing(self, monkeypatch):
+        from cron import scheduler
+
+        ran: list[str] = []
+        monkeypatch.setattr(scheduler, "get_due_and_skipped_jobs", lambda: ([], []))
+        monkeypatch.setattr(scheduler, "load_jobs", lambda: [])
+        monkeypatch.setattr(scheduler, "run_job",
+                            lambda j, **k: (ran.append(j["id"]), (True, "", "", None))[1])
+
+        scheduler.tick(verbose=False, sync=True)
+
+        assert ran == []

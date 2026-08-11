@@ -141,3 +141,55 @@ def test_emit_twice_dedups_via_ledger(intake, fixture_env, hermes_root, capsys):
         "second emit must dedup through the ledger, not create a second row"
     assert list(inbox.glob("*.json")) == [], \
         "dedup short-circuits before write, so the envelope is not recreated"
+
+
+def test_terminal_ledger_row_does_not_get_reblocked_by_legacy_processed_file(
+        intake, fixture_env, hermes_root, capsys):
+    """A terminal DDP record must reach the emitter's cooldown/reopen policy.
+
+    Legacy v2 mailbox files are a migration fallback only. If their key is
+    already known to the ledger, they must not turn a terminal row into an
+    indefinite intake pre-filter block.
+    """
+    from devflow_delegation.emitter import DelegationEmitter
+
+    mailbox = hermes_root / "mailbox" / "devflow"
+    processed = mailbox / "processed"
+    processed.mkdir(parents=True)
+    processed.joinpath("legacy.json").write_text(json.dumps({
+        "type": "DEVFLOW_FIX_REQUEST",
+        "idempotency_key": "roadmap:sr-901:v1",
+    }), encoding="utf-8")
+
+    em = DelegationEmitter()
+    request = em.delegate(
+        source={"agent": "roadmap-intake", "kind": "arch-review", "finding_id": "SR-901"},
+        kind="task",
+        title="SR-901: Collapse duplicate probe helpers.",
+        problem_statement="Collapse duplicate probe helpers.",
+        evidence=[{"kind": "roadmap_row", "ref": "roadmap.md:L6", "summary": "fixture"}],
+        acceptance_criteria=["Resolve SR-901."],
+        target={"repo": "hermes", "subsystem": "roadmap"},
+        severity="medium",
+        priority="P1",
+        confidence=0.8,
+        idempotency_key="roadmap:sr-901:v1",
+    )
+    assert request.status == "queued"
+    em.ledger.set_state(request.request_id, "DECLINED", terminal_reason="fixture")
+    for queued in (mailbox / "inbox").glob("*.json"):
+        queued.unlink()
+
+    rc = intake.main([
+        "--roadmap", str(fixture_env), "--mailbox", str(mailbox),
+        "--emit", "--no-canvas",
+    ])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "already-queued(dup): 0" in out
+    assert "fresh: 1" in out
+    assert "EMITTED 1 request(s)" in out
+    assert len(list((mailbox / "inbox").glob("*.json"))) == 1
+    assert em.ledger.summary_counts()["total"] == 2
+    assert em.ledger.summary_counts()["by_state"].get("REQUESTED") == 1

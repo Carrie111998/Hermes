@@ -98,6 +98,17 @@ def test_missing_policy_file_is_not_an_error(tmp_path):
     assert load_policy_overrides(tmp_path / "nope.json") == {}
 
 
+def test_utf16_bom_policy_file_from_windows_powershell_loads(tmp_path):
+    # Windows PowerShell's `>` redirection writes UTF-16LE+BOM. This is still
+    # operator-authored JSON and must receive the same fail-closed validation.
+    p = tmp_path / "policy.json"
+    p.write_text(json.dumps({"arch-review": {"mode": "queue"}}), encoding="utf-16")
+
+    overrides = load_policy_overrides(p)
+
+    assert overrides == {"arch-review": {"mode": "queue"}}
+
+
 def test_invalid_override_value_fails_closed(tmp_path):
     # An operator typo in a security-gating enum field (a bad severity or an
     # unknown mode) must fail closed at the config boundary, not silently

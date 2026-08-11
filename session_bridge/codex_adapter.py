@@ -5,6 +5,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 import hashlib
+from itertools import islice
 import json
 import math
 from pathlib import Path
@@ -520,8 +521,11 @@ class CodexSourceAdapter:
             raise TypeError("Codex trusted origins must be a mapping or callable")
 
     def stderr_tail(self, n: int = 20) -> list[str]:
+        limit = max(0, int(n))
+        if limit == 0:
+            return []
         method = getattr(self._client, "stderr_tail", None)
-        return list(method(n)) if callable(method) else []
+        return list(islice(method(limit), limit)) if callable(method) else []
 
     def _load_trusted_origins(self) -> dict[str, str]:
         value = self._trusted_origins_resolver()

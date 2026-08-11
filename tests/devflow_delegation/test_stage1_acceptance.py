@@ -18,6 +18,7 @@ import pytest
 from devflow_delegation import cli
 from devflow_delegation.adapters import explicit, nightly_gate, security_audit, watchdog
 from devflow_delegation.emitter import DelegationEmitter
+from devflow_delegation.lifecycle import transition
 from tests.devflow_delegation.conftest import make_delegate_kwargs
 
 
@@ -40,11 +41,16 @@ def test_synthetic_request_traverses_full_control_plane(queue_all):
         source={"agent": "main", "kind": "explicit", "finding_id": "acc-1"}))
     assert r.status == "queued"
 
-    # lifecycle telemetry via the CLI transition path (what a triage cron uses)
+    # The generic CLI is allowed to run the non-human REQUESTED -> TRIAGED
+    # triage edge. PLANNED is created here through the low-level fixture
+    # primitive so this acceptance test does not model an unauthenticated
+    # operator approval path; production approval uses the gateway protocol.
     assert cli.main(["transition", "--request-id", r.request_id, "--to", "TRIAGED",
                      "--actor", "acceptance"]) == 0
-    assert cli.main(["transition", "--request-id", r.request_id, "--to", "PLANNED",
-                     "--actor", "acceptance"]) == 0
+    assert em.ledger.record_human_decision(
+        r.request_id, "acceptance", "approve", "fixture setup", "token-acceptance"
+    )
+    assert transition(em.ledger, em.bus, r.request_id, "PLANNED", actor="acceptance") == "PLANNED"
 
     row = em.ledger.get_request(r.request_id)
     assert row["state"] == "PLANNED"

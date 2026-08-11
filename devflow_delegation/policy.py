@@ -73,7 +73,14 @@ def load_policy_overrides(path: Path) -> Dict[str, dict]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # utf-8-sig tolerates a UTF-8/UTF-16 BOM: Windows PowerShell's `>`
+        # redirection writes UTF-16LE+BOM, which plain utf-8 rejects at byte 0.
+        raw = path.read_bytes()
+        if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+            text = raw.decode("utf-16")
+        else:
+            text = raw.decode("utf-8-sig")
+        data = json.loads(text)
     except (OSError, ValueError) as exc:
         raise PolicyError(f"policy file unreadable/malformed: {exc}") from exc
     if not isinstance(data, dict):

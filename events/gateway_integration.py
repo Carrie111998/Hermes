@@ -34,6 +34,7 @@ from events.subscribers.whatsapp_escalator import WhatsAppEscalator
 from events.subscribers.digest_composer import DigestComposer, DIGEST_SCHEDULE_HOURS
 from events.subscribers.memory_writer import MemoryWriter
 from events.subscribers.telegram_mirror import TelegramMirror
+from events.subscribers.jobflow_dispatcher import JobFlowDispatcher
 from events.subscribers.mailbox_translator import MailboxTranslator
 from events.subscribers.cron_stale_monitor import CronStaleMonitor
 from events.subscribers.tracker_intent_applier import (
@@ -156,6 +157,19 @@ def startup(adapters: Optional[Dict] = None) -> None:
     # TelegramMirror registered duplicated every mailbox_message delivery.
     # _registry.register(TelegramMirror(_bus))
     _registry.register(MailboxTranslator(_bus))
+    # Event-driven JobFlow activation. Registered unconditionally so its
+    # cursor advances and lag_report() covers it, but INERT unless
+    # HERMES_JOBFLOW_EVENT_DISPATCH is set (default 'off' -> handle() returns
+    # immediately). 'shadow' records would-wake decisions without acting.
+    # Activation goes through cron.wake_channel, never jobs.json.
+    try:
+        from jobflow_dispatch.store import ActivationStore, default_ledger_path
+
+        _registry.register(
+            JobFlowDispatcher(_bus, ActivationStore(default_ledger_path()))
+        )
+    except Exception:
+        logger.exception("JobFlowDispatcher registration failed; continuing without it")
     # Registered like any other subscriber (so startup_all() builds its
     # IntentApplier and shutdown_all()/lag_report() still cover it), but it is
     # driven by a DEDICATED thread below and SKIPPED in _subscriber_poll_loop's

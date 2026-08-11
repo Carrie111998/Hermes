@@ -810,6 +810,23 @@ class SidebarSourcePage(list[SidebarSource]):
         self.next_cursor = next_cursor
 
 
+class LocalSessionOwnsCanonicalId(ValueError):
+    """A local, non-bridge session already materialises this canonical id.
+
+    Hermes writes its own Codex-provider sessions to ``codex:<native_id>`` --
+    the same namespace the bridge uses for imported native Codex threads -- so
+    both systems can legitimately claim one id for the same underlying thread,
+    materialised with different message representations.
+
+    This is neither corruption nor a failed import. The local row holds
+    authoritative content the bridge never wrote (delegation/heartbeat turns,
+    thousands of messages), so it must never be adopted or overwritten. It is a
+    known, benign condition: scans count it as an exclusion rather than a
+    failure, because treating it as a failure degrades the provider and starves
+    every downstream lane that depends on a healthy scan.
+    """
+
+
 class SessionBridgeStore:
     """Transactional persistence for the cross-harness session bridge."""
 
@@ -3421,6 +3438,14 @@ class SessionBridgeStore:
                     and session_row["source"] == provider.value
                 )
                 if not matching_identity:
+                    if (
+                        external_row is None
+                        and session_row["source"] == provider.value
+                    ):
+                        raise LocalSessionOwnsCanonicalId(
+                            "session ID collision for imported session "
+                            f"{session_id!r}"
+                        )
                     raise ValueError(
                         f"session ID collision for imported session {session_id!r}"
                     )
@@ -3974,9 +3999,25 @@ class SessionBridgeStore:
                         database, after=cutoff, limit=limit
                     )
                 )
+        # One Hermes session can legitimately appear in more than one database:
+        # the root/profile split writes some sessions to both this store's own
+        # database and a profile database. Keep the first occurrence --
+        # _native_hermes_databases() yields this store's own database first, so
+        # the primary copy wins, and that is also the copy
+        # _recorded_worktree_snapshots() resolves against. Raising here instead
+        # let 7 duplicated identities out of 20,846 sources disable the entire
+        # Claude visibility lane, because the caller reports any exception from
+        # this path as a generic provider_degraded.
+        deduped: list[SidebarSource] = []
+        seen_identities: set[str] = set()
+        for source in sources:
+            identity = source.source_session_id
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            deduped.append(source)
+        sources = deduped
         identities = [source.source_session_id for source in sources]
-        if len(identities) != len(set(identities)):
-            raise ValueError("duplicate native Hermes session identity across profiles")
         snapshots = self._recorded_worktree_snapshots(identities)
         sources = [
             self._with_recorded_worktree_snapshot(

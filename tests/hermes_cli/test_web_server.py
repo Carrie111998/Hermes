@@ -1870,29 +1870,98 @@ class TestWebServerEndpoints:
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
 
-    def test_profiles_sessions_sidebar_accepts_window_above_500(self):
-        """Load-more must be able to reach every non-empty session in a large
-        profile instead of silently stopping at the old 500-row transport cap."""
+    def test_profiles_sessions_catalog_routes_cap_pages_at_500(self):
+        """Catalog responses stay bounded even when the caller asks for more."""
         from hermes_state import SessionDB
 
-        expected = {f"large-sidebar-{index:04d}" for index in range(501)}
+        rows = [(f"bounded-sidebar-{index:04d}", float(index)) for index in range(501)]
         db = SessionDB()
         try:
-            for session_id in expected:
-                db.create_session(session_id=session_id, source="desktop")
-                db.append_message(session_id=session_id, role="user", content="hi")
+            with db._lock:
+                db._conn.executemany(
+                    "INSERT INTO sessions (id, source, started_at, message_count) VALUES (?, 'desktop', ?, 1)",
+                    rows,
+                )
+                db._conn.commit()
         finally:
             db.close()
 
-        resp = self.client.get(
+        catalog = self.client.get(
+            "/api/profiles/sessions"
+            "?profile=all&limit=5001&offset=0&min_messages=1"
+            "&archived=exclude&order=recent&exclude_sources=cron,telegram"
+        )
+        assert catalog.status_code == 200
+        assert catalog.json()["limit"] == 500
+        assert len(catalog.json()["sessions"]) == 500
+
+        sidebar = self.client.get(
             "/api/profiles/sessions/sidebar"
-            "?recents_profile=all&recents_limit=501&recents_exclude=cron,telegram"
+            "?recents_profile=all&recents_limit=5001&recents_exclude=cron,telegram"
             "&cron_limit=1&messaging_limit=1"
             "&messaging_exclude=cron,cli,codex,desktop,gateway,local,tui"
         )
-        assert resp.status_code == 200
-        returned = {session["id"] for session in resp.json()["recents"]["sessions"]}
-        assert expected <= returned
+        assert sidebar.status_code == 200
+        assert sidebar.json()["recents"]["total"] == 501
+        assert len(sidebar.json()["recents"]["sessions"]) == 500
+
+    def test_profiles_sessions_concrete_profile_pages_cover_full_catalog(self, monkeypatch):
+        """Concrete-profile offsets expose the whole catalog without overlap."""
+        from hermes_state import SessionDB
+
+        expected = {f"paged-session-{index:04d}" for index in range(501)}
+        rows = [
+            (session_id, "desktop", float(index), 1, 0)
+            for index, session_id in enumerate(sorted(expected))
+        ]
+        rows.extend([
+            ("paged-filtered-source", "cron", 1000.0, 1, 0),
+            ("paged-filtered-archived", "desktop", 1001.0, 1, 1),
+            ("paged-filtered-empty", "desktop", 1002.0, 0, 0),
+        ])
+        db = SessionDB()
+        try:
+            with db._lock:
+                db._conn.executemany(
+                    """INSERT INTO sessions
+                       (id, source, started_at, message_count, archived)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    rows,
+                )
+                db._conn.commit()
+        finally:
+            db.close()
+
+        requested_windows = []
+        original_list_sessions_rich = SessionDB.list_sessions_rich
+
+        def record_window(db, *args, **kwargs):
+            requested_windows.append((kwargs["limit"], kwargs["offset"]))
+            return original_list_sessions_rich(db, *args, **kwargs)
+
+        monkeypatch.setattr(SessionDB, "list_sessions_rich", record_window)
+
+        pages = []
+        for offset in (0, 250, 500):
+            response = self.client.get(
+                "/api/profiles/sessions"
+                f"?profile=default&limit=250&offset={offset}&min_messages=1"
+                "&archived=exclude&order=recent&source=desktop"
+            )
+            assert response.status_code == 200
+            page = response.json()
+            assert page["total"] == 501
+            assert page["profile_totals"] == {"default": 501}
+            assert page["limit"] == 250
+            assert page["offset"] == offset
+            assert all(session["profile"] == "default" for session in page["sessions"])
+            pages.append(page["sessions"])
+
+        assert [len(page) for page in pages] == [250, 250, 1]
+        returned = [session["id"] for page in pages for session in page]
+        assert len(returned) == len(set(returned)) == len(expected)
+        assert set(returned) == expected
+        assert requested_windows == [(250, 0), (250, 250), (250, 500)]
 
     def test_profiles_sessions_sidebar_enriches_bridge_provider(self):
         """Imported Claude/Codex sessions must keep their provider badge on the
@@ -2189,6 +2258,40 @@ class TestWebServerEndpoints:
             r["session_id"] == "branch-child" and r.get("lineage_root") == "branch-child"
             for r in results
         )
+
+    def test_get_session_messages_uses_read_only_db(self, monkeypatch):
+        """Transcript reads must not run unrelated Session Bridge migrations.
+
+        A damaged bridge ledger once made every imported Claude transcript fail
+        to open even though the session and message rows were intact.
+        """
+        import hermes_state
+
+        captured = {}
+
+        class _ReadOnlyMessagesDB:
+            def __init__(self, *args, **kwargs):
+                captured["read_only"] = kwargs.get("read_only")
+
+            def resolve_session_id(self, session_id):
+                return session_id
+
+            def resolve_resume_session_id(self, session_id):
+                return session_id
+
+            def get_messages(self, session_id, *, limit=None, offset=0):
+                return [{"role": "user", "content": "still readable"}]
+
+            def close(self):
+                captured["closed"] = True
+
+        monkeypatch.setattr(hermes_state, "SessionDB", _ReadOnlyMessagesDB)
+
+        resp = self.client.get("/api/sessions/claude:imported/messages")
+
+        assert resp.status_code == 200
+        assert resp.json()["messages"][0]["content"] == "still readable"
+        assert captured == {"read_only": True, "closed": True}
 
     def test_get_session_messages_follows_compression_tip(self):
         """Reading a compressed session by its old id should hydrate from the

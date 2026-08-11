@@ -37,6 +37,24 @@ def _packages_find_include():
     return data["tool"]["setuptools"]["packages"]["find"]["include"]
 
 
+def test_activity_packages_and_policy_data_are_packaged():
+    data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    include = data["tool"]["setuptools"]["packages"]["find"]["include"]
+    for package in (
+        "activity_policy",
+        "activity_policy.*",
+        "activity_telemetry",
+        "activity_telemetry.*",
+    ):
+        assert package in include
+
+    package_data = data["tool"]["setuptools"]["package-data"]
+    assert "policies.yaml" in package_data.get("activity_policy", [])
+
+    manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
+    assert "recursive-include activity_policy policies.yaml" in manifest
+
+
 def test_every_on_disk_subpackage_is_covered_by_packages_find():
     """Regression test for #34701 (and the bug class behind #34034 / #28149).
 
@@ -468,3 +486,66 @@ def test_security_pins_present_in_mirrored_lazy_features():
         "pyproject extras — the lazy install path would not enforce the "
         "CVE-patched floor:\n  " + "\n  ".join(problems)
     )
+
+
+#: Top-level packages that live in the source tree but intentionally do NOT
+#: ship in the wheel. Each needs a reason, because the default assumption for
+#: an importable package is that it ships.
+NOT_SHIPPED_TOP_LEVEL = {
+    "tests": "the test suite itself",
+    "scripts": "operator scripts executed from the checkout, never imported",
+    "ai_usage": (
+        "consumed live from the checkout by the laptop tray collector; no "
+        "shipped package imports it (verified 2026-08-10)"
+    ),
+}
+
+
+def test_every_top_level_package_on_disk_is_declared_or_explicitly_excluded():
+    """A NEW top-level package must be shipped or consciously excluded.
+
+    ``test_every_on_disk_subpackage_is_covered_by_packages_find`` only checks
+    packages already named in ``include`` — it derives its top-level set FROM
+    that list, so an entirely undeclared package is invisible to it. That is
+    exactly how ``jobflow_dispatch`` was added, imported fine in the repo, and
+    would have been absent from the wheel: every test passed and nothing
+    flagged it.
+
+    A missing package is silent until an installed-from-wheel deployment
+    raises ModuleNotFoundError at runtime, so the guard belongs here.
+    """
+    include = _packages_find_include()
+    declared = {name for name in include if "." not in name}
+
+    on_disk = {
+        path.name
+        for path in REPO_ROOT.iterdir()
+        if path.is_dir()
+        and (path / "__init__.py").is_file()
+        and not path.name.startswith((".", "_"))
+    }
+
+    undeclared = sorted(on_disk - declared - set(NOT_SHIPPED_TOP_LEVEL))
+    assert undeclared == [], (
+        "top-level package(s) on disk but absent from "
+        "[tool.setuptools.packages.find] include: "
+        f"{undeclared}. Either add '<name>' and '<name>.*' to include, or add "
+        "the name to NOT_SHIPPED_TOP_LEVEL with the reason it must not ship."
+    )
+
+
+def test_excluded_packages_still_exist():
+    """Keep the exclusion list honest as the tree changes."""
+    missing = sorted(
+        name for name in NOT_SHIPPED_TOP_LEVEL if not (REPO_ROOT / name).is_dir()
+    )
+    assert missing == [], (
+        f"NOT_SHIPPED_TOP_LEVEL names packages that no longer exist: {missing}"
+    )
+
+
+def test_jobflow_dispatch_is_packaged():
+    """Regression for the miss this guard was written after."""
+    include = _packages_find_include()
+    for package in ("jobflow_dispatch", "jobflow_dispatch.*"):
+        assert package in include, f"{package} missing from packages.find include"

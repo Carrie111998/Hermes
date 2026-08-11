@@ -55,6 +55,7 @@ def test_machine_shape_matches_spec(ledger):
 def test_legal_forward_path_emits_events(ledger, bus):
     rid = seed(ledger)
     assert transition(ledger, bus, rid, "TRIAGED", actor="test") == "TRIAGED"
+    assert ledger.record_human_decision(rid, "test", "approve", "fixture", "token-forward")
     assert transition(ledger, bus, rid, "PLANNED", actor="test") == "PLANNED"
     hist = ledger.transitions_for(rid)
     assert [t["to_state"] for t in hist] == ["TRIAGED", "PLANNED"]
@@ -78,6 +79,54 @@ def test_illegal_transition_rejected_and_state_unchanged(ledger, bus):
 def test_unknown_request_rejected(ledger, bus):
     with pytest.raises(IllegalTransitionError):
         transition(ledger, bus, "dwr_nonexistent", "TRIAGED", actor="test")
+
+
+def test_triaged_human_edges_require_matching_central_decision_provenance(ledger):
+    rid = seed(ledger)
+    transition(ledger, None, rid, "TRIAGED", actor="triage")
+
+    with pytest.raises(IllegalTransitionError, match="human decision"):
+        transition(ledger, None, rid, "PLANNED", actor="telegram:admin-1")
+
+    with ledger.transaction():
+        assert ledger.record_human_decision(
+            rid, "telegram:admin-1", "approve", "reviewed", "token-1"
+        )
+        assert transition(
+            ledger,
+            None,
+            rid,
+            "PLANNED",
+            actor="telegram:admin-1",
+            expected_from_state="TRIAGED",
+        ) == "PLANNED"
+
+
+def test_triaged_human_edge_rejects_mismatched_decision(ledger):
+    rid = seed(ledger)
+    transition(ledger, None, rid, "TRIAGED", actor="triage")
+    with ledger.transaction():
+        assert ledger.record_human_decision(
+            rid, "telegram:admin-1", "decline", "not ready", "token-1"
+        )
+        with pytest.raises(IllegalTransitionError, match="does not authorize"):
+            transition(ledger, None, rid, "PLANNED", actor="telegram:admin-1")
+
+
+def test_expected_from_state_closes_stale_preread_race(ledger):
+    rid = seed(ledger)
+    transition(ledger, None, rid, "TRIAGED", actor="triage")
+
+    with pytest.raises(IllegalTransitionError, match="expected REQUESTED"):
+        transition(
+            ledger,
+            None,
+            rid,
+            "CANCELLED",
+            actor="stale-cli",
+            expected_from_state="REQUESTED",
+        )
+    assert ledger.get_request(rid)["state"] == "TRIAGED"
 
 
 def test_terminal_states_record_terminal_reason(ledger, bus):

@@ -1642,6 +1642,111 @@ def test_codex_scan_stderr_diagnostics_are_bounded_and_redact_relative_paths() -
     assert all("[REDACTED_PATH]" in line for line in result)
 
 
+@pytest.mark.parametrize(
+    "native_path",
+    (
+        r"C:\\Users\\Private Owner\\Codex Logs\\thread.jsonl",
+        r"\\server\\private share\\Codex Logs\\thread.jsonl",
+        r"\\?\\C:\\Users\\Private Owner\\Codex Logs\\thread.jsonl",
+        r"\\?\\UNC\\server\\private share\\Codex Logs\\thread.jsonl",
+        r"C:\\Users\\Private Owner",
+        r"\\server\\private share",
+        r"\\?\\C:\\Users\\Private Owner",
+        r"\\?\\UNC\\server\\private share",
+    ),
+)
+def test_codex_scan_diagnostic_redacts_windows_path_forms(native_path: str) -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    result = _redacted_codex_diagnostic_text(f"failed at {native_path}")
+
+    assert native_path not in result
+    assert "Private Owner" not in result
+    assert "private share" not in result
+    assert "[REDACTED_PATH]" in result
+
+
+@pytest.mark.parametrize(
+    "native_path",
+    (
+        r"C:\\Users\\Private Owner",
+        r"\\server\\private share",
+        r"\\?\\C:\\Users\\Private Owner",
+        r"\\?\\UNC\\server\\private share",
+    ),
+)
+def test_codex_scan_diagnostic_redacts_entire_terminal_windows_path(
+    native_path: str,
+) -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    assert _redacted_codex_diagnostic_text(f"failed at {native_path}") == (
+        "failed at [REDACTED_PATH]"
+    )
+
+
+@pytest.mark.parametrize(
+    "native_path",
+    (
+        "/home/Private Owner",
+        "/home/Private Owner/Codex Logs/thread.jsonl",
+        "/var/lib/Private Workspace/Session Data",
+    ),
+)
+def test_codex_scan_diagnostic_redacts_entire_terminal_posix_path(
+    native_path: str,
+) -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    assert _redacted_codex_diagnostic_text(f"failed at {native_path}") == (
+        "failed at [REDACTED_PATH]"
+    )
+
+
+def test_codex_scan_diagnostic_does_not_over_redact_ordinary_prose() -> None:
+    from session_bridge.coordinator import _redacted_codex_diagnostic_text
+
+    prose = "Private Owner reviewed the failure after retry"
+
+    assert _redacted_codex_diagnostic_text(prose) == prose
+
+
+@pytest.mark.asyncio
+async def test_codex_scan_diagnostic_failure_never_replaces_projection_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class UnprintableProjectionError(RuntimeError):
+        def __str__(self) -> str:
+            raise RuntimeError("synthetic str failure")
+
+    failing = _codex_summary("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", 300.0)
+    healthy = _codex_summary("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", 200.0)
+    adapter = _FullHistoryCodexAdapter(active=[failing, healthy], archived=[])
+    original_project = adapter.project_thread
+
+    def project_thread(summary: CodexThreadSummary) -> SessionProjection:
+        if summary.native_id == failing.native_id:
+            raise UnprintableProjectionError()
+        return original_project(summary)
+
+    adapter.project_thread = project_thread  # type: ignore[method-assign]
+    coordinator = SessionBridgeCoordinator(
+        config=BridgeConfig(),
+        store=_StateStore([]),
+        adapters={Provider.CODEX: adapter},
+    )
+
+    with caplog.at_level(logging.WARNING, logger="session_bridge.coordinator"):
+        summary = await coordinator.scan_all_history(Provider.CODEX)
+
+    assert summary.failed == 1
+    assert summary.indexed == 1
+    assert adapter.projected_native_ids == [healthy.native_id]
+    assert "codex_scan_diagnostic" in caplog.text
+    assert "diagnostic_unavailable" in caplog.text
+    assert "codex_scan_failed" in coordinator.health()["recent_error_codes"]
+
+
 @pytest.mark.asyncio
 async def test_scan_all_codex_history_includes_archived_when_steady_state_excludes_it() -> (
     None
@@ -6430,9 +6535,17 @@ async def test_reconcile_rejects_non_deterministic_claude_attempt_sidecar(
 
 @pytest.mark.parametrize("continuous", (False, True))
 @pytest.mark.asyncio
-async def test_successful_scan_runs_mirror_float_only_in_continuous_mode(
+async def test_successful_scan_runs_mirror_float_independent_of_sidebar_continuous(
     continuous: bool,
 ) -> None:
+    """Claude-side visibility must not be gated by the Codex sidebar lane.
+
+    Per the 2026-07-17 claude-native-session-visibility design, Claude delivery
+    "must not reuse or couple transitions to session_sidebar_jobs, which remains
+    specific to Codex". Pausing the Codex sidebar (sidebar.continuous=false) is a
+    deliberate, supported state and must not silently stop desktop registry
+    records for Codex/Hermes mirrors.
+    """
     now = 3_000_000.0
     store = _SidebarScanStore()
     event_loop_thread = get_ident()
@@ -6455,9 +6568,49 @@ async def test_successful_scan_runs_mirror_float_only_in_continuous_mode(
     summary = await coordinator.scan_once(Provider.CLAUDE)
 
     assert summary.failed == 0
-    assert len(float_threads) == int(continuous)
-    if continuous:
-        assert float_threads[0] != event_loop_thread
+    assert len(float_threads) == 1
+    assert float_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_successful_scan_floats_mirrors_when_another_provider_is_degraded() -> (
+    None
+):
+    """A degraded Codex provider must not stop Claude-side desktop registration.
+
+    Floating/registering mirrors only reads the local state database and writes
+    local registry files, so it cannot depend on Codex reachability. Codex scans
+    hang on this host (codex_scan_failed), which previously starved the Claude
+    visibility lane indefinitely.
+    """
+    now = 3_000_000.0
+    store = _SidebarScanStore()
+    float_calls: list[int] = []
+
+    class RecordingFloatWorker:
+        def run_once(self) -> dict[str, int]:
+            float_calls.append(1)
+            return {"examined": 0, "floated": 0, "skipped": 0}
+
+    coordinator = SessionBridgeCoordinator(
+        config=_sidebar_config(continuous=True),
+        store=store,
+        adapters={
+            Provider.CLAUDE: _LifecycleClaudeAdapter(),
+            # Configured but never scanned -> last_success stays None, which is
+            # exactly how a hung Codex provider presents.
+            Provider.CODEX: _LifecycleClaudeAdapter(),
+        },
+        target_adapters={Provider.CODEX: _ForbiddenSidebarTarget()},
+        clock=lambda: now,
+        mirror_float=RecordingFloatWorker(),
+    )
+
+    summary = await coordinator.scan_once(Provider.CLAUDE)
+
+    assert summary.failed == 0
+    assert coordinator._any_configured_provider_unhealthy() is True
+    assert float_calls == [1]
 
 
 def test_mirror_float_must_provide_run_once() -> None:

@@ -199,3 +199,157 @@ def test_find_by_idempotency_key(ledger):
     found = ledger.find_by_idempotency_key("critic:gw-timeout:v1")
     assert found["request_id"] == req.request_id
     assert ledger.find_by_idempotency_key("nonexistent:key") is None
+
+
+# Stage 2: transaction(), leases, and executor artifacts.
+def test_transaction_rolls_back_state_and_history_together(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    with pytest.raises(RuntimeError):
+        with ledger.transaction():
+            ledger.set_state(req.request_id, "PLANNED")
+            ledger.record_transition(req.request_id, "REQUESTED", "PLANNED", "test", "p1")
+            raise RuntimeError("simulated crash")
+
+    assert ledger.get_request(req.request_id)["state"] == "REQUESTED"
+    assert ledger.transitions_for(req.request_id) == []
+
+
+def test_nested_transaction_uses_savepoint(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    with ledger.transaction():
+        ledger.set_state(req.request_id, "TRIAGED")
+        with pytest.raises(RuntimeError):
+            with ledger.transaction():
+                ledger.set_state(req.request_id, "PLANNED")
+                raise RuntimeError("inner rollback")
+
+    assert ledger.get_request(req.request_id)["state"] == "TRIAGED"
+
+
+def test_lease_persists_attempt_and_worktree_identity(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    first = ledger.acquire_lease(req.request_id, "executor", lease_id="lse-1")
+    assert first["attempt_count"] == 1
+    assert ledger.set_lease_worktree(req.request_id, "lse-1", "/tmp/worktree", "ddp-branch")
+    assert ledger.lease_for_request(req.request_id)["branch"] == "ddp-branch"
+    assert ledger.release_lease(req.request_id, "lse-1")
+
+    second = ledger.acquire_lease(req.request_id, "executor", lease_id="lse-2")
+    assert second["attempt_count"] == 2
+
+
+def test_renew_heartbeat_renews_expiry(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+    lease = ledger.acquire_lease(req.request_id, "executor", lease_id="lse-1", expires_in_seconds=60)
+
+    assert ledger.renew_heartbeat(req.request_id, lease["lease_id"], expires_in_seconds=600)
+    renewed = ledger.lease_for_request(req.request_id)
+    assert renewed["heartbeat_at"] >= lease["heartbeat_at"]
+    assert renewed["expires_at"] > lease["expires_at"]
+
+
+def test_artifacts_are_idempotent(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+
+    ledger.add_artifact(req.request_id, "branch", "ddp-branch")
+    ledger.add_artifact(req.request_id, "branch", "ddp-branch")
+
+    assert ledger.artifacts_for(req.request_id) == [
+        {"id": 1, "request_id": req.request_id, "kind": "branch", "ref": "ddp-branch", "created_at": ledger.artifacts_for(req.request_id)[0]["created_at"]}
+    ]
+
+
+def test_stage2_schema_migrates_existing_ledger(tmp_path):
+    db = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db)
+    conn.executescript("""
+        CREATE TABLE requests (
+            request_id TEXT PRIMARY KEY, idempotency_key TEXT UNIQUE NOT NULL,
+            fingerprint TEXT NOT NULL, envelope_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'REQUESTED', terminal_reason TEXT,
+            source_agent TEXT NOT NULL, source_kind TEXT NOT NULL,
+            target_repo TEXT NOT NULL, target_subsystem TEXT NOT NULL,
+            kind TEXT NOT NULL, severity TEXT NOT NULL,
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE leases (
+            request_id TEXT PRIMARY KEY, lease_id TEXT NOT NULL, holder TEXT NOT NULL,
+            acquired_at TEXT NOT NULL, expires_at TEXT NOT NULL, heartbeat_at TEXT
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+    migrated = DelegationLedger(db)
+    schema = sqlite3.connect(db)
+    request_columns = {row[1] for row in schema.execute("PRAGMA table_info(requests)")}
+    lease_columns = {row[1] for row in schema.execute("PRAGMA table_info(leases)")}
+    tables = {row[0] for row in schema.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    schema.close()
+
+    assert "lease_attempt_count" in request_columns
+    assert {"worktree_path", "branch", "attempt_count"} <= lease_columns
+    assert "artifacts" in tables
+    migrated.close()
+
+
+def test_count_prs_for_target_since_counts_only_pr_artifacts_in_window(tmp_path):
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+
+    def _seed(idem, repo):
+        req = parse_request({
+            "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+            "idempotency_key": idem,
+            "source": {"agent": "operator", "kind": "explicit", "finding_id": "f"},
+            "kind": "task", "title": "t", "problem_statement": "p",
+            "evidence": [{"kind": "test", "summary": "s"}],
+            "target": {"repo": repo, "subsystem": "src"},
+            "severity": "low", "priority": "P3", "confidence": 1.0,
+            "acceptance_criteria": ["a"], "safety_notes": [],
+        })
+        ledger.insert_request(req)
+        return req.request_id
+
+    a = _seed("k-a", "sandbox")
+    b = _seed("k-b", "sandbox")
+    c = _seed("k-c", "other")
+    ledger.add_artifact(a, "pr", "https://example.test/pr/1")
+    ledger.add_artifact(b, "branch", "ddp-b-a1")          # not a pr -> not counted
+    ledger.add_artifact(c, "pr", "https://example.test/pr/2")  # other target -> not counted
+
+    assert ledger.count_prs_for_target_since("sandbox", "1970-01-01T00:00:00+00:00") == 1
+    assert ledger.count_prs_for_target_since("other", "1970-01-01T00:00:00+00:00") == 1
+    # A window that starts in the far future excludes everything.
+    assert ledger.count_prs_for_target_since("sandbox", "2999-01-01T00:00:00+00:00") == 0
+
+
+def test_count_prs_for_target_since_counts_pr_attempt_alone(tmp_path):
+    # A pr_attempt artifact is written durably BEFORE the PR client is
+    # invoked (see executor._stage_commit_push callers). If gh pr create
+    # succeeds but a later step (gh pr view) raises, no "pr" artifact is
+    # ever written -- but the budget must still see the attempt, or a
+    # second canary tick could open a second real PR against the same
+    # already-exhausted budget.
+    ledger = DelegationLedger(tmp_path / "ledger.db")
+    req = parse_request({
+        "schema_version": "3.0", "type": "DEVFLOW_WORK_REQUEST",
+        "idempotency_key": "k-attempt-only",
+        "source": {"agent": "operator", "kind": "explicit", "finding_id": "f"},
+        "kind": "task", "title": "t", "problem_statement": "p",
+        "evidence": [{"kind": "test", "summary": "s"}],
+        "target": {"repo": "sandbox", "subsystem": "src"},
+        "severity": "low", "priority": "P3", "confidence": 1.0,
+        "acceptance_criteria": ["a"], "safety_notes": [],
+    })
+    ledger.insert_request(req)
+    ledger.add_artifact(req.request_id, "pr_attempt", "ddp-branch-a1")
+
+    assert ledger.count_prs_for_target_since("sandbox", "1970-01-01T00:00:00+00:00") == 1

@@ -9,7 +9,13 @@ import {
   normalizeSessionSource
 } from '@/lib/session-source'
 import { setCronJobs } from '@/store/cron'
-import { $pinnedSessionIds, $sessionsLimit, bumpSessionsLimit, SIDEBAR_SESSIONS_PAGE_SIZE } from '@/store/layout'
+import {
+  $pinnedSessionIds,
+  $sessionsLimit,
+  bumpSessionsLimit,
+  SIDEBAR_SESSIONS_INITIAL_LIMIT,
+  SIDEBAR_SESSIONS_PAGE_SIZE
+} from '@/store/layout'
 import { ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
 import {
   $messagingSessions,
@@ -74,6 +80,7 @@ interface UseSessionListActionsArgs {
  *  wires into the sidebar and refresh effects. */
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
   const refreshSessionsRequestRef = useRef(0)
+  const hydratedProfileTotalsRef = useRef<Map<string, number>>(new Map())
 
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
@@ -140,18 +147,27 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
   const refreshSessions = useCallback(async () => {
     const requestId = refreshSessionsRequestRef.current + 1
     refreshSessionsRequestRef.current = requestId
+    const sessionsEmpty = $sessions.get().length === 0
+
+    // A soft gateway switch clears gateway-bound stores without remounting this
+    // hook. Empty cache means the per-profile hydration memo belongs to the old
+    // backend and cannot suppress a same-name, same-total catalog fetch.
+    if (sessionsEmpty) {
+      hydratedProfileTotalsRef.current.clear()
+    }
+
     // The loading flag exists to drive the initial skeletons (they only render
     // while the list is empty). Turn-complete / reconnect refreshes over a
     // populated list used to flip it true→false anyway, churning every
     // $sessionsLoading subscriber twice per turn for no visible change.
-    const showLoading = $sessions.get().length === 0
+    const showLoading = sessionsEmpty
 
     if (showLoading) {
       setSessionsLoading(true)
     }
 
     try {
-      const limit = $sessionsLimit.get()
+      const limit = Math.min(Math.max(1, $sessionsLimit.get()), SIDEBAR_SESSIONS_INITIAL_LIMIT)
 
       // Require at least one message so abandoned/empty "Untitled" drafts (one
       // was created per TUI/desktop launch before the lazy-create fix) don't
@@ -165,27 +181,35 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       // stay cross-profile.
       const sessionProfile = profileScope === ALL_PROFILES ? 'all' : profileScope
 
-      // Batched: one request opens each profile DB once and returns all three
-      // source-scoped slices, instead of three separate listAllProfileSessions
-      // calls that each reopened + re-counted every profile DB per refresh.
-      const result = await listSidebarSessions({
+      const sidebarRequest = {
         recentsProfile: sessionProfile,
         recentsLimit: limit,
         recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
         cronLimit: CRON_SECTION_LIMIT,
         messagingLimit: MESSAGING_SECTION_LIMIT,
         messagingExclude: MESSAGING_EXCLUDED_SOURCES
-      })
+      }
+
+      // Batched: one request opens each profile DB once and returns all three
+      // source-scoped slices, instead of three separate listAllProfileSessions
+      // calls that each reopened + re-counted every profile DB per refresh.
+      const result = await listSidebarSessions(sidebarRequest)
 
       if (refreshSessionsRequestRef.current === requestId) {
         const recents = result.recents
 
-        // Signature-gate the swap (same pattern as cron/messaging): a refresh
-        // that returns content-identical rows must keep the previous array
-        // identity, or every sidebar memo keyed on $sessions recomputes and the
-        // whole list re-renders once per turn/broadcast for nothing.
+        // The bounded first page is only additive information. Keep every
+        // cached row (plus the normal live/pinned survivors) so a short page or
+        // a partially failed batched response can update recent rows without
+        // making an older ordinary conversation disappear.
         setSessions(prev => {
-          const next = mergeSessionPage(prev, recents.sessions, sessionsToKeep())
+          const keep = sessionsToKeep()
+
+          for (const session of prev) {
+            keep.add(session.id)
+          }
+
+          const next = mergeSessionPage(prev, recents.sessions, keep)
 
           return sameCronSignature(prev, next) ? prev : next
         })
@@ -211,7 +235,151 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
         setMessagingSessions(prev => (sameCronSignature(prev, messagingRows) ? prev : messagingRows))
         // Hit the cap → at least one platform may have more on disk than loaded.
         setMessagingTruncated(result.messaging.sessions.length >= MESSAGING_SECTION_LIMIT)
+
+        // Totals tell us which concrete profile catalogs are stale. A stable
+        // total needs only the bounded batched refresh above; a changed total
+        // is hydrated sequentially in fixed-size concrete-profile pages.
+        const authoritativeTotals = new Map<string, number>()
+
+        for (const [profile, total] of Object.entries(recents.profile_totals ?? {})) {
+          if (typeof total === 'number' && Number.isFinite(total) && total >= 0 && Number.isInteger(total)) {
+            authoritativeTotals.set(normalizeProfileKey(profile), total)
+          }
+        }
+
+        const failedProfiles = new Set(
+          (result.errors ?? []).map(error => (error.profile === 'all' ? 'all' : normalizeProfileKey(error.profile)))
+        )
+
+        for (const [profile, total] of authoritativeTotals) {
+          if (refreshSessionsRequestRef.current !== requestId) {
+            break
+          }
+
+          if (
+            failedProfiles.has('all') ||
+            failedProfiles.has(profile) ||
+            hydratedProfileTotalsRef.current.get(profile) === total
+          ) {
+            continue
+          }
+
+          const hydratedRows: SessionInfo[] = []
+          const seenIds = new Set<string>()
+          let complete = true
+          let offset = 0
+
+          do {
+            if (refreshSessionsRequestRef.current !== requestId) {
+              complete = false
+
+              break
+            }
+
+            let page
+
+            try {
+              page = await listAllProfileSessions(
+                SIDEBAR_SESSIONS_INITIAL_LIMIT,
+                1,
+                'exclude',
+                'recent',
+                profile,
+                { excludeSources: SIDEBAR_EXCLUDED_SOURCES, offset }
+              )
+            } catch {
+              complete = false
+
+              break
+            }
+
+            if (refreshSessionsRequestRef.current !== requestId || page.errors?.length) {
+              complete = false
+
+              break
+            }
+
+            const concreteTotal = page.profile_totals?.[profile] ?? page.total
+
+            // Every concrete page must describe the same complete catalog as
+            // the batched response that triggered this hydration. A missing,
+            // synthetic, malformed, or drifted total makes the page additive
+            // only: never reconcile cached rows or memoize this hydration.
+            if (
+              typeof concreteTotal !== 'number' ||
+              !Number.isFinite(concreteTotal) ||
+              concreteTotal < 0 ||
+              !Number.isInteger(concreteTotal) ||
+              concreteTotal !== total
+            ) {
+              complete = false
+
+              break
+            }
+
+            const rows = page.sessions
+
+            // An empty first page authoritatively confirms a zero-total
+            // profile. Anywhere else it is a stalled pagination cursor.
+            if (rows.length === 0) {
+              if (total !== 0 || offset !== 0) {
+                complete = false
+              }
+
+              break
+            }
+
+            // A concrete-profile request must never leak another owner's row;
+            // reconciling that response could delete one profile and insert a
+            // different one's sessions in its place.
+            if (rows.some(session => normalizeProfileKey(session.profile) !== profile)) {
+              complete = false
+
+              break
+            }
+
+            for (const session of rows) {
+              if (seenIds.has(session.id)) {
+                complete = false
+
+                break
+              }
+
+              seenIds.add(session.id)
+              hydratedRows.push(session)
+            }
+
+            if (!complete || rows.length < SIDEBAR_SESSIONS_INITIAL_LIMIT || seenIds.size >= total) {
+              break
+            }
+
+            offset += SIDEBAR_SESSIONS_INITIAL_LIMIT
+          } while (offset <= total)
+
+          // A cursor/page failure, total drift that left us short, or a stale
+          // request can update nothing authoritatively. Keep the additive first
+          // page and every cached row, and retry on a later refresh.
+          if (!complete || seenIds.size !== total || refreshSessionsRequestRef.current !== requestId) {
+            continue
+          }
+
+          const keep = sessionsToKeep(profile)
+
+          setSessions(prev => {
+            const inProfile = (session: SessionInfo) => normalizeProfileKey(session.profile) === profile
+            const previousForProfile = prev.filter(inProfile)
+            const reconciledProfile = mergeSessionPage(previousForProfile, hydratedRows, keep)
+            const next = [...prev.filter(session => !inProfile(session)), ...reconciledProfile]
+
+            return sameCronSignature(prev, next) ? prev : next
+          })
+          hydratedProfileTotalsRef.current.set(profile, total)
+        }
       }
+    } catch {
+      // A failed bounded first-page read is non-destructive. Leave every cache
+      // slice intact; the loading flag still settles in finally and a later
+      // refresh can retry.
     } finally {
       if (showLoading && refreshSessionsRequestRef.current === requestId) {
         setSessionsLoading(false)
@@ -234,19 +402,24 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
     const inKey = (s: SessionInfo) => normalizeProfileKey(s.profile) === key
     const loaded = $sessions.get().filter(inKey).length
 
-    const result = await listAllProfileSessions(loaded + SIDEBAR_SESSIONS_PAGE_SIZE, 1, 'exclude', 'recent', key, {
-      excludeSources: SIDEBAR_EXCLUDED_SOURCES
+    const result = await listAllProfileSessions(SIDEBAR_SESSIONS_INITIAL_LIMIT, 1, 'exclude', 'recent', key, {
+      excludeSources: SIDEBAR_EXCLUDED_SOURCES,
+      offset: loaded
     })
 
-    const keep = sessionsToKeep(key)
+    setSessions(prev => {
+      const previousForProfile = prev.filter(inKey)
+      const keep = sessionsToKeep(key)
 
-    setSessions(prev => [
-      ...prev.filter(s => !inKey(s)),
-      ...mergeSessionPage(prev.filter(inKey), result.sessions, keep)
-    ])
+      for (const session of previousForProfile) {
+        keep.add(session.id)
+      }
+
+      return [...prev.filter(s => !inKey(s)), ...mergeSessionPage(previousForProfile, result.sessions, keep)]
+    })
 
     const total = result.profile_totals?.[key] ?? result.total ?? result.sessions.length
-    setSessionProfileTotals(prev => ({ ...prev, [key]: Math.max(total, result.sessions.length) }))
+    setSessionProfileTotals(prev => ({ ...prev, [key]: Math.max(total, loaded + result.sessions.length) }))
   }, [])
 
   return {

@@ -1,4 +1,5 @@
 graft skills
+recursive-include activity_policy policies.yaml
 graft optional-skills
 graft optional-mcps
 graft locales

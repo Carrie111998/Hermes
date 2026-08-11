@@ -1320,6 +1320,17 @@ class TestBangPrefixCommands:
         assert msg_event.message_type == MessageType.COMMAND
 
     @pytest.mark.asyncio
+    async def test_bang_ddp_command_is_rewritten_to_slash(self, adapter):
+        """Slack thread guidance may safely use ``!ddp-approve``."""
+        await adapter._handle_slack_message(
+            self._make_event("!ddp-approve dwr_123 operator reviewed", thread_ts="1111111111.000001")
+        )
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.text == "/ddp-approve dwr_123 operator reviewed"
+        assert msg_event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
     async def test_bang_works_inside_thread(self, adapter):
         """The whole point: ``!stop`` inside a thread reply dispatches."""
         evt = self._make_event("!stop", thread_ts="1111111111.000001")

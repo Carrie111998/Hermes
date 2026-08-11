@@ -367,6 +367,7 @@ export async function listSessions(
 export interface SessionSourceFilter {
   source?: string
   excludeSources?: string[]
+  offset?: number
 }
 
 export async function listAllProfileSessions(
@@ -377,6 +378,9 @@ export async function listAllProfileSessions(
   profile: 'all' | (string & {}) = 'all',
   filter: SessionSourceFilter = {}
 ): Promise<PaginatedSessions> {
+  const offset =
+    typeof filter.offset === 'number' && Number.isFinite(filter.offset) ? Math.max(0, Math.floor(filter.offset)) : 0
+
   const sourceParam = filter.source ? `&source=${encodeURIComponent(filter.source)}` : ''
 
   const excludeParam = filter.excludeSources?.length
@@ -385,16 +389,12 @@ export async function listAllProfileSessions(
 
   const result = await window.hermesDesktop.api<PaginatedSessions>({
     path:
-      `/api/profiles/sessions?limit=${limit}&offset=0&min_messages=${Math.max(0, minMessages)}` +
+      `/api/profiles/sessions?limit=${limit}&offset=${offset}&min_messages=${Math.max(0, minMessages)}` +
       `&archived=${archived}&order=${order}&profile=${encodeURIComponent(profile)}${sourceParam}${excludeParam}`,
     timeoutMs: SESSION_LIST_REQUEST_TIMEOUT_MS
   })
 
-  return {
-    ...result,
-    sessions: result.sessions.slice(0, limit),
-    offset: 0
-  }
+  return result
 }
 
 // Batched sidebar slices in one request: recents (scoped to the active profile),

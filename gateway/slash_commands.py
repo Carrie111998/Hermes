@@ -371,7 +371,10 @@ class GatewaySlashCommandsMixin:
         from gateway.slash_access import policy_for_source as _policy_for_source
 
         source = event.source
-        policy = _policy_for_source(self.config, source)
+        config = self._gateway_config_for_source(source)
+        if config is None:
+            return "**You** — slash access policy unavailable for this profile"
+        policy = _policy_for_source(config, source)
         platform = source.platform.value if source and source.platform else "?"
         chat_type = (source.chat_type if source else "") or "dm"
         scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
@@ -803,7 +806,11 @@ class GatewaySlashCommandsMixin:
         """
         try:
             from gateway.slash_access import policy_for_source
-            policy = policy_for_source(self.config, source)
+
+            config = self._gateway_config_for_source(source)
+            if config is None:
+                return False
+            policy = policy_for_source(config, source)
             uid = getattr(source, "user_id", None)
             return bool(policy.enabled and uid and policy.is_admin(uid))
         except Exception:
@@ -4634,6 +4641,200 @@ class GatewaySlashCommandsMixin:
         lines.append("")
         lines.append("Invoke a bundle with `/<slug>` to load all its skills.")
         return "\n".join(lines)
+
+    # DDP decisions are intentionally separate from /approve and /deny, which
+    # resolve pending dangerous tool commands.  The gateway command path is
+    # deliberately fail-closed: an operator must configure an explicit admin
+    # list for the source scope before a lifecycle decision can even be staged.
+    _DDP_CONFIRM_TTL_SECONDS = 300.0
+
+    def _ddp_actor_for_source(self, source: SessionSource) -> Optional[str]:
+        """Return an authenticated, explicitly-admin actor identity or None."""
+        try:
+            from gateway.slash_access import policy_for_source
+
+            config = self._gateway_config_for_source(source)
+            if config is None:
+                return None
+            policy = policy_for_source(config, source)
+            user_id = str(getattr(source, "user_id", "") or "").strip()
+            platform = getattr(source, "platform", None)
+            platform_name = getattr(platform, "value", str(platform or "")).strip()
+            if not (policy.enabled and user_id and policy.is_admin(user_id) and platform_name):
+                return None
+            return f"{platform_name}:{user_id}"
+        except Exception:
+            return None
+
+    def _ddp_ledger_and_bus(self):
+        ledger = getattr(self, "_ddp_ledger", None)
+        bus = getattr(self, "_ddp_bus", None)
+        if ledger is None:
+            from devflow_delegation.emitter import DelegationEmitter
+
+            emitter = DelegationEmitter()
+            ledger, bus = emitter.ledger, emitter.bus
+        return ledger, bus
+
+    def _ddp_decision_service(self):
+        """Return this gateway process's shared authoritative decision service."""
+        service = getattr(self, "_ddp_shared_decision_service", None)
+        if service is None:
+            from devflow_delegation.decision_service import DdpDecisionService
+
+            ledger, bus = self._ddp_ledger_and_bus()
+            service = DdpDecisionService(ledger=ledger, bus=bus)
+            self._ddp_shared_decision_service = service
+        return service
+
+    async def _handle_ddp_decision_command(self, event: MessageEvent, decision: str) -> str:
+        """Stage one bounded, evidence-backed DDP lifecycle decision."""
+        actor = self._ddp_actor_for_source(event.source)
+        if actor is None:
+            return (
+                "⛔ DDP human approval is not enabled for this caller. "
+                "Configure an explicit allow_admin_from policy for this platform scope."
+            )
+
+        args = event.get_command_args().strip().split(maxsplit=1)
+        canonical = "ddp-approve" if decision == "approve" else "ddp-decline"
+        if not args:
+            return f"Usage: /{canonical} <request-id> <evidence>"
+        if len(args) < 2 or not args[1].strip():
+            return "Decision evidence is required; include a short operator-visible reason."
+        request_id, evidence_ref = args[0].strip(), args[1].strip()[:500]
+        if not request_id:
+            return f"Usage: /{canonical} <request-id> <evidence>"
+
+        try:
+            from devflow_delegation.decision_service import (
+                DdpDecisionConflict,
+                DdpDecisionUnauthorized,
+            )
+
+            staged = await asyncio.to_thread(
+                self._ddp_decision_service().stage,
+                request_id=request_id,
+                decision=decision,
+                actor=actor,
+                rationale=evidence_ref,
+            )
+        except DdpDecisionConflict as exc:
+            return str(exc)
+        except DdpDecisionUnauthorized as exc:
+            return str(exc)
+        except Exception as exc:
+            logger.warning("DDP decision ledger unavailable: %s", exc)
+            return "❌ DDP ledger is unavailable; no decision was recorded."
+
+        return (
+            f"DDP {decision} staged for `{request_id}`\n"
+            f"Target lifecycle state: `{staged.target_state}`\n"
+            f"Evidence: {evidence_ref}\n\n"
+            f"To execute this one-time decision, reply "
+            f"`/{canonical}-confirm {staged.confirmation_token}`"
+        )
+
+    async def _handle_ddp_confirm_command(self, event: MessageEvent, decision: str) -> str:
+        """Durably execute an actor-bound, staged DDP decision once."""
+        actor = self._ddp_actor_for_source(event.source)
+        if actor is None:
+            return (
+                "⛔ DDP human approval is not enabled for this caller. "
+                "Configure an explicit allow_admin_from policy for this platform scope."
+            )
+        token = event.get_command_args().strip().split(maxsplit=1)[0] if event.get_command_args().strip() else ""
+        if not token:
+            canonical = "ddp-approve" if decision == "approve" else "ddp-decline"
+            return f"Usage: /{canonical}-confirm <confirmation-token>"
+
+        service = self._ddp_decision_service()
+        staged = service.pending(token)
+        if staged is None:
+            return "This DDP confirmation token is unknown, expired, or already used."
+        if staged.decision != decision:
+            return "This confirmation token is for a different DDP decision."
+
+        request_id = staged.request_id
+        target_state = staged.target_state
+        try:
+            from devflow_delegation.decision_service import (
+                DdpDecisionExpired,
+                DdpDecisionTelemetryError,
+                DdpDecisionUnauthorized,
+            )
+            from devflow_delegation.lifecycle import IllegalTransitionError
+
+            result = await asyncio.to_thread(service.confirm, staged=staged, actor=actor)
+            if result == "already_decided":
+                return f"DDP request {request_id} was already decided; no transition was added."
+        except DdpDecisionExpired:
+            return "This DDP confirmation token has expired; stage the decision again."
+        except DdpDecisionUnauthorized as exc:
+            if "actor" in str(exc):
+                return "Only the same admin who staged this DDP decision may confirm it."
+            return f"DDP decision was not applied: {exc}"
+        except IllegalTransitionError as exc:
+            return f"DDP decision was not applied: {exc}"
+        except DdpDecisionTelemetryError:
+            logger.exception("DDP %s telemetry failed for %s", decision, request_id)
+            verb = "approved" if decision == "approve" else "declined"
+            return (
+                f"✅ DDP request {request_id} {verb}; lifecycle state is now {target_state}. "
+                "Telemetry delivery failed after the durable decision."
+            )
+        except Exception as exc:
+            logger.exception("DDP %s confirmation failed for %s", decision, request_id)
+            return f"❌ DDP decision was not applied: {exc}"
+
+        verb = "approved" if decision == "approve" else "declined"
+        return f"✅ DDP request {request_id} {verb}; lifecycle state is now {target_state}."
+
+    async def _handle_ddp_approve_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_decision_command(event, "approve")
+
+    async def _handle_ddp_decline_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_decision_command(event, "decline")
+
+    async def _handle_ddp_approve_confirm_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_confirm_command(event, "approve")
+
+    async def _handle_ddp_decline_confirm_command(self, event: MessageEvent) -> str:
+        return await self._handle_ddp_confirm_command(event, "decline")
+
+    async def _handle_devflow_login_command(self, event: MessageEvent) -> str:
+        """Issue a one-time code to sign in to the loopback Mission Control UI.
+
+        The loopback :3040 browser has no login front door and grants are minted
+        only from an authenticated admin identity. This command mints a login
+        grant (via the same API-server grant store the browser redeem reads) and
+        hands the operator a one-time code to paste at :3040/auth. Same
+        explicit-admin, fail-closed gate as the DDP decision commands.
+        """
+        actor = self._ddp_actor_for_source(event.source)
+        if actor is None:
+            return (
+                "⛔ DevFlow Mission Control login is not enabled for this caller. "
+                "Configure an explicit allow_admin_from policy for this platform scope."
+            )
+        adapter = self.adapters.get(Platform.API_SERVER)
+        get_store = getattr(adapter, "_get_devflow_grant_store", None)
+        if adapter is None or not callable(get_store):
+            return "❌ DevFlow Mission Control API is offline; cannot issue a login code."
+        try:
+            grant = get_store().mint(
+                authenticated_actor=actor,
+                audience="devflow-mission-control",
+            )
+        except Exception as exc:
+            logger.warning("DevFlow login grant mint failed: %s", exc)
+            return "❌ Could not issue a DevFlow login code; please try again."
+        return (
+            "DevFlow Mission Control — one-time login code (single use, ~60s):\n\n"
+            f"`{grant}`\n\n"
+            "Open http://localhost:3040/auth on this machine and paste the code to "
+            "sign in. Re-run /devflow-login for a fresh code if it expires."
+        )
 
     async def _handle_approve_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /approve command — unblock waiting agent thread(s).

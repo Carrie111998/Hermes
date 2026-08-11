@@ -604,6 +604,8 @@ if AIOHTTP_AVAILABLE:
             cors_headers = adapter._cors_headers_for_origin(origin)
 
         if request.method == "OPTIONS":
+            if request.path.startswith("/api/devflow/"):
+                return web.Response(status=403)
             if cors_headers is None:
                 return web.Response(status=403)
             return web.Response(status=200, headers=cors_headers)
@@ -1022,6 +1024,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        self._devflow_grant_store: Optional[Any] = None
+        self._devflow_decision_service: Optional[Any] = None
+        self._devflow_decision_adapter: Optional[Any] = None
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1291,6 +1296,185 @@ class APIServerAdapter(BasePlatformAdapter):
                 return bearer_err
         return self._check_auth(request)
 
+    def _get_devflow_grant_store(self):
+        if self._devflow_grant_store is None:
+            from gateway.devflow_auth import DevflowLoginGrantStore
+
+            self._devflow_grant_store = DevflowLoginGrantStore(
+                audit=lambda event, fields: logger.info(
+                    "DevFlow authentication audit event=%s outcome=%s",
+                    event,
+                    fields.get("outcome", "unknown"),
+                )
+            )
+        return self._devflow_grant_store
+
+    def _get_devflow_decision_adapter(self):
+        from gateway.devflow_decisions import DevflowDecisionAdapter
+
+        service = self._devflow_decision_service
+        if service is None:
+            runner = self.gateway_runner
+            resolver = getattr(runner, "_ddp_decision_service", None)
+            if not callable(resolver):
+                raise RuntimeError("DDP decision service is unavailable")
+            service = resolver()
+            self._devflow_decision_service = service
+        adapter = self._devflow_decision_adapter
+        if adapter is None or getattr(adapter, "_service", None) is not service:
+            adapter = DevflowDecisionAdapter(service)
+            self._devflow_decision_adapter = adapter
+        return adapter
+
+    def _devflow_admin_actor(
+        self,
+        *,
+        platform: Platform,
+        user_id: str,
+    ) -> Optional[str]:
+        runner = self.gateway_runner
+        resolver = getattr(runner, "_ddp_actor_for_source", None)
+        if not callable(resolver) or not user_id:
+            return None
+        from gateway.session import SessionSource
+
+        source = SessionSource(
+            platform=platform,
+            chat_id="devflow-mission-control",
+            chat_type="dm",
+            user_id=user_id,
+        )
+        return resolver(source)
+
+    async def _devflow_json_body(self, request: "web.Request") -> Optional[dict[str, Any]]:
+        try:
+            body = await request.json()
+        except Exception:
+            return None
+        return body if isinstance(body, dict) else None
+
+    @staticmethod
+    def _devflow_reject_browser_origin(request: "web.Request") -> Optional["web.Response"]:
+        if request.headers.get("Origin", "").strip():
+            return web.json_response({"error": "request unavailable"}, status=403)
+        return None
+
+    async def _handle_devflow_grant_mint(self, request: "web.Request") -> "web.Response":
+        origin_err = self._devflow_reject_browser_origin(request)
+        if origin_err:
+            return origin_err
+        init_data = request.headers.get("X-Telegram-Init-Data", "").strip()
+        if not init_data:
+            return self._check_auth(request) or web.json_response(
+                {"error": "request unavailable"}, status=403
+            )
+        try:
+            identity = validate_telegram_init_data(init_data)
+        except MiniAppAuthError:
+            return self._check_auth(request) or web.json_response(
+                {"error": "request unavailable"}, status=403
+            )
+        actor = self._devflow_admin_actor(
+            platform=Platform.TELEGRAM,
+            user_id=identity.user_id,
+        )
+        body = await self._devflow_json_body(request)
+        if actor is None or body is None or set(body) != {"audience"}:
+            return web.json_response({"error": "request unavailable"}, status=403)
+        try:
+            grant = self._get_devflow_grant_store().mint(
+                authenticated_actor=actor,
+                audience=body["audience"],
+            )
+        except Exception:
+            return web.json_response({"error": "request unavailable"}, status=403)
+        return web.json_response({"grant": grant, "expires_in": 60}, status=201)
+
+    async def _handle_devflow_grant_redeem(self, request: "web.Request") -> "web.Response":
+        origin_err = self._devflow_reject_browser_origin(request)
+        if origin_err:
+            return origin_err
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        body = await self._devflow_json_body(request)
+        if body is None or set(body) != {"grant", "audience"}:
+            return web.json_response({"error": "request unavailable"}, status=403)
+        try:
+            redeemed = self._get_devflow_grant_store().redeem(
+                grant=body["grant"], audience=body["audience"]
+            )
+        except Exception:
+            return web.json_response({"error": "request unavailable"}, status=403)
+        return web.json_response({"subject": redeemed.subject})
+
+    def _devflow_actor_from_subject(self, request: "web.Request") -> Optional[str]:
+        subject = request.headers.get("X-Devflow-Operator-Subject", "").strip()
+        return self._get_devflow_grant_store().actor_for_subject(subject)
+
+    @staticmethod
+    def _devflow_decision_error_response(
+        error: Exception, *, confirming: bool
+    ) -> tuple[int, str]:
+        from devflow_delegation.decision_service import (
+            DdpDecisionConflict,
+            DdpDecisionExpired,
+            DdpDecisionUnauthorized,
+        )
+        from gateway.devflow_decisions import DevflowDecisionRequestError
+
+        if isinstance(error, DevflowDecisionRequestError):
+            return 400, "invalid request"
+        if isinstance(error, (DdpDecisionConflict, DdpDecisionExpired)):
+            return 409, "request unavailable"
+        if isinstance(error, DdpDecisionUnauthorized):
+            return (409 if confirming else 403), "request unavailable"
+        return 503, "request unavailable"
+
+    async def _handle_devflow_decision_stage(self, request: "web.Request") -> "web.Response":
+        origin_err = self._devflow_reject_browser_origin(request)
+        if origin_err:
+            return origin_err
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        actor = self._devflow_actor_from_subject(request)
+        body = await self._devflow_json_body(request)
+        if actor is None or body is None:
+            return web.json_response({"error": "request unavailable"}, status=403)
+        try:
+            staged = await self._get_devflow_decision_adapter().stage(actor=actor, body=body)
+        except Exception as error:
+            status, message = self._devflow_decision_error_response(
+                error, confirming=False
+            )
+            return web.json_response({"error": message}, status=status)
+        return web.json_response(staged.as_dict())
+
+    async def _handle_devflow_decision_confirm(self, request: "web.Request") -> "web.Response":
+        origin_err = self._devflow_reject_browser_origin(request)
+        if origin_err:
+            return origin_err
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        actor = self._devflow_actor_from_subject(request)
+        body = await self._devflow_json_body(request)
+        if actor is None or body is None:
+            return web.json_response({"error": "request unavailable"}, status=403)
+        try:
+            result, staged = await self._get_devflow_decision_adapter().confirm(
+                actor=actor, body=body
+            )
+        except Exception as error:
+            status, message = self._devflow_decision_error_response(
+                error, confirming=True
+            )
+            return web.json_response({"error": message}, status=status)
+        return web.json_response(
+            {"result": result, "request_id": staged.request_id, "state": staged.target_state}
+        )
+
     def _get_miniapp_agent_registry(self) -> MiniAppAgentRegistry:
         if self._miniapp_agent_registry is None:
             self._miniapp_agent_registry = MiniAppAgentRegistry()
@@ -1535,6 +1719,10 @@ class APIServerAdapter(BasePlatformAdapter):
             # the target adapter's own verifier (platform-signed bearer), NOT
             # API_SERVER_KEY — external platforms hold no API server key.
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            ("POST", "/api/devflow/auth/grants", self._handle_devflow_grant_mint),
+            ("POST", "/api/devflow/auth/grants/redeem", self._handle_devflow_grant_redeem),
+            ("POST", "/api/devflow/decisions/stage", self._handle_devflow_decision_stage),
+            ("POST", "/api/devflow/decisions/confirm", self._handle_devflow_decision_confirm),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),

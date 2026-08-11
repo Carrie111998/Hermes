@@ -67,8 +67,7 @@ from .coordinator import (
 from .mcp_server import create_app, resolve_bearer_token, resolve_marker_key
 from .mirror_float import (
     ClaudeMirrorFloatWorker,
-    default_ccd_sessions_base,
-    discover_ccd_registry_root,
+    discover_ccd_registry_roots,
 )
 from .mirror import (
     BatchProgress,
@@ -3112,9 +3111,7 @@ class ProductionBackend:
             mirror_float = (
                 ClaudeMirrorFloatWorker(
                     self._require_store(),
-                    registry_root=discover_ccd_registry_root(
-                        default_ccd_sessions_base()
-                    ),
+                    registry_roots=discover_ccd_registry_roots(),
                 )
                 if (
                     not catalog_only
