@@ -289,3 +289,40 @@ def test_huggingface_hub_lazy_pin_inside_transformers_window():
         "range (>=1.5.0,<2). The lazy refresh would downgrade the shared "
         "package and break Hindsight local embeddings (#60783)."
     )
+
+
+def test_no_publish_time_exemptions_have_exact_pins():
+    """Regression for review on #83055: `exclude-newer-package` entries that
+    exist because a pinned version has no publish time on PyPI's simple index
+    (see #79434) must carry an exact `==` pin in an extra. An unconditional
+    exemption on an *unversioned* transitive would let every future release of
+    that package bypass the rolling 14-day quarantine the moment it is
+    published.
+
+    The invariant this asserts: exempt == pinned. If a new no-publish-time
+    package needs an exemption, pin it exactly first — mirror users / older uv
+    still resolve, and cutoff-new releases stay quarantined.
+    """
+    with Path(__file__).resolve().parents[1].joinpath("pyproject.toml").open("rb") as handle:
+        data = tomllib.load(handle)
+    project, tool = data["project"], data["tool"]
+
+    exempt = tool["uv"]["exclude-newer-package"]
+    pinned = {}
+    for extra_name, deps in project["optional-dependencies"].items():
+        for dep in deps:
+            if "==" in dep:
+                name, _, version = dep.partition("==")
+                pinned.setdefault(name, set()).add(version)
+
+    # These three are exempted purely because their *pinned* versions have no
+    # publish-time metadata on the simple index (comment at pyproject.toml
+    # ~line 390). Each must be exactly pinned somewhere, so the exemption
+    # cannot widen selection to a future release.
+    no_publish_time = {"defusedxml": "0.7.1", "python-olm": "3.2.16", "unpaddedbase64": "2.1.0"}
+    for name, expected in no_publish_time.items():
+        assert name in exempt, f"{name} must stay exempt (no publish time on simple index, see #79434)"
+        assert name in pinned and expected in pinned[name], (
+            f"{name} must be exactly pinned =={expected} so the exclude-newer "
+            f"exemption cannot bypass the rolling quarantine (review on #83055)"
+        )

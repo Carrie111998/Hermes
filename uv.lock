@@ -1693,6 +1693,8 @@ matrix = [
     { name = "aiosqlite" },
     { name = "asyncpg" },
     { name = "mautrix", extra = ["encryption"] },
+    { name = "python-olm" },
+    { name = "unpaddedbase64" },
 ]
 mcp = [
     { name = "mcp" },
@@ -1898,6 +1900,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = "==1.2.2" },
     { name = "python-multipart", specifier = ">=0.0.9,<1" },
     { name = "python-multipart", marker = "extra == 'web'", specifier = "==0.0.32" },
+    { name = "python-olm", marker = "extra == 'matrix'", specifier = "==3.2.16" },
     { name = "python-telegram-bot", extras = ["webhooks"], marker = "extra == 'messaging'", specifier = "==22.6" },
     { name = "python-telegram-bot", extras = ["webhooks"], marker = "extra == 'termux'", specifier = "==22.6" },
     { name = "pywin32", marker = "sys_platform == 'win32'", specifier = ">=306,<312" },
@@ -1927,6 +1930,7 @@ requires-dist = [
     { name = "tenacity", specifier = "==9.1.4" },
     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.21" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = "==2025.3" },
+    { name = "unpaddedbase64", marker = "extra == 'matrix'", specifier = "==2.1.0" },
     { name = "urllib3", specifier = ">=2.7.0,<3" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24.0,<1" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'web'", specifier = "==0.41.0" },
