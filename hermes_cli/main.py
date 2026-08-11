@@ -644,7 +644,25 @@ def _apply_profile_override() -> None:
             sys.argv = sys.argv[:start] + sys.argv[start + consume :]
 
 
+_RAW_ARGV_BEFORE_PROFILE_STRIP = list(sys.argv)
 _apply_profile_override()
+
+# Earliest-possible gateway spawn record. `_apply_profile_override()` above is
+# what makes this point viable at all: it resolves HERMES_HOME, so the log's
+# location is finally knowable — and it is still ~50s ahead of `run_gateway()`,
+# which sits behind this module's remaining imports plus plugin discovery
+# (measured 50.6s from process creation on a real Windows boot, 2026-08-11).
+#
+# That window is where a double-spawn's losing racer dies, so it cannot stay
+# unrecorded. Uses a distinct `gateway.spawn` tag and a stdlib-only module so
+# the write costs nothing and cannot perturb `gateway.start` pair detection;
+# the argv gate keeps every non-gateway `hermes` command from writing at all.
+try:
+    from hermes_cli.gateway_diag import emit_gateway_spawn_diag
+
+    emit_gateway_spawn_diag(_RAW_ARGV_BEFORE_PROFILE_STRIP)
+except Exception:
+    pass  # a diagnostic must never block CLI startup
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.

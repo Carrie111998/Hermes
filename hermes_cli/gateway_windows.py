@@ -1402,8 +1402,14 @@ def _print_deep_probes() -> None:
                     tag = event.get("tag", "?")
                     pid = event.get("pid", "?")
                     ts = event.get("ts", "?")
-                    healthy = tag in ("gateway.start",)
-                    print(f"  [6] {_mark(healthy):4s}  Last lifecycle event: tag={tag} pid={pid} ts={ts}")
+                    # `gateway.spawn` is written ~50s before `gateway.start`
+                    # (CLI imports + plugin discovery sit between them), so
+                    # seeing it last means "boot in progress", not a failure —
+                    # otherwise every check during a boot would read FAIL.
+                    booting = tag == "gateway.spawn"
+                    healthy = booting or tag in ("gateway.start",)
+                    suffix = "  (boot in progress)" if booting else ""
+                    print(f"  [6] {_mark(healthy):4s}  Last lifecycle event: tag={tag} pid={pid} ts={ts}{suffix}")
                 except Exception:
                     print(f"  [6] {_mark(False):4s}  Last lifecycle line not JSON: {last_event[:120]}")
             else:

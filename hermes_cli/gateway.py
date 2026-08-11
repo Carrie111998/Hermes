@@ -30,6 +30,13 @@ if os.name == "posix":
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from gateway.config import coerce_systemd_watchdog_seconds, load_gateway_config
+
+# Shared with hermes_cli.main, which writes the earlier `gateway.spawn` record
+# from a point where importing this module would itself cost seconds.
+from hermes_cli.gateway_diag import (
+    process_start_age_s as _process_start_age_s,
+    write_diag as _gateway_exit_diag,
+)
 from gateway.status import pid_exists, terminate_pid
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,
@@ -4978,58 +4985,6 @@ def _guard_official_docker_root_gateway() -> None:
         "  Set HERMES_ALLOW_ROOT_GATEWAY=1 only if you intentionally accept this risk."
     )
     sys.exit(1)
-
-
-def _gateway_exit_diag(tag: str, **extra: object) -> None:
-    """Append one JSON lifecycle record to ``logs/gateway-exit-diag.log``.
-
-    Best-effort by contract: a diagnostic must never be able to kill the
-    gateway, so every failure path is swallowed. Opt out with
-    ``HERMES_GATEWAY_EXIT_DIAG=0`` (default: on while we're still chasing the
-    Windows lifecycle bug).
-
-    Module-level rather than nested inside ``run_gateway()`` so the
-    ``gateway.start`` record can be written at function entry, before any of
-    the startup work that used to precede it.
-    """
-    if os.environ.get("HERMES_GATEWAY_EXIT_DIAG", "1") != "1":
-        return
-    try:
-        import json as _json
-        from datetime import datetime as _dt, timezone as _tz
-
-        from hermes_constants import get_hermes_home as _ghh
-
-        log_dir = _ghh() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        line = {
-            "ts": _dt.now(_tz.utc).isoformat(),
-            "tag": tag,
-            "pid": os.getpid(),
-            "python": sys.version.split()[0],
-            "platform": sys.platform,
-            **extra,
-        }
-        with open(log_dir / "gateway-exit-diag.log", "a", encoding="utf-8") as f:
-            f.write(_json.dumps(line, default=str) + "\n")
-    except Exception:
-        pass  # never let the diagnostic itself crash the gateway
-
-
-def _process_start_age_s() -> float | None:
-    """Seconds between this process's creation and now, or None if unknown.
-
-    Stamped onto ``gateway.start`` so the record self-documents how much
-    boot latency still precedes it — the residual blind spot is then
-    readable from the log itself instead of needing a live
-    ``Get-CimInstance Win32_Process`` correlation after the fact.
-    """
-    try:
-        import psutil  # type: ignore
-
-        return round(time.time() - psutil.Process(os.getpid()).create_time(), 3)
-    except Exception:
-        return None
 
 
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False):
