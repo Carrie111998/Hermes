@@ -2237,9 +2237,18 @@ def _iter_home_target_platforms():
         from hermes_cli.plugins import discover_plugins
         discover_plugins()  # idempotent
         from gateway.platform_registry import platform_registry
-        for entry in platform_registry.plugin_entries():
-            if entry.cron_deliver_env_var and entry.name not in _HOME_TARGET_ENV_VARS:
-                yield entry.name
+        for name in platform_registry.known_names():
+            # Filter by NAME before resolving. ``plugin_entries()`` would run
+            # every deferred loader -- importing all ~18 bundled adapters and
+            # their vendor SDKs -- only for this loop to discard the 11 whose
+            # names are already built-ins above. Resolving just the survivors
+            # yields the identical set: ``get()`` runs one loader, and a
+            # built-in name is skipped without importing anything.
+            if name in _HOME_TARGET_ENV_VARS:
+                continue
+            entry = platform_registry.get(name)
+            if entry and entry.source == "plugin" and entry.cron_deliver_env_var:
+                yield name
     except Exception:
         pass
 
