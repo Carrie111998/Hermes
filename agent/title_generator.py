@@ -105,6 +105,17 @@ _TITLE_RESPONSE_FORMAT = {
     },
 }
 
+# Fallback cascade for relays that reject strict ``json_schema`` (see
+# ``_is_response_format_rejection``). ``json_object`` still constrains the
+# model to valid JSON — the prompt already demands it — while ``None`` drops
+# the constraint entirely and ``_extract_title_text``'s loose scan parses
+# whatever the model returns. Kept as a module constant so the retry loop
+# reads as a data-driven list rather than nested copy-paste.
+_TITLE_RESPONSE_FORMAT_FALLBACKS = (
+    {"type": "json_object"},
+    None,
+)
+
 # Control-tag wrappers that surround machine-authored content inside what is
 # nominally a "user" message. Titling from these is what produces a session
 # named after a slash command or an injected reminder rather than the user's
@@ -330,6 +341,40 @@ def _clean_title(text: str) -> Optional[str]:
     return title
 
 
+def _is_response_format_rejection(exc: Exception) -> bool:
+    """Return True when a 400 plausibly rejects our ``response_format``.
+
+    Strict ``json_schema`` support varies across OpenAI-compatible relays:
+    Nous/Novita-relayed models answer HTTP 400 "This request is not valid.
+    Check the model name and other parameters. Additional info: Provider
+    returned error" — the *parameter* is the problem, not the model or the
+    request body. Detecting that class lets ``generate_title`` retry with a
+    looser constraint instead of leaving the session with only a derived
+    title. Every other 400 class (model-not-found, max_tokens, …) is already
+    retried inside ``call_llm`` and reaches us only after it gave up, so it is
+    raised unchanged rather than masked by the cascade.
+    """
+    status = getattr(exc, "status_code", None)
+    if status is not None and status != 400:
+        return False
+    text = str(exc).lower()
+    markers = (
+        "response_format",
+        "json_schema",
+        "json schema",
+        "strict",
+        "additionalproperties",
+        "additional_properties",
+        "this request is not valid",
+        "not valid",
+        "unsupported parameter",
+        "unsupported_parameter",
+        "invalid request",
+        "request body",
+    )
+    return any(marker in text for marker in markers)
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -391,31 +436,59 @@ def generate_title(
         {"role": "user", "content": user_snippet},
     ]
 
-    try:
-        response = call_llm(
-            task="title_generation",
-            messages=messages,
-            # A title is a handful of tokens. The old 500-token ceiling let a
-            # chatty model burn seconds generating prose we then threw away.
-            max_tokens=64,
-            temperature=0.3,
-            timeout=timeout,
-            main_runtime=main_runtime,
-            extra_body={"response_format": _TITLE_RESPONSE_FORMAT},
+    # Response-format cascade, strictest first. Most providers honor strict
+    # json_schema; relays that don't (Nous/Novita-relayed models) answer HTTP
+    # 400 — detect that class with _is_response_format_rejection and retry
+    # with a looser constraint instead of leaving the session with only a
+    # derived title. The prompt already demands JSON, so json_object is nearly
+    # as good, and the final tier drops the constraint entirely: the loose
+    # scan in _extract_title_text parses plain JSON or prose.
+    formats = (_TITLE_RESPONSE_FORMAT,) + _TITLE_RESPONSE_FORMAT_FALLBACKS
+    last_exc = None
+    for idx, response_format in enumerate(formats):
+        extra_body = (
+            {"response_format": response_format}
+            if response_format is not None
+            else {}
         )
-        content = response.choices[0].message.content or ""
-        return _clean_title(_extract_title_text(content))
-    except Exception as e:
-        # Log at WARNING so this shows up in agent.log without debug mode.
-        # Full detail at debug level for operators who need the stack.
-        logger.warning("Title generation failed: %s", e)
-        logger.debug("Title generation traceback", exc_info=True)
-        if failure_callback is not None:
-            try:
-                failure_callback("title generation", e)
-            except Exception:
-                logger.debug("Title generation failure_callback raised", exc_info=True)
-        return None
+        try:
+            response = call_llm(
+                task="title_generation",
+                messages=messages,
+                # A title is a handful of tokens. The old 500-token ceiling let a
+                # chatty model burn seconds generating prose we then threw away.
+                max_tokens=64,
+                temperature=0.3,
+                timeout=timeout,
+                main_runtime=main_runtime,
+                extra_body=extra_body,
+            )
+            content = response.choices[0].message.content or ""
+            return _clean_title(_extract_title_text(content))
+        except Exception as e:
+            last_exc = e
+            if not _is_response_format_rejection(e) or idx == len(formats) - 1:
+                # Not a response_format 400 (model-not-found, max_tokens, …),
+                # or every tier failed: report the original error unchanged.
+                break
+            logger.warning(
+                "Title generation response_format rejected (%s); "
+                "retrying with a looser constraint",
+                e,
+            )
+    e = last_exc
+    if e is None:  # pragma: no cover — formats is never empty
+        e = RuntimeError("title generation failed without an exception")
+    # Log at WARNING so this shows up in agent.log without debug mode.
+    # Full detail at debug level for operators who need the stack.
+    logger.warning("Title generation failed: %s", e)
+    logger.debug("Title generation traceback", exc_info=True)
+    if failure_callback is not None:
+        try:
+            failure_callback("title generation", e)
+        except Exception:
+            logger.debug("Title generation failure_callback raised", exc_info=True)
+    return None
 
 
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):

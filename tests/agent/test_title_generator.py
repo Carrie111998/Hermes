@@ -560,3 +560,167 @@ class TestModelSwitchMarkerNotTitleable:
         assert apply_instant_title(db, "sess-1", "南京市秦淮区 小时级天气预报") == (
             "南京市秦淮区 小时级天气预报"
         )
+
+
+class _Fake400(Exception):
+    """Exception shaped like openai.BadRequestError (has .status_code)."""
+
+    status_code = 400
+
+
+class _Fake500(Exception):
+    """Exception shaped like an upstream 5xx (not a response_format issue)."""
+
+    status_code = 500
+
+
+class TestResponseFormatFallback:
+    """FIX-B: strict json_schema is rejected by Nous/Novita-relayed models with
+    HTTP 400; generate_title must retry with a looser constraint instead of
+    leaving the session with only a derived title.
+
+    Reproduction (live, 2026-08-11): json_schema strict -> 400, json_object
+    -> 200, no response_format -> 200.
+    """
+
+    def _nous_rejection(self):
+        return _Fake400(
+            "Error code: 400 - {'status': 400, 'message': 'This request is not "
+            "valid. Check the model name and other parameters. Additional info: "
+            "Provider returned error'}"
+        )
+
+    def test_retries_with_json_object_on_response_format_rejection(self):
+        """First tier (strict json_schema) 400s; the json_object tier succeeds."""
+        calls = []
+
+        def flaky_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise self._nous_rejection()
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = '{"title": "Fix flaky auth test"}'
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=flaky_call_llm):
+            title = generate_title("fix the flaky auth test in login")
+
+        assert title == "Fix flaky auth test"
+        assert len(calls) == 2
+        # First attempt sent strict json_schema; the retry sent json_object.
+        assert calls[0]["extra_body"]["response_format"]["type"] == "json_schema"
+        assert calls[1]["extra_body"]["response_format"] == {"type": "json_object"}
+
+    def test_drops_response_format_when_json_object_also_rejected(self):
+        """Both structured tiers 400; the unconstrained tier still titles."""
+        calls = []
+
+        def flaky_call_llm(**kwargs):
+            calls.append(kwargs)
+            if len(calls) < 3:
+                raise self._nous_rejection()
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Fix flaky auth test"
+            return resp
+
+        with patch("agent.title_generator.call_llm", side_effect=flaky_call_llm):
+            title = generate_title("fix the flaky auth test in login")
+
+        assert title == "Fix flaky auth test"
+        assert len(calls) == 3
+        assert calls[0]["extra_body"]["response_format"]["type"] == "json_schema"
+        assert calls[1]["extra_body"]["response_format"] == {"type": "json_object"}
+        # Last tier: no response_format at all — the loose parser handles prose.
+        assert "response_format" not in calls[2]["extra_body"]
+
+    def test_all_tiers_rejected_fires_callback_with_last_error(self):
+        """Every tier 400s: fall back to derived title and surface the failure."""
+        captured = []
+
+        def always_reject(**kwargs):
+            raise self._nous_rejection()
+
+        with patch("agent.title_generator.call_llm", side_effect=always_reject):
+            result = generate_title(
+                "question",
+                failure_callback=lambda task, exc: captured.append((task, exc)),
+            )
+
+        assert result is None
+        assert len(captured) == 1
+        assert captured[0][0] == "title generation"
+        assert captured[0][1].status_code == 400
+
+    def test_non_response_format_400_is_not_retried(self):
+        """A 400 that is not a response_format rejection (e.g. model-not-found)
+        must be reported unchanged, not masked by the cascade."""
+        calls = []
+        exc = _Fake400("Error code: 400 - model 'gpt-999' does not exist")
+        captured = []
+
+        def raise_exc(**kwargs):
+            calls.append(kwargs)
+            raise exc
+
+        with patch("agent.title_generator.call_llm", side_effect=raise_exc):
+            result = generate_title(
+                "question",
+                failure_callback=lambda task, e: captured.append((task, e)),
+            )
+
+        assert result is None
+        assert len(calls) == 1
+        assert captured == [("title generation", exc)]
+
+    def test_5xx_is_not_retried(self):
+        """Upstream 5xx (provider capacity) is already retried inside call_llm;
+        it must not trigger the response_format cascade."""
+        calls = []
+
+        def raise_exc(**kwargs):
+            calls.append(kwargs)
+            raise _Fake500("upstream capacity limits")
+
+        with patch("agent.title_generator.call_llm", side_effect=raise_exc):
+            result = generate_title("question")
+
+        assert result is None
+        assert len(calls) == 1
+
+
+class TestIsResponseFormatRejection:
+    """Detection predicate for the FIX-B cascade."""
+
+    def test_matches_nous_400_message(self):
+        from agent.title_generator import _is_response_format_rejection
+
+        exc = _Fake400(
+            "Error code: 400 - {'status': 400, 'message': 'This request is not "
+            "valid. Check the model name and other parameters. Additional info: "
+            "Provider returned error'}"
+        )
+        assert _is_response_format_rejection(exc) is True
+
+    def test_matches_explicit_response_format_markers(self):
+        from agent.title_generator import _is_response_format_rejection
+
+        assert _is_response_format_rejection(
+            _Fake400("unsupported parameter: response_format")
+        ) is True
+        assert _is_response_format_rejection(
+            _Fake400("json_schema is not supported by this model")
+        ) is True
+
+    def test_rejects_non_400_status(self):
+        from agent.title_generator import _is_response_format_rejection
+
+        exc = _Fake500("This request is not valid")
+        assert _is_response_format_rejection(exc) is False
+
+    def test_rejects_unrelated_400(self):
+        from agent.title_generator import _is_response_format_rejection
+
+        exc = _Fake400("Error code: 400 - model 'gpt-999' does not exist")
+        assert _is_response_format_rejection(exc) is False
