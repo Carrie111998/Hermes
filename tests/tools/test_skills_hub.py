@@ -433,6 +433,38 @@ class TestCheckForSkillUpdates:
 
         assert bundle_content_hash(bundle) == content_hash(skill_dir)
 
+    def test_bundle_content_hash_matches_installed_content_hash_when_file_and_dir_share_prefix(self, tmp_path):
+        # Regression: a file ("styles.md") whose name is a segment-prefix of a
+        # sibling directory ("styles/") sorts differently as a Path vs a
+        # string, and the two hash functions used to disagree on the same
+        # content -- install recorded one digest, `hermes skills check`
+        # compared another, so the skill reported update_available forever.
+        from tools.skills_guard import content_hash
+
+        files = {
+            "SKILL.md": "# demo\n",
+            "styles.md": "# index of styles\n",
+            "styles/a.md": "style a\n",
+            "styles/b.md": "style b\n",
+            "references.md": "# refs\n",
+            "references/x.md": "ref x\n",
+        }
+        bundle = SkillBundle(
+            name="demo-skill",
+            files=dict(files),
+            source="github",
+            identifier="owner/repo/demo-skill",
+            trust_level="community",
+        )
+        skill_dir = tmp_path / "demo-skill"
+        skill_dir.mkdir()
+        for rel, content in files.items():
+            path = skill_dir / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+        assert bundle_content_hash(bundle) == content_hash(skill_dir)
+
 
     def test_reports_update_when_remote_hash_differs(self):
         lock = MagicMock()
