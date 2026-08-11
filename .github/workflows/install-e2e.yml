@@ -7,8 +7,9 @@ name: Install & Update E2E
 # scripts/dev-sandbox.sh, then applies one update route and requires the
 # checkout to land on this commit with a working `hermes`.
 #
-# The starting versions are chosen at runtime from the repo's release tags
-# (scripts/sandbox/pick-release-tags.sh): newest, oldest, and a spread between.
+# The starting versions are chosen at runtime from the official upstream's
+# release tags (scripts/sandbox/pick-release-tags.sh): newest, oldest, and a
+# spread between.  This fork deliberately carries no release tags of its own.
 # A hardcoded list would stop covering the newest release the day after it
 # ships, and would pin an "oldest" that nobody still runs.
 #
@@ -64,16 +65,19 @@ jobs:
       tags: ${{ steps.pick.outputs.tags }}
     steps:
       # This job only reads tag names and runs one script, so avoid blobs and
-      # unrelated paths.  It must, however, fetch the complete ref history:
-      # the shallow checkout plus fetch-tags combination does not populate the
-      # refs/tags namespace reliably under checkout v6, and tags are this job's
-      # entire input.
+      # unrelated paths.  The fork has no release tags; fetch the official
+      # upstream tags explicitly below instead of relying on checkout's
+      # origin-only tag behavior.
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           filter: blob:none
-          fetch-depth: 0
           sparse-checkout: scripts/sandbox/pick-release-tags.sh
           sparse-checkout-cone-mode: false
+      - name: Fetch upstream release tags
+        run: |
+          set -euo pipefail
+          git fetch --force --no-tags https://github.com/NousResearch/hermes-agent.git \
+            '+refs/tags/v*:refs/tags/v*'
       - id: pick
         run: |
           set -euo pipefail
