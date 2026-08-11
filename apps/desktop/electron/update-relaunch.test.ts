@@ -37,7 +37,12 @@ import {
   unpackedDirName
 } from './update-relaunch'
 
-const ROOT = '/home/u/.hermes/hermes-agent'
+// `path.resolve`, not the bare literal: `resolveUnpackedRelease` normalizes
+// its execPath with `path.resolve`, which on Windows prepends the current
+// drive. A driveless POSIX root could therefore never equal the resolved exec
+// path, so this file only passed on POSIX. Resolving the root here is a no-op
+// on POSIX and makes both sides agree on Windows.
+const ROOT = path.resolve('/home/u/.hermes/hermes-agent')
 const UNPACKED = path.join(ROOT, 'apps', 'desktop', 'release', 'linux-unpacked')
 
 // ---------------------------------------------------------------------------

@@ -168,13 +168,19 @@ test('getVenvSitePackagesEntries: returns empty on Windows when site-packages do
 })
 
 test('getVenvSitePackagesEntries: reads pyvenv.cfg version on POSIX and resolves lib/pythonX.Y/site-packages', () => {
+  // Built with `path.join`, like the Windows case above: the implementation
+  // selects the *layout* from `isWindows` but still joins with the host's
+  // separator, so a hard-coded POSIX literal never matched on Windows and this
+  // case only passed on POSIX.
+  const expected = path.join('/venv', 'lib', 'python3.12', 'site-packages')
+
   const result = getVenvSitePackagesEntries('/venv', {
     isWindows: false,
-    directoryExists: p => p === '/venv/lib/python3.12/site-packages',
+    directoryExists: p => p === expected,
     readFile: () => 'version_info = 3.12.1\n'
   })
 
-  assert.deepEqual(result, ['/venv/lib/python3.12/site-packages'])
+  assert.deepEqual(result, [expected])
 })
 
 test('getVenvSitePackagesEntries: returns empty on POSIX when pyvenv.cfg is missing', () => {
