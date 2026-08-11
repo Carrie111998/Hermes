@@ -257,3 +257,137 @@ def test_probe_translates_a_timeout_into_probe_error(monkeypatch):
 
     with pytest.raises(mod.ProbeError):
         mod.probe(["json"], [])
+
+
+def _probe_result(resolved_ok, resolved_missing=(), imports=None):
+    return {
+        "resolved": {
+            **{n: {"ok": True, "origin": f"/root/{n}", "error": None} for n in resolved_ok},
+            **{n: {"ok": False, "origin": None, "error": "not found"} for n in resolved_missing},
+        },
+        "imports": imports or {},
+        "executable": "/usr/bin/python3.11",
+    }
+
+
+def _install_root_with(mapping, root=Path("/root")):
+    from hermes_cli.install_doctor import InstallRoot
+
+    return InstallRoot(path=root, provenance="test", mapping=mapping)
+
+
+def test_analyze_reports_exactly_the_drifted_five():
+    """The 18-of-23 case, reproduced against the checker."""
+    from hermes_cli.install_doctor import analyze
+
+    present = [f"pkg{i}" for i in range(18)]
+    declared = set(present) | set(DRIFTED_ON_2026_08_10)
+    mapping = {name: f"/root/{name}" for name in present}
+
+    findings = analyze(
+        declared,
+        _probe_result(present, DRIFTED_ON_2026_08_10),
+        _install_root_with(mapping),
+    )
+
+    assert findings.missing == tuple(sorted(DRIFTED_ON_2026_08_10))
+    assert findings.ok is False
+    assert findings.checked_breadth is True
+    assert "18" in findings.diagnosis and "23" in findings.diagnosis
+
+
+def test_analyze_is_clean_when_everything_resolves():
+    from hermes_cli.install_doctor import analyze
+
+    names = ["events", "jobflow_dispatch"]
+    findings = analyze(
+        set(names),
+        _probe_result(names, imports={"events.gateway_integration": {"ok": True, "error": None}}),
+        _install_root_with({n: f"/root/{n}" for n in names}),
+    )
+
+    assert findings.ok is True
+    assert findings.missing == ()
+    assert findings.broken_imports == ()
+
+
+def test_analyze_catches_a_broken_chain_when_breadth_is_clean():
+    """The depth layer must fire even when every top-level resolves."""
+    from hermes_cli.install_doctor import analyze
+
+    findings = analyze(
+        {"events"},
+        _probe_result(
+            ["events"],
+            imports={
+                "events.gateway_integration": {
+                    "ok": False,
+                    "error": "ModuleNotFoundError: No module named 'jobflow_dispatch'",
+                }
+            },
+        ),
+        _install_root_with({"events": "/root/events"}),
+    )
+
+    assert findings.missing == ()
+    assert findings.ok is False
+    assert findings.broken_imports[0][0] == "events.gateway_integration"
+    assert "jobflow_dispatch" in findings.broken_imports[0][1]
+
+
+def test_analyze_still_reports_drift_when_the_diagnosis_is_unavailable():
+    """An unparseable finder degrades the explanation, never the verdict."""
+    from hermes_cli.install_doctor import analyze
+
+    findings = analyze(
+        {"events", "jobflow_dispatch"},
+        _probe_result(["events"], ["jobflow_dispatch"]),
+        _install_root_with(None),
+    )
+
+    assert findings.missing == ("jobflow_dispatch",)
+    assert findings.ok is False
+    assert findings.diagnosis is None
+
+
+def test_analyze_skips_breadth_without_declarations_and_says_so():
+    """A sealed wheel install has no source tree to diff against."""
+    from hermes_cli.install_doctor import analyze
+
+    findings = analyze(
+        None,
+        _probe_result([], imports={"events.gateway_integration": {"ok": True, "error": None}}),
+        _install_root_with(None, root=None),
+    )
+
+    assert findings.checked_breadth is False
+    assert findings.ok is True
+    assert any("no pyproject" in note.lower() for note in findings.notes)
+
+
+def test_remedy_names_the_command_the_root_and_the_console_script_trap():
+    from hermes_cli.install_doctor import remedy_lines
+
+    root_path = Path("/agent-src")
+    text = "\n".join(remedy_lines(_install_root_with({}, root=root_path)))
+
+    assert "pip install -e . --no-deps" in text
+    # Compare against str(Path(...)), NOT the literal "/agent-src":
+    # remedy_lines renders str(path), which is "\agent-src" on Windows.
+    assert str(root_path) in text
+    assert "WinError 32" in text
+    assert "python -m hermes_cli.main" in text
+
+
+def test_render_failure_output_contains_the_remedy():
+    from hermes_cli.install_doctor import analyze, render
+
+    root = _install_root_with({"events": "/root/events"})
+    result = _probe_result(["events"], ["jobflow_dispatch"])
+    findings = analyze({"events", "jobflow_dispatch"}, result, root)
+
+    text = "\n".join(render(findings, root, result))
+
+    assert "jobflow_dispatch" in text
+    assert "pip install -e . --no-deps" in text
+    assert "/usr/bin/python3.11" in text

@@ -298,3 +298,127 @@ def probe(names, entrypoints, python: str | None = None, env: dict | None = None
         return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
         raise ProbeError(f"probe returned non-JSON output: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class Findings:
+    """The verdict, plus everything needed to explain it."""
+
+    missing: tuple[str, ...]
+    broken_imports: tuple[tuple[str, str], ...]
+    diagnosis: str | None
+    notes: tuple[str, ...]
+    checked_breadth: bool
+
+    @property
+    def ok(self) -> bool:
+        return not self.missing and not self.broken_imports
+
+
+def analyze(
+    declared: set[str] | None,
+    probe_result: dict,
+    install_root: InstallRoot,
+) -> Findings:
+    """Turn a probe result into a verdict.
+
+    ``declared`` is None when no root yielded a readable pyproject.toml (a
+    sealed wheel install). Breadth is then SKIPPED with an explicit note
+    rather than reported as a pass — there is nothing to have drifted from,
+    and an unqualified "clean" would overstate what was checked. Depth still
+    runs, because importing the entrypoints is meaningful on any install.
+    """
+    resolved = probe_result.get("resolved", {})
+    notes: list[str] = []
+
+    if declared is None:
+        checked_breadth = False
+        missing: list[str] = []
+        notes.append(
+            "Breadth check SKIPPED: no pyproject.toml was readable at the "
+            "resolved install root, so there is no declaration list to diff "
+            "against. Import checks still ran."
+        )
+    else:
+        checked_breadth = True
+        missing = sorted(
+            name
+            for name in declared
+            if not resolved.get(name, {}).get("ok", False)
+        )
+
+    broken = tuple(
+        (name, entry.get("error") or "import failed")
+        for name, entry in sorted(probe_result.get("imports", {}).items())
+        if not entry.get("ok", False)
+    )
+
+    diagnosis = None
+    if missing and install_root.mapping is not None and declared is not None:
+        held = len(set(install_root.mapping) & declared)
+        diagnosis = (
+            f"The editable finder holds {held} of the {len(declared)} declared "
+            "names. It is generated ONCE at install time and is never "
+            "regenerated as packages are added, so it drifts silently every "
+            "time a new top-level package lands."
+        )
+
+    return Findings(
+        missing=tuple(missing),
+        broken_imports=broken,
+        diagnosis=diagnosis,
+        notes=tuple(notes),
+        checked_breadth=checked_breadth,
+    )
+
+
+def remedy_lines(install_root: InstallRoot) -> list[str]:
+    """The fix, the interpreter that must apply it, and the trap that blocks it."""
+    where = str(install_root.path) if install_root.path else "the agent-src checkout"
+    return [
+        "Remedy — regenerate the finder by reinstalling the editable package:",
+        "",
+        f"    cd {where}",
+        "    pip install -e . --no-deps",
+        "",
+        "Use the interpreter that OWNS the install (the one this ran under):",
+        f"    {sys.executable}",
+        "",
+        "If pip fails with WinError 32 (file in use): a console-script wrapper",
+        "stays resident as the PARENT of its python process, so a gateway",
+        "started via hermes.exe holds the install open. Stop it and relaunch",
+        "as a module instead, which avoids the wrapper entirely:",
+        "",
+        "    python -m hermes_cli.main gateway",
+    ]
+
+
+def render(findings: Findings, install_root: InstallRoot, probe_result: dict) -> list[str]:
+    """Human-readable report lines."""
+    lines: list[str] = [
+        f"install root : {install_root.provenance}",
+        f"interpreter  : {probe_result.get('executable', sys.executable)}",
+    ]
+    for note in findings.notes:
+        lines.append(f"note         : {note}")
+
+    if findings.ok:
+        if findings.checked_breadth:
+            lines.append("[OK] every declared package resolves from a neutral cwd")
+        else:
+            lines.append("[OK] import checks passed (breadth not checked — see note)")
+        return lines
+
+    if findings.missing:
+        lines.append(
+            f"[FAIL] {len(findings.missing)} declared name(s) do NOT resolve from a "
+            "neutral cwd:"
+        )
+        lines.extend(f"         - {name}" for name in findings.missing)
+    for name, error in findings.broken_imports:
+        lines.append(f"[FAIL] import {name} failed: {error}")
+
+    if findings.diagnosis:
+        lines.extend(["", f"Why: {findings.diagnosis}"])
+    lines.extend(["", *remedy_lines(install_root)])
+    return lines
