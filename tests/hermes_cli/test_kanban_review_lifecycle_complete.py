@@ -149,10 +149,10 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert completed.block_recurrences == 0
 
 
-@pytest.mark.parametrize("bad_payload", [None, "{not-json", "{}"])
+@pytest.mark.parametrize("bad_payload", [None, "{not-json", "{}", b"\x80"])
 def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     conn,
-    bad_payload: str | None,
+    bad_payload: str | bytes | None,
 ) -> None:
     task_id, review = _claimed_review(conn, "Malformed reviewer provenance")
     assert kb.request_changes(
@@ -271,10 +271,10 @@ def test_parent_reopen_blocks_request_review_until_parent_is_done(conn) -> None:
     )
 
 
-@pytest.mark.parametrize("bad_payload", ["{not-json", "[]"])
+@pytest.mark.parametrize("bad_payload", ["{not-json", "[]", b"\x80"])
 def test_request_changes_fails_closed_on_malformed_review_provenance(
     conn,
-    bad_payload: str,
+    bad_payload: str | bytes,
 ):
     task_id = kb.create_task(conn, title="Malformed handoff", assignee="builder")
     implementation = kb.claim_task(conn, task_id, claimer="builder:1")
@@ -310,14 +310,18 @@ def test_request_changes_fails_closed_on_malformed_review_provenance(
     assert task.current_run_id == review.current_run_id
 
 
-def test_reclaim_fails_safe_on_non_object_claim_provenance(conn) -> None:
+@pytest.mark.parametrize("bad_payload", ["[]", b"\x80"])
+def test_reclaim_fails_safe_on_non_object_claim_provenance(
+    conn,
+    bad_payload: str | bytes,
+) -> None:
     task_id, _review = _claimed_review(conn, "Non-object claimed payload")
     with kb.write_txn(conn):
         conn.execute(
-            "UPDATE task_events SET payload = '[]' "
+            "UPDATE task_events SET payload = ? "
             "WHERE task_id = ? AND kind = 'claimed' "
             "AND run_id = (SELECT current_run_id FROM tasks WHERE id = ?)",
-            (task_id, task_id),
+            (bad_payload, task_id, task_id),
         )
     assert kb.reclaim_task(conn, task_id, signal_fn=lambda *_args: None)
     task = kb.get_task(conn, task_id)
@@ -414,6 +418,47 @@ def test_review_escalation_unblocks_back_to_review(conn) -> None:
     resumed = kb.get_task(conn, task_id)
     assert resumed is not None
     assert resumed.status == "review"
+
+
+def test_invalid_utf8_block_payload_unblocks_to_legacy_ready(conn) -> None:
+    task_id, review = _claimed_review(conn, "Corrupt blocked payload")
+    assert kb.block_task(
+        conn,
+        task_id,
+        reason="needs_input: maintainer decision required",
+        kind="needs_input",
+        expected_run_id=review.current_run_id,
+    )
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND kind = 'blocked'",
+            (b"\x80", task_id),
+        )
+
+    assert kb.unblock_task(conn, task_id)
+    resumed = kb.get_task(conn, task_id)
+    assert resumed is not None
+    assert resumed.status == "ready"
+
+
+def test_request_changes_fails_closed_on_invalid_utf8_claim_provenance(conn) -> None:
+    task_id, review = _claimed_review(conn, "Corrupt claimed payload")
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND kind = 'claimed' AND run_id = ?",
+            (b"\x80", task_id, review.current_run_id),
+        )
+
+    ok, detail = kb.request_changes(
+        conn,
+        task_id,
+        reason="Needs changes.",
+        expected_run_id=review.current_run_id,
+    )
+    assert ok is False
+    assert detail == "active run was not claimed from review"
 
 
 def test_review_dependency_wait_reenters_review_after_parent_finishes(conn) -> None:

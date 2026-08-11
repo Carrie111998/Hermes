@@ -4233,7 +4233,7 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     ).fetchone()
     try:
         payload = json.loads(row["payload"]) if row and row["payload"] else {}
-    except (json.JSONDecodeError, TypeError):
+    except (TypeError, ValueError, RecursionError):
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
@@ -4591,7 +4591,7 @@ def _retry_status_for_run(
     ).fetchone()
     try:
         payload = json.loads(event["payload"]) if event and event["payload"] else {}
-    except (json.JSONDecodeError, TypeError):
+    except (TypeError, ValueError, RecursionError):
         payload = {}
     if not isinstance(payload, dict):
         payload = {}
@@ -6205,7 +6205,7 @@ def request_review(
                     if changes_event and changes_event["payload"]
                     else {}
                 )
-            except (json.JSONDecodeError, TypeError):
+            except (TypeError, ValueError, RecursionError):
                 changes_payload = {}
             prior_reviewer = (
                 changes_payload.get("reviewer")
@@ -6329,7 +6329,7 @@ def request_changes(
                 if claimed_event and claimed_event["payload"]
                 else {}
             )
-        except (json.JSONDecodeError, TypeError):
+        except (TypeError, ValueError, RecursionError):
             claimed_payload = {}
         if not isinstance(claimed_payload, dict):
             claimed_payload = {}
@@ -6350,7 +6350,7 @@ def request_changes(
                 if requested_event["payload"]
                 else {}
             )
-        except (json.JSONDecodeError, TypeError):
+        except (TypeError, ValueError, RecursionError):
             requested_payload = {}
         if not isinstance(requested_payload, dict):
             requested_payload = {}
@@ -6617,7 +6617,7 @@ def reopen_review_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 if review_event and review_event["payload"]
                 else {}
             )
-        except (json.JSONDecodeError, TypeError):
+        except (TypeError, ValueError, RecursionError):
             handoff = {}
         implementer = handoff.get("implementer")
         if not isinstance(implementer, str) or not implementer.strip():

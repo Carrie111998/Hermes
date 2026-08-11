@@ -632,6 +632,31 @@ def test_reopen_review_task_returns_to_ready(kanban_home: Path) -> None:
         assert kb.reopen_review_task(conn, tid) is False
 
 
+def test_reopen_review_tolerates_invalid_utf8_handoff(kanban_home: Path) -> None:
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="corrupt handoff", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None
+        assert kb.request_review(
+            conn,
+            tid,
+            summary="v1",
+            reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? "
+                "WHERE task_id = ? AND kind = 'review_requested'",
+                (b"\x80", tid),
+            )
+
+        assert kb.reopen_review_task(conn, tid)
+        reopened = kb.get_task(conn, tid)
+        assert reopened is not None
+        assert reopened.status == "ready"
+
+
 def test_review_cycle_end_to_end(kanban_home: Path) -> None:
     """Full loop: run -> review -> follow-up reopen -> re-run -> review ->
     approve -> done. Never blocks, never triages, and stays wake-subscribed
