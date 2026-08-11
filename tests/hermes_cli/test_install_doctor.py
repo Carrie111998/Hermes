@@ -519,3 +519,31 @@ def test_doctor_section_lines_is_ok_when_clean(tmp_path):
 
     assert remediation is None
     assert all(status != "fail" for status, _, _ in rows)
+
+
+def test_doctor_section_lines_warns_instead_of_ok_when_breadth_was_skipped(tmp_path):
+    """ok=True with checked_breadth=False must never render as an OK row.
+
+    Findings.ok means "nothing was found wrong", not "everything was
+    checked". This is the boundary where a caller could otherwise report a
+    clean bill of health over zero checks, and the analyze/render tests do
+    not pin this row.
+    """
+    from hermes_cli.install_doctor import InstallRoot, doctor_section_lines
+
+    # Root exists but holds no pyproject.toml (a sealed wheel install), so
+    # _collect leaves `declared` as None and analyze skips breadth.
+    root_dir = tmp_path / "sealed-wheel"
+    root_dir.mkdir()
+    root = InstallRoot(path=root_dir, provenance="test", mapping=None)
+
+    def fake_probe(names, entrypoints, python=None):
+        return _probe_result(
+            [], imports={e: {"ok": True, "error": None} for e in entrypoints}
+        )
+
+    rows, remediation = doctor_section_lines(probe_fn=fake_probe, root=root)
+
+    assert remediation is None
+    assert [status for status, _, _ in rows] == ["warn"]
+    assert all(status != "ok" for status, _, _ in rows)
