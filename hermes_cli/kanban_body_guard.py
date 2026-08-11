@@ -67,10 +67,6 @@ PLACEHOLDER_BODIES = frozenset({
     "placeholder",
 })
 
-# Minimum length for a body to plausibly be an instruction. Anything shorter
-# than this is a token, not a brief. Kept low so terse-but-real bodies pass.
-MIN_BODY_CHARS = 8
-
 _STDIN_SENTINEL = "-"
 
 
@@ -150,11 +146,4 @@ def validate_body(body: Optional[str], *, allow_missing: bool = False) -> Option
             "not exist yet."
         )
 
-    stripped = body.strip()
-    if len(stripped) < MIN_BODY_CHARS:
-        raise BlankBodyError(
-            f"body is too short to be an instruction ({len(stripped)} chars, "
-            f"minimum {MIN_BODY_CHARS}): {stripped!r}. State what the worker "
-            "should actually do."
-        )
     return body

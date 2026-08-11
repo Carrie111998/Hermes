@@ -399,6 +399,7 @@ def test_create_happy_path(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "child task",
+        "body": "Implement the child task and report its verified result.",
         "assignee": "peer",
         "parents": [worker_env],
     })
@@ -414,6 +415,27 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("body", [None, "", "   ", "-", "--", "n/a", "tbd", "."])
+def test_create_rejects_blank_and_placeholder_bodies(worker_env, body):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "invalid child task",
+        "body": body,
+        "assignee": "peer",
+        "parents": [worker_env],
+    }))
+
+    assert out.get("ok") is not True
+    assert "no instruction" in out["error"]
+    from hermes_cli import kanban_db as kb
+    with kb.connect_closing() as conn:
+        assert all(
+            task.title != "invalid child task"
+            for task in kb.list_tasks(conn, limit=100)
+        )
 
 
 def test_link_happy_path(worker_env):
@@ -509,6 +531,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     # 4. spawn a child task for follow-up
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
+        "body": "Write the integration test described by the parent handoff.",
         "assignee": "qa",
         "parents": [worker_env],
     }))
@@ -858,6 +881,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     from tools import kanban_tools as kt
     out = kt._handle_create({
         "title": "no sub gated",
+        "body": "Create a valid task without an automatic subscription.",
         "assignee": "peer",
     })
     d = json.loads(out)
@@ -885,6 +909,7 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
 
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
+        "body": "Create this valid task even when notification setup fails.",
         "assignee": "peer",
     })
     d = json.loads(out)

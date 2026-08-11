@@ -334,7 +334,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
-    p_create.add_argument("--body", default=None, help="Optional opening post")
+    p_create.add_argument(
+        "--body",
+        default=None,
+        help=(
+            "Required work brief; pass '-' to read it from stdin. May be "
+            "omitted only with --triage."
+        ),
+    )
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
@@ -1698,6 +1705,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        # Diagnostics need graph context from the same live connection. This
+        # used to be fetched after leaving ``connect_closing()``, so human
+        # ``kanban show`` output crashed after printing only the header. JSON
+        # show and worker-tool views were unaffected, which made complete
+        # stored bodies look blank specifically to CLI callers.
+        graph = kb.task_graph_context(conn, task.id)
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1780,7 +1793,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
     diags = kd.compute_task_diagnostics(
-        task, events, runs, graph=kb.task_graph_context(conn, task.id)
+        task, events, runs, graph=graph
     )
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}

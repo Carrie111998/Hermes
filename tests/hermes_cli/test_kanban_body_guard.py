@@ -44,16 +44,14 @@ def test_the_naive_guard_would_have_passed_the_dash():
     "Rotate the expired GitHub PAT and verify with git ls-remote.",
     "Fix bug #12 in auth.py",
     "- audit the board\n- report the rate",
-    "Ship it now",   # terse but real, and >= MIN_BODY_CHARS
+    "Ship it",
+    "Deploy.",
+    "Fix #1",
+    "修复登录错误",
 ])
 def test_real_bodies_pass(body):
     assert is_placeholder_body(body) is False
     assert validate_body(body) == body
-
-
-def test_too_short_is_rejected():
-    with pytest.raises(BlankBodyError, match="too short"):
-        validate_body("do it")
 
 
 def test_missing_allowed_only_for_triage():

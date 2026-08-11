@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import threading
@@ -55,6 +56,52 @@ def test_kanban_list_json_includes_session_id(kanban_home):
         and row.get("session_id") == "acp-x"
         for row in payload
     )
+
+
+def test_human_show_reads_graph_before_connection_closes_and_prints_body(
+    kanban_home,
+):
+    """Pryor's CLI path must not mistake a complete body for a blank card."""
+    body = "First line of the stored brief.\nSecond line proves multiline output."
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(
+            conn, title="show body regression", body=body, assignee="stark"
+        )
+
+    output = kc.run_slash(f"show {task_id}")
+
+    assert "Cannot operate on a closed database" not in output
+    assert "Body:\n" + body in output
+
+
+def test_create_dash_reads_multiline_stdin_through_real_cli_path(
+    kanban_home, monkeypatch
+):
+    body = "Known first line from stdin.\nKnown second line from stdin."
+    monkeypatch.setattr("sys.stdin", io.StringIO(body))
+
+    output = kc.run_slash(
+        "create 'stdin body regression' --body - --initial-status blocked"
+    )
+
+    assert output.startswith("Created t_")
+    with kb.connect_closing() as conn:
+        task = kb.list_tasks(conn, limit=1)[0]
+    assert task.body == body
+
+
+@pytest.mark.parametrize("body", ["", "   ", "-", "--", "n/a", "tbd", "."])
+def test_create_rejects_blank_or_placeholder_body_before_db_write(
+    kanban_home, monkeypatch, body
+):
+    monkeypatch.setattr("sys.stdin", io.StringIO(""))
+    quoted = json.dumps(body)
+
+    output = kc.run_slash(f"create 'invalid body regression' --body={quoted}")
+
+    assert "refusing to create" in output or "stdin was empty" in output
+    with kb.connect_closing() as conn:
+        assert kb.list_tasks(conn, limit=10) == []
 
 
 def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch):

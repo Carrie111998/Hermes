@@ -1358,6 +1358,9 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    triage, bool_error = _parse_bool_arg(args, "triage")
+    if bool_error:
+        return tool_error(bool_error)
     # The body IS the job spec — a worker handed a blank brief guesses. Reject
     # null / empty / whitespace-only bodies and punctuation placeholders ('-',
     # 'n/a', 'tbd') at CREATE time rather than letting a worker discover the
@@ -1365,9 +1368,7 @@ def _handle_create(args: dict, **kw) -> str:
     from hermes_cli.kanban_body_guard import BlankBodyError, validate_body
 
     try:
-        body = validate_body(
-            args.get("body"), allow_missing=bool(args.get("triage"))
-        )
+        body = validate_body(args.get("body"), allow_missing=triage)
     except BlankBodyError as exc:
         return tool_error(f"kanban_create: {exc}")
     parents = args.get("parents") or []
@@ -1402,9 +1403,6 @@ def _handle_create(args: dict, **kw) -> str:
     _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
-    triage, bool_error = _parse_bool_arg(args, "triage")
-    if bool_error:
-        return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -2165,9 +2163,10 @@ KANBAN_CREATE_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": (
-                    "Opening post: full spec, acceptance criteria, "
-                    "links. The assigned worker reads this as part of "
-                    "its context."
+                    "Opening post: full spec, acceptance criteria, and "
+                    "links. Required unless triage=true; blank and "
+                    "placeholder values are rejected. The assigned worker "
+                    "reads this as part of its context."
                 ),
             },
             "parents": {
