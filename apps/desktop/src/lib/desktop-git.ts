@@ -3,6 +3,7 @@ import type {
   HermesGitBranch,
   HermesGitCommit,
   HermesGitWorktree,
+  HermesRepoPullRequests,
   HermesRepoStatus,
   HermesReviewList,
   HermesReviewShipInfo
@@ -98,6 +99,9 @@ const remoteGit: GitBridge = {
     push: repoPath => gitPost('review/push', { path: repoPath }),
 
     shipInfo: repoPath => gitGet<HermesReviewShipInfo>('review/ship-info', { path: repoPath }),
+
+    prList: (repoPath, branches, numbers) =>
+      gitPost<HermesRepoPullRequests>('review/pr-list', { branches, numbers: numbers ?? [], path: repoPath }),
 
     createPr: repoPath => gitPost('review/create-pr', { path: repoPath })
   },

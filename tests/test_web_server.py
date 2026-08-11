@@ -7,6 +7,7 @@ Config + Server + asyncio.run to capture kwargs without starting an event loop.
 import asyncio
 import contextlib
 
+import pytest
 import uvicorn
 
 from hermes_cli import web_server
@@ -151,20 +152,32 @@ def test_start_server_enables_ws_ping_for_half_open_detection(monkeypatch):
     assert captured["ws_ping_timeout"] >= captured["ws_ping_interval"]
 
 
+@pytest.mark.windows_only
 def test_start_server_runs_on_uvicorns_loop_factory(monkeypatch):
     """Windows must serve on a SelectorEventLoop, not uvicorn's Proactor default.
 
-    On Windows ``asyncio.run`` defaults to a ProactorEventLoop, and uvicorn>=0.36
-    ``Config.get_loop_factory()`` returns ProactorEventLoop too. With Hermes's
-    split startup/main_loop path that leaves the bind announced before HTTP
-    probes succeed (#50641). ``start_server`` therefore forces a SelectorEventLoop
-    on win32 and routes through ``uvicorn._compat.asyncio_run``.
+    On Windows ``asyncio.run`` defaults to a ProactorEventLoop, but uvicorn's
+    socket-serving stack forces a SelectorEventLoop on win32
+    (``uvicorn/loops/asyncio.py``). Serving on the proactor loop binds a socket
+    that never accepts — the backend prints "Skipping web UI build" and hangs
+    forever with the port LISTENING but no TCP handshake (#50641). We fix that
+    by routing the serve call through ``uvicorn._compat.asyncio_run`` with
+    ``config.get_loop_factory()`` — exactly what ``uvicorn.Server.run`` does.
+
+    This asserts the behavioral contract: on Windows the loop factory the runner
+    receives is the one uvicorn's own Config produced, and bare ``asyncio.run``
+    is never the serve path when the loop-factory runner exists.
+
+    Windows-only: faking ``sys.platform`` selected the branch but left the
+    proactor/selector loop policy this exists for entirely absent.
     """
     _stub_uvicorn(monkeypatch)
 
-    # The fix only changes behavior on win32; simulate it so the Windows branch
-    # is actually exercised on a POSIX CI host.
-    monkeypatch.setattr(web_server.sys, "platform", "win32")
+    # The fake Config (installed by _stub_uvicorn) returns its ``_loop_factory``
+    # from get_loop_factory(). Pin a sentinel so we can assert it is threaded
+    # through to the runner unchanged.
+    sentinel_factory = object()
+    monkeypatch.setattr(uvicorn.Config, "_loop_factory", sentinel_factory, raising=False)
 
     seen: dict = {}
 
@@ -207,9 +220,11 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     The #50641 fix is intentionally win32-scoped to keep the blast radius
     minimal — Python's default loop on POSIX is already a SelectorEventLoop
     (or uvloop), which is what uvicorn serves on, so there is nothing to fix.
+
+    No platform patching: the Linux CI host is already POSIX, so this asserts
+    the real host's serve path.
     """
     _stub_uvicorn(monkeypatch)
-    monkeypatch.setattr(web_server.sys, "platform", "linux")
 
     # If the Windows branch were taken, the loop-factory runner would fire.
     runner_called = {"hit": False}

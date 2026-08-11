@@ -37,15 +37,18 @@ class TestResolveHermesUidGid:
         assert gid == 911
 
 
-
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific")
-def test_resolve_hermes_uid_gid_windows_returns_none_none(monkeypatch):
-    monkeypatch.setenv("HERMES_UID", "1000")
-    monkeypatch.setenv("HERMES_GID", "911")
-    from hermes_cli.config import _resolve_hermes_uid_gid
-    uid, gid = _resolve_hermes_uid_gid()
-    assert uid is None
-    assert gid is None
+    # ``windows_only`` rather than ``skipif(sys.platform != "win32")``: the
+    # Windows CI job selects ``-m windows_only``, so a bare skipif would leave
+    # this test skipped on Linux AND unselected on the Windows lane — dead on
+    # every host.
+    @pytest.mark.windows_only
+    def test_windows_returns_none_none(self, monkeypatch):
+        monkeypatch.setenv("HERMES_UID", "1000")
+        monkeypatch.setenv("HERMES_GID", "911")
+        from hermes_cli.config import _resolve_hermes_uid_gid
+        uid, gid = _resolve_hermes_uid_gid()
+        assert uid is None
+        assert gid is None
 
 
 # ---------------------------------------------------------------------------
