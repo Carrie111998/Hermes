@@ -16,6 +16,16 @@ import pytest
 from hermes_cli import gateway_diag
 
 
+@pytest.fixture(autouse=True)
+def _clear_spawn_sentinel(monkeypatch):
+    """Drop the once-per-process sentinel between tests.
+
+    It lives in os.environ (see SPAWN_LOGGED_PID_VAR), which is process-wide,
+    so without this the first test to log would silence every later one.
+    """
+    monkeypatch.delenv(gateway_diag.SPAWN_LOGGED_PID_VAR, raising=False)
+
+
 def _records():
     from hermes_constants import get_hermes_home
 
@@ -68,6 +78,39 @@ def test_emit_gateway_spawn_diag_writes_for_a_gateway_run():
     # it and misreport how the process was launched.
     assert record["argv"] == argv
     assert record["python"] == sys.version.split()[0]
+
+
+def test_emit_gateway_spawn_diag_is_once_per_process(monkeypatch):
+    """A re-executed module body must not fake a second spawn.
+
+    Under ``python -m hermes_cli.main`` the module body runs twice — once as
+    ``__main__``, once when something imports ``hermes_cli.main`` by name — and
+    those are separate module objects, so a module-global guard cannot see the
+    first pass. Observed live: PID 40772 logged spawn at proc_age_s=12.5 and
+    again at 144.9.
+    """
+    monkeypatch.delenv(gateway_diag.SPAWN_LOGGED_PID_VAR, raising=False)
+    argv = ["hermes", "gateway", "run"]
+
+    assert gateway_diag.emit_gateway_spawn_diag(argv) is True
+    assert gateway_diag.emit_gateway_spawn_diag(argv) is False
+    assert gateway_diag.emit_gateway_spawn_diag(argv) is False
+
+    assert [r["tag"] for r in _records()] == ["gateway.spawn"]
+
+
+def test_spawn_suppression_does_not_leak_to_a_child_process(monkeypatch):
+    """Inheriting the sentinel must not silence a freshly spawned gateway.
+
+    ``gateway restart`` spawns the new gateway as a child, so it inherits this
+    env var. The child is exactly the process whose spawn we most need
+    recorded — hence a PID comparison rather than a bare flag.
+    """
+    # Simulate inheriting a parent's sentinel: same var, different PID.
+    monkeypatch.setenv(gateway_diag.SPAWN_LOGGED_PID_VAR, str(os.getpid() + 1))
+
+    assert gateway_diag.emit_gateway_spawn_diag(["hermes", "gateway", "run"]) is True
+    assert [r["tag"] for r in _records()] == ["gateway.spawn"]
 
 
 def test_emit_gateway_spawn_diag_stays_silent_for_other_commands():

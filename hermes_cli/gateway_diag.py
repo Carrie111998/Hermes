@@ -34,6 +34,19 @@ import sys
 DIAG_ENV_VAR = "HERMES_GATEWAY_EXIT_DIAG"
 DIAG_LOG_NAME = "gateway-exit-diag.log"
 
+# Records which PID has already written its `gateway.spawn`. Must be an env var
+# rather than a module global: under `python -m hermes_cli.main` the module body
+# runs once as `__main__` and again the first time anything imports
+# `hermes_cli.main` by its real name, and those are two distinct module objects
+# with separate globals. Observed live — PID 40772 logged spawn at
+# proc_age_s=12.5 and again at 144.9.
+#
+# The value is the PID, not a bare "1", because env vars are inherited: a
+# gateway spawned as a CHILD of a process that already logged (e.g. by
+# `gateway restart`) must still record its own spawn. Comparing PIDs makes the
+# suppression strictly per-process.
+SPAWN_LOGGED_PID_VAR = "HERMES_GATEWAY_SPAWN_DIAG_PID"
+
 
 def diag_enabled() -> bool:
     """Whether lifecycle records should be written (default: on)."""
@@ -118,7 +131,11 @@ def emit_gateway_spawn_diag(argv: list[str]) -> bool:
     any of this runs: logging the pre-strip copy keeps the record honest about
     how the process was actually launched.
     """
-    if not argv_selects_gateway_run(argv):
+    if not diag_enabled() or not argv_selects_gateway_run(argv):
         return False
+    pid = str(os.getpid())
+    if os.environ.get(SPAWN_LOGGED_PID_VAR) == pid:
+        return False  # this process already logged its spawn; see the var's docs
+    os.environ[SPAWN_LOGGED_PID_VAR] = pid
     write_diag("gateway.spawn", argv=list(argv), proc_age_s=process_start_age_s())
     return True
