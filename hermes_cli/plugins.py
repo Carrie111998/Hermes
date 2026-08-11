@@ -2053,6 +2053,19 @@ class PluginManager:
         if not init_file.exists():
             raise FileNotFoundError(f"No __init__.py in {plugin_dir}")
 
+        verified_source: bytes | None = None
+        if manifest.source in {"user", "project"}:
+            from hermes_cli.plugin_integrity import (
+                integrity_enforced,
+                verified_entrypoint_bytes,
+            )
+
+            if integrity_enforced():
+                verified_source = verified_entrypoint_bytes(
+                    manifest.key or manifest.name,
+                    plugin_dir,
+                )
+
         # Ensure the namespace parent package exists
         if _NS_PARENT not in sys.modules:
             ns_pkg = types.ModuleType(_NS_PARENT)
@@ -2075,7 +2088,18 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        try:
+            if verified_source is None:
+                spec.loader.exec_module(module)
+            else:
+                # Execute the exact bytes held open and hashed by the host.
+                # Asking the import loader to reopen the path here would leave
+                # a hash-check/use race in the integrity boundary.
+                code = compile(verified_source, str(init_file), "exec")
+                exec(code, module.__dict__)
+        except BaseException:
+            sys.modules.pop(module_name, None)
+            raise
         return module
 
     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:

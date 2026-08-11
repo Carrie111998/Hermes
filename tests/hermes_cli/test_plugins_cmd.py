@@ -262,10 +262,17 @@ class TestCmdInstall:
 class TestCmdUpdate:
     """Test the update command."""
 
+    @patch("hermes_cli.plugin_integrity.record_plugin_entrypoint")
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
     @patch("hermes_cli.plugins_cmd.subprocess.run")
-    def test_update_git_pull_success(self, mock_run, mock_plugins_dir, mock_sanitize):
+    def test_update_git_pull_success(
+        self,
+        mock_run,
+        mock_plugins_dir,
+        mock_sanitize,
+        mock_record_integrity,
+    ):
         from hermes_cli.plugins_cmd import cmd_update
 
         mock_plugins_dir_val = MagicMock()
@@ -282,6 +289,7 @@ class TestCmdUpdate:
         cmd_update("test-plugin")
 
         mock_run.assert_called_once()
+        mock_record_integrity.assert_called_once_with("test-plugin", mock_target)
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
@@ -587,6 +595,7 @@ class TestSubdirInstallE2E:
         plugins_dir = tmp_path / "installed"
         plugins_dir.mkdir()
         monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
 
         identifier = f"file://{repo_root}#my-plugin"
         target, manifest, name = pc._install_plugin_core(identifier, force=False)
@@ -602,6 +611,11 @@ class TestSubdirInstallE2E:
         # ...and the repo-root noise is NOT.
         assert not (target / "README.md").exists()
         assert not (target / "tests").exists()
+        from hermes_cli.plugin_integrity import verified_entrypoint_bytes
+
+        assert verified_entrypoint_bytes("my-plugin", target) == (
+            target / "__init__.py"
+        ).read_bytes()
 
     def test_missing_subdir_raises(self, tmp_path, monkeypatch):
         if shutil.which("git") is None:

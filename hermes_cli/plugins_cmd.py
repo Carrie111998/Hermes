@@ -578,6 +578,19 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
     _copy_example_files(target, Console())
     installed_manifest = _read_manifest(target)
     installed_name = installed_manifest.get("name") or target.name
+    if has_yaml and (target / "__init__.py").exists():
+        from hermes_cli.plugin_integrity import (
+            PluginIntegrityError,
+            record_plugin_entrypoint,
+        )
+
+        try:
+            record_plugin_entrypoint(installed_name, target)
+        except PluginIntegrityError as exc:
+            shutil.rmtree(target, ignore_errors=True)
+            raise PluginOperationError(
+                f"Cannot record plugin entrypoint integrity: {exc}"
+            ) from exc
     return target, installed_manifest, installed_name
 
 
@@ -699,6 +712,22 @@ def cmd_update(name: str) -> None:
     # __pycache__ compiled from the previous revision.
     _clear_plugin_bytecode(target)
 
+    if (target / "__init__.py").exists():
+        from hermes_cli.plugin_integrity import (
+            PluginIntegrityError,
+            record_plugin_entrypoint,
+        )
+
+        manifest = _read_manifest(target)
+        key = manifest.get("name") or name
+        try:
+            record_plugin_entrypoint(key, target)
+        except PluginIntegrityError as exc:
+            console.print(
+                f"[red]Error:[/red] Updated plugin integrity could not be recorded: {exc}"
+            )
+            sys.exit(1)
+
     # Copy any new .example files
     _copy_example_files(target, console)
 
@@ -725,6 +754,10 @@ def cmd_remove(name: str) -> None:
         console.print(f"[red]Error:[/red] {e}")
         sys.exit(1)
 
+    from hermes_cli.plugin_integrity import remove_plugin_evidence
+
+    manifest = _read_manifest(target)
+    remove_plugin_evidence(manifest.get("name") or name, target)
     shutil.rmtree(target)
     _display_removed(name, plugins_dir)
 
@@ -857,6 +890,26 @@ def _resolve_plugin_key_and_source(name: str) -> Optional[tuple]:
     return None
 
 
+def _record_discovered_plugin_integrity(key: str, source: str) -> None:
+    """Bind the current user/project entrypoint at the explicit enable gate."""
+    if source not in {"user", "project"}:
+        return
+    for entry in _discover_all_plugins():
+        # entry = (name, version, description, source, dir_path, key)
+        if entry[5] != key or entry[3] != source:
+            continue
+        plugin_dir = entry[4]
+        if not plugin_dir:
+            break
+        from hermes_cli.plugin_integrity import record_plugin_entrypoint
+
+        record_plugin_entrypoint(key, Path(plugin_dir))
+        return
+    raise PluginOperationError(
+        f"Cannot locate directory entrypoint for plugin '{key}'."
+    )
+
+
 def _set_plugin_entry_flag(plugin_id: str, key: str, value: bool) -> None:
     """Write ``plugins.entries.<plugin_id>.<key> = value`` into config.yaml."""
     from hermes_cli.config import load_config, save_config
@@ -897,6 +950,12 @@ def cmd_enable(name: str, allow_tool_override: Optional[bool] = None) -> None:
         console.print(f"[red]Plugin '{name}' is not installed or bundled.[/red]")
         sys.exit(1)
     key, source = resolved
+
+    try:
+        _record_discovered_plugin_integrity(key, source)
+    except (OSError, PluginOperationError, RuntimeError) as exc:
+        console.print(f"[red]Error:[/red] Cannot trust plugin '{key}': {exc}")
+        sys.exit(1)
 
     enabled = _get_enabled_set()
     disabled = _get_disabled_set()

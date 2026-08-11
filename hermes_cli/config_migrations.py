@@ -718,6 +718,42 @@ def _migrate_to_34(results: Dict[str, Any], quiet: bool) -> None:
                 )
 
 
+def _migrate_to_35(results: Dict[str, Any], quiet: bool) -> None:
+    # ── Version 34 → 35: establish host-owned directory-plugin evidence ──
+    # Existing enabled user plugins predate the pre-import integrity boundary.
+    # Bind their current entrypoints once during the trusted host upgrade so
+    # later edits fail closed before top-level Python executes. Project plugins
+    # are included when their existing explicit discovery opt-in is active.
+    from pathlib import Path
+
+    from hermes_cli.plugin_integrity import record_plugin_entrypoint
+    from hermes_cli.plugins import PluginManager
+
+    recorded = 0
+    for manifest in PluginManager()._collect_directory_manifests():
+        if manifest.source not in {"user", "project"} or manifest.portable:
+            continue
+        plugin_dir = Path(manifest.path or "")
+        if not (plugin_dir / "__init__.py").exists():
+            continue
+        try:
+            record_plugin_entrypoint(manifest.key or manifest.name, plugin_dir)
+            recorded += 1
+        except Exception as exc:
+            results["warnings"].append(
+                f"Could not record integrity evidence for plugin "
+                f"{manifest.key or manifest.name}: {exc}"
+            )
+    results["config_added"].append(
+        f"directory plugin integrity evidence ({recorded} plugin(s))"
+    )
+    if not quiet:
+        print(
+            f"  ✓ Recorded host-owned integrity evidence for {recorded} "
+            "directory plugin(s)"
+        )
+
+
 #: Registry of (target_version, migration_fn), strictly ascending. The driver
 #: applies every entry whose target version is greater than the on-disk
 #: version captured before the ladder started. Order matters: later steps may
@@ -740,6 +776,7 @@ MIGRATIONS: Tuple[Tuple[int, Callable[[Dict[str, Any], bool], None]], ...] = (
     (32, _migrate_to_32),
     (33, _migrate_to_33),
     (34, _migrate_to_34),
+    (35, _migrate_to_35),
 )
 
 
