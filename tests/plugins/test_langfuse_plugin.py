@@ -808,7 +808,16 @@ class TestApiRequestError:
     def test_error_hook_marks_generation_errored_and_clears_state(self, monkeypatch):
         sys.modules.pop("plugins.observability.langfuse", None)
         mod = importlib.import_module("plugins.observability.langfuse")
-        monkeypatch.setattr(mod, "_get_langfuse", lambda: object())
+
+        class _Client:
+            def __init__(self):
+                self.flush_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+
+        client = _Client()
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
 
         class _Obs:
             def __init__(self):
@@ -863,6 +872,7 @@ class TestApiRequestError:
             "error_summary": update["status_message"],
         }
         assert mod._request_key(1) not in state.generations
+        assert client.flush_count == 1
 
 
 class TestSessionEndCleanup:

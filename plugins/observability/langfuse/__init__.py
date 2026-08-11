@@ -964,7 +964,8 @@ def on_api_request_error(
     api_request_id: str = "",
     **_: Any,
 ) -> None:
-    if _get_langfuse() is None:
+    client = _get_langfuse()
+    if client is None:
         return
 
     task_key = _trace_key(
@@ -1032,6 +1033,10 @@ def on_api_request_error(
         level="ERROR",
         status_message=status_message,
     )
+    try:
+        client.flush()
+    except Exception:
+        pass
 
 
 def on_session_end(
