@@ -73,6 +73,82 @@ def test_build_gateway_argv_keeps_venv_console_python_for_uv_venv(monkeypatch, t
     assert str(project) in env_overlay["PYTHONPATH"].split(gateway_windows.os.pathsep)
 
 
+def test_build_gateway_cmd_script_forwards_proxy_env(monkeypatch):
+    """The .cmd launcher must bake the user's proxy env so a logon/Startup
+    gateway (running outside the interactive shell) still reaches Telegram/
+    Discord/HTTP (issue #83683)."""
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
+    content = gateway_windows._build_gateway_cmd_script(
+        r"C:\venv\Scripts\python.exe", r"C:\Hermes", r"C:\Hermes", "--profile work"
+    )
+    assert 'set "TELEGRAM_PROXY=socks5://127.0.0.1:1080"' in content
+    assert 'set "HTTPS_PROXY=http://proxy.example.com:8080"' in content
+    # Base vars still present.
+    assert 'set "HERMES_HOME=C:\\Hermes"' in content
+
+
+def test_build_gateway_vbs_script_forwards_proxy_env(monkeypatch):
+    """The console-less .vbs launcher must bake the user's proxy env too
+    (issue #83683)."""
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+    content = gateway_windows._build_gateway_vbs_script(
+        r"C:\venv\Scripts\python.exe", r"C:\Hermes", r"C:\Hermes", "--profile work"
+    )
+    assert 'env.Item("TELEGRAM_PROXY") = "socks5://127.0.0.1:1080"' in content
+
+
+def test_build_gateway_argv_loads_proxy_snapshot(monkeypatch, tmp_path):
+    """The direct-spawn path (manual start + desktop recovery relaunch) must
+    reload the proxy env snapshot so a gateway launched by the desktop backend
+    still gets the user's proxy (issue #83683)."""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    project = tmp_path / "project"
+    scripts = project / "venv" / "Scripts"
+    site_packages = project / "venv" / "Lib" / "site-packages"
+    scripts.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    venv_python = scripts / "python.exe"
+    venv_python.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(gateway_windows.sys, "platform", "win32")
+    monkeypatch.setattr(gateway, "PROJECT_ROOT", project)
+    monkeypatch.setattr(gateway, "get_python_path", lambda: str(venv_python))
+    monkeypatch.setattr(gateway, "_profile_arg", lambda hermes_home: "")
+    monkeypatch.setattr("hermes_cli.config.get_hermes_home", lambda: str(hermes_home))
+
+    # No snapshot yet -> the overlay carries no proxy (it does not read
+    # os.environ directly; that only happens in _spawn_detached).
+    argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
+    assert "TELEGRAM_PROXY" not in env_overlay
+
+    # Write a snapshot including the user's proxy, then the overlay must carry
+    # it even though the spawning process's environment may not.
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+    gateway_windows._write_proxy_env_snapshot(str(hermes_home))
+    argv, cwd, env_overlay = gateway_windows._build_gateway_argv()
+    assert env_overlay["TELEGRAM_PROXY"] == "socks5://127.0.0.1:1080"
+
+
+def test_proxy_env_snapshot_roundtrip_filters_keys(monkeypatch, tmp_path):
+    """Snapshot write/load round-trips proxy vars and drops anything not in the
+    allowlist (issue #83683). Robust to pre-existing proxy env in the test
+    runner (HTTPS_PROXY etc.)."""
+    hermes_home = tmp_path / "hermes-home"
+    monkeypatch.setenv("TELEGRAM_PROXY", "socks5://127.0.0.1:1080")
+    monkeypatch.setenv("HERMES_HOME", "should-not-be-snapshotted")
+    gateway_windows._write_proxy_env_snapshot(str(hermes_home))
+    loaded = gateway_windows._load_proxy_env_snapshot(str(hermes_home))
+    # The user proxy is captured...
+    assert loaded.get("TELEGRAM_PROXY") == "socks5://127.0.0.1:1080"
+    # ...and only allowlisted keys survive (HERMES_HOME must be dropped).
+    assert "HERMES_HOME" not in loaded
+    assert all(k in gateway_windows.GATEWAY_PROXY_ENV_VARS for k in loaded)
+    # Missing file -> empty, never raises.
+    assert gateway_windows._load_proxy_env_snapshot(str(tmp_path / "nope")) == {}
+
+
 class TestStableWindowsGatewayWorkingDir:
     def test_stable_gateway_working_dir_uses_hermes_home(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"

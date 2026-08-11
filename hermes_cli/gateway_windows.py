@@ -28,6 +28,7 @@ Design notes
 from __future__ import annotations
 
 import ctypes
+import json
 import locale
 import os
 import re
@@ -60,6 +61,85 @@ _TASK_DESCRIPTION = "Hermes Agent Gateway - Messaging Platform Integration"
 _TASK_LOGON_DELAY = "PT30S"
 _TASK_RESTART_INTERVAL = "PT1M"
 _TASK_RESTART_COUNT = 999
+
+# Proxy / egress env vars forwarded to the gateway on Windows. The gateway reads
+# these to route Telegram / Discord / HTTP traffic; if they're absent the
+# platform connections can silently fail to come up. A gateway launched via the
+# Scheduled Task / Startup VBS (which runs outside the user's interactive
+# shell) would otherwise have no proxy, and a gateway started by the desktop
+# backend via the direct-spawn path inherits the *backend's* environment, not
+# the user's shell environment — so neither would reach Telegram behind a proxy
+# (issue #83683 reporter: a recovered gateway came up with no messaging
+# platforms connected). We snapshot these at install time (when the user's
+# interactive shell still has them) and bake them into the VBS/CMD launchers
+# and a small JSON file the direct-spawn path reloads.
+GATEWAY_PROXY_ENV_VARS = (
+    "TELEGRAM_PROXY",
+    "DISCORD_PROXY",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "https_proxy",
+    "http_proxy",
+    "all_proxy",
+    "no_proxy",
+)
+
+
+def _collect_proxy_env() -> dict[str, str]:
+    """Snapshot the user's proxy env vars to forward to the gateway.
+
+    Returns only the vars that are actually set, so a no-proxy install adds
+    nothing extra to the launchers.
+    """
+    collected: dict[str, str] = {}
+    for key in GATEWAY_PROXY_ENV_VARS:
+        value = os.environ.get(key)
+        if value:
+            collected[key] = value
+    return collected
+
+
+def get_proxy_env_snapshot_path(hermes_home: str) -> Path:
+    return Path(hermes_home) / "gateway-service" / "proxy-env.json"
+
+
+def _write_proxy_env_snapshot(hermes_home: str) -> None:
+    """Persist the proxy env so the direct-spawn (manual / recovery) path can
+    reload it even when the spawning process lacks the user's shell environment.
+
+    Best-effort: if we can't snapshot, the launcher-baked proxy still covers the
+    logon / Startup launch path, and the direct spawn falls back to whatever the
+    spawning process's own environment carries.
+    """
+    try:
+        snapshot = _collect_proxy_env()
+        path = get_proxy_env_snapshot_path(hermes_home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snapshot), encoding="utf-8", newline="")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def _load_proxy_env_snapshot(hermes_home: str) -> dict[str, str]:
+    """Reload the proxy env snapshot written at install time.
+
+    Returns {} on a missing file or any read/parse error — callers merge this
+    into the gateway's env overlay, so an empty result is always safe.
+    """
+    try:
+        path = get_proxy_env_snapshot_path(hermes_home)
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): str(v) for k, v in data.items() if k in GATEWAY_PROXY_ENV_VARS}
+    except Exception:
+        return {}
 
 
 def _schtasks_encoding() -> str:
@@ -430,6 +510,12 @@ def _build_gateway_cmd_script(
     # Do NOT use `--replace` for service-managed starts; repeated /Run calls
     # should be idempotent, not churn parent/child takeover loops.
     lines.append(" ".join(_quote_cmd_script_arg(a) for a in prog_args))
+    # Forward proxy env captured at install time so the gateway can reach
+    # Telegram/Discord/HTTP through the user's proxy (issue #83683). The
+    # Scheduled Task / Startup run outside the user's interactive shell, so
+    # without this the gateway launched on logon has no proxy.
+    for _pk, _pv in _collect_proxy_env().items():
+        lines.append(f'set "{_pk}={_pv}"')
     lines.append("exit /b 0")
     return "\r\n".join(lines) + "\r\n"
 
@@ -505,6 +591,14 @@ def _build_gateway_vbs_script(
         "Else",
         f"  env.Item({_quote_vbs_string('PYTHONPATH')}) = {_quote_vbs_string(static_pythonpath)}",
         "End If",
+        # Forward proxy env captured at install time so the gateway can reach
+        # Telegram/Discord/HTTP through the user's proxy (issue #83683). The
+        # Scheduled Task / Startup run outside the user's interactive shell, so
+        # without this the gateway launched on logon has no proxy.
+        *[
+            f"env.Item({_quote_vbs_string(k)}) = {_quote_vbs_string(v)}"
+            for k, v in _collect_proxy_env().items()
+        ],
         f"sh.CurrentDirectory = {_quote_vbs_string(working_dir)}",
         # Window style 0 = hidden; bWaitOnReturn False = detached/async. The
         # console python's one console is created hidden and inherited by all
@@ -568,6 +662,13 @@ def _write_task_script() -> Path:
     vbs_tmp = vbs_path.with_name(vbs_path.name + ".tmp")
     vbs_tmp.write_text(vbs_content, encoding="utf-8", newline="")
     vbs_tmp.replace(vbs_path)
+
+    # Snapshot the proxy env so the direct-spawn (manual / recovery) launch path
+    # can reload it even when the spawning process lacks the user's shell env
+    # (issue #83683). The VBS/CMD launchers above already bake it for the
+    # logon / Startup path; this covers `gateway start` and the desktop
+    # backend's recovery relaunch.
+    _write_proxy_env_snapshot(hermes_home)
     return script_path
 
 
@@ -818,6 +919,13 @@ def _build_gateway_argv() -> tuple[list[str], str, dict[str, str]]:
         if extra_pythonpath
         else [project_root],
     )
+    # Merge the proxy env snapshot written at install time (issue #83683). The
+    # direct-spawn path (manual `gateway start` and the desktop backend's
+    # recovery relaunch) runs outside the user's interactive shell, so it would
+    # otherwise start a gateway with no proxy and no messaging platforms. The
+    # spawning process's own environment (if it carries the proxy) still wins
+    # because `_spawn_detached` layers os.environ under this overlay anyway.
+    env_overlay.update(_load_proxy_env_snapshot(hermes_home))
     return argv, working_dir, env_overlay
 
 

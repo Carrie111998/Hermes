@@ -1525,6 +1525,52 @@ def kill_gateway_processes(
     return killed
 
 
+def _gateway_has_active_supervisor() -> bool:
+    """Return True when an external supervisor is actively running the gateway.
+
+    Used by the orphan-reap guard so a desktop (re)start never kills the user's
+    live, supervised messaging gateway (issue #83683).  A supervisor owns the
+    gateway lifecycle, so reaping it would orphan messaging (WeChat/QQ/Telegram
+    go silent) with nothing to relaunch it.
+
+    Returns True when systemd reports the gateway unit running, macOS launchd
+    has a loaded+running plist, or the Windows ``Hermes_Gateway`` scheduled task
+    is currently running (or otherwise has a live gateway pid beside it).
+    """
+    try:
+        if supports_systemd_services():
+            selected_system, running = _probe_systemd_service_running()
+            if running:
+                return True
+    except Exception:
+        pass
+    if is_macos():
+        try:
+            if get_launchd_plist_path().exists() and _probe_launchd_service_running():
+                return True
+        except Exception:
+            pass
+    if is_windows():
+        try:
+            from hermes_cli import gateway_windows
+
+            if gateway_windows.is_task_registered():
+                task_status = gateway_windows.query_task_status()
+                state = (task_status.get("State") or "").lower()
+                # "Running" => the scheduled task currently has the gateway
+                # process alive and supervised.  "Ready"/"Queued"/"Disabled"
+                # mean it is not actively running the gateway right now.
+                if state.startswith("running"):
+                    return True
+                # Fallback: a live gateway pid beside the scheduled task also
+                # counts as supervised — the task owns the lifecycle.
+                if gateway_windows._gateway_pids():
+                    return True
+        except Exception:
+            pass
+    return False
+
+
 def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool:
     """Kill no-supervisor gateway orphans the pidfile/runtime record can't see.
 
@@ -1538,10 +1584,19 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     running gateway — gating on ``supports_systemd_services()`` keeps the
     orphan-aware scan from killing live management processes there.
 
+    Regression guard (issue #83683): a *supervised* gateway — one that owns a
+    live ``gateway.pid`` record, or one managed by an external supervisor
+    (macOS launchd, the Windows ``Hermes_Gateway`` scheduled task, or a systemd
+    unit) — is NEVER reaped here.  Desktop restarts used to kill the live user
+    gateway (which matches ``looks_like_gateway_command_line``) and left
+    messaging (WeChat/QQ/Telegram) silently dead because nothing relaunched it.
+    We only reap genuine orphans that are neither the supervised instance nor
+    under an active supervisor.  The desktop backend additionally relaunches a
+    missing supervised gateway on boot (see web_server._ensure_desktop_gateway_running).
+
     Args:
         extra_exclude: Additional PIDs to skip (e.g. a PID already killed by
             the caller so the sweep doesn't send a redundant SIGTERM/SIGKILL).
-
     Returns True if at least one orphan was reaped.
     """
     try:
@@ -1550,15 +1605,39 @@ def _reap_unsupervised_gateway_orphans(extra_exclude: set | None = None) -> bool
     except Exception:
         return False
 
-    from gateway.status import _pid_exists, write_planned_stop_marker
+    from gateway.status import (
+        _pid_exists,
+        get_running_pid,
+        write_planned_stop_marker,
+    )
+
+    # If an external supervisor is actively managing a live gateway, it owns
+    # the lifecycle — reaping here would orphan messaging (issue #83683).
+    if _gateway_has_active_supervisor():
+        return False
+
+    # The supervised instance (explicit gateway.pid) is owned by the user / an
+    # external supervisor.  Never reap it — only genuine duplicates/orphans.
+    supervised_pid = None
+    try:
+        supervised_pid = get_running_pid()
+    except Exception:
+        supervised_pid = None
 
     own = {os.getpid()}
     if extra_exclude:
         own |= extra_exclude
+    if supervised_pid:
+        own.add(supervised_pid)
     try:
         # find_gateway_pids() includes no-supervisor `gateway restart` runtimes
-        # for the current profile when no systemd supervisor is present.
-        orphans = [p for p in find_gateway_pids(exclude_pids=own) if p and p > 0]
+        # for the current profile when no systemd supervisor is present.  Drop
+        # the supervised PID so a legitimately-running gateway survives.
+        orphans = [
+            p
+            for p in find_gateway_pids(exclude_pids=own)
+            if p and p > 0 and p != supervised_pid
+        ]
     except Exception:
         return False
     if not orphans:
