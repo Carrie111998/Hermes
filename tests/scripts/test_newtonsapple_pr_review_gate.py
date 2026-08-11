@@ -2,6 +2,8 @@
 
 import json
 import base64
+import zipfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -118,6 +120,7 @@ def test_execution_evidence_is_signed_from_the_local_worker(monkeypatch):
                 gate._unavailable_local_gate(name, "Docker unavailable")
                 for name in gate.BASELINE_EXECUTION_GATES
             ],
+            "artifacts": [],
         },
     )
 
@@ -184,6 +187,119 @@ def test_linux_arm_platform_packages_repairs_missing_lock_entries(tmp_path):
         "@esbuild/linux-arm64@0.27.2",
         "@rolldown/binding-linux-arm64-gnu@1.1.5",
     )
+
+
+def test_playwright_artifact_candidates_are_confined_and_bounded():
+    paths = [
+        f"/workspace/test-results/case-{index}/test-failed-1.png" for index in range(8)
+    ]
+    paths.extend([
+        "/workspace/test-results/case-0/trace.zip",
+        "/workspace/test-results/case-1/trace.zip",
+        "/workspace/other/test-failed-1.png",
+        "/workspace/test-results/../escape/test-failed-1.png",
+        "/tmp/test-results/case/test-failed-1.png",
+    ])
+
+    selected = gate._playwright_artifact_candidates("\0".join(paths) + "\0")
+
+    screenshots = [path for kind, path in selected if kind == "screenshot"]
+    traces = [path for kind, path in selected if kind == "trace"]
+    assert len(screenshots) == gate.LOCAL_REVIEW_SCREENSHOT_LIMIT
+    assert traces == [
+        gate.PurePosixPath("test-results/case-0/trace.zip"),
+        gate.PurePosixPath("test-results/case-1/trace.zip"),
+    ]
+    assert all(path.parts[0] == "test-results" for _, path in selected)
+
+
+def test_trace_summary_extracts_bounded_actions_and_errors(tmp_path):
+    trace_path = tmp_path / "trace.zip"
+    with zipfile.ZipFile(trace_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "0-trace.trace",
+            "\n".join([
+                json.dumps({"type": "before", "apiName": "page.goto"}),
+                json.dumps({"type": "before", "apiName": "locator.click"}),
+                json.dumps({"type": "after", "error": {"message": "button missing"}}),
+            ]),
+        )
+        archive.writestr("resources/source.txt", "ignored")
+
+    summary = gate._trace_archive_summary(trace_path)
+
+    assert summary == {
+        "entries": 2,
+        "trace_files": 1,
+        "recent_actions": ["page.goto", "locator.click"],
+        "errors": ["button missing"],
+    }
+
+
+def test_playwright_artifacts_are_copied_to_private_content_addressed_cache(
+    monkeypatch, tmp_path
+):
+    review_tuple = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+        request_id=REVIEW_REQUEST_ID,
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII="
+    )
+    trace_path = tmp_path / "fixture-trace.zip"
+    with zipfile.ZipFile(trace_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "0-trace.trace",
+            json.dumps({"type": "before", "apiName": "page.screenshot"}),
+        )
+    sources = {
+        "/workspace/test-results/example/test-failed-1.png": png,
+        "/workspace/test-results/example/trace.zip": trace_path.read_bytes(),
+    }
+
+    def fake_run(command, *, cwd, env, timeout):
+        if "find" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="\0".join(sources) + "\0",
+                stderr="",
+            )
+        if "stat" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=str(len(sources[command[-1]])),
+                stderr="",
+            )
+        if command[:2] == ["docker", "cp"]:
+            source = command[2].split(":", 1)[1]
+            Path(command[3]).write_bytes(sources[source])
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(gate, "_run_command", fake_run)
+
+    artifacts = gate._export_playwright_artifacts(
+        review_tuple, "review-worker", env={"PATH": "/bin"}
+    )
+
+    assert [artifact["kind"] for artifact in artifacts] == ["screenshot", "trace"]
+    for artifact in artifacts:
+        host_path = Path(artifact["host_path"])
+        assert host_path.is_file()
+        assert host_path.parent == gate._review_artifact_directory(review_tuple)
+        assert (
+            artifact["sha256"]
+            == gate.hashlib.sha256(host_path.read_bytes()).hexdigest()
+        )
+        assert host_path.stat().st_mode & 0o777 == 0o400
+    assert artifacts[1]["trace_summary"]["recent_actions"] == ["page.screenshot"]
+
+    gate._remove_review_artifacts(review_tuple)
+    assert not gate._review_artifact_directory(review_tuple).exists()
 
 
 def test_feature_command_result_is_signed_and_exact_head(monkeypatch, tmp_path):
@@ -1519,6 +1635,7 @@ def test_local_execution_reports_unavailable_gates_in_signed_evidence(monkeypatc
                 gate._unavailable_local_gate(name, "local worker unavailable")
                 for name in gate.BASELINE_EXECUTION_GATES
             ],
+            "artifacts": [],
         },
     )
     result = gate.execution_evidence(_execution_request("execution_evidence"))

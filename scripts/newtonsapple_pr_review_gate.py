@@ -14,14 +14,17 @@ import hashlib
 import os
 import re
 import secrets
+import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Optional, cast
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -73,7 +76,16 @@ MIGRATOR_DOCKERFILE_SHA256 = (
 )
 LOCAL_REVIEW_LOG_LIMIT = 1_000_000
 LOCAL_REVIEW_EXCERPT_LIMIT = 12_000
-EXECUTION_GATE_POLICY_VERSION = "newtonsapple-v2"
+LOCAL_REVIEW_SCREENSHOT_LIMIT = 6
+LOCAL_REVIEW_TRACE_LIMIT = 6
+LOCAL_REVIEW_ARTIFACT_LIMIT = LOCAL_REVIEW_SCREENSHOT_LIMIT + LOCAL_REVIEW_TRACE_LIMIT
+LOCAL_REVIEW_SCREENSHOT_MAX_BYTES = 5 * 1024 * 1024
+LOCAL_REVIEW_TRACE_MAX_BYTES = 25 * 1024 * 1024
+LOCAL_REVIEW_ARTIFACT_TOTAL_MAX_BYTES = 100 * 1024 * 1024
+LOCAL_REVIEW_TRACE_ENTRY_LIMIT = 500
+LOCAL_REVIEW_TRACE_UNCOMPRESSED_MAX_BYTES = 100 * 1024 * 1024
+LOCAL_REVIEW_TRACE_TEXT_MAX_BYTES = 2 * 1024 * 1024
+EXECUTION_GATE_POLICY_VERSION = "newtonsapple-v3"
 _EXECUTION_GATE_POLICY = {
     "version": EXECUTION_GATE_POLICY_VERSION,
     "repository": REPOSITORY,
@@ -90,6 +102,14 @@ _EXECUTION_GATE_POLICY = {
         "install": EXECUTION_GATE_COMMANDS["install"],
         "dependency_rebuild": ["npm", "rebuild"],
         "statuses": ["pass", "pr-fail", "unavailable"],
+        "visual_artifacts": {
+            "source": "playwright-test-results",
+            "screenshots": LOCAL_REVIEW_SCREENSHOT_LIMIT,
+            "traces": LOCAL_REVIEW_TRACE_LIMIT,
+            "total_bytes": LOCAL_REVIEW_ARTIFACT_TOTAL_MAX_BYTES,
+            "content_addressed": True,
+            "signed_manifest": True,
+        },
         "gate_network": {
             "online_without_pr_scripts": [
                 "install",
@@ -1078,6 +1098,269 @@ def _review_worker_name(review_tuple: ReviewTuple) -> str:
     return f"newtonsapple-review-{digest}"
 
 
+def _review_artifact_directory(review_tuple: ReviewTuple) -> Path:
+    hermes_home_value = os.environ.get("HERMES_HOME", "")
+    hermes_home = Path(hermes_home_value)
+    if not hermes_home_value or not hermes_home.is_absolute():
+        raise RuntimeError("review artifact cache is unavailable")
+    digest = hashlib.sha256(tuple_key(review_tuple).encode()).hexdigest()
+    return hermes_home / "cache" / "pr-review-artifacts" / digest
+
+
+def _remove_review_artifacts(review_tuple: ReviewTuple) -> None:
+    try:
+        directory = _review_artifact_directory(review_tuple)
+    except RuntimeError:
+        return
+    if directory.exists():
+        shutil.rmtree(directory)
+
+
+def _playwright_artifact_candidates(output: str) -> list[tuple[str, PurePosixPath]]:
+    screenshots: list[PurePosixPath] = []
+    traces: list[PurePosixPath] = []
+    for raw_path in output.split("\0"):
+        if not raw_path or "\ufffd" in raw_path or len(raw_path) > 1024:
+            continue
+        path = PurePosixPath(raw_path)
+        try:
+            relative = path.relative_to("/workspace")
+        except ValueError:
+            continue
+        if (
+            not relative.parts
+            or relative.parts[0] != "test-results"
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            continue
+        if path.name.startswith("test-failed-") and path.suffix == ".png":
+            screenshots.append(relative)
+        elif path.name == "trace.zip":
+            traces.append(relative)
+    return [
+        *(
+            ("screenshot", path)
+            for path in sorted(set(screenshots))[:LOCAL_REVIEW_SCREENSHOT_LIMIT]
+        ),
+        *(("trace", path) for path in sorted(set(traces))[:LOCAL_REVIEW_TRACE_LIMIT]),
+    ]
+
+
+def _trace_message(value: object) -> str:
+    if isinstance(value, dict):
+        for key in ("message", "value", "error"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return _clean_log(candidate, limit=500).strip()
+    if isinstance(value, str) and value.strip():
+        return _clean_log(value, limit=500).strip()
+    return ""
+
+
+def _trace_archive_summary(path: Path) -> Optional[dict[str, object]]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            entries = archive.infolist()
+            if not entries or len(entries) > LOCAL_REVIEW_TRACE_ENTRY_LIMIT:
+                return None
+            total_uncompressed = 0
+            trace_files = []
+            actions: list[str] = []
+            errors: list[str] = []
+            trace_bytes_read = 0
+            for entry in entries:
+                member = PurePosixPath(entry.filename)
+                if member.is_absolute() or ".." in member.parts:
+                    return None
+                total_uncompressed += entry.file_size
+                if total_uncompressed > LOCAL_REVIEW_TRACE_UNCOMPRESSED_MAX_BYTES:
+                    return None
+                if entry.compress_size == 0 and entry.file_size > 0:
+                    return None
+                if entry.compress_size and entry.file_size / entry.compress_size > 100:
+                    return None
+                if entry.is_dir() or not entry.filename.endswith(".trace"):
+                    continue
+                if (
+                    entry.file_size > LOCAL_REVIEW_TRACE_TEXT_MAX_BYTES
+                    or trace_bytes_read + entry.file_size
+                    > LOCAL_REVIEW_TRACE_TEXT_MAX_BYTES
+                ):
+                    continue
+                trace_files.append(entry.filename)
+                trace_bytes_read += entry.file_size
+                for raw_line in archive.read(entry).splitlines():
+                    try:
+                        event = json.loads(raw_line)
+                    except (TypeError, ValueError):
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    if event.get("type") == "before":
+                        action = event.get("apiName") or event.get("method")
+                        if isinstance(action, str) and action and action not in actions:
+                            actions.append(action[:160])
+                    message = _trace_message(event.get("error"))
+                    if not message and event.get("type") in {"error", "stderr"}:
+                        message = _trace_message(
+                            event.get("message") or event.get("text")
+                        )
+                    if message and message not in errors:
+                        errors.append(message)
+            if not trace_files:
+                return None
+            return {
+                "entries": len(entries),
+                "trace_files": len(trace_files),
+                "recent_actions": actions[-12:],
+                "errors": errors[:6],
+            }
+    except (OSError, zipfile.BadZipFile):
+        return None
+
+
+def _valid_png(data: bytes) -> bool:
+    if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
+        return False
+    width, height = struct.unpack(">II", data[16:24])
+    return (
+        0 < width <= 16_384 and 0 < height <= 16_384 and width * height <= 100_000_000
+    )
+
+
+def _export_playwright_artifacts(
+    review_tuple: ReviewTuple,
+    worker_name: str,
+    *,
+    env: dict[str, str],
+) -> list[dict[str, object]]:
+    discovered = _run_command(
+        _worker_command(
+            worker_name,
+            [
+                "find",
+                "/workspace/test-results",
+                "-type",
+                "f",
+                "(",
+                "-name",
+                "test-failed-*.png",
+                "-o",
+                "-name",
+                "trace.zip",
+                ")",
+                "-print0",
+            ],
+        ),
+        cwd=Path("/"),
+        env=env,
+        timeout=60,
+    )
+    if discovered.returncode != 0:
+        return []
+    candidates = _playwright_artifact_candidates(discovered.stdout)
+    if not candidates:
+        return []
+
+    directory = _review_artifact_directory(review_tuple)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    directory.chmod(0o700)
+    artifacts: list[dict[str, object]] = []
+    total_bytes = sum(
+        path.stat().st_size
+        for path in directory.iterdir()
+        if path.is_file() and not path.is_symlink()
+    )
+    for kind, relative in candidates:
+        source_path = PurePosixPath("/workspace") / relative
+        maximum = (
+            LOCAL_REVIEW_SCREENSHOT_MAX_BYTES
+            if kind == "screenshot"
+            else LOCAL_REVIEW_TRACE_MAX_BYTES
+        )
+        measured = _run_command(
+            _worker_command(
+                worker_name,
+                ["stat", "-c", "%s", "--", source_path.as_posix()],
+            ),
+            cwd=Path("/"),
+            env=env,
+            timeout=30,
+        )
+        try:
+            size = int(measured.stdout.strip())
+        except ValueError:
+            continue
+        if measured.returncode != 0 or size <= 0 or size > maximum:
+            continue
+
+        temporary = directory / f".{secrets.token_hex(16)}.tmp"
+        copied = _run_command(
+            ["docker", "cp", f"{worker_name}:{source_path.as_posix()}", str(temporary)],
+            cwd=Path("/"),
+            env=env,
+            timeout=120,
+        )
+        if copied.returncode != 0:
+            temporary.unlink(missing_ok=True)
+            continue
+        try:
+            data = temporary.read_bytes()
+            if len(data) != size:
+                continue
+            trace_summary: Optional[dict[str, object]] = None
+            if kind == "screenshot":
+                if not _valid_png(data):
+                    continue
+                suffix = ".png"
+                mime_type = "image/png"
+            else:
+                trace_summary = _trace_archive_summary(temporary)
+                if trace_summary is None:
+                    continue
+                suffix = ".trace.zip"
+                mime_type = "application/zip"
+            digest = hashlib.sha256(data).hexdigest()
+            artifact_id = hashlib.sha256(
+                (
+                    tuple_key(review_tuple) + "\0" + relative.as_posix() + "\0" + digest
+                ).encode()
+            ).hexdigest()
+            destination = directory / f"{artifact_id}{suffix}"
+            if destination.exists():
+                if hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+                    continue
+                temporary.unlink(missing_ok=True)
+            else:
+                if total_bytes + size > LOCAL_REVIEW_ARTIFACT_TOTAL_MAX_BYTES:
+                    continue
+                os.replace(temporary, destination)
+                destination.chmod(0o400)
+                total_bytes += size
+            test_case = relative.parent.relative_to("test-results").as_posix()
+            artifact: dict[str, object] = {
+                "id": artifact_id,
+                "kind": kind,
+                "mime_type": mime_type,
+                "size_bytes": size,
+                "sha256": digest,
+                "source": relative.as_posix(),
+                "test_case": test_case,
+                "host_path": str(destination),
+            }
+            if trace_summary is not None:
+                artifact["trace_summary"] = trace_summary
+            artifacts.append(artifact)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return artifacts
+
+
+def _is_playwright_command(command: list[str]) -> bool:
+    normalized = " ".join(command).lower()
+    return "playwright" in normalized or "test:e2e" in normalized
+
+
 def _docker_environment(home: Path) -> dict[str, str]:
     return {**_credential_free_environment(home), "DOCKER_HOST": _local_docker_host()}
 
@@ -1538,6 +1821,7 @@ def _run_worker_gate(
 
 def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
     """Run exact-head gates once in a disposable full-stack review worker."""
+    _remove_review_artifacts(review_tuple)
     base_tree_sha = _commit_tree_sha(review_tuple.base_sha)
     head_tree_sha = _commit_tree_sha(review_tuple.head_sha)
     worker = {
@@ -1562,10 +1846,17 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
             "docker_compose": True,
             "playwright_chromium": True,
             "feature_commands": True,
+            "signed_visual_artifacts": True,
+        },
+        "artifact_export": {
+            "status": "pending",
+            "screenshots": 0,
+            "traces": 0,
         },
         "mutations": [],
     }
     gates: list[dict] = []
+    artifacts: list[dict[str, object]] = []
     worker_name = ""
     with tempfile.TemporaryDirectory(prefix="newtonsapple-review-") as temp:
         root = Path(temp)
@@ -1734,6 +2025,26 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
                     setup_command=["npm", "run", "db:start"],
                 )
             )
+            try:
+                artifacts = _export_playwright_artifacts(
+                    review_tuple, worker_name, env=docker_env
+                )
+                worker["artifact_export"] = {
+                    "status": "pass",
+                    "screenshots": sum(
+                        artifact["kind"] == "screenshot" for artifact in artifacts
+                    ),
+                    "traces": sum(
+                        artifact["kind"] == "trace" for artifact in artifacts
+                    ),
+                }
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                worker["artifact_export"] = {
+                    "status": "unavailable",
+                    "screenshots": 0,
+                    "traces": 0,
+                    "reason": _clean_log(str(exc), limit=500),
+                }
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
             reason = str(exc)
             gates.extend(
@@ -1751,6 +2062,7 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
         "head_tree_sha": head_tree_sha,
         "worker": worker,
         "gates": gates,
+        "artifacts": artifacts,
     }
 
 
@@ -1773,6 +2085,7 @@ def execution_evidence(payload: dict) -> dict:
         },
         "worker": local["worker"],
         "gates": local["gates"],
+        "artifacts": local["artifacts"],
     }
     return _signed_result(
         report,
@@ -1849,6 +2162,25 @@ def execute_feature_command(payload: dict) -> dict:
             env=env,
             timeout=120,
         )
+    artifacts: list[dict[str, object]] = []
+    artifact_export = {"status": "not-applicable", "screenshots": 0, "traces": 0}
+    if _is_playwright_command(command):
+        try:
+            artifacts = _export_playwright_artifacts(review_tuple, worker_name, env=env)
+            artifact_export = {
+                "status": "pass",
+                "screenshots": sum(
+                    artifact["kind"] == "screenshot" for artifact in artifacts
+                ),
+                "traces": sum(artifact["kind"] == "trace" for artifact in artifacts),
+            }
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            artifact_export = {
+                "status": "unavailable",
+                "screenshots": 0,
+                "traces": 0,
+                "reason": _clean_log(str(exc), limit=500),
+            }
     result_payload = {
         **review_tuple.__dict__,
         "command": command,
@@ -1864,6 +2196,8 @@ def execute_feature_command(payload: dict) -> dict:
         "network": "isolated",
         "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
         "output_excerpt": log[-LOCAL_REVIEW_EXCERPT_LIMIT:],
+        "artifact_export": artifact_export,
+        "artifacts": artifacts,
     }
     return _signed_result(
         result_payload,
@@ -2404,6 +2738,7 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         )
         drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
         _remove_review_worker(review_tuple)
+        _remove_review_artifacts(review_tuple)
         return {"settled": "release", **failure}
     if operation != "complete":
         raise RuntimeError("invalid settlement operation")
@@ -2440,6 +2775,7 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
     )
     delivered = drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
     _remove_review_worker(review_tuple)
+    _remove_review_artifacts(review_tuple)
     return {"settled": "complete", "outbox_delivered": delivered}
 
 

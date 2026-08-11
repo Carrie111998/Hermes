@@ -15,6 +15,7 @@ import json
 import posixpath
 import re
 import secrets
+import stat
 import subprocess
 import threading
 import zipfile
@@ -22,7 +23,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterator, Optional
 
 from cryptography.exceptions import InvalidSignature
@@ -57,6 +58,11 @@ _MAX_CONCISE_PATCH_CHARS = 4_000
 _MAX_PAGE_CHARS = 60_000
 _MAX_RECOVERY_CURSOR_INVENTORY = 16
 _MAX_EXPOSED_CURSORS = 16
+_MAX_EXECUTION_ARTIFACTS_PER_RESULT = 12
+_MAX_EXECUTION_ARTIFACTS_PER_SCOPE = 24
+_MAX_EXECUTION_SCREENSHOT_BYTES = 5 * 1024 * 1024
+_MAX_EXECUTION_TRACE_BYTES = 25 * 1024 * 1024
+_MAX_EXECUTION_ARTIFACT_TOTAL_BYTES = 100 * 1024 * 1024
 # A pull request can expose up to 3,000 changed files. Exact-head review may
 # materialize both base and head blobs plus the bounded 200-entry artifact
 # inventory, so the old 200-cursor ceiling rejected legitimate large reviews.
@@ -134,6 +140,7 @@ class EvidenceScope:
     )
     execution_attestation_valid: bool = False
     execution_attestation: dict[str, Any] = field(default_factory=dict)
+    execution_artifacts: dict[str, dict[str, Any]] = field(default_factory=dict)
     api_changed_inventory: set[tuple[str, str, str]] = field(default_factory=set)
     tree_raw_inventory: set[tuple[str, str, str]] = field(default_factory=set)
     tree_changed_inventory: set[tuple[str, str, str]] = field(default_factory=set)
@@ -1484,6 +1491,13 @@ def _read(scope: EvidenceScope, token: str) -> str:
                 "attested": True,
                 "required_gates": list(scope.required_execution_gates),
                 "gates": scope.execution_attestation.get("gates", []),
+                "artifact_export": scope.execution_attestation.get("worker", {}).get(
+                    "artifact_export"
+                ),
+                "artifacts": [
+                    _public_execution_artifact(artifact)
+                    for artifact in scope.execution_artifacts.values()
+                ],
             }
         elif cursor.kind == "gate_resolution":
             loader = scope.gate_resolution_loader
@@ -1608,6 +1622,236 @@ def _read(scope: EvidenceScope, token: str) -> str:
         return _error(scope, str(exc), fatal=True)
 
 
+def _execution_artifact_cache_root() -> Path:
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "cache" / "pr-review-artifacts").resolve()
+
+
+def _valid_trace_summary(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "entries",
+        "trace_files",
+        "recent_actions",
+        "errors",
+    }:
+        return False
+    entries = value.get("entries")
+    trace_files = value.get("trace_files")
+    actions = value.get("recent_actions")
+    errors = value.get("errors")
+    return bool(
+        isinstance(entries, int)
+        and not isinstance(entries, bool)
+        and 1 <= entries <= 500
+        and isinstance(trace_files, int)
+        and not isinstance(trace_files, bool)
+        and 1 <= trace_files <= entries
+        and isinstance(actions, list)
+        and len(actions) <= 12
+        and all(isinstance(item, str) and 0 < len(item) <= 160 for item in actions)
+        and isinstance(errors, list)
+        and len(errors) <= 6
+        and all(isinstance(item, str) and 0 < len(item) <= 500 for item in errors)
+    )
+
+
+def _verified_execution_artifact(
+    scope: EvidenceScope, artifact: Any
+) -> Optional[dict[str, Any]]:
+    if not isinstance(artifact, dict):
+        return None
+    kind = artifact.get("kind")
+    required_keys = {
+        "id",
+        "kind",
+        "mime_type",
+        "size_bytes",
+        "sha256",
+        "source",
+        "test_case",
+        "host_path",
+    }
+    if kind == "trace":
+        required_keys.add("trace_summary")
+    if set(artifact) != required_keys:
+        return None
+    artifact_id = artifact.get("id")
+    digest = artifact.get("sha256")
+    size = artifact.get("size_bytes")
+    source = artifact.get("source")
+    test_case = artifact.get("test_case")
+    host_path = artifact.get("host_path")
+    if (
+        not isinstance(artifact_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or isinstance(size, bool)
+        or not isinstance(size, int)
+        or size <= 0
+        or not isinstance(source, str)
+        or not source.startswith("test-results/")
+        or len(source) > 1024
+        or not isinstance(test_case, str)
+        or not test_case
+        or len(test_case) > 1024
+        or not isinstance(host_path, str)
+        or not host_path
+        or len(host_path) > 4096
+    ):
+        return None
+    source_path = PurePosixPath(source)
+    if source_path.is_absolute() or ".." in source_path.parts:
+        return None
+    if kind == "screenshot":
+        if (
+            artifact.get("mime_type") != "image/png"
+            or size > _MAX_EXECUTION_SCREENSHOT_BYTES
+        ):
+            return None
+        suffix = ".png"
+    elif kind == "trace":
+        if (
+            artifact.get("mime_type") != "application/zip"
+            or size > _MAX_EXECUTION_TRACE_BYTES
+            or not _valid_trace_summary(artifact.get("trace_summary"))
+        ):
+            return None
+        suffix = ".trace.zip"
+    else:
+        return None
+
+    candidate = Path(host_path)
+    try:
+        root = _execution_artifact_cache_root()
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(root)
+        metadata = candidate.lstat()
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if (
+        candidate.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or resolved.name != f"{artifact_id}{suffix}"
+        or metadata.st_size != size
+    ):
+        return None
+    try:
+        data = resolved.read_bytes()
+    except OSError:
+        return None
+    if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+        return None
+    if kind == "screenshot":
+        if len(data) < 24 or data[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+    else:
+        try:
+            with zipfile.ZipFile(resolved) as archive:
+                entries = archive.infolist()
+                if (
+                    not entries
+                    or len(entries) > 500
+                    or sum(entry.file_size for entry in entries) > 100 * 1024 * 1024
+                ):
+                    return None
+        except (OSError, zipfile.BadZipFile):
+            return None
+    return dict(artifact)
+
+
+def _validate_execution_artifacts(
+    scope: EvidenceScope, value: Any
+) -> Optional[dict[str, dict[str, Any]]]:
+    if not isinstance(value, list) or len(value) > _MAX_EXECUTION_ARTIFACTS_PER_RESULT:
+        return None
+    result: dict[str, dict[str, Any]] = {}
+    total = 0
+    for raw_artifact in value:
+        artifact = _verified_execution_artifact(scope, raw_artifact)
+        if artifact is None or artifact["id"] in result:
+            return None
+        total += artifact["size_bytes"]
+        if total > _MAX_EXECUTION_ARTIFACT_TOTAL_BYTES:
+            return None
+        result[artifact["id"]] = artifact
+    return result
+
+
+def _valid_artifact_export(
+    value: Any,
+    artifacts: dict[str, dict[str, Any]],
+    *,
+    allow_not_applicable: bool,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    allowed = {"pass", "unavailable"}
+    if allow_not_applicable:
+        allowed.add("not-applicable")
+    if status not in allowed:
+        return False
+    expected_keys = {"status", "screenshots", "traces"}
+    if status == "unavailable":
+        expected_keys.add("reason")
+    if set(value) != expected_keys:
+        return False
+    screenshots = value.get("screenshots")
+    traces = value.get("traces")
+    if (
+        isinstance(screenshots, bool)
+        or not isinstance(screenshots, int)
+        or isinstance(traces, bool)
+        or not isinstance(traces, int)
+        or screenshots < 0
+        or traces < 0
+    ):
+        return False
+    if status in {"unavailable", "not-applicable"}:
+        if screenshots != 0 or traces != 0 or artifacts:
+            return False
+    if status == "unavailable":
+        reason = value.get("reason")
+        if not isinstance(reason, str) or not reason or len(reason) > 500:
+            return False
+    return bool(
+        screenshots
+        == sum(artifact["kind"] == "screenshot" for artifact in artifacts.values())
+        and traces
+        == sum(artifact["kind"] == "trace" for artifact in artifacts.values())
+    )
+
+
+def _public_execution_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in artifact.items() if key != "host_path"}
+
+
+def _execution_artifact(scope: EvidenceScope, artifact_id: Any) -> str:
+    if not scope.execution_attestation_valid:
+        return _error(scope, "Read the execution attestation before artifacts")
+    if (
+        not isinstance(artifact_id, str)
+        or re.fullmatch(r"[0-9a-f]{64}", artifact_id) is None
+    ):
+        return _error(scope, "Invalid execution artifact ID")
+    artifact = scope.execution_artifacts.get(artifact_id)
+    verified = _verified_execution_artifact(scope, artifact)
+    if verified is None:
+        return _error(scope, "Execution artifact is unavailable or changed")
+    public = _public_execution_artifact(verified)
+    if verified["kind"] == "screenshot":
+        public["image_url"] = verified["host_path"]
+    response = {
+        "success": True,
+        "kind": "execution_artifact",
+        "items": public,
+        "coverage": _coverage(scope),
+    }
+    return json.dumps(response, ensure_ascii=False)
+
+
 def _execute_feature_command(
     scope: EvidenceScope, command: Any, timeout_seconds: Any
 ) -> str:
@@ -1661,10 +1905,28 @@ def _execute_feature_command(
         or len(result["output_excerpt"]) > 12_000
     ):
         return _error(scope, "Feature command attestation was invalid")
+    artifacts = _validate_execution_artifacts(scope, result.get("artifacts"))
+    if artifacts is None or not _valid_artifact_export(
+        result.get("artifact_export"), artifacts, allow_not_applicable=True
+    ):
+        return _error(scope, "Feature command artifacts were invalid")
+    merged_artifacts = {**scope.execution_artifacts, **artifacts}
+    if (
+        len(merged_artifacts) > _MAX_EXECUTION_ARTIFACTS_PER_SCOPE
+        or sum(artifact["size_bytes"] for artifact in merged_artifacts.values())
+        > _MAX_EXECUTION_ARTIFACT_TOTAL_BYTES
+    ):
+        return _error(scope, "Feature command artifacts exceeded review limits")
+    with scope.lock:
+        scope.execution_artifacts = merged_artifacts
+    public_result = dict(result)
+    public_result["artifacts"] = [
+        _public_execution_artifact(artifact) for artifact in artifacts.values()
+    ]
     response = {
         "success": True,
         "kind": "feature_command",
-        "items": result,
+        "items": public_result,
         "coverage": _coverage(scope),
     }
     encoded = json.dumps(response, ensure_ascii=False)
@@ -1678,6 +1940,7 @@ def github_pr_evidence_tool(
     cursor: Optional[str] = None,
     command: Any = None,
     timeout_seconds: Any = 1800,
+    artifact_id: Any = None,
 ) -> str:
     """Return manifest metadata or consume one opaque evidence cursor."""
     scope = current_evidence_scope()
@@ -1691,6 +1954,8 @@ def github_pr_evidence_tool(
         return _read(scope, cursor)
     if operation == "execute":
         return _execute_feature_command(scope, command, timeout_seconds)
+    if operation == "artifact":
+        return _execution_artifact(scope, artifact_id)
     return _error(scope, "Unsupported evidence operation")
 
 
@@ -2132,9 +2397,24 @@ def record_execution_attestation(payload: bytes, signature: str) -> bool:
         or not set(mutations).issubset(declared_artifacts)
     ):
         return False
+    execution_artifacts = _validate_execution_artifacts(
+        scope, report.get("artifacts", [])
+    )
+    if execution_artifacts is None:
+        return False
+    if worker.get("required") is True:
+        if not _valid_artifact_export(
+            worker.get("artifact_export"),
+            execution_artifacts,
+            allow_not_applicable=False,
+        ):
+            return False
+    elif execution_artifacts or worker.get("artifact_export") is not None:
+        return False
 
     with scope.lock:
         scope.execution_attestation = report
+        scope.execution_artifacts = execution_artifacts
         scope.execution_attestation_valid = True
     return True
 
@@ -2153,15 +2433,16 @@ registry.register(
             "tokens, call manifest again and resume only from its bounded "
             "current_required_cursors inventory. After reading the signed execution "
             "attestation, use operation=execute for relevant feature-specific commands "
-            "in the retained exact-head full-stack worker. A recalled manifest omits "
-            "consumed control-plane cursors."
+            "in the retained exact-head full-stack worker and operation=artifact for "
+            "a selected signed Playwright screenshot or trace summary. A recalled "
+            "manifest omits consumed control-plane cursors."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "operation": {
                     "type": "string",
-                    "enum": ["manifest", "read", "execute"],
+                    "enum": ["manifest", "read", "execute", "artifact"],
                 },
                 "cursor": {
                     "type": "string",
@@ -2182,6 +2463,14 @@ registry.register(
                     "maximum": 3600,
                     "default": 1800,
                 },
+                "artifact_id": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$",
+                    "description": (
+                        "Opaque signed execution-artifact ID returned by the "
+                        "execution attestation or a feature-command result."
+                    ),
+                },
             },
             "required": ["operation"],
             "additionalProperties": False,
@@ -2192,6 +2481,7 @@ registry.register(
         cursor=args.get("cursor"),
         command=args.get("command"),
         timeout_seconds=args.get("timeout_seconds", 1800),
+        artifact_id=args.get("artifact_id"),
     ),
     check_fn=check_github_pr_evidence_requirements,
     description="Tuple-bound read-only GitHub PR evidence",

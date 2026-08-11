@@ -42,6 +42,8 @@ live-state check and publication.
   and full desktop/mobile Chromium E2E.
 - Targeted verification: the narrowest relevant test, UI journey, migration
   replay, CLI dry-run, or validation boundary not covered by baseline.
+- Visual verification: retrieve selected signed failed-test screenshots, inspect
+  them with `vision_analyze`, and use the paired trace summaries for context.
 - Results: `pass`, `pr-fail`, or `unavailable` using signed evidence only.
 - Output: actionable findings, compact verification table, coverage paragraph,
   exact base/head, and the supplied completion marker.
@@ -103,6 +105,13 @@ Docker Compose, local services, and Playwright Chromium.
    feature-specific command not already proved by a baseline gate. This is the
    retained exact-head full-stack worker, so run the command instead of calling
    it unavailable merely because it is not a baseline row.
+6. When the baseline or a targeted Playwright command returns visual artifacts,
+   retrieve each relevant screenshot with
+   `github_pr_evidence(operation="artifact", artifact_id="...")`, then call
+   `vision_analyze` with the returned `image_url`. Compare visible state with
+   the assertion/log evidence and paired signed trace summary. Inspect at most
+   the bounded selected set, skip duplicates, and state only observations that
+   materially support a finding or explain a failed journey.
 
 For UI or interaction changes, run the narrowest relevant Playwright spec or
 journey in addition to the full E2E gate when one exists. Start a disposable
@@ -203,6 +212,8 @@ any differs from the trusted envelope. End with the exact supplied v2 marker:
 - Do not substitute Actions status for local exact-head verification.
 - Do not omit a relevant targeted command merely because it is absent from the
   baseline rows; use the retained worker.
+- Do not include local artifact paths in the GitHub review. They are ephemeral
+  control-plane handles, not user-facing evidence links.
 - Do not post progress, duplicate reviews, generic praise, long summaries, or
   speculative improvements.
 - Do not retry deterministic product failures. Retry suspected transient

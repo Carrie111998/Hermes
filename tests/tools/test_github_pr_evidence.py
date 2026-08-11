@@ -37,6 +37,68 @@ BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
 
 
+def _execution_screenshot(monkeypatch, tmp_path, *, artifact_id="1" * 64):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    data = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII="
+    )
+    path = (
+        hermes_home
+        / "cache"
+        / "pr-review-artifacts"
+        / ("2" * 64)
+        / f"{artifact_id}.png"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(data)
+    return {
+        "id": artifact_id,
+        "kind": "screenshot",
+        "mime_type": "image/png",
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "source": "test-results/example/test-failed-1.png",
+        "test_case": "example",
+        "host_path": str(path),
+    }
+
+
+def _execution_trace(monkeypatch, tmp_path, *, artifact_id="3" * 64):
+    hermes_home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    path = (
+        hermes_home
+        / "cache"
+        / "pr-review-artifacts"
+        / ("2" * 64)
+        / f"{artifact_id}.trace.zip"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "0-trace.trace",
+            json.dumps({"type": "before", "apiName": "page.goto"}),
+        )
+    data = path.read_bytes()
+    return {
+        "id": artifact_id,
+        "kind": "trace",
+        "mime_type": "application/zip",
+        "size_bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "source": "test-results/example/trace.zip",
+        "test_case": "example",
+        "host_path": str(path),
+        "trace_summary": {
+            "entries": 1,
+            "trace_files": 1,
+            "recent_actions": ["page.goto"],
+            "errors": [],
+        },
+    }
+
+
 def _comparison(merge_base_sha=BASE_SHA):
     return {
         "base_commit": {"sha": BASE_SHA},
@@ -141,12 +203,13 @@ def _gate_record(scope, gate, *, status="pass", executor="github_actions"):
 
 
 def _signed_execution_attestation(
-    scope, *, gates=None, preflight=None, worker_required=True
+    scope, *, gates=None, preflight=None, worker_required=True, artifacts=None
 ):
     private_key = Ed25519PrivateKey.generate()
     scope.base_tree_sha = "c" * 40
     scope.head_tree_sha = "d" * 40
     manifest_sha256 = _install_gate_resolution(scope, private_key)
+    artifacts = artifacts or []
     payload = json.dumps(
         {
             "contract_version": "v2",
@@ -178,12 +241,22 @@ def _signed_execution_attestation(
                         "resources_bounded": True,
                         "egress_isolated_before_browser_verification": True,
                     },
+                    "artifact_export": {
+                        "status": "pass",
+                        "screenshots": sum(
+                            artifact["kind"] == "screenshot" for artifact in artifacts
+                        ),
+                        "traces": sum(
+                            artifact["kind"] == "trace" for artifact in artifacts
+                        ),
+                    },
                 }
                 if worker_required
                 else {"required": False}
             ),
             "gates": gates
             or [_gate_record(scope, gate) for gate in scope.required_execution_gates],
+            "artifacts": artifacts,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1619,6 +1692,12 @@ def test_feature_command_requires_attestation_and_verifies_signed_exact_head_res
             "tree_after": scope.head_tree_sha,
             "log_sha256": "e" * 64,
             "output_excerpt": "feature passed",
+            "artifact_export": {
+                "status": "not-applicable",
+                "screenshots": 0,
+                "traces": 0,
+            },
+            "artifacts": [],
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1647,6 +1726,116 @@ def test_feature_command_requires_attestation_and_verifies_signed_exact_head_res
     assert completed["kind"] == "feature_command"
     assert completed["items"]["status"] == "pass"
     assert completed["items"]["output_excerpt"] == "feature passed"
+
+
+def test_signed_screenshot_is_retrievable_for_visual_analysis_and_tamper_evident(
+    monkeypatch, tmp_path
+):
+    from tools.image_source import ResolveContext, resolve_image_source
+
+    scope = _scope()
+    artifact = _execution_screenshot(monkeypatch, tmp_path)
+
+    with evidence_scope(scope):
+        payload, signature = _signed_execution_attestation(scope, artifacts=[artifact])
+        assert record_execution_attestation(payload, signature) is True
+
+        retrieved = json.loads(
+            github_pr_evidence_tool("artifact", artifact_id=artifact["id"])
+        )
+        assert retrieved["success"] is True
+        assert retrieved["items"]["image_url"] == artifact["host_path"]
+        assert "host_path" not in retrieved["items"]
+        resolved = asyncio.run(
+            resolve_image_source(retrieved["items"]["image_url"], ResolveContext())
+        )
+        assert resolved.mime == "image/png"
+        assert hashlib.sha256(resolved.data).hexdigest() == artifact["sha256"]
+
+        Path(artifact["host_path"]).write_bytes(b"tampered")
+        rejected = json.loads(
+            github_pr_evidence_tool("artifact", artifact_id=artifact["id"])
+        )
+        assert rejected["success"] is False
+        assert "changed" in rejected["error"]
+
+
+def test_signed_trace_returns_bounded_summary_without_exposing_host_path(
+    monkeypatch, tmp_path
+):
+    scope = _scope()
+    artifact = _execution_trace(monkeypatch, tmp_path)
+
+    with evidence_scope(scope):
+        payload, signature = _signed_execution_attestation(scope, artifacts=[artifact])
+        assert record_execution_attestation(payload, signature) is True
+
+        retrieved = json.loads(
+            github_pr_evidence_tool("artifact", artifact_id=artifact["id"])
+        )
+
+    assert retrieved["success"] is True
+    assert retrieved["items"]["trace_summary"]["recent_actions"] == ["page.goto"]
+    assert "host_path" not in retrieved["items"]
+    assert "image_url" not in retrieved["items"]
+
+
+def test_execution_attestation_rejects_artifact_outside_private_cache(
+    monkeypatch, tmp_path
+):
+    scope = _scope()
+    artifact = _execution_screenshot(monkeypatch, tmp_path)
+    outside = tmp_path / f"{artifact['id']}.png"
+    outside.write_bytes(Path(artifact["host_path"]).read_bytes())
+    artifact["host_path"] = str(outside)
+
+    with evidence_scope(scope):
+        payload, signature = _signed_execution_attestation(scope, artifacts=[artifact])
+        assert record_execution_attestation(payload, signature) is False
+
+
+def test_feature_command_adds_public_visual_artifact_without_leaking_cache_path(
+    monkeypatch, tmp_path
+):
+    scope = _scope()
+    command = ["npx", "playwright", "test", "tests/example.spec.ts"]
+    artifact = _execution_screenshot(monkeypatch, tmp_path)
+    private_key = Ed25519PrivateKey.generate()
+    scope.execution_attestation_public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    scope.execution_attestation_valid = True
+    scope.head_tree_sha = "d" * 40
+    result = {
+        **scope.tuple_dict,
+        "command": command,
+        "status": "pr-fail",
+        "attempted": True,
+        "exit_code": 1,
+        "started_at": "2026-08-10T18:00:00Z",
+        "completed_at": "2026-08-10T18:00:01Z",
+        "duration_ms": 1000,
+        "tree_before": scope.head_tree_sha,
+        "tree_after": scope.head_tree_sha,
+        "log_sha256": "e" * 64,
+        "output_excerpt": "assertion failed",
+        "artifact_export": {"status": "pass", "screenshots": 1, "traces": 0},
+        "artifacts": [artifact],
+    }
+    payload = json.dumps(result, sort_keys=True, separators=(",", ":")).encode()
+    signature = base64.b64encode(private_key.sign(payload)).decode("ascii")
+    scope.feature_command_loader = lambda selected, timeout: (payload, signature)
+
+    with evidence_scope(scope):
+        completed = json.loads(
+            github_pr_evidence_tool("execute", command=command, timeout_seconds=300)
+        )
+
+    assert completed["success"] is True
+    assert completed["items"]["artifacts"][0]["id"] == artifact["id"]
+    assert "host_path" not in completed["items"]["artifacts"][0]
+    assert artifact["id"] in scope.execution_artifacts
 
 
 def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
@@ -1691,6 +1880,11 @@ def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
                 "resources_bounded": True,
                 "egress_isolated_before_browser_verification": True,
             },
+            "artifact_export": {
+                "status": "pass",
+                "screenshots": 0,
+                "traces": 0,
+            },
         },
         "gates": [
             {
@@ -1708,6 +1902,7 @@ def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
             }
             for gate in scope.required_execution_gates
         ],
+        "artifacts": [],
     }
     payload = json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
     signature = base64.b64encode(private_key.sign(payload)).decode("ascii")
@@ -1886,6 +2081,11 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
                 "resources_bounded": True,
                 "egress_isolated_before_browser_verification": True,
             },
+            "artifact_export": {
+                "status": "pass",
+                "screenshots": 0,
+                "traces": 0,
+            },
         },
         "gates": [
             _gate_record(scope, "quality"),
@@ -1988,6 +2188,7 @@ def test_pr_184_execution_contract_preserves_feature_specific_failures_and_capab
                 "contradiction": True,
             },
         ],
+        "artifacts": [],
     }
 
     def sign(candidate):
