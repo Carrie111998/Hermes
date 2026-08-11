@@ -149,7 +149,87 @@ def test_animated_sticker_thumbnail_uses_vision_and_cache():
     assert 'It shows: "A cat waving hello"' in event.text
 
 
-def test_animated_sticker_metadata_fallback_is_cached():
+@pytest.mark.parametrize(
+    "vision_failure",
+    [json.dumps({"success": False}), RuntimeError("temporary vision outage")],
+)
+def test_animated_sticker_vision_failure_does_not_cache_metadata(
+    vision_failure, tmp_path
+):
+    from plugins.platforms.telegram.adapter import TelegramAdapter
+    from plugins.platforms.telegram.tgs import TGSFrameResult
+
+    tgs_file = SimpleNamespace(
+        download_as_bytearray=AsyncMock(return_value=_tgs_bytes())
+    )
+    sticker = SimpleNamespace(
+        emoji="✨",
+        set_name="Sparkles",
+        file_unique_id="transient-vision-failure-uid",
+        is_animated=True,
+        is_video=False,
+        get_file=AsyncMock(return_value=tgs_file),
+        thumbnail=None,
+    )
+    event = SimpleNamespace(text="")
+    vision = AsyncMock(
+        side_effect=[
+            vision_failure,
+            json.dumps({"success": True, "analysis": "A sparkling star"}),
+        ]
+    )
+
+    with (
+        patch(
+            "gateway.sticker_cache.CACHE_PATH",
+            tmp_path / "sticker-cache.json",
+        ),
+        patch(
+            "plugins.platforms.telegram.tgs.extract_tgs_frame",
+            return_value=TGSFrameResult(
+                b"\x89PNG\r\n\x1a\nframe",
+                "a 512x512 animation with 2 layers",
+            ),
+        ) as extract_frame,
+        patch(
+            "plugins.platforms.telegram.adapter.cache_image_from_bytes",
+            return_value="/tmp/sticker.png",
+        ),
+        patch(
+            "tools.vision_tools.vision_analyze_tool",
+            new=vision,
+        ),
+    ):
+        asyncio.run(
+            TelegramAdapter._handle_sticker(
+                object.__new__(TelegramAdapter), SimpleNamespace(sticker=sticker), event
+            )
+        )
+        retry_event = SimpleNamespace(text="")
+        asyncio.run(
+            TelegramAdapter._handle_sticker(
+                object.__new__(TelegramAdapter),
+                SimpleNamespace(sticker=sticker),
+                retry_event,
+            )
+        )
+        cached_event = SimpleNamespace(text="")
+        asyncio.run(
+            TelegramAdapter._handle_sticker(
+                object.__new__(TelegramAdapter),
+                SimpleNamespace(sticker=sticker),
+                cached_event,
+            )
+        )
+
+    assert "a 512x512 animation with 2 layers" in event.text
+    assert vision.await_count == 2
+    assert extract_frame.call_count == 2
+    assert 'It shows: "A sparkling star"' in retry_event.text
+    assert 'It shows: "A sparkling star"' in cached_event.text
+
+
+def test_animated_sticker_metadata_fallback_is_not_cached(tmp_path):
     from plugins.platforms.telegram.adapter import TelegramAdapter
     from plugins.platforms.telegram.tgs import TGSFrameResult
 
@@ -168,23 +248,32 @@ def test_animated_sticker_metadata_fallback_is_cached():
     event = SimpleNamespace(text="")
 
     with (
-        patch("gateway.sticker_cache.get_cached_description", return_value=None),
-        patch("gateway.sticker_cache.cache_sticker_description") as cache_description,
+        patch(
+            "gateway.sticker_cache.CACHE_PATH",
+            tmp_path / "sticker-cache.json",
+        ),
         patch(
             "plugins.platforms.telegram.tgs.extract_tgs_frame",
             return_value=TGSFrameResult(None, "a 512x512 animation with 2 layers"),
-        ),
+        ) as extract_frame,
     ):
         asyncio.run(
             TelegramAdapter._handle_sticker(
                 object.__new__(TelegramAdapter), SimpleNamespace(sticker=sticker), event
             )
         )
+        retry_event = SimpleNamespace(text="")
+        asyncio.run(
+            TelegramAdapter._handle_sticker(
+                object.__new__(TelegramAdapter),
+                SimpleNamespace(sticker=sticker),
+                retry_event,
+            )
+        )
 
-    cache_description.assert_called_once_with(
-        "metadata-uid", "a 512x512 animation with 2 layers", "✨", "Sparkles"
-    )
+    assert extract_frame.call_count == 2
     assert "a 512x512 animation with 2 layers" in event.text
+    assert "a 512x512 animation with 2 layers" in retry_event.text
 
 
 def test_video_sticker_vision_failure_keeps_emoji_fallback():

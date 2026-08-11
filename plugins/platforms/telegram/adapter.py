@@ -9602,9 +9602,6 @@ class TelegramAdapter(BasePlatformAdapter):
 
             if image_bytes is None:
                 if metadata_description:
-                    cache_sticker_description(
-                        sticker.file_unique_id, metadata_description, emoji, set_name
-                    )
                     event.text = build_sticker_injection(
                         metadata_description, emoji, set_name
                     )
@@ -9631,12 +9628,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 event.text = build_sticker_injection(description, emoji, set_name)
             else:
                 if metadata_description:
-                    cache_sticker_description(
-                        sticker.file_unique_id,
-                        metadata_description,
-                        emoji,
-                        set_name,
-                    )
                     event.text = build_sticker_injection(
                         metadata_description, emoji, set_name
                     )
@@ -9652,9 +9643,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 exc_info=True,
             )
             if metadata_description:
-                cache_sticker_description(
-                    sticker.file_unique_id, metadata_description, emoji, set_name
-                )
                 event.text = build_sticker_injection(
                     metadata_description, emoji, set_name
                 )
