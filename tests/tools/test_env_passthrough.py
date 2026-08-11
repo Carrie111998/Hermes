@@ -1,6 +1,7 @@
 """Tests for tools.env_passthrough — skill and config env var passthrough."""
 
 import os
+from unittest.mock import patch
 import pytest
 import yaml
 
@@ -10,6 +11,7 @@ from tools.env_passthrough import (
     clear_env_passthrough,
     get_all_passthrough,
     is_env_passthrough,
+    is_trusted_env_passthrough,
     register_env_passthrough,
     resolve_passthrough_value,
 )
@@ -20,10 +22,12 @@ def _clean_passthrough():
     """Ensure a clean passthrough state for every test."""
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
+    _ep_mod._trusted_passthrough = None
     ss.set_multiplex_active(False)
     yield
     clear_env_passthrough()
     _ep_mod._config_passthrough = None
+    _ep_mod._trusted_passthrough = None
     ss.set_multiplex_active(False)
 
 
@@ -411,3 +415,156 @@ class TestTerminalIntegration:
         assert "OPENAI_API_KEY" not in child_env
         assert "ANTHROPIC_API_KEY" not in child_env
         assert child_env["PATH"] == "/usr/bin"
+
+
+class TestTrustedConfigPassthrough:
+    """Operator-only ``terminal.trusted_env_passthrough`` — the sanctioned way
+    to let a protected credential (e.g. GH_TOKEN) reach terminal subprocesses.
+    Config-only: skills can never populate it, and dynamic Hermes-internal
+    secrets can never be trusted through it."""
+
+    def _write_config(self, tmp_path, monkeypatch, trusted):
+        config = {"terminal": {"trusted_env_passthrough": trusted}}
+        (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._trusted_passthrough = None
+        _ep_mod._config_passthrough = None
+
+    def test_defaults_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._trusted_passthrough = None
+        assert not is_trusted_env_passthrough("GH_TOKEN")
+
+    def test_reads_gh_token_from_config(self, tmp_path, monkeypatch):
+        self._write_config(tmp_path, monkeypatch, ["GH_TOKEN"])
+        assert is_trusted_env_passthrough("GH_TOKEN")
+        assert not is_trusted_env_passthrough("SOME_OTHER_VAR")
+
+    def test_rejects_dynamic_internal_secret(self, tmp_path, monkeypatch):
+        # An operator cannot trust a dynamically-named Hermes secret, even by
+        # listing it explicitly — the loader filters these out.
+        self._write_config(tmp_path, monkeypatch, [
+            "GH_TOKEN",
+            "AUXILIARY_VISION_API_KEY",
+            "AUXILIARY_VISION_BASE_URL",
+            "GATEWAY_RELAY_SECRET",
+        ])
+        assert is_trusted_env_passthrough("GH_TOKEN")
+        assert not is_trusted_env_passthrough("AUXILIARY_VISION_API_KEY")
+        assert not is_trusted_env_passthrough("AUXILIARY_VISION_BASE_URL")
+        assert not is_trusted_env_passthrough("GATEWAY_RELAY_SECRET")
+
+    def test_is_config_only_skills_cannot_populate(self, tmp_path, monkeypatch):
+        # Trusting GH_TOKEN in config does NOT add it to the skill/ordinary
+        # allowlist, and a skill registering it is still refused there.
+        self._write_config(tmp_path, monkeypatch, ["GH_TOKEN"])
+        register_env_passthrough(["GH_TOKEN"])
+        assert not is_env_passthrough("GH_TOKEN")
+        assert "GH_TOKEN" not in get_all_passthrough()
+        # The trusted set stays separate and authoritative for the terminal.
+        assert is_trusted_env_passthrough("GH_TOKEN")
+
+    def test_ordinary_passthrough_unaffected(self, tmp_path, monkeypatch):
+        # Ordinary skill/config passthrough of non-protected vars keeps working
+        # alongside a trusted-credential config, and does not leak into trusted.
+        config = {
+            "terminal": {
+                "trusted_env_passthrough": ["GH_TOKEN"],
+                "env_passthrough": ["MY_CUSTOM_KEY"],
+            }
+        }
+        (tmp_path / "config.yaml").write_text(yaml.dump(config), encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _ep_mod._trusted_passthrough = None
+        _ep_mod._config_passthrough = None
+
+        register_env_passthrough(["TENOR_API_KEY"])
+        assert is_env_passthrough("MY_CUSTOM_KEY")   # ordinary config
+        assert is_env_passthrough("TENOR_API_KEY")   # skill
+        assert not is_trusted_env_passthrough("MY_CUSTOM_KEY")
+
+
+class TestTrustedTerminalPassthrough:
+    """The trusted override is honored ONLY by terminal env construction
+    (``_make_run_env``) and never widens beyond it."""
+
+    def test_make_run_env_strips_gh_token_by_default(self):
+        from tools.environments.local import _make_run_env
+
+        _ep_mod._trusted_passthrough = frozenset()
+        with patch.dict(os.environ, {"PATH": "/usr/bin", "GH_TOKEN": "ghp_secret"}, clear=True):
+            run_env = _make_run_env({})
+        assert "GH_TOKEN" not in run_env
+
+    def test_make_run_env_allows_trusted_gh_token(self):
+        from tools.environments.local import _make_run_env
+
+        _ep_mod._trusted_passthrough = frozenset({"GH_TOKEN"})
+        with patch.dict(os.environ, {"PATH": "/usr/bin", "GH_TOKEN": "ghp_secret"}, clear=True):
+            run_env = _make_run_env({})
+        assert run_env.get("GH_TOKEN") == "ghp_secret"
+
+    def test_make_run_env_never_exposes_dynamic_secret_even_if_trusted(self):
+        # Defense in depth: even if the trusted set somehow named a dynamic
+        # internal secret, _make_run_env strips it before the trusted check.
+        from tools.environments.local import _make_run_env
+
+        _ep_mod._trusted_passthrough = frozenset(
+            {"AUXILIARY_VISION_API_KEY", "GATEWAY_RELAY_SECRET"}
+        )
+        with patch.dict(os.environ, {
+            "PATH": "/usr/bin",
+            "AUXILIARY_VISION_API_KEY": "sk-secret",
+            "GATEWAY_RELAY_SECRET": "relay-secret",
+        }, clear=True):
+            run_env = _make_run_env({})
+        assert "AUXILIARY_VISION_API_KEY" not in run_env
+        assert "GATEWAY_RELAY_SECRET" not in run_env
+
+    def test_trusted_gh_token_has_no_effect_outside_terminal(self):
+        from tools.code_execution_tool import _scrub_child_env
+        from tools.environments.local import _sanitize_subprocess_env
+
+        _ep_mod._trusted_passthrough = frozenset({"GH_TOKEN"})
+        # execute_code sandbox is unaffected.
+        child_env = _scrub_child_env(
+            {"GH_TOKEN": "ghp_secret", "PATH": "/usr/bin"}, is_windows=False
+        )
+        assert "GH_TOKEN" not in child_env
+        # Background/PTY + generic build_subprocess_env engine is unaffected.
+        sanitized = _sanitize_subprocess_env({"GH_TOKEN": "ghp_secret", "PATH": "/usr/bin"})
+        assert "GH_TOKEN" not in sanitized
+        # The ordinary/skill allowlist never reports it either.
+        assert not is_env_passthrough("GH_TOKEN")
+
+    def test_make_run_env_trusted_uses_active_profile_scope(self, monkeypatch):
+        # Profile-scoped secret resolution is preserved for trusted credentials:
+        # the routed profile's value wins over the process env value.
+        from tools.environments.local import _make_run_env
+
+        _ep_mod._trusted_passthrough = frozenset({"GH_TOKEN"})
+        monkeypatch.setenv("GH_TOKEN", "ghp-default-profile")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"GH_TOKEN": "ghp-routed-profile"})
+        try:
+            run_env = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+        assert run_env.get("GH_TOKEN") == "ghp-routed-profile"
+
+    def test_make_run_env_trusted_omits_missing_scoped_secret(self, monkeypatch):
+        # A trusted credential absent from the routed scope must not fall back
+        # to the process env under active multiplexing.
+        from tools.environments.local import _make_run_env
+
+        _ep_mod._trusted_passthrough = frozenset({"GH_TOKEN"})
+        monkeypatch.setenv("GH_TOKEN", "ghp-default-profile")
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            run_env = _make_run_env({})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+        assert "GH_TOKEN" not in run_env

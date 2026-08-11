@@ -310,6 +310,13 @@ DEFAULT_CONFIG = {
         # (terminal and execute_code).  Skill-declared required_environment_variables
         # are passed through automatically; this list is for non-skill use cases.
         "env_passthrough": [],
+        # Operator-only override letting protected credentials (names in the
+        # provider blocklist, e.g. GH_TOKEN for gh/git) reach TERMINAL
+        # subprocesses only. Empty by default. Unlike env_passthrough above it
+        # may name provider credentials, but it is config-only — skills can
+        # never populate it — and can never expose a dynamic Hermes-internal
+        # secret (AUXILIARY_*_API_KEY / _BASE_URL, GATEWAY_RELAY_* auth).
+        "trusted_env_passthrough": [],
         # HOME handling for host tool subprocesses:
         #   auto    — host keeps the real OS-user HOME; containers use
         #             HERMES_HOME/home for persistent state (default)

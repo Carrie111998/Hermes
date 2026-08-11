@@ -1270,10 +1270,12 @@ def _make_run_env(env: dict) -> dict:
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
+            is_trusted_env_passthrough as _is_trusted_passthrough,
             resolve_passthrough_value as _resolve_passthrough_value,
         )
     except Exception:
         _is_passthrough = lambda _: False  # noqa: E731
+        _is_trusted_passthrough = lambda _: False  # noqa: E731
         _resolve_passthrough_value = lambda _name, fallback: fallback  # noqa: E731
 
     merged = dict(os.environ | env)
@@ -1287,7 +1289,10 @@ def _make_run_env(env: dict) -> dict:
         elif _is_hermes_internal_secret(k):
             continue
         else:
-            passthrough = _is_passthrough(k)
+            # Operators may trust specific protected credentials (e.g. GH_TOKEN)
+            # into the terminal via terminal.trusted_env_passthrough; skills
+            # cannot, and dynamic internal secrets are already stripped above.
+            passthrough = _is_passthrough(k) or _is_trusted_passthrough(k)
             if k in _HERMES_PROVIDER_ENV_BLOCKLIST and not passthrough:
                 continue
             value = _resolve_passthrough_value(k, v) if passthrough else v

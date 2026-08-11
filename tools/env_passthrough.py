@@ -17,6 +17,14 @@ Both ``code_execution_tool.py`` and ``tools/environments/local.py`` consult
 :func:`is_env_passthrough` before stripping a variable.
 When profile multiplexing is active, their forwarded values are resolved
 through the current profile's secret scope rather than the process environment.
+
+For protected credentials an operator explicitly needs in the local terminal
+(e.g. ``GH_TOKEN`` for ``gh``/``git``), ``terminal.trusted_env_passthrough`` is
+a separate, config-only override read by :func:`is_trusted_env_passthrough`.
+Unlike the two sources above it MAY name provider credentials, but only the
+terminal backend's environment construction honours it — never skills,
+execute_code, or the non-terminal spawn helpers — and it can never expose a
+dynamic Hermes-internal secret.
 """
 
 from __future__ import annotations
@@ -177,6 +185,71 @@ def is_env_passthrough(var_name: str) -> bool:
 def get_all_passthrough() -> frozenset[str]:
     """Return the union of skill-registered and config-based passthrough vars."""
     return frozenset(_get_allowed()) | _load_config_passthrough()
+
+
+# Cache for the operator-configured trusted terminal allowlist (loaded once
+# per process). Kept distinct from _config_passthrough: skills never feed it
+# and it MAY name protected provider credentials.
+_trusted_passthrough: frozenset[str] | None = None
+
+
+def _load_trusted_env_passthrough() -> frozenset[str]:
+    """Load ``terminal.trusted_env_passthrough`` from config.yaml (cached).
+
+    This operator-only allowlist is the single sanctioned way to let a
+    protected provider credential — a name in ``_HERMES_PROVIDER_ENV_BLOCKLIST``
+    such as ``GH_TOKEN`` — reach terminal subprocesses, for operators who want
+    ``gh``/``git`` in the agent terminal to use their own token. It defaults
+    empty and is read only from config.yaml: skills cannot populate it, so the
+    skill-bypass surface closed by GHSA-rhgp-j443-p4rf is untouched.
+
+    Dynamic Hermes-internal secrets (``_is_hermes_internal_secret``:
+    ``AUXILIARY_*_API_KEY`` / ``_BASE_URL``, ``GATEWAY_RELAY_*`` auth) can never
+    be trusted this way; they are filtered out here and remain stripped
+    unconditionally on every spawn path.
+    """
+    global _trusted_passthrough
+    if _trusted_passthrough is not None:
+        return _trusted_passthrough
+
+    result: set[str] = set()
+    try:
+        from hermes_cli.config import read_raw_config
+        from tools.environments.local import _is_hermes_internal_secret
+
+        cfg = read_raw_config()
+        trusted = cfg_get(cfg, "terminal", "trusted_env_passthrough")
+        if isinstance(trusted, list):
+            for item in trusted:
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                name = item.strip()
+                if _is_hermes_internal_secret(name):
+                    logger.warning(
+                        "env passthrough: refusing to trust dynamic Hermes "
+                        "internal secret %r via terminal.trusted_env_passthrough",
+                        name,
+                    )
+                    continue
+                result.add(name)
+    except Exception as e:
+        logger.debug("Could not read terminal.trusted_env_passthrough: %s", e)
+
+    _trusted_passthrough = frozenset(result)
+    return _trusted_passthrough
+
+
+def is_trusted_env_passthrough(var_name: str) -> bool:
+    """Return True if *var_name* is operator-trusted for terminal subprocesses.
+
+    Distinct from :func:`is_env_passthrough`: this consults only the operator's
+    ``terminal.trusted_env_passthrough`` config (never skill state or the
+    ordinary ``terminal.env_passthrough`` allowlist) and MAY name protected
+    provider credentials. Only the terminal backend's environment construction
+    (``tools.environments.local._make_run_env``) honours it, so the override
+    never widens beyond terminal subprocesses.
+    """
+    return var_name in _load_trusted_env_passthrough()
 
 
 def resolve_passthrough_value(
