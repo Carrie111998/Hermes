@@ -172,7 +172,8 @@ jobs:
           python3 -c "
           import json, glob
           merged = {}
-          for f in glob.glob('durations/*/test_durations.json'):
+          files = glob.glob('durations/*/test_durations.json')
+          for f in files:
             with open(f) as fh:
               merged.update(json.load(fh))
           with open('test_durations.json', 'w') as fh:
