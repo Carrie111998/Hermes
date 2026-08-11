@@ -98,19 +98,52 @@ _COMPRESSION_CHILD_SQL = (
 )
 
 
-# Rows that surface in pickers: roots + branch children (subagent runs and
-# compression continuations stay hidden).
-_LISTABLE_CHILD_SQL = f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')})"
+# A child whose parent ended at an explicit gateway conversation boundary
+# (reset/switch/timeout — the same set find_latest_gateway_session_for_peer
+# treats as non-recoverable) is a fresh user conversation, not a subagent run
+# or a compression continuation. It must surface in pickers and must NOT be a
+# cascade-delete target. Without this, every gateway reset (微信/飞书/TG 的
+# /new、idle/daily 超时重置) hid the new session from all session lists
+# (CLI /sessions, `hermes sessions list`, desktop sidebar, dashboard).
+#
+# The started_at >= p.ended_at guard keeps this from accidentally admitting
+# subagent rows whose parent happened to end with a boundary reason: a real
+# reset continuation is created only after its parent is ended, while a
+# delegate spawns while the parent is still live. The _delegate_from guard
+# additionally protects the ephemeral (schema-migration) path, which has no
+# outer delegate filter.
+_GATEWAY_BOUNDARY_END_REASONS = (
+    "'session_reset', 'session_switch', 'idle', 'daily',"
+    " 'suspended', 'resume_pending_expired'"
+)
+_GATEWAY_BOUNDARY_CHILD_SQL = (
+    "json_extract(COALESCE({a}.model_config, '{{}}'), '$._delegate_from') IS NULL"
+    " AND EXISTS (SELECT 1 FROM sessions p"
+    "            WHERE p.id = {a}.parent_session_id"
+    f"            AND p.end_reason IN ({_GATEWAY_BOUNDARY_END_REASONS})"
+    "            AND {a}.started_at >= p.ended_at)"
+)
+
+
+# Rows that surface in pickers: roots + branch children + gateway-boundary
+# children (subagent runs and compression continuations stay hidden).
+_LISTABLE_CHILD_SQL = (
+    f"(s.parent_session_id IS NULL OR {_BRANCH_CHILD_SQL.format(a='s')}"
+    f" OR {_GATEWAY_BOUNDARY_CHILD_SQL.format(a='s')})"
+)
 
 
 def _ephemeral_child_sql(alias: str = "s") -> str:
-    """Subagent runs (cascade-delete targets), not branches or compression tips."""
+    """Subagent runs (cascade-delete targets), not branches, gateway-boundary
+    children (real user conversations), or compression tips."""
     branch = _BRANCH_CHILD_SQL.format(a=alias)
     compression = _COMPRESSION_CHILD_SQL.format(a=alias)
+    boundary = _GATEWAY_BOUNDARY_CHILD_SQL.format(a=alias)
     return (
         f"({alias}.parent_session_id IS NOT NULL"
         f" AND NOT ({branch})"
-        f" AND NOT ({compression}))"
+        f" AND NOT ({compression})"
+        f" AND NOT ({boundary}))"
     )
 
 

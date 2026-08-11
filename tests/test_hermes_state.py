@@ -1920,6 +1920,47 @@ class TestListSessionsRich:
         assert "delegate" not in ids, "Delegate sub-agent should not appear in default list"
         assert "root" in ids
 
+    def test_gateway_reset_child_visible(self, db):
+        """A session created after a gateway reset (/new, idle/daily timeout,
+        session_switch) is a fresh user conversation — it must surface in
+        default listings even though it carries a parent_session_id.
+
+        Regression: gateway reset_session() writes parent_session_id for
+        lineage, but _LISTABLE_CHILD_SQL only admitted 'branched' parents, so
+        every reset continuation disappeared from all session lists.
+        """
+        db.create_session("reset-root", "cli")
+        db._conn.execute(
+            "UPDATE sessions SET ended_at=?, end_reason='session_reset' "
+            "WHERE id='reset-root'",
+            (time.time() - 10,),
+        )
+        db.create_session(
+            "reset-child", "weixin", parent_session_id="reset-root"
+        )
+        db.append_message("reset-child", "user", "继续聊")
+
+        sessions = db.list_sessions_rich()
+        ids = [s["id"] for s in sessions]
+        assert "reset-child" in ids, (
+            "Gateway reset continuation should appear in default list"
+        )
+
+    def test_gateway_reset_child_not_ephemeral(self, db):
+        """Reset-boundary children are real conversations — the ephemeral
+        (cascade-delete) classifier must exclude them alongside branches and
+        compression tips."""
+        import hermes_state_common as hsc
+
+        sql = hsc._ephemeral_child_sql("sessions")
+        # Boundary exclusion is wired in: a session_reset/daily/... parent
+        # keeps the child out of the ephemeral (cascade-delete) class.
+        assert "session_reset" in sql
+        assert "NOT (" in sql
+        assert hsc._GATEWAY_BOUNDARY_CHILD_SQL.format(
+            a="sessions"
+        ) in sql
+
 
 
 class TestCompressionChainProjection:
