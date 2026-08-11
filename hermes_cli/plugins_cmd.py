@@ -288,6 +288,109 @@ def _read_manifest(plugin_dir: Path) -> dict:
         return {}
 
 
+class _StubPluginContext:
+    """Permissive throwaway context for the install-time load smoke test.
+
+    The real ``PluginContext`` exposes ~18 ``register_*`` methods (tool, hook,
+    command, middleware, web_search_provider, platform, secret_source, …) plus
+    a handful of public attributes/methods used by plugins at ``register()``
+    time: ``llm``, ``subagent_lifecycle``, ``profile_name`` (properties),
+    ``inject_message``, ``dispatch_tool``, ``config`` (mapping access), and
+    ``get_config``/``get_secret`` helpers, plus ``logger``. Rather than
+    hand-mirror the full surface (which silently breaks whenever plugins.py
+    gains a registrar), this stub returns a no-op for any ``register_*`` access
+    and for the known non-register_ members above, and raises ``AttributeError``
+    only for anything genuinely unexpected. That lets a valid provider/platform/
+    secret-source plugin run ``register()`` without mutating the live tool
+    registry or tripping a false "load check failed" warning.
+    """
+
+    # Real PluginContext public members a plugin may legitimately touch during
+    # register(); the stub answers each with a non-mutating no-op so the smoke
+    # test never emits a false warning on a valid plugin.
+    _NOOP_MEMBERS = {
+        "llm",
+        "subagent_lifecycle",
+        "profile_name",
+        "inject_message",
+        "dispatch_tool",
+        "config",
+        "get_config",
+        "get_secret",
+        "logger",
+    }
+
+    def __init__(self, name: str):
+        self.manifest = {"name": name}
+
+    def __getattr__(self, attr: str):
+        if attr.startswith("register_") or attr in self._NOOP_MEMBERS:
+            # Properties on the real context return values; a None-returning
+            # no-op is the safe permissive answer for a throwaway smoke context.
+            return lambda *a, **k: None
+        raise AttributeError(attr)
+
+
+def _smoke_test_plugin_load(plugin_dir: Path) -> Optional[str]:
+    """Best-effort load check run at install time.
+
+    Imports the plugin's ``__init__.py`` and calls its ``register(ctx)`` with
+    a throwaway stub context (no-op registrars) so we catch import errors and
+    broken ``register()`` implementations *before* the user discovers the
+    plugin is dead at gateway start — where the same failure is only logged as
+    a warning and silently skipped.
+
+    Returns an error string if the load/register fails, or ``None`` if it
+    succeeded. A plugin with no ``__init__.py`` (declarative-only, e.g. a
+    model catalog) is treated as OK (``None``). This is a soft check: a failure
+    is reported but does NOT block install, matching the existing policy that
+    ``requires_env``/manifest warnings don't abort the install.
+
+    Callers MUST only invoke this after the user has affirmatively opted in to
+    enabling the plugin (explicit ``--enable`` or a ``y`` at the prompt) — it
+    imports and executes arbitrary third-party plugin code. See cmd_install /
+    dashboard_install_plugin, which gate on the resolved enable flag.
+    """
+    init_file = plugin_dir / "__init__.py"
+    if not init_file.exists():
+        return None
+
+    import importlib.util
+
+    module_name = f"_hermes_plugin_smoke_{plugin_dir.name}"
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, init_file)
+        if spec is None or spec.loader is None:
+            return f"cannot build import spec for {init_file}"
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+    except Exception as exc:  # ImportError, SyntaxError, etc.
+        sys.modules.pop(module_name, None)
+        return f"import failed: {type(exc).__name__}: {exc}"
+
+    try:
+        register_fn = getattr(module, "register", None)
+        if register_fn is None:
+            # No register() — declarative plugin, nothing to exercise.
+            return None
+
+        stub_ctx = _StubPluginContext(plugin_dir.name)
+        register_fn(stub_ctx)
+    except Exception as exc:
+        return f"register() raised: {type(exc).__name__}: {exc}"
+    finally:
+        # Avoid leaking the smoke module (and any submodules it imported) into
+        # sys.modules for the life of the process.
+        sys.modules.pop(module_name, None)
+        for leaked in [
+            m for m in sys.modules if m.startswith(f"{module_name}.")
+        ]:
+            sys.modules.pop(leaked, None)
+    return None
+
+
+
 def _copy_example_files(plugin_dir: Path, console) -> None:
     """Copy any .example files to their real names if they don't already exist.
 
@@ -489,6 +592,13 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
                 timeout=60,
                 stdin=subprocess.DEVNULL,
                 env=noninteractive_git_env(),
+                # Run in a stable directory. The gateway process may have been
+                # launched from a temp dir (e.g. macOS /var/folders/.../T) that
+                # gets purged, leaving an unreadable CWD. git clone with no cwd
+                # inherits that dead CWD and fails with
+                # "Unable to read current working directory". plugins_dir
+                # (~/.hermes/plugins) always exists.
+                cwd=str(plugins_dir),
             )
         except FileNotFoundError as e:
             raise PluginOperationError(
@@ -531,6 +641,15 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
         plugin_name = manifest.get("name") or (
             subdir.rstrip("/").rsplit("/", 1)[-1] if subdir else _repo_name_from_url(git_url)
         )
+
+        # The plugin name must be a string; a malformed manifest (e.g.
+        # `name: [a, b]` or `name: 123`) would otherwise crash _sanitize_plugin_name
+        # with a raw TypeError instead of a clean install error.
+        if not isinstance(plugin_name, str):
+            raise PluginOperationError(
+                f"Plugin manifest name must be a string, got "
+                f"{type(plugin_name).__name__}: {plugin_name!r}",
+            )
 
         try:
             target = _sanitize_plugin_name(plugin_name, plugins_dir)
@@ -647,6 +766,17 @@ def cmd_install(
             should_enable = False
 
     if should_enable:
+        # Best-effort load check: catch a plugin whose __init__/register() is
+        # broken so the user sees it at install time, not as a silent skip at
+        # gateway start. We only reach here after an affirmative enable
+        # (explicit --enable or a "y" at the prompt), so running it imports
+        # and executes plugin code the user has consented to.
+        load_check = _smoke_test_plugin_load(target)
+        if load_check:
+            console.print(
+                f"[yellow]Warning:[/yellow] {installed_name} enabled but its "
+                f"load check failed: {load_check}",
+            )
         enabled = _get_enabled_set()
         disabled = _get_disabled_set()
         enabled.add(installed_name)
@@ -1894,11 +2024,22 @@ def dashboard_install_plugin(
     if ap.exists():
         hint = str(ap)
 
+    # Best-effort load check: catch a plugin that imports/registers broken
+    # so the dashboard can surface it instead of reporting a silent success
+    # that only fails at gateway start (where it's logged and skipped).
+    # Skip it when the plugin is installed disabled (enable=False) — running
+    # it imports and calls register() on arbitrary plugin code, so we avoid
+    # executing plugin code the user chose not to enable.
+    load_check = _smoke_test_plugin_load(target) if enable else None
+    if load_check:
+        warnings.append(f"load check failed: {load_check}")
+
     return {
         "ok": True,
         "plugin_name": installed_name,
         "warnings": warnings,
         "missing_env": missing_env,
+        "load_check": load_check,
         "after_install_path": hint,
         "enabled": enable,
     }

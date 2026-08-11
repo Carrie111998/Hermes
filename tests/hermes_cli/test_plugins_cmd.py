@@ -5,6 +5,9 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
+import sys
+import io
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -683,3 +686,439 @@ def test_portable_manifest_is_visible_to_plugin_cli(tmp_path):
         "Portable test plugin",
         "portable.test",
     )
+
+
+# ── _install_plugin_core: git clone cwd independence ────────────────────────
+
+
+class TestInstallCloneCwd:
+    """The git clone must run in a stable cwd, not the (possibly deleted)
+    process CWD / TMPDIR.
+
+    Regression guard for the dashboard install failure where the gateway was
+    launched from a purged temp dir (macOS /var/folders/.../T) and git clone
+    died with "Unable to read current working directory". Passing an explicit
+    cwd to subprocess.run keeps the clone independent of the process CWD.
+    """
+
+    def test_clone_uses_explicit_cwd(self, tmp_path, monkeypatch):
+        if shutil.which("git") is None:
+            pytest.skip("git not available")
+
+        from hermes_cli import plugins_cmd as pc
+
+        # A local source repo to clone.
+        repo_root = tmp_path / "monorepo"
+        repo_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo_root)],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-q", "--allow-empty", "-m", "x"],
+            check=True,
+            capture_output=True,
+        )
+        # plugin.yaml so the clone is recognized as a plugin.
+        (repo_root / "plugin.yaml").write_text("name: cwd-guard\nversion: 1.0.0\n")
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+
+        captured = {}
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, **kwargs):
+            if cmd and cmd[0] == shutil.which("git") and "clone" in cmd:
+                captured["cwd"] = kwargs.get("cwd")
+            return real_run(cmd, **kwargs)
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        pc._install_plugin_core(f"file://{repo_root}", force=False)
+
+        # The clone must have been told to run in a concrete, existing dir —
+        # not inherit whatever (possibly deleted) cwd the gateway process has.
+        assert captured.get("cwd") is not None
+        assert Path(captured["cwd"]).is_dir()
+
+
+# ── malformed manifest name -> clean error (not raw TypeError) ─────────────
+
+
+class TestInstallMalformedName:
+    """A malformed plugin.yaml `name` must fail with a clean error.
+
+    Regression: a non-string name (list/int) used to crash
+    _sanitize_plugin_name with a raw TypeError instead of a PluginOperationError.
+    """
+
+    def _make_repo(self, tmp_path, name_value: object) -> str:
+        import subprocess
+
+        repo_root = tmp_path / "repo"
+        repo_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo_root)],
+            check=True,
+            capture_output=True,
+        )
+        (repo_root / "plugin.yaml").write_text(
+            f"name: {name_value!r}\nversion: 1.0.0\n"
+            if not isinstance(name_value, str)
+            else f"name: {name_value}\nversion: 1.0.0\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-q", "--allow-empty", "-m", "x"],
+            check=True,
+            capture_output=True,
+        )
+        return f"file://{repo_root}"
+
+    def test_list_name_raises_clean_error(self, tmp_path, monkeypatch):
+        from hermes_cli.plugins_cmd import PluginOperationError, _install_plugin_core
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.plugins_cmd._plugins_dir", lambda: plugins_dir
+        )
+        with pytest.raises(PluginOperationError) as exc:
+            _install_plugin_core(self._make_repo(tmp_path, ["a", "b"]), force=True)
+        assert "must be a string" in str(exc.value)
+
+    def test_int_name_raises_clean_error(self, tmp_path, monkeypatch):
+        from hermes_cli.plugins_cmd import PluginOperationError, _install_plugin_core
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(
+            "hermes_cli.plugins_cmd._plugins_dir", lambda: plugins_dir
+        )
+        with pytest.raises(PluginOperationError) as exc:
+            _install_plugin_core(self._make_repo(tmp_path, 123), force=True)
+        assert "must be a string" in str(exc.value)
+
+
+# ── smoke test skipped for disabled installs (no plugin-code execution) ────
+
+
+class TestInstallSmokeSkippedWhenDisabled:
+    """A disabled install must not import/run plugin code via the load check.
+
+    The install-time load check imports the plugin's __init__ and calls
+    register(), executing arbitrary plugin code. For an explicitly disabled
+    install (enable=False) we must not run it.
+    """
+
+    def _make_good_repo(self, tmp_path) -> str:
+        import subprocess
+
+        repo_root = tmp_path / "goodrepo"
+        repo_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo_root)],
+            check=True,
+            capture_output=True,
+        )
+        (repo_root / "plugin.yaml").write_text("name: good-plugin\nversion: 1.0.0\n")
+        (repo_root / "__init__.py").write_text(
+            "def register(ctx):\n    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-q", "--allow-empty", "-m", "x"],
+            check=True,
+            capture_output=True,
+        )
+        return f"file://{repo_root}"
+
+    def test_disabled_install_skips_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        res = pc.dashboard_install_plugin(self._make_good_repo(tmp_path), force=True, enable=False)
+        assert calls == [], "smoke test must not run for disabled install"
+        assert res["load_check"] is None
+        assert res["enabled"] is False
+
+    def test_enabled_install_runs_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        res = pc.dashboard_install_plugin(self._make_good_repo(tmp_path), force=True, enable=True)
+        assert len(calls) == 1, "smoke test must run for enabled install"
+        assert res["enabled"] is True
+
+
+# ── _smoke_test_plugin_load: install-time load verification ────────────────
+
+
+class TestInstallLoadSmoke:
+    """Install must surface a broken plugin instead of reporting silent success.
+
+    A plugin whose __init__.py fails to import or whose register() raises
+    would otherwise pass install and only fail (as a logged warning) at
+    gateway start. _smoke_test_plugin_load catches it at install time.
+    """
+
+    def _write_plugin(self, tmp_path, body: str, *, has_init: bool = True) -> Path:
+        d = tmp_path / "smoke_plugin"
+        d.mkdir()
+        (d / "plugin.yaml").write_text("name: smoke-plugin\nversion: 1.0.0\n")
+        if has_init:
+            (d / "__init__.py").write_text(body)
+        return d
+
+    def test_good_plugin_passes(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        body = (
+            "def register(ctx):\n"
+            "    ctx.register_tool(name='ok_tool', handler=lambda a: {}, "
+            "check_fn=lambda: True)\n"
+        )
+        d = self._write_plugin(tmp_path, body)
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_syntax_error_init_fails(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        d = self._write_plugin(tmp_path, "def register(ctx):\n    return (\n")  # syntax error
+        err = _smoke_test_plugin_load(d)
+        assert err is not None
+        assert "import failed" in err
+
+    def test_register_raises_fails(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        body = "def register(ctx):\n    raise RuntimeError('boom')\n"
+        d = self._write_plugin(tmp_path, body)
+        err = _smoke_test_plugin_load(d)
+        assert err is not None
+        assert "register() raised" in err
+
+    def test_no_init_is_ok(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        # Declarative plugin (model catalog, no code) must not be flagged.
+        d = self._write_plugin(tmp_path, "", has_init=False)
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_does_not_mutate_live_registry(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        body = (
+            "def register(ctx):\n"
+            "    ctx.register_tool(name='side_effect_tool', handler=lambda a: {}, "
+            "check_fn=lambda: True)\n"
+        )
+        d = self._write_plugin(tmp_path, body)
+        # The stub ctx returns no-ops; the real tool registry must be untouched.
+        # We just assert the function returns None (no exception) and runs
+        # register() against the stub.
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_provider_plugin_register_succeeds(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        # A real provider plugin (e.g. plugins/web/firecrawl) calls
+        # ctx.register_web_search_provider(...), which the old 4-method stub
+        # did not expose. The permissive stub must satisfy it.
+        body = (
+            "class _P:\n    pass\n"
+            "def register(ctx):\n"
+            "    ctx.register_web_search_provider(_P())\n"
+            "    ctx.register_platform(_P())\n"
+            "    ctx.register_secret_source(_P())\n"
+        )
+        d = self._write_plugin(tmp_path, body)
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_sys_modules_cleanup(self, tmp_path):
+        import sys
+
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        # A plugin that imports a submodule must not leak module entries into
+        # sys.modules after the smoke test returns.
+        sub = tmp_path / "leaky_plugin"
+        sub.mkdir()
+        (sub / "plugin.yaml").write_text("name: leaky-plugin\nversion: 1.0.0\n")
+        (sub / "__init__.py").write_text(
+            "from . import _helper\n"
+            "def register(ctx):\n    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        (sub / "_helper.py").write_text("VALUE = 1\n")
+
+        module_name = f"_hermes_plugin_smoke_{sub.name}"
+        assert _smoke_test_plugin_load(sub) is None
+        assert module_name not in sys.modules
+        assert f"{module_name}._helper" not in sys.modules
+
+
+class TestStubContextPublicMembers:
+    """The smoke-test stub must satisfy the real PluginContext public surface
+    a valid plugin may touch at register() time, so it never emits a false
+    "load check failed" warning.
+
+    Regression guard for review C2 on hermes-agent#73243: the real
+    ``PluginContext`` exposes public non-register_ members (``llm``,
+    ``subagent_lifecycle``, ``profile_name``, ``inject_message``,
+    ``dispatch_tool``, ``config``) in addition to the ``register_*`` methods.
+    A stub that raised ``AttributeError`` on those would falsely warn on a
+    valid plugin that reads them. The permissive stub no-ops them.
+    """
+
+    def test_plugin_using_public_members_loads_without_false_warning(
+        self, tmp_path
+    ):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        d = tmp_path / "public_members_plugin"
+        d.mkdir()
+        (d / "plugin.yaml").write_text("name: public-members-plugin\nversion: 1.0.0\n")
+        # Exercise every non-register_ public member the real context exposes,
+        # plus a register_* call. Only a genuine error should return non-None.
+        (d / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    _ = ctx.llm\n"
+            "    _ = ctx.subagent_lifecycle\n"
+            "    _ = ctx.profile_name\n"
+            "    _ = ctx.inject_message('hi')\n"
+            "    _ = ctx.dispatch_tool('t', {})\n"
+            "    _ = ctx.config\n"
+            "    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        assert _smoke_test_plugin_load(d) is None
+
+    def test_unknown_member_still_raises(self, tmp_path):
+        from hermes_cli.plugins_cmd import _smoke_test_plugin_load
+
+        d = tmp_path / "unknown_member_plugin"
+        d.mkdir()
+        (d / "plugin.yaml").write_text("name: unknown-member-plugin\nversion: 1.0.0\n")
+        (d / "__init__.py").write_text(
+            "def register(ctx):\n"
+            "    ctx.this_is_not_a_real_context_method()\n"
+        )
+        # A genuinely unknown member must still surface as a load failure so
+        # real breakage is not silently swallowed.
+        err = _smoke_test_plugin_load(d)
+        assert err is not None
+        assert "register() raised" in err
+
+
+class TestCmdInstallConsentGating:
+    """The load smoke test must NOT execute plugin code before the user
+    affirmatively opts in to enabling the plugin.
+
+    Regression guard for the pre-consent execution bug: cmd_install used to
+    call _smoke_test_plugin_load() while enable was still None (before the
+    "Enable now?" prompt), so a plain interactive/non-tty install ran third-
+    party __init__.py/register() for a plugin the user never enabled.
+    """
+
+    class _TtyStringIO(io.StringIO):
+        """StringIO that reports itself as a TTY so cmd_install's prompt runs."""
+
+        def isatty(self) -> bool:  # type: ignore[override]
+            return True
+
+    def _make_good_repo(self, tmp_path) -> str:
+        import subprocess
+
+        repo_root = tmp_path / "goodrepo"
+        repo_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(repo_root)],
+            check=True,
+            capture_output=True,
+        )
+        (repo_root / "plugin.yaml").write_text("name: good-plugin\nversion: 1.0.0\n")
+        (repo_root / "__init__.py").write_text(
+            "def register(ctx):\n    ctx.register_tool(name='t', handler=lambda a: {})\n"
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "add", "-A"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo_root), "commit", "-q", "--allow-empty", "-m", "x"],
+            check=True,
+            capture_output=True,
+        )
+        return f"file://{repo_root}"
+
+    def test_non_tty_install_does_not_run_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        # Non-tty stdin -> should_enable resolves to False without prompting.
+        monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+        monkeypatch.setattr(sys, "stdout", io.StringIO())
+        pc.cmd_install(self._make_good_repo(tmp_path), force=True)
+        assert calls == [], "smoke test must not run for a non-enabled install"
+
+    def test_declined_prompt_does_not_run_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        # TTY present but user answers 'n' -> should_enable = False.
+        monkeypatch.setattr(sys, "stdin", self._TtyStringIO("n\n"))
+        monkeypatch.setattr(sys, "stdout", self._TtyStringIO())
+        pc.cmd_install(self._make_good_repo(tmp_path), force=True)
+        assert calls == [], "smoke test must not run when enablement is declined"
+
+    def test_affirmative_prompt_runs_smoke(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins_cmd as pc
+
+        plugins_dir = tmp_path / "installed"
+        plugins_dir.mkdir()
+        monkeypatch.setattr(pc, "_plugins_dir", lambda: plugins_dir)
+        calls = []
+        monkeypatch.setattr(
+            pc, "_smoke_test_plugin_load", lambda d: calls.append(d) or None
+        )
+        # User answers 'y' -> should_enable = True -> smoke test runs.
+        monkeypatch.setattr(sys, "stdin", self._TtyStringIO("y\n"))
+        monkeypatch.setattr(sys, "stdout", self._TtyStringIO())
+        pc.cmd_install(self._make_good_repo(tmp_path), force=True)
+        assert len(calls) == 1, "smoke test must run after affirmative enablement"
