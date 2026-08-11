@@ -549,3 +549,31 @@ class TestFailureAttribution:
         failed = {e.id: e for e in pool.entries()}["cred-1"]
         assert failed.failure_reason != "billing"
 
+    def test_overloaded_rotates_on_second_attempt(self, tmp_path, monkeypatch):
+        """Overloaded errors allow 1 retry on same key, then rotate pool on 2nd attempt."""
+        from agent.error_classifier import FailoverReason
+        pool = self._make_pool(
+            tmp_path, monkeypatch,
+            [self._entry(0, "key-a"), self._entry(1, "key-b")],
+        )
+        agent = self._agent(pool, failing_key="key-a")
+
+        from agent.agent_runtime_helpers import recover_with_credential_pool
+
+        # Attempt 1: retry same key
+        recovered, has_retried = recover_with_credential_pool(
+            agent, status_code=503, has_retried_429=False, classified_reason=FailoverReason.overloaded
+        )
+        assert recovered is False
+        assert has_retried is True
+
+        # Attempt 2: rotates to key-b (cred-1)
+        recovered, has_retried = recover_with_credential_pool(
+            agent, status_code=503, has_retried_429=True, classified_reason=FailoverReason.overloaded
+        )
+        assert recovered is True
+        assert has_retried is False
+        agent._swap_credential.assert_called_once()
+        swapped = agent._swap_credential.call_args[0][0]
+        assert swapped.id == "cred-1"
+
