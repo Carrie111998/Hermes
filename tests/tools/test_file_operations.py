@@ -673,3 +673,21 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_char_from_sample_truncation_not_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # read_file samples the first 1000 *bytes* with head -c 1000. A
+        # multibyte UTF-8 character split at that boundary decodes to a
+        # trailing U+FFFD even in perfectly valid Japanese/CJK text. That
+        # truncation artifact appears only at the very end of the sample and
+        # must not trigger the binary guard (mid-sample U+FFFD still does).
+        sample = "正しい日本語テキスト\n" * 50 + "\ufffd"
+        assert ops._is_likely_binary("notes.txt", sample) is False
+
+    def test_mid_sample_replacement_char_still_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # U+FFFD embedded mid-sample (real corruption / non-UTF-8 bytes)
+        # must still be flagged binary even when the sample also ends with
+        # a trailing replacement char.
+        sample = "start\ufffdmiddle\ufffd\n"
+        assert ops._is_likely_binary("notes.txt", sample) is True

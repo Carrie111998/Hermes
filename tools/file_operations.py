@@ -899,6 +899,7 @@ class ShellFileOperations(FileOperations):
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
+            sample = content_sample[:1000]
             # Undecodable bytes: the terminal env decodes stdout with
             # errors="replace", so any non-UTF-8 byte arrives here already
             # turned into U+FFFD. That char is "printable" (ord 65533), so the
@@ -908,11 +909,18 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # Exception: head -c 1000 samples *bytes*, so a multibyte UTF-8
+            # character split at the 1000-byte boundary decodes to a trailing
+            # U+FFFD even in perfectly valid Japanese/CJK text. That artifact
+            # appears only at the very end of the sample — strip the trailing
+            # run before the check so valid UTF-8 isn't misclassified as
+            # binary. Mid-sample U+FFFD still means binary/corrupt.
+            if sample.rstrip("\ufffd").count("\ufffd") > 0:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     
