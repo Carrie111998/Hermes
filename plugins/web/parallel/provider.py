@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Any, Dict, List
 
 from agent.web_search_provider import WebSearchProvider
@@ -41,6 +42,8 @@ logger = logging.getLogger(__name__)
 # ``tools.web_tools._parallel_client = None`` between cases see fresh state.
 # The plugin reads/writes through that public module (see
 # :func:`_get_sync_client` / :func:`_get_async_client`).
+_sync_client_lock = threading.Lock()
+_async_client_lock = threading.Lock()
 
 
 def _ensure_parallel_sdk_installed() -> None:
@@ -73,21 +76,26 @@ def _get_sync_client() -> Any:
     if cached is not None:
         return cached
 
-    from agent.web_search_provider import get_provider_env
+    with _sync_client_lock:
+        cached = getattr(_wt, "_parallel_client", None)
+        if cached is not None:
+            return cached
 
-    api_key = get_provider_env("PARALLEL_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "PARALLEL_API_KEY environment variable not set. "
-            "Get your API key at https://parallel.ai"
-        )
+        from agent.web_search_provider import get_provider_env
 
-    _ensure_parallel_sdk_installed()
-    from parallel import Parallel  # noqa: WPS433 — deliberately lazy
+        api_key = get_provider_env("PARALLEL_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "PARALLEL_API_KEY environment variable not set. "
+                "Get your API key at https://parallel.ai"
+            )
 
-    client = Parallel(api_key=api_key)
-    _wt._parallel_client = client
-    return client
+        _ensure_parallel_sdk_installed()
+        from parallel import Parallel  # noqa: WPS433 — deliberately lazy
+
+        client = Parallel(api_key=api_key)
+        _wt._parallel_client = client
+        return client
 
 
 def _get_async_client() -> Any:
@@ -101,21 +109,26 @@ def _get_async_client() -> Any:
     if cached is not None:
         return cached
 
-    from agent.web_search_provider import get_provider_env
+    with _async_client_lock:
+        cached = getattr(_wt, "_async_parallel_client", None)
+        if cached is not None:
+            return cached
 
-    api_key = get_provider_env("PARALLEL_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "PARALLEL_API_KEY environment variable not set. "
-            "Get your API key at https://parallel.ai"
-        )
+        from agent.web_search_provider import get_provider_env
 
-    _ensure_parallel_sdk_installed()
-    from parallel import AsyncParallel  # noqa: WPS433 — deliberately lazy
+        api_key = get_provider_env("PARALLEL_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "PARALLEL_API_KEY environment variable not set. "
+                "Get your API key at https://parallel.ai"
+            )
 
-    client = AsyncParallel(api_key=api_key)
-    _wt._async_parallel_client = client
-    return client
+        _ensure_parallel_sdk_installed()
+        from parallel import AsyncParallel  # noqa: WPS433 — deliberately lazy
+
+        client = AsyncParallel(api_key=api_key)
+        _wt._async_parallel_client = client
+        return client
 
 
 def _reset_clients_for_tests() -> None:
