@@ -78,6 +78,7 @@ import re
 import random
 import secrets
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1275,6 +1276,23 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
+);
+
+-- Gate-epoch table for stage-gate authorization CAS (AION-CORE-PR6).
+-- Each row binds a *gate* (a namespace like ``repo:pr:stage``) to a
+-- monotonic epoch counter, a canonical decision, and a bound head SHA.
+-- HOLD / REQUEST_CHANGES / changed-fact increment the epoch and invalidate
+-- all prior intent tokens.  At the merge-write boundary, the queued intent
+-- must match the current epoch + decision + head exactly — stale intent
+-- from an older epoch is rejected atomically.  No real GitHub merge occurs
+-- in this table; it lives entirely inside the native Kanban DB.
+CREATE TABLE IF NOT EXISTS gate_epochs (
+    gate_id         TEXT PRIMARY KEY,
+    epoch           INTEGER NOT NULL DEFAULT 1,
+    last_decision   TEXT,
+    last_head       TEXT,
+    last_bound_by   TEXT,
+    last_bound_at   INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -5294,6 +5312,8 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
+    # Close owned workspace processes (AION-CORE-PR6).
+    _cleanup_workspace_on_completion(conn, task_id)
     # Clean up the scratch workspace and any stale tmux session for the worker.
     _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
@@ -5919,6 +5939,15 @@ def block_task(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    # Read workspace_path before entering the transaction so we can
+    # clean up owned children after the block commits (AION-CORE-PR6).
+    _wp_row = conn.execute(
+        "SELECT workspace_path, workspace_kind FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    _block_workspace_path: Optional[str] = (
+        _wp_row["workspace_path"] if _wp_row else None
+    )
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -6104,6 +6133,32 @@ def block_task(
         run_id=run_id,
         reason=reason,
     )
+    # After blocking, close owned child processes in the task's workspace
+    # so no in-flight effects survive the block (AION-CORE-PR6: write-after-stop).
+    if _block_workspace_path:
+        try:
+            _wp = Path(_block_workspace_path).expanduser().resolve()
+            if _wp.is_dir():
+                _evidence = close_workspace_processes(_wp)
+                _log.info(
+                    "block_task workspace cleanup: task=%s path=%s "
+                    "signalled=%s terminated=%s killed=%s survivors=%s "
+                    "skipped_identity_mismatch=%s skipped_unowned=%s "
+                    "skipped_self=%s",
+                    task_id, str(_wp),
+                    _evidence.get("signalled", 0),
+                    _evidence.get("terminated", 0),
+                    _evidence.get("killed", 0),
+                    _evidence.get("survivors", 0),
+                    _evidence.get("skipped_identity_mismatch", 0),
+                    _evidence.get("skipped_unowned", 0),
+                    _evidence.get("skipped_self", 0),
+                )
+        except Exception as _exc:
+            _log.warning(
+                "block_task workspace cleanup failed for task=%s: %s",
+                task_id, _exc,
+            )
     return True
 
 
@@ -11318,3 +11373,607 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Process identity helpers (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _read_process_identity(pid: int) -> dict | None:
+    """Capture process identity from /proc for TOCTOU revalidation.
+
+    Reads ``/proc/<pid>/stat`` starttime (field 22; 0-indexed field 21),
+    current cwd, and PGID.  Returns ``None`` when the process has exited or
+    /proc is unreadable.
+
+    The starttime + PID pair is a reliable identity anchor: Linux reuses
+    PIDs but starttime is monotonic per-boot, so a PID-recycled process
+    can never match the captured identity of a prior occupant.
+
+    Returns:
+        ``{"starttime": int, "cwd": str, "pgid": int}`` or ``None``.
+    """
+    import os as _os
+
+    try:
+        stat_data = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (OSError, FileNotFoundError):
+        return None
+
+    # stat format: "pid (comm) state ppid pgrp ..."
+    # comm may contain spaces and parentheses; split at the last ')'
+    close_paren = stat_data.rfind(")")
+    if close_paren == -1:
+        return None
+    fields = stat_data[close_paren + 2:].split()
+    # After "pid (comm) ": field index 0=state, 19=starttime (21st field
+    # in the full stat line minus pid+comm = index 19 in the post-paren split).
+    if len(fields) < 20:
+        return None
+    try:
+        starttime = int(fields[19])
+    except (ValueError, IndexError):
+        return None
+
+    try:
+        cwd = Path(f"/proc/{pid}/cwd").resolve()
+        pgid = _os.getpgid(pid)
+    except (OSError, RuntimeError):
+        return None
+
+    return {"starttime": starttime, "cwd": str(cwd), "pgid": pgid}
+
+
+def _revalidate_identity(pid: int, captured: dict) -> bool:
+    """Return True if *pid* still matches the captured identity.
+
+    Re-reads /proc identity and compares starttime, cwd, and pgid.  A
+    mismatch means the PID was recycled, the process changed working
+    directory, or it moved process groups — in all cases the captured
+    identity is stale and the signal must be withheld.
+    """
+    current = _read_process_identity(pid)
+    if current is None:
+        return False  # process exited — no signal needed
+    return (
+        current["starttime"] == captured["starttime"]
+        and current["cwd"] == captured["cwd"]
+        and current["pgid"] == captured["pgid"]
+    )
+
+
+def _discover_descendant_pids(parent_pid: int) -> set[int]:
+    """Return the set of descendant PIDs for *parent_pid* (recursive).
+
+    Walks /proc/<pid>/task/<tid>/children for every known PID under
+    *parent_pid* to build a transitive closure of child processes.
+    """
+    descendants: set[int] = set()
+    frontier = [parent_pid]
+    while frontier:
+        pid = frontier.pop()
+        try:
+            children_path = Path(f"/proc/{pid}/task/{pid}/children")
+            children_text = children_path.read_text(encoding="utf-8")
+            for child_str in children_text.split():
+                try:
+                    child_pid = int(child_str)
+                except ValueError:
+                    continue
+                if child_pid not in descendants:
+                    descendants.add(child_pid)
+                    frontier.append(child_pid)
+        except (OSError, FileNotFoundError):
+            continue
+    return descendants
+
+
+# ---------------------------------------------------------------------------
+# Workspace process cleanup (AION-RL2-CORE-01 / AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def close_workspace_processes(
+    workspace_path: Path, *, dry_run: bool = False,
+    owned_pids: set[int] | None = None,
+) -> dict:
+    """Close processes whose cwd is inside ``workspace_path``.
+
+    Only signals processes whose working directory resolves inside the
+    exact workspace — never broad-kill, never touches processes outside the
+    workspace, never touches gateway/self/external cwd.
+
+    When *owned_pids* is provided (non-None), cwd containment alone is NOT
+    sufficient: a process must also be in *owned_pids* (or be a descendant of
+    any PID in it) to be eligible for signalling.  This gates shared-directory
+    (``workspace_kind=dir``) cleanup so unrelated processes (YAML LSPs, other
+    task workers) sharing the same directory are never signalled.  For
+    ``scratch`` and ``worktree`` workspaces, *owned_pids* should remain None
+    — those workspaces are exclusive to one task and cwd containment is
+    sufficient.
+
+    Every signal is gated on an immediate identity re-read via
+    ``/proc/<pid>/stat`` (starttime + cwd + pgid).  If the identity has
+    changed since discovery (PID reuse, cwd change, pgid change), the signal
+    is withheld and the mismatch is recorded.  This prevents TOCTOU attacks
+    where a PID is recycled between discovery and signal delivery.
+
+    **Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix):** after
+    SIGTERM, the function waits briefly, re-checks liveness via
+    ``/proc/<pid>/stat`` (starttime match), and escalates to SIGKILL for
+    TERM-ignoring survivors.  It then waits again and reports authoritative
+    survivor counts.  This closes the 八府巡按 audit finding that a single
+    SIGTERM-and-return leaves TERM-ignoring owned children alive.
+
+    Args:
+        workspace_path: Absolute path to the workspace directory.
+        dry_run: When True, report what WOULD be signalled without killing.
+        owned_pids: Optional set of PIDs that are eligible for signalling.
+            When None, cwd containment is the sole eligibility test
+            (suitable for scratch/worktree).  When a non-empty set, only
+            processes whose PID is in this set (or whose ancestor PID is
+            in this set) may be signalled even when their cwd is inside
+            the workspace (suitable for shared-dir workspaces).
+
+    Returns a dict with cleanup evidence:
+        - ``workspace``: str — resolved workspace path
+        - ``signalled``: int — count of PIDs that received a signal (0 in dry_run)
+        - ``terminated``: int — PIDs that exited after SIGTERM alone
+        - ``killed``: int — PIDs that required SIGKILL escalation
+        - ``survivors``: int — PIDs still alive after TERM→KILL ladder
+        - ``would_signal``: int — count that WOULD be signalled (dry_run only)
+        - ``skipped_outside``: int — processes outside workspace (negative canary)
+        - ``skipped_self``: int — current process (self-preservation)
+        - ``skipped_identity_mismatch``: int — identity re-read mismatch (TOCTOU guard)
+        - ``skipped_unowned``: int — processes inside workspace but not in *owned_pids*
+          (shared-dir containment gate; always 0 when *owned_pids* is None)
+        - ``dry_run``: bool — True if dry-run mode
+        - ``pids``: list of (pgid, pid, cwd, outcome) tuples for signalled PIDs
+          where outcome is one of 'terminated', 'killed', 'survivor'
+    """
+    import os as _os
+    import signal as _signal
+    import time as _time
+
+    wp = Path(workspace_path).resolve()
+    result: dict = {
+        "workspace": str(wp),
+        "signalled": 0,
+        "terminated": 0,
+        "killed": 0,
+        "survivors": 0,
+        "would_signal": 0,
+        "skipped_outside": 0,
+        "skipped_self": 0,
+        "skipped_identity_mismatch": 0,
+        "skipped_unowned": 0,
+        "dry_run": dry_run,
+        "pids": [],
+    }
+
+    if not wp.is_dir():
+        return result
+
+    # Never signal the completing caller itself — a completion inside
+    # the workspace must not kill the completing caller.  All eligible
+    # children are signalled individually by PID with TOCTOU identity
+    # revalidation.  killpg is never used because a process group can
+    # contain members with different CWDs — signalling the entire group
+    # risks hitting outside-workspace processes (#AION-RL2-CORE-01).
+    my_pid = _os.getpid()
+
+    # Walk /proc to find processes whose cwd is inside the workspace.
+    wp_str = str(wp)
+    signalled_pids: set[int] = set()  # track PID-scope signals for dedup
+
+    for entry in _os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            cwd_link = Path(f"/proc/{pid}/cwd")
+            cwd = cwd_link.resolve()
+        except (OSError, RuntimeError):
+            continue
+
+        cwd_str = str(cwd)
+        # Exact workspace check: cwd must be equal to wp or a descendant.
+        if cwd_str == wp_str or cwd_str.startswith(wp_str + "/"):
+            try:
+                pgid = _os.getpgid(pid)
+            except OSError:
+                continue
+
+            # Never signal the completing caller itself.
+            if pid == my_pid:
+                result["skipped_self"] += 1
+                continue
+
+            # Shared-dir ownership gate: when owned_pids is provided, cwd
+            # containment alone is not sufficient — the PID must be in the
+            # owned set (which already includes all descendants of the
+            # task's worker PID).  This prevents signalling unrelated
+            # processes (YAML LSPs, other task workers) that happen to
+            # share the same directory (#AION-RL2-CORE-01 runtime RED).
+            if owned_pids is not None and pid not in owned_pids:
+                result["skipped_unowned"] += 1
+                continue
+
+            # Signal only by PID with individual identity revalidation —
+            # never killpg.  killpg broadcasts to every member of the
+            # process group, which can hit outside-workspace processes
+            # when a group has mixed CWDs (#AION-RL2-CORE-01 repair,
+            # bafuxunan audit t_bb18e80b at head 2378ac3142).
+            if pid in signalled_pids:
+                continue
+            if dry_run:
+                identity = _read_process_identity(pid)
+                if identity is None:
+                    continue
+                result["would_signal"] += 1
+                result["pids"].append((pgid, pid, cwd_str, "would_signal"))
+                signalled_pids.add(pid)
+            else:
+                # Capture identity BEFORE any signal.
+                identity = _read_process_identity(pid)
+                if identity is None:
+                    continue
+                # Re-validate identity immediately before signal.
+                # If PID was recycled, cwd changed, or pgid moved —
+                # never signal.  This is a best-effort TOCTOU guard.
+                if not _revalidate_identity(pid, identity):
+                    result["skipped_identity_mismatch"] += 1
+                    continue
+
+                # -----------------------------------------------------------
+                # Bounded TERM→KILL ladder (AION-CORE-PR6 GM2 red-team fix)
+                # -----------------------------------------------------------
+                try:
+                    _os.kill(pid, _signal.SIGTERM)
+                except OSError:
+                    # Process already gone — count it as cleaned.
+                    signalled_pids.add(pid)
+                    result["signalled"] += 1
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                signalled_pids.add(pid)
+                result["signalled"] += 1
+
+                # Wait for graceful TERM exit; re-check liveness.
+                _time.sleep(0.5)
+                if not _revalidate_identity(pid, identity):
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # TERM-ignoring survivor — escalate to SIGKILL.
+                try:
+                    _os.kill(pid, _signal.SIGKILL)
+                except OSError:
+                    # Already gone between liveness check and KILL.
+                    result["terminated"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "terminated"))
+                    continue
+
+                # Wait for SIGKILL to take effect; final liveness check.
+                _time.sleep(1.5)
+                if not _revalidate_identity(pid, identity):
+                    result["killed"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "killed"))
+                else:
+                    result["survivors"] += 1
+                    result["pids"].append((pgid, pid, cwd_str, "survivor"))
+        else:
+            result["skipped_outside"] += 1
+
+    return result
+
+
+def _cleanup_workspace_on_completion(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    """Close processes whose cwd is inside the task's workspace.
+
+    Called after a successful completion. Reads the task's workspace_path
+    from the DB, then calls :func:`close_workspace_processes`. Best-effort —
+    any error is logged and swallowed so completion is never blocked.
+
+    **AION-CORE-PR6 edge-case fixes (CI investigation t_5cf56231):**
+
+    - **dir workspace stale-task**: for ``workspace_kind=dir`` (shared
+      directory), builds an ``owned_pids`` set from the task's spawn events
+      in ``task_spawns``.  If no owned PIDs are found (stale task with no
+      active worker record), signals *none* — other tasks may still be using
+      the shared workspace.
+
+    - **PID-recycled starttime mismatch**: handled inside
+      :func:`close_workspace_processes` via :func:`_revalidate_identity`,
+      which compares /proc starttime against the captured identity before
+      each signal.
+
+    - **legacy spawn without starttime**: spawn events created before
+      starttime tracking was added have ``starttime IS NULL``.  These are
+      treated as owned (PID match alone) but cannot be revalidated — they
+      are signalled without the starttime guard as a best-effort fallback.
+    """
+    try:
+        row = conn.execute(
+            "SELECT workspace_path, workspace_kind FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        wp = row["workspace_path"]
+        wk = row["workspace_kind"]
+        if not wp:
+            return
+        path = Path(wp).expanduser().resolve()
+        if not path.is_dir():
+            return
+
+        # Build owned_pids for shared-dir workspace gating.
+        # For scratch/worktree workspaces, owned_pids stays None — cwd
+        # containment alone is sufficient because the workspace is exclusive
+        # to this task.
+        owned_pids: set[int] | None = None
+        if wk == "dir":
+            # Query spawn events for this task to find owned PIDs.
+            # Handle legacy spawns (starttime IS NULL) as owned but
+            # note they cannot be TOCTOU-revalidated.
+            spawn_rows = conn.execute(
+                "SELECT pid, starttime FROM task_spawns WHERE task_id = ?",
+                (task_id,),
+            ).fetchall()
+            if spawn_rows:
+                owned_pids = set()
+                for srow in spawn_rows:
+                    spid = srow["pid"]
+                    owned_pids.add(spid)
+                    # Include descendants for each owned PID so child
+                    # processes are also eligible for signalling.
+                    try:
+                        descendants = _discover_descendant_pids(spid)
+                        owned_pids.update(descendants)
+                    except Exception:
+                        pass  # best-effort descendant discovery
+            else:
+                # Stale dir workspace — no active spawn records for this
+                # task.  Signal none to avoid hitting another task's
+                # processes in the shared workspace.
+                _log.info(
+                    "complete_task workspace cleanup: task=%s kind=%s "
+                    "path=%s — stale-task, signalling none "
+                    "(shared dir workspace with no owned PIDs)",
+                    task_id, wk, str(path),
+                )
+                return
+
+        evidence = close_workspace_processes(
+            path, owned_pids=owned_pids,
+        )
+        _log.info(
+            "complete_task workspace cleanup: task=%s kind=%s path=%s "
+            "signalled=%s terminated=%s killed=%s survivors=%s "
+            "skipped_identity_mismatch=%s skipped_unowned=%s dry_run=%s",
+            task_id, wk, str(path),
+            evidence.get("signalled", 0),
+            evidence.get("terminated", 0),
+            evidence.get("killed", 0),
+            evidence.get("survivors", 0),
+            evidence.get("skipped_identity_mismatch", 0),
+            evidence.get("skipped_unowned", 0),
+            evidence.get("dry_run", False),
+        )
+    except Exception as exc:
+        _log.warning(
+            "complete_task workspace cleanup failed for task=%s: %s",
+            task_id, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gate-epoch CAS (AION-CORE-PR6)
+# ---------------------------------------------------------------------------
+
+
+def _gate_id(repo: str, pr_number: int, stage: str = "merge") -> str:
+    """Canonical gate identifier: ``repo:PR:stage``."""
+    return f"{repo}:{pr_number}:{stage}"
+
+
+def set_gate_decision(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    decision: str,
+    head: str,
+    bound_by: str = "kanban",
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Set a gate decision, atomically incrementing the epoch.
+
+    A new HOLD / REQUEST_CHANGES / changed-fact always increments the epoch,
+    which invalidates all prior intent tokens from older epochs.  APPROVE
+    also increments to bind the new approval epoch.  The write boundary
+    consumer must compare-epoch to ensure no intervening HOLD occurred.
+
+    Returns a dict with ``gate_id``, ``old_epoch``, ``new_epoch``,
+    ``decision``, ``head``, and whether the epoch changed.
+    """
+    gid = _gate_id(repo, pr_number, stage)
+    now = int(time.time())
+
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT epoch, last_decision, last_head FROM gate_epochs "
+            "WHERE gate_id = ?",
+            (gid,),
+        ).fetchone()
+
+        if existing is None:
+            conn.execute(
+                "INSERT INTO gate_epochs "
+                "(gate_id, epoch, last_decision, last_head, last_bound_by, last_bound_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (gid, decision, head, bound_by, now),
+            )
+            return {
+                "gate_id": gid,
+                "old_epoch": 0,
+                "new_epoch": 1,
+                "decision": decision,
+                "head": head,
+                "epoch_changed": True,
+            }
+
+        old_epoch = existing["epoch"]
+        new_epoch = old_epoch + 1
+        conn.execute(
+            "UPDATE gate_epochs "
+            "SET epoch = ?, last_decision = ?, last_head = ?, "
+            "    last_bound_by = ?, last_bound_at = ? "
+            "WHERE gate_id = ?",
+            (new_epoch, decision, head, bound_by, now, gid),
+        )
+        return {
+            "gate_id": gid,
+            "old_epoch": old_epoch,
+            "new_epoch": new_epoch,
+            "decision": decision,
+            "head": head,
+            "epoch_changed": True,
+        }
+
+
+def get_gate_epoch(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Read the current gate epoch and decision without mutating."""
+    gid = _gate_id(repo, pr_number, stage)
+    row = conn.execute(
+        "SELECT epoch, last_decision, last_head, last_bound_by, last_bound_at "
+        "FROM gate_epochs WHERE gate_id = ?",
+        (gid,),
+    ).fetchone()
+    if row is None:
+        return {
+            "gate_id": gid,
+            "epoch": 0,
+            "decision": None,
+            "head": None,
+        }
+    return {
+        "gate_id": gid,
+        "epoch": row["epoch"],
+        "decision": row["last_decision"],
+        "head": row["last_head"],
+        "bound_by": row["last_bound_by"],
+        "bound_at": row["last_bound_at"],
+    }
+
+
+def validate_gate_intent(
+    conn: sqlite3.Connection,
+    repo: str,
+    pr_number: int,
+    intent_epoch: int,
+    intent_decision: str,
+    intent_head: str,
+    *,
+    stage: str = "merge",
+) -> dict:
+    """Atomically compare-and-swap at the merge-write boundary.
+
+    An intent from epoch N is valid ONLY if the current gate epoch is
+    still N AND the current decision is APPROVE AND the current head
+    matches.  Any drift (newer epoch, non-APPROVE decision, head mismatch)
+    fails closed.
+
+    Returns a dict with ``valid`` (bool), ``gate_id``, ``current`` (the
+    live state), and ``mismatch_reason`` when invalid.  Does NOT mutate
+    the gate — this is a pure read-and-validate operation.
+    """
+    current = get_gate_epoch(conn, repo, pr_number, stage=stage)
+    gid = current["gate_id"]
+
+    if current["epoch"] == 0:
+        # Gate never initialised — no prior decision exists to validate.
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": "no_gate_initialised",
+        }
+
+    if current["epoch"] != intent_epoch:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"epoch_mismatch: intent={intent_epoch} "
+                f"current={current['epoch']}"
+            ),
+        }
+
+    if current["decision"] != intent_decision:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"decision_mismatch: intent={intent_decision!r} "
+                f"current={current['decision']!r}"
+            ),
+        }
+
+    if intent_head is not None and current["head"] != intent_head:
+        return {
+            "valid": False,
+            "gate_id": gid,
+            "current": current,
+            "mismatch_reason": (
+                f"head_mismatch: intent={intent_head[:12]} "
+                f"current={current['head'][:12] if current['head'] else 'None'}"
+            ),
+        }
+
+    return {
+        "valid": True,
+        "gate_id": gid,
+        "current": current,
+    }
+
+
+def _classify_failure(error: str) -> str:
+    """Classify a failure error message as 'platform_resource' or 'task'.
+
+    Platform-resource failures are shared-infra problems the task does not
+    own: subprocess-spawn EAGAIN/ENOMEM (pid exhaustion, cgroup limits),
+    temporary fs errors, etc. These are recorded with ``failure_category``
+    in event evidence so operators can distinguish "the task is broken"
+    from "the host is overloaded" without opening logs.
+
+    Returns 'platform_resource' when the error matches known platform-level
+    signals; 'task' for everything else.
+    """
+    lower = error.lower()
+    if "errno 11" in lower or "eagain" in lower:
+        return "platform_resource"
+    if "resource temporarily unavailable" in lower:
+        return "platform_resource"
+    if "errno 12" in lower or "enomem" in lower:
+        return "platform_resource"
+    if "cannot allocate memory" in lower:
+        return "platform_resource"
+    if "errno 28" in lower or "enospc" in lower:
+        return "platform_resource"
+    return "task"
