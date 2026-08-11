@@ -14381,6 +14381,17 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached for payload-too-large error.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 compression failed after {max_compression_attempts} attempts.")
+                            # Compression is exhausted, but the fallback chain may still have a
+                            # provider with a larger context window. Returning here skipped the
+                            # failover guard further down, which handles every other error class.
+                            if self._try_activate_fallback():
+                                self._emit_status(
+                                    f"Switched to fallback provider {self.provider}/{self.model} "
+                                    f"after compression was exhausted"
+                                )
+                                compression_attempts = 0
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -14412,6 +14423,17 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Payload too large and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}413 payload too large. Cannot compress further.")
+                            # Compression is exhausted, but the fallback chain may still have a
+                            # provider with a larger context window. Returning here skipped the
+                            # failover guard further down, which handles every other error class.
+                            if self._try_activate_fallback():
+                                self._emit_status(
+                                    f"Switched to fallback provider {self.provider}/{self.model} "
+                                    f"after compression was exhausted"
+                                )
+                                compression_attempts = 0
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -14465,6 +14487,17 @@ class AIAgent:
                                 self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                                 self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                                 logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                                # Compression is exhausted, but the fallback chain may still have a
+                                # provider with a larger context window. Returning here skipped the
+                                # failover guard further down, which handles every other error class.
+                                if self._try_activate_fallback():
+                                    self._emit_status(
+                                        f"Switched to fallback provider {self.provider}/{self.model} "
+                                        f"after compression was exhausted"
+                                    )
+                                    compression_attempts = 0
+                                    restart_with_compressed_messages = True
+                                    break
                                 self._persist_session(messages, conversation_history)
                                 return {
                                     "messages": messages,
@@ -14538,6 +14571,17 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Max compression attempts ({max_compression_attempts}) reached.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 Try /new to start a fresh conversation, or /compress to retry compression.", force=True)
                             logging.error(f"{self.log_prefix}Context compression failed after {max_compression_attempts} attempts.")
+                            # Compression is exhausted, but the fallback chain may still have a
+                            # provider with a larger context window. Returning here skipped the
+                            # failover guard further down, which handles every other error class.
+                            if self._try_activate_fallback():
+                                self._emit_status(
+                                    f"Switched to fallback provider {self.provider}/{self.model} "
+                                    f"after compression was exhausted"
+                                )
+                                compression_attempts = 0
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -14571,6 +14615,17 @@ class AIAgent:
                             self._vprint(f"{self.log_prefix}❌ Context length exceeded and cannot compress further.", force=True)
                             self._vprint(f"{self.log_prefix}   💡 The conversation has accumulated too much content. Try /new to start fresh, or /compress to manually trigger compression.", force=True)
                             logging.error(f"{self.log_prefix}Context length exceeded: {approx_tokens:,} tokens. Cannot compress further.")
+                            # Compression is exhausted, but the fallback chain may still have a
+                            # provider with a larger context window. Returning here skipped the
+                            # failover guard further down, which handles every other error class.
+                            if self._try_activate_fallback():
+                                self._emit_status(
+                                    f"Switched to fallback provider {self.provider}/{self.model} "
+                                    f"after compression was exhausted"
+                                )
+                                compression_attempts = 0
+                                restart_with_compressed_messages = True
+                                break
                             self._persist_session(messages, conversation_history)
                             return {
                                 "messages": messages,
@@ -16039,7 +16094,16 @@ class AIAgent:
             str: Final assistant response
         """
         result = self.run_conversation(message, stream_callback=stream_callback)
-        return result["final_response"]
+        if not isinstance(result, dict):
+            return ""
+        # Failure paths (failed/partial/compression_exhausted) return no
+        # "final_response" at all. Subscripting raised KeyError:
+        # final_response, which hid the actual cause carried in "error".
+        response = result.get("final_response")
+        if response is not None:
+            return response
+        detail = str(result.get("error") or "").strip()
+        raise RuntimeError(detail or "Agent produced no response.")
 
     def _run_codex_app_server_turn(
         self,
