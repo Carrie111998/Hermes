@@ -16,15 +16,18 @@ import tools.delegate_tool as dt
 
 
 class _FakeCompressor:
-    def __init__(self, context_length, max_tokens):
+    def __init__(self, context_length, max_tokens, last_real_prompt_tokens):
         self.context_length = context_length
         self.max_tokens = max_tokens
+        self.last_real_prompt_tokens = last_real_prompt_tokens
 
 
 class _FakeParent:
-    def __init__(self, context_length, used_tokens, max_tokens):
-        self.context_compressor = _FakeCompressor(context_length, max_tokens)
-        self.session_prompt_tokens = used_tokens
+    def __init__(self, context_length, used_tokens, max_tokens, session_prompt_tokens=None):
+        self.context_compressor = _FakeCompressor(context_length, max_tokens, used_tokens)
+        self.session_prompt_tokens = (
+            used_tokens if session_prompt_tokens is None else session_prompt_tokens
+        )
 
 
 def test_small_summaries_pass_through_untouched():
@@ -76,3 +79,23 @@ def test_empty_results_is_noop():
         [{"task_index": 0, "status": "failed", "summary": None}],
         _FakeParent(131_000, 1_000, 8_000),
     )
+
+
+def test_cumulative_session_tokens_do_not_trigger_floor(monkeypatch):
+    monkeypatch.setattr(dt, "_load_config", lambda: {"max_summary_chars": 0})
+    parent = _FakeParent(
+        context_length=1_000_000,
+        used_tokens=143_000,
+        max_tokens=8_000,
+        session_prompt_tokens=11_090_000,
+    )
+    results = [
+        {"task_index": 0, "summary": "A" * 5_900, "status": "completed"},
+        {"task_index": 1, "summary": "B" * 3_900, "status": "completed"},
+    ]
+
+    dt._apply_summary_budget(results, parent)
+
+    assert dt._parent_summary_char_budget(parent, len(results)) > 5_900
+    assert results[0]["summary"] == "A" * 5_900
+    assert results[1]["summary"] == "B" * 3_900

@@ -1998,7 +1998,10 @@ def _parent_summary_char_budget(parent_agent, n_summaries: int) -> Optional[int]
         if not isinstance(context_length, int) or context_length <= 0:
             return None
 
-        used_tokens = getattr(parent_agent, "session_prompt_tokens", 0)
+        # session_prompt_tokens is a cumulative billing counter, including
+        # cache hits. The compressor tracks the provider-reported occupancy of
+        # the current prompt separately.
+        used_tokens = getattr(compressor, "last_real_prompt_tokens", 0)
         if not isinstance(used_tokens, (int, float)) or used_tokens < 0:
             used_tokens = 0
 
