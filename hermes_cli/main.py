@@ -507,16 +507,40 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 
 # ---------------------------------------------------------------------------
-# Profile override — MUST happen before any hermes module import.
+# Profile override — MUST happen before any HERMES_HOME-resolving import.
 #
-# Many modules cache HERMES_HOME at import time (module-level constants).
 # We intercept --profile/-p from sys.argv here and set the env var so that
 # every subsequent ``os.getenv("HERMES_HOME", ...)`` resolves correctly.
 # The flag is stripped from sys.argv so argparse never sees it.
 # Falls back to ~/.hermes/active_profile for sticky default.
+#
+# NOT "before any hermes module import" — the wording this comment used to
+# carry.  The call site below sits *after* ~39 module-level
+# ``hermes_cli.subcommands.*`` imports, which is unavoidable: argparse wiring
+# needs those builders bound.  What actually holds is narrower and sufficient:
+#
+#   * Those builders are pure argparse.  Their only repo-owned module-level
+#     import is ``hermes_cli.subcommands._shared`` (argparse-only); every
+#     handler dependency is imported lazily inside the ``cmd_*`` bodies.  The
+#     import closure reaching this point is 44 modules, all of them either
+#     stdlib or parser builders, and none of them touches HERMES_HOME.
+#   * So the property that matters — no module-level constant snapshots
+#     HERMES_HOME before the override resolves it — is preserved, even though
+#     the literal "no hermes imports yet" claim is false.
+#
+# That is a convention, not a language guarantee: one new top-level
+# ``from hermes_cli.config import ...`` in any subcommand module would pull the
+# resolving layer in ahead of the override and silently reintroduce the
+# profile-isolation bug.  ``tests/hermes_cli/test_profile_override_import_order.py``
+# pins it so that breakage fails a test instead of misrouting profile state.
+#
+# Moving this call above the subcommand imports would make the strict claim
+# true, but it is not a latency win: the pre-override wall clock is dominated
+# by interpreter startup (~3s warm / ~7.4s cold), while the subcommand-import
+# slice itself measures ~0.06s warm / ~1.3s cold.
 # ---------------------------------------------------------------------------
 def _apply_profile_override() -> None:
-    """Pre-parse --profile/-p and set HERMES_HOME before imports."""
+    """Pre-parse --profile/-p and set HERMES_HOME before imports that read it."""
     argv = sys.argv[1:]
     profile_name = None
     consume = 0
