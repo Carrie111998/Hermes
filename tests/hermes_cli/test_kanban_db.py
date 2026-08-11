@@ -380,6 +380,196 @@ def _seed_v2_card(board: str, *, step: str = "development") -> str:
     return tid
 
 
+def _seed_stale_terminal_card(board: str, *, phase: str = "development") -> tuple[str, int, int]:
+    task_id = _seed_v2_card(board, step=phase)
+    completed_at = 1_700_000_123
+    with kb.connect(board=board) as conn:
+        with kb.authorized_governance_write(), kb.write_txn(conn):
+            conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'done',
+                       completed_at = ?,
+                       assignee = 'developer',
+                       result = 'preserve this evidence',
+                       project_id = 'project-1',
+                       branch_name = 'feature/preserve-evidence'
+                 WHERE id = ?
+                """,
+                (completed_at, task_id),
+            )
+            event_id = kb._append_event(
+                conn,
+                task_id,
+                "completed",
+                {"evidence": "preserve this event payload"},
+            )
+    return task_id, completed_at, event_id
+
+
+def test_clear_terminal_state_clears_only_the_stale_generic_terminal_flag(kanban_home):
+    board = "clear-terminal-success"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+
+    with kb.connect(board=board) as conn:
+        before = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        before_runs = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ]
+        before_events = [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ]
+
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=completed_at,
+            expected_phase="development",
+            expected_latest_event_id=event_id,
+            actor="operator",
+            reason="clear stale generic terminal state",
+        )
+        assert kb.clear_terminal_state(conn, request) is True
+
+        after = dict(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone())
+        assert after["status"] == "ready"
+        assert after["completed_at"] is None
+        for field, value in before.items():
+            if field not in {"status", "completed_at"}:
+                assert after[field] == value, field
+        assert [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_runs WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ] == before_runs
+
+        events = conn.execute(
+            "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+        ).fetchall()
+        assert [tuple(row) for row in events[:-1]] == before_events
+        assert events[-1]["kind"] == "terminal_state_cleared"
+        payload = json.loads(events[-1]["payload"])
+        assert payload == {
+            "operation": "clear_terminal_state",
+            "actor": "operator",
+            "reason": "clear stale generic terminal state",
+            "expected": {
+                "status": "done",
+                "completed_at": completed_at,
+                "phase": "development",
+                "latest_event_id": event_id,
+            },
+        }
+
+
+@pytest.mark.parametrize("field", ["expected_completed_at", "expected_latest_event_id"])
+def test_clear_terminal_state_refuses_stale_cas_fields(kanban_home, field):
+    board = f"clear-terminal-stale-{field}"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+    with kb.connect(board=board) as conn:
+        before = {
+            "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
+            "events": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+                ).fetchall()
+            ],
+        }
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=(completed_at + 1 if field == "expected_completed_at" else completed_at),
+            expected_phase="development",
+            expected_latest_event_id=(event_id + 1 if field == "expected_latest_event_id" else event_id),
+            actor="operator",
+            reason="stale CAS must refuse",
+        )
+        assert kb.clear_terminal_state(conn, request) is False
+        assert tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before["task"]
+        assert [
+            tuple(row)
+            for row in conn.execute(
+                "SELECT * FROM task_events WHERE task_id = ? ORDER BY id", (task_id,)
+            ).fetchall()
+        ] == before["events"]
+
+
+def test_clear_terminal_state_refuses_non_done_status(kanban_home):
+    board = "clear-terminal-non-done"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+    with kb.connect(board=board) as conn:
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+        conn.commit()
+        before = {
+            "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
+            "events": len(kb.list_events(conn, task_id)),
+        }
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=completed_at,
+            expected_phase="development",
+            expected_latest_event_id=event_id,
+            actor="operator",
+            reason="non-done must refuse",
+        )
+        assert kb.clear_terminal_state(conn, request) is False
+        assert tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before["task"]
+        assert len(kb.list_events(conn, task_id)) == before["events"]
+
+
+def test_clear_terminal_state_refuses_already_terminal_phase(kanban_home):
+    board = "clear-terminal-terminal-phase"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board, phase="done")
+    with kb.connect(board=board) as conn:
+        before = {
+            "task": tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()),
+            "events": len(kb.list_events(conn, task_id)),
+        }
+        request = kb.ClearTerminalStateRequest(
+            task_id=task_id,
+            expected_completed_at=completed_at,
+            expected_phase="done",
+            expected_latest_event_id=event_id,
+            actor="operator",
+            reason="terminal phase must refuse",
+        )
+        assert kb.clear_terminal_state(conn, request) is False
+        assert tuple(conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()) == before["task"]
+        assert len(kb.list_events(conn, task_id)) == before["events"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("actor", ""), ("actor", "  "), ("reason", ""), ("reason", "  ")],
+)
+def test_clear_terminal_state_refuses_empty_actor_or_reason(kanban_home, field, value):
+    board = f"clear-terminal-empty-{field}-{len(value)}"
+    _v2_product_board(board)
+    task_id, completed_at, event_id = _seed_stale_terminal_card(board)
+    values = {
+        "task_id": task_id,
+        "expected_completed_at": completed_at,
+        "expected_phase": "development",
+        "expected_latest_event_id": event_id,
+        "actor": "operator",
+        "reason": "required reason",
+    }
+    values[field] = value
+    with kb.connect(board=board) as conn:
+        with pytest.raises(ValueError, match=field):
+            kb.clear_terminal_state(conn, kb.ClearTerminalStateRequest(**values))
+
+
 @pytest.mark.parametrize("step", sorted(kb.PRODUCT_WORKFLOW_STEP_SET))
 def test_create_task_accepts_each_product_step(kanban_home, step):
     with kb.connect() as conn:

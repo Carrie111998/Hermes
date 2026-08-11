@@ -6496,6 +6496,16 @@ class TaskSnapshotConflict(RuntimeError):
         self.current = current
 
 
+@dataclass(frozen=True)
+class ClearTerminalStateRequest:
+    task_id: str
+    expected_completed_at: int
+    expected_phase: str
+    expected_latest_event_id: int
+    actor: str
+    reason: str
+
+
 def task_snapshot_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "status": row["status"],
@@ -10966,6 +10976,113 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    return True
+
+
+def clear_terminal_state(
+    conn: sqlite3.Connection,
+    request: ClearTerminalStateRequest,
+) -> bool:
+    """Clear a stale generic terminal flag without rewriting workflow history.
+
+    The operator must present the exact terminal snapshot observed before the
+    repair. Only ``status`` and ``completed_at`` are changed; the stored phase,
+    assignee, evidence, runs, and prior events remain untouched. A successful
+    repair appends one auditable event carrying the expected snapshot.
+    """
+    if not isinstance(request, ClearTerminalStateRequest):
+        raise TypeError("request must be ClearTerminalStateRequest")
+
+    task_id = str(request.task_id or "").strip()
+    if not task_id:
+        raise ValueError("task_id is required")
+    for field in ("expected_completed_at", "expected_latest_event_id"):
+        value = getattr(request, field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{field} is required")
+    expected_phase = str(request.expected_phase or "").strip()
+    if not expected_phase:
+        raise ValueError("expected_phase is required")
+    actor = str(request.actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required")
+    reason = str(request.reason or "").strip()
+    if not reason:
+        raise ValueError("reason is required")
+
+    expected_snapshot = {
+        "status": "done",
+        "completed_at": request.expected_completed_at,
+        "phase": expected_phase,
+        "latest_event_id": request.expected_latest_event_id,
+    }
+    board = _board_slug_for_connection(conn)
+    board_meta = product_board_metadata(board)
+    with authorized_governance_write(), write_txn(conn):
+        row = conn.execute(
+            "SELECT status, completed_at, current_step_key FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row["status"] != "done":
+            return False
+        if (
+            row["completed_at"] != request.expected_completed_at
+            or row["current_step_key"] != expected_phase
+        ):
+            return False
+        if row["current_step_key"] == "done":
+            return False
+
+        latest_event = conn.execute(
+            "SELECT id FROM task_events WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if (
+            latest_event is None
+            or int(latest_event["id"]) != request.expected_latest_event_id
+        ):
+            return False
+
+        restored_status = _column_status_for_step(board_meta, expected_phase)
+        if restored_status in {"done", "archived"}:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?, completed_at = NULL
+             WHERE id = ?
+               AND status = 'done'
+               AND completed_at = ?
+               AND current_step_key = ?
+               AND (
+                   SELECT id FROM task_events
+                    WHERE task_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+               ) = ?
+            """,
+            (
+                restored_status,
+                task_id,
+                request.expected_completed_at,
+                expected_phase,
+                task_id,
+                request.expected_latest_event_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "terminal_state_cleared",
+            {
+                "operation": "clear_terminal_state",
+                "actor": actor,
+                "reason": reason,
+                "expected": expected_snapshot,
+            },
+        )
     return True
 
 
