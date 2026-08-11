@@ -26,13 +26,24 @@ API_KEY_ENV = {
 }
 
 
-def validate_cover_inputs(args):
+def validate_inputs(args):
     direct_inputs = [value for value in (args.audio_url, args.audio_base64) if value]
     has_feature = bool(args.cover_feature_id)
     if args.model not in COVER_MODELS:
         if direct_inputs or has_feature:
             raise SystemExit("cover inputs require a music-cover model")
+        if args.instrumental and not args.prompt:
+            raise SystemExit("--prompt is required for instrumental music")
+        if not args.instrumental and not args.lyrics:
+            if not args.lyrics_optimizer:
+                raise SystemExit("vocal music requires --lyrics or --lyrics-optimizer")
+            if not args.prompt:
+                raise SystemExit("--prompt is required with --lyrics-optimizer")
         return
+    if args.lyrics_optimizer or args.instrumental:
+        raise SystemExit("cover models do not support generation-only options")
+    if not args.prompt:
+        raise SystemExit("--prompt is required for cover models")
     if has_feature:
         if direct_inputs:
             raise SystemExit(
@@ -49,20 +60,27 @@ def validate_cover_inputs(args):
 def generate(args, opener=urlopen):
     if args.model not in MODELS:
         raise SystemExit(f"unsupported model: {args.model}")
-    validate_cover_inputs(args)
+    validate_inputs(args)
     api_key_env = API_KEY_ENV[args.region]
     api_key = os.environ.get(api_key_env)
     if not api_key:
         raise SystemExit(f"{api_key_env} is required")
     payload = {
         "model": args.model,
-        "prompt": args.prompt,
         "stream": False,
         "output_format": args.output_format,
         "audio_setting": {"format": args.audio_format},
-        "is_instrumental": args.instrumental,
     }
-    for key in ("lyrics", "audio_url", "audio_base64", "cover_feature_id"):
+    if args.model not in COVER_MODELS:
+        payload["lyrics_optimizer"] = args.lyrics_optimizer
+        payload["is_instrumental"] = args.instrumental
+    for key in (
+        "prompt",
+        "lyrics",
+        "audio_url",
+        "audio_base64",
+        "cover_feature_id",
+    ):
         value = getattr(args, key, None)
         if value is not None:
             payload[key] = value
@@ -95,13 +113,14 @@ def generate(args, opener=urlopen):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--prompt", required=True)
+    p.add_argument("--prompt")
     p.add_argument("--lyrics")
     p.add_argument("--model", default="music-3.0")
     p.add_argument("--region", choices=ENDPOINTS, default="global")
     p.add_argument("--output", required=True)
     p.add_argument("--output-format", choices=("url", "hex"), default="url")
     p.add_argument("--audio-format", choices=("mp3", "wav", "pcm"), default="mp3")
+    p.add_argument("--lyrics-optimizer", action="store_true")
     p.add_argument("--instrumental", action="store_true")
     p.add_argument("--aigc-watermark", action="store_true")
     p.add_argument("--audio-url")

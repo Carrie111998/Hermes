@@ -71,6 +71,7 @@ python skills/media/minimax-music/scripts/generate_music.py \
 | `--region` | `global` by default; use `cn` for the China endpoint and credential |
 | `--audio-format` | `mp3`, `wav`, or `pcm` |
 | `--output-format` | `url` downloads the expiring URL; `hex` decodes inline audio |
+| `--lyrics-optimizer` | Generates lyrics from the prompt when lyrics are omitted |
 | `--instrumental` | Generates without vocals |
 | `--aigc-watermark` | Adds the China-region watermark field |
 | `--audio-url` | Reference audio URL for a cover request |
@@ -82,11 +83,13 @@ python skills/media/minimax-music/scripts/generate_music.py \
 1. Choose `global` or `cn` and set the matching API key.
 2. Choose a generation model for new music or a cover model for reference
    audio.
-3. For a direct cover, pass exactly one of `--audio-url` or
+3. For vocal text-to-music, provide lyrics or use `--lyrics-optimizer` with a
+   prompt.
+4. For a direct cover, pass exactly one of `--audio-url` or
    `--audio-base64`. Do not combine either one with `--cover-feature-id`.
-4. When using `--cover-feature-id`, provide replacement lyrics with
+5. When using `--cover-feature-id`, provide replacement lyrics with
    `--lyrics`.
-5. Run the script with `terminal` and confirm the requested output file was
+6. Run the script with `terminal` and confirm the requested output file was
    created. URL results are downloaded immediately because they expire after
    24 hours.
 
@@ -96,6 +99,7 @@ python skills/media/minimax-music/scripts/generate_music.py \
   to `MINIMAX_API_KEY`.
 - Cover audio must be 6-360 seconds and no larger than 50 MB.
 - Cover-only inputs are rejected for text-to-music models.
+- `--lyrics-optimizer` is for text-to-music models, not cover models.
 - `--aigc-watermark` is only sent to the China endpoint.
 - Generated URL results expire after 24 hours.
 
