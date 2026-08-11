@@ -1,6 +1,6 @@
-import { cleanup, fireEvent, render } from '@testing-library/react'
 import { DndContext, KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
 import { SortableContext, verticalListSortingStrategy } from '@dnd-kit/sortable'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
 import { useSortableBindings } from './reorderable-list'
@@ -23,8 +23,8 @@ function Probe({ id }: { id: string }) {
 
   return (
     <div>
-      <pre data-testid="grabber-keys" data-keys={Object.keys(bindings.dragHandleProps ?? {}).join(',')} />
-      <pre data-testid="shell-keys" data-keys={Object.keys(bindings.shellDragProps ?? {}).join(',')} />
+      <pre data-keys={Object.keys(bindings.dragHandleProps ?? {}).join(',')} data-testid="grabber-keys" />
+      <pre data-keys={Object.keys(bindings.shellDragProps ?? {}).join(',')} data-testid="shell-keys" />
     </div>
   )
 }
@@ -69,7 +69,7 @@ function ProbeHost({ id }: { id: string }) {
   )
 
   return (
-    <DndContext sensors={sensors} onDragEnd={() => {}}>
+    <DndContext onDragEnd={() => {}} sensors={sensors}>
       <SortableContext items={[id]} strategy={verticalListSortingStrategy}>
         <BehaviorProbe id={id} />
       </SortableContext>
