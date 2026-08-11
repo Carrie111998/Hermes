@@ -171,6 +171,23 @@ def test_first_observation_of_terminal_item_has_unknown_duration() -> None:
     assert timing["items"]["task"]["known"] is False
 
 
+def test_terminal_first_clear_restart_rotates_cycle_for_new_work() -> None:
+    first = TodoStore(clock=FakeClock(100))
+    first.write([_item("completed")])
+    assert first.snapshot()["timing"]["cycle"]["id"] == 1
+    first.write([])
+
+    resumed = TodoStore(clock=FakeClock(200))
+    resumed.hydrate(first.snapshot())
+    resumed.write([_item("pending", "next")])
+
+    timing = resumed.snapshot()["timing"]
+    assert timing["cycle"]["id"] == 2
+    assert timing["cycle"]["known"] is True
+    assert timing["cycle"]["started_at"] == 200
+    assert timing["items"]["next"]["cycle_id"] == 2
+
+
 def test_model_supplied_timing_fields_are_ignored() -> None:
     clock = FakeClock(100)
     store = TodoStore(clock=clock)

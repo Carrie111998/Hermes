@@ -65,9 +65,7 @@ class TodoTimingState:
         if rotate:
             self._start_cycle(current, now)
             started_cycle = True
-        elif not previous and current and (
-            self._cycle_id == 0 or self._cycle_completed_at is not None
-        ):
+        elif not previous and current:
             self._start_cycle(current, now)
             started_cycle = True
 
