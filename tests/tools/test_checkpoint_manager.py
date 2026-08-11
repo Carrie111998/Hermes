@@ -35,10 +35,10 @@ from tools.checkpoint_manager import (
 # Nearly every test here drives real ``git`` subprocesses, so the whole module
 # is spawn-bound rather than compute-bound.  The suite-wide --timeout=30
 # (pyproject.toml) is calibrated for in-process tests; it is not survivable
-# here once the host is under memory-commit pressure, where a single spawn
-# costs seconds rather than milliseconds.  Measured 2026-08-11 at 97.5%
-# commit: a bare ``git --version`` took 2.75s, so even _init_store's six
-# config spawns (~22s) straddled the 30s default and killed test_creates_git_store.
+# here on a contended host, where a single spawn costs seconds rather than
+# milliseconds.  Measured 2026-08-11 alongside 8+ concurrent pytest sweeps:
+# a bare ``git --version`` took 2.75s, so even _init_store's six config
+# spawns (~22s) straddled the 30s default and killed test_creates_git_store.
 # Because --timeout-method=thread ``os._exit``es the whole pytest process, one
 # such overrun aborts an entire tests/tools sweep -- so this is a sweep-integrity
 # guard, not just a per-test allowance.  TestRealPruning overrides this with a
@@ -325,11 +325,18 @@ class TestRealPruning:
     spawn COUNT so the fix can't silently regress.
 
     The wall-clock budget, though, is not a property of this code — it is a
-    property of the host.  Per-spawn cost scales with memory-commit pressure,
-    and the timeout must be sized for the loaded case, not the idle one:
+    property of the host, and the variable to size against is MEASURED PER-SPAWN
+    COST, not any single host metric:
 
-        idle host      (2026-06-11, post-fix): ~0.26s/spawn ->  18.35s
-        97.5% commit   (2026-08-11, measured):  ~3.6s/spawn -> 255.9s
+        quiet host     (2026-06-11, post-fix): ~0.26s/spawn ->  18.35s
+        contended host (2026-08-11, measured):  ~3.6s/spawn -> 255.9s
+
+    Do NOT read commit-charge percentage as the predictor — it is a contributor,
+    not the signal.  A 2026-06-11 run of this whole file finished 80 tests in
+    72.3s at 97.2% commit; the 2026-08-11 run took 2774.6s at 97.5% commit.
+    Near-identical commit, 38x the wall clock.  What differed was concurrency:
+    the slow run overlapped 8+ other pytest sweeps.  To judge this file, time a
+    bare ``git --version`` (2.746s on the slow host, sub-0.5s when quiet).
 
     Same 71 spawns, same code, 14x the wall clock — a bare ``git --version``
     alone cost 2.75s on the 08-11 host.  The old timeout(120) sat between
