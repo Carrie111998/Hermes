@@ -4793,8 +4793,8 @@ class AIAgent:
             "Tool %s returned image content for %s/%s; projecting mode=%s "
             "to text/reference content",
             tool_name,
-            self.provider,
-            self.model,
+            getattr(self, "provider", ""),
+            getattr(self, "model", ""),
             tool_result_image_mode,
         )
         return summary
