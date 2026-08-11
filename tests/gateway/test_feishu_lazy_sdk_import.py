@@ -18,6 +18,7 @@ test that already imported ``lark_oapi`` would otherwise mask a regression.
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -41,14 +42,45 @@ def _run(code: str, timeout: int = 300) -> subprocess.CompletedProcess:
 
 
 def _lark_installed() -> bool:
-    import importlib.util
+    """True when the real ``lark_oapi`` SDK is importable from disk.
 
-    return importlib.util.find_spec("lark_oapi") is not None
+    Deliberately *not* ``importlib.util.find_spec``: that consults
+    ``sys.modules`` first and raises ``ValueError`` if the named module is
+    already there without a ``__spec__`` -- which is exactly what a sibling
+    test's ``MagicMock`` stub looks like.  ``PathFinder`` searches ``sys.path``
+    instead, so the answer reflects the on-disk SDK that the clean
+    subprocesses in ``_run`` will actually import.
+    """
+    from importlib.machinery import PathFinder
+
+    return PathFinder.find_spec("lark_oapi") is not None
 
 
 requires_lark = pytest.mark.skipif(
     not _lark_installed(), reason="lark_oapi not installed"
 )
+
+
+def test_lark_installed_ignores_injected_sys_modules_stub(monkeypatch):
+    """The probe must describe the on-disk SDK, not an in-process stub.
+
+    ``tests/gateway/test_feishu_approval_buttons.py`` installs a ``MagicMock``
+    under ``sys.modules["lark_oapi"]`` at *import* time, and it sorts before
+    this module -- so during collection of ``tests/gateway`` the stub is
+    already in place.  ``MagicMock`` refuses to synthesise dunder attributes,
+    so reading ``__spec__`` off it raises ``AttributeError``, which
+    ``importlib.util.find_spec`` re-raises as ``ValueError``.  That aborted
+    collection for the entire directory, not just this file.
+
+    The stub must change neither the answer nor the control flow: every real
+    check here runs in a subprocess with a clean interpreter, so what matters
+    is whether the SDK is importable from disk.
+    """
+    baseline = _lark_installed()
+
+    monkeypatch.setitem(sys.modules, "lark_oapi", MagicMock())
+
+    assert _lark_installed() == baseline
 
 
 @requires_lark
