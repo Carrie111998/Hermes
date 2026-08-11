@@ -69,7 +69,7 @@ post_install: |
   1.25.12+ on PATH for the bootstrap `go build`.
 
   Default env is Calendar-only with ICLOUD_MCP_READ_ONLY=true (7 tools).
-  Create an app-specific password at https://appleid.apple.com — never use
+  Create an app-specific password at https://appleid.apple.com; never use
   the main Apple Account password.
 
   After install, start a new Hermes session and call icloud_capabilities.
