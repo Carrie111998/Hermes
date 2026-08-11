@@ -12,6 +12,76 @@ import pytest
 from tests.gateway.test_gateway_command_dispatch_minimal import _make_event, _make_runner
 
 
+class _AttemptInt(int):
+    pass
+
+
+class _AttemptFloat(float):
+    pass
+
+
+class _RaisingAttemptDict(dict):
+    def get(self, key, default=None):
+        raise RuntimeError("metadata access failed")
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"model_attempted": True}, True),
+        ({"model_attempted": False}, False),
+        ({"api_calls": 1}, True),
+        ({"api_calls": 0}, False),
+        ({"api_calls": -1}, False),
+        ({"api_calls": 1.0}, True),
+        ({"api_calls": 0.0}, False),
+        ({"api_calls": -1.0}, False),
+        ({"api_calls": 1.5}, False),
+        ({"api_calls": float("nan")}, False),
+        ({"api_calls": float("inf")}, False),
+        ({"api_calls": float("-inf")}, False),
+        ({"api_calls": True}, False),
+        ({"api_calls": False}, False),
+        ({"api_calls": "1"}, False),
+        ({"api_calls": "1.0"}, False),
+        ({"api_calls": object()}, False),
+        ({"api_calls": _AttemptInt(1)}, False),
+        ({"api_calls": _AttemptFloat(1.0)}, False),
+        (_RaisingAttemptDict(api_calls=1), False),
+        (object(), False),
+    ],
+    ids=(
+        "explicit-attempt",
+        "explicit-no-attempt",
+        "positive-int",
+        "zero-int",
+        "negative-int",
+        "positive-integral-float",
+        "zero-float",
+        "negative-integral-float",
+        "positive-fractional-float",
+        "nan",
+        "positive-infinity",
+        "negative-infinity",
+        "true-is-not-a-call-count",
+        "false-is-not-a-call-count",
+        "integer-string",
+        "float-string",
+        "arbitrary-call-count",
+        "int-subclass",
+        "float-subclass",
+        "raising-dict-subclass",
+        "arbitrary-result",
+    ),
+)
+def test_gateway_legacy_signature_actual_attempt_metadata_is_strict_and_never_raises(
+    result, expected
+):
+    from gateway.run import _validated_actual_model_attempt
+
+    assert _validated_actual_model_attempt(result) is expected
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("profile", ["missing", object(), 17])
 async def test_gateway_refresh_global_fallback_uses_default_adapters_in_platform_scopes(

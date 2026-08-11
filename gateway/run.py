@@ -31,6 +31,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -3644,7 +3645,7 @@ def _normalize_empty_agent_response(
 
 def _validated_actual_model_attempt(result: Any) -> bool:
     """Fail-closed validator for legacy agent completion metadata."""
-    if not isinstance(result, dict):
+    if type(result) is not dict:
         return False
     attempted = result.get("model_attempted")
     if type(attempted) is bool and attempted:
