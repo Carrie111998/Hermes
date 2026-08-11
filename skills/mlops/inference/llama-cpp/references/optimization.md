@@ -17,8 +17,9 @@ Maximize llama.cpp inference speed and efficiency.
 
 ### BLAS acceleration
 ```bash
-# OpenBLAS (faster matrix ops)
-make LLAMA_OPENBLAS=1
+# OpenBLAS (faster matrix ops) — build with CMake (Makefile build is deprecated upstream)
+cmake -B build -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release -j
 
 # BLAS gives 2-3× speedup
 ```

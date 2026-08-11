@@ -78,13 +78,13 @@ curl http://localhost:8080/v1/chat/completions \
 **Dockerfile**:
 ```dockerfile
 FROM ubuntu:22.04
-RUN apt-get update && apt-get install -y git build-essential
-RUN git clone https://github.com/ggerganov/llama.cpp
+RUN apt-get update && apt-get install -y git build-essential cmake
+RUN git clone https://github.com/ggml-org/llama.cpp
 WORKDIR /llama.cpp
-RUN make LLAMA_CUDA=1
+RUN cmake -B build -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release
 COPY models/ /models/
 EXPOSE 8080
-CMD ["./llama-server", "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["./build/bin/llama-server", "-m", "/models/model.gguf", "--host", "0.0.0.0", "--port", "8080"]
 ```
 
 **Run**:
