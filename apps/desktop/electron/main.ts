@@ -176,6 +176,7 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
   applyProfileDeleteLifecycle,
   applyProfileRenameLifecycle,
+  assertProfileNotRevoked,
   createProfileRevocationGuard,
   decideProfileDeleteAction,
   type ProfileMutationToken,
@@ -7767,6 +7768,8 @@ function persistSshConnectionToken(profile, source, token) {
 // A null/empty profile resolves the env/global remote, so legacy callers and
 // the connection test (which pass no profile) are unchanged.
 async function resolveRemoteBackend(profile) {
+  assertProfileNotRevoked(profile, candidate => profileRevocations.isRevoked(candidate))
+
   const config = readDesktopConnectionConfig()
 
   // 1. Per-profile override — "a profile with its own remote host". Wins even
@@ -11511,8 +11514,13 @@ ipcMain.handle('hermes:api', async (event, request) => {
 
   return runProfileMutationPreflight(
     creationMutation,
-    async handoff => {
+    async (handoff, track) => {
       const deletion = await prepareProfileDeleteRequest(request)
+
+      if (deletion.mutation) {
+        track(deletion.mutation)
+      }
+
       const tornDownProfile = deletion.profile
       const profileMutation = deletion.mutation || creationMutation
 

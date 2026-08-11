@@ -5,6 +5,7 @@ import { test } from 'vitest'
 import { makeBackendTarget } from './backend-target'
 import {
   applyProfileDeleteLifecycle,
+  assertProfileNotRevoked,
   createProfileRevocationGuard,
   decideProfileDeleteAction,
   profileNameFromCreateRequest,
@@ -110,6 +111,70 @@ test('runProfileMutationPreflight completes an early success before handoff', as
   assert.deepEqual(completions, ['succeeded:create-token'])
 })
 
+test('runProfileMutationPreflight adopts a deletion token created during preflight', async () => {
+  const completions: string[] = []
+
+  await assert.rejects(
+    runProfileMutationPreflight(
+      null,
+      async (_handoff, track) => {
+        track('delete-token')
+        throw new Error('backend unavailable after teardown')
+      },
+      (mutation, succeeded) => completions.push(`${succeeded ? 'succeeded' : 'failed'}:${mutation}`)
+    ),
+    /backend unavailable after teardown/
+  )
+
+  assert.deepEqual(completions, ['failed:delete-token'])
+})
+
+test('an adopted failed deletion drains so a later successful recreation restores authority', async () => {
+  const guard = createProfileRevocationGuard()
+  const deletion = guard.revoke('worker')
+
+  await assert.rejects(
+    runProfileMutationPreflight(
+      null,
+      async (_handoff, track) => {
+        track(deletion)
+        throw new Error('backend unavailable after teardown')
+      },
+      (mutation, succeeded) => guard.completeMutation({ mutation, succeeded })
+    ),
+    /backend unavailable after teardown/
+  )
+
+  const recreation = guard.startCreation('worker')
+  guard.completeMutation({ mutation: recreation, succeeded: true })
+
+  assert.equal(guard.isRevoked('worker'), false)
+})
+
+test('runProfileMutationPreflight does not settle twice when settlement itself throws', async () => {
+  const completions: boolean[] = []
+
+  await assert.rejects(
+    runProfileMutationPreflight(
+      'create-token',
+      async () => 'created',
+      (_mutation, succeeded) => {
+        completions.push(succeeded)
+        throw new Error('settlement failed')
+      }
+    ),
+    /settlement failed/
+  )
+
+  assert.deepEqual(completions, [true])
+})
+
+test('assertProfileNotRevoked rejects profile connection resolution while deletion owns authority', () => {
+  assert.throws(() => assertProfileNotRevoked('worker', profile => profile === 'worker'), /being deleted/)
+  assert.doesNotThrow(() => assertProfileNotRevoked('worker', () => false))
+  assert.doesNotThrow(() => assertProfileNotRevoked(null, () => true))
+})
+
 // ---------------------------------------------------------------------------
 // decideProfileDeleteAction
 // ---------------------------------------------------------------------------
@@ -203,6 +268,39 @@ test('applyProfileDeleteLifecycle fails the revocation token when teardown rejec
     /teardown failed/
   )
 
+  assert.deepEqual(failed, ['delete-token'])
+})
+
+test('applyProfileDeleteLifecycle waits for every started primary teardown before failing revocation', async () => {
+  let releaseProfileTeardown!: () => void
+
+  const profileTeardown = new Promise<void>(resolve => {
+    releaseProfileTeardown = resolve
+  })
+
+  const failed: string[] = []
+
+  const lifecycle = applyProfileDeleteLifecycle(
+    { action: 'teardown-primary', profile: 'worker' },
+    {
+      destroyRevokedWindows: () => {},
+      failRevocation: mutation => failed.push(mutation),
+      revokeProfile: () => 'delete-token',
+      revokeWindowTargets: () => [],
+      teardownPrimary: () => {
+        throw new Error('primary teardown failed')
+      },
+      teardownProfileBackends: () => profileTeardown,
+      writeActiveProfile: () => {}
+    }
+  )
+
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(failed, [])
+
+  releaseProfileTeardown()
+  await assert.rejects(lifecycle, /primary teardown failed/)
   assert.deepEqual(failed, ['delete-token'])
 })
 

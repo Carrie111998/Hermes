@@ -93,6 +93,38 @@ test('applyProfileRenameLifecycle fails the revocation token when teardown rejec
   assert.deepEqual(failed, ['rename-token'])
 })
 
+test('applyProfileRenameLifecycle waits for every started primary teardown before failing revocation', async () => {
+  let releasePoolTeardown!: () => void
+
+  const poolTeardown = new Promise<void>(resolve => {
+    releasePoolTeardown = resolve
+  })
+
+  const failed: string[] = []
+
+  const lifecycle = applyProfileRenameLifecycle({ from: 'worker', to: 'coder' }, 'worker', {
+    completeRevocation: () => {},
+    destroyRevokedWindows: () => {},
+    failRevocation: mutation => failed.push(mutation),
+    migrateConnectionOverride: () => {},
+    revokeProfile: () => 'rename-token',
+    revokeWindowTargets: () => [],
+    teardownPrimary: async () => {
+      throw new Error('primary teardown failed')
+    },
+    teardownProfilePools: () => poolTeardown,
+    writeActiveProfile: () => {}
+  })
+
+  await Promise.resolve()
+  await Promise.resolve()
+  assert.deepEqual(failed, [])
+
+  releasePoolTeardown()
+  await assert.rejects(lifecycle, /primary teardown failed/)
+  assert.deepEqual(failed, ['rename-token'])
+})
+
 test('profileRenameFromRequest parses a valid PATCH profile rename', () => {
   assert.deepEqual(
     profileRenameFromRequest({ method: 'PATCH', path: '/api/profiles/Worker', body: { new_name: 'Coder' } }),

@@ -56,27 +56,72 @@ export function profileNameFromCreateRequest(request) {
   return PROFILE_NAME_RE.test(name) && name !== 'default' ? name : null
 }
 
+export function assertProfileNotRevoked(
+  profile: string | null,
+  isRevoked: (profile: string) => boolean
+): void {
+  if (profile && isRevoked(profile)) {
+    throw new Error(`Profile "${profile}" is being deleted and cannot be connected.`)
+  }
+}
+
+export async function settleStartedOperations(operations: Array<() => Promise<void>>): Promise<void> {
+  const noFailure = Symbol('no-failure')
+  let firstFailure: unknown | typeof noFailure = noFailure
+  const started = operations.map(async operation => operation())
+
+  await Promise.all(
+    started.map(async operation => {
+      try {
+        await operation
+      } catch (error) {
+        if (firstFailure === noFailure) {
+          firstFailure = error
+        }
+      }
+    })
+  )
+
+  if (firstFailure !== noFailure) {
+    throw firstFailure
+  }
+}
+
 export async function runProfileMutationPreflight<T, M>(
   mutation: M | null,
-  operation: (handoff: () => void) => Promise<T>,
+  operation: (handoff: () => void, track: (mutation: M) => void) => Promise<T>,
   settle: (mutation: M, succeeded: boolean) => void
 ): Promise<T> {
   let handedOff = false
+  let settled = false
+  let trackedMutation = mutation
+
+  const settleTracked = (succeeded: boolean): void => {
+    if (trackedMutation !== null && !handedOff && !settled) {
+      settled = true
+      settle(trackedMutation, succeeded)
+    }
+  }
 
   try {
-    const result = await operation(() => {
-      handedOff = true
-    })
+    const result = await operation(
+      () => {
+        handedOff = true
+      },
+      nextMutation => {
+        if (handedOff) {
+          throw new Error('Cannot track a profile mutation after request handoff.')
+        }
 
-    if (mutation !== null && !handedOff) {
-      settle(mutation, true)
-    }
+        trackedMutation = nextMutation
+      }
+    )
+
+    settleTracked(true)
 
     return result
   } catch (error) {
-    if (mutation !== null && !handedOff) {
-      settle(mutation, false)
-    }
+    settleTracked(false)
 
     throw error
   }
@@ -145,7 +190,7 @@ export async function applyProfileRenameLifecycle<T>(
 
     if (decision.action === 'teardown-primary') {
       deps.writeActiveProfile(decision.to)
-      await Promise.all([deps.teardownPrimary(), deps.teardownProfilePools(decision.from)])
+      await settleStartedOperations([deps.teardownPrimary, () => deps.teardownProfilePools(decision.from)])
     } else {
       await deps.teardownProfilePools(decision.from)
     }
@@ -459,7 +504,7 @@ export async function applyProfileDeleteLifecycle<T>(
 
     if (decision.action === 'teardown-primary') {
       deps.writeActiveProfile('default')
-      await Promise.all([deps.teardownPrimary(), deps.teardownProfileBackends(decision.profile)])
+      await settleStartedOperations([deps.teardownPrimary, () => deps.teardownProfileBackends(decision.profile)])
     } else {
       await deps.teardownProfileBackends(decision.profile)
     }
