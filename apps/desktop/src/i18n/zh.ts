@@ -273,6 +273,8 @@ export const zh: Translations = {
       'view.toggleReview': '切换审查面板',
       'view.toggleStatusbar': '切换状态栏',
       'view.showFiles': '显示文件浏览器',
+      'view.toggleHud': '切换 HUD 模式',
+      'hud.snapToPointer': '将 HUD 移到指针处（全局，HUD 打开时）',
       'view.showTerminal': '显示终端',
       'view.newTerminal': '新建终端',
       'view.nextTerminal': '下一个终端',
