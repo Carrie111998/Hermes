@@ -189,15 +189,21 @@ def test_non_json_oauth_config_fails_closed(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_active_owner_flow_is_closed_before_replacement(tmp_path, monkeypatch):
-    from tools.mcp_oauth_manager import MCPOAuthManager, _ProviderEntry
+    from tools.mcp_oauth_manager import (
+        MCPAuthFlowLifecycleError,
+        MCPOAuthManager,
+        _ProviderEntry,
+    )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     manager = MCPOAuthManager()
-    closed = asyncio.Event()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
 
     class OldFlow:
         async def aclose(self):
-            closed.set()
+            close_started.set()
+            await release_close.wait()
 
     old_flow = OldFlow()
     old_provider = SimpleNamespace(
@@ -215,10 +221,100 @@ async def test_active_owner_flow_is_closed_before_replacement(tmp_path, monkeypa
     replacement = SimpleNamespace()
     monkeypatch.setattr(manager, "_build_provider", lambda *_args: replacement)
 
-    result = manager.get_or_build_provider("srv", "https://new.example/mcp", {})
-    assert result is replacement
-    await asyncio.wait_for(closed.wait(), timeout=1)
-    assert old_provider._hermes_active_flows == {}
+    with pytest.raises(MCPAuthFlowLifecycleError):
+        manager.get_or_build_provider("srv", "https://new.example/mcp", {})
+    assert manager._entries[manager._key("srv")] is entry
+    assert old_provider._hermes_active_flows == {id(old_flow): old_flow}
+    assert not close_started.is_set()
+    release_close.set()
+
+
+@pytest.mark.asyncio
+async def test_incompatible_inner_with_aclose_is_closed_before_protocol_error(
+    tmp_path, monkeypatch
+):
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPAuthFlowProtocolError
+
+    provider = await _provider(tmp_path, monkeypatch)
+    closed = 0
+
+    class Incompatible:
+        async def __anext__(self):
+            return httpx.Request("POST", "https://example.com/mcp")
+
+        async def aclose(self):
+            nonlocal closed
+            closed += 1
+
+    monkeypatch.setattr(
+        OAuthClientProvider, "async_auth_flow", lambda *_: Incompatible()
+    )
+    flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
+    with pytest.raises(MCPAuthFlowProtocolError):
+        await flow.__anext__()
+    assert closed == 1
+    assert provider._hermes_active_flows == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_metadata_persistence_error_is_primary_over_close_error(
+    tmp_path, monkeypatch
+):
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    provider = await _provider(tmp_path, monkeypatch)
+    persistence = ValueError("persistence-primary")
+    cleanup = RuntimeError("cleanup-secondary")
+
+    class Inner:
+        async def __anext__(self):
+            return httpx.Request("POST", "https://example.com/mcp")
+
+        async def asend(self, _response):
+            raise StopAsyncIteration
+
+        async def aclose(self):
+            raise cleanup
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", lambda *_: Inner())
+    monkeypatch.setattr(
+        provider,
+        "_persist_oauth_metadata_if_changed",
+        lambda: (_ for _ in ()).throw(persistence),
+    )
+    flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
+    await flow.__anext__()
+    with pytest.raises(ValueError, match="persistence-primary") as raised:
+        await flow.asend(httpx.Response(200))
+    assert raised.value is persistence
+
+
+@pytest.mark.asyncio
+async def test_refresh_failure_preserves_primary_when_invalidation_fails(
+    tmp_path, monkeypatch
+):
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+
+    provider = await _provider(tmp_path, monkeypatch)
+    primary = RuntimeError("refresh-primary")
+    secondary = OSError("unlink-secondary")
+
+    async def failing_refresh(*_args):
+        raise primary
+
+    monkeypatch.setattr(
+        OAuthClientProvider, "_handle_refresh_response", failing_refresh
+    )
+    monkeypatch.setattr(
+        provider.context.storage,
+        "invalidate_tokens",
+        lambda: (_ for _ in ()).throw(secondary),
+    )
+    with pytest.raises(RuntimeError, match="refresh-primary") as raised:
+        await provider._handle_refresh_response(httpx.Response(500))
+    assert raised.value is primary
+    assert provider.context.current_tokens is None
 
 
 @pytest.mark.asyncio
@@ -500,8 +596,18 @@ async def test_public_run_http_transport_runtime_matrix(
             assert kwargs["timeout"].connect == 2.0
         elif transport == "legacy":
             assert kwargs["auth"] is provider
-            assert kwargs["verify"] is False
-            assert kwargs["timeout"] == 2.0
+            assert callable(kwargs["httpx_client_factory"])
+            legacy_client = kwargs["httpx_client_factory"](
+                headers=kwargs["headers"],
+                timeout=kwargs["timeout"],
+                auth=kwargs["auth"],
+            )
+            legacy_client_kwargs = next(
+                item[1] for item in calls if item[0] == "client"
+            )
+            assert legacy_client is not None
+            assert legacy_client_kwargs["verify"] is False
+            assert legacy_client_kwargs["timeout"] == 2.0
         else:
             client_kwargs = next(item[1] for item in calls if item[0] == "client")
             assert client_kwargs["verify"] is False

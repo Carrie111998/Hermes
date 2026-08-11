@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import json
 import logging
 import re
@@ -79,6 +80,61 @@ def _oauth_config_fingerprint(oauth_config: Optional[dict]) -> str:
             "OAuth configuration contains unsupported non-JSON values"
         ) from exc
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _effective_provider_fingerprint(
+    server_name: str,
+    server_url: str,
+    oauth_config: Optional[dict],
+    transport_options: dict[str, Any],
+) -> str:
+    """Fingerprint the effective provider construction inputs.
+
+    The manager must compare what the provider will actually receive, rather
+    than the raw user fragment before provider-specific defaults and transport
+    defaults are applied.  Keep this pure: callback-port reservation belongs
+    to provider construction and must not happen while holding the cache lock.
+    """
+    from tools.mcp_oauth import apply_oauth_provider_defaults
+
+    effective_oauth = dict(oauth_config or {})
+    apply_oauth_provider_defaults(
+        effective_oauth, server_name=server_name, server_url=server_url
+    )
+    effective_oauth.setdefault("client_name", "Hermes Agent")
+    if not effective_oauth.get("token_endpoint_auth_method"):
+        effective_oauth["token_endpoint_auth_method"] = (
+            "client_secret_post"
+            if effective_oauth.get("client_secret")
+            else "none"
+        )
+    effective_oauth.setdefault("redirect_host", "127.0.0.1")
+    effective_oauth.setdefault("timeout", 300.0)
+    try:
+        effective_redirect_port = int(effective_oauth.get("redirect_port", 0))
+    except (TypeError, ValueError) as exc:
+        raise MCPAuthConfigurationError(
+            "OAuth redirect_port must be an integer"
+        ) from exc
+    effective_oauth["effective_redirect_uri"] = effective_oauth.get(
+        "redirect_uri"
+    ) or (
+        f"http://{effective_oauth['redirect_host']}:{effective_redirect_port}"
+        "/callback"
+    )
+    effective_transport = {
+        "connect_timeout": 60.0,
+        "read_timeout": 300.0,
+        "ssl_verify": True,
+        "client_cert": None,
+        "follow_redirects": True,
+        "headers": {},
+        "strict_redirect_headers": False,
+        **transport_options,
+    }
+    return _oauth_config_fingerprint(
+        {"oauth": effective_oauth, "transport": effective_transport}
+    )
 
 
 def _same_endpoint(a: str, b: str) -> bool:
@@ -286,19 +342,34 @@ def _make_hermes_provider_class() -> Optional[type]:
 
         async def _handle_refresh_response(self, response: Any) -> bool:
             """Never leave a failed refresh bearer readable on disk."""
+            invalidate = getattr(self.context.storage, "invalidate_tokens", None)
+
+            def invalidate_durably() -> None:
+                if not callable(invalidate):
+                    return
+                try:
+                    invalidate()
+                except BaseException as cleanup_exc:
+                    # Durable cleanup is secondary to the SDK's refresh
+                    # outcome.  The in-memory token has already been cleared;
+                    # never replace a primary refresh exception with unlink or
+                    # persistence diagnostics.
+                    logger.warning(
+                        "MCP OAuth '%s': failed to invalidate durable tokens "
+                        "after refresh failure: %s",
+                        self._hermes_server_name,
+                        cleanup_exc,
+                    )
+
             try:
                 ok = await super()._handle_refresh_response(response)
             except BaseException:
                 self.context.clear_tokens()
-                invalidate = getattr(self.context.storage, "invalidate_tokens", None)
-                if callable(invalidate):
-                    invalidate()
+                invalidate_durably()
                 raise
             if not ok:
                 self.context.clear_tokens()
-                invalidate = getattr(self.context.storage, "invalidate_tokens", None)
-                if callable(invalidate):
-                    invalidate()
+                invalidate_durably()
             return ok
 
         async def _prefetch_oauth_metadata(self) -> None:
@@ -552,9 +623,23 @@ def _make_hermes_provider_class() -> Optional[type]:
             inner = super().async_auth_flow(request)
             required = ("__anext__", "asend", "aclose")
             if any(not callable(getattr(inner, name, None)) for name in required):
-                raise MCPAuthFlowProtocolError(
+                protocol_error = MCPAuthFlowProtocolError(
                     "MCP SDK OAuth auth flow must implement __anext__, asend, and aclose"
                 )
+                close = getattr(inner, "aclose", None)
+                if callable(close):
+                    try:
+                        close_result = close()
+                        if inspect.isawaitable(close_result):
+                            await close_result
+                    except BaseException as cleanup_exc:
+                        logger.warning(
+                            "MCP OAuth '%s': incompatible SDK flow cleanup failed: %s",
+                            self._hermes_server_name,
+                            cleanup_exc,
+                        )
+                        raise protocol_error from cleanup_exc
+                raise protocol_error
             active_flows = getattr(self, "_hermes_active_flows", None)
             if active_flows is None:
                 active_flows = self._hermes_active_flows = {}
@@ -614,7 +699,11 @@ def _make_hermes_provider_class() -> Optional[type]:
             except StopAsyncIteration:
                 # Persist any metadata the SDK discovered lazily during the
                 # 401 branch so a subsequent cold-load skips discovery.
-                self._persist_oauth_metadata_if_changed()
+                try:
+                    self._persist_oauth_metadata_if_changed()
+                except BaseException as exc:
+                    primary = exc
+                    raise
                 return
             except GeneratorExit:
                 # Caller-driven outer aclose is cleanup control, not an
@@ -680,8 +769,8 @@ class MCPOAuthManager:
     ) -> Optional[Any]:
         """Return the provider for an endpoint/config and safe transport policy."""
         transport_options = dict(transport_options or {})
-        fingerprint = _oauth_config_fingerprint(
-            {"oauth": oauth_config or {}, "transport": transport_options}
+        fingerprint = _effective_provider_fingerprint(
+            server_name, server_url, oauth_config, transport_options
         )
         key = self._key(server_name)
         with self._entries_lock:
@@ -756,30 +845,40 @@ class MCPOAuthManager:
         async def close_all() -> None:
             for flow_id, flow in flows:
                 try:
-                    await flow.aclose()
+                    await asyncio.wait_for(flow.aclose(), timeout=5.0)
                 finally:
                     getattr(provider, "_hermes_active_flows", {}).pop(flow_id, None)
 
-        close_coro = close_all()
         try:
             current = asyncio.get_running_loop()
         except RuntimeError:
             current = None
+        close_coro = close_all()
         try:
             if current is owner:
-                # ``get_or_build_provider`` is synchronous and cannot await
-                # while already executing on the owner loop. Fence now and
-                # let the owner task reap the flow before its next use.
-                asyncio.create_task(close_coro)
+                # A synchronous cache API cannot safely await a coroutine on
+                # its own running loop. Schedule bounded cleanup, observe its
+                # result, and fail closed without publishing a replacement.
+                task = asyncio.create_task(close_coro)
+
+                def _observe(task: asyncio.Task) -> None:
+                    try:
+                        task.result()
+                    except BaseException as exc:
+                        logger.warning(
+                            "MCP OAuth '%s': owner-side flow cleanup failed: %s",
+                            getattr(provider, "_hermes_server_name", ""),
+                            exc,
+                        )
+
+                task.add_done_callback(_observe)
+                return False
             else:
                 future = asyncio.run_coroutine_threadsafe(close_coro, owner)
                 # A replacement requested from another live loop must not be
                 # published before owner-side ``aclose`` has completed.
                 future.result(timeout=5.0)
-        except (RuntimeError, OSError):
-            close_coro.close()
-            return False
-        except TimeoutError:
+        except BaseException:
             close_coro.close()
             return False
         return True

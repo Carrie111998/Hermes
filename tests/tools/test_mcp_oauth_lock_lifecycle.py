@@ -4,6 +4,7 @@ These tests deliberately exercise the provider handed to HTTPX and the manager
 entry point used by ``MCPServerTask._run_http``.  They do not replace the
 SDK's response-driven control-plane protocol with a helper-only fake.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -25,7 +26,11 @@ async def _noop_callback() -> tuple[str, str | None]:
 
 
 async def _provider(tmp_path, monkeypatch):
-    from mcp.shared.auth import OAuthClientInformationFull, OAuthClientMetadata, OAuthToken
+    from mcp.shared.auth import (
+        OAuthClientInformationFull,
+        OAuthClientMetadata,
+        OAuthToken,
+    )
     from pydantic import AnyUrl
 
     from tools.mcp_oauth import HermesTokenStorage
@@ -84,7 +89,9 @@ async def test_outer_close_closes_inner_exactly_once(tmp_path, monkeypatch):
             nonlocal close_calls
             close_calls += 1
 
-    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", lambda self, request: Inner())
+    monkeypatch.setattr(
+        OAuthClientProvider, "async_auth_flow", lambda self, request: Inner()
+    )
     flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
     await flow.__anext__()
     await flow.aclose()
@@ -93,7 +100,9 @@ async def test_outer_close_closes_inner_exactly_once(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_inner_close_failure_does_not_mask_primary_exception(tmp_path, monkeypatch):
+async def test_inner_close_failure_does_not_mask_primary_exception(
+    tmp_path, monkeypatch
+):
     """A provider/transport error remains observable if cleanup also fails."""
     from mcp.client.auth.oauth2 import OAuthClientProvider
 
@@ -115,7 +124,9 @@ async def test_inner_close_failure_does_not_mask_primary_exception(tmp_path, mon
             close_calls += 1
             raise cleanup
 
-    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", lambda self, request: Inner())
+    monkeypatch.setattr(
+        OAuthClientProvider, "async_auth_flow", lambda self, request: Inner()
+    )
     flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
     await flow.__anext__()
 
@@ -145,7 +156,9 @@ async def test_natural_completion_closes_inner_flow(tmp_path, monkeypatch):
             nonlocal close_calls
             close_calls += 1
 
-    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", lambda self, request: Inner())
+    monkeypatch.setattr(
+        OAuthClientProvider, "async_auth_flow", lambda self, request: Inner()
+    )
     flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
     await flow.__anext__()
 
@@ -156,7 +169,9 @@ async def test_natural_completion_closes_inner_flow(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_incompatible_sdk_generator_fails_closed_before_transport(tmp_path, monkeypatch):
+async def test_incompatible_sdk_generator_fails_closed_before_transport(
+    tmp_path, monkeypatch
+):
     """An SDK protocol drift cannot silently become an unauthenticated request."""
     from mcp.client.auth.oauth2 import OAuthClientProvider
     import tools.mcp_oauth_manager as manager_module
@@ -167,7 +182,9 @@ async def test_incompatible_sdk_generator_fails_closed_before_transport(tmp_path
     class Incompatible:
         pass
 
-    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", lambda self, request: Incompatible())
+    monkeypatch.setattr(
+        OAuthClientProvider, "async_auth_flow", lambda self, request: Incompatible()
+    )
     flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
 
     with pytest.raises(expected_error):
@@ -192,7 +209,9 @@ async def test_cancellation_closes_inner_flow(tmp_path, monkeypatch):
         async def aclose(self):
             closed.set()
 
-    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", lambda self, request: Inner())
+    monkeypatch.setattr(
+        OAuthClientProvider, "async_auth_flow", lambda self, request: Inner()
+    )
     flow = provider.async_auth_flow(httpx.Request("POST", "https://example.com/mcp"))
     await flow.__anext__()
 

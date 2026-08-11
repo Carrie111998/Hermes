@@ -869,11 +869,11 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
         # it after the constructor has already bound is a no-op) so a lingering
         # TIME_WAIT socket from a previous flow cannot block the next one
         # (#44590).
+        reserved = _reserved_sockets.pop(port, None)
         try:
             server = HTTPServer(
                 ("127.0.0.1", port), handler_cls, bind_and_activate=False
             )
-            reserved = _reserved_sockets.pop(port, None)
             if reserved is not None:
                 # Adopt the reserved (already bound) socket and start listening.
                 server.socket.close()
@@ -885,6 +885,8 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 server.server_bind()
                 server.server_activate()
         except OSError as exc:
+            if reserved is not None:
+                reserved.close()
             # The loopback callback port is genuinely in use: a concurrent OAuth
             # flow, a leftover listener, or a fixed `oauth.redirect_port` that
             # collided. build_oauth_auth does not start its own callback server,
@@ -896,7 +898,11 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 "in the server config, then retry."
             ) from exc
 
-        server_thread = threading.Thread(target=server.handle_request, daemon=True)
+        server_thread = threading.Thread(
+            target=lambda: server.serve_forever(poll_interval=0.01),
+            name="mcp-oauth-callback-listener",
+            daemon=True,
+        )
         server_thread.start()
 
         # Optional paste-fallback thread: only on interactive TTYs. Reads one
@@ -904,6 +910,7 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
         # result dict. The HTTP listener and this thread race for the result;
         # whichever fills it first wins.
         paste_thread: threading.Thread | None = None
+        paste_stop = threading.Event()
         if _is_interactive():
             print(
                 "\n  Or paste the redirect URL here (or the ``?code=...&state=...`` "
@@ -913,7 +920,7 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 flush=True,
             )
             paste_thread = threading.Thread(
-                target=_paste_callback_reader, args=(result,), daemon=True
+                target=_paste_callback_reader, args=(result, paste_stop), daemon=True
             )
             paste_thread.start()
 
@@ -927,7 +934,29 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
                 await asyncio.sleep(poll_interval)
                 elapsed += poll_interval
         finally:
+            # ``server_close`` only closes the listening socket; it does not
+            # deterministically stop a worker blocked in ``handle_request``.
+            # Use the HTTPServer shutdown handshake from the owning coroutine,
+            # then join the worker before returning or surfacing timeout/
+            # cancellation. This makes a timed-out flow immediately reusable.
+            server.shutdown()
             server.server_close()
+            server_thread.join(timeout=2.0)
+            if server_thread.is_alive():
+                raise RuntimeError("OAuth callback listener did not terminate")
+            paste_stop.set()
+            if paste_thread is not None:
+                paste_thread.join(timeout=2.0)
+                if paste_thread.is_alive():
+                    # A platform-provided stdin can be uninterruptibly blocked
+                    # in readline (notably pytest capture and Windows console
+                    # handles). It is daemon-only and the listener/port are
+                    # already fully reaped; do not mask the primary callback
+                    # result with a secondary stdin cleanup failure.
+                    logger.debug("OAuth paste callback reader remained blocked")
+            leaked_reserved = _reserved_sockets.pop(port, None)
+            if leaked_reserved is not None:
+                leaked_reserved.close()
 
         if result["error"] == _USER_SKIPPED_SENTINEL:
             raise OAuthNonInteractiveError("user_skipped")
@@ -944,7 +973,9 @@ def _make_callback_waiter(port: int, timeout: float = 300.0):
     return _wait
 
 
-def _paste_callback_reader(result: dict) -> None:
+def _paste_callback_reader(
+    result: dict, stop_event: threading.Event | None = None
+) -> None:
     """Read one line from stdin, parse it as an OAuth redirect, write to result.
 
     Accepts any of:
@@ -960,7 +991,35 @@ def _paste_callback_reader(result: dict) -> None:
     fallback alongside the HTTP listener, which remains the primary path.
     """
     try:
-        line = sys.stdin.readline()
+        if stop_event is None:
+            line = sys.stdin.readline().strip()
+        elif os.name == "nt":
+            try:
+                stdin_fd = sys.stdin.fileno()
+            except (AttributeError, OSError, ValueError):
+                stdin_fd = None
+            if not isinstance(stdin_fd, int):
+                line = sys.stdin.readline().strip()
+            else:
+                import msvcrt
+
+                line = ""
+                while not stop_event.is_set():
+                    if msvcrt.kbhit():
+                        line = sys.stdin.readline().strip()
+                        break
+                    stop_event.wait(0.05)
+        else:
+            import select
+
+            line = ""
+            while not stop_event.is_set():
+                readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if readable:
+                    line = sys.stdin.readline().strip()
+                    break
+        if stop_event is not None and stop_event.is_set() and not line:
+            return
     except (KeyboardInterrupt, OSError, ValueError):
         return
     if not line:

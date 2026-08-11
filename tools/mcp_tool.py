@@ -120,6 +120,10 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
+
+class MCPAuthLegacyMTLSCompatibilityError(RuntimeError):
+    """Installed legacy MCP transport cannot receive configured client certs."""
+
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
 # interrupt a stalled SSL handshake, which froze the asyncio event loop and
@@ -3042,8 +3046,12 @@ class MCPServerTask:
                     config.get("oauth"),
                     {
                         "connect_timeout": connect_timeout,
+                        "read_timeout": 300.0,
                         "ssl_verify": ssl_verify,
                         "client_cert": client_cert,
+                        "follow_redirects": True,
+                        "headers": dict(headers),
+                        "strict_redirect_headers": _strict_cfg_headers,
                     },
                 )
             except Exception as exc:
@@ -3228,13 +3236,51 @@ class MCPServerTask:
                     "enforce the portable redirect-header boundary "
                     "(strict_redirect_headers). Upgrade the mcp package."
                 )
+            # The installed legacy factory owns its HTTPX client, but exposes
+            # the supported ``httpx_client_factory`` seam.  Route all TLS and
+            # auth settings through that seam instead of silently dropping a
+            # configured client certificate (or passing unsupported ``verify``
+            # kwargs to older signatures).
+            legacy_parameters = inspect.signature(streamablehttp_client).parameters
+            legacy_accepts_factory = "httpx_client_factory" in legacy_parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in legacy_parameters.values()
+            )
+            if not legacy_accepts_factory:
+                if client_cert is not None or ssl_verify is not True:
+                    raise MCPAuthLegacyMTLSCompatibilityError(
+                        "installed legacy MCP streamablehttp_client cannot configure "
+                        "requested TLS/mTLS settings"
+                    )
+                legacy_factory = None
+            else:
+                import httpx as _httpx_mod
+
+                def legacy_factory(headers=None, timeout=None, auth=None):
+                    kwargs: dict[str, Any] = {
+                        "follow_redirects": True,
+                        "verify": ssl_verify,
+                        "timeout": timeout
+                        if timeout is not None
+                        else _httpx_mod.Timeout(float(connect_timeout), read=300.0),
+                    }
+                    if headers is not None:
+                        kwargs["headers"] = headers
+                    if auth is not None:
+                        kwargs["auth"] = auth
+                    if client_cert is not None:
+                        kwargs["cert"] = client_cert
+                    return _httpx_mod.AsyncClient(**kwargs)
+
             _http_kwargs: dict = {
                 "headers": headers,
                 "timeout": float(connect_timeout),
-                "verify": ssl_verify,
+                "sse_read_timeout": 300.0,
             }
             if _oauth_auth is not None:
                 _http_kwargs["auth"] = _oauth_auth
+            if legacy_factory is not None:
+                _http_kwargs["httpx_client_factory"] = legacy_factory
             try:
                 async with streamablehttp_client(url, **_http_kwargs) as (
                     read_stream, write_stream, _get_session_id,
