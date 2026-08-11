@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover - non-Windows
 from datetime import datetime, timedelta
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Optional, Dict, List, Any, Set, Tuple, Union
+from typing import Optional, Dict, List, Any, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
 
@@ -728,11 +728,7 @@ def _recoverable_oneshot_run_at(
 
     try:
         run_at_dt = _ensure_aware(datetime.fromisoformat(run_at))
-    except Exception as e:
-        logger.warning(
-            "One-shot job has an unparseable run_at %r — treating as never "
-            "eligible to fire/recover: %s", run_at, e,
-        )
+    except Exception:
         return None
     if run_at_dt >= now - timedelta(seconds=ONESHOT_GRACE_SECONDS):
         return run_at
@@ -767,11 +763,8 @@ def _compute_grace_seconds(schedule: dict) -> int:
                 period_seconds = int((second - first).total_seconds())
                 grace = period_seconds // 2
                 return max(MIN_GRACE, min(grace, MAX_GRACE))
-            except Exception as e:
-                logger.debug(
-                    "Could not compute cron period from expr %r for grace "
-                    "window — falling back to MIN_GRACE: %s", expr, e,
-                )
+            except Exception:
+                pass
 
     return MIN_GRACE
 
@@ -891,21 +884,20 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     store = _current_cron_store()
     try:
         _atomic_write_epoch(store.cron_dir / "ticker_heartbeat")
-    except Exception as e:
-        logger.warning("Could not write ticker heartbeat marker: %s", e)
+    except Exception:
+        pass
     if success:
         try:
             _atomic_write_epoch(store.cron_dir / "ticker_last_success")
-        except Exception as e:
-            logger.warning("Could not write ticker last-success marker: %s", e)
+        except Exception:
+            pass
 
 
 def _epoch_file_age(path: Path) -> Optional[float]:
     try:
         raw = path.read_text(encoding="utf-8").strip()
         return max(0.0, time.time() - float(raw))
-    except Exception as e:
-        logger.debug("Could not read epoch marker %s: %s", path, e)
+    except Exception:
         return None
 
 
@@ -943,8 +935,8 @@ def record_catch_up_occurrence() -> None:
         except (OSError, ValueError):
             value = 0
         _atomic_write_counter(path, max(0, value) + 1)
-    except Exception as e:
-        logger.debug("Could not increment catch-up occurrence counter: %s", e)
+    except Exception:
+        pass
 
 
 def record_ticker_error(message: str) -> None:
@@ -978,12 +970,8 @@ def record_ticker_error(message: str) -> None:
             except OSError:
                 pass
             raise
-    except Exception as e:
-        logger.warning(
-            "Could not persist ticker last-error message (original tick "
-            "failure was: %r) — the root cause of that failure will not be "
-            "visible to 'hermes cron status': %s", message, e,
-        )
+    except Exception:
+        pass
 
 
 def get_catch_up_occurrence_count() -> int:
@@ -991,8 +979,7 @@ def get_catch_up_occurrence_count() -> int:
     path = _current_cron_store().cron_dir / "catch_up_occurrences"
     try:
         return max(0, int(path.read_text(encoding="utf-8").strip()))
-    except (OSError, ValueError) as e:
-        logger.debug("Could not read catch-up occurrence counter %s: %s", path, e)
+    except (OSError, ValueError):
         return 0
 
 
@@ -1001,17 +988,8 @@ def clear_ticker_error() -> None:
     store = _current_cron_store()
     try:
         (store.cron_dir / "ticker_last_error").unlink()
-    except FileNotFoundError:
-        # No marker to clear is the common/expected case -- most ticks never
-        # record an error in the first place, so this isn't a failure and
-        # must stay silent. Warning here was firing on essentially every
-        # successful tick, drowning out real signal in the gateway logs.
+    except OSError:
         pass
-    except OSError as e:
-        logger.warning(
-            "Could not clear stale ticker_last_error marker — a resolved "
-            "failure may keep being reported by 'hermes cron status': %s", e,
-        )
 
 
 def get_ticker_last_error() -> Optional[str]:
@@ -1019,8 +997,7 @@ def get_ticker_last_error() -> Optional[str]:
     store = _current_cron_store()
     try:
         raw = (store.cron_dir / "ticker_last_error").read_text(encoding="utf-8")
-    except Exception as e:
-        logger.debug("Could not read ticker_last_error marker: %s", e)
+    except Exception:
         return None
     lines = raw.splitlines()
     if len(lines) < 2:
@@ -1033,33 +1010,43 @@ def get_ticker_last_error() -> Optional[str]:
 # Job CRUD Operations
 # =============================================================================
 
+def _parse_jobs_file(jobs_file: Path) -> Tuple[Any, bool]:
+    """Tolerantly parse jobs.json; shared by load_jobs and the save-path peek.
+
+    Returns ``(data, used_strict_fallback)``. utf-8-sig absorbs a Windows
+    BOM; a strict parse failure is retried with ``strict=False`` to survive
+    bare control characters in string values. IO errors from the open and
+    parse errors from the fallback propagate to the caller, which decides
+    between repair (load_jobs) and bail-out (peek).
+    """
+    with open(jobs_file, "r", encoding="utf-8-sig") as f:
+        raw = f.read()
+    try:
+        return json.loads(raw), False
+    except json.JSONDecodeError:
+        return json.loads(raw, strict=False), True
+
+
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
+    # Stamp BEFORE reading (fail-safe direction — see _record_load_stamp):
+    # a sibling write racing this load leaves the stamp older than disk, so
+    # the save-path merge runs instead of being wrongly skipped.
+    pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
+        _record_load_stamp(None)
         return []
 
-    _strict_retry = False  # track whether we used the strict=False fallback
-
     try:
-        # utf-8-sig: Windows Notepad / PowerShell 5.1 Set-Content -Encoding UTF8
-        # write a leading BOM; json.load under plain utf-8 raises
-        # JSONDecodeError("Unexpected UTF-8 BOM") and takes down cron.
-        with open(jobs_file, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
-    except json.JSONDecodeError:
-        # Retry with strict=False to handle bare control chars in string values
-        _strict_retry = True
-        try:
-            with open(jobs_file, 'r', encoding='utf-8-sig') as f:
-                data = json.loads(f.read(), strict=False)
-        except Exception as e:
-            logger.error("Failed to auto-repair jobs.json: %s", e)
-            raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
+        data, _strict_retry = _parse_jobs_file(jobs_file)
     except IOError as e:
         logger.error("IOError reading jobs.json: %s", e)
         raise RuntimeError(f"Failed to read cron database: {e}") from e
+    except Exception as e:
+        logger.error("Failed to auto-repair jobs.json: %s", e)
+        raise RuntimeError(f"Cron database corrupted and unrepairable: {e}") from e
 
     # Validate the top-level JSON shape: accept a dict (expected) or a bare
     # list (auto-repair). Anything else (str/number/null) is corruption that
@@ -1071,6 +1058,7 @@ def load_jobs() -> List[Dict[str, Any]]:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+        _record_load_stamp(pre_read_stamp)
         return jobs
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
@@ -1078,6 +1066,7 @@ def load_jobs() -> List[Dict[str, Any]]:
         if data:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
+        _record_load_stamp(pre_read_stamp)
         return data
 
     raise RuntimeError(
@@ -1085,8 +1074,142 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
-def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage. Caller must hold _jobs_lock()."""
+def _peek_jobs_unlocked() -> Optional[List[Dict[str, Any]]]:
+    """Best-effort read of on-disk jobs without repair side-effects.
+
+    Caller must hold ``_jobs_lock()``. Returns ``[]`` when the file is
+    missing, ``None`` when the payload is unreadable/corrupt (caller should
+    not attempt a shrink-merge against an unknown baseline). Never calls
+    ``save_jobs`` — the repair-free property is what keeps the save path
+    re-entrancy-safe (a repairing read here would recurse through
+    ``_save_jobs_unlocked``).
+    """
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return []
+    try:
+        data, _ = _parse_jobs_file(jobs_file)
+    except Exception:
+        return None
+    if isinstance(data, dict):
+        jobs = data.get("jobs", [])
+        return jobs if isinstance(jobs, list) else None
+    if isinstance(data, list):
+        return data
+    return None
+
+
+def _jobs_file_stamp(jobs_file: Path) -> Optional[Tuple[int, int, int]]:
+    """Cheap change-detection stamp for jobs.json: ``(mtime_ns, size, ino)``.
+
+    ``None`` means the file is missing/unstatable. Used as a fast-path gate
+    in front of the shrink-merge so the healthy no-race save costs one
+    ``stat()`` instead of a full read+parse (the ``advance_next_runs``
+    batching exists because this path is hot — see its docstring).
+    ``st_ino`` is included because every legitimate writer goes through
+    mkstemp+rename (new inode), so even a same-size write inside one mtime
+    quantum on a coarse-clock filesystem (ext4 jiffies, network mounts)
+    cannot false-match.
+    """
+    try:
+        st = jobs_file.stat()
+        return (st.st_mtime_ns, st.st_size, st.st_ino)
+    except OSError:
+        return None
+
+
+def _record_load_stamp(stamp: Optional[Tuple[int, int, int]]) -> None:
+    """Remember jobs.json's stamp for the enclosing _jobs_lock() section.
+
+    No-op outside a critical section. Lets the save path skip the
+    shrink-merge parse when the file provably hasn't changed since this
+    section loaded it (#80703's fast-path). The caller must capture the
+    stamp BEFORE reading the file: a sibling landing mid-read then leaves
+    the recorded stamp OLDER than disk — a mismatch, so the merge runs
+    (fail-safe direction). Stamping after the read would let that sibling's
+    write be certified as "seen" without being in the loaded payload,
+    wrongly suppressing the recovery.
+    """
+    if not getattr(_jobs_lock_state, "depth", 0):
+        return
+    _jobs_lock_state.load_stamp = stamp
+
+
+def _merge_unexpected_disk_jobs(
+    jobs: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Collection[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return *jobs* plus any on-disk jobs missing from the save payload (#80624).
+
+    Under ``_jobs_lock()``'s degraded flock-timeout path (#60703), two
+    processes can both believe they own the store. A writer that loaded an
+    older/smaller snapshot then calls ``save_jobs`` and would otherwise
+    clobber concurrent creates (the filed ``no_agent`` watchdog pattern:
+    CLI/tool create succeeds, then a gateway tick/remove rewrites
+    ``jobs.json`` empty or without the new id).
+
+    Intentional deletes pass ``removed_ids``. Any other id present on disk
+    but absent from *jobs* is treated as a concurrent create and merged
+    back before the atomic write. The caller's list is never mutated — a
+    new list is returned when anything was recovered.
+
+    Fast path: when the enclosing critical section recorded a load stamp
+    and the file's ``(mtime_ns, size)`` still matches, nothing can have
+    changed underneath us, so the read+parse is skipped entirely — one
+    ``stat()`` on the healthy no-race save.
+    """
+    stamp = getattr(_jobs_lock_state, "load_stamp", None)
+    if stamp is not None and _jobs_file_stamp(_current_cron_store().jobs_file) == stamp:
+        return jobs
+
+    disk_jobs = _peek_jobs_unlocked()
+    if disk_jobs is None:
+        return jobs
+
+    intended_remove = {str(i) for i in (removed_ids or ()) if i}
+    new_ids: Set[str] = set()
+    for job in jobs:
+        if isinstance(job, dict) and job.get("id"):
+            new_ids.add(str(job["id"]))
+
+    recovered: List[Dict[str, Any]] = []
+    for disk_job in disk_jobs:
+        if not isinstance(disk_job, dict):
+            continue
+        disk_id = disk_job.get("id")
+        if not disk_id:
+            continue
+        disk_id = str(disk_id)
+        if disk_id in new_ids or disk_id in intended_remove:
+            continue
+        recovered.append(disk_job)
+        new_ids.add(disk_id)
+
+    if not recovered:
+        return jobs
+    logger.warning(
+        "Preserved %d cron job(s) present on disk but missing from the "
+        "in-memory save payload (concurrent create under degraded lock "
+        "or stale writer) (#80624): %s",
+        len(recovered),
+        [j.get("id") for j in recovered],
+    )
+    return jobs + recovered
+
+
+def _save_jobs_unlocked(
+    jobs: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Collection[str]] = None,
+    replace: bool = False,
+):
+    """Save all jobs to storage. Caller must hold _jobs_lock().
+
+    ``removed_ids`` lists job ids this mutation intentionally deleted.
+    ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
+    that mean to rewrite the store wholesale).
+    """
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1102,27 +1225,126 @@ def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
             _stat_before = os.stat(jobs_file.parent)
         except OSError:
             _stat_before = None
-    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
+
+    # Shrink-merge + rewrite loop (#80624): under the degraded flock-timeout
+    # path another process can create a job between our load and our write.
+    # Merge unexpected disk ids into the payload, stage the write, then
+    # re-peek; if new ids appeared, merge again and restage before replace.
+    # The merge itself fast-paths to a single stat() when the enclosing
+    # section's load stamp still matches (see _merge_unexpected_disk_jobs).
+    tmp_path = None
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
+        for _attempt in range(5):
+            if not replace:
+                jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
+                        f,
+                        indent=2,
+                        ensure_ascii=False,
+                    )
+                    f.flush()
+                    os.fsync(f.fileno())
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                tmp_path = None
+                raise
+
+            if not replace:
+                # Verify-after-stage: a sibling landing while we serialized
+                # the payload must trigger another merge round. Same stamp
+                # fast path as the merge — an unchanged stamp proves nothing
+                # was written, so the full parse is skipped.
+                _stamp = getattr(_jobs_lock_state, "load_stamp", None)
+                _unchanged = (
+                    _stamp is not None and _jobs_file_stamp(jobs_file) == _stamp
+                )
+                disk_jobs = None if _unchanged else _peek_jobs_unlocked()
+                if disk_jobs is not None:
+                    payload_ids = {
+                        str(j["id"])
+                        for j in jobs
+                        if isinstance(j, dict) and j.get("id")
+                    }
+                    intended = {str(i) for i in (removed_ids or ()) if i}
+                    if any(
+                        isinstance(dj, dict)
+                        and dj.get("id")
+                        and str(dj["id"]) not in payload_ids
+                        and str(dj["id"]) not in intended
+                        for dj in disk_jobs
+                    ):
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                        tmp_path = None
+                        continue
+
+            atomic_replace(tmp_path, jobs_file)
+            tmp_path = None
+            _secure_file(jobs_file)
+            _preserve_file_ownership(jobs_file, _stat_before)
+            # Invalidate (never refresh) the stamp after writing: the stamp
+            # certifies "this section's loaded payload still matches disk",
+            # which stops being provable the moment anyone writes. A refresh
+            # here would let a nested save (e.g. create_job inside a broader
+            # section) certify disk against an OUTER caller's stale payload
+            # and deterministically clobber the nested create; it also races
+            # a degraded sibling landing between replace and stat. Later
+            # saves in this section simply take the full merge (fail-safe).
+            _record_load_stamp(None)
+            return
+
+        # Exhausted retries — last merge + write without another re-peek.
+        if not replace:
+            jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(
+                {"jobs": jobs, "updated_at": _hermes_now().isoformat()},
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
             f.flush()
             os.fsync(f.fileno())
         atomic_replace(tmp_path, jobs_file)
+        tmp_path = None
         _secure_file(jobs_file)
         _preserve_file_ownership(jobs_file, _stat_before)
     except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         raise
 
 
-def save_jobs(jobs: List[Dict[str, Any]]):
-    """Save all jobs to storage."""
+def save_jobs(
+    jobs: List[Dict[str, Any]],
+    *,
+    removed_ids: Optional[Collection[str]] = None,
+    replace: bool = False,
+):
+    """Save all jobs to storage.
+
+    See ``_save_jobs_unlocked`` for ``removed_ids`` / ``replace`` semantics
+    (shrink-merge guard against concurrent-create clobber, #80624).
+    """
     with _jobs_lock():
-        _save_jobs_unlocked(jobs)
+        _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 
 
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
@@ -1180,7 +1402,7 @@ def _resolve_default_model_snapshot() -> Optional[str]:
         try:
             from hermes_cli import managed_scope
             cfg = managed_scope.apply_managed_overlay(cfg)
-        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
+        except Exception:
             pass
         cfg = _expand_env_vars(cfg)
         # Mirror run_job's precedence: the explicit cron-fleet default
@@ -1720,21 +1942,6 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
-    try:
-        from hermes_logging import emit_event
-
-        emit_event(
-            "cron.outcome", subsystem="cron",
-            outcome="succeeded" if success else "failed",
-            action_id=job_id, detail=error or delivery_error or "",
-        )
-    except Exception as e:
-        logger.warning(
-            "Could not emit cron.outcome event for job %s (outcome=%s) — "
-            "this run's result will not appear in the audit trail: %s",
-            job_id, "succeeded" if success else "failed", e,
-        )
-
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
@@ -2049,11 +2256,8 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                     _age = (now - claimed_at).total_seconds()
                     if 0 <= _age < claim_ttl_seconds:
                         return False  # someone holds a fresh claim
-                except Exception as e:
-                    logger.debug(
-                        "Malformed fire_claim on job %s (%r) — overwriting: %s",
-                        job_id, existing, e,
-                    )  # malformed claim → overwrite
+                except Exception:
+                    pass  # malformed claim → overwrite
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
@@ -2214,11 +2418,8 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     _age = (now - claimed_at).total_seconds()
                     if 0 <= _age < _run_claim_ttl:
                         continue  # a fresh claim is held by an in-flight run
-                except (KeyError, ValueError, TypeError) as e:
-                    logger.debug(
-                        "Malformed run_claim on job %s (%r) — falling through "
-                        "to (re)claim: %s", job.get("id"), existing_claim, e,
-                    )
+                except (KeyError, ValueError, TypeError):
+                    pass  # malformed claim → fall through and (re)claim
 
             next_run = job.get("next_run_at")
             if not next_run:
