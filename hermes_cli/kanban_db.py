@@ -4140,6 +4140,26 @@ class Event:
     run_id: Optional[int] = None
 
 
+@dataclass(frozen=True)
+class ReworkDirective:
+    """Durable, first-class instructions for the next product worker."""
+
+    id: int
+    task_id: str
+    origin_kind: str
+    origin_run_id: Optional[int]
+    origin_intent_key: Optional[str]
+    origin_phase: str
+    target_phase: str
+    rejected_branch: Optional[str]
+    rejected_sha: Optional[str]
+    epic_tip_sha: Optional[str]
+    findings: tuple[str, ...]
+    status: str
+    created_at: int
+    resolved_by_run_id: Optional[int]
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -4398,6 +4418,23 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+CREATE TABLE IF NOT EXISTS product_rework_directives (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    origin_kind         TEXT NOT NULL,
+    origin_run_id       INTEGER,
+    origin_intent_key   TEXT,
+    origin_phase        TEXT NOT NULL,
+    target_phase        TEXT NOT NULL,
+    rejected_branch     TEXT,
+    rejected_sha        TEXT,
+    epic_tip_sha        TEXT,
+    findings_json       TEXT NOT NULL,
+    status              TEXT NOT NULL CHECK (status IN ('active', 'resolved', 'superseded')),
+    created_at          INTEGER NOT NULL,
+    resolved_by_run_id  INTEGER
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -4443,6 +4480,11 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_product_rework_directives_task
+    ON product_rework_directives(task_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_product_rework_directives_active
+    ON product_rework_directives(task_id)
+    WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 CREATE INDEX IF NOT EXISTS idx_qualification_intake_status
@@ -8907,6 +8949,171 @@ def _append_event(
     return int(cursor.lastrowid)
 
 
+_REWORK_DIRECTIVE_ORIGIN_KINDS = frozenset(
+    {"test", "review", "integration", "refresh"}
+)
+_REWORK_DIRECTIVE_TARGET_PHASES = frozenset({"architecture", "development"})
+_FULL_REWORK_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def _rework_directive_from_row(row: sqlite3.Row) -> ReworkDirective:
+    try:
+        raw_findings = json.loads(row["findings_json"])
+    except (TypeError, ValueError):
+        raw_findings = []
+    findings = (
+        tuple(item if isinstance(item, str) else str(item) for item in raw_findings)
+        if isinstance(raw_findings, list)
+        else ()
+    )
+    return ReworkDirective(
+        id=int(row["id"]),
+        task_id=row["task_id"],
+        origin_kind=row["origin_kind"],
+        origin_run_id=(
+            int(row["origin_run_id"])
+            if row["origin_run_id"] is not None
+            else None
+        ),
+        origin_intent_key=row["origin_intent_key"],
+        origin_phase=row["origin_phase"],
+        target_phase=row["target_phase"],
+        rejected_branch=row["rejected_branch"],
+        rejected_sha=row["rejected_sha"],
+        epic_tip_sha=row["epic_tip_sha"],
+        findings=findings,
+        status=row["status"],
+        created_at=int(row["created_at"]),
+        resolved_by_run_id=(
+            int(row["resolved_by_run_id"])
+            if row["resolved_by_run_id"] is not None
+            else None
+        ),
+    )
+
+
+def create_rework_directive(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    origin_kind: str,
+    origin_run_id: Optional[int] = None,
+    origin_intent_key: Optional[str] = None,
+    origin_phase: str,
+    target_phase: str,
+    rejected_branch: Optional[str] = None,
+    rejected_sha: Optional[str] = None,
+    epic_tip_sha: Optional[str] = None,
+    findings: Iterable[str],
+) -> ReworkDirective:
+    """Append a rework directive, superseding the previous active one."""
+    origin_kind = str(origin_kind or "").strip()
+    origin_phase = str(origin_phase or "").strip()
+    target_phase = str(target_phase or "").strip()
+    if origin_kind not in _REWORK_DIRECTIVE_ORIGIN_KINDS:
+        raise ValueError(f"invalid rework directive origin kind: {origin_kind}")
+    if not origin_phase:
+        raise ValueError("rework directive origin phase is required")
+    if target_phase not in _REWORK_DIRECTIVE_TARGET_PHASES:
+        raise ValueError(f"invalid rework directive target phase: {target_phase}")
+    normalized_findings = tuple(str(item).strip() for item in findings)
+    if not normalized_findings or any(not item for item in normalized_findings):
+        raise ValueError("rework directive findings must be non-empty strings")
+
+    def _clean_optional(value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return None
+        cleaned = str(value).strip()
+        return cleaned or None
+
+    now = int(time.time())
+    with write_txn(conn):
+        if not conn.execute(
+            "SELECT 1 FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone():
+            raise ValueError(f"unknown task {task_id}")
+        conn.execute(
+            "UPDATE product_rework_directives SET status = 'superseded' "
+            "WHERE task_id = ? AND status = 'active'",
+            (task_id,),
+        )
+        cursor = conn.execute(
+            "INSERT INTO product_rework_directives ("
+            "task_id, origin_kind, origin_run_id, origin_intent_key, "
+            "origin_phase, target_phase, rejected_branch, rejected_sha, "
+            "epic_tip_sha, findings_json, status, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+            (
+                task_id,
+                origin_kind,
+                int(origin_run_id) if origin_run_id is not None else None,
+                _clean_optional(origin_intent_key),
+                origin_phase,
+                target_phase,
+                _clean_optional(rejected_branch),
+                _clean_optional(rejected_sha),
+                _clean_optional(epic_tip_sha),
+                json.dumps(list(normalized_findings), ensure_ascii=False),
+                now,
+            ),
+        )
+        directive_id = cursor.lastrowid
+        if directive_id is None:
+            raise RuntimeError("rework directive insert did not return an id")
+        row = conn.execute(
+            "SELECT * FROM product_rework_directives WHERE id = ?",
+            (int(directive_id),),
+        ).fetchone()
+        assert row is not None
+        return _rework_directive_from_row(row)
+
+
+def active_rework_directive(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[ReworkDirective]:
+    """Return the task's one active directive, if it has one."""
+    row = conn.execute(
+        "SELECT * FROM product_rework_directives "
+        "WHERE task_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return _rework_directive_from_row(row) if row is not None else None
+
+
+def resolve_rework_directive(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    new_sha: Optional[str],
+    resolved_by_run_id: Optional[int],
+) -> bool:
+    """Resolve an active directive only after a different Development SHA."""
+    candidate_sha = str(new_sha or "").strip()
+    if not _FULL_REWORK_SHA_RE.fullmatch(candidate_sha):
+        return False
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT id, rejected_sha FROM product_rework_directives "
+            "WHERE task_id = ? AND status = 'active' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        rejected_sha = str(row["rejected_sha"] or "").strip()
+        if candidate_sha == rejected_sha:
+            return False
+        updated = conn.execute(
+            "UPDATE product_rework_directives "
+            "SET status = 'resolved', resolved_by_run_id = ? "
+            "WHERE id = ? AND status = 'active'",
+            (
+                int(resolved_by_run_id) if resolved_by_run_id is not None else None,
+                int(row["id"]),
+            ),
+        )
+        return updated.rowcount == 1
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -10185,7 +10392,7 @@ def _route_product_rework_if_requested(
     with authorized_governance_write(), write_txn(conn):
         row = conn.execute(
             "SELECT title, assignee, status, current_step_key, "
-            "current_run_id, rework_count FROM tasks WHERE id = ?",
+            "current_run_id, rework_count, branch_name FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if row is None:
@@ -10219,6 +10426,47 @@ def _route_product_rework_if_requested(
             or row["current_run_id"] != int(expected_run_id)
         ):
             return False
+
+        run_metadata: dict = {}
+        if row["current_run_id"] is not None:
+            run_row = conn.execute(
+                "SELECT metadata FROM task_runs WHERE id = ?",
+                (int(row["current_run_id"]),),
+            ).fetchone()
+            if run_row is not None and run_row["metadata"]:
+                try:
+                    parsed_run_metadata = json.loads(run_row["metadata"])
+                except (TypeError, ValueError):
+                    parsed_run_metadata = None
+                if isinstance(parsed_run_metadata, dict):
+                    run_metadata = parsed_run_metadata
+
+        def _directive_value(*keys: str) -> Optional[str]:
+            for source in (run_metadata, metadata if isinstance(metadata, dict) else {}):
+                for key in keys:
+                    value = source.get(key)
+                    if value is not None and str(value).strip():
+                        return str(value).strip()
+            return None
+
+        rejected_branch = _directive_value(
+            f"{current_step}_branch", "rejected_branch", "branch"
+        ) or row["branch_name"]
+        rejected_sha = _directive_value(
+            f"{current_step}_head_sha",
+            "rejected_sha",
+            "head_sha",
+            "source_sha",
+        )
+        epic_tip_sha = _directive_value("epic_tip_sha", "epic_head_sha")
+        origin_intent_key = _directive_value(
+            "origin_intent_key", "integration_intent_key", "intent_key"
+        )
+        origin_kind = (
+            current_step
+            if current_step in _REWORK_DIRECTIVE_ORIGIN_KINDS
+            else "refresh"
+        )
 
         observed_count = int(row["rework_count"] or 0)
         next_count = observed_count + 1
@@ -10265,6 +10513,19 @@ def _route_product_rework_if_requested(
         )
         if expected_run_id is not None and run_id is None:
             raise RuntimeError("rework run ownership changed")
+        directive = create_rework_directive(
+            conn,
+            task_id,
+            origin_kind=origin_kind,
+            origin_run_id=run_id,
+            origin_intent_key=origin_intent_key,
+            origin_phase=current_step,
+            target_phase=str(target_step),
+            rejected_branch=rejected_branch,
+            rejected_sha=rejected_sha,
+            epic_tip_sha=epic_tip_sha,
+            findings=findings,
+        )
         _append_event(
             conn,
             task_id,
@@ -10276,6 +10537,7 @@ def _route_product_rework_if_requested(
                 "findings": findings,
                 "rework_count": next_count,
                 "max_rework_cycles": max_cycles,
+                "directive_id": directive.id,
             },
             run_id=run_id,
         )
@@ -15306,6 +15568,13 @@ def handoff(
             )
             if expected_run_id is not None and run_id is None:
                 raise RuntimeError("handoff run ownership changed")
+            if str(step or "") == "development" and sha is not None:
+                resolve_rework_directive(
+                    conn,
+                    task_id,
+                    new_sha=sha,
+                    resolved_by_run_id=run_id,
+                )
             _append_event(
                 conn,
                 task_id,
@@ -18955,17 +19224,18 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     Order:
       1. Task title (mandatory).
       2. Task body (optional opening post, capped at 8 KB).
-      3. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
+      3. The active product rework directive, when present.
+      4. Prior attempts on THIS task (most recent ``_CTX_MAX_PRIOR_ATTEMPTS``
          shown; older attempts collapsed into a one-line summary).
          Each attempt's ``summary`` / ``error`` / ``metadata`` capped at
          ``_CTX_MAX_FIELD_BYTES`` each.
-      4. Structured handoff results of every done parent task. Prefers
+      5. Structured handoff results of every done parent task. Prefers
          ``run.summary`` / ``run.metadata`` when the parent was executed
          via a run; falls back to ``task.result`` for older data. Same
          per-field cap.
-      5. Cross-task role history for the assignee (most recent 5
+      6. Cross-task role history for the assignee (most recent 5
          completed runs on other tasks).
-      6. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
+      7. Comment thread (most recent ``_CTX_MAX_COMMENTS`` shown, older
          collapsed).
 
     All caps exist so worker prompts stay bounded even on pathological
@@ -19085,6 +19355,37 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             "or escalate; diagnosis, reason, fault_domain, and "
             "the complete expected snapshot are required."
         )
+        lines.append("")
+
+    directive = active_rework_directive(conn, task_id)
+    if directive is not None:
+        lines.append("## Required rework directive")
+        lines.append(
+            "_This is persisted workflow authority. Complete the target phase "
+            "before treating the directive as resolved._"
+        )
+        lines.append(
+            f"Origin: {directive.origin_kind} / phase `{directive.origin_phase}`"
+            + (
+                f" / run `{directive.origin_run_id}`"
+                if directive.origin_run_id is not None
+                else ""
+            )
+        )
+        if directive.origin_intent_key:
+            lines.append(f"Origin intent: `{_cap(directive.origin_intent_key)}`")
+        lines.append(f"Target phase: `{directive.target_phase}`")
+        if directive.rejected_branch:
+            lines.append(
+                f"Rejected branch: `{_cap(directive.rejected_branch)}`"
+            )
+        if directive.rejected_sha:
+            lines.append(f"Rejected SHA: `{directive.rejected_sha}`")
+        if directive.epic_tip_sha:
+            lines.append(f"Epic tip SHA: `{directive.epic_tip_sha}`")
+        lines.append("Findings:")
+        for finding in directive.findings:
+            lines.append(f"- {_cap(finding)}")
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

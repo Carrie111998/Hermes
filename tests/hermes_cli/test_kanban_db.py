@@ -103,7 +103,13 @@ def test_init_creates_expected_tables(kanban_home):
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         ).fetchall()
     names = {r["name"] for r in rows}
-    assert {"tasks", "task_links", "task_comments", "task_events"} <= names
+    assert {
+        "tasks",
+        "task_links",
+        "task_comments",
+        "task_events",
+        "product_rework_directives",
+    } <= names
 
 
 
@@ -477,6 +483,175 @@ def test_product_rejection_routes_backward(
         "custom-developer" if target == "development" else "custom-architect"
     )
     assert any(event.kind == "rework_requested" for event in events)
+
+
+def test_rework_directive_is_append_only_with_one_active_row(kanban_home):
+    board = "rework-directive-append-only"
+    _v2_product_board(board)
+    rejected_sha = "a" * 40
+    replacement_sha = "b" * 40
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: durable directive",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        first = kb.create_rework_directive(
+            conn,
+            tid,
+            origin_kind="test",
+            origin_run_id=11,
+            origin_intent_key="intent-1",
+            origin_phase="test",
+            target_phase="development",
+            rejected_branch="story/durable-directive",
+            rejected_sha=rejected_sha,
+            epic_tip_sha="c" * 40,
+            findings=["first finding"],
+        )
+        assert first.status == "active"
+        assert kb.active_rework_directive(conn, tid) == first
+
+        second = kb.create_rework_directive(
+            conn,
+            tid,
+            origin_kind="review",
+            origin_run_id=12,
+            origin_intent_key="intent-2",
+            origin_phase="review",
+            target_phase="development",
+            rejected_branch="story/durable-directive",
+            rejected_sha=replacement_sha,
+            epic_tip_sha="d" * 40,
+            findings=["replacement finding"],
+        )
+        rows = conn.execute(
+            "SELECT status FROM product_rework_directives "
+            "WHERE task_id = ? ORDER BY id",
+            (tid,),
+        ).fetchall()
+
+    assert second.status == "active"
+    assert [row["status"] for row in rows] == ["superseded", "active"]
+
+
+def test_rework_directive_routes_with_exact_sha_and_precedes_attempts(
+    kanban_home,
+):
+    board = "rework-directive-context"
+    _v2_product_board(board)
+    rejected_sha = "e" * 40
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: visible rework",
+            assignee="tester",
+            workflow_template_id="product",
+            current_step_key="test",
+            board=board,
+        )
+        claimed = kb.claim_task(conn, tid, board=board, claimer="tester")
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="Test rejected the candidate",
+            metadata={
+                "workflow_outcome": {
+                    "verdict": "changes_requested",
+                    "target_step": "development",
+                    "findings": ["the candidate is incomplete"],
+                },
+                "rejected_branch": "story/visible-rework",
+                "rejected_sha": rejected_sha,
+                "epic_tip_sha": "f" * 40,
+            },
+            expected_run_id=claimed.current_run_id,
+            board=board,
+        )
+        directive = kb.active_rework_directive(conn, tid)
+        context = kb.build_worker_context(conn, tid)
+
+    assert directive is not None
+    assert directive.origin_phase == "test"
+    assert directive.target_phase == "development"
+    assert directive.rejected_branch == "story/visible-rework"
+    assert directive.rejected_sha == rejected_sha
+    assert directive.findings == ("the candidate is incomplete",)
+    assert "## Required rework directive" in context
+    assert rejected_sha in context
+    assert context.index("## Required rework directive") < context.index(
+        "## Prior attempts on this task"
+    )
+
+
+def test_rework_directive_resolves_only_after_new_development_sha(
+    kanban_home, tmp_path
+):
+    board = "rework-directive-resolution"
+    _v2_product_board(board)
+    repo = tmp_path / "directive-repo"
+    _init_git_repo(repo)
+    rejected_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    with kb.connect(board=board) as conn:
+        tid = kb.create_task(
+            conn,
+            title="Story: resolve rework",
+            assignee="developer",
+            workflow_template_id="product",
+            current_step_key="development",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+            branch_name="main",
+            board=board,
+        )
+        kb.create_rework_directive(
+            conn,
+            tid,
+            origin_kind="test",
+            origin_run_id=21,
+            origin_phase="test",
+            target_phase="development",
+            rejected_branch="story/resolve-rework",
+            rejected_sha=rejected_sha,
+            findings=["fix the implementation"],
+        )
+        assert not kb.resolve_rework_directive(
+            conn,
+            tid,
+            new_sha=rejected_sha,
+            resolved_by_run_id=22,
+        )
+        assert kb.active_rework_directive(conn, tid) is not None
+
+        claimed = kb.claim_task(conn, tid, board=board, claimer="developer")
+        assert claimed is not None and claimed.current_run_id is not None
+        (repo / "fixed.txt").write_text("fixed\n", encoding="utf-8")
+        assert kb.handoff(
+            conn,
+            tid,
+            board=board,
+            summary="Implemented the requested fix",
+            metadata={"ai_provenance": {"writer": {"agent": "hermes"}}},
+            expected_run_id=claimed.current_run_id,
+            expected_phase="development",
+        )
+        resolved = conn.execute(
+            "SELECT status, resolved_by_run_id FROM product_rework_directives "
+            "WHERE task_id = ?",
+            (tid,),
+        ).fetchone()
+
+    assert resolved["status"] == "resolved"
+    assert resolved["resolved_by_run_id"] == claimed.current_run_id
 
 
 @pytest.mark.parametrize(

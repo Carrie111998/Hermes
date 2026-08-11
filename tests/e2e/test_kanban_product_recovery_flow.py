@@ -274,9 +274,26 @@ def test_governed_product_story_recovers_through_release_and_done(
                 "ai_provenance": {
                     "tester": {"agent": "hermes", "result": "failed"}
                 },
+                "rejected_branch": branch,
+                "rejected_sha": first_development_sha,
+                "epic_tip_sha": rollback_target,
             },
             expected_run_id=failed_test.current_run_id,
             board=board,
+        )
+
+        directive = kb.active_rework_directive(conn, task_id)
+        assert directive is not None
+        assert directive.origin_phase == "test"
+        assert directive.target_phase == "development"
+        assert directive.rejected_branch == branch
+        assert directive.rejected_sha == first_development_sha
+        assert directive.epic_tip_sha == rollback_target
+        recovery_context = kb.build_worker_context(conn, task_id)
+        assert "## Required rework directive" in recovery_context
+        assert first_development_sha in recovery_context
+        assert recovery_context.index("## Required rework directive") < recovery_context.index(
+            "## Prior attempts on this task"
         )
 
         development_two = _claim(conn, task_id, board=board, claimer="developer-two")
@@ -301,6 +318,7 @@ def test_governed_product_story_recovers_through_release_and_done(
         ]
         second_development_sha = development_handoffs[-1].payload["sha"]
         assert second_development_sha != first_development_sha
+        assert kb.active_rework_directive(conn, task_id) is None
 
         test_result = subprocess.run(
             [str(story_worktree / "scripts" / "run_tests.sh")],
@@ -318,8 +336,11 @@ def test_governed_product_story_recovers_through_release_and_done(
             metadata={
                 "workflow_outcome": {"verdict": "passed"},
                 "ai_provenance": {
+                    "writer": {"agent": "claude-code"},
                     "tester": {"agent": "hermes", "result": "passed"}
                 },
+                "test_branch": branch,
+                "test_head_sha": second_development_sha,
                 "tests_run": ["scripts/run_tests.sh"],
             },
             expected_run_id=passed_test.current_run_id,
@@ -345,6 +366,9 @@ def test_governed_product_story_recovers_through_release_and_done(
                         "reviewed_commit": second_development_sha,
                     },
                 },
+                "review_branch": branch,
+                "review_base_sha": rollback_target,
+                "review_head_sha": second_development_sha,
             },
             expected_run_id=reviewer.current_run_id,
             board=board,
@@ -402,6 +426,15 @@ def test_governed_product_story_recovers_through_release_and_done(
 
     rework = [event for event in events if event.kind == "rework_requested"]
     assert len(rework) == 1 and rework[0].payload["rework_count"] == 1
+    directive_rows = conn.execute(
+        "SELECT status, rejected_sha, resolved_by_run_id "
+        "FROM product_rework_directives WHERE task_id = ?",
+        (task_id,),
+    ).fetchall()
+    assert len(directive_rows) == 1
+    assert directive_rows[0]["status"] == "resolved"
+    assert directive_rows[0]["rejected_sha"] == first_development_sha
+    assert directive_rows[0]["resolved_by_run_id"] == development_two.current_run_id
     integration = next(event for event in events if event.kind == "story_merged_to_main")
     policy = next(event for event in events if event.kind == "deployment_policy_evaluated")
     smoke = next(event for event in events if event.kind == "deployment_recorded")
