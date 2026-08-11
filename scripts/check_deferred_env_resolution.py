@@ -58,8 +58,8 @@ Calibration — the acceptance test
 A version that finds ZERO on the unfixed tree is broken regardless of how clean
 its output looks. Verified 2026-08-11:
 
-* Tree WITHOUT commit 9223e5783 (``d6434ece5^``): flags
-  ``hermes_cli/gateway.py:5149`` — the ``atexit.register(_atexit_hook)`` line —
+* Tree WITHOUT the gateway_diag fix — that is ``d6434ece5^`` — flags
+  ``hermes_cli/gateway.py:5149``, the ``atexit.register(_atexit_hook)`` line,
   with the chain ``_atexit_hook -> _exit_diag(=write_diag)`` reaching
   ``get_hermes_home`` in ``hermes_cli/gateway_diag.py``. That is the reference
   instance: two modules and two renames from its resolution.
@@ -67,8 +67,12 @@ its output looks. Verified 2026-08-11:
   ``hermes_cli/gateway_diag.py`` (``register_exit_hook``'s inner ``_hook``) and
   ``hermes_cli/gateway.py`` drops out. The surviving hit is the fixed form —
   benign per the triage caveat above.
-* 7 candidates on the deployed branch (``5908bfe42``) with threads excluded,
+* 7 candidates on the deployed branch (at ``5908bfe42``) with threads excluded,
   out of 51 registrations over ~1120 modules.
+
+⚠ Do NOT look for ``9223e5783``. Earlier notes named it as the gateway_diag
+fix; it is an orphaned pre-rebase artifact contained by no branch. The work
+landed as ``d6434ece5``.
 
 The synthetic regression tests in
 ``tests/scripts/test_check_deferred_env_resolution.py`` lock each resolution
