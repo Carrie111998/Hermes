@@ -29,10 +29,14 @@ Design: docs/superpowers/specs/2026-08-10-editable-finder-drift-guard-design.md
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import site
+import subprocess
+import sys
 import sysconfig
+import tempfile
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
@@ -194,3 +198,97 @@ def resolve_install_root(finder: Path | None = None) -> InstallRoot:
         provenance=f"editable finder {finder.name} -> {root}",
         mapping=mapping,
     )
+
+
+class ProbeError(RuntimeError):
+    """The probe subprocess did not return usable JSON."""
+
+
+# Runs in a SEPARATE interpreter with an empty cwd. Keep it dependency-free
+# and self-contained: it cannot import anything from this package, because
+# importing this package is part of what is under test.
+_PROBE_SRC = r"""
+import importlib, importlib.util, json, sys
+
+names = json.loads(sys.argv[1])
+entrypoints = json.loads(sys.argv[2])
+
+resolved = {}
+for name in names:
+    try:
+        spec = importlib.util.find_spec(name)
+    except Exception as exc:
+        resolved[name] = {"ok": False, "origin": None,
+                          "error": "%s: %s" % (type(exc).__name__, exc)}
+        continue
+    if spec is None:
+        resolved[name] = {"ok": False, "origin": None, "error": "not found"}
+    else:
+        origin = spec.origin
+        if origin is None and spec.submodule_search_locations:
+            origin = list(spec.submodule_search_locations)[0]
+        resolved[name] = {"ok": True, "origin": origin, "error": None}
+
+imports = {}
+for name in entrypoints:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        imports[name] = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    else:
+        imports[name] = {"ok": True, "error": None}
+
+json.dump({"resolved": resolved, "imports": imports,
+           "executable": sys.executable}, sys.stdout)
+"""
+
+
+def probe(names, entrypoints, python: str | None = None, env: dict | None = None) -> dict:
+    """Resolve ``names`` and import ``entrypoints`` from a NEUTRAL cwd.
+
+    The subprocess runs with cwd set to a freshly created EMPTY directory --
+    not %TEMP% itself, so a stray module left there cannot perturb the
+    result.
+
+    Deliberately NOT run with ``-P``: a real reboot-time launch DOES prepend
+    cwd to sys.path, and reproducing that faithfully is the entire point. An
+    empty cwd supplies the neutral-cwd falsifier without diverging from how
+    the gateway actually starts. Run this from inside agent-src instead and
+    every package resolves via cwd, hiding the drift completely.
+
+    Uses ``sys.executable`` -- the interpreter that invoked doctor, which is
+    the install being graded. The returned "executable" is rendered so it is
+    never ambiguous which environment was checked.
+
+    ``env`` overrides the subprocess environment. It exists so the guard can
+    be proven end-to-end against the real interpreter (see Task 6): setting
+    PYTHONNOUSERSITE=1 suppresses the user-site editable finder and
+    reproduces a genuinely package-less install, which is the only way to
+    exercise the breadth and depth layers for real rather than via fixtures.
+    """
+    python = python or sys.executable
+    with tempfile.TemporaryDirectory(prefix="hermes-install-doctor-") as neutral:
+        proc = subprocess.run(
+            [
+                python,
+                "-c",
+                _PROBE_SRC,
+                json.dumps(sorted(names)),
+                json.dumps(list(entrypoints)),
+            ],
+            cwd=neutral,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    if proc.returncode != 0 or not proc.stdout.strip():
+        raise ProbeError(
+            f"probe subprocess failed (exit {proc.returncode}): "
+            f"{(proc.stderr or '').strip()[:500]}"
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise ProbeError(f"probe returned non-JSON output: {exc}") from exc

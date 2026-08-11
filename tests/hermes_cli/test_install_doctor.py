@@ -190,3 +190,49 @@ def test_resolve_install_root_falls_back_when_no_finder_exists(monkeypatch):
 
     assert resolved.mapping is None
     assert "no editable finder" in resolved.provenance
+
+
+def test_probe_resolves_present_and_missing_names():
+    """Real subprocess, stdlib-only targets — hermetic on any machine."""
+    from hermes_cli.install_doctor import probe
+
+    result = probe(["json", "hermes_definitely_missing_xyz"], [])
+
+    assert result["resolved"]["json"]["ok"] is True
+    assert result["resolved"]["json"]["origin"]
+    assert result["resolved"]["hermes_definitely_missing_xyz"]["ok"] is False
+    assert result["executable"]
+
+
+def test_probe_reports_a_failing_entrypoint_import():
+    from hermes_cli.install_doctor import probe
+
+    result = probe([], ["hermes_definitely_missing_xyz"])
+
+    entry = result["imports"]["hermes_definitely_missing_xyz"]
+    assert entry["ok"] is False
+    assert "ModuleNotFoundError" in entry["error"]
+
+
+def test_probe_runs_from_a_directory_that_is_not_the_repo(tmp_path):
+    """The probe must not resolve names via the caller's cwd.
+
+    A module dropped in the CALLER's cwd must be invisible to the probe --
+    that is the whole falsifier. Run with cwd=tmp_path containing a decoy.
+    """
+    import os
+
+    from hermes_cli.install_doctor import probe
+
+    (tmp_path / "hermes_decoy_module.py").write_text("x = 1\n", encoding="utf-8")
+    previous = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        result = probe(["hermes_decoy_module"], [])
+    finally:
+        os.chdir(previous)
+
+    assert result["resolved"]["hermes_decoy_module"]["ok"] is False, (
+        "probe resolved a module from the caller's cwd — the neutral-cwd "
+        "guarantee is broken and the guard would report false clean"
+    )
