@@ -540,6 +540,33 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    def test_absolute_python_interpreter_passes_through(self, monkeypatch):
+        """An innocent absolute interpreter command reaches execution intact."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                if command.startswith("cat "):
+                    return {"output": "", "returncode": 1}
+                calls.append(command)
+                return {"output": "1", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = '/usr/bin/python3 -c "print(1)"'
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert result["output"] == "1"
+        assert calls == [command]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -694,6 +721,16 @@ class TestLifecycleGuardModule:
             '/usr/bin/python3 -c "print(1)"'
         )
         assert result is False
+
+    def test_embedded_nul_referenced_path_is_unreadable_not_unsafe(self):
+        """A recursively tokenized NUL-bearing Path returns False, not an error."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = '/bin/bash "embedded\x00nul.sh"'
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(command) is False
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:

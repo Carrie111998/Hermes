@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # Recursively tokenized binary data can produce a Path containing an
+        # embedded NUL. os.open() raises ValueError for that input; treat it
+        # like any other unreadable non-script path rather than crashing the
+        # terminal lifecycle guard.
         return None, False
     try:
         metadata = os.fstat(descriptor)
