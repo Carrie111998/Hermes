@@ -164,6 +164,29 @@ class TestTickerErrorMarker:
         jobs.clear_ticker_error()
         assert jobs.get_ticker_last_error() is None
 
+    def test_clear_when_no_marker_is_a_silent_noop(self, cron_store, caplog):
+        """A missing marker is the common case (most ticks never record an
+        error) and must not warn -- this was firing on essentially every
+        successful tick and drowning out real signal in the gateway logs."""
+        assert jobs.get_ticker_last_error() is None
+        with caplog.at_level("WARNING"):
+            jobs.clear_ticker_error()
+        assert caplog.records == []
+
+    def test_clear_still_warns_on_genuine_oserror(self, cron_store, monkeypatch, caplog):
+        """A real OSError (permissions, I/O failure, etc.) other than a
+        missing file must still warn -- only FileNotFoundError is silent."""
+        jobs.record_ticker_error("RuntimeError: boom")
+
+        def _raise_permission_error(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+        monkeypatch.setattr(type(cron_store / "ticker_last_error"), "unlink", _raise_permission_error)
+
+        with caplog.at_level("WARNING"):
+            jobs.clear_ticker_error()
+        assert any("Could not clear stale ticker_last_error marker" in r.message for r in caplog.records)
+
 
 class TestTickerLoopRecordsErrors:
     def _run_one_tick(self, monkeypatch, tick_fn):
