@@ -476,8 +476,21 @@ HARDLINE_PATTERNS_COMPILED = [
 # writes "sudo -S" into a command (the sudo-password-piping mechanism was
 # removed; see terminal_tool._transform_sudo_command), so there is no
 # longer any legitimate source for this pattern at all.
+#
+# sudo follows standard getopt short-flag combining: -S (read password
+# from stdin) is a boolean flag with no argument, so it can be bundled
+# with any other boolean short flags in either order and either combined
+# or as separate arguments -- "sudo -Sk", "sudo -kS", "sudo -k -S", and
+# "sudo -n -k -S" are all real, functioning stdin-password invocations
+# (verified against the actual sudo binary: "sudo -Sk -l" and
+# "sudo -S -k -l" both prompt for a stdin password identically). A regex
+# anchored to a literal, standalone "-S" as the first argument misses all
+# of these. The pattern below instead requires "sudo" followed by zero or
+# more flag groups (each "-" + letters), where at least one group -- first
+# or not, combined or standalone -- contains an "S" (case-folded by
+# IGNORECASE, matching this guard's existing tolerance for "-s").
 _SUDO_STDIN_RE = re.compile(
-    r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+-S\b',
+    r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+(?:-[A-Za-z]*\s+)*-[A-Za-z]*S[A-Za-z]*\b',
     re.IGNORECASE)
 
 

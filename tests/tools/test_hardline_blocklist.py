@@ -566,6 +566,23 @@ _SUDO_STDIN_BLOCK = [
     "sudo -S apt-get install foo",
     "echo password | sudo -S systemctl restart nginx",
     "sudo -k && sudo -S whoami",
+    # Combined/reordered short flags (2026-08-11): sudo follows standard
+    # getopt short-flag combining -- -S is a boolean flag with no argument,
+    # so it can be bundled with other boolean short flags in either order,
+    # combined into one token or given separately. Verified against the
+    # actual sudo binary: "sudo -Sk -l" and "sudo -S -k -l" both prompt for
+    # a stdin password identically, and so does S given as a later,
+    # separate flag ("sudo -k -S"). A regex anchored to a literal,
+    # standalone leading "-S" misses all of these -- see the widened
+    # _SUDO_STDIN_RE pattern in tools/approval.py.
+    "sudo -Sk whoami",
+    "sudo -nS whoami",
+    "sudo -kS whoami",
+    "sudo -SkE whoami",
+    "sudo -S -k whoami",
+    "sudo -k -S whoami",
+    "sudo -n -S whoami",
+    "sudo -n -k -S whoami",
 ]
 
 _SUDO_STDIN_ALLOW = [
@@ -578,6 +595,15 @@ _SUDO_STDIN_ALLOW = [
     "some_tool -S thing",
     # Literal text mention of sudo
     "echo 'use sudo -S to pipe passwords'",
+    # Combined/reordered short flags, no S anywhere in the group -- the
+    # widened pattern must not start blocking flags that don't contain S
+    "sudo -k whoami",
+    "sudo -n whoami",
+    "sudo -k -n whoami",
+    # Mentions inside other commands' arguments -- must still not trip
+    "grep -n 'sudo -S' README.md",
+    "printf '%s\\n' 'sudo -S is dangerous'",
+    "rg --line-number 'sudo -S' .",
 ]
 
 _SUDO_STDIN_BLOCK_YOLO = [
@@ -594,6 +620,21 @@ def test_sudo_stdin_guard_detects_without_password():
         is_blocked, desc = approval_mod._check_sudo_stdin_guard(cmd)
         assert is_blocked, f"expected sudo stdin guard to block {cmd!r}"
         assert "sudo" in desc.lower()
+
+
+def test_sudo_stdin_guard_does_not_false_positive():
+    """The widened combined/reordered-flag pattern must not start blocking
+    flags that don't contain S, or text that merely mentions "sudo -S"
+    without it being a real command start.
+
+    _SUDO_STDIN_ALLOW existed before this change but was never wired to an
+    actual test -- fixing that here so these cases (and the new ones added
+    alongside the combined-flag fix) actually verify something."""
+    import tools.approval as approval_mod
+
+    for cmd in _SUDO_STDIN_ALLOW:
+        is_blocked, _desc = approval_mod._check_sudo_stdin_guard(cmd)
+        assert not is_blocked, f"expected sudo stdin guard to NOT block {cmd!r}"
 
 
 def test_sudo_stdin_guard_fires_even_with_sudo_password_set(monkeypatch):
