@@ -580,6 +580,13 @@ def build_session_context_prompt(
             f"**Session type:** {session_label} — messages are prefixed "
             "with [sender name]. Multiple users may participate."
         )
+        lines.append(
+            "If you intentionally choose not to reply to the current message "
+            "(for example because it is coordination between other participants), "
+            "respond with exactly `NO_REPLY` and nothing else. Never return an "
+            "empty response for intentional silence; the gateway suppresses the "
+            "`NO_REPLY` control token so nothing is posted to the chat."
+        )
     elif context.source.user_name:
         lines.append(
             f"**User:** {_format_untrusted_prompt_value(context.source.user_name)}"

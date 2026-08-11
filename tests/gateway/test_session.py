@@ -234,6 +234,8 @@ class TestBuildSessionContextPrompt:
 
         assert "current turn's sender prefix" in prompt
         assert "Do not guess or reuse `<@U...>` mentions" in prompt
+        assert "respond with exactly `NO_REPLY` and nothing else" in prompt
+        assert "Never return an empty response for intentional silence" in prompt
 
     def test_non_shared_slack_prompt_omits_self_mention_guidance(self):
         """1:1 Slack DMs are single-user: the shared-thread mention guidance
@@ -254,6 +256,7 @@ class TestBuildSessionContextPrompt:
         prompt = build_session_context_prompt(ctx)
 
         assert "current turn's sender prefix" not in prompt
+        assert "respond with exactly `NO_REPLY` and nothing else" not in prompt
 
 
     def test_local_delivery_path_uses_display_hermes_home(self):
