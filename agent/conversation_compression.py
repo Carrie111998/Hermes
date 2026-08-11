@@ -2217,9 +2217,6 @@ def compress_context(
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
     _trigger_source = "manual" if force else "auto"
-    # Track whether aux summarization has dispatched for this compression trigger
-    # within the same turn. Prevents re-billing on model fallback chain.
-    _aux_dispatched_this_trigger = getattr(agent, "_aux_compression_dispatched", False)
     try:
         agent._compression_attempt_id = _attempt_id
         setattr(agent.context_compressor, "_compression_telemetry_seed", {
@@ -2752,11 +2749,94 @@ def compress_context(
             if callable(durable_loader):
                 durable_parent = durable_loader(_lock_db, _lock_sid)
                 if isinstance(durable_parent, list) and len(durable_parent) > len(messages):
-                    # Cap the growth factor to avoid adopting a wildly inflated transcript
-                    # during a single compression attempt (e.g., due to fallback-chain reloads).
-                    # If growth exceeds 1.5x, keep the original snapshot and log a warning.
-                    MAX_GROWTH_FACTOR = 1.5
-                    if len(durable_parent) <= len(messages) * MAX_GROWTH_FACTOR:
+                    # The in-memory transcript carries the CURRENT turn's
+                    # un-persisted user tail (anchored by
+                    # _persist_user_message_idx) that the durable snapshot read
+                    # above does not contain yet. Flush that tail through the
+                    # normal rotation-boundary path (conversation_history = the
+                    # already-durable prefix, #68196 boundary) BEFORE adopting,
+                    # then re-read the durable parent so the adopted snapshot
+                    # includes the live input. If the flush fails (or the
+                    # anchor is unknown), skip adoption entirely: replacing
+                    # the in-memory transcript with a snapshot that lacks the
+                    # user's input would silently drop it from the summarized
+                    # and rotated history (#adopt-live-tail).
+                    _preflush_idx = getattr(agent, "_persist_user_message_idx", None)
+                    _preflush_ok = False
+                    if (
+                        isinstance(_preflush_idx, int)
+                        and 0 <= _preflush_idx < len(messages)
+                    ):
+                        try:
+                            _preflush_ok = agent._flush_messages_to_session_db(
+                                messages,
+                                conversation_history=messages[:_preflush_idx],
+                            )
+                        except Exception:
+                            _preflush_ok = False
+                    else:
+                        # No known un-persisted tail (anchor unset or already
+                        # at the end of the snapshot): the in-memory transcript
+                        # is fully durable, so adopting the longer parent
+                        # cannot drop live input — keep the legacy
+                        # adopt-directly behavior for that shape
+                        # (test_compression_concurrent_fork).
+                        _preflush_ok = True
+                    if not _preflush_ok:
+                        logger.warning(
+                            "compression: session=%s grew before lease "
+                            "(%d → %d msgs) but the pre-adoption flush of the "
+                            "live tail failed; skipping durable-snapshot "
+                            "adoption so un-persisted user input is kept",
+                            _lock_sid,
+                            len(messages),
+                            len(durable_parent),
+                        )
+                    else:
+                        # Re-read after the flush so the adopted snapshot
+                        # carries the just-persisted tail.
+                        durable_parent = durable_loader(_lock_db, _lock_sid)
+                    if (
+                        _preflush_ok
+                        and isinstance(durable_parent, list)
+                        and len(durable_parent) > len(messages)
+                    ):
+                        # Validate that the durable parent is a strict
+                        # superset of the in-memory snapshot — i.e. the
+                        # snapshot is a prefix and the durable parent only
+                        # APPENDS rows. A growth factor cap (#82576 v1) was
+                        # wrong: legitimate concurrent writers can append
+                        # >1.5× before lease acquisition, and rejecting that
+                        # violated the data-preservation invariant. Instead,
+                        # verify the relationship: if the durable parent's
+                        # first N rows don't match the snapshot (different
+                        # content/order), the growth is suspicious and we
+                        # abort fail-closed rather than proceeding with a
+                        # known-inconsistent transcript.
+                        _mismatch_idx: Optional[int] = None
+                        for _i in range(min(len(messages), len(durable_parent))):
+                            _snap_msg = messages[_i]
+                            _dur_msg = durable_parent[_i]
+                            if (
+                                not isinstance(_snap_msg, dict)
+                                or not isinstance(_dur_msg, dict)
+                                or _snap_msg.get("role") != _dur_msg.get("role")
+                                or _snap_msg.get("content") != _dur_msg.get("content")
+                            ):
+                                _mismatch_idx = _i
+                                break
+                        if _mismatch_idx is not None:
+                            logger.warning(
+                                "compression: session=%s durable parent (%d msgs) "
+                                "is not an extension of the in-memory snapshot "
+                                "(%d msgs) — prefix mismatch at index %d; "
+                                "aborting to avoid data loss",
+                                _lock_sid,
+                                len(durable_parent),
+                                len(messages),
+                                _mismatch_idx,
+                            )
+                            raise AuxiliaryExplicitCancellation()
                         logger.info(
                             "compression: session=%s grew before lease "
                             "(%d → %d msgs); adopting durable snapshot",
@@ -2770,17 +2850,13 @@ def compress_context(
                         # the compressor re-derives from the adopted transcript
                         # instead of under-counting the newly visible rows.
                         approx_tokens = 0
-                    else:
-                        logger.warning(
-                            "compression: session=%s grew before lease "
-                            "(%d → %d msgs, growth factor %.2f > %.2f); "
-                            "rejecting adoption to avoid transcript inflation",
-                            _lock_sid,
-                            len(messages),
-                            len(durable_parent),
-                            len(durable_parent) / len(messages),
-                            MAX_GROWTH_FACTOR,
-                        )
+                        # The whole adopted list is durable (DB re-read plus
+                        # the just-flushed tail). Re-anchor the persist index
+                        # at the end so the rotation-boundary flush that runs
+                        # after compression skips the adopted rows by identity
+                        # (conversation_history=messages[:idx]) instead of
+                        # re-appending the concurrent rows and the live tail.
+                        agent._persist_user_message_idx = len(messages)
 
         # Notify external memory provider before compression discards context.
         # The provider's on_pre_compress() may return a string of insights it
@@ -2878,36 +2954,34 @@ def compress_context(
                 )
                 compressed = messages
             else:
-                # If aux summarization already dispatched for this trigger, skip re-dispatch.
-                # Prevents re-billing on model fallback chain re-entries (see #82576).
-                if _aux_dispatched_this_trigger:
-                    logger.info(
-                        "Compression: aux summarization already dispatched for this trigger "
-                        "(session=%s); skipping fallback re-dispatch.",
-                        agent.session_id or "none",
+                with aux_progress_hook(_progress_hook), aux_interrupt_protection(
+                    cancel_event=_hard_cancel_event
+                ):
+                    # Snapshot the interrupt state before dispatch. A
+                    # prior fallback-chain attempt may have left the event
+                    # set (explicit_interrupt). We must not INHERIT that
+                    # stale signal: a re-entry should start fresh. But we
+                    # must NOT clear the event (that would defeat the
+                    # is_set() check below for a genuinely new interrupt).
+                    # Instead, distinguish a prior attempt's consumed
+                    # cancellation from a new one: only a NEW set
+                    # (clear→set during this dispatch) triggers the freeze.
+                    _pre_dispatch_interrupted = (
+                        _hard_cancel_event is not None
+                        and _hard_cancel_event.is_set()
                     )
-                    compressed = messages
-                else:
-                    with aux_progress_hook(_progress_hook), aux_interrupt_protection(
-                        cancel_event=_hard_cancel_event
+                    compressed = compress_fn(messages, **compress_kwargs)
+                    # Freeze a hard stop that arrived after the final
+                    # provider attempt unwound but before this transaction
+                    # can rotate session state — but ONLY if it is a new
+                    # interrupt, not a stale one inherited from a prior
+                    # fallback-chain attempt.
+                    if (
+                        _hard_cancel_event is not None
+                        and _hard_cancel_event.is_set()
+                        and not _pre_dispatch_interrupted
                     ):
-                        # Mark that aux summarization has been dispatched for this trigger.
-                        agent._aux_compression_dispatched = True
-                        try:
-                            compressed = compress_fn(messages, **compress_kwargs)
-                        finally:
-                            # Reset the hard-interrupt flag so fallback chain re-entries
-                            # don't inherit the same interrupt and re-bill.
-                            if _hard_cancel_event is not None:
-                                _hard_cancel_event.clear()
-                        # Freeze a hard stop that arrived after the final provider
-                        # attempt unwound but before this transaction can rotate
-                        # session state.
-                        if (
-                            _hard_cancel_event is not None
-                            and _hard_cancel_event.is_set()
-                        ):
-                            raise AuxiliaryExplicitCancellation()
+                        raise AuxiliaryExplicitCancellation()
         finally:
             if commit_fence is not None:
                 try:
@@ -3627,14 +3701,6 @@ def compress_context(
         finally:
             if _commit_fence_entered:
                 commit_fence.finish_commit()
-        # Clear the aux dispatch flag so a future compression trigger in a later
-        # turn can proceed normally. This must be after commit_fence.finish_commit()
-        # to avoid a race where the fence is still active but the flag is cleared.
-        try:
-            if hasattr(agent, "_aux_compression_dispatched"):
-                delattr(agent, "_aux_compression_dispatched")
-        except Exception:
-            pass
 
 
 def _compress_context_via_codex_app_server(
