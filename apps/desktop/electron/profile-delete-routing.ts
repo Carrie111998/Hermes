@@ -359,6 +359,38 @@ export function decideProfileDeleteAction(
   return { action: 'teardown-pool', profile }
 }
 
+export interface ProfileDeleteLifecycleDeps<T> {
+  destroyRevokedWindows: (webContentsIds: number[]) => void
+  revokeProfile: (profile: string) => T
+  revokeWindowTargets: (profile: string) => number[]
+  teardownPrimary: () => Promise<void>
+  teardownProfileBackends: (profile: string) => Promise<void>
+  writeActiveProfile: (profile: string) => void
+}
+
+export async function applyProfileDeleteLifecycle<T>(
+  decision: ProfileDeleteDecision,
+  deps: ProfileDeleteLifecycleDeps<T>
+): Promise<{ mutation: T | null; profile: string | null }> {
+  if (decision.action === 'noop' || !decision.profile) {
+    return { mutation: null, profile: null }
+  }
+
+  const mutation = deps.revokeProfile(decision.profile)
+  const revokedWindowIds = deps.revokeWindowTargets(decision.profile)
+
+  deps.destroyRevokedWindows(revokedWindowIds)
+
+  if (decision.action === 'teardown-primary') {
+    deps.writeActiveProfile('default')
+    await Promise.all([deps.teardownPrimary(), deps.teardownProfileBackends(decision.profile)])
+  } else {
+    await deps.teardownProfileBackends(decision.profile)
+  }
+
+  return { mutation, profile: decision.profile }
+}
+
 /**
  * Route the next `hermes:api` request away from the primary/window backend
  * whenever a profile was just torn down -- otherwise ensureBackend would

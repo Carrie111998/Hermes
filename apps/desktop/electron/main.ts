@@ -174,6 +174,7 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import {
+  applyProfileDeleteLifecycle,
   applyProfileRenameLifecycle,
   createProfileRevocationGuard,
   decideProfileDeleteAction,
@@ -8717,6 +8718,17 @@ async function teardownPoolBackendsForProfile(profile) {
   await Promise.all(keys.map(key => teardownPoolBackendAndWait(key)))
 }
 
+async function teardownProfileBackendsAndSsh(profile) {
+  const scope = sshScopeKey(profile)
+
+  await applySshConnectionTeardown({
+    closePublishedConnection: closePublishedSshConnection,
+    retireAndRun: (retiredScope, operation) => sshBootstrapCoordinator.retireAndRun(retiredScope, operation),
+    scope,
+    teardownRelatedState: () => teardownPoolBackendsForProfile(profile)
+  })
+}
+
 function stopAllPoolBackends() {
   for (const profile of [...backendPool.keys()]) {
     stopPoolBackend(profile)
@@ -8741,28 +8753,14 @@ async function prepareProfileDeleteRequest(request) {
     primaryProfileKey
   })
 
-  if (decision.action === 'noop') {
-    return { mutation: null, profile: null }
-  }
-
-  const mutation = profileRevocations.revoke(decision.profile)
-  const revokedWindowIds = windowTargets.revokeProfile(decision.profile)
-
-  destroyRevokedWindows(revokedWindowIds, BrowserWindow.getAllWindows())
-
-  if (decision.action === 'teardown-primary') {
-    writeActiveDesktopProfile('default')
-    await Promise.all([
-      teardownPrimaryBackendAndWait(),
-      teardownPoolBackendsForProfile(decision.profile)
-    ])
-
-    return { mutation, profile: decision.profile }
-  }
-
-  await teardownPoolBackendsForProfile(decision.profile)
-
-  return { mutation, profile: decision.profile }
+  return applyProfileDeleteLifecycle<ProfileMutationToken>(decision, {
+    destroyRevokedWindows: webContentsIds => destroyRevokedWindows(webContentsIds, BrowserWindow.getAllWindows()),
+    revokeProfile: deletedProfile => profileRevocations.revoke(deletedProfile),
+    revokeWindowTargets: deletedProfile => windowTargets.revokeProfile(deletedProfile),
+    teardownPrimary: () => teardownPrimaryBackendAndWait(),
+    teardownProfileBackends: teardownProfileBackendsAndSsh,
+    writeActiveProfile: deletedProfile => writeActiveDesktopProfile(deletedProfile)
+  })
 }
 
 async function completeProfileMutation<T>(
@@ -8810,17 +8808,7 @@ async function completeProfileMutation<T>(
         revokeProfile: profile => profileRevocations.revoke(profile),
         revokeWindowTargets: profile => windowTargets.revokeProfile(profile),
         teardownPrimary: () => teardownPrimaryBackendAndWait(),
-        teardownProfilePools: async profile => {
-          const scope = sshScopeKey(profile)
-
-          await applySshConnectionTeardown({
-            closePublishedConnection: closePublishedSshConnection,
-            retireAndRun: (retiredScope, operation) =>
-              sshBootstrapCoordinator.retireAndRun(retiredScope, operation),
-            scope,
-            teardownRelatedState: () => teardownPoolBackendsForProfile(profile)
-          })
-        },
+        teardownProfilePools: teardownProfileBackendsAndSsh,
         writeActiveProfile: profile => writeActiveDesktopProfile(profile)
       })
     }

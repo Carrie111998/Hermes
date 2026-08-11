@@ -4,6 +4,7 @@ import { test } from 'vitest'
 
 import { makeBackendTarget } from './backend-target'
 import {
+  applyProfileDeleteLifecycle,
   createProfileRevocationGuard,
   decideProfileDeleteAction,
   profileNameFromCreateRequest,
@@ -91,6 +92,44 @@ test('decideProfileDeleteAction tears down the primary backend for the primary p
 
 test('decideProfileDeleteAction tears down the pool backend for any other valid profile', () => {
   assert.deepEqual(decideProfileDeleteAction('worker', deps), { action: 'teardown-pool', profile: 'worker' })
+})
+
+test('applyProfileDeleteLifecycle resets and tears down every primary-profile backend', async () => {
+  const events: string[] = []
+
+  const result = await applyProfileDeleteLifecycle(
+    { action: 'teardown-primary', profile: 'primary-profile' },
+    {
+      destroyRevokedWindows: ids => events.push(`windows:${ids.join(',')}`),
+      revokeProfile: profile => {
+        events.push(`revoked:${profile}`)
+
+        return 'mutation'
+      },
+      revokeWindowTargets: profile => {
+        events.push(`targets:${profile}`)
+
+        return [7, 9]
+      },
+      teardownPrimary: async () => {
+        events.push('primary-torn-down')
+      },
+      teardownProfileBackends: async profile => {
+        events.push(`profile-torn-down:${profile}`)
+      },
+      writeActiveProfile: profile => events.push(`active:${profile}`)
+    }
+  )
+
+  assert.deepEqual(result, { mutation: 'mutation', profile: 'primary-profile' })
+  assert.deepEqual(events, [
+    'revoked:primary-profile',
+    'targets:primary-profile',
+    'windows:7,9',
+    'active:default',
+    'primary-torn-down',
+    'profile-torn-down:primary-profile'
+  ])
 })
 
 // ---------------------------------------------------------------------------
