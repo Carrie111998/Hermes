@@ -52,7 +52,17 @@ def _blocked_url_in_code(code: str) -> Optional[str]:
 def _base_subprocess_env() -> dict:
     from tools.browser_tool import _build_browser_env
 
-    return _build_browser_env()
+    env = _build_browser_env()
+    # The browser-use CLI runs in its own Python environment (uv tool /
+    # uvx), NOT the Hermes venv.  Hermes sets PYTHONPATH to its own
+    # site-packages (see tools/environments/local.py), and a child Python
+    # interpreter honors it ahead of its own site-packages — on this
+    # machine that made browser-use import the Hermes venv's
+    # pydantic_core, a CPython-3.11 binary that a 3.12 interpreter can't
+    # load (ModuleNotFoundError: pydantic_core._pydantic_core).  Strip the
+    # var so the CLI resolves its own dependencies.
+    env.pop("PYTHONPATH", None)
+    return env
 
 
 def _read_browser_cfg() -> dict:
