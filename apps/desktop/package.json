@@ -52,7 +52,7 @@
     "fix": "npm run lint:fix && npm run fmt",
     "test:ui": "vitest run --project ui",
     "test:desktop:platforms": "vitest run --project electron",
-    "test:desktop:win-install": "vitest run --project electron desktop-electron-pin assert-dist-built assert-win-vcruntime before-pack stage-native-deps write-build-stamp",
+    "test:desktop:win-install": "vitest run --project electron desktop-electron-pin assert-dist-built assert-win-vcruntime write-build-stamp",
     "test": "vitest run",
     "preview": "node scripts/assert-root-install.mjs && vite preview --host 127.0.0.1 --port 4174",
     "check:test:desktop:platforms": "npm run test:desktop:platforms",

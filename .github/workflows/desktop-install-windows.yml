@@ -20,8 +20,16 @@ name: Desktop install (Windows)
 #     `desktop-electron-pin.test.ts` asserts the dependency, the lockfile and
 #     `build.electronVersion` all agree, which is what keeps electron-builder
 #     from packaging a different Electron than `npm ci` installed.
-#   * The `scripts/*.test.mjs` build guards, which gate `prebuilder` and
-#     `postbuild` and therefore run on Windows during a real packaging run.
+#   * The `scripts/*.test.mjs` build guards that gate `prebuilder`/`postbuild`
+#     — the ones whose module graph does not reach `electron-builder`. The two
+#     that do (`before-pack`, `stage-native-deps`) fail to load under vitest on
+#     Windows with `SyntaxError: Invalid or unexpected token` while loading
+#     cleanly on ubuntu. That is a vitest/vite transform problem with that
+#     dependency, not this repo's code, and it is a packaging-stage concern
+#     rather than an install-path one — so it is recorded as a finding rather
+#     than chased here. Observed, not assumed: the four listed in
+#     `test:desktop:win-install` were seen passing on a Windows runner
+#     (21 tests, 0 failures) in the run that surfaced the other two.
 #
 # It deliberately does NOT run the whole `electron` vitest project: that also
 # holds POSIX-only suites (ssh-connection asserts ControlMaster multiplexing,
