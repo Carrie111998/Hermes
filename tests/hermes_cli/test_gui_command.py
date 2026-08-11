@@ -149,6 +149,30 @@ def test_up_to_date_packaged_gui_launch_skips_npm_resolution(tmp_path, monkeypat
     assert mock_run.call_args.kwargs["cwd"] == desktop_dir
 
 
+def test_source_launch_without_npm_fails_before_desktop_entry_write(tmp_path, monkeypatch):
+    """A doomed source-mode launch must exit before any side effects.
+
+    Lazy npm resolution moved the missing-npm exit later in cmd_gui; the
+    resolve is hoisted above _register_linux_desktop_entry() so a failed run
+    can't leave a freshly (re)written launcher entry behind, matching the old
+    eager check's exit-before-side-effects ordering.
+    """
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    _make_packaged_executable(root, monkeypatch)
+
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+         patch("hermes_cli.main._register_linux_desktop_entry") as mock_register, \
+         patch("hermes_cli.main.subprocess.run") as mock_run, \
+         pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(source=True))
+
+    assert exc.value.code == 1
+    mock_register.assert_not_called()
+    mock_run.assert_not_called()
+
+
 def test_gui_install_env_prepends_managed_node_on_bare_path(tmp_path, monkeypatch):
     """Regression: npm's child scripts (electron-winstaller's select-7z-arch.js)
     shell out to bare ``node``. When Desktop is launched from the updater chain

@@ -7152,7 +7152,7 @@ def cmd_gui(args: argparse.Namespace):
             build_label = "source build" if source_mode else "packaged app"
             print(f"✓ Desktop {build_label} is up to date (content stamp matches)")
         else:
-            _ensure_npm()
+            npm = _ensure_npm()
             print("→ Installing desktop workspace dependencies...")
             # Put the Hermes-managed Node on PATH so npm's child scripts (which
             # shell out to bare `node`, e.g. electron-winstaller's
@@ -7271,6 +7271,13 @@ def cmd_gui(args: argparse.Namespace):
             # Build succeeded — write the stamp so next run can skip
             _write_desktop_build_stamp(PROJECT_ROOT, source_mode=source_mode)
 
+    # A source-mode launch needs npm below; resolve it before the
+    # desktop-entry side effect so a missing-npm run exits without first
+    # (re)writing the launcher entry, matching the old eager check's
+    # exit-before-side-effects ordering.
+    if source_mode and not getattr(args, "build_only", False):
+        npm = _ensure_npm()
+
     # Linux: register the app in the desktop launcher, so Hermes shows up
     # in the application menu with its icon. Best-effort and idempotent.
     # A failure must never stop the app from launching.
@@ -7297,7 +7304,7 @@ def cmd_gui(args: argparse.Namespace):
         return
 
     if source_mode:
-        _ensure_npm()
+        npm = _ensure_npm()
         print("→ Launching Hermes Desktop from source build...")
         launch_result = subprocess.run([npm, "exec", "--", "electron", "."], cwd=desktop_dir, env=env, check=False)
         sys.exit(launch_result.returncode)
