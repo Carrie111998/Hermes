@@ -927,7 +927,13 @@ class TestGetProcessStartTime:
     def test_live_process_is_stable_int(self):
         import subprocess
         import time
-        p = subprocess.Popen(["sleep", "20"])
+        # Spawn the long-lived child through sys.executable rather than
+        # ["sleep", "20"]: Windows has no `sleep` on PATH (it ships in
+        # Git\usr\bin, which PowerShell and the cron environment do NOT
+        # carry — only an MSYS/Git-Bash PATH does), so the POSIX form
+        # raised WinError 2 and this test failed everywhere except a
+        # Git-Bash shell. The probe only needs *a* live process.
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
         try:
             a = status._get_process_start_time(p.pid)
             time.sleep(0.2)
@@ -952,7 +958,8 @@ class TestGetProcessStartTime:
             return orig_read_text(self, *args, **kwargs)
 
         monkeypatch.setattr(Path, "read_text", no_proc)
-        p = subprocess.Popen(["sleep", "20"])
+        # Portable long-lived child — see test_live_process_is_stable_int.
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
         try:
             a = status._get_process_start_time(p.pid)
             b = status._get_process_start_time(p.pid)

@@ -129,6 +129,107 @@ def test_subprocess_getstatusoutput_systemctl_blocked():
         subprocess.getstatusoutput("systemctl --user restart hermes-gateway")
 
 
+# ──────────────── direct gateway launch (no systemctl) ─────────
+#
+# The systemctl guard keys on ``systemctl`` appearing in the command, so it
+# never saw the direct spawn paths — which are the ONLY paths Windows uses,
+# and the ones every ``--detached`` flow takes. A test that stubbed part of
+# the launch surface but missed the branch the code actually took would
+# reach the real Popen and leave a background gateway running on the
+# developer's machine. That happened on every run of
+# ``test_gateway_restart_on_windows_preserves_failure_fallback`` until
+# 82b130b6e (two rogue gateways, PIDs 44560 + 43476, on 2026-08-10).
+
+
+def test_direct_hermes_gateway_run_blocked():
+    """``launch_gateway_detached`` builds exactly this argv."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["hermes", "gateway", "run"])
+
+
+def test_absolute_hermes_entrypoint_gateway_run_blocked():
+    """An absolute entrypoint must be caught as readily as the bare name.
+
+    ``launch_gateway_detached`` prefers ``sys.argv[0]`` when it looks like
+    the hermes CLI, so the real argv is usually a full path.
+    """
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen([r"C:\Users\dev\.venv\Scripts\hermes.exe", "gateway", "run"])
+
+
+def test_pythonw_dash_m_gateway_run_blocked():
+    """``gateway_windows._spawn_detached`` builds this argv."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(
+            [r"C:\Python311\pythonw.exe", "-m", "hermes_cli.main", "gateway", "run"]
+        )
+
+
+def test_gateway_run_with_replace_flag_blocked():
+    """``--replace`` is what the restart path passes; a flag must not hide the verb."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["hermes", "gateway", "run", "--replace"])
+
+
+def test_gateway_stop_blocked():
+    """Stopping the live gateway is as destructive as spawning over it."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["hermes", "gateway", "stop"])
+
+
+def test_gateway_restart_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.run(["hermes", "gateway", "restart"])
+
+
+def test_python_dash_m_gateway_run_module_blocked():
+    """``python -m gateway.run`` has no ``gateway`` subcommand token at all."""
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["python", "-m", "gateway.run"])
+
+
+def test_gateway_run_py_script_blocked():
+    with pytest.raises(RuntimeError, match="live-system guard"):
+        subprocess.Popen(["python", "/opt/hermes/gateway/run.py"])
+
+
+# The allow-cases below must not spawn ``echo``/``true``: those are POSIX-only
+# and would land this file's Windows run red — the exact condition that hid the
+# rogue-gateway bug in the first place. ``sys.executable -c ""`` exists on every
+# platform, and the guard inspects the argv it is GIVEN, so passing the
+# gateway-shaped tokens as arguments exercises the matcher without running one.
+
+
+def _run_allowed(*extra_argv):
+    """Run a harmless real subprocess whose argv carries ``extra_argv``.
+
+    If the guard wrongly matched, this raises RuntimeError instead of
+    returning — which is precisely what the allow-case asserts against.
+    """
+    return subprocess.run(
+        [sys.executable, "-c", "", *extra_argv], capture_output=True, text=True
+    )
+
+
+def test_gateway_status_passes_through():
+    """Read-only gateway subcommands must NOT be blocked."""
+    assert _run_allowed("hermes", "gateway", "status").returncode == 0
+
+
+def test_gateway_logs_passes_through():
+    assert _run_allowed("hermes", "gateway", "logs", "--tail", "20").returncode == 0
+
+
+def test_gateway_install_passes_through():
+    """``install`` writes a service definition; it does not start a gateway."""
+    assert _run_allowed("hermes", "gateway", "install").returncode == 0
+
+
+def test_unrelated_command_containing_gateway_word_passes_through():
+    """The word "gateway" alone (e.g. an API gateway path) must not trip it."""
+    assert _run_allowed("deploying", "api-gateway", "to", "staging").returncode == 0
+
+
 # ──────────────────── os.system / os.popen ────────────────────
 
 

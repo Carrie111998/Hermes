@@ -134,17 +134,43 @@ def pid_exists(pid: int) -> bool:
     — Python's Windows implementation of ``os.kill`` routes any signal other
     than ``CTRL_C_EVENT`` / ``CTRL_BREAK_EVENT`` through ``TerminateProcess``,
     so passing ``0`` would kill the target process with exit code 0 rather
-    than probe it.  Use ``tasklist`` as a robust Windows fallback.
+    than probe it.  Prefer :mod:`psutil` (a hard dependency, and what the
+    sibling ``_pid_exists`` probe already uses) and keep ``tasklist`` only as
+    a fallback for a stripped-down install.
+
+    ``tasklist`` used to be the only Windows path, with ``timeout=5`` and a
+    bare ``except Exception: return False``.  Measured on this machine, that
+    spawn takes 3.4-4.0s idle, so under disk contention it exceeds the budget
+    and the ``TimeoutExpired`` was converted into "the process is dead" — a
+    false negative on the gateway's own liveness probe.  That is the dangerous
+    direction: ``get_running_pid`` deletes the PID file of a LIVE gateway and
+    callers spawn a duplicate.  psutil answers in-process in microseconds, and
+    a failing fallback probe now fails SAFE (reports alive) rather than
+    reporting a running gateway as gone.
     """
     if _IS_WINDOWS:
         try:
+            import psutil  # type: ignore
+
+            return bool(psutil.pid_exists(int(pid)))
+        except ImportError:
+            pass
+        except Exception:
+            pass
+        try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
-                capture_output=True, text=True, timeout=5,
+                capture_output=True, text=True, timeout=30,
             )
             return str(pid) in result.stdout
         except Exception:
-            return False
+            logger.warning(
+                "pid_exists(%s): Windows liveness probe failed; reporting the "
+                "process as alive so a live gateway is never treated as gone.",
+                pid,
+                exc_info=True,
+            )
+            return True
     try:
         os.kill(pid, 0)
         return True

@@ -1704,6 +1704,53 @@ class PluginManager:
             return Path(manifest.path).name
         return name
 
+    def _platform_env_hints(
+        self, manifest: PluginManifest, platform_name: str
+    ) -> tuple[str, ...]:
+        """Env var names / prefixes that could configure this platform.
+
+        Derived from ``plugin.yaml``'s ``requires_env`` WITHOUT importing the
+        adapter module, so the gateway config path can decide whether a
+        platform is worth resolving before paying for its SDK import (see
+        ``gateway.config._deferred_platform_may_be_configured``, which matches
+        these against ``os.environ`` UNION the profile's ``.env`` file).
+
+        We emit both the exact declared names and their leading prefix
+        (``FEISHU_APP_ID`` -> ``FEISHU_``), plus a prefix derived from the
+        platform name itself (``google_chat`` -> ``GOOGLE_CHAT_``). The
+        prefixes matter: they subsume the manifest's ``optional_env`` block
+        (``FEISHU_HOME_CHANNEL`` etc.) for free, and they cover platforms whose
+        adapter reads a var the manifest never declared. Deliberately a
+        SUPERSET of what could enable the platform -- over-matching costs one
+        import, under-matching silently stops auto-enabling it.
+
+        Returns ``()`` when nothing can be derived, which callers must treat as
+        "resolve it" rather than "skip it".
+        """
+        hints: set[str] = set()
+
+        for item in manifest.requires_env or []:
+            if isinstance(item, dict):
+                var = str(item.get("name") or "").strip()
+            else:
+                var = str(item or "").strip()
+            if not var:
+                continue
+            hints.add(var)
+            head, sep, _ = var.partition("_")
+            if sep and head:
+                hints.add(head + "_")
+
+        # Only widen with the name-derived prefix once the manifest has told us
+        # something. A manifest that declares NO ``requires_env`` (e.g. raft)
+        # must yield ``()`` so callers fail open and resolve it -- synthesizing
+        # a ``RAFT_`` prefix there would invent a gate the plugin never agreed
+        # to and could silently stop auto-enabling it.
+        if hints and platform_name:
+            hints.add(platform_name.replace("-", "_").upper() + "_")
+
+        return tuple(sorted(hints))
+
     def _register_deferred_platform(self, manifest: PluginManifest) -> None:
         """Register a lazy loader for a bundled platform plugin.
 
@@ -1727,13 +1774,29 @@ class PluginManager:
             self._load_plugin(_manifest)
 
         try:
+            env_hints: tuple[str, ...] = ()
+            try:
+                env_hints = self._platform_env_hints(manifest, platform_name)
+            except Exception:
+                # Fail open: no hints means callers resolve unconditionally,
+                # i.e. exactly the pre-hint behaviour.
+                logger.debug(
+                    "env-hint derivation failed for '%s'; resolving eagerly",
+                    lookup_key,
+                    exc_info=True,
+                )
+                env_hints = ()
+
             from gateway.platform_registry import platform_registry
 
-            platform_registry.register_deferred(platform_name, _loader)
+            platform_registry.register_deferred(
+                platform_name, _loader, env_hints=env_hints
+            )
             logger.debug(
-                "Registered deferred platform loader: %s (plugin=%s)",
+                "Registered deferred platform loader: %s (plugin=%s, env_hints=%s)",
                 platform_name,
                 lookup_key,
+                env_hints,
             )
         except Exception:
             # If the registry import fails for any reason, fall back to eager
