@@ -6405,9 +6405,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 if isinstance(candidate, dict):
                     status = candidate
             except Exception:
+                # Context-engine plugins are trusted code, but their exception
+                # text may still contain provider URLs, headers, or credentials.
+                # This telemetry path must never copy those details into logs.
                 logger.warning(
-                    "Context engine status unavailable for completed API run",
-                    exc_info=True,
+                    "Context engine status unavailable for completed API run"
                 )
 
         def _nonnegative_int(value: Any) -> Optional[int]:
@@ -6434,7 +6436,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         declared_source = status.get("context_source")
         allowed_sources = {"provider_prompt_tokens", "rough_estimate", "unknown"}
-        if declared_source in allowed_sources:
+        if isinstance(declared_source, str) and declared_source in allowed_sources:
             context_source = declared_source
         elif context_tokens is None:
             context_source = "unknown"
@@ -6851,11 +6853,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
-                    effective_session_id = (
+                    reported_session_id = (
                         result.get("session_id")
                         if isinstance(result, dict)
                         else None
-                    ) or session_id
+                    )
+                    effective_session_id = (
+                        reported_session_id
+                        if isinstance(reported_session_id, str)
+                        and reported_session_id.strip()
+                        and len(reported_session_id) <= self._MAX_SESSION_HEADER_LEN
+                        else session_id
+                    )
                     session_fields: Dict[str, Any] = {
                         "session_id": effective_session_id,
                     }
