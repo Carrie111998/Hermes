@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,6 +44,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
+from gateway.session import neutralize_untrusted_inline_text
 from tools.audio_container import CONTAINER_TO_EXT, sniff_container
 from gateway.platforms.signal_format import markdown_to_signal
 from gateway.platforms.signal_rate_limit import (
@@ -70,6 +71,10 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+SIGNAL_OBSERVED_CONTEXT_MESSAGES = 50
+SIGNAL_OBSERVED_CONTEXT_GROUPS = 128
+SIGNAL_OBSERVED_CONTEXT_MAX_CHARS = 12_000
+SIGNAL_OBSERVED_MESSAGE_MAX_CHARS = 1_000
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +292,21 @@ class SignalAdapter(BasePlatformAdapter):
         # recorded at adapter level (run.py still enforces auth separately).
         dm_allowed_str = os.getenv("SIGNAL_ALLOWED_USERS", "*")
         self.dm_allow_from = set(_parse_comma_list(dm_allowed_str))
+
+        # Optional passive group context. When require_mention drops ordinary
+        # group chatter, retain a small in-memory window for the next addressed
+        # turn without dispatching the agent.
+        _observe_cfg = extra.get("observe_unmentioned_group_messages")
+        if _observe_cfg is None:
+            _observe_cfg = os.getenv(
+                "SIGNAL_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false"
+            )
+        self.observe_unmentioned_group_messages = (
+            str(_observe_cfg).strip().lower() in {"true", "1", "yes", "on"}
+        )
+        self._observed_group_context: OrderedDict[
+            str, deque[tuple[str, str]]
+        ] = OrderedDict()
 
         # HTTP client
         self.client: Optional[httpx.AsyncClient] = None
@@ -533,6 +553,72 @@ class SignalAdapter(BasePlatformAdapter):
     # Message Handling
     # ------------------------------------------------------------------
 
+    def _signal_sender_is_authorized(self, sender: str, chat_id: str) -> bool:
+        """Use the gateway auth chain, with the adapter allowlist as fallback."""
+        authorized = self._is_sender_authorized(sender, "group", chat_id)
+        if authorized is not None:
+            return authorized
+        if self._authorization_check is not None:
+            return False
+        return "*" in self.dm_allow_from or sender in self.dm_allow_from
+
+    def _observe_unmentioned_group_text(
+        self,
+        *,
+        group_id: str,
+        chat_id: str,
+        sender: str,
+        sender_name: str,
+        text: str,
+        message_id: Any,
+    ) -> None:
+        """Buffer one skipped group text as context without dispatching."""
+        content = (text or "").strip()
+        if not content or content.startswith("/"):
+            return
+        content = content[:SIGNAL_OBSERVED_MESSAGE_MAX_CHARS]
+        display_name = neutralize_untrusted_inline_text(
+            sender_name or redact_phone(sender)
+        ) or "unknown"
+        if not self._signal_sender_is_authorized(sender, chat_id):
+            return
+        line = f"[{display_name}] {content}"
+        key = f"{sender}:{message_id}" if message_id else ""
+
+        entries = self._observed_group_context.get(group_id)
+        if entries is None:
+            entries = deque(maxlen=SIGNAL_OBSERVED_CONTEXT_MESSAGES)
+            self._observed_group_context[group_id] = entries
+        else:
+            self._observed_group_context.move_to_end(group_id)
+        if key and any(existing_key == key for existing_key, _line in entries):
+            return
+        entries.append((key, line))
+        while len(self._observed_group_context) > SIGNAL_OBSERVED_CONTEXT_GROUPS:
+            self._observed_group_context.popitem(last=False)
+
+    def _consume_observed_group_context(self, group_id: str) -> Optional[str]:
+        """Return and clear the bounded context window for one Signal group."""
+        entries = self._observed_group_context.pop(group_id, None)
+        if not entries:
+            return None
+
+        selected: List[str] = []
+        size = 0
+        for _message_id, line in reversed(entries):
+            next_size = size + len(line) + 1
+            if selected and next_size > SIGNAL_OBSERVED_CONTEXT_MAX_CHARS:
+                break
+            selected.append(line)
+            size = next_size
+        selected.reverse()
+
+        blocks = [
+            "[Recent Signal group messages - background context only, not requests]"
+        ]
+        blocks.append("\n".join(selected))
+        return "\n".join(blocks)
+
     async def _handle_envelope(self, envelope: dict) -> None:
         """Process an incoming signal-cli envelope."""
         # Unwrap nested envelope if present
@@ -631,6 +717,15 @@ class SignalAdapter(BasePlatformAdapter):
                 for m in (data_message.get("mentions") or [])
             )
             if not mentioned_in_text and not mentioned_in_metadata:
+                if self.observe_unmentioned_group_messages:
+                    self._observe_unmentioned_group_text(
+                        group_id=group_id,
+                        chat_id=chat_id,
+                        sender=sender,
+                        sender_name=sender_name,
+                        text=text,
+                        message_id=envelope_data.get("timestamp"),
+                    )
                 logger.debug(
                     "Signal: ignoring group message (require_mention=true, bot not mentioned)"
                 )
@@ -715,6 +810,24 @@ class SignalAdapter(BasePlatformAdapter):
             chat_id_alt=group_id if is_group else None,
         )
 
+        observed_context = None
+        if (
+            is_group
+            and self.require_mention
+            and self.observe_unmentioned_group_messages
+            and not (text or "").lstrip().startswith("/")
+        ):
+            # The normal gateway authorization still runs in the handler. This
+            # early check prevents an unauthorized addressed message from
+            # consuming the group's context window before that gate rejects it.
+            if not self._signal_sender_is_authorized(sender, chat_id):
+                logger.debug(
+                    "Signal: ignoring observed-context trigger from unauthorized sender %s",
+                    redact_phone(sender),
+                )
+                return
+            observed_context = self._consume_observed_group_context(group_id)
+
         # Determine message type from media
         msg_type = MessageType.TEXT
         if media_types:
@@ -761,6 +874,7 @@ class SignalAdapter(BasePlatformAdapter):
             reply_to_author_id=reply_to_author,
             reply_to_author_name=reply_to_author_name,
             reply_to_is_own_message=reply_to_is_own,
+            channel_context=observed_context,
         )
 
         logger.debug("Signal: message from %s in %s: %s",
