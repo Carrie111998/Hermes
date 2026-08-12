@@ -20815,20 +20815,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_name,
         )
         try:
+            rename_kwargs = {"only_if_current_name": guard_name}
+            if use_connector_guard:
+                # These are relay-only controls.  The native Discord adapter
+                # deliberately has the smaller ``only_if_current_name``
+                # contract, so passing relay keywords here breaks every native
+                # semantic rename with ``TypeError``.
+                rename_kwargs.update(
+                    prefer_connector_created=True,
+                    parent_chat_id=parent_chat_id,
+                )
             renamed = await rename_thread(
                 target_thread_id,
                 thread_name,
-                prefer_connector_created=use_connector_guard,
-                only_if_current_name=guard_name,
-                parent_chat_id=parent_chat_id,
+                **rename_kwargs,
             )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",
                 target_thread_id,
                 bool(renamed),
             )
-        except Exception:
-            logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)
+        except Exception as exc:
+            # Warning, not debug: call-contract drift previously disappeared
+            # behind a debug-only swallow. Keep the record deliberately
+            # message-free: transport exceptions can embed credential-bearing
+            # URLs in ``str(exc)`` and in formatted tracebacks.
+            logger.warning(
+                "discord auto-thread rename failed: thread=%s lane=%s error=%s",
+                target_thread_id,
+                "relay" if use_connector_guard else "native",
+                type(exc).__name__,
+            )
 
     def _schedule_discord_semantic_thread_rename(
         self,
