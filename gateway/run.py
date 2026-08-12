@@ -10945,7 +10945,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _sigusr2,
                     file=_fh,
                     all_threads=True,
-                    chain=True,
+                    chain=False,
                 )
             except Exception:
                 logger.debug("Could not set up faulthandler file logging", exc_info=True)
