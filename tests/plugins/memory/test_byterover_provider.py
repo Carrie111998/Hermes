@@ -62,6 +62,11 @@ def test_timeout_query_reaches_prefetch_and_tool_query(monkeypatch):
     assert [kwargs["timeout"] for _, kwargs in calls] == [17.5, 17.5]
 
 
+def test_prefetch_keeps_runtime_docstring():
+    assert ByteRoverMemoryProvider.prefetch.__doc__ is not None
+    assert "default 10s" in ByteRoverMemoryProvider.prefetch.__doc__
+
+
 def test_timeout_query_schema_registers_default_and_bounds():
     provider = ByteRoverMemoryProvider({})
 

@@ -292,9 +292,9 @@ class ByteRoverMemoryProvider(MemoryProvider):
         """Run brv query synchronously before the agent's first LLM call.
 
         Blocks until the query completes (up to the configured timeout_query
-        seconds, default %ds), ensuring the result is available as context
+        seconds, default 10s), ensuring the result is available as context
         before the model is called.
-        """ % _QUERY_TIMEOUT
+        """
         if not query or len(query.strip()) < _MIN_QUERY_LEN:
             return ""
         result = _run_brv(
