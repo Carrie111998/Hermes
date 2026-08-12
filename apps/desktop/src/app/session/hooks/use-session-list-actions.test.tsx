@@ -62,6 +62,14 @@ vi.mock('@/hermes', async importOriginal => ({
   listSidebarSessions: (...args: unknown[]) => listSidebarSessions(...args)
 }))
 
+// #165: the recents exclusion list is the built-in constant merged with the
+// configurable `sessions.exclude_sources` value from config.yaml.
+const useHermesConfigRecord = vi.hoisted(() => vi.fn())
+
+vi.mock('@/app/hooks/use-config-record', () => ({
+  useHermesConfigRecord
+}))
+
 // The refresh only reads the optimistic tombstone set; stub it so we don't pull
 // the whole projects store (gateway / fs / git) into this hook's test.
 const removed = vi.hoisted(() => ({ ids: new Set<string>() }))
@@ -73,6 +81,10 @@ vi.mock('@/store/projects', () => ({
 beforeEach(() => {
   listSidebarSessions.mockReset()
   listAllProfileSessions.mockReset()
+  useHermesConfigRecord.mockReset()
+  // Default: config record present but without sessions.exclude_sources —
+  // exercises the backward-compatible path for every existing test.
+  useHermesConfigRecord.mockReturnValue({ data: {}, isLoading: false })
   removed.ids = new Set()
   setSessions([])
   setCronSessions([])
@@ -224,6 +236,43 @@ describe('refreshSessions batches slices into one request', () => {
         recentsProfile: 'work',
         recentsExclude: expect.arrayContaining(['cron']),
         messagingExclude: expect.arrayContaining(['cron'])
+      })
+    )
+  })
+
+  it('merges config sessions.exclude_sources into the recents exclusion list (#165)', async () => {
+    // Default config ships sessions.exclude_sources: ['a2a'] — the sidebar must
+    // combine it with the built-in SIDEBAR_EXCLUDED_SOURCES constant.
+    useHermesConfigRecord.mockReturnValue({
+      data: { sessions: { exclude_sources: ['a2a'] } },
+      isLoading: false
+    })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listSidebarSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recentsExclude: expect.arrayContaining(['a2a', 'cron', 'kanban', 'subagent', 'tool'])
+      })
+    )
+  })
+
+  it('keeps the built-in exclusions when config sessions.exclude_sources is absent (#165)', async () => {
+    useHermesConfigRecord.mockReturnValue({ data: {}, isLoading: false })
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }))
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect(listSidebarSessions).toHaveBeenCalledWith(
+      expect.objectContaining({
+        recentsExclude: expect.arrayContaining(['cron', 'kanban', 'subagent', 'tool'])
       })
     )
   })

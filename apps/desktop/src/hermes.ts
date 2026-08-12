@@ -653,9 +653,16 @@ export function setSessionPinnedRemote(id: string, pinned: boolean, profile?: st
   })
 }
 
-export function searchSessions(query: string): Promise<SessionSearchResponse> {
+export function searchSessions(
+  query: string,
+  excludeSources: string[] = []
+): Promise<SessionSearchResponse> {
+  const params = new URLSearchParams({ q: query })
+  if (excludeSources.length) {
+    params.set('exclude_sources', excludeSources.join(','))
+  }
   return window.hermesDesktop.api<SessionSearchResponse>({
-    path: `/api/sessions/search?q=${encodeURIComponent(query)}`
+    path: `/api/sessions/search?${params.toString()}`
   })
 }
 

@@ -20,6 +20,7 @@ import {
   listSessions,
   listSidebarSessions,
   resetSidebarBatchCapability,
+  searchSessions,
   setApiRequestProfile,
   speakText,
   transcribeAudio
@@ -461,6 +462,28 @@ describe('Hermes REST helpers', () => {
     expect(api).toHaveBeenCalledWith(
       expect.objectContaining({
         path: '/api/model/options?refresh=1&include_unconfigured=1'
+      })
+    )
+  })
+
+  it('searchSessions passes configured exclude_sources through (#165)', async () => {
+    api.mockResolvedValue({ results: [] })
+    await searchSessions('order cut', ['a2a', 'cron'])
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/sessions/search?q=order+cut&exclude_sources=a2a%2Ccron'
+      })
+    )
+  })
+
+  it('searchSessions omits exclude_sources when none are configured (#165)', async () => {
+    api.mockResolvedValue({ results: [] })
+    await searchSessions('order cut')
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path: '/api/sessions/search?q=order+cut'
       })
     )
   })

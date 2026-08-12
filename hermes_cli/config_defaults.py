@@ -2820,6 +2820,14 @@ DEFAULT_CONFIG = {
         # setting is inert when it isn't. False: never load the extension or
         # serve the cjk index. Bridged to HERMES_CJK_FTS (internal carrier).
         "cjk_fts": True,
+        # Session sources to hide from the desktop sidebar "recent sessions"
+        # list and Cmd+Shift+F session search. Combines with the built-in
+        # SIDEBAR_EXCLUDED_SOURCES (cron/kanban/subagent/tool/messaging);
+        # anything listed here is filtered on top of those. Default excludes
+        # A2A conversations, which are machine-to-machine dispatches, not
+        # interactive chats — the desktop sidebar was getting flooded by them.
+        # Set to [] to show everything the built-in list allows.
+        "exclude_sources": ["a2a"],
         # Slow session-search log threshold in milliseconds: searches at or
         # above it log one INFO line with the routing path taken (fts_cjk /
         # fts5 / trigram / like_scan) so latency regressions stay

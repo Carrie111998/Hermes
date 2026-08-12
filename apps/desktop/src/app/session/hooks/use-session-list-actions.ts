@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 
 import { getCronJobs, listAllProfileSessions, listSidebarSessions, type SessionInfo } from '@/hermes'
+import { useHermesConfigRecord } from '@/app/hooks/use-config-record'
 import { sameCronSignature } from '@/lib/session-signatures'
 import {
   isMessagingSource,
@@ -84,6 +85,18 @@ interface UseSessionListActionsArgs {
  *  wires into the sidebar and refresh effects. */
 export function useSessionListActions({ profileScope }: UseSessionListActionsArgs) {
   const refreshSessionsRequestRef = useRef(0)
+
+  // #165: the sidebar recents list hides the built-in machine sources plus
+  // whatever `sessions.exclude_sources` adds (default ['a2a']). Reading the
+  // config record keeps the exclusion list configurable without code changes.
+  const { data: configRecord } = useHermesConfigRecord()
+
+  const recentsExclude = useMemo(() => {
+    const configExcludes = (
+      configRecord as { sessions?: { exclude_sources?: string[] } } | undefined
+    )?.sessions?.exclude_sources
+    return Array.from(new Set([...SIDEBAR_EXCLUDED_SOURCES, ...(configExcludes ?? [])]))
+  }, [configRecord])
 
   // Messaging-platform sessions as their own slice, fetched separately from
   // local recents so each platform renders a self-managed section and never
@@ -181,7 +194,7 @@ export function useSessionListActions({ profileScope }: UseSessionListActionsArg
       const result = await listSidebarSessions({
         recentsProfile: sessionProfile,
         recentsLimit: limit,
-        recentsExclude: SIDEBAR_EXCLUDED_SOURCES,
+        recentsExclude,
         cronLimit: CRON_SECTION_LIMIT,
         messagingLimit: MESSAGING_SECTION_LIMIT,
         messagingExclude: MESSAGING_EXCLUDED_SOURCES

@@ -24,6 +24,7 @@ import {
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
+import { useHermesConfigRecord } from '@/app/hooks/use-config-record'
 import { useI18n } from '@/i18n'
 import { comboTokens } from '@/lib/keybinds/combo'
 import { resolveProfileColor } from '@/lib/profile-color'
@@ -394,6 +395,16 @@ export function ChatSidebar({
   const searchInputRef = useRef<HTMLInputElement>(null)
   const trimmedQuery = searchQuery.trim()
 
+  // #165: exclude the configured `sessions.exclude_sources` (default ['a2a'])
+  // from full-text session search, matching the sidebar recents list.
+  const { data: searchConfigRecord } = useHermesConfigRecord()
+  const searchExcludeSources = useMemo(() => {
+    const configExcludes = (
+      searchConfigRecord as { sessions?: { exclude_sources?: string[] } } | undefined
+    )?.sessions?.exclude_sources
+    return configExcludes ?? []
+  }, [searchConfigRecord])
+
   // Hotkey (session.focusSearch) → focus the field once it's mounted.
   useEffect(() => {
     const onFocus = () => searchInputRef.current?.focus({ preventScroll: true })
@@ -571,7 +582,7 @@ export function ChatSidebar({
     setSearchPending(true)
 
     const id = window.setTimeout(() => {
-      void searchSessions(trimmedQuery)
+      void searchSessions(trimmedQuery, searchExcludeSources)
         .then(res => {
           if (!cancelled) {
             setServerMatches(res.results)
@@ -589,7 +600,7 @@ export function ChatSidebar({
       cancelled = true
       window.clearTimeout(id)
     }
-  }, [trimmedQuery])
+  }, [trimmedQuery, searchExcludeSources])
 
   const searchResults = useMemo(() => {
     if (!trimmedQuery) {
