@@ -184,6 +184,16 @@ class GatewayKanbanWatchersMixin:
         # task is genuinely done lets the cursor (advanced atomically by
         # claim_unseen_events_for_sub) handle dedup, and any retry-loop
         # event reaches the user.
+        #
+        # `progress` ("still working on it" pings from the dispatcher, see
+        # kanban_db.emit_progress_events) is claimed and delivered alongside
+        # the terminal kinds, but deliberately does NOT live in
+        # TERMINAL_KINDS: that tuple names the events that mean something
+        # happened to the task, and is the natural place a future change
+        # would hang unsubscribe/final-state logic off. A progress ping is the
+        # opposite — proof the task is still alive — and must never end a
+        # subscription or wake the creating agent.
+        NOTIFY_KINDS = TERMINAL_KINDS + ("progress",)
         # Per-subscription send-failure counter. Adapter.send raising
         # means the chat is dead (deleted, bot kicked, etc.) — after N
         # consecutive send failures the sub is dropped so we don't spin
@@ -341,7 +351,7 @@ class GatewayKanbanWatchersMixin:
                                         platform=sub["platform"],
                                         chat_id=sub["chat_id"],
                                         thread_id=sub.get("thread_id") or "",
-                                        kinds=TERMINAL_KINDS,
+                                        kinds=NOTIFY_KINDS,
                                     )
                                     if not events:
                                         continue
@@ -479,6 +489,54 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("status"):
                                 new_status = str(ev.payload["status"])
                             msg = f"🔄 {board_tag}{tag}Kanban {sub['task_id']} → {new_status}"
+                        elif kind == "progress":
+                            # "Still working on it" ping while the task runs.
+                            # Plain English on purpose: this one goes out
+                            # repeatedly to a human who just wants to know the
+                            # thing didn't die, so no IDs, no status codes.
+                            if task is not None and task.status != "running":
+                                # The task finished between the dispatcher
+                                # emitting this ping and us delivering it. Its
+                                # completion message is already out (or right
+                                # behind this event in the same claim), so a
+                                # "still working" line here would contradict
+                                # it. Drop the message; the cursor still
+                                # advances past the event.
+                                continue
+                            payload = ev.payload or {}
+                            progress_title = str(
+                                payload.get("title") or title
+                            )[:120]
+                            who_progress = (
+                                payload.get("assignee")
+                                or (task.assignee if task else "")
+                            )
+                            as_who = (
+                                f" (running as {who_progress})"
+                                if who_progress else ""
+                            )
+                            try:
+                                minutes = int(payload["elapsed_minutes"])
+                            except (KeyError, TypeError, ValueError):
+                                minutes = None
+                            if minutes is None:
+                                elapsed_phrase = "still going"
+                            elif minutes < 1:
+                                elapsed_phrase = "less than a minute in"
+                            elif minutes == 1:
+                                elapsed_phrase = "about 1 minute in"
+                            else:
+                                elapsed_phrase = f"about {minutes} minutes in"
+                            note = payload.get("note")
+                            update = (
+                                f"Latest update: {str(note)[:200]}"
+                                if note else "No status update yet."
+                            )
+                            msg = (
+                                f"⏳ {board_tag}Still working on "
+                                f"{progress_title}{as_who} — {elapsed_phrase}."
+                                f"\n{update}"
+                            )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the
                             # recurrence limit and was routed to `triage` for a
@@ -1111,6 +1169,29 @@ class GatewayKanbanWatchersMixin:
             )
             stale_timeout_seconds = 0
 
+        # Read progress_notify_interval_seconds — how often a still-running
+        # task pings its subscribers with a "still working on it" message.
+        # 0 (or an unparseable value) disables progress pings entirely; the
+        # check is then skipped outright, so an install that doesn't want
+        # them pays nothing for the feature.
+        raw_progress = kanban_cfg.get("progress_notify_interval_seconds", 0)
+        try:
+            progress_interval_seconds = int(raw_progress or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.progress_notify_interval_seconds=%r; "
+                "disabling progress pings",
+                raw_progress,
+            )
+            progress_interval_seconds = 0
+        if progress_interval_seconds < 0:
+            logger.warning(
+                "kanban dispatcher: kanban.progress_notify_interval_seconds=%r is "
+                "negative; disabling progress pings",
+                raw_progress,
+            )
+            progress_interval_seconds = 0
+
         # kanban.reconcile_orphans (config.yaml, default true): each tick,
         # requeue 'running' cards whose claim bookkeeping is broken (no
         # valid claim, dead/gone worker) — the zombie-card reconciliation
@@ -1244,7 +1325,7 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
-                return _kb.dispatch_once(
+                result = _kb.dispatch_once(
                     conn,
                     board=slug,
                     max_spawn=max_spawn,
@@ -1255,6 +1336,29 @@ class GatewayKanbanWatchersMixin:
                     max_in_progress_per_profile=max_in_progress_per_profile,
                     reconcile_orphans=reconcile_orphans,
                 )
+                # Progress pings ride the same tick and the same connection
+                # as dispatch: the running set was just reconciled, so this
+                # sees the freshest possible view of what's actually alive.
+                # Isolated in its own try — a cosmetic "still working"
+                # notification must never take down real dispatch work.
+                if progress_interval_seconds > 0:
+                    try:
+                        pinged = _kb.emit_progress_events(
+                            conn, progress_interval_seconds, board=slug,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "kanban dispatcher: progress ping failed on board %s",
+                            slug,
+                        )
+                    else:
+                        if pinged:
+                            logger.info(
+                                "kanban dispatcher [%s]: progress ping for %d "
+                                "running task(s): %s",
+                                slug, len(pinged), pinged,
+                            )
+                return result
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
                     disabled_corrupt_boards[slug] = (fingerprint, time.monotonic())
