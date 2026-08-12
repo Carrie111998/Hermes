@@ -55,6 +55,19 @@ def _attach_agent(
 
 
 class TestCLIStatusBar:
+    def test_weekly_plan_usage_shows_used_and_remaining_when_enabled(self):
+        cli_obj = _make_cli(model="openai-codex/gpt-5.4")
+        cli_obj._plan_usage_visible = True
+        cli_obj._status_usage_snapshot = SimpleNamespace(
+            windows=(SimpleNamespace(label="Weekly", used_percent=37.0),)
+        )
+        cli_obj._status_usage_lock = MagicMock()
+        cli_obj._status_usage_refreshing = True
+
+        text = cli_obj._build_status_bar_text(width=120)
+
+        assert "weekly 37% used · 63% left" in text
+
     def test_session_title_is_right_aligned_after_it_is_queued(self):
         cli_obj = _make_cli()
         cli_obj._pending_title = "weekly-digest"

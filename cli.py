@@ -5231,6 +5231,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Battery read-out in the status bar (toggled via /battery, off by
         # default). Persisted to display.battery so it survives restarts.
         self._battery_visible = bool(CLI_CONFIG["display"].get("battery", False))
+        # Weekly provider-plan usage read-out (toggled via /planusage, off by
+        # default). Persisted to display.plan_usage so users can opt in.
+        self._plan_usage_visible = bool(CLI_CONFIG["display"].get("plan_usage", False))
         # Cached provider-plan usage for the status bar. Refresh asynchronously;
         # quota requests must never block prompt_toolkit repaints.
         self._status_usage_snapshot = None
@@ -5948,8 +5951,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         }
 
         try:
-            self._maybe_refresh_status_usage()
-            usage = getattr(self, "_status_usage_snapshot", None)
+            if getattr(self, "_plan_usage_visible", False):
+                self._maybe_refresh_status_usage()
+            usage = (
+                getattr(self, "_status_usage_snapshot", None)
+                if getattr(self, "_plan_usage_visible", False)
+                else None
+            )
             if usage is not None:
                 labels = []
                 for window in tuple(getattr(usage, "windows", ()) or ()):
@@ -5957,8 +5965,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if used is None:
                         continue
                     remaining = max(0, min(100, round(100 - float(used))))
-                    short = "S" if getattr(window, "label", "") == "Session" else "W"
-                    labels.append(f"{short} {remaining}%")
+                    if getattr(window, "label", "") == "Weekly":
+                        labels.append(f"weekly {round(float(used))}% used · {remaining}% left")
                 snapshot["plan_usage_label"] = "plan " + " · ".join(labels) if labels else ""
         except Exception:
             pass
@@ -11477,6 +11485,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_diff_command(cmd_original)
         elif canonical == "battery":
             self._handle_battery_command(cmd_original)
+        elif canonical == "planusage":
+            parts = (cmd_original or "").split()
+            arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            if arg in ("status", "show"):
+                state = "on" if self._plan_usage_visible else "off"
+                self._console_print(f"  Weekly plan usage indicator {state}")
+            elif arg in ("on", "true", "yes"):
+                self._plan_usage_visible = True
+                save_config_value("display.plan_usage", True)
+                self._console_print("  Weekly plan usage indicator on")
+            elif arg in ("off", "false", "no"):
+                self._plan_usage_visible = False
+                save_config_value("display.plan_usage", False)
+                self._console_print("  Weekly plan usage indicator off")
+            elif arg in ("", "toggle"):
+                self._plan_usage_visible = not self._plan_usage_visible
+                save_config_value("display.plan_usage", self._plan_usage_visible)
+                state = "on" if self._plan_usage_visible else "off"
+                self._console_print(f"  Weekly plan usage indicator {state}")
+            else:
+                self._console_print("  Usage: /planusage [on|off|status]")
         elif canonical == "timestamps":
             self._handle_timestamps_command(cmd_original)
         elif canonical == "verbose":
