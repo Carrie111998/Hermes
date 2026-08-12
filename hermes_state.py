@@ -8624,20 +8624,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if row is not None:
                     best = current
 
-                # Walk to the most-recently-started child — but skip explicit
-                # branch (`_branched_from`), delegate/subagent (`_delegate_from`),
-                # and tool children. They also carry a ``parent_session_id`` yet
-                # are NOT compression continuations; following them would hijack
-                # the resume target to an unrelated session (e.g. a subagent
-                # run). This mirrors the child-exclusion in ``get_compression_tip``.
+                # Walk to the most-recently-started child — but only descend
+                # through a parent that is either still live (``end_reason`` NULL)
+                # or a compression continuation (``end_reason='compression'``).
+                # A parent that ended at a *deliberate* conversation boundary
+                # — ``/new``/``/reset`` (``session_reset``), ``/resume`` switch
+                # (``session_switch``), or an idle/daily expiry — forks a FRESH
+                # child that still carries ``parent_session_id`` but must NOT be
+                # resumed into: following it hijacks ``/resume <old>`` to the
+                # latest reset descendant (#84284). Also skip explicit branch
+                # (`_branched_from`), delegate/subagent (`_delegate_from`), and
+                # tool children, mirroring ``get_compression_tip``.
                 try:
                     child_row = self._conn.execute(
-                        "SELECT id FROM sessions "
-                        "WHERE parent_session_id = ? "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL "
-                        "  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL "
-                        "  AND COALESCE(source, '') != 'tool' "
-                        "ORDER BY started_at DESC, id DESC LIMIT 1",
+                        "SELECT child.id FROM sessions child "
+                        "JOIN sessions parent ON parent.id = child.parent_session_id "
+                        "WHERE child.parent_session_id = ? "
+                        "  AND (parent.end_reason IS NULL OR parent.end_reason = 'compression') "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._branched_from') IS NULL "
+                        "  AND json_extract(COALESCE(child.model_config, '{}'), '$._delegate_from') IS NULL "
+                        "  AND COALESCE(child.source, '') != 'tool' "
+                        "ORDER BY child.started_at DESC, child.id DESC LIMIT 1",
                         (current,),
                     ).fetchone()
                 except Exception:

@@ -10,6 +10,7 @@ used to load zero rows and show a blank chat.
 and redirects to the first descendant that actually has messages. These
 tests pin that behaviour.
 """
+
 import time
 
 import pytest
@@ -42,14 +43,6 @@ def test_returns_self_when_only_parent_has_messages(db):
     assert db.resolve_resume_session_id("root") == "root"
 
 
-
-
-
-
-
-
-
-
 def test_walks_from_middle_of_chain(db):
     # If the user happens to know an intermediate ID, we still find the msg-bearing descendant.
     _make_chain(db, [("a", None), ("b", "a"), ("c", "b"), ("d", "c")])
@@ -77,28 +70,76 @@ def test_follows_compression_tip_when_parent_retains_messages(db):
     # at/after the parent's ended_at (the get_compression_tip discriminator).
     conn = db._conn
     assert conn is not None
-    conn.execute("UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = 'root'", (base, base + 50))
+    conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = 'root'",
+        (base, base + 50),
+    )
     conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'cont'", (base + 100,))
     conn.commit()
 
     assert db.resolve_resume_session_id("root") == "cont"
 
 
-
-
 def test_prefers_most_recent_child_when_fork_exists(db):
     # If a session was somehow forked (two children), pick the latest one.
     # In practice, compression only produces single-chain shape, but the helper
     # should degrade gracefully.
-    _make_chain(db, [
-        ("parent", None),
-        ("older_fork", "parent"),
-        ("newer_fork", "parent"),
-    ])
+    _make_chain(
+        db,
+        [
+            ("parent", None),
+            ("older_fork", "parent"),
+            ("newer_fork", "parent"),
+        ],
+    )
     db.append_message("newer_fork", role="user", content="x")
     assert db.resolve_resume_session_id("parent") == "newer_fork"
 
 
+def test_does_not_follow_session_reset_child(db):
+    # Regression for #84284: `/new` (and `/reset`) end the current session with
+    # end_reason='session_reset' and fork a FRESH child linked by
+    # parent_session_id. resolve_resume_session_id must NOT walk that reset
+    # boundary — `/resume <A>` should reload A, not hijack to the latest reset
+    # descendant that happens to have messages.
+    _make_chain(db, [("A", None), ("B", "A")])
+    db.append_message("A", role="user", content="in A")
+    db.append_message("B", role="user", content="in B (new session)")
+    db.end_session("A", "session_reset")
+
+    assert db.resolve_resume_session_id("A") == "A"
 
 
+def test_does_not_follow_session_switch_or_expiry_child(db):
+    # The same fresh-fork problem applies to `/resume` switches
+    # (end_reason='session_switch') and idle/daily auto-expiries — any
+    # deliberate boundary forks a fresh child that must not be resumed into.
+    for boundary in ("session_switch", "idle", "daily"):
+        parent = f"A_{boundary}"
+        child = f"B_{boundary}"
+        db.create_session(parent, source="cli")
+        db.create_session(child, source="cli", parent_session_id=parent)
+        db.append_message(parent, role="user", content="in A")
+        db.append_message(child, role="user", content="in B")
+        db.end_session(parent, boundary)
+        assert db.resolve_resume_session_id(parent) == parent, boundary
 
+
+def test_still_follows_compression_child_after_fix(db):
+    # The fix must not regress the compression-continuation walk: a parent
+    # ended with end_reason='compression' is still followed forward.
+    base = int(time.time()) - 10_000
+    db.create_session("root", source="cli")
+    db.append_message("root", role="user", content="pre")
+    db.end_session("root", "compression")
+    db.create_session("cont", source="cli", parent_session_id="root")
+    db.append_message("cont", role="assistant", content="post")
+    conn = db._conn
+    conn.execute(
+        "UPDATE sessions SET started_at = ?, ended_at = ? WHERE id = 'root'",
+        (base, base + 50),
+    )
+    conn.execute("UPDATE sessions SET started_at = ? WHERE id = 'cont'", (base + 100,))
+    conn.commit()
+
+    assert db.resolve_resume_session_id("root") == "cont"
