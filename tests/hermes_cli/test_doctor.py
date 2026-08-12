@@ -1574,12 +1574,21 @@ def test_npm_audit_fix_hint_avoids_crashing_workspace_flag(monkeypatch, tmp_path
     # ... and it must not point at the root-level form either: npm can crash
     # there too with `isDescendantOf` on this monorepo tree.
     assert "npm audit fix" not in out
-    # ... and explains the workspace advisories are build-time tooling whose
-    # manual remediation may hit a known npm arborist crash, so the user isn't
-    # left thinking a crashing command means a broken Hermes install.
-    assert "build-time tooling" in out
+    # ... and it must still explain that a crashing manual remediation is a known
+    # npm arborist bug, so the user isn't left thinking it means a broken Hermes
+    # install, plus how to actually remediate (bump + re-resolve the lockfile).
     assert "known npm bug" in out
-    assert "lockfile bump" in out
+    assert "lockfile" in out
+
+    # Doctor must NOT blanket-label the workspace block "build-time tooling".
+    # The 2026-08-11 triage of this output found genuine runtime advisories in
+    # the set — react-router-dom (GHSA-qwww-vcr4-c8h2, ships to the browser) in
+    # `web` and a direct `undici` dependency in `ui-tui`. That blanket label is
+    # precisely why they sat untriaged, so it is a regression to reintroduce it.
+    assert "build-time tooling" not in out
+    # Instead it points at the per-workspace detection command so each advisory
+    # gets classified rather than dismissed as a group.
+    assert "npm audit --json --workspace web" in out
 
 
 class TestDoctorDeprecatedConfigAndEnv:
