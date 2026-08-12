@@ -540,6 +540,208 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    @pytest.mark.parametrize(
+        "shebang",
+        [
+            "#!/usr/bin/env python3",
+            "#!/usr/bin/env -S -u PYTHONPATH python3 -I",
+            "#!/usr/bin/env --unset PYTHONPATH python3",
+            "#!/usr/bin/python3",
+        ],
+    )
+    def test_safe_executable_python_shebang_script_passes_through(
+        self, monkeypatch, tmp_path, shebang
+    ):
+        """Python source must not be shell-tokenized as executable commands.
+
+        A safe Python wrapper containing an absolute directory literal used to
+        be rejected because the shell walker treated that literal as a nested
+        script path; opening the directory then failed closed as non-regular.
+        """
+        import tools.terminal_tool as tt
+
+        calls = []
+        script = tmp_path / "safe-wrapper"
+        script.write_text(
+            f"{shebang}\n"
+            "from pathlib import Path\n"
+            'ROOT = Path("/home/pistomat/rack")\n'
+            'print("safe")\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "safe", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+        command = f"{script} --dry-run"
+
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        assert calls == [command]
+
+    def test_executable_python_shebang_lifecycle_command_stays_blocked(
+        self, monkeypatch, tmp_path
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "unsafe-wrapper"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            'import os\nos.system("hermes gateway restart")\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=str(script)))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    @pytest.mark.parametrize(
+        "python_body",
+        [
+            'import os\nos.system("launchctl submit -l com.example.helper -- /bin/true")\n',
+            "import subprocess\n"
+            'subprocess.run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "import subprocess\n"
+            'subprocess.run(args=["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "import subprocess\n"
+            'subprocess.run(["neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true"], executable="/bin/launchctl")\n',
+            "import os\n"
+            'os.execle("/bin/launchctl", "neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            "from os import execlpe as launch\n"
+            'launch("launchctl", "neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+            "import os\n"
+            'os.execv("/bin/launchctl", ["neutral-name", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "from subprocess import *\n"
+            'run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "from os import *\n"
+            'execle("/bin/launchctl", "launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true", {})\n',
+        ],
+    )
+    def test_executable_python_shebang_neutral_launchctl_submit_stays_blocked(
+        self, monkeypatch, tmp_path, python_body
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / "unsafe-wrapper"
+        script.write_text(
+            "#!/usr/bin/env python3\n" + python_body,
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=str(script)))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("source", "expected"),
+        [
+            (
+                'import os\nos.execle("/bin/launchctl", "neutral-name", "submit", "-l", "com.example.helper", {})\n',
+                "/bin/launchctl submit -l com.example.helper",
+            ),
+            (
+                'from os import execlpe as launch\nlaunch("launchctl", "neutral-name", "submit", "-l", "com.example.helper", {})\n',
+                "launchctl submit -l com.example.helper",
+            ),
+            (
+                'import os\nos.execv("/bin/launchctl", ["neutral-name", "submit", "-l", "com.example.helper"])\n',
+                "/bin/launchctl submit -l com.example.helper",
+            ),
+        ],
+    )
+    def test_python_exec_payload_uses_real_executable_not_argv0(
+        self, source, expected
+    ):
+        from cron.lifecycle_guard import _iter_python_command_payloads
+
+        assert list(_iter_python_command_payloads(source)) == [expected]
+
+    def test_python_shell_walk_keeps_nonregular_forced_shell_reference_fail_closed(
+        self, monkeypatch, tmp_path
+    ):
+        import cron.lifecycle_guard as lg
+        import tools.terminal_tool as tt
+
+        fifo = tmp_path / "ops.fifo"
+        os.mkfifo(fifo)
+        script = tmp_path / "unsafe-wrapper"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            'os.system("""\n'
+            f"bash {fifo}\n"
+            '""")\n',
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        self._patch_env(monkeypatch, self._make_fake_env(), inside_gateway=True)
+        monkeypatch.setattr(lg, "_iter_python_command_payloads", lambda _text: iter(()))
+
+        result = json.loads(tt.terminal_tool(command=str(script)))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
+    @pytest.mark.parametrize(
+        ("name", "source", "command_factory"),
+        [
+            (
+                "forced.py",
+                "#!/usr/bin/env python3\n./inner.sh\n",
+                lambda script: f"/bin/bash {script}",
+            ),
+            (
+                "extensionless-shell",
+                "#!/bin/sh # python3 is mentioned only in a comment\n./inner.sh\n",
+                str,
+            ),
+        ],
+    )
+    def test_shell_execution_is_not_misclassified_as_python(
+        self, monkeypatch, tmp_path, name, source, command_factory
+    ):
+        import tools.terminal_tool as tt
+
+        script = tmp_path / name
+        inner = tmp_path / "inner.sh"
+        script.write_text(source, encoding="utf-8")
+        inner.write_text(
+            "#!/bin/sh\nhermes gateway stop\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o700)
+        inner.chmod(0o700)
+
+        class _FakeEnv:
+            env = {}
+            cwd = str(tmp_path)
+
+            def execute(self, command, **kwargs):  # pragma: no cover
+                raise AssertionError("execute must not be reached")
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=command_factory(script)))
+
+        assert result["exit_code"] == 1
+        assert "Blocked" in result["error"]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt
@@ -675,6 +877,27 @@ class TestLifecycleGuardModule:
         script.write_text('import os\nos.system("hermes gateway restart")\n', encoding="utf-8")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("clean prompt", str(script))
+
+    @pytest.mark.parametrize(
+        "python_body",
+        [
+            "import subprocess\n"
+            'subprocess.run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+            "import subprocess as sp\n"
+            'sp.run(["launchctl", "bootstrap", "gui/501", "/tmp/helper.plist"])\n',
+            "from subprocess import *\n"
+            'run(["launchctl", "submit", "-l", "com.example.helper", "--", "/bin/true"])\n',
+        ],
+    )
+    def test_python_cron_script_process_api_lifecycle_command_blocks(
+        self, tmp_path, python_body
+    ):
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        script = tmp_path / "unsafe.py"
+        script.write_text(python_body, encoding="utf-8")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("daily", str(script))
 
     def test_absolute_path_binary_does_not_crash_guard(self):
         """#76762: a terminal command invoking a binary by absolute path
