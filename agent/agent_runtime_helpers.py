@@ -3826,83 +3826,87 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             elif isinstance(tc, dict):
                 tc["function"] = {"name": _EMPTY_NAME_SENTINEL, "arguments": "{}"}
 
-    assistant_call_variants: List[tuple[Any, frozenset[str]]] = []
-    surviving_call_ids: set[str] = set()
-    for msg in messages:
+    # --- Enforce positional tool_call <-> tool-result pairing ---
+    # Strict OpenAI-compatible providers require every assistant tool_calls
+    # message to be immediately followed by a contiguous run of tool results
+    # covering every declared call. A global id-presence check is insufficient:
+    # compaction or replay can repeat a call id whose only result is historical,
+    # so that old result masks a positionally unanswered replay (#94704).
+    #
+    # Walk one assistant/result transaction at a time. Match through the shared
+    # variant helpers so ``id``, ``call_id``, ``response_item_id`` and composite
+    # bridge spellings remain equivalent (#55626, #63000, #93251).
+    paired: List[Dict[str, Any]] = []
+    removed_positional_orphans = 0
+    added_positional_stubs = 0
+    index = 0
+    while index < len(messages):
+        msg = messages[index]
         if msg.get("role") != "assistant":
+            if msg.get("role") == "tool" and tool_result_id_variants(
+                msg.get("tool_call_id")
+            ):
+                removed_positional_orphans += 1
+            else:
+                paired.append(msg)
+            index += 1
             continue
-        for tc in msg.get("tool_calls") or []:
-            # A tool_call may carry SEVERAL equivalent id spellings (``id``
-            # fc_..., ``call_id`` call_..., ``response_item_id``, or a
-            # composite ``call|item`` bridge id). ``_get_tool_call_id_static``
-            # returns only the preferred one, but a tool result keyed on any
-            # OTHER spelling would then look orphaned and get dropped +
-            # replaced with a bogus "[Result unavailable]" stub — silently
-            # eating a perfectly valid tool result (#55626, #63000). Register
-            # EVERY variant so a result matching any of them survives.
-            variants = tool_call_id_variants(tc)
-            if variants:
-                assistant_call_variants.append((tc, variants))
-                surviving_call_ids.update(variants)
 
-    result_entries = [
-        (msg, tool_result_id_variants(msg.get("tool_call_id")))
-        for msg in messages
-        if msg.get("role") == "tool"
-    ]
-
-    # 1. Drop tool results whose complete alias set matches no assistant call.
-    orphaned_result_objects = {
-        id(msg)
-        for msg, variants in result_entries
-        if variants and not (variants & surviving_call_ids)
-    }
-    if orphaned_result_objects:
-        messages = [m for m in messages if id(m) not in orphaned_result_objects]
-        result_entries = [
-            (msg, variants)
-            for msg, variants in result_entries
-            if id(msg) not in orphaned_result_objects
+        paired.append(msg)
+        calls = [
+            (tc, tool_call_id_variants(tc))
+            for tc in msg.get("tool_calls") or []
         ]
-        _ra().logger.debug(
-            "Pre-call sanitizer: removed %d orphaned tool result(s)",
-            len(orphaned_result_objects),
-        )
+        matched_calls: set[int] = set()
+        cursor = index + 1
+        while cursor < len(messages) and messages[cursor].get("role") == "tool":
+            result = messages[cursor]
+            result_variants = tool_result_id_variants(result.get("tool_call_id"))
+            if not result_variants:
+                # Preserve legacy/provider-specific tool rows with no usable id;
+                # the existing sanitizer deliberately treated these as opaque.
+                paired.append(result)
+            else:
+                candidates = [
+                    call_index
+                    for call_index, (_, call_variants) in enumerate(calls)
+                    if call_index not in matched_calls
+                    and call_variants
+                    and call_variants & result_variants
+                ]
+                if candidates:
+                    matched_calls.add(candidates[0])
+                    paired.append(result)
+                else:
+                    removed_positional_orphans += 1
+            cursor += 1
 
-    # 2. Inject one stub per assistant call with no result on ANY alias.
-    surviving_result_variants = [
-        variants for _, variants in result_entries if variants
-    ]
-    missing_tool_calls = [
-        tc
-        for tc, variants in assistant_call_variants
-        if not any(variants & result_variants for result_variants in surviving_result_variants)
-    ]
-    if missing_tool_calls:
-        missing_tool_call_objects = {id(tc) for tc in missing_tool_calls}
-        patched: List[Dict[str, Any]] = []
-        for msg in messages:
-            patched.append(msg)
-            if msg.get("role") == "assistant":
-                for tc in msg.get("tool_calls") or []:
-                    if id(tc) not in missing_tool_call_objects:
-                        continue
-                    cid = coalesce_tool_call_id(tc)
-                    if not cid:
-                        variants = tool_call_id_variants(tc)
-                        cid = sorted(variants)[0] if variants else ""
-                    if not cid:
-                        continue
-                    patched.append({
-                        "role": "tool",
-                        "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                        "content": "[Result unavailable — see context summary above]",
-                        "tool_call_id": cid,
-                    })
-        messages = patched
+        for call_index, (tc, variants) in enumerate(calls):
+            if call_index in matched_calls or not variants:
+                continue
+            cid = coalesce_tool_call_id(tc) or sorted(variants)[0]
+            paired.append({
+                "role": "tool",
+                "name": _ra().AIAgent._get_tool_call_name_static(tc),
+                "content": "[Result unavailable — see context summary above]",
+                "tool_call_id": cid,
+            })
+            added_positional_stubs += 1
+
+        index = cursor
+
+    if removed_positional_orphans or added_positional_stubs:
+        messages = paired
+    if removed_positional_orphans:
         _ra().logger.debug(
-            "Pre-call sanitizer: added %d stub tool result(s)",
-            len(missing_tool_calls),
+            "Pre-call sanitizer: removed %d positionally orphaned tool result(s)",
+            removed_positional_orphans,
+        )
+    if added_positional_stubs:
+        _ra().logger.debug(
+            "Pre-call sanitizer: added %d stub result(s) for positionally "
+            "unanswered tool call(s)",
+            added_positional_stubs,
         )
 
     # 3. Deduplicate tool_call_ids. Strict providers (DeepSeek) reject a
