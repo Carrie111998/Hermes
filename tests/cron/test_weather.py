@@ -39,6 +39,15 @@ def test_missing_location_is_non_blocking():
     assert "config.yaml" in result
 
 
+def test_null_location_is_non_blocking():
+    with patch("cron.weather._weather_config", return_value={"weather_location": None}), \
+         patch("cron.weather._request_json") as request:
+        result = fetch_morning_brief_weather()
+
+    assert result.startswith("WEATHER_UNAVAILABLE:")
+    request.assert_not_called()
+
+
 def test_upstream_failure_retries_then_returns_non_blocking_marker():
     with patch("cron.weather._weather_config", return_value={"weather_location": "Taipei"}), \
          patch("cron.weather._request_json", side_effect=OSError("network down")) as request, \
