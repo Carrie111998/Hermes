@@ -1478,11 +1478,7 @@ class _CodexCompletionsAdapter:
                     # to the default rather than being forwarded to the
                     # Codex backend, which rejects e.g. {"effort": null}
                     # with a 400.
-                    effort = reasoning_cfg.get("effort") or "medium"
-                    # Codex backend rejects "minimal"; clamp to "low" to
-                    # match the main-agent Codex transport behavior.
-                    if effort == "minimal":
-                        effort = "low"
+                    effort = reasoning_cfg.get("effort") or "high"
                     resp_kwargs["reasoning"] = {
                         "effort": effort,
                         "summary": "auto",
@@ -8323,7 +8319,7 @@ def _build_call_kwargs(
         if reasoning_config.get("enabled") is False:
             merged_extra["reasoning"] = {"enabled": False}
         else:
-            effort = reasoning_config.get("effort") or "medium"
+            effort = reasoning_config.get("effort") or "high"
             merged_extra["reasoning"] = {"enabled": True, "effort": effort}
     # Portal product tags + sticky session_id. The provider profile usually
     # supplies both; this fallback covers profile-load failures and alias

@@ -177,7 +177,7 @@ class OpenRouterProfile(ProviderProfile):
             elif reasoning_config is not None:
                 extra_body["reasoning"] = dict(reasoning_config)
             else:
-                extra_body["reasoning"] = {"enabled": True, "effort": "medium"}
+                extra_body["reasoning"] = {"enabled": True, "effort": "high"}
 
         # Same resolution as build_extra_body: xAI's prompt cache is pinned per
         # backend server via this header, and aux calls pass no session_id, so

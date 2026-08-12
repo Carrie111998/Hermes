@@ -1326,7 +1326,7 @@ class TestBuildApiKwargs:
         kwargs = agent._build_api_kwargs(messages)
         reasoning = kwargs["extra_body"]["reasoning"]
         assert reasoning["enabled"] is True
-        assert reasoning["effort"] == "medium"
+        assert reasoning["effort"] == "high"
 
 
     def test_reasoning_not_sent_for_unsupported_openrouter_model(self, agent):
@@ -1353,19 +1353,19 @@ class TestBuildApiKwargs:
             supports_reasoning=True,
             provider_profile=profile,
         )
-        assert kwargs["extra_body"]["reasoning"] == {"effort": "medium"}
+        assert kwargs["extra_body"]["reasoning"] == {"effort": "high"}
 
 
-    def test_core_responses_preserves_supported_xhigh(self, agent, monkeypatch):
-        """The core GitHub Responses path must preserve a supported xhigh."""
+    def test_core_responses_preserves_supported_max(self, agent, monkeypatch):
+        """The core GitHub Responses path must preserve a supported max."""
         monkeypatch.setattr(
             "hermes_cli.models.github_model_reasoning_efforts",
-            lambda _model: ["none", "low", "medium", "high", "xhigh"],
+            lambda _model: ["none", "low", "high", "max"],
         )
         agent.model = "gpt-5.5"
-        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        agent.reasoning_config = {"enabled": True, "effort": "max"}
 
-        assert agent._github_models_reasoning_extra_body() == {"effort": "xhigh"}
+        assert agent._github_models_reasoning_extra_body() == {"effort": "max"}
 
 
 

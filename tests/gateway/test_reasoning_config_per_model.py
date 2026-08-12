@@ -15,9 +15,9 @@ class TestGatewayPerModelReasoningConfig:
         fake_cfg = {
             "model": {"default": "anthropic/claude-opus-4.5"},
             "agent": {
-                "reasoning_effort": "medium",
+                "reasoning_effort": "high",
                 "reasoning_overrides": {
-                    "anthropic/claude-opus-4.5": "xhigh",
+                    "anthropic/claude-opus-4.5": "max",
                 },
             },
         }
@@ -26,7 +26,7 @@ class TestGatewayPerModelReasoningConfig:
         result = gateway_run.GatewayRunner._load_reasoning_config()
         assert result is not None
         assert result["enabled"] is True
-        assert result["effort"] == "xhigh"
+        assert result["effort"] == "max"
 
 
     def test_global_fallback_with_yaml_false(self, monkeypatch):
@@ -62,10 +62,10 @@ class TestGatewaySessionEffectiveModel:
         fake_cfg = {
             "model": {"default": "gpt-5"},
             "agent": {
-                "reasoning_effort": "medium",
+                "reasoning_effort": "high",
                 "reasoning_overrides": {
                     "gpt-5": "low",
-                    "claude-opus-4.5": "xhigh",
+                    "claude-opus-4.5": "max",
                 },
             },
         }
@@ -75,7 +75,7 @@ class TestGatewaySessionEffectiveModel:
         # must win over the config default model's override.
         result = gateway_run.GatewayRunner._load_reasoning_config("claude-opus-4.5")
         assert result is not None
-        assert result["effort"] == "xhigh"
+        assert result["effort"] == "max"
 
         # And without a model arg, the config default's override applies.
         result_default = gateway_run.GatewayRunner._load_reasoning_config()
@@ -100,7 +100,7 @@ class TestApiServerPerModelReasoning:
             "model": {"default": "cheap/model-mini"},
             "agent": {
                 "reasoning_effort": "low",
-                "reasoning_overrides": {"premium/model-max": "xhigh"},
+                "reasoning_overrides": {"premium/model-max": "max"},
             },
         }
 
@@ -136,7 +136,7 @@ class TestApiServerPerModelReasoning:
         kwargs = self._run(monkeypatch, "premium/model-max")
 
         assert kwargs["model"] == "premium/model-max"
-        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "xhigh"}
+        assert kwargs["reasoning_config"] == {"enabled": True, "effort": "max"}
 
     def test_model_without_an_override_falls_back_to_global(self, monkeypatch):
         kwargs = self._run(monkeypatch, "cheap/model-mini")

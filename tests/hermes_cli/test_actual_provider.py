@@ -211,7 +211,8 @@ def test_actual_codex_transport_clamps_reasoning_effort():
     from agent.transports.codex import ResponsesApiTransport
 
     t = ResponsesApiTransport()
-    for requested, expected in (("xhigh", "high"), ("ultra", "max"), ("high", "high")):
+    # Actual Computer clamps max→high on SGLang/vLLM backends.
+    for requested, expected in (("max", "high"), ("high", "high"), ("low", "low")):
         kwargs = t.build_kwargs(
             model="glm-5.2-nvfp4",
             messages=[{"role": "user", "content": "hi"}],
@@ -222,15 +223,15 @@ def test_actual_codex_transport_clamps_reasoning_effort():
         )
         assert kwargs["reasoning"]["effort"] == expected, requested
 
-    # Other providers keep the wider values untouched on the generic path.
+    # Other providers keep the values untouched on the generic path.
     kwargs = t.build_kwargs(
         model="some-model",
         messages=[{"role": "user", "content": "hi"}],
         tools=None,
         provider="openai-codex",
-        reasoning_config={"effort": "xhigh"},
+        reasoning_config={"effort": "max"},
     )
-    assert kwargs["reasoning"]["effort"] == "xhigh"
+    assert kwargs["reasoning"]["effort"] == "max"
 
 
 def test_actual_runtime_config_local_base_url_without_key(monkeypatch):

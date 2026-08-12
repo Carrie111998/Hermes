@@ -73,7 +73,7 @@ class OpenCodeGoProfile(ProviderProfile):
             effort = (reasoning_config.get("effort") or "").strip().lower()
             if not effort or effort == "none":
                 return extra_body, top_level
-            top_level["reasoning_effort"] = "max" if effort in {"xhigh", "max", "ultra"} else "high"
+            top_level["reasoning_effort"] = "max" if effort == "max" else "high"
             return extra_body, top_level
 
         if _is_kimi_k2_model(model):
@@ -90,9 +90,7 @@ class OpenCodeGoProfile(ProviderProfile):
                 return extra_body, top_level
 
             effort = (reasoning_config.get("effort") or "").strip().lower()
-            if effort in {"xhigh", "max", "ultra"}:
-                top_level["reasoning_effort"] = "high"
-            elif effort in {"low", "medium", "high"}:
+            if effort in {"low", "high", "max"}:
                 top_level["reasoning_effort"] = effort
 
             # Avoid "cannot specify both 'thinking' and 'reasoning_effort'" HTTP 400:
@@ -114,9 +112,9 @@ class OpenCodeGoProfile(ProviderProfile):
 
         if isinstance(reasoning_config, dict):
             effort = (reasoning_config.get("effort") or "").strip().lower()
-            if effort in {"xhigh", "max", "ultra"}:
+            if effort == "max":
                 top_level["reasoning_effort"] = "max"
-            elif effort in {"low", "medium", "high"}:
+            elif effort in {"low", "high"}:
                 top_level["reasoning_effort"] = effort
 
         # Avoid "cannot specify both 'thinking' and 'reasoning_effort'" HTTP 400:

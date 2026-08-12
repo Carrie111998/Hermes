@@ -234,13 +234,13 @@ def test_reasoning_effort_survives_clearing_the_model(conn):
     tid = kb.create_task(
         conn, title="t", assignee="worker",
         model_override="glm-5", provider_override="openrouter",
-        reasoning_effort="ultra",
+        reasoning_effort="max",
     )
     assert kb.set_model_override(conn, tid, None)
     t = kb.get_task(conn, tid)
     assert t.model_override is None
     assert t.provider_override is None
-    assert t.reasoning_effort == "ultra"
+    assert t.reasoning_effort == "max"
 
 
 def test_reasoning_effort_without_a_model_override(conn):
@@ -281,10 +281,10 @@ def test_patch_sets_and_clears_reasoning_effort(client):
     task = _create(client)
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"reasoning_effort": "xhigh"},
+        json={"reasoning_effort": "max"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["task"]["reasoning_effort"] == "xhigh"
+    assert r.json()["task"]["reasoning_effort"] == "max"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{task['id']}",
@@ -304,8 +304,8 @@ def test_patch_rejects_an_unknown_level(client):
 
 
 def test_create_accepts_reasoning_effort(client):
-    task = _create(client, reasoning_effort="minimal")
-    assert task["reasoning_effort"] == "minimal"
+    task = _create(client, reasoning_effort="low")
+    assert task["reasoning_effort"] == "low"
 
 
 def test_bulk_reasoning_effort(client):

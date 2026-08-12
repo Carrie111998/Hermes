@@ -75,8 +75,6 @@ class KimiProfile(ProviderProfile):
 
         if not reasoning_config or not isinstance(reasoning_config, dict):
             # No config → thinking enabled, let the server pick the depth.
-            # (Previously also sent reasoning_effort="medium", which paired
-            # thinking + effort on every default call.)
             extra_body["thinking"] = {"type": "enabled"}
             return extra_body, top_level
 
@@ -88,7 +86,7 @@ class KimiProfile(ProviderProfile):
         # Enabled: prefer an explicit effort; only fall back to extra_body
         # thinking when no recognized effort is requested.
         effort = (reasoning_config.get("effort") or "").strip().lower()
-        if effort in {"low", "medium", "high"}:
+        if effort in {"low", "high", "max"}:
             top_level["reasoning_effort"] = effort
         else:
             extra_body["thinking"] = {"type": "enabled"}

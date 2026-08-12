@@ -3274,7 +3274,7 @@ def run_conversation(
                             "The model used all its output tokens on reasoning "
                             "and had none left for the actual response.\n\n"
                             "To fix this:\n"
-                            "→ Lower reasoning effort: `/thinkon low` or `/thinkon minimal`\n"
+                            "→ Lower reasoning effort: `/thinkon low`\n"
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
                         agent._cleanup_task_resources(effective_task_id)
@@ -5823,7 +5823,7 @@ def run_conversation(
                         )
                         agent._vprint(
                             f"{agent.log_prefix}      2. Lower `reasoning_budget` or set "
-                            f"`reasoning_effort: medium` on this model if the provider supports it.",
+                            f"`reasoning_effort: low` on this model if the provider supports it.",
                             force=True,
                         )
                         agent._vprint(

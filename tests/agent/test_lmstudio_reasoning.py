@@ -35,7 +35,7 @@ def test_effort_ladder_is_monotonic():
 
 
 
-@pytest.mark.parametrize("effort", ["max", "ultra"])
+@pytest.mark.parametrize("effort", ["max"])
 def test_clamped_effort_is_still_checked_against_allowed_options(effort):
     """A clamped value stays subject to the model's published allowed set.
 

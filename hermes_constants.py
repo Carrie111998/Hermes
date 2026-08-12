@@ -940,15 +940,31 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
 
 
 VALID_REASONING_EFFORTS = (
-    "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    "low", "high", "max",
 )
+
+# Backward-compatible aliases: old effort levels mapped to the new
+# standardized set (low, high, max).  This keeps existing user configs
+# working without silent behavior changes:
+#   minimal → low   (was the weakest thinking level)
+#   medium  → high   (K3 maps medium→high; keeps agentic default behavior)
+#   xhigh   → max    (was above high)
+#   ultra   → max    (was above max)
+_EFFORT_ALIASES: dict[str, str] = {
+    "minimal": "low",
+    "medium": "high",
+    "xhigh": "max",
+    "ultra": "max",
+}
 
 
 def parse_reasoning_effort(effort) -> dict | None:
     """Parse a reasoning effort level into a config dict.
 
-    Valid levels: "none", "minimal", "low", "medium", "high", "xhigh", "max",
-    "ultra".
+    Valid levels: "low", "high", "max".
+    Legacy levels "minimal", "medium", "xhigh", "ultra" are accepted as
+    aliases and mapped to the closest standardized level (see
+    ``_EFFORT_ALIASES``).
     Returns None when the input is empty or unrecognized (caller uses default).
     Returns {"enabled": False} for "none" (aliases: "false", "disabled", and
     YAML boolean False — users write ``reasoning_effort: false``/``off``/``no``
@@ -966,6 +982,8 @@ def parse_reasoning_effort(effort) -> dict | None:
     effort = effort.strip().lower()
     if effort in {"none", "false", "disabled"}:
         return {"enabled": False}
+    # Map legacy effort names to the standardized set.
+    effort = _EFFORT_ALIASES.get(effort, effort)
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
@@ -1152,7 +1170,7 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     if effort and str(effort).strip() and result is None:
         import logging
         logging.getLogger(__name__).warning(
-            "Unknown reasoning_effort '%s', using default (medium)", effort
+            "Unknown reasoning_effort '%s', using default (high)", effort
         )
     return result
 

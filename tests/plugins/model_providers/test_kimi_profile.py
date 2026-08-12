@@ -35,17 +35,12 @@ class TestKimiReasoningWireShape:
     """``build_api_kwargs_extras`` never emits thinking + reasoning_effort together."""
 
     def test_no_config_enables_thinking_without_effort(self, kimi_profile):
-        """No reasoning_config → thinking on, server picks the depth.
-
-        Regression guard: this path previously also sent
-        ``reasoning_effort="medium"``, pairing thinking + effort on every
-        default call.
-        """
+        """No reasoning_config → thinking on, server picks the depth."""
         extra_body, top_level = kimi_profile.build_api_kwargs_extras(reasoning_config=None)
         assert extra_body == {"thinking": {"type": "enabled"}}
         assert top_level == {}
 
-    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    @pytest.mark.parametrize("effort", ["low", "high", "max"])
     def test_explicit_effort_sends_effort_only(self, kimi_profile, effort):
         extra_body, top_level = kimi_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort}
@@ -60,10 +55,10 @@ class TestKimiReasoningWireShape:
         assert extra_body == {"thinking": {"type": "enabled"}}
         assert top_level == {}
 
-    @pytest.mark.parametrize("effort", ["", "garbage", "xhigh", "max"])
+    @pytest.mark.parametrize("effort", ["", "garbage", "minimal", "medium"])
     def test_unrecognized_effort_falls_back_to_thinking(self, kimi_profile, effort):
-        """Unknown/strong efforts aren't in Moonshot's low|medium|high set, so
-        we drop to the thinking toggle rather than sending an invalid effort."""
+        """Efforts not in Moonshot's low|high|max set fall back to the
+        thinking toggle rather than sending an invalid effort."""
         extra_body, top_level = kimi_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort}
         )

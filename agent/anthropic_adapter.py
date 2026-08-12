@@ -3014,14 +3014,14 @@ def build_anthropic_kwargs(
     # 4.6 behavior and preserving the activity-feed UX during long tool runs.
     if reasoning_config and isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is not False and "haiku" not in model.lower():
-            effort = str(reasoning_config.get("effort", "medium")).lower()
-            budget = THINKING_BUDGET.get(effort, 8000)
+            effort = str(reasoning_config.get("effort", "high")).lower()
+            budget = THINKING_BUDGET.get(effort, 16000)
             if _supports_adaptive_thinking(model):
                 kwargs["thinking"] = {
                     "type": "adaptive",
                     "display": "summarized",
                 }
-                adaptive_effort = ADAPTIVE_EFFORT_MAP.get(effort, "medium")
+                adaptive_effort = ADAPTIVE_EFFORT_MAP.get(effort, "high")
                 # Downgrade xhigh→max on models that don't list xhigh as a
                 # supported level (Opus/Sonnet 4.6). Opus 4.7+ keeps xhigh.
                 if adaptive_effort == "xhigh" and not _supports_xhigh_effort(model):

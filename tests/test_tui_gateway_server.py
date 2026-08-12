@@ -6741,7 +6741,7 @@ def test_complete_slash_leaves_argument_stages_alone(monkeypatch):
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
-    (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: high\n", encoding="utf-8")
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
 
@@ -6759,7 +6759,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     assert resp_effort["result"]["value"] == "low"
     assert agent.reasoning_config == {"enabled": True, "effort": "low"}
     assert server._sessions["sid"]["create_reasoning_override"] == {"enabled": True, "effort": "low"}
-    assert server._load_cfg()["agent"]["reasoning_effort"] == "medium"
+    assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
 
     resp_status = server.handle_request(
         {
@@ -6773,7 +6773,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     resp_global_status = server.handle_request(
         {"id": "6", "method": "config.get", "params": {"key": "reasoning"}}
     )
-    assert resp_global_status["result"]["value"] == "medium"
+    assert resp_global_status["result"]["value"] == "high"
 
     del server._sessions["sid"]["create_reasoning_override"]
     agent.reasoning_config = {"enabled": True, "effort": "high"}
@@ -6838,7 +6838,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
 
 def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
-    (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: high\n", encoding="utf-8")
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
     server._sessions["sid"]["create_reasoning_override"] = {"enabled": True, "effort": "low"}

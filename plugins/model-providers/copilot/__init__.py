@@ -34,30 +34,20 @@ class CopilotProfile(ProviderProfile):
 
                 supported_efforts = github_model_reasoning_efforts(model)
                 if supported_efforts and reasoning_config:
-                    effort = reasoning_config.get("effort", "medium")
+                    effort = reasoning_config.get("effort", "high")
                     # Honor the requested level when the live Copilot catalog
-                    # lists it as supported: gpt-5.5/gpt-5.4 DO support
-                    # ``xhigh``. Only downgrade levels the catalog does NOT
-                    # list (e.g. ``xhigh``/``max`` on models capped lower, or
-                    # ``minimal`` where unsupported), choosing the nearest
-                    # weaker supported level rather than forwarding verbatim.
-                    #
-                    # (Previously this unconditionally mapped xhigh->high, a
-                    #  stale guard that silently capped models which do support
-                    #  the higher level.)
+                    # lists it as supported. Only downgrade levels the catalog
+                    # does NOT list, choosing the nearest weaker supported
+                    # level rather than forwarding verbatim.
                     if effort not in supported_efforts:
-                        if effort == "xhigh" and "high" in supported_efforts:
+                        if "high" in supported_efforts:
                             effort = "high"
-                        elif effort == "minimal" and "low" in supported_efforts:
-                            effort = "low"
-                        elif "medium" in supported_efforts:
-                            effort = "medium"
                         else:
                             effort = supported_efforts[0]
                     if effort in supported_efforts:
                         extra_body["reasoning"] = {"effort": effort}
                 elif supported_efforts:
-                    extra_body["reasoning"] = {"effort": "medium"}
+                    extra_body["reasoning"] = {"effort": "high"}
             except Exception:
                 pass
         return extra_body, {}

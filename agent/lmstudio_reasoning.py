@@ -43,7 +43,7 @@ def resolve_lmstudio_effort(
     than silently substituting a different effort. When ``allowed_options`` is
     falsy (probe failed), skip clamping and send the resolved effort anyway.
     """
-    effort = "medium"
+    effort = "high"
     if reasoning_config and isinstance(reasoning_config, dict):
         if reasoning_config.get("enabled") is False:
             effort = "none"

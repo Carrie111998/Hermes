@@ -2686,11 +2686,11 @@ class TestAnthropicAuxiliaryReasoningTranslation:
         adapter.create(
             model="claude-fable-5",
             messages=[{"role": "user", "content": "hi"}],
-            _reasoning_config={"enabled": True, "effort": "medium"},
+            _reasoning_config={"enabled": True, "effort": "high"},
         )
 
         assert captured["thinking"] == {"type": "adaptive", "display": "summarized"}
-        assert captured["output_config"] == {"effort": "medium"}
+        assert captured["output_config"] == {"effort": "high"}
         assert "extra_body" not in captured
 
     def test_build_call_kwargs_private_reasoning_only_for_anthropic_messages(self):
@@ -2698,25 +2698,25 @@ class TestAnthropicAuxiliaryReasoningTranslation:
             "anthropic",
             "claude-fable-5",
             [{"role": "user", "content": "hi"}],
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url="https://api.anthropic.com/v1",
         )
-        assert anthropic_kwargs["_reasoning_config"] == {"enabled": True, "effort": "medium"}
+        assert anthropic_kwargs["_reasoning_config"] == {"enabled": True, "effort": "high"}
 
         proxy_kwargs = _build_call_kwargs(
             "custom",
             "claude-fable-5",
             [{"role": "user", "content": "hi"}],
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url="https://example.test/anthropic/v1",
         )
-        assert proxy_kwargs["_reasoning_config"] == {"enabled": True, "effort": "medium"}
+        assert proxy_kwargs["_reasoning_config"] == {"enabled": True, "effort": "high"}
 
         openai_wire_kwargs = _build_call_kwargs(
             "custom",
             "gpt-compatible",
             [{"role": "user", "content": "hi"}],
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url="https://example.test/v1",
         )
         assert "_reasoning_config" not in openai_wire_kwargs
@@ -2730,11 +2730,11 @@ class TestAuxiliaryProviderProfileReasoning:
             "kimi-coding",
             "kimi-k2-turbo-preview",
             [{"role": "user", "content": "hi"}],
-            reasoning_config={"enabled": True, "effort": "medium"},
+            reasoning_config={"enabled": True, "effort": "high"},
             base_url="https://api.moonshot.ai/v1",
         )
 
-        assert kwargs["reasoning_effort"] == "medium"
+        assert kwargs["reasoning_effort"] == "high"
         assert "reasoning" not in kwargs.get("extra_body", {})
         assert "thinking" not in kwargs.get("extra_body", {})
 
@@ -2856,9 +2856,9 @@ class TestCodexAdapterReasoningTranslation:
 
 
 
-    def test_reasoning_effort_null_falls_back_to_medium(self):
+    def test_reasoning_effort_null_falls_back_to_high(self):
         """Parity with agent/transports/codex.py::build_kwargs() — falsy
-        ``effort`` (None / empty / 0) keeps the default ``medium`` instead
+        ``effort`` (None / empty / 0) keeps the default ``high`` instead
         of being forwarded to Codex.  Codex rejects ``{"effort": null}``
         with HTTP 400 (Invalid value for parameter `reasoning.effort`)."""
         adapter, captured = self._build_adapter()
@@ -2866,7 +2866,7 @@ class TestCodexAdapterReasoningTranslation:
             messages=[{"role": "user", "content": "hi"}],
             extra_body={"reasoning": {"effort": None}},
         )
-        assert captured.get("reasoning") == {"effort": "medium", "summary": "auto"}
+        assert captured.get("reasoning") == {"effort": "high", "summary": "auto"}
         assert captured.get("include") == ["reasoning.encrypted_content"]
 
 

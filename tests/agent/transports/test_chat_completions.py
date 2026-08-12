@@ -22,7 +22,7 @@ class TestChatCompletionsBasic:
 
 
     @pytest.mark.parametrize("provider", ["nous", "openrouter"])
-    def test_gpt56_ultra_uses_max_wire_effort(self, transport, provider):
+    def test_gpt56_max_uses_max_wire_effort(self, transport, provider):
         from providers import get_provider_profile
 
         profile = get_provider_profile(provider)
@@ -30,7 +30,7 @@ class TestChatCompletionsBasic:
             model="openai/gpt-5.6-sol",
             messages=[{"role": "user", "content": "Hi"}],
             tools=[],
-            reasoning_config={"enabled": True, "effort": "ultra"},
+            reasoning_config={"enabled": True, "effort": "max"},
             supports_reasoning=True,
             provider_profile=profile,
             provider_name=provider,
@@ -198,7 +198,7 @@ class TestChatCompletionsBuildKwargs:
             model="gpt-4o", messages=msgs,
             supports_reasoning=True,
         )
-        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "medium"}
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
 
     def test_nous_omits_disabled_reasoning(self, transport):
         from providers import get_provider_profile

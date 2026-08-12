@@ -286,7 +286,7 @@ class ResponsesApiTransport(ProviderTransport):
         self._last_issuer_kind = issuer_kind
 
         # Resolve reasoning effort
-        reasoning_effort = "medium"
+        reasoning_effort = "high"
         reasoning_enabled = True
         reasoning_config = params.get("reasoning_config")
         if reasoning_config and isinstance(reasoning_config, dict):
@@ -295,19 +295,19 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
-        _effort_clamp = {"minimal": "low"}
+        _effort_clamp = {}
         if "gpt-5.6" in (model or "").lower():
             # Ultra is the Codex product tier; the Responses API wire value is max.
             _effort_clamp["ultra"] = "max"
         if params.get("is_xai_responses", False):
             # xAI Responses tops out at high; keep generic stronger values usable.
-            _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
+            _effort_clamp.update({"max": "high"})
         if (params.get("provider") or "").strip().lower() == "actual":
             # Actual Computer relays to SGLang/vLLM backends that accept only
             # none/low/medium/high/max for reasoning effort — a forwarded
             # xhigh/ultra fails with a wrapped HTTP 400 ("Expecting value:
             # line 1 column 1"). Clamp Hermes' wider set to the supported one.
-            _effort_clamp.update({"xhigh": "high", "ultra": "max"})
+            _effort_clamp.update({"max": "high"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)

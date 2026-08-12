@@ -2907,8 +2907,8 @@ def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> A
     Examples:
         >>> cfg_get({"agent": {"reasoning_effort": "high"}}, "agent", "reasoning_effort")
         'high'
-        >>> cfg_get({}, "agent", "reasoning_effort", default="medium")
-        'medium'
+        >>> cfg_get({}, "agent", "reasoning_effort", default="high")
+        'high'
         >>> cfg_get({"agent": "oops_a_string"}, "agent", "reasoning_effort", default="low")
         'low'
         >>> cfg_get(None, "anything", default=42)

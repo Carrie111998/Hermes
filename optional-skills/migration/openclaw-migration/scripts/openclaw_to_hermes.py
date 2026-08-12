@@ -2457,7 +2457,7 @@ class Migrator:
             if thinking in {"always", "high", "xhigh"}:
                 agent_cfg["reasoning_effort"] = "high"
             elif thinking in {"auto", "medium", "adaptive"}:
-                agent_cfg["reasoning_effort"] = "medium"
+                agent_cfg["reasoning_effort"] = "high"
             elif thinking in {"off", "low", "none", "minimal"}:
                 agent_cfg["reasoning_effort"] = "low"
             changes = True

@@ -139,17 +139,23 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
 
     Accepts any level in ``hermes_constants.VALID_REASONING_EFFORTS`` plus
-    ``"none"`` (thinking disabled), case-insensitively. Empty / None means
-    "inherit the worker profile's own ``agent.reasoning_effort``" and stores
-    NULL. Anything else is rejected rather than silently dropped — a typo'd
-    level must not quietly hand the task back to the profile default.
+    ``"none"`` (thinking disabled), case-insensitively. Legacy aliases
+    (``minimal``, ``medium``, ``xhigh``, ``ultra``) are accepted and mapped
+    to the standardized set. Empty / None means "inherit the worker
+    profile's own ``agent.reasoning_effort``" and stores NULL. Anything
+    else is rejected rather than silently dropped — a typo'd level must
+    not quietly hand the task back to the profile default.
     """
-    from hermes_constants import VALID_REASONING_EFFORTS
+    from hermes_constants import VALID_REASONING_EFFORTS, _EFFORT_ALIASES
 
     value = str(effort or "").strip().lower()
     if not value:
         return None
-    if value == "none" or value in VALID_REASONING_EFFORTS:
+    if value == "none":
+        return value
+    # Map legacy effort names to the standardized set.
+    value = _EFFORT_ALIASES.get(value, value)
+    if value in VALID_REASONING_EFFORTS:
         return value
     allowed = ", ".join(("none", *VALID_REASONING_EFFORTS))
     raise ValueError(

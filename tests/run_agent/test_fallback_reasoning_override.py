@@ -22,21 +22,21 @@ class TestFallbackReasoningOverride:
         """
         from hermes_constants import resolve_per_model_reasoning_effort
 
-        # Simulate: primary was gemini-flash (medium), fallback to claude-opus-4.5 (xhigh)
+        # Simulate: primary was gemini-flash (high), fallback to claude-opus-4.5 (max)
         overrides = {
-            "claude-opus-4.5": "xhigh",
-            "gemini-flash": "medium",
+            "claude-opus-4.5": "max",
+            "gemini-flash": "high",
         }
 
         # Fallback model lookup
         fb_result = resolve_per_model_reasoning_effort("claude-opus-4.5", overrides)
         assert fb_result is not None
-        assert fb_result["effort"] == "xhigh"
+        assert fb_result["effort"] == "max"
 
         # Primary model lookup (for comparison)
         primary_result = resolve_per_model_reasoning_effort("gemini-flash", overrides)
         assert primary_result is not None
-        assert primary_result["effort"] == "medium"
+        assert primary_result["effort"] == "high"
 
         # The key point: fallback result differs from primary
         assert fb_result["effort"] != primary_result["effort"]
@@ -45,7 +45,7 @@ class TestFallbackReasoningOverride:
         """Fallback to a model with no override should resolve to None (→ global)."""
         from hermes_constants import resolve_per_model_reasoning_effort
 
-        overrides = {"claude-opus-4.5": "xhigh"}
+        overrides = {"claude-opus-4.5": "max"}
 
         # Fallback to gpt-5 which has no override
         result = resolve_per_model_reasoning_effort("gpt-5", overrides)
@@ -75,7 +75,7 @@ class TestFallbackReasoningOverride:
             "client_kwargs": {},
             "use_prompt_caching": False,
             "use_native_cache_layout": False,
-            "reasoning_config": {"enabled": True, "effort": "medium"},
+            "reasoning_config": {"enabled": True, "effort": "high"},
             "compressor_model": "gemini-flash",
             "compressor_base_url": "",
             "compressor_api_key": "",
@@ -91,10 +91,10 @@ class TestFallbackReasoningOverride:
         agent._transport_cache = {}
         agent._config_context_length = None
         agent._rate_limited_until = 0
-        # During fallback, reasoning was changed to xhigh (fallback model's override)
+        # During fallback, reasoning was changed to max (fallback model's override)
         agent.model = "claude-opus-4.5"
         agent.provider = "anthropic"
-        agent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+        agent.reasoning_config = {"enabled": True, "effort": "max"}
         agent.context_compressor = MagicMock()
         agent.base_url = ""
         agent._anthropic_prompt_cache_policy = MagicMock(return_value=(False, False))
@@ -103,8 +103,8 @@ class TestFallbackReasoningOverride:
 
         result = restore_primary_runtime(agent)
         assert result is True
-        # reasoning_config should be restored to primary's value (medium)
-        assert agent.reasoning_config == {"enabled": True, "effort": "medium"}
+        # reasoning_config should be restored to primary's value (high)
+        assert agent.reasoning_config == {"enabled": True, "effort": "high"}
 
     def test_fallback_global_fallback_with_yaml_false(self):
         """Fallback global fallback must not coerce YAML boolean False.

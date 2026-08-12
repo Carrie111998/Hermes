@@ -16,11 +16,11 @@ _NON_REASONING_MODEL_MARKERS = ("solar-mini", "syn-pro")
 # When the user hasn't picked a reasoning effort, Hermes passes
 # reasoning_config=None. Solar's own server default is "minimal" (reasoning
 # off), which is the wrong default for an agentic workload. We default reasoning
-# ON at this effort — matching the "medium (default)" that Hermes' /reasoning
+# ON at this effort — matching the "high (default)" that Hermes' /reasoning
 # panel shows for an unset config, so the displayed default and the real wire
 # value agree. An explicit saved setting or a `/reasoning <level>` change is
 # always honored over this default; `/reasoning none` disables it.
-_DEFAULT_REASONING_EFFORT = "medium"
+_DEFAULT_REASONING_EFFORT = "high"
 
 
 def _model_supports_reasoning(model: str | None) -> bool:
@@ -44,10 +44,10 @@ class UpstageProfile(ProviderProfile):
     """Upstage Solar — top-level ``reasoning_effort`` control.
 
     Solar Pro/Open expose reasoning through a top-level ``reasoning_effort``
-    field (``minimal`` | ``low`` | ``medium`` | ``high``), mirroring OpenAI's
-    shape. Unlike DeepSeek/Kimi it does NOT require echoing ``reasoning_content``
-    back on later turns, so only the request field needs wiring. We emit at most
-    ``low`` | ``medium`` | ``high`` — the explicit values both Solar Pro 2 and
+    field (``low`` | ``high`` | ``max``), mirroring OpenAI's shape. Unlike
+    DeepSeek/Kimi it does NOT require echoing ``reasoning_content`` back on
+    later turns, so only the request field needs wiring. We emit at most
+    ``low`` | ``high`` | ``max`` — the explicit values both Solar Pro 2 and
     Pro 3 accept.
 
     Default-on: Solar's own server default is ``minimal`` (off), but for an
@@ -75,20 +75,17 @@ class UpstageProfile(ProviderProfile):
         if reasoning_config.get("enabled") is False:
             return {}, top_level
 
-        # Map Hermes' effort vocabulary onto Solar's accepted set. xhigh/max/
-        # ultra collapse to high (Solar's strongest). minimal → off (omit).
-        # Unknown-but-enabled efforts (future vocabulary additions above
-        # "high", per the max/ultra precedent in #62650) also collapse to
-        # high rather than silently downgrading to the medium default.
+        # Map Hermes' effort vocabulary onto Solar's accepted set. max stays
+        # max (Solar's strongest). Unknown-but-enabled efforts collapse to
+        # high rather than silently downgrading to the low default.
         effort = (reasoning_config.get("effort") or "").strip().lower()
         if not effort:
             top_level["reasoning_effort"] = _DEFAULT_REASONING_EFFORT
             return {}, top_level
         mapped = {
-            "minimal": None,
             "low": "low",
-            "medium": "medium",
             "high": "high",
+            "max": "max",
         }.get(effort, "high")
 
         if mapped:

@@ -13,9 +13,9 @@ class TestTUIPerModelReasoningConfig:
         fake_cfg = {
             "model": {"default": "anthropic/claude-opus-4.5"},
             "agent": {
-                "reasoning_effort": "medium",
+                "reasoning_effort": "high",
                 "reasoning_overrides": {
-                    "anthropic/claude-opus-4.5": "xhigh",
+                    "anthropic/claude-opus-4.5": "max",
                 },
             },
         }
@@ -24,7 +24,7 @@ class TestTUIPerModelReasoningConfig:
         result = tui_server._load_reasoning_config()
         assert result is not None
         assert result["enabled"] is True
-        assert result["effort"] == "xhigh"
+        assert result["effort"] == "max"
 
     def test_global_fallback_when_no_override(self, monkeypatch):
         """Global reasoning_effort applies when no per-model override matches."""

@@ -13,7 +13,7 @@ distinct guidance for this case:
      OpenAI, Anthropic, DeepSeek).  Workarounds in priority order:
      1. Set `providers.<provider>.models.<model>.stale_timeout_seconds: 900`
         in `~/.hermes/config.yaml` to extend the per-call timeout...
-     2. Lower `reasoning_budget` or set `reasoning_effort: medium`...
+     2. Lower `reasoning_budget` or set `reasoning_effort: low`...
      3. Use a smaller / faster reasoning model..."
 
 The existing `_is_stream_drop` guidance at
@@ -129,7 +129,7 @@ def build_thinking_timeout_guidance(
         "(Hermes's built-in floor is 600s for known reasoning models — "
         "if you still see this after raising, the upstream cap is even "
         "shorter.)\n"
-        "2. Lower `reasoning_budget` or set `reasoning_effort: medium` on this "
+        "2. Lower `reasoning_budget` or set `reasoning_effort: low` on this "
         "model if the provider supports it.\n"
         "3. Use a smaller / faster reasoning model if the task doesn't "
         "require deep thinking."

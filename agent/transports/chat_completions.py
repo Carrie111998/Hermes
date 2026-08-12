@@ -112,36 +112,32 @@ def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> 
         # happens; omit thinkingLevel to avoid model-specific validation quirks.
         return {"includeThoughts": False}
 
-    effort = str(reasoning_config.get("effort", "medium") or "medium").strip().lower()
+    effort = str(reasoning_config.get("effort", "high") or "high").strip().lower()
     if effort == "none":
         return {"includeThoughts": False}
 
     thinking_config: Dict[str, Any] = {"includeThoughts": True}
 
     # Gemini 2.5 accepts thinkingBudget; don't guess a budget from Hermes'
-    # coarse effort levels. ``includeThoughts`` alone is enough to surface
+    # coarse effort levels.  ``includeThoughts`` alone is enough to surface
     # thought parts without risking request validation errors.
     if normalized_model.startswith("gemini-2.5-"):
         return thinking_config
 
-    if effort not in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
-        effort = "medium"
+    if effort not in {"low", "high", "max"}:
+        effort = "high"
 
     # Gemini 3 Flash documents low/medium/high thinking levels; Gemini 3 Pro
     # is stricter (low/high). Clamp Hermes' wider effort set to what each
     # family accepts so we never forward an undocumented level verbatim.
     if normalized_model.startswith(("gemini-3", "gemini-3.1")):
         if "flash" in normalized_model:
-            if effort in {"minimal", "low"}:
+            if effort == "low":
                 thinking_config["thinkingLevel"] = "low"
-            elif effort in {"high", "xhigh", "max", "ultra"}:
-                thinking_config["thinkingLevel"] = "high"
             else:
-                thinking_config["thinkingLevel"] = "medium"
+                thinking_config["thinkingLevel"] = "high"
         elif "pro" in normalized_model:
-            thinking_config["thinkingLevel"] = (
-                "high" if effort in {"high", "xhigh", "max", "ultra"} else "low"
-            )
+            thinking_config["thinkingLevel"] = "high" if effort in {"high", "max"} else "low"
 
     return thinking_config
 
@@ -475,10 +471,10 @@ class ChatCompletionsTransport(ProviderTransport):
                 and reasoning_config.get("enabled") is False
             )
             if not _kimi_thinking_off:
-                _kimi_effort = "medium"
+                _kimi_effort = "high"
                 if reasoning_config and isinstance(reasoning_config, dict):
                     _e = (reasoning_config.get("effort") or "").strip().lower()
-                    if _e in {"low", "medium", "high"}:
+                    if _e in {"low", "high", "max"}:
                         _kimi_effort = _e
                 api_kwargs["reasoning_effort"] = _kimi_effort
 
@@ -493,7 +489,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 _tokenhub_effort = "high"
                 if reasoning_config and isinstance(reasoning_config, dict):
                     _e = (reasoning_config.get("effort") or "").strip().lower()
-                    if _e in {"low", "medium", "high"}:
+                    if _e in {"low", "high", "max"}:
                         _tokenhub_effort = _e
                 api_kwargs["reasoning_effort"] = _tokenhub_effort
 
@@ -554,9 +550,9 @@ class ChatCompletionsTransport(ProviderTransport):
                 if gh_reasoning is not None:
                     extra_body["reasoning"] = gh_reasoning
             else:
-                _effort = "medium"
+                _effort = "high"
                 if reasoning_config and isinstance(reasoning_config, dict):
-                    _effort = reasoning_config.get("effort", "medium") or "medium"
+                    _effort = reasoning_config.get("effort", "high") or "high"
                 extra_body["reasoning"] = {"enabled": True, "effort": _effort}
 
         if provider_name == "gemini":

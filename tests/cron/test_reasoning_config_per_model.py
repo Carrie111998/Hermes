@@ -19,9 +19,9 @@ class TestCronPerModelReasoningConfig:
         _cfg = {
             "model": {"default": "anthropic/claude-opus-4.5"},
             "agent": {
-                "reasoning_effort": "medium",
+                "reasoning_effort": "high",
                 "reasoning_overrides": {
-                    "anthropic/claude-opus-4.5": "xhigh",
+                    "anthropic/claude-opus-4.5": "max",
                 },
             },
         }
@@ -31,7 +31,7 @@ class TestCronPerModelReasoningConfig:
 
         result = resolve_per_model_reasoning_effort(_model, _overrides)
         assert result is not None
-        assert result["effort"] == "xhigh"
+        assert result["effort"] == "max"
 
     def test_cron_falls_back_to_global_when_no_override(self):
         """When no per-model override matches, global effort is used."""
@@ -42,7 +42,7 @@ class TestCronPerModelReasoningConfig:
             "agent": {
                 "reasoning_effort": "low",
                 "reasoning_overrides": {
-                    "anthropic/claude-opus-4.5": "xhigh",
+                    "anthropic/claude-opus-4.5": "max",
                 },
             },
         }
@@ -72,7 +72,7 @@ class TestCronPerModelReasoningConfig:
             "model": {"default": "gpt-5"},
             "agent": {
                 "reasoning_effort": False,  # YAML boolean, not string
-                "reasoning_overrides": {"claude-opus-4.5": "xhigh"},
+                "reasoning_overrides": {"claude-opus-4.5": "max"},
             },
         }
         _model = _cfg["model"]["default"]

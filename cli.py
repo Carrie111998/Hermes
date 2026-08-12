@@ -392,7 +392,7 @@ def _parse_reasoning_config(effort) -> dict | None:
     from hermes_constants import parse_reasoning_effort
     result = parse_reasoning_effort(effort)
     if effort and str(effort).strip() and result is None:
-        logger.warning("Unknown reasoning_effort '%s', using default (medium)", effort)
+        logger.warning("Unknown reasoning_effort '%s', using default (high)", effort)
     return result
 
 
@@ -18393,7 +18393,7 @@ def main(
         skills: Comma-separated or repeated list of skills to preload for the session
         model: Model to use (default: anthropic/claude-opus-4-20250514)
         provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
-        reasoning: Reasoning effort for this run (none|minimal|low|medium|high|xhigh|max|ultra). Overrides agent.reasoning_effort.
+        reasoning: Reasoning effort for this run (none|low|high|max). Overrides agent.reasoning_effort. Legacy aliases: minimal→low, medium→high, xhigh→max, ultra→max.
         api_key: API key for authentication
         base_url: Base URL for the API
         max_turns: Maximum tool-calling iterations (default: 60)

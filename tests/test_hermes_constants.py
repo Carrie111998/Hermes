@@ -338,12 +338,26 @@ class TestParseReasoningEffort:
     def test_known_supported_levels_are_documented(self):
         """Guard against silently dropping a documented level.
 
-        The docstring promises "minimal", "low", "medium", "high", "xhigh",
-        "max", "ultra". If someone removes one from VALID_REASONING_EFFORTS without
-        updating the docstring, this test will fail and force the call out.
+        The docstring promises "low", "high", "max". If someone removes one
+        from VALID_REASONING_EFFORTS without updating the docstring, this test
+        will fail and force the call out.
         """
-        documented = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+        documented = {"low", "high", "max"}
         assert documented.issubset(set(VALID_REASONING_EFFORTS))
+
+    @pytest.mark.parametrize(
+        "legacy,canonical",
+        [
+            ("minimal", "low"),
+            ("medium", "high"),
+            ("xhigh", "max"),
+            ("ultra", "max"),
+        ],
+    )
+    def test_legacy_aliases_are_mapped(self, legacy, canonical):
+        """Legacy effort names are accepted and mapped to the standardized set."""
+        result = parse_reasoning_effort(legacy)
+        assert result == {"enabled": True, "effort": canonical}
 
 
 class TestResolvePerModelReasoningEffort:
@@ -361,9 +375,9 @@ class TestResolvePerModelReasoningEffort:
     def test_exact_match(self):
         """Exact model string match returns the parsed override."""
         from hermes_constants import resolve_per_model_reasoning_effort
-        overrides = {"claude-opus-4.5": "xhigh"}
+        overrides = {"claude-opus-4.5": "max"}
         result = resolve_per_model_reasoning_effort("claude-opus-4.5", overrides)
-        assert result == {"enabled": True, "effort": "xhigh"}
+        assert result == {"enabled": True, "effort": "max"}
 
 
 
@@ -388,7 +402,7 @@ class TestResolvePerModelReasoningEffort:
         variant) are keys, the exact input matches the exact key first.
         """
         from hermes_constants import resolve_per_model_reasoning_effort
-        overrides = {"claude-opus-4.5": "high", "claude-opus-4-5": "xhigh"}
+        overrides = {"claude-opus-4.5": "high", "claude-opus-4-5": "max"}
         result = resolve_per_model_reasoning_effort("claude-opus-4.5", overrides)
         assert result == {"enabled": True, "effort": "high"}
 
@@ -405,7 +419,7 @@ class TestResolveReasoningConfig:
     explicit model argument wins over the config's model.default.
     """
 
-    def _cfg(self, effort: object = "medium", overrides=None, default_model="gpt-5"):
+    def _cfg(self, effort: object = "high", overrides=None, default_model="gpt-5"):
         return {
             "model": {"default": default_model},
             "agent": {
@@ -416,9 +430,9 @@ class TestResolveReasoningConfig:
 
     def test_per_model_override_wins(self):
         from hermes_constants import resolve_reasoning_config
-        cfg = self._cfg(overrides={"claude-opus-4.5": "xhigh"})
+        cfg = self._cfg(overrides={"claude-opus-4.5": "max"})
         result = resolve_reasoning_config(cfg, "claude-opus-4.5")
-        assert result == {"enabled": True, "effort": "xhigh"}
+        assert result == {"enabled": True, "effort": "max"}
 
 
 
@@ -444,8 +458,8 @@ class TestResolveReasoningConfig:
     def test_invalid_override_value_falls_back_to_global(self):
         """A junk override value for the matching model falls through to global."""
         from hermes_constants import resolve_reasoning_config
-        cfg = self._cfg(effort="medium", overrides={"gpt-5": "turbo-max"})
-        assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "medium"}
+        cfg = self._cfg(effort="high", overrides={"gpt-5": "turbo-max"})
+        assert resolve_reasoning_config(cfg, "gpt-5") == {"enabled": True, "effort": "high"}
 
 
 class TestReasoningOverridesDefaultConfig:
@@ -463,11 +477,11 @@ class TestReasoningOverridesDefaultConfig:
         from hermes_constants import resolve_per_model_reasoning_effort
         # User config with one override, query uses different spelling
         overrides = {
-            "anthropic/claude-opus-4.5": "xhigh",  # user wrote with dots
+            "anthropic/claude-opus-4.5": "max",  # user wrote with dots
         }
         # Lookup with different spelling (bare, dashes) — should still match
         result = resolve_per_model_reasoning_effort("claude-opus-4-5", overrides)
-        assert result == {"enabled": True, "effort": "xhigh"}
+        assert result == {"enabled": True, "effort": "max"}
 
         # Another override, bare key
         overrides2 = {"gpt-5": "low"}
