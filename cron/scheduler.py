@@ -4405,8 +4405,12 @@ def _run_job_impl(
             # 0 = unlimited (legacy behavior, opt-in for debugging)
             _session_db = SessionDB()
     except concurrent.futures.TimeoutError:
+        # %g, not %.0f: a sub-second timeout rounded to "0s", and 0 is this
+        # function's sentinel for *unlimited* — so the log claimed the exact
+        # opposite of what had just happened. %g keeps 10.0 as "10" and shows
+        # 0.2 as "0.2".
         logger.error(
-            "Job '%s': SessionDB init did not return within %.0fs — proceeding "
+            "Job '%s': SessionDB init did not return within %gs — proceeding "
             "without a session store for this run instead of blocking it "
             "forever",
             job.get("id", "?"), _session_db_timeout,

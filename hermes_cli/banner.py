@@ -503,8 +503,34 @@ def get_latest_release_tag(repo_dir: Optional[Path] = None) -> Optional[tuple]:
     return _latest_release_cache
 
 
+_version_label_cache: Optional[str] = None
+
+
 def format_banner_version_label() -> str:
-    """Return the version label shown in the startup banner title."""
+    """Return the version label shown in the startup banner title.
+
+    Computed once per process. ``get_git_banner_state()`` shells out to git on
+    every call — three subprocesses, each guarded by a 5s timeout whose failure
+    is swallowed into a None/fallback state. Process spawn is slow and
+    load-sensitive on Windows, so under load one call could lose that race and
+    silently return the bare ``Hermes Agent vX (date)`` while another returned
+    the full ``· upstream … · local … (+N carried commits)`` form. Two callers
+    in the same process then disagreed about the version string — which is how
+    the nightly gate caught this, via test_version_command comparing the
+    /version command's output against a second call to this function.
+
+    Caching is correct as well as cheaper: the git state this describes cannot
+    change during the process's lifetime, and a banner label that differs
+    between two reads in one process is simply wrong.
+    """
+    global _version_label_cache  # noqa: PLW0603 — process-wide lazy singleton
+    if _version_label_cache is not None:
+        return _version_label_cache
+    _version_label_cache = _compute_banner_version_label()
+    return _version_label_cache
+
+
+def _compute_banner_version_label() -> str:
     base = f"Hermes Agent v{VERSION} ({RELEASE_DATE})"
     state = get_git_banner_state()
     if not state:

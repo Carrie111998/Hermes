@@ -42,7 +42,7 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
 def _listener_pids_on_port(port: int) -> list:
-    """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
+    """PIDs of processes *listening* on ``port`` — never clients.
 
     This must match only LISTEN sockets. A bare ``lsof -i :PORT`` (or
     ``fuser PORT/tcp``) also returns *clients* whose connection merely involves
@@ -50,8 +50,32 @@ def _listener_pids_on_port(port: int) -> list:
     sharing the port. SIGTERMing those closed the user's browser at irregular
     intervals. Restricting to LISTEN state frees the port for a new bridge
     without ever touching an unrelated client.
+
+    psutil is tried first because it is the only implementation that is both
+    cross-platform and fast. The shell-out alternatives are neither: on Windows
+    ``netstat -ano -p TCP`` was measured at 5.3-36.3s on a developer laptop
+    (1000+ connection rows, re-resolved every call), which blew the 5s
+    subprocess cap that used to guard it and — because the caller swallowed the
+    resulting TimeoutExpired — turned the whole port cleanup into a silent
+    no-op. The same enumeration through psutil takes 16-62ms because it reads
+    the kernel table directly (GetExtendedTcpTable / /proc/net/tcp) instead of
+    spawning a process to format it as text.
     """
     pids: list = []
+    try:
+        import psutil
+
+        for conn in psutil.net_connections(kind="tcp"):
+            if conn.status != psutil.CONN_LISTEN or conn.pid is None:
+                continue
+            if conn.laddr and conn.laddr.port == port:
+                pids.append(conn.pid)
+        if pids:
+            return pids
+    except (ImportError, PermissionError, OSError):
+        pass  # psutil absent, or the kernel table needs privileges we lack
+    except Exception:  # noqa: BLE001 — psutil.AccessDenied et al; fall through
+        pass
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
@@ -80,41 +104,39 @@ def _listener_pids_on_port(port: int) -> list:
 
 
 def _kill_port_process(port: int) -> None:
-    """Kill any process *listening* on the given TCP port (a stale bridge)."""
-    try:
-        if _IS_WINDOWS:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+    """Kill any process *listening* on the given TCP port (a stale bridge).
 
-            # Use netstat to find the PID bound to this port, then taskkill
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=windows_hide_flags(),
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] == "LISTENING":
-                    local_addr = parts[1]
-                    if local_addr.endswith(f":{port}"):
-                        try:
-                            subprocess.run(
-                                ["taskkill", "/PID", parts[4], "/F"],
-                                capture_output=True, timeout=5,
-                                creationflags=windows_hide_flags(),
-                            )
-                        except subprocess.SubprocessError:
-                            pass
-        else:
-            # POSIX: only ever signal a process LISTENING on the port. A client
-            # whose connection happens to involve this port number (a browser
-            # tab on a local dev server, etc.) must never be killed.
-            for pid in _listener_pids_on_port(port):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
-                    pass
-    except Exception:
-        pass
+    Both platforms resolve the target through :func:`_listener_pids_on_port`,
+    so the LISTEN-only safety invariant (never signal a mere client of this
+    port — that is what was closing the user's browser) is enforced in exactly
+    one place rather than reimplemented per-OS. Windows previously parsed
+    ``netstat -ano`` inline under a 5s cap the command routinely exceeded,
+    which meant the cleanup silently did nothing at all on that platform.
+    """
+    try:
+        pids = _listener_pids_on_port(port)
+    except Exception:  # noqa: BLE001 — cleanup is best-effort
+        logger.debug("port cleanup: listener lookup failed for %d", port, exc_info=True)
+        return
+
+    for pid in pids:
+        try:
+            if _IS_WINDOWS:
+                from hermes_cli._subprocess_compat import windows_hide_flags
+
+                # Windows has no SIGTERM for an unrelated process; taskkill /F
+                # is the supported equivalent. Only the PID lookup was slow —
+                # killing a single known PID returns promptly.
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    capture_output=True, timeout=10,
+                    creationflags=windows_hide_flags(),
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError,
+                subprocess.SubprocessError):
+            pass
 
 
 async def _wait_for_port_release(port: int, timeout_s: float = 15.0) -> bool:
