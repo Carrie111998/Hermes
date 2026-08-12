@@ -35,6 +35,10 @@ FATAL_MARKERS = (
     b"ENOTTY",
     b"gateway.start_timeout",
 )
+FIRST_RUN_SETUP_MARKERS = (
+    b"No inference provider is configured yet",
+    b"Set up a provider now?",
+)
 
 
 def _resize(fd: int, cols: int, rows: int) -> None:
@@ -112,16 +116,32 @@ def main(argv: list[str] | None = None) -> int:
             if marker in output:
                 raise RuntimeError(f"Hermes TUI emitted fatal startup marker: {marker.decode(errors='replace')}")
 
-        # A terminal Ctrl-C is the normal interactive exit path. Give Hermes a
-        # short grace period to reap its gateway child before escalating.
+        # A fresh install without credentials deliberately hands off from the
+        # painted TUI into an interactive provider-onboarding prompt.  That
+        # prompt catches KeyboardInterrupt and treats Ctrl-C as "skip setup",
+        # so using Ctrl-C immediately would test onboarding semantics instead
+        # of the TUI exit path. Decline onboarding explicitly, then exercise
+        # Ctrl-C once the normal interactive surface owns the terminal again.
+        if any(marker in output for marker in FIRST_RUN_SETUP_MARKERS):
+            os.write(master, b"n\n")
+            output += _drain(master, proc, time.monotonic() + 2.0)
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"Hermes exited after declining first-run setup with code {proc.returncode}"
+                )
+
+        # Ctrl-C on an idle non-dashboard TUI is the normal exit hotkey.  Give
+        # the Node parent enough time to reap its gateway child; gracefulExit's
+        # own failsafe is four seconds, so the smoke grace must be longer than
+        # that rather than racing it at the same deadline.
         os.write(master, b"\x03")
-        output += _drain(master, proc, time.monotonic() + 4.0)
+        output += _drain(master, proc, time.monotonic() + 5.5)
         try:
-            rc = proc.wait(timeout=4.0)
+            rc = proc.wait(timeout=1.0)
         except subprocess.TimeoutExpired as exc:
             _signal_process_group(proc, signal.SIGTERM)
             proc.wait(timeout=3.0)
-            raise RuntimeError("Hermes TUI did not exit after terminal Ctrl-C") from exc
+            raise RuntimeError("Hermes TUI did not exit after onboarding was dismissed and Ctrl-C was sent") from exc
         if rc not in (0, 130, -signal.SIGINT):
             raise RuntimeError(f"Hermes TUI did not shut down cleanly after Ctrl-C (code {rc})")
     except Exception as exc:
