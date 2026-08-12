@@ -13051,15 +13051,26 @@ def _(rid, params: dict) -> dict:
             # has all API keys in os.environ.
             from tools.environments.local import _sanitize_subprocess_env
             sanitized_env = _sanitize_subprocess_env(os.environ.copy())
-            r = subprocess.run(
-                qc.get("command", ""),
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                stdin=subprocess.DEVNULL,
-                env=sanitized_env,
-            )
+            # run_text_capture, not subprocess.run: with shell=True the real
+            # command is always a grandchild of cmd.exe, and a grandchild
+            # inheriting capture PIPES defeats `timeout` outright on Windows.
+            # It captures into temp files, so the 30s bound actually holds
+            # (+ up to ~10s for the synchronous best-effort tree-kill).
+            from hermes_cli._subprocess_compat import run_text_capture
+            try:
+                r = run_text_capture(
+                    qc.get("command", ""),
+                    shell=True,
+                    timeout=30,
+                    env=sanitized_env,
+                )
+            except subprocess.TimeoutExpired:
+                # Newly reachable: on Windows the pipe-based call could not
+                # time out at all here, so this path had no handler. Without
+                # one the exception escapes — and unlike shell.exec this
+                # handler is NOT in _LONG_HANDLERS, so it runs inline on the
+                # main stdin loop, where an escape takes the gateway down.
+                return _err(rid, 5002, "quick command timed out (30s)")
             output = (
                 (r.stdout or "")
                 + ("\n" if r.stdout and r.stderr else "")
@@ -15950,9 +15961,15 @@ def _(rid, params: dict) -> dict:
     except ImportError:
         return _err(rid, 5001, "shell.exec unavailable: approval safety module not importable")
     try:
-        r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
-            stdin=subprocess.DEVNULL,
+        # run_text_capture, not subprocess.run: this handler runs arbitrary
+        # user shell commands, so the child is cmd.exe and the real command is
+        # ALWAYS a grandchild holding the capture pipe's write end open. Under
+        # subprocess.run that makes `timeout` unenforceable on Windows — a
+        # single wedged command would hang the whole gateway RPC thread, since
+        # nothing else bounds this call. Temp-file capture keeps the 30s bound.
+        from hermes_cli._subprocess_compat import run_text_capture
+        r = run_text_capture(
+            cmd, shell=True, timeout=30, cwd=os.getcwd(),
         )
         return _ok(
             rid,
