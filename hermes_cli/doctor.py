@@ -595,6 +595,75 @@ def _check_version_consistency(issues: list[str]) -> None:
         )
 
 
+def _scan_installed_distributions(
+    paths: list[str] | None = None,
+) -> tuple[list[tuple[str, str]], int]:
+    """Find installed distributions whose metadata is incomplete.
+
+    Returns ``(broken, total)`` where *broken* is a list of
+    ``(name, reason)``.  ``paths`` overrides the search path (tests only).
+
+    A half-installed distribution is one whose files are on disk but whose
+    ``.dist-info`` metadata is not: pip can then neither use it nor
+    uninstall it, so the environment cannot repair itself.  Importing the
+    module does not reliably detect this — the package directory is still
+    importable in some of these states — which is why the import probes
+    above cannot stand in for this check.
+    """
+    import importlib.metadata as _md
+
+    broken: list[tuple[str, str]] = []
+    try:
+        dists = list(_md.distributions() if paths is None
+                     else _md.distributions(path=paths))
+    except Exception:
+        return [], 0
+
+    for dist in dists:
+        path = getattr(dist, "_path", None)
+        try:
+            name = (dist.metadata["Name"] or "").strip()
+        except Exception:
+            broken.append((str(path or "<unknown>"), "METADATA unreadable"))
+            continue
+        if not name:
+            broken.append((str(path or "<unknown>"), "METADATA missing Name"))
+            continue
+        try:
+            record = dist.read_text("RECORD")
+        except Exception as exc:
+            broken.append((name, f"RECORD unreadable ({type(exc).__name__})"))
+            continue
+        if record is None and path is not None and str(path).endswith(".dist-info"):
+            # Only wheel installs (.dist-info) are guaranteed a RECORD.
+            # .egg-info / legacy / editable installs legitimately lack one,
+            # so restricting to .dist-info keeps this free of false alarms.
+            broken.append((name, "RECORD missing from .dist-info"))
+    return broken, len(dists)
+
+
+def _check_installed_distributions(issues: list[str]) -> None:
+    """Report half-installed distributions in the active environment."""
+    broken, total = _scan_installed_distributions()
+    if not total:
+        return
+    if not broken:
+        check_ok("Installed package metadata", f"({total} distributions intact)")
+        return
+    for name, reason in sorted(broken)[:10]:
+        _fail_and_issue(
+            f"Half-installed package: {name}",
+            f"({reason})",
+            f"Reinstall it: {_python_install_cmd()} --force-reinstall {name}",
+            issues,
+        )
+    if len(broken) > 10:
+        check_warn(
+            "Half-installed packages",
+            f"(+{len(broken) - 10} more not shown)",
+        )
+
+
 def _check_s6_supervision(issues: list[str]) -> None:
     """Inside a container under our s6 /init, surface what s6 sees.
 
@@ -1099,7 +1168,9 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
-    
+
+    _check_installed_distributions(issues)
+
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()
