@@ -273,8 +273,7 @@ def test_sequential_tool_is_fenced_before_request_middleware(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(
-        tool_executor,
-        "_apply_tool_request_middleware_for_agent",
+        "hermes_cli.middleware.apply_tool_request_middleware",
         lambda *_args, **_kwargs: pytest.fail(
             "stale worker reached tool request middleware"
         ),
