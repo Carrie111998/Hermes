@@ -135,9 +135,9 @@ THREAT_PATTERNS = [
     (r'\$HOME/\.docker|\~/\.docker',
      "docker_dir_access", "high", "exfiltration",
      "references Docker config (may contain registry creds)"),
-    (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env',
+    (r'\b(?:cat|read|open|load|source|dump|copy|upload|send|transmit)\b[^\n]{0,256}(?:\$HOME/\.hermes/\.env|\~/\.hermes/\.env)',
      "hermes_env_access", "critical", "exfiltration",
-     "directly references Hermes secrets file"),
+     "reads or transmits Hermes secrets file"),
     # Match `cat <secrets-file>` (reading credentials) but NOT `cat > <file>`
     # or `cat >> <file>`, which are output redirections that WRITE a file
     # (e.g. a setup doc telling the user to write their own keys into their
@@ -458,12 +458,12 @@ THREAT_PATTERNS = [
      "sets SUID/SGID bit on a file"),
 
     # ── Agent config persistence ──
-    (r'AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules',
+    (r'\b(?:update|modify|edit|write|change|append|replace|overwrite|add\s+to)\b[^\n]{0,256}(?:AGENTS\.md|CLAUDE\.md|\.cursorrules|\.clinerules)',
      "agent_config_mod", "critical", "persistence",
-     "references agent config files (could persist malicious instructions across sessions)"),
-    (r'\.hermes/config\.yaml|\.hermes/SOUL\.md',
+     "modifies agent config files (could persist malicious instructions across sessions)"),
+    (r'\b(?:update|modify|edit|write|change|append|replace|overwrite|add\s+to)\b[^\n]{0,256}(?:\.hermes/config\.yaml|\.hermes/SOUL\.md)',
      "hermes_config_mod", "critical", "persistence",
-     "references Hermes configuration files directly"),
+     "modifies Hermes configuration files directly"),
     (r'\.claude/settings|\.codex/config',
      "other_agent_config", "high", "persistence",
      "references other agent configuration files"),
