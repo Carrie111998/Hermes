@@ -852,3 +852,58 @@ def test_login_rate_limit_fails_closed():
         "email": "admin@example.test", "password": "wrong-password",
     })
     assert blocked.status_code == 429
+
+
+def test_admin_documents_ui_is_wired_and_customer_copy_hides_implementation_terms():
+    _, client = make_client()
+    main = client.get("/js/main.js").text
+    admin = client.get("/js/pages/admin.js").text
+    documents = client.get("/js/pages/admin-documents.js").text
+
+    assert "'/admin/documents'" in main
+    assert "['/admin/documents', 'Documents']" in admin
+    assert "Processed (.md) artifact" in documents
+
+    customer_sources = client.get("/js/pages/setup.js").text + client.get("/js/pages/onboarding.js").text
+    for forbidden in ("Anydoc", "conversion", "converter", "Markdown generation", "OCR"):
+        assert forbidden.lower() not in customer_sources.lower()
+
+
+def test_admin_documents_module_and_routes_resolve():
+    _, client = make_client()
+    assert client.get("/js/pages/admin-documents.js").status_code == 200
+
+    main = client.get("/js/main.js").text
+    # The exact list path must be registered before the :documentId detail path,
+    # or /admin/documents resolves as a document with an empty id.
+    assert main.index("{ path: '/admin/documents'") < main.index("/admin/documents/:documentId")
+    assert "import * as adminDocuments from './pages/admin-documents.js'" in main
+
+    api = client.get("/js/api.js").text
+    for route in (
+        "'admin.documents.list'", "'admin.documents.detail'", "'admin.documents.artifact'",
+        "'admin.documents.retry'", "'admin.documents.delete'", "'admin.agentRuns.detail'",
+    ):
+        assert route in api, route
+    # The artifact route returns bytes; parsing it as JSON would corrupt a PDF.
+    assert "name === 'admin.documents.artifact'" in api
+
+
+def test_admin_document_pages_never_use_innerhtml():
+    """Records and evidence are model-authored; they render as text nodes only."""
+    _, client = make_client()
+    for path in ("/js/pages/admin-documents.js", "/js/pages/agent-runs.js"):
+        assert "innerHTML" not in client.get(path).text, path
+
+
+def test_admin_run_detail_shows_output_related_and_evidence():
+    _, client = make_client()
+    runs = client.get("/js/pages/agent-runs.js").text
+    assert "call('admin.agentRuns.detail'" in runs
+    assert "Final output" in runs
+    assert "Sources" in runs
+    assert "evidenceTable" in runs
+    # Credentials and prompt internals are stripped server-side and must not be
+    # re-introduced by the page reaching for them.
+    for forbidden in ("system_prompt", "authorization", "tool_args"):
+        assert forbidden not in runs.lower()

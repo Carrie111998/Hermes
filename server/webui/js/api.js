@@ -84,6 +84,12 @@ export const routes = {
   'admin.users.disable':        ['POST',   '/admin/users/:userId/disable'],
   'admin.errors':               ['GET',    '/admin/errors'],
   'admin.logs':                 ['GET',    '/admin/logs'],
+  'admin.documents.list':       ['GET',    '/admin/documents'],
+  'admin.documents.detail':     ['GET',    '/admin/documents/:documentId'],
+  'admin.documents.artifact':   ['GET',    '/admin/documents/:documentId/artifacts/:role'],
+  'admin.documents.retry':      ['POST',   '/admin/documents/:documentId/retry'],
+  'admin.documents.delete':     ['DELETE', '/admin/documents/:documentId'],
+  'admin.agentRuns.detail':     ['GET',    '/admin/agent-runs/:runId/detail'],
 
   // 7.4 Company profile
   'company.getProfile':         ['GET',    '/company/profile'],
@@ -461,7 +467,10 @@ async function realCall(name, { params, query, body, authOverride, authRetried =
     config.onAuthFailure?.();
   }
   if (res.status === 204) return null;
-  if (name === 'exports.download') {
+  // Binary routes: the body is the file itself, so it must not be parsed as
+  // JSON. Document artifacts are the admin preview/download of the exact bytes
+  // the backend holds — same handling as a CSV export.
+  if (name === 'exports.download' || name === 'admin.documents.artifact') {
     if (!res.ok) {
       let errorPayload = null;
       try { errorPayload = await res.json(); } catch { /* non-JSON error */ }
@@ -472,10 +481,10 @@ async function realCall(name, { params, query, body, authOverride, authRetried =
       );
     }
     const blob = await res.blob();
-    return {
-      blob,
-      filename: responseFilename(res.headers.get('Content-Disposition'), `${params?.exportId || 'export'}.csv`),
-    };
+    const fallback = name === 'exports.download'
+      ? `${params?.exportId || 'export'}.csv`
+      : `${params?.documentId || 'document'}-${params?.role || 'file'}`;
+    return { blob, filename: responseFilename(res.headers.get('Content-Disposition'), fallback) };
   }
   let payload = null;
   try { payload = await res.json(); } catch { /* non-JSON body */ }

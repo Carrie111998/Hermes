@@ -6,6 +6,7 @@
 import { el, card, badge, button, fmt, pageHead, emptyState, kv, toast } from '../ui.js';
 import { call } from '../api.js';
 import { subscribe } from '../mocks/db.js';
+import { evidenceTable } from './admin-documents.js';
 
 const RUN_TYPE_LABELS = {
   company_brain_build: 'Company Brain',
@@ -21,6 +22,45 @@ const RUN_TYPE_LABELS = {
   analytics_refresh: 'Analytics',
 };
 
+const RELATED_ROUTES = {
+  document_id: id => `/admin/documents/${id}`,
+  source_document_id: id => `/admin/documents/${id}`,
+};
+
+/* What the run produced and what it looked at.
+
+   Credentials, prompt internals, and raw tool arguments are already stripped
+   server-side (server/agent_evidence.py) — this only renders what survived,
+   as escaped text nodes rather than parsed markup. */
+function resultCards(detail, ctx) {
+  if (!detail) return null;
+
+  const related = Object.entries(detail.related || {});
+  return el('div', { class: 'ifz-mt-4' },
+    card({
+      title: 'Final output',
+      body: detail.output
+        ? el('pre', { class: 'ifz-runlog ifz-small' },
+            el('code', {}, JSON.stringify(detail.output, null, 2)))
+        : el('div', { class: 'ifz-small ifz-muted' }, 'No structured output recorded'),
+    }),
+    related.length
+      ? el('div', { class: 'ifz-mt-4' }, card({
+          title: 'Related',
+          body: el('div', { class: 'ifz-row' }, related.map(([key, value]) => {
+            const href = RELATED_ROUTES[key]?.(value);
+            return href
+              ? button(`${key.replace(/_/g, ' ')}: ${value}`, {
+                  size: 'sm', onClick: () => ctx.navigate(href),
+                })
+              : el('span', { class: 'ifz-small ifz-muted' }, `${key}: ${value}`);
+          })),
+        }))
+      : null,
+    el('div', { class: 'ifz-mt-4' },
+      card({ title: 'Sources', flush: true, body: evidenceTable(detail.evidence) })));
+}
+
 export async function mountDetail(root, ctx) {
   let disposed = false;
   const runId = ctx.params.runId;
@@ -32,11 +72,14 @@ export async function mountDetail(root, ctx) {
   async function render() {
     let run;
     try {
-      const [record, logs] = await Promise.all([
+      const [record, logs, detail] = await Promise.all([
         call('agentRuns.get', { params: { runId } }),
         call('agentRuns.events', { params: { runId } }),
+        // Cross-company: this page is admin-only and a run may belong to any
+        // tenant. Optional so a live run still renders if detail lags.
+        call('admin.agentRuns.detail', { params: { runId } }).catch(() => null),
       ]);
-      run = { ...record, logs: logs.items };
+      run = { ...record, logs: logs.items, detail };
     } catch {
       host.replaceChildren(emptyState({
         icon: 'bolt', title: 'Run not found',
@@ -97,7 +140,8 @@ export async function mountDetail(root, ctx) {
             ['Started', fmt.ago(run.created_at)],
             ['Finished', run.finished_at ? fmt.ago(run.finished_at) : '—'],
           ])) })),
-      card({ title: 'Live log', body: logHost }));
+      card({ title: 'Live log', body: logHost }),
+      resultCards(run.detail, ctx));
 
     if (stickToBottom) logHost.scrollTop = logHost.scrollHeight;
   }

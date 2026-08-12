@@ -16,6 +16,7 @@ import * as setup from './pages/setup.js';
 import * as analytics from './pages/analytics.js';
 import * as admin from './pages/admin.js';
 import * as agentRuns from './pages/agent-runs.js';
+import * as adminDocuments from './pages/admin-documents.js';
 import * as research from './pages/research.js';
 import * as researchEditor from './pages/research-editor.js';
 import * as researchDetail from './pages/research-detail.js';
@@ -152,6 +153,10 @@ const routes = [
   { path: '/admin/users',          mount: appPage('Users', admin.mountUsers) },
   { path: '/admin/agent-runs',     mount: appPage('Agent Runs', admin.mountAgentRuns) },
   { path: '/admin/agent-runs/:runId', mount: appPage('Agent Run', agentRuns.mountDetail) },
+  // Exact list path before the :documentId detail path, so /admin/documents
+  // never resolves as a document whose id is the empty string.
+  { path: '/admin/documents',      mount: appPage('Documents', adminDocuments.mountList) },
+  { path: '/admin/documents/:documentId', mount: appPage('Document', adminDocuments.mountDetail) },
   { path: '/admin/analytics',      mount: appPage('Admin Analytics', admin.mountAnalytics) },
   { path: '/admin/integrations',   mount: appPage('Integration Health', admin.mountIntegrations) },
   { path: '/admin/errors',         mount: appPage('Errors', admin.mountErrors) },

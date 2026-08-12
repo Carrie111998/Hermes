@@ -14,6 +14,7 @@ const ADMIN_TABS = [
   ['/admin/companies', 'Companies'],
   ['/admin/users', 'Users'],
   ['/admin/agent-runs', 'Runs'],
+  ['/admin/documents', 'Documents'],
   ['/admin/analytics', 'Analytics'],
   ['/admin/integrations', 'Integrations'],
   ['/admin/errors', 'Errors'],
@@ -29,7 +30,7 @@ function adminNav(ctx, activePath) {
     }, label)));
 }
 
-function withAdmin(root, ctx, title, sub, activePath, body, actions = []) {
+export function withAdmin(root, ctx, title, sub, activePath, body, actions = []) {
   root.replaceChildren(
     pageHead({
       title,
