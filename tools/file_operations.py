@@ -969,30 +969,41 @@ class ShellFileOperations(FileOperations):
 
         File operations run through a terminal backend (possibly remote), so
         raw bytes cannot cross the transport directly — the terminal decodes
-        stdout with ``errors="replace"`` and manufactures U+FFFD at every
-        byte it cannot decode, including a multibyte character cut in half by
-        ``head -c``. Wrapping the sample in base64 lets the original bytes
-        survive the transport, so binary detection can happen at the byte
-        layer where it is well-defined (#80308 and friends).
+        stdout with ``errors="replace"``. Base64 is preferred, with a
+        byte-safe hexadecimal fallback for environments without a working
+        ``base64`` command. Both transports preserve the original bytes so
+        binary detection never depends on an arbitrary UTF-8 boundary.
 
-        Returns the sample bytes, or ``None`` when the transport could not
-        produce clean base64 (exotic shells without ``base64``); callers fall
-        back to the legacy text-sample heuristic in that case.
+        Returns the sample bytes, or ``None`` when neither transport can
+        produce a clean byte representation.
         """
-        result = self._exec(
-            f"head -c {length} {self._escape_shell_arg(path)} 2>/dev/null | base64"
+        escaped_path = self._escape_shell_arg(path)
+        result = self._exec(f"head -c {length} {escaped_path} 2>/dev/null | base64")
+        if result.exit_code == 0:
+            encoded = _strip_terminal_fence_leaks(result.stdout)
+            encoded = "".join(encoded.split())
+            if not encoded:
+                return b""
+            if re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+                try:
+                    return base64.b64decode(encoded, validate=True)
+                except (binascii.Error, ValueError):
+                    pass
+
+        # Keep the fallback byte-safe: terminal stdout may be decoded as text,
+        # but ASCII hex survives that boundary without introducing U+FFFD.
+        hex_result = self._exec(
+            f"od -An -v -tx1 -N {length} {escaped_path} 2>/dev/null"
         )
-        if result.exit_code != 0:
+        if hex_result.exit_code != 0:
             return None
-        encoded = _strip_terminal_fence_leaks(result.stdout)
-        encoded = "".join(encoded.split())
-        if not encoded:
-            return b""
-        if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", encoded):
+        hex_text = _strip_terminal_fence_leaks(hex_result.stdout)
+        tokens = hex_text.split()
+        if not tokens or any(not re.fullmatch(r"[0-9A-Fa-f]{2}", token) for token in tokens):
             return None
         try:
-            return base64.b64decode(encoded, validate=True)
-        except (binascii.Error, ValueError):
+            return bytes.fromhex("".join(tokens))
+        except ValueError:
             return None
 
     @staticmethod
@@ -1051,11 +1062,12 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            if "\ufffd" in content_sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
-                               if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            non_printable = sum(
+                1 for c in content_sample if ord(c) < 32 and c not in '\n\r\t'
+            )
+            return non_printable / len(content_sample) > 0.30
         
         return False
     
@@ -1394,7 +1406,10 @@ class ShellFileOperations(FileOperations):
             ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
             is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
         else:
-            sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+            # Read three extra bytes so a UTF-8 code point cut at the legacy
+            # 1000-byte boundary can be completed before the terminal decodes
+            # the sample. UTF-8 code points are at most four bytes wide.
+            sample_cmd = f"head -c 1003 {self._escape_shell_arg(path)} 2>/dev/null"
             sample_result = self._exec(sample_cmd)
             sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
             is_binary = self._is_likely_binary(path, sample_output)
@@ -1632,7 +1647,9 @@ class ShellFileOperations(FileOperations):
             ext_binary = os.path.splitext(path)[1].lower() in BINARY_EXTENSIONS
             is_binary = ext_binary or self._is_likely_binary_bytes(sample_bytes)
         else:
-            sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+            # Keep the fallback sampler consistent with read_file(): include
+            # enough bytes to complete a UTF-8 code point cut at byte 1000.
+            sample_result = self._exec(f"head -c 1003 {self._escape_shell_arg(path)} 2>/dev/null")
             sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
             is_binary = self._is_likely_binary(path, sample_output)
         if is_binary:

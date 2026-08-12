@@ -686,6 +686,17 @@ class TestReadNonUtf8IsBinary:
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
 
+    def test_replacement_char_at_eof_stays_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # A real U+FFFD at EOF must not be mistaken for a truncation artifact.
+        assert ops._is_likely_binary("notes.txt", "漢字\ufffd") is True
+
+    def test_replacement_char_before_boundary_stays_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # A replacement marker before the boundary is evidence of an invalid
+        # byte in the file, not a truncation artifact.
+        assert ops._is_likely_binary("notes.txt", "bad\ufffd text") is True
+
 # =========================================================================
 # Byte-layer binary detection (#80308 class: CJK/multibyte text flagged
 # binary because the byte-boundary sample manufactured U+FFFD in transit)
@@ -765,6 +776,25 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         assert ops._sample_file_bytes("/tmp/x.txt") is None
 
+    def test_sample_falls_back_to_byte_safe_hex_transport(self, mock_env):
+        payload = b"a" * 1002 + "中".encode("utf-8") + b" text"
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "| base64" in command:
+                return {"output": "not base64", "returncode": 0}
+            if command.startswith("od -An -v -tx1"):
+                hex_bytes = " ".join(f"{byte:02x}" for byte in payload[:1000])
+                return {"output": hex_bytes, "returncode": 0}
+            return {"output": "", "returncode": 1}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+
+        assert ops._sample_file_bytes("/tmp/x.txt") == payload[:1000]
+        assert any("od -An -v -tx1" in command for command in commands)
+
     def test_sample_falls_back_on_nonzero_exit(self, mock_env):
         mock_env.execute.return_value = {"output": "", "returncode": 127}
         ops = ShellFileOperations(mock_env)
@@ -803,4 +833,55 @@ class TestByteLayerBinaryDetection:
         ops = ShellFileOperations(mock_env)
         result = ops.read_file("/tmp/a.out")
         assert result.is_binary is True
+
+    def test_fallback_sample_preserves_utf8_boundary(self, mock_env):
+        content = (b"a" * 1002 + "中".encode("utf-8") + b" text")
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("wc -c"):
+                return {"output": f"{len(content)}\n", "returncode": 0}
+            if "| base64" in command:
+                return {"output": "not base64", "returncode": 0}
+            if command.startswith("od -An -v -tx1"):
+                return {"output": " ".join(f"{byte:02x}" for byte in content[:1000]), "returncode": 0}
+            if command.startswith("sed -n"):
+                return {"output": content.decode("utf-8"), "returncode": 0}
+            if command.startswith("wc -l"):
+                return {"output": "1\n", "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file("/tmp/boundary.txt")
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert any("od -An -v -tx1" in command for command in commands)
+
+    def test_read_file_raw_fallback_preserves_utf8_boundary(self, mock_env):
+        content = (b"a" * 1002 + "中".encode("utf-8") + b" text")
+        commands = []
+
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if command.startswith("wc -c"):
+                return {"output": f"{len(content)}\n", "returncode": 0}
+            if "| base64" in command:
+                return {"output": "not base64", "returncode": 0}
+            if command.startswith("od -An -v -tx1"):
+                return {"output": " ".join(f"{byte:02x}" for byte in content[:1000]), "returncode": 0}
+            if command.startswith("cat "):
+                return {"output": content.decode("utf-8"), "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.read_file_raw("/tmp/boundary.txt")
+
+        assert result.is_binary is False
+        assert result.error is None
+        assert result.content == content.decode("utf-8")
+        assert any("od -An -v -tx1" in command for command in commands)
 
