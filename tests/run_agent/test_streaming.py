@@ -478,6 +478,59 @@ class TestReasoningStreaming:
 
     @patch("run_agent.AIAgent._create_request_openai_client")
     @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_call_inline_reasoning_counts_without_display_callback(
+        self, mock_close, mock_create
+    ):
+        """Suppressed tool-call content still reaches the shared budget sink."""
+        from agent.reasoning_budget import (
+            ReasoningBudgetConfig,
+            ReasoningBudgetTracker,
+        )
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(tool_calls=[
+                _make_tool_call_delta(
+                    index=0,
+                    tc_id="call_123",
+                    name="terminal",
+                )
+            ]),
+            _make_stream_chunk(content="<think>"),
+            _make_stream_chunk(content="a" * 13),
+            _make_stream_chunk(content="</think>"),
+            _make_stream_chunk(finish_reason="tool_calls"),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent._reasoning_budget_tracker = ReasoningBudgetTracker(
+            ReasoningBudgetConfig(
+                warn_after_tokens=4,
+                context_ratio=0,
+                ratio_min_tokens=0,
+                nudge_next_turn=False,
+            )
+        )
+        agent._emit_warning = MagicMock()
+
+        agent._interruptible_streaming_api_call({})
+
+        agent._emit_warning.assert_called_once()
+
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
     def test_reasoning_callback_fires(self, mock_close, mock_create):
         """Reasoning deltas fire the reasoning_callback."""
         from run_agent import AIAgent

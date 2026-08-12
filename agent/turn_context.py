@@ -532,6 +532,10 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
+    from agent.reasoning_budget import begin_reasoning_budget_turn
+
+    reasoning_budget_nudge = begin_reasoning_budget_turn(agent)
+
     # Store stream callback for _interruptible_api_call to pick up.
     agent._stream_callback = stream_callback
     agent._persist_user_message_idx = None
@@ -1210,6 +1214,10 @@ def build_turn_context(
     # Multimodal (list) content can't take the string sidecar — append a
     # durable text part instead of dropping the fact.
     _gateway_notes = consume_gateway_turn_context_notes(agent)
+    if reasoning_budget_nudge:
+        _gateway_notes = "\n\n".join(
+            note for note in (_gateway_notes, reasoning_budget_nudge) if note
+        )
     if _gateway_notes:
         _gw_turn_content = (
             messages[current_turn_user_idx].get("content")

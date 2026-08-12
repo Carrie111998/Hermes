@@ -1000,6 +1000,20 @@ When the iteration budget is fully exhausted, the CLI shows a notification to th
 
 `agent.api_max_retries` controls how many times Hermes retries a provider API call on transient errors (rate limits, connection drops, 5xx) **before** fallback-provider switching engages. The default is `3` — four attempts total. If you have [fallback providers](/user-guide/features/fallback-providers) configured and want to fail over faster, drop this to `0` so the first transient error on your primary immediately hands off to the fallback instead of churning retries against the flaky endpoint.
 
+## Reasoning Output Budget Warnings
+
+Hermes can warn when a single user turn streams an unusually large amount of model reasoning. The check is provider-independent: structured reasoning deltas from chat-completions, Anthropic, Bedrock, and Codex transports all pass through the same counter. It never stops the stream automatically; it emits one visible warning per user turn so you can decide whether to interrupt.
+
+```yaml
+agent:
+  reasoning_warn_after_tokens: 100000    # Absolute approximate-token threshold; 0 disables the feature
+  reasoning_warn_context_ratio: 8.0      # Also warn at 8x the current request-context estimate; 0 disables this check
+  reasoning_warn_ratio_min_tokens: 8192  # Do not apply the ratio check below this output size
+  reasoning_warn_nudge: false            # Add a one-shot conclusion note to the next user-message sidecar
+```
+
+Token counts are approximate. Either the absolute threshold or the ratio threshold can trigger the warning; the ratio floor avoids noisy warnings on tiny prompts and responses. Set `reasoning_warn_after_tokens: 0` to disable both checks. The optional nudge is off by default and is attached to the next user message rather than changing the conversation's cached system prompt.
+
 ## Verify-on-Stop (coding verification)
 
 When enabled, Hermes refuses to accept a final answer on a turn where the agent edited code in a workspace but produced no fresh verification evidence (a passing test run, build, lint, etc.) — it injects a synthetic follow-up asking the agent to verify or explain why it can't. Doc/markdown/skill-only edits never trigger it, and the loop is bounded so it can never trap the agent.

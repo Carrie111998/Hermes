@@ -989,7 +989,12 @@ def init_agent(
     # '<think>' as delta1 and 'Let me check' as delta2 — the regex
     # erased delta1, so downstream state machines never learned a
     # block was open and leaked delta2 as content).
-    agent._stream_think_scrubber = StreamingThinkScrubber()
+    _reasoning_budget_sink = getattr(agent, "_track_reasoning_budget_delta", None)
+    agent._stream_think_scrubber = StreamingThinkScrubber(
+        on_reasoning_delta=(
+            _reasoning_budget_sink if callable(_reasoning_budget_sink) else None
+        )
+    )
     # Visible assistant text already delivered through live token callbacks
     # during the current model response. Used to avoid re-sending the same
     # commentary when the provider later returns it as a completed interim

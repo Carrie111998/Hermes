@@ -853,6 +853,17 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Warn once when one user turn streams an unusually large amount of model
+  # reasoning. Token counts are approximate. The absolute threshold and the
+  # ratio threshold (reasoning output / current request context) can each fire;
+  # ratio checks wait for ratio_min_tokens to avoid noise on tiny responses.
+  # Set reasoning_warn_after_tokens to 0 to disable the feature entirely.
+  reasoning_warn_after_tokens: 100000
+  reasoning_warn_context_ratio: 8.0
+  reasoning_warn_ratio_min_tokens: 8192
+  # Opt in to add a one-shot conclusion note to the next user-message sidecar.
+  reasoning_warn_nudge: false
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.

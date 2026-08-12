@@ -6526,13 +6526,26 @@ class AIAgent:
         if delivered:
             self._record_streamed_assistant_text(text)
 
+    def _track_reasoning_budget_delta(self, text: str) -> None:
+        """Account for reasoning text and surface a newly crossed budget."""
+        try:
+            from agent.reasoning_budget import track_reasoning_delta
+
+            warning_text = track_reasoning_delta(self, text)
+        except Exception:
+            logger.debug("Reasoning budget tracking failed", exc_info=True)
+            return
+        if warning_text:
+            self._emit_warning(warning_text)
+
     def _fire_reasoning_delta(self, text: str) -> None:
-        """Fire reasoning callback if registered."""
+        """Account for reasoning and fire its display callback if registered."""
         # Single-writer guard (#65991): fence out a superseded stream's
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        self._track_reasoning_budget_delta(text)
         cb = self.reasoning_callback
         if cb is not None:
             try:

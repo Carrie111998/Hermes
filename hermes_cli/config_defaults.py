@@ -35,6 +35,12 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # One-shot warning for unusually large streamed reasoning output.
+        # Set warn_after_tokens to 0 to disable both absolute and ratio checks.
+        "reasoning_warn_after_tokens": 100_000,
+        "reasoning_warn_context_ratio": 8.0,
+        "reasoning_warn_ratio_min_tokens": 8_192,
+        "reasoning_warn_nudge": False,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
