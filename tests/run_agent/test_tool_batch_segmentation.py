@@ -626,6 +626,42 @@ class TestSegmentedDispatchIntegration:
         assert messages[0]["content"].count(STEER_MARKER_OPEN) == 1
         assert "preserve malformed-call steer after budget enforcement" in messages[0]["content"]
 
+    def test_post_budget_flush_persists_final_messages(self, agent):
+        """RC-09: SQLite must receive the FINAL (budgeted) transcript, not the
+        untrimmed per-tool copy. A crash before the turn-end flush used to leave
+        the large raw result in the DB with no aggregate budget applied."""
+        calls = [_tc("terminal", '{"command":"x"}', call_id="big")]
+        messages = []
+        msg = SimpleNamespace(content="", tool_calls=calls)
+        budget = BudgetConfig(default_result_size=10_000, turn_budget=48, preview_size=16)
+
+        flushed_contents = []
+
+        def fake_flush(msgs):
+            flushed_contents.append([
+                m.get("content") if isinstance(m, dict) else None for m in msgs
+            ])
+            return True
+
+        agent._flush_messages_to_session_db = fake_flush
+
+        def fake_handle(name, args, task_id, **kwargs):
+            return "B" * 1_000  # exceeds turn_budget=48 → truncated in the aggregate
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=fake_handle),
+            patch("agent.tool_executor._budget_for_agent", return_value=budget),
+        ):
+            agent._execute_tool_calls(msg, messages, "task-1")
+
+        # At least one per-tool flush + one post-budget flush.
+        assert len(flushed_contents) >= 2, flushed_contents
+        first = flushed_contents[0][-1]
+        last = flushed_contents[-1][-1]
+        assert "B" * 100 in first  # per-tool flush held the raw large result
+        assert "Truncated:" in last  # final flush reflects the budget preview
+        assert len(last) < len(first)
+
 
 class TestPathCanonicalization:
     """Regression tests for _canonical_path / _extract_parallel_scope_path fixes.

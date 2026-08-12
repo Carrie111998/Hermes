@@ -1577,6 +1577,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # so the steer marker is never truncated. See steer() for details.
     if finalize and num_tools > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
+        # Re-flush after the aggregate budget + steer so the persisted transcript
+        # matches the final in-RAM state. A crash before the turn-end flush used
+        # to leave the untrimmed per-result copies (and no steer) in SQLite.
+        _flush_session_db_after_tool_progress(agent, messages, stage="post-budget steer")
 
 
 
@@ -2358,6 +2362,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        # Re-flush after the aggregate budget + steer (same rationale as the
+        # concurrent path) so SQLite matches the final in-RAM transcript.
+        _flush_session_db_after_tool_progress(agent, messages, stage="post-budget steer")
 
 
 
