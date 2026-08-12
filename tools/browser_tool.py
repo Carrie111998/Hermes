@@ -4761,10 +4761,18 @@ def _maybe_autoinstall_chromium() -> bool:
         "(one-time ~170MB; disable via security.allow_lazy_installs)"
     )
     try:
-        proc = subprocess.run(
+        # run_text_capture, not capture_output=True: on Windows ``npx`` is
+        # npx.cmd, a batch shim, so cmd.exe is the direct child and node is
+        # already a grandchild — and agent-browser then spawns its own
+        # downloader for the ~170MB Chromium fetch. Those grandchildren inherit
+        # the capture pipe handles and hold the write end open, so the pipe
+        # never reaches EOF: subprocess.run kills only cmd.exe at 600s and then
+        # blocks re-draining forever, hanging the tool call that triggered the
+        # auto-install. Temp-file capture has nothing to drain.
+        from hermes_cli._subprocess_compat import run_text_capture
+
+        proc = run_text_capture(
             install_cmd,
-            capture_output=True,
-            text=True,
             timeout=600,
             env=_build_browser_env(),
         )

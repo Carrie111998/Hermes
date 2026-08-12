@@ -318,7 +318,11 @@ class TestResolveGitExecutable:
             "_resolve_git_executable",
             return_value="/resolved/git",
         ):
-            with patch.object(pc.subprocess, "run") as run:
+            # Patched on run_text_capture, not subprocess.run: `git pull` runs
+            # a fetch, which forks git-remote-https and (on Windows) a
+            # credential helper. Those grandchildren inherit and hold open a
+            # capture pipe, so the 60s timeout would never fire.
+            with patch.object(pc, "run_text_capture") as run:
                 run.return_value = MagicMock(returncode=0, stdout="Already up to date\n", stderr="")
                 ok, msg = pc._git_pull_plugin_dir(tmp_path)
         assert ok is True
@@ -454,7 +458,7 @@ class TestCmdUpdate:
 
     @patch("hermes_cli.plugins_cmd._sanitize_plugin_name")
     @patch("hermes_cli.plugins_cmd._plugins_dir")
-    @patch("hermes_cli.plugins_cmd.subprocess.run")
+    @patch("hermes_cli.plugins_cmd.run_text_capture")
     def test_update_git_pull_success(self, mock_run, mock_plugins_dir, mock_sanitize):
         from hermes_cli.plugins_cmd import cmd_update
 

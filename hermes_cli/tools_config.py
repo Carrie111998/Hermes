@@ -1349,10 +1349,20 @@ def _run_post_setup(post_setup_key: str):
             else [npx_bin, "-y", "agent-browser", "install", "--with-deps"]
         )
         try:
-            result = subprocess.run(
+            # run_text_capture, not capture_output=True: both branches of
+            # install_cmd are batch shims on Windows (agent-browser.cmd, or
+            # npx.cmd), so cmd.exe is the direct child and node is a
+            # grandchild, which then spawns the ~170MB Chromium downloader.
+            # Grandchildren inherit the capture pipe handles and hold the write
+            # end open, so the pipe never reaches EOF and subprocess.run's 600s
+            # never fires — it kills cmd.exe and blocks re-draining. The helper
+            # applies CREATE_NO_WINDOW itself, which is all
+            # _post_setup_no_window_flags() yields for a redirected child.
+            from hermes_cli._subprocess_compat import run_text_capture
+
+            result = run_text_capture(
                 install_cmd,
-                capture_output=True, text=True, cwd=str(PROJECT_ROOT), timeout=600,
-                creationflags=_post_setup_no_window_flags(),
+                cwd=str(PROJECT_ROOT), timeout=600,
             )
             if result.returncode == 0:
                 _print_success("    Chromium installed")

@@ -201,15 +201,19 @@ class TestRunJobScript:
 
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(venv_python))
-        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        # Stubbed on run_text_capture, not subprocess.run: a script slot runs
+        # arbitrary user code, which routinely shells out again, and on Windows
+        # that grandchild inherits and holds open a capture pipe — so
+        # script_timeout would never fire and the scheduler thread would wedge.
+        monkeypatch.setattr(sched_mod, "run_text_capture", fake_run)
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
-        assert captured["kwargs"]["creationflags"] == 0x08000000
+        # No creationflags passed through: the helper owns CREATE_NO_WINDOW.
+        assert "creationflags" not in captured["kwargs"]
         env = captured["kwargs"]["env"]
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
@@ -238,16 +242,18 @@ class TestRunJobScript:
 
         monkeypatch.setattr(sched_mod.sys, "platform", "win32")
         monkeypatch.setattr(sched_mod.sys, "executable", str(pythonw))
-        monkeypatch.setattr(sched_mod, "windows_hide_flags", lambda: 0x08000000)
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod, "run_text_capture", fake_run)
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [str(python), str(script.resolve())]
-        assert captured["kwargs"]["encoding"] == "utf-8"
-        assert captured["kwargs"]["errors"] == "replace"
+        # The utf-8/replace decoding this used to request via encoding= and
+        # errors= is now what run_text_capture does unconditionally, so the
+        # kwargs are gone while the guarantee they bought is not: the sibling
+        # python is still chosen so captured output is decodable at all.
+        assert "encoding" not in captured["kwargs"]
 
     def test_non_windows_script_preserves_default_text_decoding(self, cron_env, monkeypatch):
         from cron import scheduler as sched_mod
@@ -264,14 +270,17 @@ class TestRunJobScript:
             return SimpleNamespace(returncode=0, stdout="ok\n", stderr="")
 
         monkeypatch.setattr(sched_mod.sys, "platform", "linux")
-        monkeypatch.setattr(sched_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(sched_mod, "run_text_capture", fake_run)
 
         success, output = _run_job_script("probe.py")
 
         assert success is True
         assert output == "ok"
         assert captured["argv"] == [sys.executable, str(script.resolve())]
-        assert captured["kwargs"]["text"] is True
+        # text=/creationflags= are no longer the caller's to pass: the helper
+        # always returns decoded str and owns all platform branching. The POSIX
+        # contract asserted here is that nothing Windows-specific leaks in.
+        assert "text" not in captured["kwargs"]
         assert "creationflags" not in captured["kwargs"]
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]

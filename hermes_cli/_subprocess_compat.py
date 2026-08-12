@@ -33,7 +33,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from typing import Mapping, Optional, Sequence
+from typing import IO, Mapping, Optional, Sequence
 
 __all__ = [
     "IS_WINDOWS",
@@ -340,7 +340,8 @@ def run_text_capture(
     timeout: float,
     cwd: str | os.PathLike | None = None,
     env: Mapping[str, str] | None = None,
-    stdin: int | None = subprocess.DEVNULL,
+    stdin: int | IO[bytes] | None = subprocess.DEVNULL,
+    input: str | None = None,  # noqa: A002 — mirrors subprocess.run's parameter name
     shell: bool = False,
     executable: str | os.PathLike | None = None,
 ) -> subprocess.CompletedProcess:
@@ -415,6 +416,15 @@ def run_text_capture(
     wants a non-interactive probe, so closing stdin is the right default; pass
     ``stdin=None`` to opt back into inheritance.
 
+    ``input`` mirrors ``subprocess.run(input=…)`` — the text is fed to the child
+    on stdin, which then hits EOF, so a child that reads its payload that way
+    (the shell hooks and the webhook route scripts both take their JSON on
+    stdin) sees exactly what it did before. It is staged in a **temp file**
+    rather than a pipe for the same reason stdout/stderr are: feeding a pipe
+    requires ``communicate()``'s writer thread, which is one more thread that
+    can park forever when a grandchild holds the other end of the capture.
+    A regular file needs no thread at all. Mutually exclusive with ``stdin``.
+
     ``shell=True`` runs ``argv`` (then a command *string*, not a list) through
     the platform shell, and is the case that needs this helper most: with a
     shell the real command is ALWAYS a grandchild — ``cmd.exe`` / ``/bin/sh``
@@ -437,7 +447,14 @@ def run_text_capture(
     # Binary temp files + an explicit decode rather than text=True: we own the
     # handles, so the decoding is ours to make deterministic (utf-8 with
     # replacement, \r\n normalized) instead of locale-dependent.
-    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f:
+    with tempfile.TemporaryFile() as out_f, tempfile.TemporaryFile() as err_f, \
+            tempfile.TemporaryFile() as in_f:
+        if input is not None:
+            if stdin != subprocess.DEVNULL:
+                raise ValueError("pass either 'input' or 'stdin', not both")
+            in_f.write(input.encode("utf-8"))
+            in_f.seek(0)
+            stdin = in_f
         proc = subprocess.Popen(
             # With shell=True the command is a string Popen hands to the shell
             # verbatim; list() would shred it into one argument per character.

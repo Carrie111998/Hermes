@@ -262,17 +262,26 @@ def test_gateway_force_kill_hides_taskkill_window(monkeypatch):
 
 
 def test_shell_hooks_hide_hook_command_windows(monkeypatch):
+    """The hook console stays hidden — now via ``run_text_capture``.
+
+    ``_spawn`` used to pass ``creationflags=windows_hide_flags()`` to
+    ``subprocess.run``. It can no longer capture through pipes: ``spec.command``
+    is whatever the user configured, so whatever it launches is a grandchild
+    that holds the capture pipe's write end open and makes ``spec.timeout``
+    unenforceable on Windows. ``run_text_capture`` captures into temp files and
+    applies ``CREATE_NO_WINDOW`` itself, so the no-flash guarantee survives the
+    move — which is what this asserts, alongside the stdin payload still being
+    delivered.
+    """
     from agent import shell_hooks
 
     captured = []
 
-    def fake_run(cmd, **kwargs):
+    def fake_capture(cmd, **kwargs):
         captured.append((cmd, kwargs))
         return SimpleNamespace(returncode=0, stdout="{}", stderr="")
 
-    monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
-    monkeypatch.setattr(shell_hooks, "windows_hide_flags", lambda: _CREATE_NO_WINDOW)
-    monkeypatch.setattr(shell_hooks.subprocess, "run", fake_run)
+    monkeypatch.setattr(shell_hooks, "run_text_capture", fake_capture)
 
     result = shell_hooks._spawn(
         shell_hooks.ShellHookSpec(event="post_tool_call", command="hook-bin --flag"),
@@ -280,7 +289,13 @@ def test_shell_hooks_hide_hook_command_windows(monkeypatch):
     )
 
     assert result["returncode"] == 0
-    assert captured[0][1]["creationflags"] == _CREATE_NO_WINDOW
+    assert captured[0][0] == ["hook-bin", "--flag"]
+    # The JSON payload still reaches the hook on stdin, now staged in a temp
+    # file by the helper rather than fed through communicate()'s writer thread.
+    assert captured[0][1]["input"] == "{}"
+    # No creationflags here by design: the helper owns CREATE_NO_WINDOW.
+    # tests/test_gbrain_cli_timeout.py covers the helper's own behaviour.
+    assert "creationflags" not in captured[0][1]
 
 
 def test_inline_skill_shell_hides_bash_window(monkeypatch):

@@ -818,12 +818,20 @@ def _bash_starts(bash: str) -> bool:
         return cached
 
     try:
-        result = subprocess.run(
+        # run_text_capture, not capture_output=True: this probe exists to make
+        # bash fork external MSYS programs (/usr/bin/true, /usr/bin/cat), so a
+        # grandchild is not a risk here but the entire point — and it inherits
+        # the capture pipe handles. Worse, the failure this probe detects is a
+        # Git-for-Windows child that never launches cleanly under Mandatory
+        # ASLR, which is exactly the state where the pipe never reaches EOF and
+        # the 15s below never fires. Pipe capture made the diagnostic hang on
+        # the condition it was written to diagnose. The helper applies
+        # CREATE_NO_WINDOW itself, replacing windows_hide_flags() here.
+        from hermes_cli._subprocess_compat import run_text_capture
+
+        result = run_text_capture(
             [bash, "--noprofile", "--norc", "-c", _BASH_EXTERNAL_PROGRAM_PROBE],
-            capture_output=True,
-            text=True,
             timeout=15,
-            creationflags=windows_hide_flags() if _IS_WINDOWS else 0,
         )
         ok = result.returncode == 0
         if not ok:

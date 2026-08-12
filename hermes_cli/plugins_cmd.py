@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from hermes_constants import get_hermes_home
+from hermes_cli._subprocess_compat import run_text_capture
 from hermes_cli.config import cfg_get
 from hermes_cli.secret_prompt import masked_secret_prompt
 
@@ -469,10 +470,16 @@ def _install_plugin_core(identifier: str, *, force: bool) -> tuple[Path, dict, s
             raise PluginOperationError("git is not installed or not in PATH.")
 
         try:
-            result = subprocess.run(
+            # run_text_capture, not capture_output=True: a network clone forks
+            # helpers — git-remote-https for the transport, and on Windows
+            # git-credential-manager.exe when the URL needs auth. Those
+            # grandchildren inherit the capture pipe handles and hold the write
+            # end open, so the pipe never reaches EOF and the 60s below never
+            # fires: subprocess.run kills only git and then blocks re-draining.
+            # A credential prompt with no console behind it (gateway, desktop)
+            # is the case that wedges forever.
+            result = run_text_capture(
                 [git_exe, "clone", "--depth", "1", git_url, str(tmp_clone)],
-                capture_output=True,
-                text=True,
                 timeout=60,
             )
         except FileNotFoundError as e:
@@ -1966,10 +1973,13 @@ def _git_pull_plugin_dir(target: Path) -> tuple[bool, str]:
     if not git_exe:
         return False, "git is not installed or not in PATH."
     try:
-        result = subprocess.run(
+        # run_text_capture, not capture_output=True: `pull` runs a fetch, which
+        # forks git-remote-https and (on Windows) git-credential-manager.exe.
+        # Those grandchildren inherit the capture pipe handles, so the pipe
+        # never reaches EOF and the 60s below never bounds the call. Same
+        # reasoning as the clone in _install_plugin_from_git.
+        result = run_text_capture(
             [git_exe, "pull", "--ff-only"],
-            capture_output=True,
-            text=True,
             timeout=60,
             cwd=str(target),
         )

@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_cli._subprocess_compat as _spc
 from tools import lazy_deps as ld
 
 
@@ -183,7 +184,18 @@ class TestInstallArgConstruction:
     """Verify the durable-target install builds the right pip/uv command
     WITHOUT hitting the network, by stubbing the subprocess layer. This is
     the CI-safe coverage of the install path; the genuine PyPI install below
-    is opt-in only."""
+    is opt-in only.
+
+    Two layers have to be stubbed, because the install path uses two different
+    spawns. The ``pip --version`` probe is a leaf process and stays on
+    ``subprocess.run``; the install itself goes through ``run_text_capture``,
+    since pip forks a build backend per sdist and that grandchild would
+    inherit — and hold open — a capture pipe, making ``timeout`` unenforceable
+    on Windows. ``lazy_deps`` imports the helper inside the function (it is a
+    deliberately lazy module), so the patch lands on the defining module.
+    Stubbing only ``subprocess.run`` here does not fail closed: it lets a REAL
+    ``pip install`` run against the live interpreter.
+    """
 
     def test_target_and_constraint_args_passed(self, tmp_path, monkeypatch):
         target = tmp_path / "lazy-packages"
@@ -193,14 +205,16 @@ class TestInstallArgConstruction:
 
         captured = {}
 
-        def fake_run(cmd, *a, **k):
+        def fake_probe(cmd, *a, **k):
             # The pip --version probe must look healthy so we reach install.
-            if "--version" in cmd:
-                return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+            return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+
+        def fake_capture(cmd, *a, **k):
             captured["cmd"] = cmd
             return subprocess.CompletedProcess(cmd, 0, "ok", "")
 
-        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+        monkeypatch.setattr(ld.subprocess, "run", fake_probe)
+        monkeypatch.setattr(_spc, "run_text_capture", fake_capture)
         # Avoid mutating the real interpreter's sys.path on success.
         monkeypatch.setattr(ld, "_activate_target_on_syspath", lambda _t: None)
 
@@ -221,13 +235,15 @@ class TestInstallArgConstruction:
         monkeypatch.setattr(ld.shutil, "which", lambda _: None)
         captured = {}
 
-        def fake_run(cmd, *a, **k):
-            if "--version" in cmd:
-                return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+        def fake_probe(cmd, *a, **k):
+            return subprocess.CompletedProcess(cmd, 0, "pip 24.0", "")
+
+        def fake_capture(cmd, *a, **k):
             captured["cmd"] = cmd
             return subprocess.CompletedProcess(cmd, 0, "ok", "")
 
-        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+        monkeypatch.setattr(ld.subprocess, "run", fake_probe)
+        monkeypatch.setattr(_spc, "run_text_capture", fake_capture)
         result = ld._venv_pip_install(("somepkg==1.2.3",))
         assert result.success
         assert "--target" not in captured["cmd"]
