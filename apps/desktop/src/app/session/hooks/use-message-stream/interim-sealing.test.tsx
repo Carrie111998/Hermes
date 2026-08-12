@@ -97,6 +97,20 @@ describe('useMessageStream interim text sealing', () => {
     vi.restoreAllMocks()
   })
 
+  it('timestamps the completed reply', async () => {
+    await mountStream()
+    let now = new Date('2026-08-10T12:00:00Z').getTime()
+    vi.spyOn(Date, 'now').mockImplementation(() => now)
+    await start()
+
+    now += 65_000
+    const completedAt = now
+    await complete('done')
+
+    const assistant = getState().messages.find(message => message.role === 'assistant')
+    expect(assistant?.timestamp).toBe(completedAt / 1000)
+  })
+
   it('preserves interim text that the final response does not include', async () => {
     await mountStream()
     await start()

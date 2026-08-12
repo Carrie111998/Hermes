@@ -4,7 +4,7 @@ import { useEffect, useRef } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getSession } from '@/hermes'
-import { textPart } from '@/lib/chat-messages'
+import { type ChatMessage, textPart } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { $composerAttachments, $composerDraft, type ComposerAttachment, setComposerDraft } from '@/store/composer'
 import { $queuedPromptsBySession, getQueuedPrompts } from '@/store/composer-queue'
@@ -1670,6 +1670,28 @@ describe('usePromptActions submit / queue drain semantics', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+  })
+
+  it('timestamps the optimistic user message', async () => {
+    const now = new Date('2026-08-10T12:00:00Z').getTime()
+    vi.spyOn(Date, 'now').mockReturnValue(now)
+    const seeds: Record<string, unknown>[] = []
+    const requestGateway = vi.fn(async () => ({}) as never)
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        onSeedState={state => seeds.push(state)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('time this')
+
+    const messages = seeds.at(-1)?.messages as ChatMessage[]
+    expect(messages.find(message => message.role === 'user')?.timestamp).toBe(now / 1000)
   })
 
   it('clears a leftover interrupted flag on a fresh submit (so the new turn streams)', async () => {
