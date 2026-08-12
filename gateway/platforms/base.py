@@ -132,6 +132,13 @@ def _mark_notify_metadata(metadata: dict | None) -> dict:
     return notify_metadata
 
 
+def _is_deferred_followup_event(event) -> bool:
+    """Return true for events that must queue and cannot answer prompts."""
+    return bool(getattr(event, "internal", False)) or bool(
+        (getattr(event, "metadata", None) or {}).get("deferred_followup_event")
+    )
+
+
 def _reply_anchor_for_event(event) -> str | None:
     """Return reply_to id for platforms that need reply semantics.
 
@@ -6042,7 +6049,7 @@ class BasePlatformAdapter(ABC):
             # Same shape as the /approve deadlock fix (PR #4926) — both
             # cases are "agent thread blocked on Event.wait, message must
             # reach the resolver before being treated as a new turn."
-            if not cmd:
+            if not cmd and not _is_deferred_followup_event(event):
                 try:
                     from tools import clarify_gateway as _clarify_mod
                     _has_text_clarify = (
@@ -6186,7 +6193,8 @@ class BasePlatformAdapter(ABC):
         # typing_task stays None; _stop_typing_refresh already no-ops on None.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
         typing_task: Optional[asyncio.Task] = None
-        if getattr(self.config, "typing_indicator", True):
+        if (getattr(self.config, "typing_indicator", True)
+                and not event.metadata.get("suppress_typing")):
             _keep_typing_kwargs: Dict[str, Any] = {"metadata": _thread_metadata}
             try:
                 _keep_typing_sig = inspect.signature(self._keep_typing)

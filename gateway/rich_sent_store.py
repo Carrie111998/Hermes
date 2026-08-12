@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from typing import Optional
 
 _MAX_ENTRIES = 1000
 _MAX_TEXT_CHARS = 2000
+_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+_LOCK = threading.Lock()
 
 
 def _store_path() -> str:
@@ -36,9 +39,43 @@ def _key(chat_id, message_id) -> str:
     return f"{chat_id}:{message_id}"
 
 
-def record(chat_id, message_id, text: Optional[str]) -> None:
-    """Persist ``text`` for ``(chat_id, message_id)``. No-op on any failure."""
-    if not text or message_id is None or chat_id is None:
+def _timestamp(entry) -> float:
+    try:
+        return float(entry.get("ts", 0)) if isinstance(entry, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _store_paths() -> list[tuple[str | None, str]]:
+    """Return default, current and named-profile index paths."""
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    root, current = get_default_hermes_root(), get_hermes_home()
+    paths = [
+        (None, root / "state" / "rich_sent_index.json"),
+        *((home.name, home / "state" / "rich_sent_index.json")
+          for home in sorted(root.glob("profiles/*")) if home.is_dir()),
+    ]
+    profile = current.name if current.parent == root / "profiles" else None
+    paths.append((profile, _store_path()))
+    return list({os.path.abspath(path): (profile, os.fspath(path))
+                 for profile, path in paths}.values())
+
+
+def record(
+    chat_id, message_id, text: Optional[str], *, thread_id=None, sender_id=None
+) -> None:
+    with _LOCK:
+        _record_unlocked(
+            chat_id, message_id, text, thread_id=thread_id, sender_id=sender_id
+        )
+
+
+def _record_unlocked(
+    chat_id, message_id, text: Optional[str], *, thread_id=None, sender_id=None
+) -> None:
+    """Persist text and optional reaction-routing metadata."""
+    if message_id is None or chat_id is None:
         return
     path = _store_path()
     try:
@@ -50,14 +87,19 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
                 data = {}
         except (FileNotFoundError, ValueError):
             data = {}
-        data[_key(chat_id, message_id)] = {
-            "t": text[:_MAX_TEXT_CHARS],
-            "ts": int(time.time()),
-        }
+        key = _key(chat_id, message_id)
+        previous = data.get(key)
+        entry = dict(previous) if isinstance(previous, dict) else {}
+        entry.update({"t": (text or "")[:_MAX_TEXT_CHARS], "ts": int(time.time())})
+        if thread_id not in {None, ""}:
+            entry["thread_id"] = str(thread_id)
+        if sender_id not in {None, ""}:
+            entry["sender_id"] = str(sender_id)
+        data[key] = entry
         # Trim oldest by timestamp when over cap.
         if len(data) > _MAX_ENTRIES:
             for k, _ in sorted(
-                data.items(), key=lambda kv: kv[1].get("ts", 0)
+                data.items(), key=lambda kv: _timestamp(kv[1])
             )[: len(data) - _MAX_ENTRIES]:
                 data.pop(k, None)
         tmp = f"{path}.tmp.{os.getpid()}"
@@ -66,6 +108,26 @@ def record(chat_id, message_id, text: Optional[str]) -> None:
         os.replace(tmp, path)  # atomic; tolerates concurrent writers racing
     except Exception:
         return
+
+
+def lookup_entry(chat_id, message_id, *, all_profiles: bool = False) -> Optional[dict]:
+    """Return one unambiguous fresh entry, optionally searching every profile."""
+    if message_id is None or chat_id is None:
+        return None
+    now, matches = time.time(), []
+    for profile, path in _store_paths() if all_profiles else [(None, _store_path())]:
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                entry = json.load(fh).get(_key(chat_id, message_id))
+            # Missing / bad / expired timestamps fail closed for ownership.
+            age = now - _timestamp(entry)
+            if isinstance(entry, dict) and 0 <= age <= _MAX_AGE_SECONDS:
+                entry = dict(entry)
+                entry["profile"] = profile
+                matches.append(entry)
+        except (FileNotFoundError, OSError, ValueError, AttributeError, TypeError):
+            pass
+    return matches[0] if len(matches) == 1 else None
 
 
 def lookup(chat_id, message_id) -> Optional[str]:

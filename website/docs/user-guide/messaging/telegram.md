@@ -1199,8 +1199,8 @@ This covers the custom fallback transport layer that Hermes uses for Telegram co
 The bot can add emoji reactions to messages as visual processing feedback:
 
 - 👀 when the bot starts processing your message
-- ✅ when the response is delivered successfully
-- ❌ if an error occurs during processing
+- 👍 when the response is delivered successfully
+- 👎 if an error occurs during processing
 
 Reactions are **disabled by default**. Enable them in `config.yaml`:
 
@@ -1216,12 +1216,54 @@ TELEGRAM_REACTIONS=true
 ```
 
 :::note
-Unlike Discord (where reactions are additive), Telegram's Bot API replaces all bot reactions in a single call. The transition from 👀 to ✅/❌ happens atomically — you won't see both at once.
+Telegram's Bot API replaces all bot reactions in one call, so 👀 changes atomically to 👍/👎. An explicit `telegram_react` reaction is preserved instead.
 :::
 
 :::tip
 If the bot doesn't have permission to add reactions in a group, the reaction calls fail silently and message processing continues normally.
 :::
+
+### Reaction tool and inbound reactions
+
+`telegram_react` adds one standard emoji reaction to the Telegram message that started the current turn. It cannot target another message or send text, and works when automatic processing reactions are disabled.
+
+Inbound reactions are off by default. Enable them with:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      inbound_reactions: true
+```
+
+An authorized user's standard emoji additions and removals on Hermes messages start turns in the original chat and forum topic. Hermes ignores bot reactions and targets whose message, bot/profile ownership, or topic cannot be verified. Telegram's General topic remains logical thread `1`, although Bot API calls omit that ID. Reactions provide context only; consequential actions still require explicit text.
+
+To let selected reactions approve the exact non-consequential proposal in the
+Hermes message being reacted to, configure them explicitly:
+
+```yaml
+platforms:
+  telegram:
+    extra:
+      inbound_reactions: true
+      proposal_approval_reactions:
+        - "👍"
+```
+
+This setting is empty by default. When a configured reaction is **added**, the
+agent is instructed to carry out the proposal only if the target message contains
+a concrete, unambiguous and non-consequential next action. The instruction does
+not broaden the proposal, grant session or permanent permission, or replace the
+normal approval flow for risky operations. Removing a reaction does not add
+approval guidance.
+
+Use a [standard Telegram reaction](https://core.telegram.org/bots/api#reactiontypeemoji)
+that the intended users can select. `👍` is available to non-Premium users and
+is the recommended default.
+Symbols such as `✅` are used in some Hermes approval-button labels but are not
+standard Telegram message reactions. Custom-emoji reactions may require
+Telegram Premium, can be restricted by chat administrators, and are not handled
+by this inbound-reaction path.
 
 ## Per-Channel Prompts
 

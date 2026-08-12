@@ -22,16 +22,19 @@ the bubble stays visible across provider stalls.
 """
 
 import asyncio
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
     Platform,
     PlatformConfig,
     SendResult,
 )
+from gateway.session import SessionSource, build_session_key
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -52,6 +55,35 @@ class _StubAdapter(BasePlatformAdapter):
 
 
 class TestKeepTypingTimeoutPerTick:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("suppress", "expected"), [(False, 1), (True, 0)])
+    async def test_event_can_suppress_typing_refresh(self, suppress, expected):
+        adapter = _StubAdapter()
+        adapter._keep_typing = AsyncMock()
+        adapter._stop_typing_refresh = AsyncMock()
+
+        async def handler(_event):
+            await asyncio.sleep(0)
+            return None
+
+        adapter.set_message_handler(handler)
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="123",
+            chat_type="private",
+            user_id="42",
+        )
+        event = MessageEvent(
+            text="event",
+            source=source,
+            message_type=MessageType.TEXT,
+            metadata={"suppress_typing": suppress},
+        )
+
+        await adapter._process_message_background(event, build_session_key(source))
+
+        assert adapter._keep_typing.await_count == expected
+
     @pytest.mark.asyncio
     async def test_slow_send_typing_does_not_block_cadence(self, monkeypatch):
         """A send_typing that hangs longer than the per-tick budget must be
