@@ -70,6 +70,7 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+SIGNAL_STATUS_REACTION_EMOJIS = {"👀", "✅", "❌"}
 
 
 # ---------------------------------------------------------------------------
@@ -1630,39 +1631,72 @@ class SignalAdapter(BasePlatformAdapter):
             return None
         return (author, ts)
 
-    def _reactions_enabled(self, event: "MessageEvent" = None) -> bool:
-        """Check if message reactions are enabled for this event.
+    def _reaction_allowed_for_event(self, event: Optional["MessageEvent"] = None) -> bool:
+        """Return True if this event is allowed to receive a bot reaction.
 
-        Two gates:
-        1. SIGNAL_REACTIONS env var — set to false/0/no to disable globally.
-        2. DM allowlist — if SIGNAL_ALLOWED_USERS is set, only react to
-           messages from senders in that list.  This prevents unauthorized
-           contacts from seeing the 👀 reaction (which fires before run.py's
-           auth gate and would otherwise reveal that a bot is listening).
+        The sender allowlist applies before any reaction path. This prevents
+        unauthorized contacts from seeing a reaction before run.py's auth gate.
         """
-        if os.getenv("SIGNAL_REACTIONS", "true").lower() in {"false", "0", "no"}:
-            return False
         if event is not None:
             sender = getattr(getattr(event, "source", None), "user_id", None)
             if sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from:
                 return False
         return True
 
+    def _status_reactions_enabled(self, event: Optional["MessageEvent"] = None) -> bool:
+        """Return True only when fixed processing-status reactions are enabled.
+
+        Default is OFF. A status reaction stamps every processed Signal message
+        with 👀/✅/❌. That reads like a ticket system in chat, so it must be an
+        explicit opt-in via SIGNAL_STATUS_REACTIONS=true.
+        """
+        if os.getenv("SIGNAL_STATUS_REACTIONS", "false").lower() not in {"true", "1", "yes", "on"}:
+            return False
+        return self._reaction_allowed_for_event(event)
+
+    def _contextual_reactions_enabled(self, event: Optional["MessageEvent"] = None) -> bool:
+        """Return True when deliberate, context-selected reactions are allowed."""
+        if os.getenv("SIGNAL_CONTEXTUAL_REACTIONS", "true").lower() in {"false", "0", "no"}:
+            return False
+        return self._reaction_allowed_for_event(event)
+
+    def _reactions_enabled(self, event: Optional["MessageEvent"] = None) -> bool:
+        """Backward-compatible alias for processing-status reaction checks."""
+        return self._status_reactions_enabled(event)
+
+    async def send_contextual_reaction(self, event: MessageEvent, emoji: str) -> bool:
+        """Send one deliberate social reaction to an inbound Signal message.
+
+        This path is for human-fit reactions such as 🤣, ❤️, 👍, 🤷‍♂️, or 😎.
+        It is separate from processing-status stamps. Status emojis are rejected
+        here so a caller cannot reintroduce the automatic check-mark behavior
+        through the contextual path.
+        """
+        if not emoji or emoji in SIGNAL_STATUS_REACTION_EMOJIS:
+            return False
+        if not self._contextual_reactions_enabled(event):
+            return False
+        target = self._extract_reaction_target(event)
+        if not target:
+            return False
+        return await self.send_reaction(event.source.chat_id, emoji, *target)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """React with 👀 when processing begins."""
-        if not self._reactions_enabled(event):
+        """React with 👀 when processing begins, only if explicitly enabled."""
+        if not self._status_reactions_enabled(event):
             return
         target = self._extract_reaction_target(event)
         if target:
             await self.send_reaction(event.source.chat_id, "👀", *target)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: "ProcessingOutcome") -> None:
-        """Swap the 👀 reaction for ✅ (success) or ❌ (failure).
+        """Swap the 👀 reaction for ✅/❌ only if status reactions are enabled.
 
-        On CANCELLED we leave the 👀 in place — no terminal outcome means
-        the reaction should keep reflecting "in progress" (matches Telegram).
+        Contextual social reactions are intentionally not tied to processing
+        completion. They must be chosen by a caller through
+        send_contextual_reaction().
         """
-        if not self._reactions_enabled(event):
+        if not self._status_reactions_enabled(event):
             return
         if outcome == ProcessingOutcome.CANCELLED:
             return

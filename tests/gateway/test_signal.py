@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageEvent, ProcessingOutcome
 
 
 @pytest.fixture(autouse=True)
@@ -41,11 +42,26 @@ def _stub_rpc(return_value):
     """Return an async mock for SignalAdapter._rpc that captures call params."""
     captured = []
 
-    async def mock_rpc(method, params, rpc_id=None):
+    async def mock_rpc(method, params, rpc_id=None, **kwargs):
         captured.append({"method": method, "params": dict(params)})
         return return_value
 
     return mock_rpc, captured
+
+
+def _reaction_event(adapter, chat_id="group:g123", sender="+155****9999", ts=1234567890):
+    source = adapter.build_source(
+        chat_id=chat_id,
+        chat_name="Supafriends",
+        chat_type="group" if chat_id.startswith("group:") else "dm",
+        user_id=sender,
+        user_name="Greg",
+    )
+    return MessageEvent(
+        text="hello",
+        source=source,
+        raw_message={"sender": sender, "timestamp_ms": ts},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +117,50 @@ class TestSignalConnectCleanup:
         mock_release.assert_called_once_with("signal-phone", "+15551234567")
         assert adapter.client is None
         assert adapter._platform_lock_identity is None
+
+
+class TestSignalReactions:
+    @pytest.mark.asyncio
+    async def test_processing_hooks_do_not_stamp_status_reactions_by_default(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, captured = _stub_rpc({"timestamp": 1})
+        event = _reaction_event(adapter)
+
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+
+        assert [call["method"] for call in captured] == []
+
+    @pytest.mark.asyncio
+    async def test_contextual_reaction_sends_selected_emoji_when_enabled(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_CONTEXTUAL_REACTIONS", "true")
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, captured = _stub_rpc({"timestamp": 1})
+        event = _reaction_event(adapter)
+
+        sent = await adapter.send_contextual_reaction(event, "🤣")
+
+        assert sent is True
+        assert len(captured) == 1
+        assert captured[0]["method"] == "sendReaction"
+        params = captured[0]["params"]
+        assert params["account"] == adapter.account
+        assert params["emoji"] == "🤣"
+        assert params["targetAuthor"] == event.raw_message["sender"]
+        assert params["targetTimestamp"] == event.raw_message["timestamp_ms"]
+        assert params["groupId"] == "g123"
+
+    @pytest.mark.asyncio
+    async def test_contextual_reaction_rejects_status_stamp_emojis(self, monkeypatch):
+        monkeypatch.setenv("SIGNAL_CONTEXTUAL_REACTIONS", "true")
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._rpc, captured = _stub_rpc({"timestamp": 1})
+        event = _reaction_event(adapter)
+
+        sent = await adapter.send_contextual_reaction(event, "✅")
+
+        assert sent is False
+        assert captured == []
 
 
 class TestSignalHelpers:
