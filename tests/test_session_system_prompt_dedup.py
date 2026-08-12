@@ -158,6 +158,22 @@ def test_deleting_one_shared_session_preserves_prompt_until_final_reference(db):
     assert _prompt_count(db) == 0
 
 
+def test_prune_empty_ghost_sessions_reaps_unknown_zero_count_rows(db):
+    db.create_session("shadow", source="unknown")
+    db.create_session("nonempty-counter", source="unknown")
+    db._conn.execute(
+        "UPDATE sessions SET started_at = 0 WHERE id IN ('shadow', 'nonempty-counter')"
+    )
+    db._conn.execute(
+        "UPDATE sessions SET message_count = 1 WHERE id = 'nonempty-counter'"
+    )
+    db._conn.commit()
+
+    assert db.prune_empty_ghost_sessions() == 1
+    assert db.get_session("shadow") is None
+    assert db.get_session("nonempty-counter") is not None
+
+
 def test_compression_child_uses_content_addressed_prompt(db):
     prompt = "compressed child prompt"
     db.create_session("parent", "webui")

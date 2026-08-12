@@ -5055,15 +5055,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._execute_write(_do)
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
-        """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
+        """Remove empty TUI and unknown-source ghost sessions older than 24hr."""
         cutoff = time.time() - 86400  # Only sessions older than 24 hours
 
         def _do(conn):
             rows = conn.execute("""
                 SELECT id FROM sessions
-                WHERE source = 'tui'
+                WHERE (
+                    source = 'tui'
+                    OR (source = 'unknown' AND message_count = 0)
+                  )
                   AND title IS NULL
-                  AND ended_at IS NOT NULL
+                  AND (ended_at IS NOT NULL OR source = 'unknown')
                   AND started_at < ?
                   AND NOT EXISTS (
                       SELECT 1 FROM messages WHERE messages.session_id = sessions.id
