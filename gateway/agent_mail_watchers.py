@@ -131,6 +131,7 @@ async def _deliver_unread_once(
             text=_wake_text(identity, message),
             source=source,
             message_id=f"agent-mail:{message_id}",
+            suppress_public_delivery=True,
         )
         # `handle_message` queues a normal agent turn and returns before its
         # response. Read-state remains owned by the identity-bound Agent Mail tool;

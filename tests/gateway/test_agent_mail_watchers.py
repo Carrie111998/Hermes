@@ -7,6 +7,8 @@ from typing import Any, cast
 import gateway.agent_mail_watchers as watcher
 from gateway.agent_mail_watchers import _agent_mail_source, _wake_text
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType
+from gateway.run import _is_nonpublic_control_plane_event
 from gateway.session import SessionSource, build_session_key
 
 
@@ -30,6 +32,23 @@ def test_agent_mail_source_uses_an_internal_session_key_not_the_watched_user():
     assert build_session_key(wake_source) == "agent:main:internal:agent-mail:default:SilverHarbor"
     assert build_session_key(wake_source) != build_session_key(human_source)
     assert "internal_session_id" not in wake_source.to_dict()
+
+
+def test_only_explicit_internal_control_plane_events_suppress_public_delivery():
+    source = _agent_mail_source(
+        channel_id="channel-1", profile="default", identity="SilverHarbor"
+    )
+    suppressed = MessageEvent(
+        text="mail", message_type=MessageType.TEXT, source=source,
+        internal=True, metadata={"suppress_public_delivery": True},
+    )
+    ordinary_internal = MessageEvent(
+        text="completion", message_type=MessageType.TEXT, source=source,
+        internal=True,
+    )
+
+    assert _is_nonpublic_control_plane_event(suppressed) is True
+    assert _is_nonpublic_control_plane_event(ordinary_internal) is False
 
 
 def test_agent_mail_wake_is_internal_and_bounded():
@@ -92,8 +111,8 @@ def test_successful_delivery_advances_only_its_profile_cursor_and_never_marks_re
         original_deliver = watcher.deliver_wake
         delivered = []
 
-        async def accepted_deliver(_adapter, *, text, source, message_id):
-            delivered.append((text, source, message_id))
+        async def accepted_deliver(_adapter, *, text, source, message_id, suppress_public_delivery=False):
+            delivered.append((text, source, message_id, suppress_public_delivery))
 
         try:
             watcher._fetch_unread = lambda *_args: [
@@ -114,6 +133,7 @@ def test_successful_delivery_advances_only_its_profile_cursor_and_never_marks_re
             )
             assert count == 1
             assert delivered[0][2] == "agent-mail:11"
+            assert delivered[0][3] is True
             assert json.loads(ironpaw_state.read_text())["last_seen_message_id"] == 11
             assert json.loads(daery_state.read_text())["last_seen_message_id"] == 77
         finally:

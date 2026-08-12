@@ -3332,6 +3332,19 @@ def _should_deliver_completed_response_before_pending(
     return True
 
 
+def _is_nonpublic_control_plane_event(event: Any) -> bool:
+    """True only for an explicitly marked synthetic control-plane event.
+
+    ``internal`` alone remains insufficient: process/delegation completions can
+    have legitimate platform-delivery semantics.  A private wake must carry the
+    explicit metadata marker created by ``deliver_wake``.
+    """
+    return bool(
+        getattr(event, "internal", False)
+        and (getattr(event, "metadata", {}) or {}).get("suppress_public_delivery")
+    )
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayAgentMailWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -14622,6 +14635,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            # A control-plane wake may execute locally but must not create a
+            # visible platform reply, stream draft, media delivery, footer, or
+            # voice bubble. Persisted internal work stays in the isolated
+            # session; only an explicit later escalation may send publicly.
+            _suppress_public_delivery = _is_nonpublic_control_plane_event(event)
+            if _suppress_public_delivery:
+                logger.info(
+                    "Suppressing public delivery for internal control-plane event "
+                    "session=%s origin=%s",
+                    session_entry.session_id,
+                    event.message_id or "unknown",
+                )
+                response = ""
+                agent_result["already_sent"] = True
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -21454,13 +21482,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_config, platform_key, "streaming"
             )
             # None = no per-platform override → follow global config
+            # Control-plane Agent Mail sessions execute locally, but their
+            # responses are intentionally non-public unless a later escalation
+            # creates a separate platform event. Disable every streaming/interim
+            # path before a draft could be sent; the handler suppresses the
+            # non-streaming final at its normal delivery boundary.
+            _suppress_public_delivery = bool(
+                getattr(source, "internal_session_id", "").startswith("agent-mail:")
+            )
             _streaming_enabled = (
-                _scfg.enabled and _scfg.transport != "off"
-                if _plat_streaming is None
-                else bool(_plat_streaming)
+                (
+                    _scfg.enabled and _scfg.transport != "off"
+                    if _plat_streaming is None
+                    else bool(_plat_streaming)
+                )
+                and not _suppress_public_delivery
             )
             _want_stream_deltas = _streaming_enabled
-            _want_interim_messages = interim_assistant_messages_enabled
+            _want_interim_messages = interim_assistant_messages_enabled and not _suppress_public_delivery
             _want_interim_consumer = _want_interim_messages
             if _want_stream_deltas or _want_interim_consumer:
                 try:

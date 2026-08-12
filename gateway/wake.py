@@ -60,6 +60,7 @@ async def deliver_wake(
     session_id: str = "",
     source: Any = None,
     message_id: str = "",
+    suppress_public_delivery: bool = False,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -85,6 +86,7 @@ async def deliver_wake(
             source=source,
             message_id=message_id or None,
             internal=True,
+            metadata={"suppress_public_delivery": True} if suppress_public_delivery else {},
         )
         await adapter.handle_message(synth_event)
         return
