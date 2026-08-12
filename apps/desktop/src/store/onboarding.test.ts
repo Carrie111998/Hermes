@@ -7,6 +7,7 @@ import {
   $desktopOnboarding,
   type DesktopOnboardingState,
   type OnboardingContext,
+  recheckExternalSignin,
   refreshOnboarding,
   requestDesktopOnboarding,
   saveOnboardingLocalEndpoint,
@@ -415,6 +416,172 @@ describe('OAuth onboarding', () => {
     expect(optionsIndex).toBeGreaterThanOrEqual(0)
     expect(recommendedIndex).toBeGreaterThan(optionsIndex)
     expect(setIndex).toBeGreaterThan(recommendedIndex)
+  })
+
+  it('validates Claude Code as Anthropic before persisting its model assignment', async () => {
+    const model = 'claude-opus-4-6'
+    const events: string[] = []
+
+    installApiMock(async ({ path }: { path: string }) => {
+      if (path.startsWith('/api/model/options')) {
+        return {
+          providers: [{ name: 'Anthropic', slug: 'anthropic', models: [model] }]
+        }
+      }
+
+      if (path.startsWith('/api/model/recommended-default?')) {
+        return { provider: 'anthropic', model }
+      }
+
+      if (path === '/api/model/set') {
+        events.push('model.set')
+
+        return { ok: true, provider: 'anthropic', model, gateway_tools: [] }
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async (method, params) => {
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        events.push('runtime.check')
+        expect(params).toEqual({ provider: 'anthropic' })
+
+        return { ok: true, provider: 'anthropic' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    $desktopOnboarding.set(
+      baseState({
+        flow: {
+          status: 'external_pending',
+          provider: { ...provider('claude-code', 'Claude Code'), flow: 'external' },
+          copied: false
+        }
+      })
+    )
+
+    await recheckExternalSignin(onboardingContext(requestGateway))
+
+    expect(events).toEqual(['runtime.check', 'model.set'])
+    expect($desktopOnboarding.get().flow).toMatchObject({
+      status: 'confirming_model',
+      providerSlug: 'anthropic',
+      currentModel: model
+    })
+  })
+
+  it('does not overwrite the current model when Claude Code lacks Anthropic credentials', async () => {
+    const paths: string[] = []
+
+    installApiMock(async ({ path }: { path: string }) => {
+      paths.push(path)
+
+      if (path.startsWith('/api/model/options')) {
+        return {
+          providers: [{ name: 'Anthropic', slug: 'anthropic', models: ['claude-opus-4-6'] }]
+        }
+      }
+
+      if (path.startsWith('/api/model/recommended-default?')) {
+        return { provider: 'anthropic', model: 'claude-opus-4-6' }
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async (method, params) => {
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        expect(params).toEqual({ provider: 'anthropic' })
+
+        return { ok: false, error: 'No Anthropic credentials found.' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    const claudeCode = { ...provider('claude-code', 'Claude Code'), flow: 'external' as const }
+    $desktopOnboarding.set(
+      baseState({
+        flow: { status: 'external_pending', provider: claudeCode, copied: false }
+      })
+    )
+
+    await recheckExternalSignin(onboardingContext(requestGateway))
+
+    expect(paths).not.toContain('/api/model/set')
+    expect($desktopOnboarding.get().flow).toMatchObject({
+      status: 'error',
+      provider: claudeCode,
+      message: expect.stringContaining('No Anthropic credentials found.')
+    })
+  })
+
+  it('does not fall back to an unrelated provider when the authenticated provider has no model options', async () => {
+    const paths: string[] = []
+
+    installApiMock(async ({ path }: { path: string }) => {
+      paths.push(path)
+
+      if (path.startsWith('/api/model/options')) {
+        return {
+          providers: [{ name: 'OpenAI Codex', slug: 'openai-codex', models: ['gpt-5.6-sol'] }]
+        }
+      }
+
+      throw new Error(`unexpected api path: ${path}`)
+    })
+
+    const requestGateway: OnboardingContext['requestGateway'] = async (method, params) => {
+      if (method === 'reload.env') {
+        return {} as never
+      }
+
+      if (method === 'setup.status') {
+        return { provider_configured: true } as never
+      }
+
+      if (method === 'setup.runtime_check') {
+        expect(params).toEqual({ provider: 'anthropic' })
+
+        return { ok: true, provider: 'anthropic' } as never
+      }
+
+      throw new Error(`unexpected gateway method: ${method}`)
+    }
+
+    $desktopOnboarding.set(
+      baseState({
+        flow: {
+          status: 'external_pending',
+          provider: { ...provider('claude-code', 'Claude Code'), flow: 'external' },
+          copied: false
+        }
+      })
+    )
+
+    await recheckExternalSignin(onboardingContext(requestGateway))
+
+    expect(paths).not.toContain('/api/model/set')
+    expect($desktopOnboarding.get().configured).toBe(true)
   })
 })
 
