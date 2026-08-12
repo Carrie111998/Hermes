@@ -34,21 +34,20 @@ low on this box and kills the whole file rather than one test.
 
 ### Status as of 2026-08-11
 
-**13 of the 14 are FIXED. Exactly one — the group E load artifact — still fails.**
-Every one of the 14 was re-run against `main` @ `eda64dfdc` on 2026-08-11; nothing below is
-an inherited claim.
+**All 14 are FIXED. Zero remain open.** Every one of the 14 was re-run against `main`;
+nothing below is an inherited claim.
 
-| group | count | status at `eda64dfdc` | evidence |
-|-------|-------|-----------------------|----------|
+| group | count | status on `main` | evidence |
+|-------|-------|------------------|----------|
 | A | 5 | ✅ fixed by `e467da742` | 32 passed |
 | B | 4 | ✅ fixed by `e467da742` | 21 + 114 passed |
 | C | 3 | ✅ green | see group C |
-| D | 1 | ✅ green — but the "ordering artifact" reading is disputed | see group D |
-| E | 1 | ❌ **still fails** on `main` — the only open entry, and a fix exists unlanded | see group E |
+| D | 1 | ✅ green — and the "ordering artifact" reading was **wrong**; same bug as C | see group D |
+| E | 1 | ✅ fixed by `9ffc94018` — and it was **no longer an artifact** | see group E |
 
-Two runs, both from an isolated worktree, both `0 failed` except where noted:
+Two runs at `eda64dfdc`, both from an isolated worktree, both `0 failed` except where noted:
 `167 passed in 497.35s` over the three A+B files, and `1 failed, 298 passed, 1 skipped in
-727.01s` over the four C/D/E files — that single failure being group E.
+727.01s` over the four C/D/E files — that single failure being group E, now fixed.
 
 `e467da742` *"fix(gateway): repair the standing tests/gateway failures on Windows"* and
 `bff71e7ed` *"fix(tests+whatsapp): clear the nightly gate lane's 4 named failures"* are both
@@ -175,37 +174,58 @@ Verified by re-running each file alone (`gw_iso.log`):
 
 > **✅ Green at `main` @ `eda64dfdc`, verified 2026-08-11**, in the same run as group C.
 >
-> **The "ordering artifact" label below is disputed.** `bff71e7ed` edits
-> `tests/gateway/test_discord_liveness.py` — a *test-side* change to the very file this
-> entry lives in, which is not what you would expect if the cause were a state leak from
-> some other module. A separate session records it as the same frozen-fake-clock bug as the
-> `latency_non_finite` entry next to it, making the split 4 real + 1 artifact rather than
-> 3 + 2. **That reading was not re-derived here** — only the green was measured. Treat
-> "passes in isolation" as insufficient grounds for calling something a run artifact.
+> **The "ordering artifact" label below is WRONG — this was re-derived, not inherited.**
+> This entry is the *same* defect as the `latency_non_finite` entry in group C, so the split
+> is **4 real + 1 artifact**, not 3 + 2. `_FakeKeepAlive` froze `_last_ack` at construction
+> while the adapter computes `ack_age = perf_counter() - _last_ack` at sample time against
+> `max_ack_age=1.0`, and `ack_stale` is checked *ahead* of both the latency and healthy paths
+> (`plugins/platforms/discord/adapter.py:1399` before `:1404`). Every second between the
+> factory call and the sample was charged to the fake heartbeat. Isolation merely shrank that
+> gap below 1.0s — it did not remove the bug.
+>
+> Proof by A/B (2026-08-11): two copies of the file differing **only** in the fake, both
+> carrying the same injected `time.sleep(1.2)` after the bot is built. The pre-`bff71e7ed`
+> fake fails **both** tests with the two errors recorded in this inventory verbatim —
+> `assert 'latency_non_finite' in '…failed: ack_stale'` and `assert adapter._running is True`
+> → False — and the fixed fake passes both. Same box, adjacent runs, 32s and 19s.
+>
+> **Treat "passes in isolation" as insufficient grounds for calling something a run
+> artifact.** A defect whose trigger is elapsed wall-clock time passes alone every time.
+> Group E is the same lesson from the other direction.
 
 - `test_discord_liveness::test_liveness_probe_does_not_call_rest_while_websocket_is_healthy`
   — `assert adapter._running is True` → False. **PASSES in isolation** (18 passed).
   State leak / ordering, not a defect in the test's subject.
 
-### E. ❌ STILL OPEN — Load artifact — 1 — the only remaining entry
+### E. ✅ FIXED — filed as a load artifact, but it had stopped being one
 
-> **❌ Still fails at `main` @ `eda64dfdc`, reproduced 2026-08-11.** The one failure in
-> `1 failed, 298 passed, 1 skipped in 727.01s`, for exactly the cause diagnosed below:
-> `subprocess.TimeoutExpired … timed out after 10 seconds` on the cold-interpreter spawn.
-> Nothing has landed against it.
+> **✅ Fixed on `main` by `9ffc94018`** *"fix(tests): size the matrix import probe's two
+> budgets to its real cost"* (`tests/gateway/test_matrix.py` only, +55/−20), landed
+> 2026-08-11. This supersedes the earlier note pointing at the same change as unlanded
+> `3e3ea51b9` on `claude/gifted-jones-0cb48d`; it was rebased onto `main` to land.
 >
-> Note it reproduced in a **four-file** run, not just the 9,898-test monolithic one — so
-> "only fails under the full suite" understates it. Any concurrent load on this box is
-> enough. The cause is a wall-clock deadline in a test, not a property of the code under test.
+> **The "load artifact" classification was stale.** The child spawn was re-measured five
+> times, cold: **11.59 / 13.66 / 16.61 / 18.50 / 24.71s, mean 17.01s — every one over the
+> hard-coded `timeout=10`.** The test therefore failed *in isolation*, deterministically, on
+> a quiet box (`1 failed in 33.82s`), not merely under load. The "7.2-8.9s warm, crosses 10s
+> under load" reading below was true when written and is not true now. That also explains why
+> it reproduced in a **four-file** run, not just the 9,898-test monolithic one.
 >
-> **Before you fix this: a fix already exists, unlanded.** `3e3ea51b9` *"fix(tests): size the
-> matrix import probe's two budgets to its real cost"* (`tests/gateway/test_matrix.py` only,
-> +55/−20) sits on branch `claude/gifted-jones-0cb48d` and is **not an ancestor of `main`** —
-> checked 2026-08-11. Land or review that rather than writing a second one. Second-hand but
-> worth knowing: it reportedly needs *two* budgets raised together, because `pyproject`'s
-> global `addopts --timeout=30` and pytest-timeout's thread method hard-exit the whole pytest
-> process, so any subprocess budget above 30s is unreachable and the **file** dies instead.
-> Raising the `timeout=10` alone would make this worse, not better.
+> **Raising `timeout=10` alone would have made it worse**, which is the part worth carrying
+> forward. `pyproject`'s global `addopts --timeout=30` plus pytest-timeout's thread method
+> **hard-exit the whole pytest process**, so any subprocess budget above 30s is unreachable:
+> pytest kills the **file** first and every test in it reports as never having run. The two
+> budgets must be set together and ordered —
+> `_SUBPROCESS_TIMEOUT_S = 180` with `@pytest.mark.timeout(_SUBPROCESS_TIMEOUT_S + 30)`, the
+> marker sized *above* the subprocess budget so `subprocess.TimeoutExpired` wins the race and
+> names what hung. `tests/gateway/test_feishu_lazy_sdk_import.py:28-45` already documented
+> this pattern **and named `test_matrix.py` as a casualty of it** — the fix existed in a
+> sibling file and had simply never been applied here.
+>
+> Verified: passes under the **default** addopts (`1 passed in 29.81s`) — the case the marker
+> exists for — and the whole file is `250 passed, 1 skipped`. Forcing the budget to 2s yields
+> an explicit "budget overrun — nothing was proven either way" failure instead of the bare
+> `TimeoutExpired` that used to read like a product defect.
 
 - `test_matrix::TestMatrixModuleImport::test_module_importable_without_mautrix` —
   `subprocess.TimeoutExpired … timed out after 10 seconds`. Confirmed PASSED when run
@@ -217,7 +237,7 @@ Verified by re-running each file alone (`gw_iso.log`):
 ## Deferred / not done
 
 *(As written, this section describes the state at `e3bfc2ebc`. **Every item has since been
-superseded** — annotated inline. Nothing here is a live to-do except the group E timeout.)*
+superseded** — annotated inline. **Nothing here is a live to-do.**)*
 
 1. **Nothing was fixed.** No test or production file edited, nothing committed.
    — ✅ **Superseded.** True of *this run*; `e467da742` (2026-08-11) then fixed the A- and
@@ -229,6 +249,7 @@ superseded** — annotated inline. Nothing here is a live to-do except the group
    was production-side (`gateway/run.py`), and it exposed a real fail-closed defect.
 4. The load artifact (E) would likely vanish on an idle box; the 0.40 tests/sec rate means
    a rerun under low memory pressure should be ~3h, not 7h.
-   — ⚠️ **Half wrong, and it is now the only open entry.** E reproduced in a four-file,
-   300-test run, so it does not need the full suite to fire — "an idle box" is a stronger
-   precondition than assumed. The throughput observation stands.
+   — ❌ **Wrong, and now fixed in `9ffc94018`.** E did not need the full suite to fire: it
+   reproduced in a four-file, 300-test run, and then — once the child spawn was actually
+   measured at 11.6-24.7s against a 10s budget — *alone on an idle box*. It had stopped being
+   a load artifact entirely. The throughput observation stands.
