@@ -12,6 +12,11 @@ call is mocked — we never actually shell out during unit tests.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -131,6 +136,16 @@ class TestSecurityGating:
 
 
 class TestEnsure:
+    def test_durable_lock_lives_outside_wipeable_target(self, monkeypatch, tmp_path):
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+
+        assert ld._lazy_install_lock_path() == (
+            tmp_path / ".lazy-packages.lazy-install.lock"
+        )
+        assert ld._lazy_install_lock_path().parent == target.parent
+        assert ld._lazy_install_lock_path().parent != target
+
     def test_already_satisfied_is_noop(self, monkeypatch):
         # If the package is importable, ensure() returns without calling pip.
         monkeypatch.setitem(ld.LAZY_DEPS, "test.satisfied", ("zzzfake>=1",))
@@ -155,6 +170,97 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
+
+    def test_concurrent_processes_install_same_feature_once(self, tmp_path):
+        """Two first-use processes must serialize and recheck under the lock.
+
+        Both children deliberately finish their initial ``feature_missing``
+        check before either can install. Without a cross-process critical
+        section they both enter the installer and mutate the same durable
+        target; with the lock, the second child observes the marker written by
+        the first and returns without a duplicate install.
+        """
+        target = tmp_path / "lazy-target"
+        ready = tmp_path / "ready"
+        install_count = tmp_path / "install-count"
+        installed = tmp_path / "installed"
+        worker = tmp_path / "worker.py"
+        worker.write_text(
+            textwrap.dedent(
+                """
+                import os
+                from pathlib import Path
+                import time
+
+                import tools.lazy_deps as ld
+
+                ready = Path(os.environ["RACE_READY"])
+                install_count = Path(os.environ["RACE_INSTALL_COUNT"])
+                installed = Path(os.environ["RACE_INSTALLED"])
+                checks = 0
+
+                ld.LAZY_DEPS["test.concurrent"] = ("race-package==1.0",)
+                ld._allow_lazy_installs = lambda: True
+                ld._unsupported_feature_reason = lambda _feature: None
+
+                def is_satisfied(_spec):
+                    global checks
+                    checks += 1
+                    if checks == 1:
+                        ready.parent.mkdir(parents=True, exist_ok=True)
+                        with ready.open("a", encoding="utf-8") as handle:
+                            handle.write(f"{os.getpid()}\\n")
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        deadline = time.monotonic() + 10
+                        while len(ready.read_text(encoding="utf-8").splitlines()) < 2:
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError("peer process did not reach pre-lock check")
+                            time.sleep(0.01)
+                        return False
+                    return installed.exists()
+
+                def install(_specs, **_kwargs):
+                    with install_count.open("a", encoding="utf-8") as handle:
+                        handle.write(f"{os.getpid()}\\n")
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    time.sleep(0.2)
+                    installed.write_text("ok", encoding="utf-8")
+                    return ld._InstallResult(True, "ok", "")
+
+                ld._is_satisfied = is_satisfied
+                ld._venv_pip_install = install
+                ld.ensure("test.concurrent", prompt=False)
+                """
+            ),
+            encoding="utf-8",
+        )
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "HERMES_LAZY_INSTALL_TARGET": str(target),
+                "PYTHONPATH": str(Path(__file__).resolve().parents[2]),
+                "RACE_READY": str(ready),
+                "RACE_INSTALL_COUNT": str(install_count),
+                "RACE_INSTALLED": str(installed),
+            }
+        )
+        children = [
+            subprocess.Popen(
+                [sys.executable, str(worker)],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        results = [child.communicate(timeout=20) for child in children]
+
+        assert [child.returncode for child in children] == [0, 0], results
+        assert len(install_count.read_text(encoding="utf-8").splitlines()) == 1
 
 
 # ---------------------------------------------------------------------------
