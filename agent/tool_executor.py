@@ -175,6 +175,23 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     return value
 
 
+def _clear_current_tool_if_idle_locked(agent) -> None:
+    """Clear the marker when called with the worker lock already held."""
+    if not agent._tool_worker_threads:
+        agent._current_tool = None
+
+
+def _clear_current_tool_if_idle(agent) -> None:
+    """Clear the activity marker only after the last concurrent worker exits."""
+    worker_lock = getattr(agent, "_tool_worker_threads_lock", None)
+    worker_threads = getattr(agent, "_tool_worker_threads", None)
+    if worker_lock is None or worker_threads is None:
+        agent._current_tool = None
+        return
+    with worker_lock:
+        _clear_current_tool_if_idle_locked(agent)
+
+
 def _flush_session_db_after_tool_progress(
     agent,
     messages: list,
@@ -980,6 +997,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _worker_tid = threading.current_thread().ident
         with agent._tool_worker_threads_lock:
             agent._tool_worker_threads.add(_worker_tid)
+            if not agent._current_tool:
+                agent._current_tool = tool_names_str
         # Race: if the agent was interrupted between fan-out (which
         # snapshotted an empty/earlier set) and our registration, apply
         # the interrupt to our own tid now so is_interrupted() inside
@@ -1139,6 +1158,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             # into _interrupted_threads, poisoning the recycled thread.
             with agent._tool_worker_threads_lock:
                 agent._tool_worker_threads.discard(_worker_tid)
+                _clear_current_tool_if_idle_locked(agent)
             try:
                 _ra()._set_interrupt(False, _worker_tid)
             except Exception:
@@ -1462,7 +1482,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
 
-        agent._current_tool = None
+        _clear_current_tool_if_idle(agent)
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
@@ -2234,7 +2254,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as _ver_err:
                 logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-        agent._current_tool = None
+        _clear_current_tool_if_idle(agent)
         _status_suffix = " (error)" if _is_error_result else ""
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 

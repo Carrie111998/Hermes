@@ -3051,9 +3051,10 @@ def _watch_gateway_turn_inactivity(
         if agent is None or not hasattr(agent, "get_activity_summary"):
             continue
         try:
-            idle_seconds = float(
-                agent.get_activity_summary().get("seconds_since_activity", 0.0)
-            )
+            activity = agent.get_activity_summary()
+            if activity.get("current_tool"):
+                continue
+            idle_seconds = float(activity.get("seconds_since_activity", 0.0))
         except Exception:
             continue
         if idle_seconds < timeout:
@@ -26410,6 +26411,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         try:
                             _act = _agent_ref.get_activity_summary()
                             _idle_secs = _act.get("seconds_since_activity", 0.0)
+                            if _act.get("current_tool"):
+                                _idle_secs = 0.0
                         except Exception:
                             pass
                     # Staged warning: fire once before escalating to full timeout.
