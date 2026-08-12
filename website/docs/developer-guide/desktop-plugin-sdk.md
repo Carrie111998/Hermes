@@ -198,7 +198,7 @@ Import the area constants from the SDK; each area has its own `data` payload.
 
 | Surface | `area` | You provide |
 |---------|--------|-------------|
-| Layout pane | `PANES_AREA` (`'panes'`) | `title` + `render` + `data: { placement, dock?, width?, height? }` |
+| Layout pane | `PANES_AREA` (`'panes'`) | `title` + `render` + `data: { placement, dock?, anchor?, width?, height? }` |
 | Full page | `ROUTES_AREA` | `data: { path }` + `render` |
 | Sidebar nav | `SIDEBAR_NAV_AREA` | `data: { path, label, codicon }` |
 | Status bar | `STATUSBAR_AREAS.left` / `.right` | `render` (or `data` as `StatusbarItem`) |
@@ -210,9 +210,9 @@ Import the area constants from the SDK; each area has its own `data` payload.
 
 ### Panes
 
-A pane is a tile in the layout tree. `placement` is the semantic role — the pane
-stacks (as tabs) with existing panes of that role; the user can drag it anywhere
-afterward.
+Most panes are tiles in the layout tree. For tiled panes, `placement` is the
+semantic role — the pane stacks (as tabs) with existing panes of that role; the
+user can drag it anywhere afterward.
 
 ```javascript
 ctx.register({
@@ -224,9 +224,9 @@ ctx.register({
 })
 ```
 
-`placement` is `'main' | 'left' | 'right' | 'top' | 'bottom'`. To land on a
-specific **edge** instead of stacking, add a `dock` gesture — the same thing as
-dragging onto a pane's drop chip:
+The tiled placements are `'main' | 'left' | 'right' | 'top' | 'bottom'`. To land
+on a specific **edge** instead of stacking, add a `dock` gesture — the same thing
+as dragging onto a pane's drop chip:
 
 ```javascript
 // Below the conversation, 200px tall.
@@ -241,6 +241,30 @@ data: {
 `terminal`, `files`, `review`, `logs`); `dock.pos` is
 `'top' | 'bottom' | 'left' | 'right' | 'center'`. Declare a `width`/`height` so
 the pane doesn't claim half the zone.
+
+For an overlay that should not join the tiling tree, use
+`placement: 'floating'`. A floating pane is rendered as a fixed, draggable card
+above the layout. It takes no space from any zone, has no tab, and cannot be
+docked or split. Set `anchor` to choose its spawn corner; the default is
+`'top-right'`.
+
+```javascript
+ctx.register({
+  id: 'floating-status',
+  area: 'panes',
+  title: 'status',
+  data: {
+    placement: 'floating',
+    anchor: 'top-right',
+    width: '320px',
+    height: '240px'
+  },
+  render: () => jsx(StatusPane, {})
+})
+```
+
+`FloatingAnchor` is exported by `@hermes/plugin-sdk` and accepts
+`'top-left' | 'top-right' | 'bottom-left' | 'bottom-right'`.
 
 ### Pages and sidebar nav
 
@@ -617,7 +641,7 @@ not treat this pipeline as a trust boundary.
 | Host | `host` (`.state.*`, `.notify`, `.notifyError`, `.navigate`, `.onEvent`, `.logs`, `.status`, `.restartGateway`, `.request`) |
 | Plugin contract | `HermesPlugin`, `PluginContext`, `PluginContribution`, `PluginStorage`, `PluginOs`, `PluginRestOptions`, `PluginNativeNotificationInput`, `Contribution` |
 | Area constants | `PANES_AREA`, `ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREAS`, `TITLEBAR_AREAS`, `PALETTE_AREA`, `KEYBINDS_AREA`, `THEMES_AREA`, `COMPOSER_AREAS` |
-| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider` |
+| Area payloads | `RouteContribution`, `SidebarNavContribution`, `StatusbarItem`, `TitlebarTool`, `PaletteContribution`, `KeybindContribution`, `ComposerMiddleware`, `ComposerAttachmentProvider`, `FloatingAnchor` |
 | React / state | `useValue`, `atom`, `computed`, `useQuery`, `useMutation`, `useQueryClient`, `queryClient`, `Contribute` |
 | UI kit | `Button`, `Input`, `Textarea`, `Select*`, `Switch`, `Checkbox`, `SegmentedControl`, `Tabs*`, `Dialog*`, `ConfirmDialog`, `DropdownMenu*`, `ContextMenu*`, `Popover*`, `Tip`/`Tooltip*`, `Badge`, `Kbd`/`KbdGroup`, `SearchField`, `ScrollArea`, `Separator`, `Skeleton`, `GlyphSpinner`, `Loader`, `EmptyState`, `ErrorState`, `CopyButton`, `StatusDot`, `LogView`, `Codicon`, `DecodeText` |
 | Helpers | `cn`, `icons`, `haptic`, `useI18n`, `profileColor`, `profileColorSoft`, `relativeTime`, `fmtDateTime`, `fmtDayTime`, `coarseElapsed`, `evaluateRuntimeReadiness` |
