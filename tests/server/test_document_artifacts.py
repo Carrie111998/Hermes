@@ -188,6 +188,46 @@ def test_backfill_is_idempotent(repo, db, tmp_path):
     assert second == {"backfilled": 0, "missing": 0, "already_current": 1}
 
 
+def test_metadata_reads_never_load_the_content_blob(repo, monkeypatch):
+    """Reading metadata must not drag the document's bytes out of SQLite.
+
+    `content` is the one heavy column and no metadata caller uses it — an
+    ArtifactRecord has no content field. Selecting it anyway cost ~5ms per 5MB
+    original on paths that run for every upload, every processing attempt, and
+    every admin page render, scaling linearly with document size.
+    """
+    repo.store_original("cmp_1", "doc_1", "report.pdf", "application/pdf", b"%PDF-x" * 1000)
+
+    selects: list[str] = []
+    for name in ("one", "all"):
+        original = getattr(repo.db, name)
+
+        def record(sql, params=(), _original=original):
+            if "FROM document_artifacts" in sql and sql.lstrip().upper().startswith("SELECT"):
+                selects.append(sql)
+            return _original(sql, params)
+
+        monkeypatch.setattr(repo.db, name, record)
+
+    repo.get_original("cmp_1", "doc_1")
+    repo.get_active_processed("cmp_1", "doc_1")
+    repo.list_artifacts("cmp_1", "doc_1")
+
+    assert selects, "expected the metadata reads to hit document_artifacts"
+    for sql in selects:
+        projection = sql.split("FROM")[0].removeprefix("SELECT")
+        columns = {part.strip().lower() for part in projection.split(",")}
+        # `content_type` is fine — it is a short string. Only the bytes matter.
+        assert "content" not in columns, sql
+
+
+def test_materialize_still_reads_the_content_blob(repo):
+    """The optimization must not reach the one caller that needs the bytes."""
+    original = repo.store_original("cmp_1", "doc_1", "report.pdf", "application/pdf", b"%PDF-x")
+    Path(original.local_path).unlink()
+    assert repo.materialize("cmp_1", original.id).read_bytes() == b"%PDF-x"
+
+
 def test_backfill_marks_unreadable_legacy_rows_needs_attention(repo, db, tmp_path):
     db.execute(
         "UPDATE documents SET storage_path=? WHERE id='doc_1'",
