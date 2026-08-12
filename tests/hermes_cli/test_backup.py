@@ -628,6 +628,41 @@ class TestSafeCopyDb:
         conn.close()
         assert rows == [(42,)]
 
+    def test_aborts_when_source_remains_busy_past_deadline(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_cli import backup as backup_mod
+
+        src = tmp_path / "locked.db"
+        dst = tmp_path / "copy.db"
+        src.touch()
+        dst.write_bytes(b"partial")
+
+        clock = iter((100.0, 100.5, 101.1))
+
+        class FakeSourceConnection:
+            def backup(self, _destination, *, pages, progress, sleep):
+                assert pages > 0
+                assert sleep > 0
+                progress(sqlite3.SQLITE_BUSY, 0, 1)
+                progress(sqlite3.SQLITE_BUSY, 0, 1)
+
+            def close(self):
+                pass
+
+        class FakeDestinationConnection:
+            def close(self):
+                pass
+
+        connections = iter((FakeSourceConnection(), FakeDestinationConnection()))
+        monkeypatch.setattr(
+            backup_mod.sqlite3, "connect", lambda *_a, **_kw: next(connections)
+        )
+        monkeypatch.setattr(backup_mod.time, "monotonic", lambda: next(clock))
+
+        assert backup_mod._safe_copy_db(src, dst, timeout_seconds=1.0) is False
+        assert not dst.exists()
+
 
     def test_is_zeroed_sqlite_file_detects_nul_header(self, tmp_path):
         from hermes_cli.backup import is_zeroed_sqlite_file
