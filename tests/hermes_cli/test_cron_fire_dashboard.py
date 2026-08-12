@@ -214,12 +214,14 @@ def test_fire_endpoint_default_port(tmp_path, monkeypatch):
 
 
 def test_fire_endpoint_config_yaml_port_wins(tmp_path, monkeypatch):
+    """The profile config.yaml port (read via the CANONICAL load_config, per
+    the config-read guard) wins over the process env API_SERVER_PORT."""
     monkeypatch.setenv("API_SERVER_PORT", "9999")
     monkeypatch.delenv("GATEWAY_MULTIPLEX_PROFILES", raising=False)
-    monkeypatch.setattr(web_server, "load_config", lambda: {})
-    (tmp_path / "config.yaml").write_text(
-        "platforms:\n  api_server:\n    extra:\n      port: 8700\n",
-        encoding="utf-8",
+    monkeypatch.setattr(
+        web_server,
+        "load_config",
+        lambda: {"platforms": {"api_server": {"extra": {"port": 8700}}}},
     )
     url = web_server._gateway_fire_endpoint("default", tmp_path)
     assert url == "http://127.0.0.1:8700/api/cron/fire"

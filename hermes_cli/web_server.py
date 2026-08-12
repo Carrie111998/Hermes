@@ -12232,18 +12232,27 @@ def _gateway_fire_endpoint(profile: str, home: Path) -> str:
 
     port = 0
     try:
-        import yaml as _yaml
+        # Profile-scoped read through the CANONICAL loader (managed-scope
+        # overlay, ${ENV_VAR} expansion, profile pathing) — never a raw
+        # yaml.safe_load of config.yaml (tests/hermes_cli/
+        # test_config_read_guard.py). The HERMES_HOME override scopes
+        # get_config_path() to the TARGET profile, same pattern the
+        # deprecated _fire_cron_job_for_profile used for its store scope.
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
 
-        cfg_path = home / "config.yaml"
-        if cfg_path.is_file():
-            data = _yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-            extra = (
-                ((data.get("platforms") or {}).get("api_server") or {}).get("extra")
-                or {}
-            )
-            raw = extra.get("port")
-            if raw:
-                port = int(raw)
+        token = set_hermes_home_override(str(home))
+        try:
+            profile_cfg = load_config()
+        finally:
+            reset_hermes_home_override(token)
+        raw = cfg_get(
+            profile_cfg, "platforms", "api_server", "extra", "port", default=None
+        )
+        if raw:
+            port = int(raw)
     except Exception:
         port = 0
     if not port:
