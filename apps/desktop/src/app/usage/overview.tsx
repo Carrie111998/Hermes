@@ -18,6 +18,7 @@ import {
   formatShortDate,
   meterEstimatedCost,
   modelTokens,
+  reportMarketEquivalent,
   reportReasoningTokens
 } from './format'
 import type {
@@ -70,6 +71,7 @@ export function MacroStrip({ meter, meterUnavailable, report }: MacroStripProps)
   const u = t.usageDashboard
   const sessionCacheRatio = cacheRatio(report.totals.cache_read_tokens, report.totals.input_tokens)
   const capturedCost = meter ? meterEstimatedCost(meter) : null
+  const marketEquivalent = reportMarketEquivalent(report)
 
   return (
     <dl className="grid grid-cols-2 border-y border-border bg-card/20 sm:grid-cols-3 xl:grid-cols-6">
@@ -78,7 +80,7 @@ export function MacroStrip({ meter, meterUnavailable, report }: MacroStripProps)
         label={u.macro.marketCost}
         meta={u.macro.rangeEstimate(report.period_days)}
         tone="estimated"
-        value={formatCurrency(report.totals.cost, locale)}
+        value={formatCurrency(marketEquivalent, locale)}
       />
       <StatCell
         icon={<Archive className="size-3.5" />}
@@ -345,6 +347,7 @@ function TokenTopology({ report }: { report: UsageReport }) {
 function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
   const { locale, t } = useI18n()
   const u = t.usageDashboard
+  const marketEquivalent = reportMarketEquivalent(report)
 
   if (meterUnavailable) {
     return (
@@ -414,7 +417,7 @@ function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
         ))}
       </div>
       <p className="mt-3 text-[10px] leading-4 text-muted-foreground">
-        {u.cost.rangeComparison(formatCurrency(report.totals.cost, locale), report.period_days)}
+        {u.cost.rangeComparison(formatCurrency(marketEquivalent, locale), report.period_days)}
       </p>
     </div>
   )

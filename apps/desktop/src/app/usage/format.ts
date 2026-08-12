@@ -132,6 +132,22 @@ export function meterEstimatedCost(
   return meter.included_calls > 0 ? 0 : null
 }
 
+export function reportMarketEquivalent(report: UsageReport): number | null {
+  const estimated = report.totals.cost
+  const included = report.totals.cost_buckets.included
+  const unknown = report.totals.cost_buckets.unknown
+
+  if (estimated == null || (unknown?.sessions ?? 0) > 0) {
+    return null
+  }
+
+  if (!included || included.sessions <= 0) {
+    return estimated
+  }
+
+  return included.at_market_cost_usd == null ? null : estimated + included.at_market_cost_usd
+}
+
 export function modelTokens(model: ModelUsage): number | null {
   const values = [model.input_tokens, model.output_tokens, model.cache_read_tokens, model.cache_write_tokens]
 

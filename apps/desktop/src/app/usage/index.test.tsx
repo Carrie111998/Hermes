@@ -207,6 +207,72 @@ describe('UsageView', () => {
     expect(within(screen.getByText('Token volume').closest('div')!).getByText('—')).toBeTruthy()
   })
 
+  it('adds included-session at-market value to the session market equivalent', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            cost_buckets: {
+              estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
+              included: {
+                sessions: 1,
+                cost_usd: 0,
+                input_tokens: 84_000,
+                output_tokens: 51_000,
+                at_market_cost_usd: 4.83
+              },
+              unknown: { sessions: 0, cost_usd: 0, input_tokens: 0, output_tokens: 0 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('$7.00')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: \$7\.00/)).toBeTruthy()
+  })
+
+  it('renders the session market equivalent as unavailable when any cost is unknown', async () => {
+    gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
+      if (method === 'usage.overview') {
+        return Promise.resolve({
+          ...usageOverviewFixture,
+          overview: {
+            ...usageOverviewFixture.overview,
+            estimated_cost: 2.17,
+            cost_buckets: {
+              estimated: { sessions: 1, cost_usd: 2.17, input_tokens: 18_000, output_tokens: 7_000 },
+              included: {
+                sessions: 1,
+                cost_usd: 0,
+                input_tokens: 84_000,
+                output_tokens: 51_000,
+                at_market_cost_usd: 4.83
+              },
+              unknown: { sessions: 1, cost_usd: 0, input_tokens: 3_000, output_tokens: 900 }
+            }
+          }
+        })
+      }
+
+      return Promise.resolve(responseFor(method, params))
+    })
+
+    renderUsage()
+
+    const marketCostLabel = await screen.findByText('Market equiv.')
+    expect(within(marketCostLabel.closest('div')!).getByText('—')).toBeTruthy()
+    expect(screen.getByText(/30d session market-equivalent: —/)).toBeTruthy()
+  })
+
   it('does not fabricate a captured zero when every metered call is unpriced', async () => {
     gatewayMock.mockImplementation((method: string, params: Record<string, unknown>) => {
       if (method === 'usage.meter.summary') {
