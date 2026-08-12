@@ -46,12 +46,36 @@ def _runner_with(monkeypatch, *, idle, armed_adapter=True):
     return r, adapter
 
 
+async def _wait_until(predicate, message: str, timeout: float = 5.0) -> None:
+    """Poll until ``predicate()`` is true, or fail with ``message``.
+
+    Sleeping a fixed 0.1s and then asserting the watcher had acted was a race
+    against the event loop, not a wait for an outcome. The watcher awaits a
+    startup-settle sleep plus one interval sleep before it can call
+    go_dormant(), and on Windows the timer granularity is ~15.6ms, so those two
+    0.01s sleeps already cost ~31ms of the 100ms budget before scheduling
+    latency is counted. Under the per-file parallel harness the budget ran out
+    first: `_running` was cleared before the task ever reached the call, the
+    `while self._running` loop exited, and the assertion read 0.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError(message)
+
+
 @pytest.mark.asyncio
 async def test_watcher_goes_dormant_when_idle(monkeypatch):
     r, adapter = _runner_with(monkeypatch, idle=True)
-    # Run one iteration: stop after the first sleep so the loop exits cleanly.
+    # Run until the watcher has actually driven dormancy once, then stop it so
+    # the loop exits cleanly.
     task = asyncio.create_task(r._scale_to_zero_watcher(interval=0.01))
-    await asyncio.sleep(0.1)
+    await _wait_until(
+        lambda: adapter.go_dormant_calls >= 1,
+        "watcher never called go_dormant() on an idle, armed runner",
+    )
     r._running = False
     await asyncio.wait_for(task, timeout=2)
     assert adapter.go_dormant_calls >= 1

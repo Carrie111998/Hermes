@@ -42,7 +42,7 @@ _OWNER_REPLY_PREFIX = "[owner reply] "
 
 
 def _listener_pids_on_port(port: int) -> list:
-    """PIDs of processes *listening* on ``port`` (POSIX) — never clients.
+    """PIDs of processes *listening* on ``port`` — never clients.
 
     This must match only LISTEN sockets. A bare ``lsof -i :PORT`` (or
     ``fuser PORT/tcp``) also returns *clients* whose connection merely involves
@@ -50,8 +50,40 @@ def _listener_pids_on_port(port: int) -> list:
     sharing the port. SIGTERMing those closed the user's browser at irregular
     intervals. Restricting to LISTEN state frees the port for a new bridge
     without ever touching an unrelated client.
+
+    psutil first, on every platform. It reads the kernel's TCP table in-process
+    (measured 16ms here against 851 connections) where every shell probe pays a
+    process spawn this box cannot afford: ``netstat -ano -p TCP`` was measured
+    at 8.2s, 9.6s and 21.3s on three consecutive idle runs. That is the same
+    spawn-cost trap that made ``gateway.status.pid_exists`` report live
+    processes as dead (fixed 2026-08-11 in e467da742); the Windows branch of
+    ``_kill_port_process`` ran netstat under ``timeout=5`` inside a bare
+    ``except Exception: pass``, so on this machine it did not merely run slowly
+    — it silently killed nothing, every time, and the replacement bridge then
+    burned the full ``_wait_for_port_release`` window and failed to bind.
+
+    The shell probes stay as the fallback for a host where psutil is missing or
+    the platform denies the connection table.
     """
     pids: list = []
+    try:
+        import psutil
+
+        for conn in psutil.net_connections(kind="tcp"):
+            if (
+                conn.status == psutil.CONN_LISTEN
+                and conn.laddr
+                and conn.laddr.port == port
+                and conn.pid
+            ):
+                pids.append(conn.pid)
+        if pids:
+            return pids
+    except Exception:
+        # ImportError, or AccessDenied on a platform that gates the table.
+        pass
+    if _IS_WINDOWS:
+        return _listener_pids_on_port_netstat(port)
     try:
         result = subprocess.run(
             ["lsof", "-ti", f"tcp:{port}", "-sTCP:LISTEN"],
@@ -79,42 +111,62 @@ def _listener_pids_on_port(port: int) -> list:
     return pids
 
 
-def _kill_port_process(port: int) -> None:
-    """Kill any process *listening* on the given TCP port (a stale bridge)."""
-    try:
-        if _IS_WINDOWS:
-            from hermes_cli._subprocess_compat import windows_hide_flags
+def _listener_pids_on_port_netstat(port: int) -> list:
+    """Windows fallback for :func:`_listener_pids_on_port` when psutil is out.
 
-            # Use netstat to find the PID bound to this port, then taskkill
-            result = subprocess.run(
-                ["netstat", "-ano", "-p", "TCP"],
-                capture_output=True, text=True, timeout=5,
-                creationflags=windows_hide_flags(),
-            )
-            for line in result.stdout.splitlines():
-                parts = line.split()
-                if len(parts) >= 5 and parts[3] == "LISTENING":
-                    local_addr = parts[1]
-                    if local_addr.endswith(f":{port}"):
-                        try:
-                            subprocess.run(
-                                ["taskkill", "/PID", parts[4], "/F"],
-                                capture_output=True, timeout=5,
-                                creationflags=windows_hide_flags(),
-                            )
-                        except subprocess.SubprocessError:
-                            pass
-        else:
-            # POSIX: only ever signal a process LISTENING on the port. A client
-            # whose connection happens to involve this port number (a browser
-            # tab on a local dev server, etc.) must never be killed.
-            for pid in _listener_pids_on_port(port):
+    Timeout is 60s, not the 5s this used to carry. netstat's cost here is a
+    process spawn plus a full TCP-table render, and both scale with host load;
+    a budget it routinely overruns turns a real listener into "no listener"
+    and the caller kills nothing. Overshooting the budget on a wedged netstat
+    is the safe direction — the caller is already in a restart path.
+    """
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    pids: list = []
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True, text=True, timeout=60,
+            creationflags=windows_hide_flags(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return pids
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        # Proto | Local Address | Foreign Address | State | PID
+        if len(parts) >= 5 and parts[3] == "LISTENING":
+            if parts[1].endswith(f":{port}"):
                 try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, OSError):
+                    pids.append(int(parts[4]))
+                except ValueError:
                     pass
-    except Exception:
-        pass
+    return pids
+
+
+def _kill_port_process(port: int) -> None:
+    """Kill any process *listening* on the given TCP port (a stale bridge).
+
+    Discovery is shared across platforms now (see _listener_pids_on_port); only
+    the signalling differs, because Windows has no SIGTERM to send.
+    """
+    # Only ever signal a process LISTENING on the port. A client whose
+    # connection happens to involve this port number (a browser tab on a local
+    # dev server, etc.) must never be killed.
+    for pid in _listener_pids_on_port(port):
+        try:
+            if _IS_WINDOWS:
+                from hermes_cli._subprocess_compat import windows_hide_flags
+
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F"],
+                    capture_output=True, timeout=30,
+                    creationflags=windows_hide_flags(),
+                )
+            else:
+                os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError,
+                subprocess.SubprocessError):
+            pass
 
 
 async def _wait_for_port_release(port: int, timeout_s: float = 15.0) -> bool:
