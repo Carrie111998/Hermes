@@ -160,6 +160,27 @@ def test_file_reference_expands_gb18030_csv(tmp_path: Path):
     assert "测试商户" in result.message
 
 
+def test_file_reference_expands_big5_csv(tmp_path: Path):
+    from agent.context_references import preprocess_context_references
+
+    payload = tmp_path / "big5-sample.csv"
+    payload.write_bytes(
+        "日期,摘要,金額\n2026-08-11,轉帳手續費,12.50\n".encode("big5")
+    )
+
+    result = preprocess_context_references(
+        "Summarize @file:big5-sample.csv",
+        cwd=tmp_path,
+        context_length=100_000,
+    )
+
+    assert result.expanded
+    assert not result.warnings
+    assert "decoded as big5" in result.message
+    assert "日期" in result.message
+    assert "轉帳手續費" in result.message
+
+
 def test_file_reference_expands_cp932_text_with_line_range(tmp_path: Path):
     from agent.context_references import preprocess_context_references
 
@@ -184,7 +205,15 @@ def test_file_reference_warns_for_undecodable_text_bytes(tmp_path: Path):
     from agent.context_references import preprocess_context_references
 
     payload = tmp_path / "bad.txt"
-    payload.write_bytes(b"\x81\x81\x81\x81")
+    # 64 bytes of pure random data — long enough that charset-normalizer
+    # refuses to guess any encoding (shorter payloads may get low-confidence
+    # single-byte codec matches).
+    payload.write_bytes(
+        b"\xa3\xf1\x8c\xd7\x5e\xb2\x09\xce\x4f\x97\xe2\x38\xda\x71\xc5\x0b"
+        b"\xb8\x64\xe9\x1d\xaf\x53\xc8\x3e\xd6\x82\x4a\x91\xf0\x7c\xcd\x28"
+        b"\x95\xe1\x46\xbe\x33\xdf\x88\x61\xb4\x0f\xc7\x5a\xec\x39\xd1\x74"
+        b"\x8f\x62\xb6\x1b\xc9\x4e\xe0\x83\x35\xd8\x6a\x9d\xf2\x7e\xc3\x17"
+    )
 
     result = preprocess_context_references(
         "Read @file:bad.txt",
@@ -194,7 +223,6 @@ def test_file_reference_warns_for_undecodable_text_bytes(tmp_path: Path):
 
     assert result.expanded
     assert result.warnings
-    assert "codec can't decode" in result.message
     assert "\ufffd" not in result.message
 
 

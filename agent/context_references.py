@@ -38,8 +38,29 @@ _SENSITIVE_HOME_FILES = (
     Path(".npmrc"),
     Path(".pypirc"),
 )
-_TEXT_ATTACHMENT_FALLBACK_ENCODINGS = ("cp932", "gb18030", "big5", "cp1252")
-_MIN_FALLBACK_DECODE_BYTES = 8
+def _read_text_attachment(path: Path) -> tuple[str, str]:
+    data = path.read_bytes()
+
+    for bom, encoding in _TEXT_ATTACHMENT_BOMS:
+        if data.startswith(bom):
+            return data.decode(encoding), encoding
+
+    try:
+        return data.decode("utf-8"), "utf-8"
+    except UnicodeDecodeError:
+        pass
+
+    from charset_normalizer import from_bytes
+
+    result = from_bytes(data)
+    best = result.best()
+    if best is not None:
+        return str(best), best.encoding
+
+    # Re-raise the original UTF-8 error — nothing could decode the bytes.
+    raise UnicodeDecodeError(
+        "utf-8", data, 0, len(data), "no encoding detected by charset-normalizer"
+    )
 _TEXT_ATTACHMENT_BOMS = (
     (b"\xff\xfe\x00\x00", "utf-32"),
     (b"\x00\x00\xfe\xff", "utf-32"),
@@ -318,32 +339,20 @@ def _read_text_attachment(path: Path) -> tuple[str, str]:
 
     try:
         return data.decode("utf-8"), "utf-8"
-    except UnicodeDecodeError as utf8_error:
-        if len(data) < _MIN_FALLBACK_DECODE_BYTES:
-            raise utf8_error
-        for encoding in _TEXT_ATTACHMENT_FALLBACK_ENCODINGS:
-            try:
-                text = data.decode(encoding)
-            except UnicodeDecodeError:
-                continue
-            if _looks_like_text_attachment(text):
-                return text, encoding
-        raise utf8_error
+    except UnicodeDecodeError:
+        pass
 
+    from charset_normalizer import from_bytes
 
-def _looks_like_text_attachment(text: str) -> bool:
-    if "\ufffd" in text:
-        return False
-    if not text:
-        return True
+    result = from_bytes(data)
+    best = result.best()
+    if best is not None:
+        return str(best), best.encoding
 
-    allowed_controls = {"\t", "\n", "\r", "\f"}
-    control_count = sum(
-        1
-        for ch in text
-        if (ord(ch) < 32 and ch not in allowed_controls) or 0x7F <= ord(ch) <= 0x9F
+    # Re-raise the original UTF-8 error — nothing could decode the bytes.
+    raise UnicodeDecodeError(
+        "utf-8", data, 0, len(data), "no encoding detected by charset-normalizer"
     )
-    return control_count / len(text) <= 0.01
 
 
 def _expand_folder_reference(
