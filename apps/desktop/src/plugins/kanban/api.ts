@@ -218,10 +218,17 @@ export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/r
 export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
   call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
-export const createBoard = (slug: string, name: string, projectId?: string) =>
+export const createBoard = (slug: string, name: string, projectId?: string, defaultWorkdir?: string) =>
   call<{ board: { slug: string } }>('/boards', {
     method: 'POST',
-    body: { slug, name, ...(projectId ? { project_id: projectId } : {}) }
+    body: {
+      slug,
+      name,
+      ...(projectId ? { project_id: projectId } : {}),
+      // Relative paths are resolved to absolute against HermesWorkspace by the
+      // caller; the backend requires an absolute, existing directory.
+      ...(defaultWorkdir ? { default_workdir: defaultWorkdir } : {})
+    }
   })
 
 /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a
