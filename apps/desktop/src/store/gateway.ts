@@ -369,6 +369,18 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
   }
 }
 
+/** Open sockets for every profile in `keep` that isn't open yet, then prune
+ *  the rest. The open half breaks the old circularity: a profile whose row
+ *  is DB-live (foreign liveness) gets a socket without any user intent, so
+ *  its serve's stream events and active_list reach the renderer. */
+export function reconcileLiveGateways(keep: Set<string>): void {
+  for (const profile of keep) {
+    void openGatewayForProfile(profile).catch(() => undefined)
+  }
+
+  pruneSecondaryGateways(keep)
+}
+
 export function closeSecondaryGateways(): void {
   for (const entry of g.secondaries.values()) {
     disposeSecondary(entry)

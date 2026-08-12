@@ -912,7 +912,10 @@ def _(rid, params: dict) -> dict:
 
     Unlike ``session.list`` this is not a historical DB browser: it reports only
     sessions with in-memory agents/workers that the current TUI can switch to
-    without closing siblings.
+    without closing siblings. It ALSO reports ``foreign`` rows — recently-active
+    sessions that exist only in state.db (cron runs, CLI one-shots, messaging
+    turns written by other processes, subagent children with a run in flight)
+    — so clients can paint cross-process liveness from the same poll.
     """
     current = str(params.get("current_session_id") or "")
     try:
@@ -941,6 +944,71 @@ def _(rid, params: dict) -> dict:
         for sid, session in snapshot
         if not session.get("_finalized")
     ]
+
+    # Cross-process liveness (foreign rows): sessions that exist only in
+    # state.db — cron runs, CLI one-shots, messaging turns written by OTHER
+    # processes — never enter this gateway's ``_sessions``, so their stream
+    # events never reach clients. The shared SQLite file is the one thing they
+    # all move (#58671); report recently-active rows here so clients can paint
+    # them from the same poll. Same 300s recency window ``/api/sessions`` uses
+    # for its ``is_active`` flag. Best-effort: a failed DB probe must never
+    # break the in-memory answer.
+    try:
+        db = _get_db()
+        if db is not None:
+            in_memory = {sid for sid, session in snapshot if not session.get("_finalized")}
+            now = time.time()
+            for s in db.list_sessions_rich(limit=50, order_by_last_active=True, compact_rows=True):
+                sid = str(s.get("id") or "")
+                if not sid or sid in in_memory:
+                    continue
+                if s.get("ended_at") is not None:
+                    continue
+                last_active = float(s.get("last_active") or s.get("started_at") or 0)
+                if (now - last_active) >= 300:
+                    continue
+                rows.append(
+                    {
+                        "current": False,
+                        "description": str(s.get("last_activity_description") or ""),
+                        "foreign": True,
+                        "id": sid,
+                        "last_active": last_active,
+                        "message_count": int(s.get("message_count") or 0),
+                        "model": str(s.get("model") or ""),
+                        "preview": "",
+                        "provider": "",
+                        "session_key": sid,
+                        "started_at": float(s.get("started_at") or 0),
+                        "status": "working",
+                        "title": str(s.get("title") or s.get("display_name") or ""),
+                    }
+                )
+            # Subagent children with a delegation run in flight but no watch
+            # window: their own session row is live in the DB, and the child
+            # mirror only streams into an opened window.
+            for child_key in list(_active_child_runs):
+                if child_key and child_key not in in_memory:
+                    rows.append(
+                        {
+                            "current": False,
+                            "description": "subagent running",
+                            "foreign": True,
+                            "id": child_key,
+                            "last_active": float(_active_child_runs[child_key]),
+                            "message_count": 0,
+                            "model": "",
+                            "preview": "",
+                            "provider": "",
+                            "session_key": child_key,
+                            "started_at": 0.0,
+                            "status": "working",
+                            "title": "",
+                        }
+                    )
+    except Exception:
+        pass
+
     return _ok(rid, {"sessions": rows})
 
 

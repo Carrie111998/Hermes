@@ -489,6 +489,13 @@ export interface SessionInfo {
   estimated_cost_usd?: null | number
   is_active: boolean
   last_active: number
+  /** Durable mid-turn activity stamp from the backend (agent heartbeat) —
+   *  populated for sessions whose events this renderer never hears (cli
+   *  one-shots, cron runs, other processes), so the row can caption what
+   *  the foreign agent is doing. */
+  last_activity_at?: number
+  last_activity_description?: string
+  last_activity_provenance?: string
   message_count: number
   model: null | string
   output_tokens: number
