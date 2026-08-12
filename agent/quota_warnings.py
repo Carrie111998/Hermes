@@ -19,6 +19,7 @@ so the pure function stays easily unit-testable.
 
 from __future__ import annotations
 
+import math
 import threading
 from dataclasses import dataclass
 from time import monotonic
@@ -56,6 +57,26 @@ class QuotaThresholds:
     strong: float
     critical: float
 
+    def __post_init__(self) -> None:
+        """Validate finiteness, range, and strict ordering.
+
+        Raises :class:`ValueError` when any threshold is non-finite
+        (``NaN``/``inf``), outside ``[0, 100]``, or when the levels are not
+        strictly ordered ``warning < strong < critical``.
+        """
+        values = (self.warning, self.strong, self.critical)
+        for name, value in zip(("warning", "strong", "critical"), values):
+            if not math.isfinite(value):
+                raise ValueError(f"{name} threshold must be finite, got {value!r}")
+            if not 0.0 <= value <= 100.0:
+                raise ValueError(f"{name} threshold must be in [0, 100], got {value!r}")
+        if not (self.warning < self.strong < self.critical):
+            raise ValueError(
+                "thresholds must be strictly ordered warning < strong < critical, "
+                f"got warning={self.warning!r} strong={self.strong!r} "
+                f"critical={self.critical!r}"
+            )
+
 
 def _quota_section(config: Optional[dict[str, Any]]) -> dict[str, Any]:
     """Return the ``quota`` sub-dict from a config dict, or ``{}`` on mismatch."""
@@ -72,9 +93,13 @@ def _coerce_threshold(section: dict[str, Any], key: str, default: float) -> floa
 
     Missing/non-numeric values (str "abc", None, etc.) fall back to the
     default.  Real numbers (int/float, including numeric strings) are coerced
-    via ``float()``.
+    via ``float()``.  ``bool`` is explicitly rejected before coercion —
+    ``float(True)`` would otherwise yield ``1.0``, a degenerate threshold, so
+    booleans fall back to the default.
     """
     raw: Any = section.get(key)
+    if isinstance(raw, bool):
+        return default
     try:
         return float(raw)
     except (TypeError, ValueError):
@@ -86,7 +111,15 @@ def quota_thresholds(config: Optional[dict] = None) -> QuotaThresholds:
 
     Reads ``quota.warning_threshold`` / ``quota.strong_threshold`` /
     ``quota.critical_threshold``; missing or non-numeric values fall back to
-    the design defaults 80 / 90 / 95 (``float``-coerced).
+    the design defaults 80 / 90 / 95 (``float``-coerced).  Booleans are
+    rejected and fall back to the default.
+
+    Raises :class:`ValueError` when the resolved thresholds fail
+    :class:`QuotaThresholds` validation — i.e. any value is non-finite, outside
+    ``[0, 100]``, or not strictly ordered ``warning < strong < critical``.
+    The config-aware wrappers (:func:`quota_warning_lines` /
+    :func:`startup_warning_lines`) catch this and return ``[]`` so a
+    misconfigured threshold never yields a wrong/mislabeled warning.
     """
     section = _quota_section(config)
     return QuotaThresholds(
@@ -158,12 +191,29 @@ def quota_warning_lines(
     """Pre-turn quota warning lines, honoring ``quota.suppress_warnings``.
 
     Returns ``[]`` when suppression is enabled (the pre-turn probe is silenced
-    for this turn — issue #6567).  Otherwise delegates to
-    :func:`get_quota_warnings` with thresholds parsed from ``config``.
+    for this turn — issue #6567) or when the configured thresholds are invalid.
+    Otherwise delegates to :func:`get_quota_warnings` with thresholds parsed
+    from ``config``.
+
+    An invalid ``quota`` threshold config (non-finite, out of ``[0, 100]``, or
+    not strictly ordered) makes :func:`quota_thresholds` raise
+    :class:`ValueError`; the safe failure mode for a warning system is to
+    show *no* warning rather than a wrong/mislabeled one, so those are caught
+    and ``[]`` is returned.
+
+    Suppression is gated on a strict ``is True`` check — only an explicit
+    boolean ``true`` silences the probe, so a YAML string ``"false"`` (which is
+    truthy) does *not* suppress.
     """
-    if _quota_section(config).get("suppress_warnings"):
+    if _quota_section(config).get("suppress_warnings") is True:
         return []
-    return get_quota_warnings(snapshot, thresholds=quota_thresholds(config))
+    try:
+        thresholds = quota_thresholds(config)
+    except ValueError:
+        # Misconfigured thresholds: fail open (no warning) rather than emit a
+        # mislabeled one — issue #6567 design-review requirement.
+        return []
+    return get_quota_warnings(snapshot, thresholds=thresholds)
 
 
 def startup_warning_lines(
@@ -175,8 +225,19 @@ def startup_warning_lines(
     Per issue #6567 the *first* probe of a session must always surface a
     critical warning to the user even when ``quota.suppress_warnings`` is set,
     so the user is never blinded at session start.
+
+    An invalid ``quota`` threshold config raises :class:`ValueError` from
+    :func:`quota_thresholds`; the safe failure mode for a warning system is to
+    show *no* warning rather than a wrong/mislabeled one, so those are caught
+    and ``[]`` is returned.
     """
-    return get_quota_warnings(snapshot, thresholds=quota_thresholds(config))
+    try:
+        thresholds = quota_thresholds(config)
+    except ValueError:
+        # Misconfigured thresholds: fail open (no warning) rather than emit a
+        # mislabeled one — issue #6567 design-review requirement.
+        return []
+    return get_quota_warnings(snapshot, thresholds=thresholds)
 
 
 # ── TTL cache ─────────────────────────────────────────────────────────────

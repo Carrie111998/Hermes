@@ -7,8 +7,6 @@ Pure unit tests over plain dict configs — never touch load_config()
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from agent.account_usage import AccountUsageSnapshot, AccountUsageWindow
 from agent.quota_warnings import (
     QuotaThresholds,
@@ -370,3 +368,78 @@ def test_cache_wraps_none_fetch_result_and_does_not_cache_none(monkeypatch):
     # None is not cached (same fail-open reasoning: retry next time).
     assert fetch_quota_snapshot("anthropic", max_age=600.0) is None
     assert len(calls) == 2
+
+
+# ── Bool threshold rejection ────────────────────────────────────────────
+
+
+def test_quota_thresholds_scalar_bool_falls_back_to_default():
+    # bool would coerce to 1.0/0.0 via float(); it must fall back to default.
+    t = quota_thresholds({"quota": {"warning_threshold": True}})
+    assert t.warning == 80.0
+    assert t.strong == 90.0
+    assert t.critical == 95.0
+
+
+def test_quota_thresholds_all_bool_falls_back_to_defaults():
+    cfg = {
+        "quota": {
+            "warning_threshold": True,
+            "strong_threshold": False,
+            "critical_threshold": True,
+        }
+    }
+    t = quota_thresholds(cfg)
+    assert t == QuotaThresholds(80, 90, 95)
+
+
+# ── Misordered / out-of-range thresholds ──────────────────────────────
+
+
+def test_quota_warning_lines_misordered_thresholds_returns_empty():
+    # warning > strong > critical is invalid ordering; no mislabeled line.
+    cfg = {
+        "quota": {
+            "warning_threshold": 95,
+            "strong_threshold": 90,
+            "critical_threshold": 80,
+        }
+    }
+    snap = _snapshot(windows=[_window(used_percent=85)])  # mislabeled strong/critical
+    assert quota_warning_lines(snap, config=cfg) == []
+    assert startup_warning_lines(snap, config=cfg) == []
+
+
+def test_quota_warning_lines_out_of_range_warning_returns_empty():
+    cfg = {"quota": {"warning_threshold": -5}}
+    snap = _snapshot(windows=[_window(used_percent=85)])
+    assert quota_warning_lines(snap, config=cfg) == []
+
+
+def test_quota_warning_lines_out_of_range_critical_returns_empty():
+    cfg = {"quota": {"critical_threshold": 150}}
+    snap = _snapshot(windows=[_window(used_percent=85)])
+    assert quota_warning_lines(snap, config=cfg) == []
+
+
+def test_startup_warning_lines_out_of_range_critical_returns_empty():
+    cfg = {"quota": {"critical_threshold": 150}}
+    snap = _snapshot(windows=[_window(used_percent=98)])
+    assert startup_warning_lines(snap, config=cfg) == []
+
+
+# ── Strict suppress_warnings: only boolean True suppresses ──────────────
+
+
+def test_quota_warning_lines_string_false_not_suppressed():
+    cfg = {"quota": {"suppress_warnings": "false"}}
+    snap = _snapshot(windows=[_window(used_percent=85)])
+    assert quota_warning_lines(snap, config=cfg) == [
+        "  ⚠ Quota warning: 85% used (threshold 80%)",
+    ]
+
+
+def test_quota_warning_lines_boolean_true_suppressed():
+    cfg = {"quota": {"suppress_warnings": True}}
+    snap = _snapshot(windows=[_window(used_percent=98)])
+    assert quota_warning_lines(snap, config=cfg) == []
