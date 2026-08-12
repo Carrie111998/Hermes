@@ -55,7 +55,22 @@ class BuilderDispatchAdapter:
         self.profile_resolver = profile_resolver
         self.cycle_registry = cycle_registry or {}
 
-    def _resolve_request(self, intent: DispatchRequest) -> ResolvedDispatchRequest:
+    def _snapshot_for_cycle(self, state: dict):
+        commit = state.get("governance_commit")
+        path = state.get("contract_path")
+        if commit is None and path is None:
+            return self.governance_attestor
+        if not isinstance(commit, str) or not isinstance(path, str):
+            raise AdapterError("CONTRACT_MISMATCH", "cycle governance binding is incomplete")
+        from .attestation import GovernanceSnapshot
+
+        return GovernanceSnapshot(
+            self.governance_repo,
+            commit,
+            registered_contract_path=path,
+        )
+
+    def _resolve_request(self, intent: DispatchRequest, snapshot) -> ResolvedDispatchRequest:
         """Expand caller IDs exclusively from owner-controlled runtime state."""
         state = self.cycle_registry.get(intent.cycle_id)
         if not isinstance(state, dict):
@@ -68,7 +83,6 @@ class BuilderDispatchAdapter:
             raise AdapterError(
                 "CONTRACT_MISMATCH", "cycle identity or revision is not current"
             )
-        snapshot = self.governance_attestor
         if not hasattr(snapshot, "bindings"):
             raise AdapterError(
                 "CONTRACT_MISMATCH", "trusted governance registry is unavailable"
@@ -86,7 +100,11 @@ class BuilderDispatchAdapter:
                 "contract": {
                     "contract_id": intent.contract_id,
                     "repository_id": state["governance_repository_id"],
-                    "path": snapshot.REGISTERED_CONTRACT_PATH,
+                    "path": getattr(
+                        snapshot,
+                        "registered_contract_path",
+                        snapshot.REGISTERED_CONTRACT_PATH,
+                    ),
                     "commit": snapshot.commit,
                     "sha256": snapshot.contract_sha256,
                 },
@@ -111,8 +129,8 @@ class BuilderDispatchAdapter:
             }
         )
 
-    def _attest_profile(self):
-        policy, interface = self.governance_attestor.load()
+    def _attest_profile(self, snapshot):
+        policy, interface = snapshot.load()
         if (
             policy.get("profile") != "deepseek-builder"
             or policy.get("provider") != "deepseek"
@@ -125,14 +143,18 @@ class BuilderDispatchAdapter:
             )
         return policy, self.profile_resolver.resolve(policy)
 
-    def _verify_runtime_governance_selection(self, request) -> None:
+    def _verify_runtime_governance_selection(self, request, snapshot) -> None:
         """Reject every caller-selected governance coordinate except the snapshot."""
-        snapshot = self.governance_attestor
         if not hasattr(snapshot, "bindings"):
             return
         contract = request.contract
         if (
-            contract.path != snapshot.REGISTERED_CONTRACT_PATH
+            contract.path
+            != getattr(
+                snapshot,
+                "registered_contract_path",
+                snapshot.REGISTERED_CONTRACT_PATH,
+            )
             or contract.commit != snapshot.commit
             or contract.sha256 != snapshot.contract_sha256
             or contract.contract_id != snapshot.contract.get("contract_id")
@@ -159,15 +181,15 @@ class BuilderDispatchAdapter:
                 "MANIFEST_MISMATCH", "validation profile ID is not registered"
             )
 
-    def _execution_packet(self, request, manifest, policy: dict) -> dict:
-        contract = getattr(self.governance_attestor, "contract", {})
+    def _execution_packet(self, request, manifest, policy: dict, snapshot) -> dict:
+        contract = getattr(snapshot, "contract", {})
         objective = contract.get("objective", {})
         packet = {
             "schema_version": "1.0.0",
             "dispatch_id": str(request.dispatch_id),
             "cycle_id": request.cycle_id,
             "governance_commit": getattr(
-                self.governance_attestor, "commit", request.contract.commit
+                snapshot, "commit", request.contract.commit
             ),
             "contract_id": request.contract.contract_id,
             "objective": objective.get("summary"),
@@ -250,12 +272,16 @@ class BuilderDispatchAdapter:
         try:
             self.schemas.validate("dispatch_request", payload)
             intent = DispatchRequest.model_validate(payload)
-            request = self._resolve_request(intent)
-            self._verify_runtime_governance_selection(request)
-            policy, _ = self._attest_profile()
+            cycle_state = self.cycle_registry.get(intent.cycle_id)
+            if not isinstance(cycle_state, dict):
+                raise AdapterError("CONTRACT_MISMATCH", "cycle is not registered")
+            snapshot = self._snapshot_for_cycle(cycle_state)
+            request = self._resolve_request(intent, snapshot)
+            self._verify_runtime_governance_selection(request, snapshot)
+            policy, _ = self._attest_profile(snapshot)
             dispatch_id = str(request.dispatch_id)
-            if hasattr(self.governance_attestor, "contract_raw"):
-                contract_raw = self.governance_attestor.contract_raw
+            if hasattr(snapshot, "contract_raw"):
+                contract_raw = snapshot.contract_raw
             else:
                 contract_raw = self.git.verify_artifact(
                     self.governance_repo, request.contract, "CONTRACT_MISMATCH"
@@ -263,8 +289,8 @@ class BuilderDispatchAdapter:
             contract = json.loads(contract_raw)
             if contract.get("contract_id") != request.contract.contract_id:
                 raise AdapterError("CONTRACT_MISMATCH", "contract identity mismatch")
-            if hasattr(self.governance_attestor, "raw"):
-                manifest_raw = self.governance_attestor.raw("allowed_path_manifest")
+            if hasattr(snapshot, "raw"):
+                manifest_raw = snapshot.raw("allowed_path_manifest")
             else:
                 manifest_raw = self.git.verify_artifact(
                     self.governance_repo,
@@ -278,7 +304,7 @@ class BuilderDispatchAdapter:
                 raise AdapterError("MANIFEST_MISMATCH", "manifest base SHA mismatch")
             if request.validation_profile not in self.validation._profiles:
                 raise AdapterError("MANIFEST_MISMATCH", "validation profile unregistered")
-            packet = self._execution_packet(request, manifest, policy)
+            packet = self._execution_packet(request, manifest, policy, snapshot)
             # Reserve only after every side-effect-free preflight has passed.
             # A preflight rejection therefore cannot poison an idempotency key.
             record, created = self.store.reserve(
@@ -464,8 +490,12 @@ class BuilderDispatchAdapter:
             request = ResolvedDispatchRequest.model_validate(
                 json.loads(record["request_json"])
             )
-            if hasattr(self.governance_attestor, "raw"):
-                manifest_raw = self.governance_attestor.raw("allowed_path_manifest")
+            cycle_state = self.cycle_registry.get(request.cycle_id)
+            if not isinstance(cycle_state, dict):
+                raise AdapterError("CONTRACT_MISMATCH", "cycle is not registered")
+            snapshot = self._snapshot_for_cycle(cycle_state)
+            if hasattr(snapshot, "raw"):
+                manifest_raw = snapshot.raw("allowed_path_manifest")
             else:
                 manifest_raw = self.git.verify_artifact(
                     self.governance_repo,

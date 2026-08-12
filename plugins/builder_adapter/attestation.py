@@ -142,14 +142,26 @@ class GovernanceSnapshot:
         }
     )
 
-    def __init__(self, repository: str | Path, commit: str):
+    def __init__(
+        self,
+        repository: str | Path,
+        commit: str,
+        *,
+        registered_contract_path: str | None = None,
+    ):
         if not re.fullmatch(r"[0-9a-f]{40}([0-9a-f]{24})?", commit):
             raise AdapterError("CONTRACT_MISMATCH", "approved governance commit is invalid")
         self.repository = Path(repository)
         self.commit = commit
+        self.registered_contract_path = (
+            safe_relative_path(registered_contract_path)
+            if registered_contract_path is not None
+            else self.REGISTERED_CONTRACT_PATH
+        )
+        self.contract_path = self.PREFIX + self.registered_contract_path
         self._git = GitVerifier({})
         contract_raw = self._git.artifact_bytes(
-            self.repository, self.commit, self.CONTRACT_PATH
+            self.repository, self.commit, self.contract_path
         )
         self.contract_raw = contract_raw
         self.contract_sha256 = hashlib.sha256(contract_raw).hexdigest()

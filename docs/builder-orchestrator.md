@@ -44,6 +44,18 @@ proposal under `~/.hermes/builder-jobs/pending/`. It creates no worktree,
 changes no governance state, and starts no worker. The printed SHA-256 identifies
 the exact proposal submitted for governance review.
 
+Activate a reviewed proposal:
+
+```console
+hermes orchestrate activate ~/.hermes/builder-jobs/pending/FEATURE_EXAMPLE_001.json
+```
+
+Activation verifies the proposal hash and pinned repository again, writes a
+cycle-specific contract and path manifest into the clean governance repository,
+commits those artifacts, creates the isolated linked worktree, and atomically
+registers the cycle in the owner-only runtime configuration. It does not start a
+builder. Restart the adapter after activation, then use `start`.
+
 Start one registered job:
 
 ```console

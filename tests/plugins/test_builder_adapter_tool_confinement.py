@@ -241,7 +241,7 @@ def test_real_governed_tool_context_exercises_complete_surface(tmp_path, monkeyp
     store.update(request.dispatch_id, phase="TASK_CREATED", task_id="t_context")
 
     class Snapshot:
-        def __init__(self, *_args):
+        def __init__(self, *_args, **_kwargs):
             pass
 
         def raw(self, artifact_id):

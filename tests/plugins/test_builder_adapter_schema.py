@@ -242,6 +242,31 @@ def test_canonical_request_hash_is_order_independent():
     assert canonical_sha256(left) == canonical_sha256(right)
 
 
+def test_cycle_specific_governance_snapshot_is_exactly_bound(tmp_path, monkeypatch):
+    adapter = make_adapter(tmp_path)
+    state = adapter.cycle_registry["FEAT_TEST_001"]
+    state["governance_commit"] = "a" * 40
+    state["contract_path"] = "contracts/active/FEATURE-ONE.json"
+    seen = {}
+
+    class Snapshot:
+        def __init__(self, repository, commit, *, registered_contract_path):
+            seen.update(
+                repository=repository,
+                commit=commit,
+                registered_contract_path=registered_contract_path,
+            )
+
+    monkeypatch.setattr("plugins.builder_adapter.attestation.GovernanceSnapshot", Snapshot)
+    result = adapter._snapshot_for_cycle(state)
+    assert isinstance(result, Snapshot)
+    assert seen == {
+        "repository": tmp_path,
+        "commit": "a" * 40,
+        "registered_contract_path": "contracts/active/FEATURE-ONE.json",
+    }
+
+
 def test_registered_schema_fully_rejects_nested_and_extra_fields(tmp_path):
     schema_path = tmp_path / "request.json"
     schema_path.write_text(

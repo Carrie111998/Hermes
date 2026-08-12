@@ -48,3 +48,14 @@ def test_orchestrate_prepare_collects_repeated_scope_fields():
     )
     assert args.acceptance == ["Tests pass"]
     assert args.allowed_paths == ["src/example.py"]
+
+
+def test_orchestrate_activate_parser():
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_orchestrate_parser(subparsers, cmd_orchestrate=_handler)
+    args = parser.parse_args(["orchestrate", "activate", "/tmp/proposal.json"])
+    assert args.orchestrate_action == "activate"
+    assert args.proposal == "/tmp/proposal.json"

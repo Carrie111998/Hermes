@@ -71,7 +71,9 @@ def _context() -> ToolContext:
     from .attestation import GovernanceSnapshot
 
     snapshot = GovernanceSnapshot(
-        governance_root, adapter_config["governance_commit"]
+        governance_root,
+        request.contract.commit,
+        registered_contract_path=request.contract.path,
     )
     raw = snapshot.raw("allowed_path_manifest")
     manifest = git.manifest_from_artifact(raw)

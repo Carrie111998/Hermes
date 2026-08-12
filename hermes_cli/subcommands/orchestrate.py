@@ -41,6 +41,11 @@ def build_orchestrate_parser(subparsers, *, cmd_orchestrate):
     prepare.add_argument("--max-runtime", type=int, default=1800)
     prepare.add_argument("--heartbeat-timeout", type=int, default=180)
 
+    activate = actions.add_parser(
+        "activate", help="Bind a reviewed proposal and create its isolated worktree"
+    )
+    activate.add_argument("proposal", help="Owner-only proposal JSON from prepare")
+
     start = actions.add_parser("start", help="Start one registered implementation job")
     start.add_argument("cycle_id")
     start.add_argument("--dispatch-id", help="Reuse a previously chosen UUID for idempotent recovery")
@@ -147,6 +152,16 @@ def run_operator_command(args) -> int:
             print(f"State: {bundle['activation_state']}")
             print(f"Bundle SHA-256: {bundle['bundle_sha256']}")
             print("No worktree was created and no builder was started.")
+            return 0
+
+        if args.orchestrate_action == "activate":
+            from plugins.builder_adapter.activation import activate_proposal
+
+            result = activate_proposal(Path(args.config).expanduser(), args.proposal)
+            print(f"Activated cycle: {result['cycle_id']}")
+            print(f"Governance commit: {result['governance_commit']}")
+            print(f"Worktree: {result['worktree_path']}")
+            print("Adapter restart required before start.")
             return 0
 
         settings, client = _client(args)
