@@ -146,7 +146,7 @@ def test_latin1_fallback_stream_honors_override(tmp_path, monkeypatch):
     assert os.getenv("OVERRIDE_PROBE") == "from-shell"
     assert os.getenv("LATIN1_VALUE") == "café"
 
-    # override=True: file value must win (user-env path).
+    # override=True: file value must win when a caller explicitly requests it.
     _load_dotenv_with_fallback(env_file, override=True)
     assert os.getenv("OVERRIDE_PROBE") == "from-file"
     assert os.getenv("LATIN1_VALUE") == "café"
