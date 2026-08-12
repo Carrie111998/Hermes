@@ -211,7 +211,38 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
     last item is a tool result, so that is what this matches: the final
     non-system message is a ``tool`` result, and the assistant message that
     issued its ``tool_call_id`` is present.
+
+    Tool-call identity is resolved the same way
+    ``_chat_messages_to_responses_input`` resolves it, because the pairing
+    that matters is the one that reaches the wire. A stored tool call can
+    carry the function call id in ``call_id``, in ``id``, or in a composite
+    ``"call_x|fc_y"`` id, and a bare ``fc_``-prefixed ``id`` is a response
+    item id that the converter turns into ``call_<rest>``. Matching only
+    ``id`` would miss the ``id=fc_… / call_id=call_…`` shape that resumed
+    legacy sessions and host-fed histories still use, and let the rejected
+    payload through.
     """
+    from agent.codex_responses_adapter import _split_responses_tool_id
+
+    def _call_ids(tool_call: Dict[str, Any]) -> set:
+        """Every call id this tool call could pair on, converter-order."""
+        candidates = set()
+        embedded_call_id, embedded_item_id = _split_responses_tool_id(
+            tool_call.get("id")
+        )
+        explicit = tool_call.get("call_id")
+        if isinstance(explicit, str) and explicit.strip():
+            candidates.add(explicit.strip())
+        if embedded_call_id:
+            candidates.add(embedded_call_id)
+        if (
+            isinstance(embedded_item_id, str)
+            and embedded_item_id.startswith("fc_")
+            and len(embedded_item_id) > len("fc_")
+        ):
+            candidates.add(f"call_{embedded_item_id[len('fc_'):]}")
+        return candidates
+
     trailing_call_ids = set()
     for msg in reversed(messages or ()):
         if not isinstance(msg, dict):
@@ -220,7 +251,10 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
         if role == "system":
             continue
         if role == "tool":
-            call_id = msg.get("tool_call_id")
+            raw = msg.get("tool_call_id")
+            call_id, _ = _split_responses_tool_id(raw)
+            if not call_id and isinstance(raw, str) and raw.strip():
+                call_id = raw.strip()
             if not call_id:
                 return False
             trailing_call_ids.add(call_id)
@@ -231,11 +265,10 @@ def _is_post_tool_replay(messages: Optional[List[Dict[str, Any]]]) -> bool:
         # existed at all.
         if role != "assistant":
             return False
-        issued = {
-            call.get("id")
-            for call in (msg.get("tool_calls") or [])
-            if isinstance(call, dict)
-        }
+        issued = set()
+        for call in msg.get("tool_calls") or []:
+            if isinstance(call, dict):
+                issued |= _call_ids(call)
         return bool(trailing_call_ids & issued)
 
     return False

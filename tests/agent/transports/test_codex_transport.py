@@ -474,6 +474,96 @@ class TestCodexBuildKwargs:
         assert "reasoning" not in item_types
         assert kw.get("include") == []
 
+    @pytest.mark.parametrize(
+        "tool_call,tool_call_id",
+        [
+            # Responses histories carry the function call id in call_id while
+            # ``id`` holds the response item id. Resumed legacy sessions and
+            # host-fed histories still use this shape.
+            ({"id": "fc_item_a", "call_id": "call_a"}, "call_a"),
+            # Plain chat-completions shape: id IS the call id.
+            ({"id": "call_a"}, "call_a"),
+            # Bare fc_ id with no call_id — the converter derives call_<rest>.
+            ({"id": "fc_a"}, "call_a"),
+            # Composite stored id, on either side of the pairing.
+            ({"id": "call_a|fc_a"}, "call_a"),
+            ({"id": "call_a"}, "call_a|fc_a"),
+            # call_id present, no id at all.
+            ({"call_id": "call_a"}, "call_a"),
+        ],
+    )
+    def test_azure_foundry_suppresses_across_tool_call_id_shapes(
+        self, transport, tool_call, tool_call_id
+    ):
+        """Every id shape the converter can pair must be detected.
+
+        The converter resolves a function call's identity as
+        ``call_id`` -> embedded ``id`` -> derived from an ``fc_`` item id, and
+        splits composite ``"call_x|fc_y"`` ids. A predicate that matched only
+        ``tool_calls[*].id`` would miss the id=fc_ / call_id=call_ shape: the
+        converter still emits paired function_call / function_call_output, so
+        the exact payload Foundry rejects would ship with the reasoning item
+        intact.
+        """
+        messages = [
+            {"role": "user", "content": "Create a marker"},
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_reasoning_items": [self._reasoning_item()],
+                "tool_calls": [
+                    {**tool_call, "type": "function",
+                     "function": {"name": "write_marker", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": tool_call_id, "content": "marker written"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            provider="azure-foundry",
+            base_url=self.AZURE_FOUNDRY_BASE_URL,
+            replay_encrypted_reasoning=True,
+        )
+        item_types = [item.get("type") for item in kw["input"] if isinstance(item, dict)]
+        # The converter paired them, so this is the rejected shape.
+        assert "function_call" in item_types
+        assert "function_call_output" in item_types
+        assert "reasoning" not in item_types
+        assert kw.get("include") == []
+
+    def test_azure_foundry_unpaired_tool_result_keeps_reasoning(self, transport):
+        """A tool result that pairs with nothing is not the rejected shape."""
+        messages = [
+            {"role": "user", "content": "Create a marker"},
+            {
+                "role": "assistant",
+                "content": "",
+                "codex_reasoning_items": [self._reasoning_item()],
+                "tool_calls": [
+                    {
+                        "id": "fc_item_x",
+                        "call_id": "call_x",
+                        "type": "function",
+                        "function": {"name": "write_marker", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_unrelated", "content": "?"},
+        ]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            provider="azure-foundry",
+            base_url=self.AZURE_FOUNDRY_BASE_URL,
+            replay_encrypted_reasoning=True,
+        )
+        item_types = [item.get("type") for item in kw["input"] if isinstance(item, dict)]
+        assert "reasoning" in item_types
+        assert kw.get("include") == ["reasoning.encrypted_content"]
+
     def test_xai_top_level_override_also_governs_extra_body(self, transport):
         """A caller's top-level request_overrides={"prompt_cache_key": ...}
         must win in extra_body.prompt_cache_key too -- the field xAI actually
