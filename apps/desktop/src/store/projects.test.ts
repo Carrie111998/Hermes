@@ -458,7 +458,7 @@ describe('repository discovery policy', () => {
         : { accepted: false, repos: [] }
     )
     gatewayWith(request)
-    $projectTree.set([{ id: 'seed', name: 'seed', folders: [], lanes: [] } as SidebarProjectTree])
+    $projectTree.set([{ id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 } satisfies SidebarProjectTree])
 
     await scanAndRecordRepos(true)
 
@@ -496,7 +496,7 @@ describe('repository discovery policy', () => {
       return { accepted: false, repos: [] }
     })
     gatewayWith(request)
-    $projectTree.set([{ id: 'seed', name: 'seed', folders: [], lanes: [] } as SidebarProjectTree])
+    $projectTree.set([{ id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 } satisfies SidebarProjectTree])
 
     await scanAndRecordRepos(true)
 
@@ -507,7 +507,7 @@ describe('repository discovery policy', () => {
     )
     // ... the cached tree is preserved ...
     expect($projectTree.get()).toEqual([
-      { id: 'seed', name: 'seed', folders: [] as never[], lanes: [] }
+      { id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 }
     ])
   })
 
@@ -523,7 +523,7 @@ describe('repository discovery policy', () => {
         : { accepted: false }
     )
     gatewayWith(request)
-    $projectTree.set([{ id: 'seed', name: 'seed', folders: [], lanes: [] } as SidebarProjectTree])
+    $projectTree.set([{ id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 } satisfies SidebarProjectTree])
 
     await scanAndRecordRepos(true)
 
@@ -532,7 +532,7 @@ describe('repository discovery policy', () => {
       expect.objectContaining({ preview_limit: expect.any(Number) })
     )
     expect($projectTree.get()).toEqual([
-      { id: 'seed', name: 'seed', folders: [] as never[], lanes: [] }
+      { id: 'seed', label: 'seed', path: null, repos: [], sessionCount: 0 }
     ])
   })
 })
