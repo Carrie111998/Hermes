@@ -294,7 +294,10 @@ _REFERENCE_SYSTEM_PROMPT = (
     "what the acting agent should check — do not invent the answer.\n\n"
     "Give your best analysis of the current state: what is going on, the "
     "best approach, concrete next steps and tool-use strategy, likely "
-    "pitfalls, and anything the acting agent missed or got wrong. Respond "
+    "pitfalls, and anything the acting agent missed or got wrong. Audit "
+    "the request itself: if evidence in the digest contradicts an "
+    "assumption in the user's request, say so plainly — do not proceed as "
+    "if the assumption were true. Respond "
     "with the advice directly, no preamble. Your response is private "
     "guidance handed to the acting agent, not an answer shown to the user."
 )

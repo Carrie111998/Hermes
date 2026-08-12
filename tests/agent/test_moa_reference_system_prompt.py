@@ -68,3 +68,15 @@ def test_reference_system_prompt_structure():
     # It should describe the digest the advisor is reading.
     assert "digest" in _REFERENCE_SYSTEM_PROMPT.lower(), \
         "Prompt should describe the digest format the advisor receives"
+
+
+def test_reference_system_prompt_premise_audit():
+    """Advisors must audit the user's premise, not obey it.
+
+    A false-premise request ("fix the inverted logic" when nothing is
+    inverted) had an advisor proposing to break correct code. The prompt
+    directs advisors to flag contradicted assumptions instead.
+    """
+    prompt_lower = _REFERENCE_SYSTEM_PROMPT.lower()
+    assert "audit the request" in prompt_lower
+    assert "contradicts an assumption" in prompt_lower
