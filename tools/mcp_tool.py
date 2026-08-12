@@ -3377,7 +3377,15 @@ class MCPServerTask:
         # agree with what the body actually speaks.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = LATEST_HANDSHAKE_VERSION
-        connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+        # Sanitize once, here: this single read feeds the transport's client
+        # timeout AND the ``initialize()`` ``wait_for`` deadline on all three
+        # branches below (SSE, Streamable HTTP, legacy Streamable HTTP). Taken
+        # raw, a YAML ``.inf`` produces a deadline that never elapses, so a
+        # server that accepts the connection but never answers ``initialize``
+        # parks this coroutine forever — the same hang the bound exists to
+        # prevent (#59349). ``.nan`` is no better: the loop's timer heap trips
+        # it on an arbitrary wake-up, so it is not a deadline at all.
+        connect_timeout = _sanitized_connect_timeout(config)
         ssl_verify = config.get("ssl_verify", True)
         client_cert = _resolve_client_cert(self.name, config)
 
