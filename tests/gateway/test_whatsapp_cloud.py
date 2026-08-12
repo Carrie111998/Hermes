@@ -17,6 +17,7 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from types import SimpleNamespace
 
 from gateway.config import Platform
 
@@ -944,20 +945,125 @@ class TestGroupMessageGating:
 
     @pytest.mark.asyncio
     async def test_allowlist_policy_admits_only_listed_groups(self):
+        """Drive the allowlist through the real normalizer, not around it.
+
+        Operator-configured entries pass through _normalize_allow_ids, which
+        is phone-number oriented; a group JID must survive it intact or the
+        allowlist can never match the inbound chat_id (#80054).
+        """
+        from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
         adapter = _make_adapter()
         adapter._group_policy = "allowlist"
-        adapter._group_allow_from = {GROUP_JID}
+        adapter._group_allow_from = WhatsAppCloudAdapter._normalize_allow_ids({GROUP_JID})
 
         admitted = await adapter._build_message_event_from_cloud(
             _group_raw(), {"15551234567": "Alice"}, {}
         )
         assert admitted is not None
 
-        adapter._group_allow_from = {"120363999999999999@g.us"}
+        adapter._group_allow_from = WhatsAppCloudAdapter._normalize_allow_ids(
+            {"120363999999999999@g.us"}
+        )
         refused = await adapter._build_message_event_from_cloud(
             _group_raw(), {"15551234567": "Alice"}, {}
         )
         assert refused is None
+
+    def test_normalizer_preserves_group_jids_but_still_bares_phone_numbers(self):
+        from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
+        norm = WhatsAppCloudAdapter._normalize_allow_ids
+        # Group JIDs survive intact — stripping "@g.us" and non-digits would
+        # yield a value that never matches an inbound group chat_id.
+        assert norm({GROUP_JID}) == {GROUP_JID}
+        # Phone-shaped entries still normalize to bare wa_id as before.
+        assert norm({"+1 (555) 123-4567"}) == {"15551234567"}
+        assert norm({"15551234567@s.whatsapp.net"}) == {"15551234567"}
+
+    @pytest.mark.asyncio
+    async def test_gated_group_still_tells_the_operator_why(self, caplog):
+        """The old code warned on every dropped group message.
+
+        That signal must survive the move to policy gating, or a
+        misconfigured group_policy is indistinguishable from silence.
+        """
+        adapter = _make_adapter()
+        adapter._group_policy = "pairing"
+
+        with caplog.at_level("INFO"):
+            event = await adapter._build_message_event_from_cloud(
+                _group_raw(), {"15551234567": "Alice"}, {}
+            )
+
+        assert event is None
+        assert any(
+            "group_policy" in rec.message and "not admitted" in rec.message
+            for rec in caplog.records
+        ), caplog.text
+
+
+class TestOutboundRecipientType:
+    """Group destinations must be addressed as groups.
+
+    Meta's send API takes recipient_type individual|group; posting a group
+    JID as "individual" is rejected, so routing group messages inbound
+    without this would accept the message and then fail every reply (#80054).
+    """
+
+    def test_recipient_type_derives_from_destination(self):
+        from gateway.platforms.whatsapp_cloud import WhatsAppCloudAdapter
+
+        assert WhatsAppCloudAdapter._recipient_type(GROUP_JID) == "group"
+        assert WhatsAppCloudAdapter._recipient_type("15551234567") == "individual"
+        assert WhatsAppCloudAdapter._recipient_type("") == "individual"
+
+    @pytest.mark.asyncio
+    async def test_text_send_to_group_uses_group_recipient_type(self):
+        adapter = _make_adapter()
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            @staticmethod
+            def json():
+                return {"messages": [{"id": "wamid.out1"}]}
+
+        async def _post(url, headers=None, json=None):
+            captured.update(json or {})
+            return _Resp()
+
+        adapter._http_client = SimpleNamespace(post=_post)
+
+        await adapter.send(GROUP_JID, "hello group")
+
+        assert captured["to"] == GROUP_JID
+        assert captured["recipient_type"] == "group"
+
+    @pytest.mark.asyncio
+    async def test_text_send_to_dm_stays_individual(self):
+        adapter = _make_adapter()
+        captured = {}
+
+        class _Resp:
+            status_code = 200
+            text = "{}"
+
+            @staticmethod
+            def json():
+                return {"messages": [{"id": "wamid.out2"}]}
+
+        async def _post(url, headers=None, json=None):
+            captured.update(json or {})
+            return _Resp()
+
+        adapter._http_client = SimpleNamespace(post=_post)
+
+        await adapter.send("15551234567", "hello dm")
+
+        assert captured["recipient_type"] == "individual"
 
     @pytest.mark.asyncio
     async def test_object_shaped_chat_field_is_understood(self):

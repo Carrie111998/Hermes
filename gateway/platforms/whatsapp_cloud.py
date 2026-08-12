@@ -200,6 +200,9 @@ def check_whatsapp_cloud_requirements() -> bool:
     return AIOHTTP_AVAILABLE and HTTPX_AVAILABLE
 
 
+GROUP_JID_SUFFIX = "@g.us"
+
+
 class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     """WhatsApp Business Cloud API adapter.
 
@@ -396,13 +399,36 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         Users sharing an allowlist between both adapters (or pasting a
         JID/phone number with ``+`` or separators) should still match,
         so strip any ``@...`` suffix and non-digit characters.
+
+        Group JIDs are exempt: they are opaque identifiers, not phone
+        numbers, and inbound group traffic is matched against the full
+        ``<id>@g.us`` value. Normalizing one would strip the suffix and
+        produce an entry that can never match (#80054).
         """
         normalized: set[str] = set()
         for entry in ids:
+            if WhatsAppCloudAdapter._is_group_jid(entry):
+                normalized.add(entry.strip())
+                continue
             bare = entry.split("@", 1)[0]
             digits = re.sub(r"\D", "", bare)
             normalized.add(digits or entry)
         return normalized
+
+    @staticmethod
+    def _is_group_jid(value: str) -> bool:
+        """True for a WhatsApp group identifier (``<id>@g.us``)."""
+        return str(value or "").strip().lower().endswith(GROUP_JID_SUFFIX)
+
+    @classmethod
+    def _recipient_type(cls, chat_id: str) -> str:
+        """Graph API ``recipient_type`` for a destination.
+
+        Meta's send-messages API takes ``individual`` or ``group``; posting a
+        group JID as ``individual`` is rejected, so every outbound payload
+        derives this from the destination rather than hardcoding it (#80054).
+        """
+        return "group" if cls._is_group_jid(chat_id) else "individual"
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         """Allowlist check against the normalized bare wa_id."""
@@ -546,7 +572,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         for idx, chunk in enumerate(chunks):
             payload: Dict[str, Any] = {
                 "messaging_product": "whatsapp",
-                "recipient_type": "individual",
+                "recipient_type": self._recipient_type(chat_id),
                 "to": chat_id,
                 "type": "text",
                 "text": {"body": chunk, "preview_url": True},
@@ -704,7 +730,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         }
         payload: Dict[str, Any] = {
             "messaging_product": "whatsapp",
-            "recipient_type": "individual",
+            "recipient_type": self._recipient_type(chat_id),
             "to": chat_id,
             "type": "interactive",
             "interactive": interactive_body,
@@ -1080,7 +1106,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
         payload: Dict[str, Any] = {
             "messaging_product": "whatsapp",
-            "recipient_type": "individual",
+            "recipient_type": self._recipient_type(chat_id),
             "to": chat_id,
             "type": media_kind,
             media_kind: media_block,
@@ -1995,6 +2021,17 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             "body": body,
         }
         if not self._should_process_message(gating_data):
+            if is_group:
+                # Replaces the previous unconditional "not implemented"
+                # warning. The drop is now a policy outcome, so this is
+                # informational and actionable rather than an error -- but it
+                # must stay, or a misconfigured group_policy is invisible.
+                logger.info(
+                    "[whatsapp_cloud] group message from %s not admitted "
+                    "(group_policy=%r) -- set group_policy to 'allowlist' or "
+                    "'open' to enable group chats",
+                    chat_id, self._group_policy,
+                )
             return None
 
         # Download media if this is a non-text message type. Inbound media
