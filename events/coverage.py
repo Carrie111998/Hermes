@@ -20,14 +20,35 @@ F601 only catches repeated *literal* keys and F602 only bare *names*, so neither
 rule reaches an attribute key at all — and this repo's ``select`` is narrow
 enough (``PLW1514``) that a green ``ruff check`` proves nothing here.
 
+Two kinds of total, and why they are separate tuples
+----------------------------------------------------
+:data:`REQUIRED_TOTAL` is total BY CHECK — ``_POLICY`` is an ordinary partial
+dict, ``classify()`` degrades to WARN-on-alerts for an unmapped type, and this
+check is the only thing standing between that and a misrouted notification.
+
+:data:`TOTAL_BY_CONSTRUCTION` is total BY CONSTRUCTION — ``EVENT_TYPE_EMOJI`` is
+a ``MappingProxyType`` derived from ``EventType.icon``, which is a required
+member field validated at class creation, so a gap cannot be expressed while
+``events.schema`` imports at all. Its line in the report is a tautology today.
+It is still checked, as the regression detector for the derivation itself: the
+day someone re-introduces a hand-maintained icon dict, this becomes a real check
+again with no edit to this file.
+
+:data:`ALL_TOTAL` is the union and is what actually gets checked. Keeping the
+two kinds visibly apart is a readability property, not a scope one — a reader
+comparing two green runs should be able to see at a glance which line could
+have failed and which could not.
+
 Why this is a check and not an import-time assertion
 ----------------------------------------------------
-Both consumers already degrade gracefully on a miss: ``event_icon()`` returns
-``""`` (a double-space gap in the header) and ``classify()`` falls back to
-WARN-on-alerts. Raising at import would convert a cosmetic notification defect
-into a gateway that will not boot — a self-inflicted outage in the very system
-whose job is to report outages. So enforcement runs where a *developer* is, not
-where the gateway is:
+For ``_POLICY``, because the consumer already degrades gracefully on a miss:
+``classify()`` falls back to WARN-on-alerts. Raising at import would convert a
+cosmetic routing defect into a gateway that will not boot — a self-inflicted
+outage in the very system whose job is to report outages. (``event_icon()`` used
+to degrade the same way, returning ``""`` for a double-space gap in the header;
+it no longer can, which is precisely what moved its table into
+TOTAL_BY_CONSTRUCTION.) So enforcement runs where a *developer* is, not where
+the gateway is:
 
   * ``python -m events.coverage`` — exits non-zero with the FULL missing set.
     Wired into ``.pre-commit-config.yaml``, so it fires when the member is
@@ -75,6 +96,8 @@ __all__ = [
     "TableSpec",
     "DiscoveredTable",
     "REQUIRED_TOTAL",
+    "TOTAL_BY_CONSTRUCTION",
+    "ALL_TOTAL",
     "KNOWN_PARTIAL",
     "MANIFEST",
     "missing_members",
@@ -114,42 +137,22 @@ class TableSpec:
             ) from exc
 
 
-# Tables that MUST have an entry for every EventType member. A miss here is a
-# real defect in delivered notifications, not merely a red test.
+# Tables contracted to be TOTAL over EventType come in two kinds, and the
+# difference is the whole reason they are separate tuples: it tells you how much
+# a green run is worth.
 #
-# TOTAL BY CONSTRUCTION vs TOTAL BY CHECK — the two entries below are no longer
-# the same kind of claim, and the difference matters when reading a green run:
+#   REQUIRED_TOTAL         — total BY CHECK. Nothing but this check stands
+#       between the table and a real defect in delivered notifications. These
+#       entries can genuinely fail, and they are why the pre-commit hook exists.
 #
-#   EVENT_TYPE_EMOJI  is TOTAL BY CONSTRUCTION. It is a MappingProxyType built
-#       as ``{et: et.icon for et in EventType}``, and ``EventType.__init__``
-#       rejects a missing (TypeError) or blank (ValueError) icon at class-
-#       creation time. It CANNOT be partial while events.schema imports at all,
-#       so its line in the report is a tautology, kept deliberately: it is the
-#       regression detector for the derivation itself. If someone ever
-#       re-introduces a hand-maintained icon dict — the exact shape that drifted
-#       four times — this entry goes back to being a real check on the day it
-#       lands, with no edit to this file.
+#   TOTAL_BY_CONSTRUCTION  — total BY CONSTRUCTION. The type system or an
+#       import-time invariant already makes a gap unrepresentable, so the check
+#       is a tautology today. Kept and checked anyway, as the regression
+#       detector for the construction itself.
 #
-#   _POLICY           is TOTAL BY CHECK. It is an ordinary partial dict with a
-#       genuine runtime fallback in classify(), so this is the entry that can
-#       actually fail, and the one the pre-commit hook exists for. Do NOT
-#       "harden" it by back-filling unmapped types at import time: coverage.py
-#       reads _POLICY after import, so a back-fill makes this check report
-#       79/79 on a table that IS missing an entry. That false green is why the
-#       2026-08-11 icon-hardening branch (archive/eventtype-icon-as-enum-field-
-#       20260811) was rejected as-is rather than landed.
+# Both are checked. Only the first can realistically fail, and a reader
+# comparing two green runs should not have to know which is which by heart.
 REQUIRED_TOTAL: Tuple[TableSpec, ...] = (
-    TableSpec(
-        "events.formatting",
-        "EVENT_TYPE_EMOJI",
-        total=True,
-        why=(
-            "event_icon() renders the Telegram/WhatsApp header's visual scan "
-            "token; a missing entry used to leave a double-space gap. Now "
-            "total by construction (derived from EventType.icon) — a failure "
-            "here means the derivation was replaced by a hand-maintained dict"
-        ),
-    ),
     TableSpec(
         "events.routing_policy",
         "_POLICY",
@@ -158,6 +161,32 @@ REQUIRED_TOTAL: Tuple[TableSpec, ...] = (
             "classify() falls back to WARN-on-watchdog_alerts for an unmapped "
             "type, so the event lands in the wrong topic and its WhatsApp "
             "escalation is decided by accident rather than by design"
+        ),
+    ),
+)
+
+# Total by construction — a gap here is UNREPRESENTABLE, not merely undetected.
+#
+# Do NOT "promote" a REQUIRED_TOTAL table into this tuple by back-filling its
+# gaps at import time. coverage.py resolves every table AFTER importing its
+# module, so an import-time back-fill makes the check report N/N on a table that
+# IS missing an entry — a guard that reads as armed and is not. That false green
+# is exactly why the 2026-08-11 icon-hardening branch
+# (archive/eventtype-icon-as-enum-field-20260811) was rejected as-is rather than
+# landed, and tests/events/test_event_type_coverage.py pins it in both
+# directions. Membership here has to be earned by making the gap impossible to
+# express, not by filling it in after the fact.
+TOTAL_BY_CONSTRUCTION: Tuple[TableSpec, ...] = (
+    TableSpec(
+        "events.formatting",
+        "EVENT_TYPE_EMOJI",
+        total=True,
+        why=(
+            "the icon is a required EventType member field validated at class-"
+            "creation time and this table is a MappingProxyType derived from "
+            "it, so a gap cannot exist while events.schema imports at all — a "
+            "failure here means the derivation was replaced by a hand-"
+            "maintained dict, which is the shape that drifted four times"
         ),
     ),
 )
@@ -196,7 +225,13 @@ KNOWN_PARTIAL: Tuple[TableSpec, ...] = (
     ),
 )
 
-MANIFEST: Tuple[TableSpec, ...] = REQUIRED_TOTAL + KNOWN_PARTIAL
+# Everything contracted to be total, regardless of what makes it so. This is
+# what actually gets CHECKED — splitting the manifest for readability must not
+# quietly narrow the check, which is the one way this refactor could have made
+# things worse.
+ALL_TOTAL: Tuple[TableSpec, ...] = REQUIRED_TOTAL + TOTAL_BY_CONSTRUCTION
+
+MANIFEST: Tuple[TableSpec, ...] = ALL_TOTAL + KNOWN_PARTIAL
 
 
 @dataclass(frozen=True)
@@ -229,6 +264,7 @@ def log_missing_members(
     table: Mapping[EventType, object],
     qualname: str,
     logger: Optional[logging.Logger] = None,
+    fix: Optional[str] = None,
 ) -> Tuple[str, ...]:
     """Emit ONE ``logger.error`` naming every EventType absent from ``table``.
 
@@ -251,6 +287,12 @@ def log_missing_members(
     disarming :func:`coverage_gaps`, the CLI, the hook, and the tests. Return
     the record; leave the table exactly as the source declared it.
 
+    ``fix`` overrides the remediation sentence. Pass it for a table in
+    :data:`TOTAL_BY_CONSTRUCTION`, where the default advice ("add one entry per
+    type") is actively WRONG: hand-adding the entries is how you rebuild the
+    parallel table the derivation exists to remove. Left unset it keeps the
+    wording every REQUIRED_TOTAL caller already relies on.
+
     Costs one dict lookup per enum member at import. Returns the missing type
     strings so the caller can publish them as a module constant, which is also
     what proves the check ran.
@@ -259,23 +301,29 @@ def log_missing_members(
     if missing:
         (logger or logging.getLogger(__name__)).error(
             "%s is missing an entry for %d of %d EventType members, which will "
-            "ship as a degraded notification for each: %s. Fix: add one entry "
-            "per type to %s (do not suppress this line).",
+            "ship as a degraded notification for each: %s. %s "
+            "(do not suppress this line).",
             qualname,
             len(missing),
             len(list(EventType)),
             ", ".join(missing),
-            qualname,
+            fix or f"Fix: add one entry per type to {qualname}",
         )
     return missing
 
 
 def coverage_gaps(
-    specs: Sequence[TableSpec] = REQUIRED_TOTAL,
+    specs: Sequence[TableSpec] = ALL_TOTAL,
 ) -> Dict[str, List[str]]:
-    """Map each incomplete required-total table to its FULL missing set.
+    """Map each incomplete total table to its FULL missing set.
 
-    Returns ``{}`` when every required table covers every EventType member.
+    Defaults to :data:`ALL_TOTAL`, not :data:`REQUIRED_TOTAL` — a table being
+    total by construction is a reason to expect it to pass, never a reason to
+    stop looking at it. Narrowing this default to REQUIRED_TOTAL would silently
+    drop EVENT_TYPE_EMOJI out of the check on the very day the derivation is
+    replaced by a hand-maintained dict.
+
+    Returns ``{}`` when every total table covers every EventType member.
     Deliberately collects rather than raising on the first miss — a report that
     names one type when twelve are gone has understated the drift at every
     recurrence on record.
@@ -376,8 +424,9 @@ def unimportable_modules() -> List[Tuple[str, str]]:
 def format_report() -> Tuple[str, bool]:
     """Build the human-readable coverage report.
 
-    Returns ``(text, ok)``. ``ok`` is False for a real drift — a required-total
-    table with a missing member, or an EventType-keyed table nobody classified.
+    Returns ``(text, ok)``. ``ok`` is False for a real drift — any table in
+    :data:`ALL_TOTAL` with a missing member (whether it was total by check or
+    by construction), or an EventType-keyed table nobody classified.
     Modules that would not import are reported as a WARNING without flipping
     ``ok``; see the comment in the body for why.
     """
@@ -391,32 +440,47 @@ def format_report() -> Tuple[str, bool]:
     # under whatever ``python`` is on PATH, which may lack an optional
     # subscriber dependency the repo venv has; blocking every commit on that
     # would get the hook disabled, which costs more than it saves. The
-    # required-total check is unaffected (it imports its two tables directly);
+    # totality check is unaffected (it imports its tables directly);
     # only discovery goes partially blind, and
     # tests/events/test_event_type_coverage.py asserts zero failures under the
     # real venv. The warning is printed either way.
     ok = not (gaps or unclassified)
 
+    def _tally() -> List[str]:
+        """Per-table counts, grouped so the two kinds of 'total' stay legible."""
+        out: List[str] = []
+        for spec in REQUIRED_TOTAL:
+            out.append(f"  {spec.qualname}: {total_members}/{total_members}")
+        if TOTAL_BY_CONSTRUCTION:
+            out.append("  total by construction (a gap is unrepresentable):")
+            for spec in TOTAL_BY_CONSTRUCTION:
+                out.append(
+                    f"    {spec.qualname}: {total_members}/{total_members}"
+                )
+        return out
+
     if ok and not broken:
         lines.append(
             f"EventType coverage OK — all {total_members} members present in "
-            f"{len(REQUIRED_TOTAL)} required-total tables."
+            f"{len(ALL_TOTAL)} total tables "
+            f"({len(REQUIRED_TOTAL)} checked, "
+            f"{len(TOTAL_BY_CONSTRUCTION)} total by construction)."
         )
-        for spec in REQUIRED_TOTAL:
-            lines.append(f"  {spec.qualname}: {total_members}/{total_members}")
+        lines.extend(_tally())
         return "\n".join(lines), True
 
     if ok:
         lines.append(
             f"EventType coverage OK — all {total_members} members present in "
-            f"{len(REQUIRED_TOTAL)} required-total tables, but discovery was "
-            f"incomplete (see below)."
+            f"{len(ALL_TOTAL)} total tables, but discovery was incomplete "
+            f"(see below)."
         )
+        lines.extend(_tally())
     else:
         lines.append("EventType coverage FAILED.")
     lines.append("")
 
-    for spec in REQUIRED_TOTAL:
+    for spec in ALL_TOTAL:
         missing = gaps.get(spec.qualname)
         if not missing:
             continue
@@ -427,9 +491,23 @@ def format_report() -> Tuple[str, bool]:
         for type_string in missing:
             lines.append(f"    {type_string}")
         lines.append(f"  Why it matters: {spec.why}.")
-        lines.append(
-            f"  Fix: add one entry per member above to {spec.qualname}."
-        )
+        if spec in TOTAL_BY_CONSTRUCTION:
+            # "Add the missing entries" is the WRONG fix here, and following it
+            # would hand-maintain the table right back into the failure mode it
+            # was derived to remove. This branch should be unreachable; if it
+            # printed, the construction is what broke.
+            lines.append(
+                f"  Fix: {spec.qualname} is supposed to be total BY "
+                f"CONSTRUCTION, so this gap should have been impossible to "
+                f"express. Do NOT paper over it by adding the entries above by "
+                f"hand — find what stopped constructing the table and restore "
+                f"that, or move the spec to REQUIRED_TOTAL and say why it can "
+                f"no longer be guaranteed."
+            )
+        else:
+            lines.append(
+                f"  Fix: add one entry per member above to {spec.qualname}."
+            )
         lines.append("")
 
     if unclassified:
@@ -444,8 +522,9 @@ def format_report() -> Tuple[str, bool]:
                 f"{len(table.missing)} EventType members absent)"
             )
         lines.append(
-            "  Fix: add each to REQUIRED_TOTAL (must cover every EventType) "
-            "or to KNOWN_PARTIAL (deliberately a subset) in events/coverage.py."
+            "  Fix: add each to REQUIRED_TOTAL (must cover every EventType), "
+            "TOTAL_BY_CONSTRUCTION (a gap is unrepresentable), or "
+            "KNOWN_PARTIAL (deliberately a subset) in events/coverage.py."
         )
         lines.append("")
 
