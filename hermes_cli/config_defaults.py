@@ -204,10 +204,11 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         # Lower values mean faster feedback on slow tasks but more chat
-        # noise; 180s is a compromise that catches spinning weak-model runs
-        # (60+ tool iterations with tiny output) before users assume the
-        # bot is dead and /restart.
-        "gateway_notify_interval": 180,
+        # noise; 300s (5min) matches the standard heartbeat cadence used
+        # elsewhere (kanban.progress_notify_interval_seconds) so the user
+        # gets one consistent "still working" rhythm across CoS turns and
+        # dispatched kanban tasks.
+        "gateway_notify_interval": 300,
         # Session stall watchdog (seconds). Scope (#76354): this is a
         # RECOVERY notifier for an in-process AIAgent that has an
         # adapter-queued follow-up (pending inbound / queued event) while its
