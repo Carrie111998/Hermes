@@ -604,6 +604,51 @@ def grok_supports_reasoning_effort(model: str) -> bool:
     return any(name.startswith(prefix) for prefix in _GROK_EFFORT_CAPABLE_PREFIXES)
 
 
+# Grok 4.6 is the first xAI Responses model to accept ``reasoning.effort=xhigh``
+# (older Grok models top out at ``high``) and xAI Priority Processing
+# (``service_tier``). Both wire capabilities are model-gated on the 4.6 family;
+# earlier models keep the provider-wide clamp/strip. See #84799.
+_GROK_4_6_PREFIXES = ("grok-4.6",)
+
+
+def _grok_model_slug(model: str) -> str:
+    """Normalize an xAI Grok model id down to its bare family slug.
+
+    Strips aggregator prefixes (``x-ai/``, ``openrouter/x-ai/``, ...) so the
+    substring allowlists below match both bare and prefixed ids.
+    """
+    name = (model or "").strip().lower()
+    if not name:
+        return ""
+    for sep in ("/",):
+        if sep in name:
+            name = name.rsplit(sep, 1)[-1]
+    return name
+
+
+def grok_supports_xhigh_effort(model: str) -> bool:
+    """Return True when the xAI Grok model accepts ``reasoning.effort=xhigh``.
+
+    Grok 4.6 is the first to accept ``xhigh``; Grok 4.5 and earlier top out at
+    ``high``. Conservative prefix allowlist, mirroring
+    ``grok_supports_reasoning_effort``.
+    """
+    return any(
+        _grok_model_slug(model).startswith(prefix) for prefix in _GROK_4_6_PREFIXES
+    )
+
+
+def grok_supports_priority_processing(model: str) -> bool:
+    """Return True when the xAI Grok model accepts Responses ``service_tier``.
+
+    xAI Priority Processing (``service_tier``) is supported by the Grok 4.6
+    family; older xAI models reject the field with HTTP 400.
+    """
+    return any(
+        _grok_model_slug(model).startswith(prefix) for prefix in _GROK_4_6_PREFIXES
+    )
+
+
 _CONTEXT_LENGTH_KEYS = (
     "context_length",
     "context_window",

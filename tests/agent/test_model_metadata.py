@@ -26,6 +26,8 @@ from agent.model_metadata import (
     get_model_context_length,
     get_next_probe_tier,
     get_cached_context_length,
+    grok_supports_priority_processing,
+    grok_supports_xhigh_effort,
     parse_context_limit_from_error,
     save_context_length,
     fetch_model_metadata,
@@ -1389,3 +1391,40 @@ class TestFallbackWarning:
             if r.levelno == logging.WARNING and "falling back" in r.getMessage()
         ]
         assert len(fallback_warnings) == 0
+
+
+# =========================================================================
+# Grok 4.6 model-gated wire capabilities (#84799)
+# =========================================================================
+
+class TestGrok46WireCapabilities:
+    """Unit tests for the Grok 4.6 model-gated helpers.
+
+    Grok 4.6 is the first xAI Responses model to accept ``reasoning.effort=xhigh``
+    and ``service_tier`` (Priority Processing). Older Grok models must keep the
+    provider-wide clamp/strip behavior.
+    """
+
+    @pytest.mark.parametrize(
+        "model", ["grok-4.6", "x-ai/grok-4.6", "openrouter/x-ai/grok-4.6"]
+    )
+    def test_grok_4_6_supports_xhigh_and_priority(self, model):
+        assert grok_supports_xhigh_effort(model), f"{model} should accept xhigh"
+        assert grok_supports_priority_processing(model), f"{model} should accept priority"
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "grok-4.5",
+            "grok-4.5-latest",
+            "grok-4.3",
+            "grok-4",
+            "grok-3-mini",
+            "grok-4.20-multi-agent",
+            "",
+            None,
+        ],
+    )
+    def test_older_grok_models_reject_xhigh_and_priority(self, model):
+        assert not grok_supports_xhigh_effort(model), f"{model} must reject xhigh"
+        assert not grok_supports_priority_processing(model), f"{model} must reject priority"

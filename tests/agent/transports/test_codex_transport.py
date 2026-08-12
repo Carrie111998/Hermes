@@ -750,6 +750,74 @@ class TestCodexTransportXaiServiceTierStrip:
         )
         assert kw.get("service_tier") == "priority"
 
+    def test_grok_4_6_preserves_service_tier(self, transport):
+        """Grok 4.6 accepts xAI Priority Processing — the provider-wide strip
+        must not remove ``service_tier`` for the 4.6 family (#84799)."""
+        for model in ("grok-4.6", "x-ai/grok-4.6"):
+            kw = transport.build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                is_xai_responses=True,
+                request_overrides={"service_tier": "priority"},
+            )
+            assert kw.get("service_tier") == "priority", (
+                f"{model} must keep service_tier=priority, got {kw.get('service_tier')!r}"
+            )
+
+
+class TestCodexTransportXaiXhighEffort:
+    """Grok 4.6 accepts ``reasoning.effort=xhigh``; Grok 4.5 and earlier top
+    out at ``high``. The transport clamps xhigh/max/ultra to high for older
+    xAI models but preserves xhigh for the 4.6 family (#84799)."""
+
+    @pytest.fixture
+    def transport(self):
+        from agent.transports.codex import ResponsesApiTransport
+        return ResponsesApiTransport()
+
+    def test_grok_4_6_preserves_xhigh(self, transport):
+        for model in ("grok-4.6", "x-ai/grok-4.6"):
+            kw = transport.build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                is_xai_responses=True,
+                reasoning_config={"effort": "xhigh"},
+            )
+            assert kw["reasoning"]["effort"] == "xhigh", (
+                f"{model} must keep xhigh, got {kw.get('reasoning')!r}"
+            )
+
+    def test_grok_4_6_still_clamps_max_and_ultra(self, transport):
+        """max/ultra are Hermes-only aliases — never valid Grok wire values —
+        so even Grok 4.6 clamps them to high."""
+        for effort in ("max", "ultra"):
+            kw = transport.build_kwargs(
+                model="grok-4.6",
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                is_xai_responses=True,
+                reasoning_config={"effort": effort},
+            )
+            assert kw["reasoning"]["effort"] == "high", (
+                f"grok-4.6 {effort} must clamp to high, got {kw.get('reasoning')!r}"
+            )
+
+    def test_grok_4_5_clamps_xhigh_to_high(self, transport):
+        """Grok 4.5 tops out at high — the older provider-wide clamp holds."""
+        for model in ("grok-4.5", "grok-4.5-latest"):
+            kw = transport.build_kwargs(
+                model=model,
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                is_xai_responses=True,
+                reasoning_config={"effort": "xhigh"},
+            )
+            assert kw["reasoning"]["effort"] == "high", (
+                f"{model} xhigh must clamp to high, got {kw.get('reasoning')!r}"
+            )
+
 
 class TestPreflightSlashEnumStrip:
     """xAI Responses safety-net: strip slash-containing enum values

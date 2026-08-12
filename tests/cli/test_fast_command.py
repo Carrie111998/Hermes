@@ -132,6 +132,22 @@ class TestPriorityProcessingModels(unittest.TestCase):
         result = resolve_fast_mode_overrides("gpt-4.1")
         assert result == {"service_tier": "priority"}
 
+    def test_grok_4_6_supports_fast_mode(self):
+        """Grok 4.6 accepts xAI Priority Processing — /fast must be exposed and
+        resolve to service_tier=priority (#84799)."""
+        from hermes_cli.models import model_supports_fast_mode, resolve_fast_mode_overrides
+
+        for model in ("grok-4.6", "x-ai/grok-4.6"):
+            assert model_supports_fast_mode(model), f"{model} should expose /fast"
+            assert resolve_fast_mode_overrides(model) == {"service_tier": "priority"}
+
+    def test_older_grok_models_excluded(self):
+        """Grok 4.5 and earlier reject service_tier — /fast must stay hidden."""
+        from hermes_cli.models import model_supports_fast_mode
+
+        for model in ("grok-4.5", "grok-4.5-latest", "grok-4.3", "grok-4", "grok-3-mini"):
+            assert not model_supports_fast_mode(model), f"{model} should not expose /fast"
+
 
 
 class TestFastModeRouting(unittest.TestCase):

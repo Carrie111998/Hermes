@@ -295,13 +295,23 @@ class ResponsesApiTransport(ProviderTransport):
             elif reasoning_config.get("effort"):
                 reasoning_effort = reasoning_config["effort"]
 
+        from agent.model_metadata import (
+            grok_supports_priority_processing,
+            grok_supports_xhigh_effort,
+        )
+
         _effort_clamp = {"minimal": "low"}
         if "gpt-5.6" in (model or "").lower():
             # Ultra is the Codex product tier; the Responses API wire value is max.
             _effort_clamp["ultra"] = "max"
         if params.get("is_xai_responses", False):
-            # xAI Responses tops out at high; keep generic stronger values usable.
-            _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
+            # xAI Responses tops out at ``high`` for Grok 4.5 and earlier, but
+            # Grok 4.6 accepts ``xhigh``. ``max``/``ultra`` are Hermes-only
+            # aliases — never valid Grok wire values — so clamp them everywhere.
+            if grok_supports_xhigh_effort(model):
+                _effort_clamp.update({"max": "high", "ultra": "high"})
+            else:
+                _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
         if (params.get("provider") or "").strip().lower() == "actual":
             # Actual Computer relays to SGLang/vLLM backends that accept only
             # none/low/medium/high/max for reasoning effort — a forwarded
@@ -441,15 +451,16 @@ class ResponsesApiTransport(ProviderTransport):
             else:
                 kwargs.pop("prompt_cache_key", None)
 
-        # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
-        # supported: service_tier") — hit when ``/fast`` priority-processing
-        # mode lingers from a prior model in the same session, or when a
-        # user explicitly sets ``agent.service_tier`` in config.yaml.  The
-        # main-loop guard (``resolve_fast_mode_overrides`` only returns
-        # ``service_tier`` for OpenAI fast-eligible models) doesn't cover
-        # those leak paths, so strip defensively when targeting xAI.  See
-        # #28490 for the original report.
-        if is_xai_responses:
+        # xAI Responses rejects ``service_tier`` for Grok 4.5 and earlier
+        # (HTTP 400 "Argument not supported: service_tier") — hit when ``/fast``
+        # priority-processing mode lingers from a prior model in the same
+        # session, or when a user explicitly sets ``agent.service_tier`` in
+        # config.yaml.  The main-loop guard (``resolve_fast_mode_overrides``
+        # only returns ``service_tier`` for OpenAI fast-eligible models) doesn't
+        # cover those leak paths, so strip defensively when targeting older xAI
+        # models.  Grok 4.6 accepts xAI Priority Processing, so preserve the
+        # field for the 4.6 family.  See #28490 (original report) and #84799.
+        if is_xai_responses and not grok_supports_priority_processing(model):
             kwargs.pop("service_tier", None)
 
         # Forward per-request timeout to the SDK so OpenAI/Anthropic clients
