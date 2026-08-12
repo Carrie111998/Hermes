@@ -2707,15 +2707,31 @@ async def fs_write_text(payload: FsWriteText):
     if not target.parent.is_dir():
         raise HTTPException(status_code=400, detail="Parent directory does not exist")
 
-    tmp = target.with_name(f".{target.name}.hermes-tmp-{os.getpid()}")
+    # Stage to an unpredictable sibling temp file (mkstemp: O_EXCL, random
+    # name, 0600) and os.replace into place. The previous scheme used a
+    # predictable name (".{name}.hermes-tmp-{pid}") — a local attacker (or a
+    # compromised sibling process on the same host) could pre-create a
+    # symlink there and redirect the write to an arbitrary file. (#84752)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(target.parent),
+        prefix=f".{target.name}.hermes-tmp-",
+        suffix=".tmp",
+    )
     try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, target)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_path, target)
     except PermissionError:
-        tmp.unlink(missing_ok=True)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         raise HTTPException(status_code=403, detail="File is not writable")
     except OSError as exc:
-        tmp.unlink(missing_ok=True)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
         raise HTTPException(status_code=500, detail=f"Could not write file: {exc}")
 
     return {"ok": True, "path": str(target), "byteSize": len(text.encode("utf-8"))}
