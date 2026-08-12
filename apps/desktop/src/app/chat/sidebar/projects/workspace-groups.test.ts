@@ -13,7 +13,8 @@ import {
   sessionProjectColor,
   type SidebarProjectTree,
   type SidebarSessionGroup,
-  sortWorktreeGroups
+  sortWorktreeGroups,
+  worktreeLabel
 } from './workspace-groups'
 
 // The grouping itself now lives on the backend (tui_gateway/project_tree.py,
@@ -54,6 +55,26 @@ describe('baseName', () => {
     expect(baseName('/www/hermes-agent/')).toBe('hermes-agent')
     expect(baseName('C:\\repos\\app')).toBe('app')
     expect(baseName('')).toBeUndefined()
+  })
+})
+
+describe('worktreeLabel', () => {
+  it('prefers the checked-out branch', () => {
+    expect(worktreeLabel('feature/login', '/repo/.worktrees/wt')).toBe('feature/login')
+    expect(worktreeLabel('  feature/login  ', '/repo/.worktrees/wt')).toBe('feature/login')
+  })
+
+  it('falls back to the dir name for a DETACHED worktree, on either separator', () => {
+    // Worktree paths reach the renderer native-spelled (electron `path.normalize`
+    // / the gateway's `_native_path`), so a `/`-only split would have handed the
+    // whole `C:\…` path back as the label on Windows.
+    expect(worktreeLabel('', 'C:\\repo\\.worktrees\\feat')).toBe('feat')
+    expect(worktreeLabel(null, 'C:/repo/.worktrees/feat')).toBe('feat')
+    expect(worktreeLabel(undefined, '/repo/.worktrees/feat')).toBe('feat')
+  })
+
+  it('falls back to the raw path when there is no segment to take', () => {
+    expect(worktreeLabel('', '')).toBe('')
   })
 })
 
@@ -433,6 +454,144 @@ describe('mergeRepoWorktreeGroups (visual enhancer)', () => {
 
     expect(merged.map(g => g.label)).toEqual(['main'])
     expect(merged[0].isHome).toBeFalsy()
+  })
+
+  // `git worktree list --porcelain` prints FORWARD-slash absolute paths even on
+  // Windows (`C:/Repo/.worktrees/x`), while lane/session paths recorded elsewhere
+  // (session cwds, the backend project tree) use backslashes. Identity checks
+  // must fold separators (and case, on Windows) or a linked worktree lane silently
+  // fails to relabel AND gets emitted twice — once per spelling.
+  describe('Windows separator mismatch (git `/` vs backend `\\`)', () => {
+    it('relabels a backslash-recorded lane from a forward-slash git worktree path', () => {
+      const repo = {
+        id: 'C:\\Repo',
+        path: 'C:\\Repo',
+        groups: [
+          lane({
+            id: 'C:\\Repo\\.worktrees\\x',
+            label: 'x',
+            isMain: false,
+            path: 'C:\\Repo\\.worktrees\\x',
+            sessions: [makeSession('C:\\Repo\\.worktrees\\x')]
+          })
+        ]
+      }
+
+      const discovered: HermesGitWorktree[] = [
+        { branch: 'main', detached: false, isMain: true, locked: false, path: 'C:/Repo' },
+        { branch: 'bb/windows-sep', detached: false, isMain: false, locked: false, path: 'C:/Repo/.worktrees/x' }
+      ]
+
+      const merged = mergeRepoWorktreeGroups(repo, discovered)
+      const linked = merged.filter(g => !g.isMain)
+
+      // Relabeled to its live branch — and NOT duplicated by the git spelling.
+      expect(linked).toHaveLength(1)
+      expect(linked[0].label).toBe('bb/windows-sep')
+      // Emitted path/id keep their ORIGINAL spelling (comparison-only folding).
+      expect(linked[0].path).toBe('C:\\Repo\\.worktrees\\x')
+      expect(linked[0].id).toBe('C:\\Repo\\.worktrees\\x')
+      expect(linked[0].sessions).toHaveLength(1)
+    })
+
+    it('folds drive-letter case too, so `c:/repo/...` and `C:\\Repo\\...` are one lane', () => {
+      const repo = {
+        id: 'C:\\Repo',
+        path: 'C:\\Repo',
+        groups: [
+          lane({
+            id: 'C:\\Repo\\.worktrees\\x',
+            label: 'x',
+            isMain: false,
+            path: 'C:\\Repo\\.worktrees\\x',
+            sessions: []
+          })
+        ]
+      }
+
+      const discovered: HermesGitWorktree[] = [
+        { branch: 'bb/case', detached: false, isMain: false, locked: false, path: 'c:/repo/.worktrees/X' }
+      ]
+
+      const merged = mergeRepoWorktreeGroups(repo, discovered)
+
+      expect(merged.filter(g => !g.isMain)).toHaveLength(1)
+      expect(merged.find(g => !g.isMain)?.label).toBe('bb/case')
+    })
+
+    it('re-anchors a stale backslash lane onto git truth without leaving a twin', () => {
+      // Lane already carries the branch label but a stale path; git says the
+      // branch lives elsewhere. Re-anchor must compare separator-agnostically.
+      const repo = {
+        id: 'C:\\Repo',
+        path: 'C:\\Repo',
+        groups: [
+          lane({
+            id: 'C:\\Repo\\.worktrees\\old',
+            label: 'bb/moved',
+            isMain: false,
+            path: 'C:\\Repo\\.worktrees\\old',
+            sessions: [makeSession('C:\\Repo\\.worktrees\\old')]
+          })
+        ]
+      }
+
+      const discovered: HermesGitWorktree[] = [
+        { branch: 'bb/moved', detached: false, isMain: false, locked: false, path: 'C:/Repo/.worktrees/new' }
+      ]
+
+      const merged = mergeRepoWorktreeGroups(repo, discovered)
+      const moved = merged.filter(g => g.label === 'bb/moved')
+
+      expect(moved).toHaveLength(1)
+      expect(moved[0].path).toBe('C:/Repo/.worktrees/new')
+      expect(moved[0].sessions).toHaveLength(1)
+    })
+
+    it('does not re-anchor when the lane path is the same dir spelled with `\\`', () => {
+      // Same worktree, two spellings: the branch lookup must see them as equal so
+      // the lane keeps its recorded path instead of being pointlessly rewritten.
+      const repo = {
+        id: 'C:\\Repo',
+        path: 'C:\\Repo',
+        groups: [
+          lane({
+            id: 'C:\\Repo\\.worktrees\\x',
+            label: 'bb/same',
+            isMain: false,
+            path: 'C:\\Repo\\.worktrees\\x',
+            sessions: []
+          })
+        ]
+      }
+
+      const discovered: HermesGitWorktree[] = [
+        { branch: 'bb/same', detached: false, isMain: false, locked: false, path: 'C:/Repo/.worktrees/x' }
+      ]
+
+      const merged = mergeRepoWorktreeGroups(repo, discovered)
+
+      expect(merged).toHaveLength(1)
+      expect(merged[0].path).toBe('C:\\Repo\\.worktrees\\x')
+    })
+
+    it('keeps POSIX paths case-SENSITIVE (two real dirs stay two lanes)', () => {
+      const repo = {
+        id: '/repo',
+        path: '/repo',
+        groups: [
+          lane({ id: '/repo/.worktrees/x', label: 'bb/lower', isMain: false, path: '/repo/.worktrees/x', sessions: [] })
+        ]
+      }
+
+      const discovered: HermesGitWorktree[] = [
+        { branch: 'bb/upper', detached: false, isMain: false, locked: false, path: '/repo/.worktrees/X' }
+      ]
+
+      const merged = mergeRepoWorktreeGroups(repo, discovered)
+
+      expect(merged.filter(g => !g.isMain)).toHaveLength(2)
+    })
   })
 })
 

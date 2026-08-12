@@ -26,6 +26,7 @@ import { SidebarWorkspaceGroup } from './workspace-group'
 import {
   mergeRepoWorktreeGroups,
   overlayRepoLanes,
+  pathKey,
   type SidebarProjectTree,
   type SidebarSessionGroup,
   type SidebarWorkspaceTree
@@ -115,13 +116,11 @@ function RepoFlatSection({
     return mergeRepoWorktreeGroups({ id: repo.id, path: repo.path, groups }, discoveredWorktrees)
   }, [repo, mergedGroups, discoveredWorktrees, liveSessions, removedSessionIds])
 
+  // Keyed by `pathKey`, not the raw string: git prints forward slashes even on
+  // Windows, so a raw key would never match a backslash lane path and a still-real
+  // worktree would stay hidden after a dismissal.
   const discoveredWorktreePaths = useMemo(
-    () =>
-      new Set(
-        (discoveredWorktrees ?? [])
-          .map(worktree => worktree.path?.trim())
-          .filter((path): path is string => Boolean(path))
-      ),
+    () => new Set((discoveredWorktrees ?? []).map(worktree => pathKey(worktree.path)).filter(Boolean)),
     [discoveredWorktrees]
   )
 
@@ -130,7 +129,9 @@ function RepoFlatSection({
   // worktree exists again (or still exists after "hide from sidebar"), surface it.
   const ordered = overlaidGroups.filter(
     group =>
-      group.isMain || !dismissedWorktrees.includes(group.id) || (group.path && discoveredWorktreePaths.has(group.path))
+      group.isMain ||
+      !dismissedWorktrees.includes(group.id) ||
+      (group.path && discoveredWorktreePaths.has(pathKey(group.path)))
   )
 
   const repoCount = ordered.reduce((sum, group) => sum + group.sessions.length, 0)

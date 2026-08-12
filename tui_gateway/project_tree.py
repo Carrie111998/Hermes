@@ -171,7 +171,14 @@ def _place(cwd: str, branch: str, resolve: Optional[Resolve], persisted_root: st
     if info and info.get("repo_root") and info.get("worktree_root"):
         repo_root = info["repo_root"]
         worktree_root = info["worktree_root"]
-        is_main = worktree_root == repo_root or bool(info.get("is_main"))
+        # Separator/case-folded, not a raw `==`: on Windows the two sides reach
+        # us in DIFFERENT spellings of the same dir — `worktree_root` is git's
+        # own `rev-parse --show-toplevel` output (forward slashes, `C:/repo`)
+        # while `repo_root` is derived through os.path.realpath/dirname (native
+        # backslashes, `C:\repo`). A raw `==` never matched, so every
+        # main-checkout session was filed into a dir-labeled linked-worktree
+        # lane instead of its branch lane.
+        is_main = _path_key(worktree_root) == _path_key(repo_root) or bool(info.get("is_main"))
 
         if is_main:
             # Unrecorded branch folds into the one trunk lane, so a repo never

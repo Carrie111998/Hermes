@@ -4,6 +4,7 @@ import { Dialog as DialogPrimitive } from 'radix-ui'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
+import { worktreeLabel } from '@/app/chat/sidebar/projects'
 import { HUD_HEADING, HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from '@/app/floating-hud'
 import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { Command, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
@@ -387,7 +388,11 @@ export function CommandPalette() {
             {
               heading: cc.branches,
               items: worktrees.map(wt => {
-                const name = wt.branch?.trim() || wt.path.split('/').pop() || wt.path
+                // Shared with the sidebar's worktree lanes so ⌘K and the tree
+                // name the same worktree the same way — and so a detached
+                // worktree's native-spelled path yields its dir name, not the
+                // whole path (a `/`-only split never splits `C:\repo\wt`).
+                const name = worktreeLabel(wt.branch, wt.path)
 
                 return {
                   icon: GitBranch,

@@ -1330,7 +1330,10 @@ def skill_view(
                 # Scan for all readable files
                 for f in skill_dir.rglob("*"):
                     if f.is_file() and f.name != "SKILL.md":
-                        rel = str(f.relative_to(skill_dir))
+                        # as_posix(): the startswith checks below are written
+                        # against forward slashes, and `rel` is handed back as
+                        # a skill_view file_path identifier.
+                        rel = f.relative_to(skill_dir).as_posix()
                         if rel.startswith("references/"):
                             available_files["references"].append(rel)
                         elif rel.startswith("templates/"):
@@ -1410,11 +1413,15 @@ def skill_view(
         asset_files = []
         script_files = []
 
+        # Every relative path below is posix-style on every platform: these are
+        # the ``file_path`` identifiers the agent hands back to skill_view (and
+        # that the supporting-files header renders), not OS paths.
         if skill_dir:
             references_dir = skill_dir / "references"
             if references_dir.exists():
                 reference_files = [
-                    str(f.relative_to(skill_dir)) for f in references_dir.glob("*.md")
+                    f.relative_to(skill_dir).as_posix()
+                    for f in references_dir.glob("*.md")
                 ]
 
             templates_dir = skill_dir / "templates"
@@ -1430,7 +1437,7 @@ def skill_view(
                 ]:
                     template_files.extend(
                         [
-                            str(f.relative_to(skill_dir))
+                            f.relative_to(skill_dir).as_posix()
                             for f in templates_dir.rglob(ext)
                         ]
                     )
@@ -1440,13 +1447,16 @@ def skill_view(
             if assets_dir.exists():
                 for f in assets_dir.rglob("*"):
                     if f.is_file():
-                        asset_files.append(str(f.relative_to(skill_dir)))
+                        asset_files.append(f.relative_to(skill_dir).as_posix())
 
             scripts_dir = skill_dir / "scripts"
             if scripts_dir.exists():
                 for ext in ["*.py", "*.sh", "*.bash", "*.js", "*.ts", "*.rb"]:
                     script_files.extend(
-                        [str(f.relative_to(skill_dir)) for f in scripts_dir.glob(ext)]
+                        [
+                            f.relative_to(skill_dir).as_posix()
+                            for f in scripts_dir.glob(ext)
+                        ]
                     )
 
         # Read tags/related_skills with backward compat:
@@ -1472,11 +1482,16 @@ def skill_view(
         if script_files:
             linked_files["scripts"] = script_files
 
+        # Relative skill paths are always posix-style, on every platform: they
+        # are display/lookup identifiers (the same form as the ``file_path``
+        # argument and the ``references/…`` prefixes used elsewhere in this
+        # module), not OS paths.  Path() re-parses forward slashes fine on
+        # Windows, so the reconstruction in skill_commands still works.
         try:
-            rel_path = str(skill_md.relative_to(active_skills_dir))
+            rel_path = skill_md.relative_to(active_skills_dir).as_posix()
         except ValueError:
             # External skill — use path relative to the skill's own parent dir
-            rel_path = str(skill_md.relative_to(skill_md.parent.parent)) if skill_md.parent.parent else skill_md.name
+            rel_path = skill_md.relative_to(skill_md.parent.parent).as_posix() if skill_md.parent.parent else skill_md.name
         skill_name = frontmatter.get(
             "name", skill_md.stem if not skill_dir else skill_dir.name
         )

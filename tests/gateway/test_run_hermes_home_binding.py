@@ -212,6 +212,24 @@ def test_env_path_name_survives_for_the_tests_that_patch_it():
     assert isinstance(run._env_path, Path)
 
 
+def test_env_path_is_never_read_at_runtime():
+    """Keeping the vestigial name is only safe while nothing READS it.
+
+    A runtime read would silently reintroduce the import-time snapshot this
+    seam exists to remove — the value is resolved once, at import, under
+    whatever home the process was started with.
+    """
+    source = Path(run.__file__).read_text(encoding="utf-8")
+    reads = [
+        line.strip()
+        for line in source.splitlines()
+        if "_env_path" in line
+        and not line.lstrip().startswith("#")
+        and "_env_path = " not in line
+    ]
+    assert not reads, f"_env_path is read at runtime: {reads}"
+
+
 # ── Every use site must go through the seam ──────────────────────────
 
 
@@ -279,3 +297,69 @@ def test_slash_commands_does_not_copy_the_snapshot_across_the_boundary():
     assert "import _hermes_home" not in source
     assert "_hermes_home / " not in source
     assert source.count("_resolve_hermes_home") >= 10
+
+
+# ── Ported from tests/gateway/test_hermes_home_binding.py ────────────
+#
+# That file was this one's twin: two sessions fixed the same defect the same
+# day, each with its own suite.  `313546825` deleted the twin in favour of this
+# file, calling it a superset and porting `test_env_path_is_never_read_at_runtime`
+# forward as "the one guard only mine had".  Two more were only in the twin, and
+# accepting the delete unchanged would have dropped them silently.
+
+
+def test_voice_mode_path_survives_patch_object_roundtrip(tmp_path, monkeypatch):
+    """``patch.object`` restores a CLASS attribute with delattr, not setattr.
+
+    test_voice_mode_platform_isolation.py uses this idiom. A property without a
+    deleter raises "property has no deleter" on teardown — which is how an
+    earlier version of this fix broke three tests. The plain attribute has no
+    such failure mode; assert the round trip anyway so a future move back to a
+    descriptor cannot regress it silently.
+
+    ``test_voice_mode_instance_override_still_wins`` above covers the instance
+    override but never tears one down, so it cannot catch this.
+    """
+    from unittest.mock import patch
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    runner = object.__new__(run.GatewayRunner)
+    custom = tmp_path / "patched_voice.json"
+    with patch.object(runner, "_VOICE_MODE_PATH", custom):
+        assert runner._voice_mode_path() == custom
+    # After teardown it must fall back to live resolution, not explode.
+    assert runner._voice_mode_path() == tmp_path / "gateway_voice_mode.json"
+
+
+def test_planned_restart_marker_path_follows_the_live_home(tmp_path, monkeypatch):
+    """The restart marker is a write site, and this is its only coverage."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    assert run._planned_restart_notification_path() == tmp_path / ".restart_pending.json"
+
+
+def test_no_module_level_constant_is_built_from_the_resolver():
+    """The seam must not be re-frozen into a new column-0 constant.
+
+    Calling ``_resolve_hermes_home()`` at module scope re-creates exactly the
+    bug this fix removes — the value is correct at import and stale forever
+    after.  ``test_no_use_site_still_reads_the_bare_constant`` cannot catch it:
+    that one bans textual reads of ``_hermes_home``, and a re-freeze names the
+    RESOLVER instead.
+
+    Graded against the module's actual attributes rather than its source, so it
+    cannot be fooled by call syntax (``f(home=_resolve_hermes_home())`` is fine)
+    and correctly accepts an import-time local that is ``del``'d once consumed.
+    """
+    survivors = {
+        name: value
+        for name, value in vars(run).items()
+        if isinstance(value, Path) and name not in ("_hermes_home", "_env_path")
+    }
+    assert not survivors, (
+        "module-level Path constants survived import; each is a fresh "
+        f"import-time snapshot of the Hermes home: {survivors}"
+    )
+    # Consumed inside the import-time config->env bridge, then dropped.
+    assert not hasattr(run, "_config_path")

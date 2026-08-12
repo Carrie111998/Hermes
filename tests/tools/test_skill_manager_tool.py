@@ -1189,7 +1189,16 @@ class TestDeleteSkillRmtreeGuard:
         skills = tmp_path / "skills"
         skills.mkdir()
         evil = skills / "evil-skill"
-        evil.symlink_to(victim, target_is_directory=True)
+        try:
+            evil.symlink_to(victim, target_is_directory=True)
+        except OSError:
+            # Windows without Developer Mode raises WinError 1314 ("a required
+            # privilege is not held"). Without a symlink there is nothing for
+            # the guard to refuse, so skip rather than fail — same guard as
+            # tests/agent/test_skill_utils.py's symlink test.
+            import shutil as _sh
+            _sh.rmtree(victim, ignore_errors=True)
+            pytest.skip("Symlinks not supported")
         try:
             with patch("tools.skill_manager_tool.SKILLS_DIR", skills), \
                  patch("agent.skill_utils.get_all_skills_dirs", return_value=[skills]), \

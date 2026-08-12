@@ -563,14 +563,18 @@ def normalize_skill_lookup_name(identifier: str) -> str:
     # ~/.hermes/skills/<name> where <name> is a symlink to a checked-out
     # skill elsewhere. Resolving first turns that trusted visible path into
     # an arbitrary absolute path that skill_view() refuses to load.
+    # as_posix(), not str(): the returned identifier is a skill_view() lookup
+    # name — the same posix form the relative early-return above passes
+    # through — not an OS path. On Windows str() would emit
+    # ``category\my-skill``, which is not the identifier skill_view resolves.
     for root in trusted_roots:
         try:
-            return str(identifier_path.relative_to(root))
+            return identifier_path.relative_to(root).as_posix()
         except ValueError:
             continue
 
     try:
-        return str(identifier_path.resolve().relative_to(primary_root.resolve()))
+        return identifier_path.resolve().relative_to(primary_root.resolve()).as_posix()
     except Exception:
         logger.debug(
             "Skill identifier %r is an absolute path outside trusted skills "

@@ -12,7 +12,7 @@ import {
   SiWechat,
   SiWhatsapp
 } from '@icons-pack/react-simple-icons'
-import type { ComponentType, SVGProps } from 'react'
+import type { ComponentType } from 'react'
 
 import { Globe, Link as LinkIcon, MessageSquareText } from '@/lib/icons'
 import { cn } from '@/lib/utils'
@@ -27,8 +27,18 @@ import { cn } from '@/lib/utils'
 // the same hex to keep visual consistency.
 type IconKind = 'brand' | 'generic'
 
+// The map below mixes two icon families that disagree on their prop surface:
+// Simple Icons narrows `SVGProps` to a hand-picked Pick<>, Tabler widens
+// `stroke` to `string | number`. Both are forwardRef components with wholly
+// optional props, and we only ever render a className, so that is the whole
+// contract this map needs. Declaring the full `ComponentType<SVGProps<...>>`
+// instead would drag React's `ref` types (LegacyRef -> RefCallback) into the
+// comparison to no benefit — and those are the types that fail to unify if a
+// second copy of @types/react ever lands in the program.
+type PlatformGlyph = ComponentType<{ className?: string }>
+
 interface PlatformIconSpec {
-  Icon?: ComponentType<SVGProps<SVGSVGElement>>
+  Icon?: PlatformGlyph
   color: string
   kind: IconKind
   monogram?: string

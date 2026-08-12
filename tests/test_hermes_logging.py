@@ -21,6 +21,34 @@ import hermes_logging
 from hermes_logging import RotatingFileHandler
 
 
+def _assert_still_logging(handler, base: Path, marker: str) -> None:
+    """Assert *handler* can still write to *base* after a rollover.
+
+    This is the invariant the rollover tests actually care about: whether a
+    rollover succeeded or was deferred by a lock, the handler must keep
+    logging to the base file. Asserting ``handler.stream is not None`` or an
+    eager ``base.exists()`` right after ``doRollover()`` instead tests stdlib
+    *mechanics*, which concurrent-log-handler (aliased as
+    ``RotatingFileHandler`` on Windows for #44873) deliberately inverts:
+
+      * ``_actual_keep_log_stream_open`` is forced ``False`` on Windows, so
+        ``handler.stream`` is ``None`` between writes — an open handle on the
+        base file is precisely what makes ``os.rename`` fail with WinError 32,
+        i.e. the bug CLH exists to fix.
+      * ``_open()`` returns ``None`` and CLH constructs itself with
+        ``delay=True``; the base file is (re)created lazily in ``do_write()``.
+
+    Emitting and reading the file back proves both properties at once — the
+    stream is usable AND the base file is there — on either implementation.
+    """
+    handler.emit(logging.makeLogRecord({"msg": marker}))
+    handler.flush()
+    assert base.exists(), f"{base.name} was not recreated after rollover"
+    assert marker in base.read_text(encoding="utf-8"), (
+        f"handler stopped logging to {base.name} after rollover"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _reset_logging_state():
     """Reset the module-level sentinel and clean up root logger handlers
@@ -373,7 +401,7 @@ class TestGatewayMode:
 
         root = logging.getLogger()
         gw_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
         ]
@@ -396,7 +424,7 @@ class TestGatewayForensicsLog:
         root = logging.getLogger()
 
         forensics_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
         ]
@@ -409,7 +437,7 @@ class TestGatewayForensicsLog:
         root = logging.getLogger()
 
         forensics_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
         ]
@@ -434,8 +462,9 @@ class TestGatewayForensicsLog:
         logging.getLogger("events.bus").info("event published")
         logging.getLogger("tools.terminal_tool").info("running command")
 
-        for h in logging.getLogger().handlers:
-            h.flush()
+        # Flushing root's handlers is not enough — the file handlers sit on the
+        # async QueueListener; draining the queue is what gets records to disk.
+        hermes_logging.flush_log_queue()
 
         forensics = hermes_home / "logs" / "gateway-forensics.log"
         assert forensics.exists()
@@ -452,19 +481,19 @@ class TestGatewayForensicsLog:
         root = logging.getLogger()
 
         custom_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).resolve() == custom_path.resolve()
         ]
         assert len(custom_handlers) == 1, (
             f"expected handler at {custom_path}, got: "
-            f"{[getattr(h, 'baseFilename', '') for h in root.handlers if isinstance(h, RotatingFileHandler)]}"
+            f"{[getattr(h, 'baseFilename', '') for h in hermes_logging.rotating_file_handlers()]}"
         )
 
         # Default path is NOT used when override is set.
         default_path = hermes_home / "logs" / "gateway-forensics.log"
         default_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).resolve() == default_path.resolve()
         ]
@@ -484,13 +513,13 @@ class TestGatewayForensicsLog:
 
         expected = (tmp_path / "my-forensics.log").resolve()
         matching = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).resolve() == expected
         ]
         assert len(matching) == 1, (
             f"expected handler at {expected}, got: "
-            f"{[getattr(h, 'baseFilename', '') for h in root.handlers if isinstance(h, RotatingFileHandler)]}"
+            f"{[getattr(h, 'baseFilename', '') for h in hermes_logging.rotating_file_handlers()]}"
         )
 
     def test_forensics_handler_idempotent_on_repeat_call(self, hermes_home, monkeypatch):
@@ -500,7 +529,7 @@ class TestGatewayForensicsLog:
 
         root = logging.getLogger()
         forensics_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
         ]
@@ -516,7 +545,7 @@ class TestGatewayForensicsLog:
 
         root = logging.getLogger()
         forensics_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == "gateway-forensics.log"
         ]
@@ -545,7 +574,7 @@ class TestGatewayForensicsLog:
         # Curated gateway.log handler stays attached even when forensics fails.
         root = logging.getLogger()
         gw_handlers = [
-            h for h in root.handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == "gateway.log"
         ]
@@ -951,6 +980,18 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason=(
+            "POSIX-only guarantee. Managed mode is NixOS-only (is_managed()), and "
+            "the guarantee under test — chmod 0660 so the hermes group can share "
+            "the log — has no Windows equivalent: os.chmod() there only toggles "
+            "the read-only bit, so S_IMODE is always 0o666/0o444. The Windows "
+            "handler is concurrent-log-handler (#44873), whose _open() returns "
+            "None and creates the file lazily in do_write(), so neither the "
+            "eager creation nor the chmod hook this test exercises applies."
+        ),
+    )
     def test_managed_mode_initial_open_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-open.log"
         logger = logging.getLogger("_test_rotating_managed_open")
@@ -975,6 +1016,15 @@ class TestAddRotatingHandler:
                 logger.removeHandler(h)
                 h.close()
 
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason=(
+            "POSIX-only guarantee — see "
+            "test_managed_mode_initial_open_sets_group_writable. chmod 0660 is "
+            "meaningless on Windows (S_IMODE is 0o666 here) and managed mode is "
+            "NixOS-only."
+        ),
+    )
     def test_managed_mode_rollover_sets_group_writable(self, tmp_path):
         log_path = tmp_path / "managed-rollover.log"
         logger = logging.getLogger("_test_rotating_managed_rollover")
@@ -1202,8 +1252,10 @@ class TestRoleScopedCatchAll:
     """role= routes the catch-all logs to per-role filenames."""
 
     def _rotating(self, name):
+        # File handlers live behind the async QueueListener, not on the root
+        # logger — root only carries the _NonFormattingQueueHandler.
         return [
-            h for h in logging.getLogger().handlers
+            h for h in hermes_logging.rotating_file_handlers()
             if isinstance(h, RotatingFileHandler)
             and Path(getattr(h, "baseFilename", "")).name == name
         ]
@@ -1240,8 +1292,7 @@ class TestRoleScopedCatchAll:
     def test_role_catch_all_actually_writes(self, hermes_home):
         hermes_logging.setup_logging(hermes_home=hermes_home, role="proxy")
         logging.getLogger("test.proxy_role").info("proxy role line")
-        for h in logging.getLogger().handlers:
-            h.flush()
+        hermes_logging.flush_log_queue()
         agent_proxy = hermes_home / "logs" / "agent-proxy.log"
         assert agent_proxy.exists()
         assert "proxy role line" in agent_proxy.read_text()
@@ -1303,9 +1354,8 @@ class TestWindowsSafeRollover:
             # Backups untouched — the bug erased these.
             assert (tmp_path / "agent.log.1").read_text(encoding="utf-8") == "BACKUP-1"
             assert (tmp_path / "agent.log.2").read_text(encoding="utf-8") == "BACKUP-2"
-            # Stream reopened → logging keeps working through the lock.
-            assert handler.stream is not None
-            handler.emit(logging.makeLogRecord({"msg": "after-lock"}))
+            # Logging keeps working through the lock.
+            _assert_still_logging(handler, base, "after-lock")
             # Rotation is deferred: shouldRollover stays quiet during cooldown,
             # so the per-emit traceback storm cannot happen.
             big = logging.makeLogRecord({"msg": "x" * 1000})
@@ -1325,9 +1375,8 @@ class TestWindowsSafeRollover:
             assert "current-line" in (tmp_path / "agent.log.1").read_text(encoding="utf-8")
             # … and the old .1 shifted to .2.
             assert (tmp_path / "agent.log.2").read_text(encoding="utf-8") == "OLD-1"
-            # Fresh base + live stream.
-            assert base.exists()
-            assert handler.stream is not None
+            # Fresh base that the handler can still write to.
+            _assert_still_logging(handler, base, "post-rollover")
             assert handler._rollover_blocked_until == 0.0
         finally:
             handler.close()
@@ -1373,10 +1422,9 @@ class TestWindowsSafeRollover:
             with open(base, "a", encoding="utf-8"):
                 handler.doRollover()  # real os.replace → WinError 32
 
-                assert handler.stream is not None
                 assert (tmp_path / "agent.log.1").read_text(encoding="utf-8") == "KEEP-1"
                 assert handler._rollover_blocked_until > 0.0
-                handler.emit(logging.makeLogRecord({"msg": "through-lock"}))
+                _assert_still_logging(handler, base, "through-lock")
 
             # Lock released → rotation resumes.
             handler._rollover_blocked_until = 0.0
@@ -1411,7 +1459,7 @@ class TestPerRoleRotationIsolation:
             handler.doRollover()
             assert "current" in (tmp_path / "agent-dashboard.log.1").read_text(encoding="utf-8")
             assert (tmp_path / "agent-dashboard.log.2").read_text(encoding="utf-8") == "OLD-1"
-            assert base.exists()
+            _assert_still_logging(handler, base, "post-rollover")
             assert handler._rollover_blocked_until == 0.0
         finally:
             handler.close()
@@ -1430,9 +1478,8 @@ class TestPerRoleRotationIsolation:
             with open(shared, "a", encoding="utf-8"):
                 handler.doRollover()
                 assert "role-line" in (tmp_path / "agent-dashboard.log.1").read_text(encoding="utf-8")
-                assert base.exists()
-                assert handler.stream is not None
                 assert handler._rollover_blocked_until == 0.0  # NOT deferred
+                _assert_still_logging(handler, base, "post-rollover")
         finally:
             handler.close()
 
