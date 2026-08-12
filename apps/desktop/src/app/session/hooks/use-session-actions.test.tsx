@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { getAllSessionMessages, getLatestSessionMessages, getSession, type SessionInfo } from '@/hermes'
@@ -1659,6 +1660,7 @@ describe('createBackendSessionForSend workspace target', () => {
     cleanup()
     $newChatProfile.set(null)
     $activeGatewayProfile.set('default')
+    $projectScope.set(ALL_PROJECTS)
     setCurrentCwd('')
     setNewChatWorkspaceTarget(undefined)
     vi.restoreAllMocks()
@@ -1691,6 +1693,21 @@ describe('createBackendSessionForSend workspace target', () => {
     )
 
     expect(params).toMatchObject({ cwd: '/clicked-workspace' })
+  })
+
+  it('does not inherit a stale cwd when Home is the active project scope', async () => {
+    const params = await createWith(
+      () => {
+        $projectScope.set(NO_PROJECT_ID)
+      },
+      () => {
+        // Simulate the stale live path left by the previously selected project
+        // before the new draft is submitted.
+        $currentCwd.set('/previous-project')
+      }
+    )
+
+    expect(params).not.toHaveProperty('cwd')
   })
 })
 describe('selectSidebarItem', () => {
