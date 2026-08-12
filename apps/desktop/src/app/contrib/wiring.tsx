@@ -273,7 +273,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [activeSessionIdRef, updateSessionState]
   )
 
-  const { refreshProjectBranch } = useCwdActions({
+  const { changeSessionCwd, refreshProjectBranch } = useCwdActions({
     activeSessionIdRef,
     onSessionRuntimeInfo: updateActiveSessionRuntimeInfo,
     requestGateway
@@ -912,7 +912,8 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     openCommandCenterSection,
     requestGateway,
     selectModel,
-    toggleCommandCenter
+    toggleCommandCenter,
+    changeSessionCwd
   }
 
   if (actionsRef.current) {

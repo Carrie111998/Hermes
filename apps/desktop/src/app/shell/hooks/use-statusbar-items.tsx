@@ -66,6 +66,8 @@ interface StatusbarItemsOptions {
   requestGateway: <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>
   statusSnapshot: StatusResponse | null
   toggleCommandCenter: () => void
+  /** Change the workspace directory for the current conversation only. */
+  changeSessionCwd?: (cwd: string) => Promise<void>
 }
 
 export function useStatusbarItems({
@@ -80,7 +82,8 @@ export function useStatusbarItems({
   openCommandCenterSection,
   requestGateway,
   statusSnapshot,
-  toggleCommandCenter
+  toggleCommandCenter,
+  changeSessionCwd
 }: StatusbarItemsOptions) {
   const { t } = useI18n()
   const copy = t.shell.statusbar
@@ -216,6 +219,23 @@ export function useStatusbarItems({
   // the tree changes; null (no named project) falls back to the cwd leaf below.
   const projectTree = useStore($projectTree)
   const projectName = useMemo(() => projectNameForCwd(currentCwd), [currentCwd, projectTree])
+
+  // Open a native folder picker, switch the focused conversation's workspace.
+  const pickAndChangeWorkspaceCwd = useCallback(async () => {
+    const paths = await window.hermesDesktop?.selectPaths?.({
+      directories: true,
+      multiple: false,
+      title: fileMenu.changeCwdTitle
+    })
+
+    const selected = paths?.[0]?.trim()
+
+    if (!selected) {
+      return
+    }
+
+    await changeSessionCwd?.(selected)
+  }, [changeSessionCwd, fileMenu.changeCwdTitle])
 
   const sessionStartedAt = primaryFocused
     ? primarySessionStartedAt
@@ -424,6 +444,12 @@ export function useStatusbarItems({
         menuItems: currentCwd
           ? [
               {
+                id: 'change-workspace-path',
+                label: fileMenu.changeCwdTitle,
+                onSelect: () => pickAndChangeWorkspaceCwd(),
+                title: displayPath(currentCwd)
+              },
+              {
                 id: 'copy-workspace-path',
                 label: fileMenu.copyPath,
                 onSelect: () => void copyFilePath(currentCwd),
@@ -496,6 +522,7 @@ export function useStatusbarItems({
       connectionItem,
       copy,
       currentCwd,
+      fileMenu.changeCwdTitle,
       fileMenu.copyPath,
       fileMenu.revealFileManager,
       fileMenu.revealInSidebar,
