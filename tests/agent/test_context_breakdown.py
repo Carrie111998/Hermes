@@ -51,6 +51,28 @@ def test_breakdown_includes_major_categories():
 
 
 
+def test_skills_index_in_volatile_tier_is_attributed_to_skills():
+    """The <available_skills> block lives in the volatile tier.
+
+    It was moved there so a skill edit no longer invalidates the cached
+    identity prefix. Searching only ``stable`` reported Skills as 0 and folded
+    the whole block into "System prompt" instead.
+    """
+    skills_block = (
+        "<available_skills>\n" + ("  - demo: a demo skill\n" * 40) + "</available_skills>"
+    )
+    volatile = "Current time: now\n" + skills_block
+    agent, parts = _make_agent(stable="base guidance", volatile=volatile)
+
+    with patch("agent.system_prompt.build_system_prompt_parts", return_value=parts):
+        data = compute_session_context_breakdown(agent, [])
+
+    by_id = {item["id"]: item["tokens"] for item in data["categories"]}
+    assert by_id.get("skills", 0) > 0
+    # The block must not be double-counted into the system prompt as well.
+    assert by_id["system_prompt"] < by_id["skills"]
+
+
 # ── /context renderers (pure functions over the payload) ────────────────────
 
 from agent.context_breakdown import (  # noqa: E402

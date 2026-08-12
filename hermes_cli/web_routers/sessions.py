@@ -44,6 +44,7 @@ _cron_profile_home = late("_cron_profile_home")
 _import_sessions_for_profile = late("_import_sessions_for_profile")
 _maybe_auto_archive_for_profile = late("_maybe_auto_archive_for_profile")
 _open_session_db_for_profile = late("_open_session_db_for_profile")
+_profile_scope = late("_profile_scope")
 _prune_sessions = late("_prune_sessions")
 _read_session_import_body = late("_read_session_import_body")
 _session_latest_descendant = late("_session_latest_descendant")
@@ -650,6 +651,106 @@ async def get_session_messages(
             "returned": len(messages),
         },
     }
+
+
+def _effective_context_length() -> int:
+    """Context window the configured model actually uses, or 0 if unknown.
+
+    Same resolution chain as ``GET /api/model/info``: an explicit
+    ``model.context_length`` override wins, otherwise the auto-detected value.
+    Must be called inside a ``_profile_scope`` so ``load_config`` resolves the
+    requested profile.
+    """
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        override = model_cfg.get("context_length")
+        if isinstance(override, int) and not isinstance(override, bool) and override > 0:
+            return override
+
+        from agent.model_metadata import get_model_context_length
+
+        return int(
+            get_model_context_length(
+                model=model_cfg.get("default") or model_cfg.get("name") or "",
+                base_url=model_cfg.get("base_url", ""),
+                provider=model_cfg.get("provider", ""),
+                config_context_length=None,
+            )
+            or 0
+        )
+    except Exception:
+        return 0
+
+
+@manage_router.get("/api/sessions/{session_id}/context")
+async def get_session_context(
+    session_id: str,
+    profile: Optional[str] = None,
+    platform: str = "cli",
+    details: bool = False,
+):
+    """Context-window breakdown for one session (same engine as ``/context``).
+
+    Registered so web UIs can render the per-category context gauge the CLI,
+    gateway and TUI already show. All the work lives in
+    :mod:`agent.context_breakdown`; this is only the HTTP seam. The inspection
+    agent is built offline (dummy api_key/base_url, no provider call) exactly
+    like ``hermes prompt-size`` does, so the numbers match a real session's
+    fixed prompt budget for that profile/platform.
+
+    ``details=1`` appends the per-skill / per-toolset attribution tables.
+    """
+
+    def _compute():
+        with _profile_scope(profile):
+            db = _open_session_db_for_profile(profile, read_only=True)
+            try:
+                sid = db.resolve_session_id(session_id)
+                if not sid:
+                    return None
+                sid = db.resolve_resume_session_id(sid)
+                # Provider-shaped, active-only history — the same projection
+                # the gateway replays, which is what the breakdown estimates.
+                history = db.get_messages_as_conversation(sid)
+            finally:
+                db.close()
+
+            from agent.context_breakdown import (
+                compute_context_details,
+                compute_session_context_breakdown,
+            )
+            from hermes_cli.prompt_size import _build_inspection_agent
+
+            agent = _build_inspection_agent(platform)
+            payload = compute_session_context_breakdown(agent, history)
+
+            # ``_build_inspection_agent`` forces a dummy base_url, which
+            # route-scopes away the ``model.context_length`` pin: the
+            # compressor then reports the AUTO-DETECTED window rather than the
+            # one a real agent for this profile uses. Re-resolve through the
+            # same chain ``GET /api/model/info`` uses so the two dashboard
+            # surfaces cannot disagree about the denominator.
+            effective = _effective_context_length()
+            if effective > 0:
+                payload["context_max"] = effective
+                used = int(payload.get("context_used") or 0)
+                payload["context_percent"] = max(
+                    0, min(100, round(used / effective * 100))
+                )
+
+            payload["session_id"] = sid
+            payload["platform"] = platform
+            if details:
+                payload["details"] = compute_context_details(agent)
+            return payload
+
+    result = await asyncio.to_thread(_compute)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return result
 
 
 @manage_router.delete("/api/sessions/{session_id}")

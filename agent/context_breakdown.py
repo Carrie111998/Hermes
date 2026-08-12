@@ -99,14 +99,19 @@ def compute_session_context_breakdown(
     context = parts.get("context", "") or ""
     volatile = parts.get("volatile", "") or ""
 
-    skills_match = _SKILLS_BLOCK_RE.search(stable)
+    # The skills index moved from the stable tier to the volatile one (so a
+    # skill edit no longer invalidates the cached identity prefix). Searching
+    # ``stable`` alone therefore reported Skills as 0 and silently folded the
+    # whole <available_skills> block into "System prompt". Mirror the
+    # precedence ``hermes_cli.prompt_size`` already uses.
+    skills_match = _SKILLS_BLOCK_RE.search(volatile) or _SKILLS_BLOCK_RE.search(stable)
     skills_index = skills_match.group(0) if skills_match else ""
 
     memory_block, user_block = _memory_blocks(agent)
     memory_text = "\n\n".join(part for part in (memory_block, user_block) if part).strip()
 
     system_core = _strip_blocks(stable, skills_index)
-    system_tail = _strip_blocks(volatile, memory_block, user_block)
+    system_tail = _strip_blocks(volatile, memory_block, user_block, skills_index)
     system_prompt_text = "\n\n".join(part for part in (system_core, system_tail) if part).strip()
 
     tools = list(getattr(agent, "tools", None) or [])
