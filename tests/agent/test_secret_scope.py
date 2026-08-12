@@ -287,3 +287,36 @@ class TestApiServerListenerGlobals:
         finally:
             ss.reset_secret_scope(token)
         assert not ss._is_global_env("API_SERVER_KEY")
+
+
+class TestUnscopedFallbackGate:
+    """SEC-05 regression (#84745): call sites that catch UnscopedSecretError
+    must NOT fall back to the process env under multiplex — the shared env
+    may hold ANOTHER profile's credentials. Outside multiplex the legacy
+    os.environ fallback must be preserved."""
+
+    def test_openrouter_check_api_key_fails_closed_under_multiplex(self, monkeypatch):
+        import tools.openrouter_client as orc
+
+        def _raise(*a, **k):
+            raise ss.UnscopedSecretError()
+
+        monkeypatch.setattr(ss, "get_secret", _raise)
+        monkeypatch.setenv("OPENROUTER_API_KEY", "env-key")
+        ss.set_multiplex_active(True)
+        assert orc.check_api_key() is False, "must not borrow the shared env under multiplex"
+        ss.set_multiplex_active(False)
+        assert orc.check_api_key() is True, "legacy env fallback must survive outside multiplex"
+
+    def test_auxiliary_scoped_key_env_fails_closed_under_multiplex(self, monkeypatch):
+        from agent.auxiliary_client import _scoped_key_env
+
+        def _raise(*a, **k):
+            raise ss.UnscopedSecretError()
+
+        monkeypatch.setattr(ss, "get_secret", _raise)
+        monkeypatch.setenv("TEST_PROVIDER_KEY", "env-key")
+        ss.set_multiplex_active(True)
+        assert _scoped_key_env("TEST_PROVIDER_KEY") == ""
+        ss.set_multiplex_active(False)
+        assert _scoped_key_env("TEST_PROVIDER_KEY") == "env-key"

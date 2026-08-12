@@ -36,11 +36,17 @@ def check_api_key() -> bool:
     CLI probes keep the legacy env read.
     """
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            allow_unscoped_env_fallback,
+            get_secret,
+        )
 
         try:
             return bool(get_secret("OPENROUTER_API_KEY"))
         except UnscopedSecretError:
+            if not allow_unscoped_env_fallback():
+                return False  # fail closed under multiplex (#84745)
             pass
     except Exception:
         pass

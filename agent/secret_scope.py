@@ -52,6 +52,18 @@ def is_multiplex_active() -> bool:
     return _MULTIPLEX_ACTIVE
 
 
+def allow_unscoped_env_fallback() -> bool:
+    """Whether the legacy ``os.environ`` fallback is safe after an unscoped read.
+
+    False under multiplex: the process env may hold ANOTHER profile's
+    credentials, so an unscoped fallback would borrow (and, in the caller's
+    hands, re-export) them. Call sites that catch ``UnscopedSecretError``
+    must consult this before reading ``os.environ`` — the catch is also the
+    fail-closed signal, not a license to read the shared env. (#84745)
+    """
+    return not _MULTIPLEX_ACTIVE
+
+
 # ── the secret scope contextvar ──────────────────────────────────────────
 _SECRET_SCOPE: ContextVar[Optional[Mapping[str, str]]] = ContextVar(
     "_SECRET_SCOPE", default=None

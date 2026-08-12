@@ -82,12 +82,19 @@ def _read_user_token_override() -> Optional[str]:
     under multiplex), fall back to ``os.environ`` only when unscoped.
     """
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            allow_unscoped_env_fallback,
+            get_secret,
+        )
 
         try:
             explicit = get_secret("TOOL_GATEWAY_USER_TOKEN")
         except UnscopedSecretError:
-            explicit = os.getenv("TOOL_GATEWAY_USER_TOKEN")
+            if not allow_unscoped_env_fallback():
+                explicit = None  # fail closed under multiplex (#84745)
+            else:
+                explicit = os.getenv("TOOL_GATEWAY_USER_TOKEN")
     except Exception:
         explicit = os.getenv("TOOL_GATEWAY_USER_TOKEN")
     if isinstance(explicit, str) and explicit.strip():

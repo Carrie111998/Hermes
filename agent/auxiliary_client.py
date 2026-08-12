@@ -1371,11 +1371,17 @@ def _scoped_key_env(name: str) -> str:
     if not name:
         return ""
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            allow_unscoped_env_fallback,
+            get_secret,
+        )
 
         try:
             return (get_secret(name) or "").strip()
         except UnscopedSecretError:
+            if not allow_unscoped_env_fallback():
+                return ""  # fail closed under multiplex (#84745)
             pass
     except Exception:
         pass

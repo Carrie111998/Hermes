@@ -394,12 +394,19 @@ def _slack_tools_loaded() -> bool:
     # process env may carry another profile's token (Slack pattern for the
     # unscoped default-profile path).
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            allow_unscoped_env_fallback,
+            get_secret,
+        )
 
         try:
             _slack_token = get_secret("SLACK_BOT_TOKEN") or ""
         except UnscopedSecretError:
-            _slack_token = os.environ.get("SLACK_BOT_TOKEN") or ""
+            if not allow_unscoped_env_fallback():
+                _slack_token = ""  # fail closed under multiplex (#84745)
+            else:
+                _slack_token = os.environ.get("SLACK_BOT_TOKEN") or ""
     except Exception:
         _slack_token = os.environ.get("SLACK_BOT_TOKEN") or ""
     if not _slack_token.strip():

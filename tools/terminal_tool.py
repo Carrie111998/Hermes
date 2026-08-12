@@ -1020,12 +1020,19 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     # hold another profile's SUDO_PASSWORD, so honor the installed scope's
     # verdict; unscoped callers keep the legacy os.environ read.
     try:
-        from agent.secret_scope import UnscopedSecretError, get_secret
+        from agent.secret_scope import (
+            UnscopedSecretError,
+            allow_unscoped_env_fallback,
+            get_secret,
+        )
 
         try:
             _configured_password = get_secret("SUDO_PASSWORD")
         except UnscopedSecretError:
-            _configured_password = os.environ.get("SUDO_PASSWORD")
+            if not allow_unscoped_env_fallback():
+                _configured_password = None  # fail closed under multiplex (#84745)
+            else:
+                _configured_password = os.environ.get("SUDO_PASSWORD")
     except Exception:
         _configured_password = os.environ.get("SUDO_PASSWORD")
     has_configured_password = _configured_password is not None
