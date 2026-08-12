@@ -1,0 +1,53 @@
+# Skill Synonym Dictionary
+# Purpose: When a user query matches a synonym, the corresponding skill's score gets boosted
+# Format: skill_name: [keyword_list]
+# Design Principles:
+#   1. Only collect keywords users actually type (natural language, not jargon)
+#   2. Avoid overly generic words (e.g., "tool", "use", "help")
+#   3. 5-15 synonyms per skill is optimal
+#   4. Include both languages if bilingual (e.g., "debug" and "调试")
+#
+# CUSTOMIZATION: Run `python scripts/generate_config.py` to auto-generate
+# from your local skill library. Then review and refine.
+# See PROMPTS.md for LLM-assisted generation prompts.
+
+# ═══════════════════════════════════════════════════════
+# Example: Engineering Skills
+# ═══════════════════════════════════════════════════════
+
+systematic-debugging:
+  - 调试
+  - 排查bug
+  - 诊断问题
+  - 修bug
+  - 找bug
+  - 报错
+  - 异常
+  - traceback
+  - 错误分析
+  - 故障排查
+  - 问题定位
+  - 根因分析
+  - debug
+  - 排查问题
+
+skill-creation-guide:
+  - 创建技能
+  - 写技能
+  - 新技能
+  - 技能格式
+  - 技能规范
+  - SKILL.md
+  - 技能模板
+
+find-skills:
+  - 找技能
+  - 搜索技能
+  - 安装技能
+  - 技能发现
+
+# ═══════════════════════════════════════════════════════
+# ADD YOUR SKILLS BELOW
+# ═══════════════════════════════════════════════════════
+# Copy the format above for each of your skills.
+# The generate_config.py script can do this automatically.
