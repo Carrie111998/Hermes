@@ -76,6 +76,22 @@ def _install_modal_test_modules(
     env_package.__path__ = [str(TOOLS_DIR / "environments")]  # type: ignore[attr-defined]
     sys.modules["tools.environments"] = env_package
 
+    # ``_ensure_modal_sdk`` runs ``tools.lazy_deps.ensure("terminal.modal")``
+    # before ``import modal``. That gate resolves availability from
+    # distribution metadata (importlib.metadata.version) rather than
+    # sys.modules, so the fake ``modal`` installed below can never satisfy it —
+    # with modal absent from the venv it raises FeatureUnavailable, which
+    # ``_ensure_modal_sdk`` re-raises as ImportError, and the fake is never
+    # reached.
+    #
+    # Load the real module (so its constants stay intact) under the synthetic
+    # ``tools`` package and neutralize only the gate. This has to happen after
+    # ``_reset_modules`` above — that call pops ``tools.lazy_deps`` from
+    # sys.modules, so a patch applied to the previous module object would be
+    # discarded and the gate would re-import a fresh, unpatched copy.
+    lazy_deps = _load_module("tools.lazy_deps", TOOLS_DIR / "lazy_deps.py")
+    lazy_deps.ensure = lambda *a, **k: None
+
     class _DummyBaseEnvironment:
         def __init__(self, cwd: str, timeout: int, env=None):
             self.cwd = cwd

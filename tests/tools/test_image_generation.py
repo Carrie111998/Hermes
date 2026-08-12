@@ -432,6 +432,11 @@ class TestManagedGatewayErrorTranslation:
         managed_gateway.nous_user_token = "test-token"
         monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
                             lambda: managed_gateway)
+        # _submit_fal_request calls _load_fal_client() before branching to the
+        # managed client. Seed the module global so it short-circuits instead
+        # of running the lazy-install gate (which checks distribution metadata
+        # and fails with fal-client absent from the venv).
+        monkeypatch.setattr(image_tool, "fal_client", MagicMock())
 
         bad_request = _MockHttpxError(403, "Forbidden")
         mock_managed_client = MagicMock()
@@ -457,6 +462,9 @@ class TestManagedGatewayErrorTranslation:
         managed_gateway = MagicMock()
         monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
                             lambda: managed_gateway)
+        # See test_4xx_translates_to_value_error_with_remediation — seed the
+        # SDK global so the lazy-install gate is never reached.
+        monkeypatch.setattr(image_tool, "fal_client", MagicMock())
 
         server_error = _MockHttpxError(502, "Bad Gateway")
         mock_managed_client = MagicMock()
@@ -492,6 +500,9 @@ class TestManagedGatewayErrorTranslation:
         managed_gateway = MagicMock()
         monkeypatch.setattr(image_tool, "_resolve_managed_fal_gateway",
                             lambda: managed_gateway)
+        # See test_4xx_translates_to_value_error_with_remediation — seed the
+        # SDK global so the lazy-install gate is never reached.
+        monkeypatch.setattr(image_tool, "fal_client", MagicMock())
 
         conn_error = ConnectionError("network down")
         mock_managed_client = MagicMock()

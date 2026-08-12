@@ -3,6 +3,8 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 
 sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
@@ -13,6 +15,29 @@ import gateway.run as gateway_run
 import run_agent
 from gateway.config import Platform
 from gateway.session import SessionSource
+
+# Both tests below drive a real agent through ``cron_scheduler.run_job`` /
+# ``gateway_run``, which build a system prompt and run the conversation loop
+# inside a ThreadPoolExecutor. Measured on a dev box with --timeout=0:
+#
+#   run 1   43.80s / 53.86s      run 2   26.41s / 13.90s
+#
+# The 2-3x spread across runs of identical code is machine load, so no single
+# number is meaningful; what is stable is that this comfortably exceeds the
+# 30s cap in pyproject addopts. When it trips, ``--timeout-method=thread``
+# hard-exits the interpreter and the whole run loses its summary line — a
+# monolithic ``pytest tests/events tests/cron`` died exactly here at 59%.
+#
+# This is NOT the platform-SDK import tax that ``_iter_home_target_platforms``
+# used to pay (fixed separately). An import profile of this file shows the
+# second test spending 15.78s while importing just SIX modules, and imports on
+# non-main threads totalling 0.127s — the cost is real agent-bootstrap and
+# conversation-loop execution, not module loading. So this mark declares a
+# budget rather than papering over a removable cost; shrinking it means making
+# agent bootstrap cheaper, which is out of scope here.
+#
+# Not an xfail — every assertion below is unchanged and still enforced.
+pytestmark = pytest.mark.timeout(180)
 
 
 def _patch_agent_bootstrap(monkeypatch):

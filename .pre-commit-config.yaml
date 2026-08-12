@@ -25,6 +25,12 @@ repos:
   # a read-only import + dict comparison, no I/O, well under a second warm.
   # See events/coverage.py for what it checks and why an import-time assertion
   # in the gateway would be the wrong trade.
+  #
+  # This hook is still bypassable (`--no-verify`, or a checkout where pre-commit
+  # was never installed), so it is backstopped -- not replaced -- by a non-fatal
+  # runtime signal: each required-total table calls
+  # events.coverage.log_missing_members() at the bottom of its own module and a
+  # running gateway logs ONE error naming every member with no entry.
   - repo: local
     hooks:
       - id: event-type-coverage

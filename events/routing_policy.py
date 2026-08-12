@@ -33,6 +33,7 @@ Invariants (enforced by tests/events/test_routing_policy.py):
 from __future__ import annotations
 
 import dataclasses
+import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -41,6 +42,8 @@ from typing import Collection, Dict, Optional, Tuple
 from events.outcomes import OutcomeState, OutcomeVerdict, evaluate_outcome
 from events.producers.agent_source_mapping import canonical_agent_source
 from events.schema import Event, EventType, Priority
+
+logger = logging.getLogger(__name__)
 
 
 class Attention(Enum):
@@ -578,3 +581,22 @@ def resolve_topic_thread(
         key = nxt
     fallback = topics.get(ALERTS, {})
     return ALERTS, str(fallback.get("thread_id", ""))
+
+
+# ── runtime drift signal (report, never repair) ─────────────────────────────
+#
+# Same residual gap as events.formatting: events.coverage contracts _POLICY to
+# be total over EventType, but every enforcement point it has is commit-time.
+# A gateway running an unmapped type says nothing — classify() silently falls
+# back to WARN-on-watchdog_alerts, so the event lands in the wrong topic and
+# its WhatsApp escalation is decided by accident. One ERROR line at import
+# names every unmapped type; delivery is unchanged.
+#
+# Publishes the RECORD only. Back-filling _POLICY here would make
+# coverage.TableSpec.resolve() — which reads this table after importing this
+# module — see a complete table forever, disarming the commit-time guard.
+from events.coverage import log_missing_members  # noqa: E402 - table must exist
+
+EVENT_TYPES_WITHOUT_POLICY = log_missing_members(
+    _POLICY, "events.routing_policy._POLICY", logger
+)

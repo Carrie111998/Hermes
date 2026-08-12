@@ -21,6 +21,7 @@ needs to remember to run commands.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shlex
 import threading
@@ -42,7 +43,14 @@ _lock = threading.Lock()
 
 # Tool-call result shapes we can parse
 _WRITE_FILE_PATH_KEY = "path"
-_TERMINAL_PATH_REGEX = re.compile(r"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+)")
+# Drive-rooted Windows paths (``C:\x\y`` / ``C:/x/y``) count as absolute too —
+# without this alternative the terminal scanner tracked nothing at all on
+# Windows, since no candidate there ever starts with "/" or "~".
+_WINDOWS_ABS_PATH = r"[A-Za-z]:[\\/][^\s'\"`]+"
+_WINDOWS_ABS_PATH_REGEX = re.compile(rf"^{_WINDOWS_ABS_PATH}$")
+_TERMINAL_PATH_REGEX = re.compile(
+    rf"(?:^|\s)(/[^\s'\"`]+|\~/[^\s'\"`]+|{_WINDOWS_ABS_PATH})"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +108,21 @@ def _extract_paths_from_patch(args: Dict[str, Any]) -> Set[str]:
     return {path} if isinstance(path, str) and path else set()
 
 
+def _split_command(cmd: str) -> list[str]:
+    """``shlex.split`` that doesn't eat Windows path separators.
+
+    POSIX mode treats ``\\`` as an escape character, so ``touch C:\\tmp\\x.log``
+    tokenises to ``C:tmpx.log``.  Clearing ``escape`` on Windows keeps quote
+    handling intact while making backslash literal.
+    """
+    lex = shlex.shlex(cmd, posix=True)
+    lex.whitespace_split = True
+    lex.commenters = ""  # as shlex.split() does — never treat "#" as a comment
+    if os.name == "nt":
+        lex.escape = ""
+    return list(lex)
+
+
 def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     """Best-effort: pull candidate filesystem paths from a terminal command
     and its output, then let ``guess_category`` / ``is_safe_path`` filter.
@@ -109,8 +132,8 @@ def _extract_paths_from_terminal(args: Dict[str, Any], result: str) -> Set[str]:
     if isinstance(cmd, str) and cmd:
         # Tokenise the command — catches `touch /tmp/hermes-x/test_foo.py`
         try:
-            for tok in shlex.split(cmd, posix=True):
-                if tok.startswith(("/", "~")):
+            for tok in _split_command(cmd):
+                if tok.startswith(("/", "~")) or _WINDOWS_ABS_PATH_REGEX.match(tok):
                     paths.add(tok)
         except ValueError:
             pass
