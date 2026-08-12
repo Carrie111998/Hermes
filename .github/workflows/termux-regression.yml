@@ -67,7 +67,12 @@ jobs:
               export HERMES_REPO_URL="file:///workspace"
               export HERMES_HOME="$HOME/.hermes-ci"
               export HERMES_INSTALL_DIR="$HOME/hermes-agent-ci"
-              git config --global --add safe.directory /workspace
+              # The bootstrap image intentionally has no git yet; Hermes must
+              # install it. Pre-authorize the read-only mounted PR checkout via
+              # Git's environment config so we do not call git before install.
+              export GIT_CONFIG_COUNT=1
+              export GIT_CONFIG_KEY_0=safe.directory
+              export GIT_CONFIG_VALUE_0=/workspace
 
               echo "== native installer =="
               bash /workspace/scripts/install-termux.sh \
