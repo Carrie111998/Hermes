@@ -74,6 +74,25 @@ def _fetch_unread(identity: str, project_key: str, after_id: int, limit: int) ->
     return [dict(row) for row in rows]
 
 
+def _agent_mail_source(*, channel_id: str, profile: str, identity: str) -> SessionSource:
+    """Build a local-only control-plane source for one profile inbox.
+
+    The Discord channel remains an escalation target owned by later delivery
+    policy, not a participant/session identity.  ``internal_session_id`` is
+    never serialized from wire input, so a normal Discord event cannot enter
+    this lane.
+    """
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=channel_id,
+        chat_type="group",
+        user_id=f"internal-agent-mail:{profile}:{identity}",
+        user_name="Agent Mail Watcher",
+        profile=profile,
+        internal_session_id=f"agent-mail:{profile}:{identity}",
+    )
+
+
 def _wake_text(identity: str, message: dict[str, Any]) -> str:
     body = str(message.get("body_md") or "")[:6000]
     return "\n".join((
@@ -134,10 +153,9 @@ class GatewayAgentMailWatchersMixin:
             return
         identity = str(cfg.get("identity") or "").strip()
         channel_id = str(cfg.get("channel_id") or "").strip()
-        user_id = str(cfg.get("user_id") or "").strip()
         project_key = str(cfg.get("project_key") or "").strip()
-        if not identity or not channel_id or not user_id or not project_key:
-            logger.warning("agent-mail watcher disabled: identity, channel_id, user_id, or project_key missing")
+        if not identity or not channel_id or not project_key:
+            logger.warning("agent-mail watcher disabled: identity, channel_id, or project_key missing")
             return
         try:
             interval = max(2.0, float(cfg.get("poll_seconds", 10)))
@@ -150,7 +168,11 @@ class GatewayAgentMailWatchersMixin:
         if adapter is None:
             logger.warning("agent-mail watcher disabled for %s: Discord adapter unavailable", profile)
             return
-        source = SessionSource(platform=Platform.DISCORD, chat_id=channel_id, chat_type="group", user_id=user_id, user_name="Agent Mail Watcher", profile=profile)
+        source = _agent_mail_source(
+            channel_id=channel_id,
+            profile=profile,
+            identity=identity,
+        )
         logger.info("agent-mail watcher active profile=%s identity=%s", profile, identity)
         while True:
             try:

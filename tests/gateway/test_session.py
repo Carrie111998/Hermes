@@ -105,6 +105,21 @@ class TestSessionSourceRoundtrip:
 
 
 class TestSessionSourceDescription:
+    def test_internal_session_id_is_local_only_and_not_restored_from_wire(self):
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            internal_session_id="agent-mail:default:SilverHarbor",
+        )
+
+        assert "internal_session_id" not in source.to_dict()
+        restored = SessionSource.from_dict({
+            "platform": "discord",
+            "chat_id": "channel-1",
+            "internal_session_id": "forged-control-plane-key",
+        })
+        assert restored.internal_session_id is None
+
     def test_local_cli(self):
         source = SessionSource(
             platform=Platform.LOCAL, chat_id="cli",

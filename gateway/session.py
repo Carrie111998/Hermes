@@ -204,6 +204,12 @@ class SessionSource:
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
 
+    # Local-only control-plane lane. This is intentionally excluded from wire
+    # serialization: platform-originated events must not be able to select an
+    # internal session namespace. Gateway-owned watchers set it for events such
+    # as Agent Mail wakes, which must never share a human platform session.
+    internal_session_id: Optional[str] = None
+
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
         # is the deprecated alias. Mirror whichever was provided onto the other
@@ -1065,6 +1071,8 @@ def build_session_key(
       - Without identifiers, messages fall back to one session per platform/chat_type.
     """
     ns = _session_key_namespace(profile)
+    if source.internal_session_id:
+        return f"{ns}:internal:{source.internal_session_id}"
     platform = source.platform.value
     slack_scope_id = (
         str(source.scope_id)

@@ -5,7 +5,31 @@ from pathlib import Path
 from typing import Any, cast
 
 import gateway.agent_mail_watchers as watcher
-from gateway.agent_mail_watchers import _wake_text
+from gateway.agent_mail_watchers import _agent_mail_source, _wake_text
+from gateway.config import Platform
+from gateway.session import SessionSource, build_session_key
+
+
+def test_agent_mail_source_uses_an_internal_session_key_not_the_watched_user():
+    """A control-plane wake cannot join the human Discord conversation."""
+    wake_source = _agent_mail_source(
+        channel_id="channel-1",
+        profile="default",
+        identity="SilverHarbor",
+    )
+    human_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-1",
+        chat_type="group",
+        user_id="terry-user",
+        profile="default",
+    )
+
+    assert wake_source.internal_session_id == "agent-mail:default:SilverHarbor"
+    assert wake_source.user_id != "terry-user"
+    assert build_session_key(wake_source) == "agent:main:internal:agent-mail:default:SilverHarbor"
+    assert build_session_key(wake_source) != build_session_key(human_source)
+    assert "internal_session_id" not in wake_source.to_dict()
 
 
 def test_agent_mail_wake_is_internal_and_bounded():
