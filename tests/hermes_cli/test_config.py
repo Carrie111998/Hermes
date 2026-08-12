@@ -1422,9 +1422,25 @@ def test_default_config_kanban_block_not_dropped_by_duplicate_key():
     kanban = DEFAULT_CONFIG["kanban"]
     # From the first (dropped) block:
     assert kanban.get("auto_subscribe_on_create") is True
+    # Existing installs remain permissive unless operators opt into
+    # orchestrator-only graph mutation.
+    assert kanban.get("worker_graph_mutations") is True
     # From the second block:
     assert "dispatch_in_gateway" in kanban
     assert "auto_decompose" in kanban
+
+
+def test_load_config_honors_worker_graph_mutation_override(tmp_path, monkeypatch):
+    """The policy is a normal ``kanban`` config value, not a stale side table."""
+    (tmp_path / "config.yaml").write_text(
+        "kanban:\n  worker_graph_mutations: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    config = load_config()
+
+    assert config["kanban"]["worker_graph_mutations"] is False
 
 
 def test_default_config_has_no_duplicate_top_level_keys():
