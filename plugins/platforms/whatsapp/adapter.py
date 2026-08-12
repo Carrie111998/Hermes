@@ -100,8 +100,38 @@ def _listener_pids_on_port(port: int) -> list:
     return pids
 
 
-def _kill_port_process(port: int) -> None:
-    """Kill any process *listening* on the given TCP port (a stale bridge)."""
+def _kill_port_process(port: int, *, session_path: Optional[Path] = None) -> None:
+    """Kill any process *listening* on the given TCP port, but ONLY if its
+    command line identifies it as one of our own bridge processes.
+
+    PATCH (local, 2026-08-11 — not upstream as of this writing): the
+    original version killed ANY process listening on ``port``, on the
+    assumption it must be "a stale bridge." That assumption breaks whenever
+    an unrelated service happens to default to the same port — observed in
+    the wild: a local Forgejo git server also defaulting to
+    ``127.0.0.1:3000``, SIGTERMed 179 times in one day every time this
+    adapter tried to reconnect and found Forgejo's own ``/health`` endpoint
+    instead of a bridge. The guard below mirrors ``_bridge_pid_is_ours``'s
+    cmdline check: only signal a PID whose command line contains ``node``
+    and ``whatsapp-bridge`` (and, when available, this session's path).
+
+    ⚠️ DURABILITY: ``hermes update`` replaces this file wholesale (see
+    ``~/.hermes/backups/pre-update-*.zip``) — a routine update can silently
+    drop this guard with no error, reverting to the unconditional-kill
+    behavior. If unexplained SIGTERMs to an unrelated service recur after an
+    update, re-apply this patch first. A PR upstreaming this fix was opened
+    against github.com/NousResearch/hermes-agent — check its status before
+    re-patching from scratch.
+    """
+    def _looks_like_our_bridge(pid: int) -> bool:
+        from gateway.status import _read_process_cmdline
+        cmdline = _read_process_cmdline(pid)
+        if not cmdline or "node" not in cmdline or "whatsapp-bridge" not in cmdline:
+            return False
+        if session_path is not None and str(session_path) not in cmdline:
+            return False
+        return True
+
     try:
         if _IS_WINDOWS:
             from hermes_cli._subprocess_compat import windows_hide_flags
@@ -118,6 +148,12 @@ def _kill_port_process(port: int) -> None:
                     local_addr = parts[1]
                     if local_addr.endswith(f":{port}"):
                         try:
+                            win_pid = int(parts[4])
+                        except ValueError:
+                            continue
+                        if not _looks_like_our_bridge(win_pid):
+                            continue
+                        try:
                             subprocess.run(
                                 ["taskkill", "/PID", parts[4], "/F"],
                                 capture_output=True, timeout=5,
@@ -126,10 +162,14 @@ def _kill_port_process(port: int) -> None:
                         except subprocess.SubprocessError:
                             pass
         else:
-            # POSIX: only ever signal a process LISTENING on the port. A client
-            # whose connection happens to involve this port number (a browser
-            # tab on a local dev server, etc.) must never be killed.
+            # POSIX: only ever signal a process LISTENING on the port AND
+            # whose cmdline identifies it as our own bridge. A client whose
+            # connection happens to involve this port number (a browser tab
+            # on a local dev server, etc.) must never be killed — nor must an
+            # unrelated service that happens to also default to this port.
             for pid in _listener_pids_on_port(port):
+                if not _looks_like_our_bridge(pid):
+                    continue
                 try:
                     os.kill(pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, OSError):
@@ -664,7 +704,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             
             # Kill any orphaned bridge from a previous gateway run
             _kill_stale_bridge_by_pidfile(self._session_path)
-            _kill_port_process(self._bridge_port)
+            _kill_port_process(self._bridge_port, session_path=self._session_path)
             await asyncio.sleep(1)
             
             # Start the bridge process in its own process group.
