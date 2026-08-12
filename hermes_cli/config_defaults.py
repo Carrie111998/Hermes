@@ -1567,7 +1567,7 @@ DEFAULT_CONFIG = {
         # the raw transcript is also echoed back to the user as a 🎙️ message.
         # Set false to keep STT for the agent while suppressing that user-facing echo.
         "echo_transcripts": True,
-        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" (Whisper API) | "mistral" (Voxtral Transcribe) | "elevenlabs" (Scribe) | "deepinfra"
+        "provider": "local",  # "local" (free, faster-whisper) | "groq" | "openai" | "openrouter" | "mistral" | "xai" | "elevenlabs" | "deepinfra"
         # Global language hint applied to EVERY provider unless a per-provider
         # language overrides it. Defaults to "en" — Whisper auto-detection
         # frequently misidentifies short/accented clips, which reads as
@@ -1600,6 +1600,10 @@ DEFAULT_CONFIG = {
         },
         "openai": {
             "model": "whisper-1",  # whisper-1, gpt-4o-mini-transcribe, gpt-4o-transcribe, gpt-transcribe
+            "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
+        },
+        "openrouter": {
+            "model": "openai/gpt-4o-mini-transcribe",  # selectable from OpenRouter's live transcription catalog
             "language": "",  # auto-detect by default; set to "en", "es", "fr", etc. to force
         },
         "mistral": {
@@ -3263,11 +3267,11 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "OPENROUTER_API_KEY": {
-        "description": "OpenRouter API key (for vision, web scraping helpers, and MoA)",
+        "description": "OpenRouter API key (for models, transcription, vision, web scraping helpers, and MoA)",
         "prompt": "OpenRouter API key",
         "url": "https://openrouter.ai/keys",
         "password": True,
-        "tools": ["vision_analyze"],
+        "tools": ["vision_analyze", "voice_transcription"],
         "category": "provider",
         "advanced": True,
     },

@@ -2389,6 +2389,32 @@ class TestNewEndpoints:
         else:
             assert data["active_provider"] is None
 
+    def test_openrouter_stt_catalog_and_selection_use_provider_scoped_config(self, monkeypatch):
+        from hermes_cli import models
+        from hermes_cli.config import load_config, save_config
+
+        catalog = [
+            ("openai/gpt-4o-mini-transcribe", "GPT-4o Mini Transcribe"),
+            ("openai/gpt-4o-transcribe", "GPT-4o Transcribe"),
+        ]
+        monkeypatch.setattr(models, "fetch_openrouter_transcription_models", lambda: catalog)
+        cfg = load_config()
+        cfg.setdefault("stt", {})["provider"] = "openrouter"
+        cfg["stt"]["openrouter"] = {"model": catalog[0][0]}
+        save_config(cfg)
+
+        response = self.client.get("/api/tools/toolsets/stt/models?provider=OpenRouter")
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["models"]] == [row[0] for row in catalog]
+        assert response.json()["current"] == catalog[0][0]
+
+        response = self.client.put(
+            "/api/tools/toolsets/stt/model",
+            json={"provider": "OpenRouter", "model": catalog[1][0]},
+        )
+        assert response.status_code == 200
+        assert load_config()["stt"]["openrouter"]["model"] == catalog[1][0]
+
     def test_get_toolset_config_reports_truthful_provider_status(self, monkeypatch):
         """Each provider row carries a server-computed readiness `status`.
 

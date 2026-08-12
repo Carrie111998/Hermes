@@ -933,7 +933,7 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "description": "Speech-to-text provider",
         # "mistral" temporarily removed — mistralai PyPI package quarantined
         # (malicious 2.4.6 release on 2026-05-12). Restore once available.
-        "options": ["local", "groq", "openai", "xai", "elevenlabs"],
+        "options": ["local", "groq", "openai", "openrouter", "xai", "elevenlabs"],
     },
     "stt.local.model": {
         "type": "select",
@@ -949,6 +949,10 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "type": "select",
         "description": "OpenAI transcription model",
         "options": ["whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe", "gpt-transcribe"],
+    },
+    "stt.openrouter.model": {
+        "type": "string",
+        "description": "OpenRouter transcription model ID",
     },
     "stt.elevenlabs.model_id": {
         "type": "select",
@@ -13971,12 +13975,12 @@ from hermes_cli.web_routers.tools import (  # noqa: E402,F401 — legacy re-expo
 
 
 # Toolsets whose backends carry a selectable model catalog, mapped to the
-# config.yaml section their `model` key lives in. Mirrors the CLI's
-# post-selection model pickers (`_configure_imagegen_model_for_plugin` /
-# `_configure_videogen_model_for_plugin` in tools_config.py).
+# config.yaml section their model selection lives in. Mirrors the CLI's
+# post-selection model pickers in tools_config.py.
 _MODEL_CATALOG_TOOLSETS = {
     "image_gen": "image_gen",
     "video_gen": "video_gen",
+    "stt": "stt",
 }
 
 
@@ -13985,7 +13989,7 @@ def _resolve_toolset_model_plugin(ts_key: str, provider_row: dict) -> Optional[s
 
     Plugin-backed rows carry ``image_gen_plugin_name`` / ``video_gen_plugin_name``;
     the managed "Nous Subscription" image row instead carries the legacy
-    ``imagegen_backend: "fal"`` marker (same underlying FAL catalog).
+    ``imagegen_backend: "fal"`` marker. OpenRouter STT is provider-scoped.
     """
     if ts_key == "image_gen":
         return provider_row.get("image_gen_plugin_name") or (
@@ -13993,6 +13997,8 @@ def _resolve_toolset_model_plugin(ts_key: str, provider_row: dict) -> Optional[s
         )
     if ts_key == "video_gen":
         return provider_row.get("video_gen_plugin_name")
+    if ts_key == "stt" and provider_row.get("stt_provider") == "openrouter":
+        return "openrouter"
     return None
 
 
@@ -14005,6 +14011,12 @@ def _toolset_model_catalog(ts_key: str, plugin_name: str):
 
     if ts_key == "image_gen":
         return _plugin_image_gen_catalog(plugin_name)
+    if ts_key == "stt" and plugin_name == "openrouter":
+        from hermes_cli.models import fetch_openrouter_transcription_models
+
+        rows = fetch_openrouter_transcription_models()
+        catalog = {model_id: {"display": display} for model_id, display in rows}
+        return catalog, (rows[0][0] if rows else None)
     return _plugin_video_gen_catalog(plugin_name)
 
 

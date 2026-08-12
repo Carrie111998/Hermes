@@ -105,6 +105,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
 ]
 
 _openrouter_catalog_cache: list[tuple[str, str]] | None = None
+_openrouter_transcription_catalog_cache: list[tuple[str, str]] | None = None
 
 
 # Fallback Vercel AI Gateway snapshot used when the live catalog is unavailable.
@@ -1574,6 +1575,40 @@ def fetch_openrouter_models(
         curated[0] = (first_id, "recommended")
     _openrouter_catalog_cache = curated
     return list(curated)
+
+
+def fetch_openrouter_transcription_models(
+    timeout: float = 8.0,
+    *,
+    force_refresh: bool = False,
+) -> list[tuple[str, str]]:
+    """Return the live OpenRouter catalog filtered to transcription output."""
+    global _openrouter_transcription_catalog_cache
+
+    if _openrouter_transcription_catalog_cache is not None and not force_refresh:
+        return list(_openrouter_transcription_catalog_cache)
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models?output_modalities=transcription",
+            headers={"Accept": "application/json"},
+        )
+        with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode())
+    except Exception:
+        return list(_openrouter_transcription_catalog_cache or [])
+
+    rows: list[tuple[str, str]] = []
+    for item in payload.get("data", []) if isinstance(payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        architecture = item.get("architecture")
+        outputs = architecture.get("output_modalities") if isinstance(architecture, dict) else None
+        model_id = str(item.get("id") or "").strip()
+        if model_id and isinstance(outputs, list) and "transcription" in outputs:
+            rows.append((model_id, str(item.get("name") or model_id).strip()))
+    if rows:
+        _openrouter_transcription_catalog_cache = rows
+    return list(rows or _openrouter_transcription_catalog_cache or [])
 
 
 def model_ids(*, force_refresh: bool = False) -> list[str]:

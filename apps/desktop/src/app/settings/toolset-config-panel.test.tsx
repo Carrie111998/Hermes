@@ -300,6 +300,50 @@ describe('ToolsetConfigPanel', () => {
     await waitFor(() => expect(selectToolsetModel).toHaveBeenCalledWith('image_gen', 'flux-2-pro', 'FAL.ai'))
   })
 
+  it('shows the live OpenRouter STT model catalog and persists a pick', async () => {
+    getToolsetConfig.mockResolvedValue(
+      config({
+        name: 'stt',
+        active_provider: 'OpenRouter',
+        providers: [
+          {
+            name: 'OpenRouter',
+            badge: 'paid · multi-model',
+            tag: 'Live transcription catalog',
+            env_vars: [],
+            post_setup: null,
+            requires_nous_auth: false,
+            is_active: true
+          }
+        ]
+      })
+    )
+    getHermesConfigRecord.mockResolvedValue({
+      stt: { provider: 'openrouter', openrouter: { model: 'openai/gpt-4o-mini-transcribe' } }
+    })
+    getToolsetModels.mockResolvedValue({
+      name: 'stt',
+      has_models: true,
+      provider: 'OpenRouter',
+      plugin: 'openrouter',
+      models: [
+        { id: 'openai/gpt-4o-mini-transcribe', display: 'GPT-4o Mini Transcribe', speed: '', strengths: '', price: '' },
+        { id: 'openai/gpt-4o-transcribe', display: 'GPT-4o Transcribe', speed: '', strengths: '', price: '' }
+      ],
+      current: 'openai/gpt-4o-mini-transcribe',
+      default: 'openai/gpt-4o-mini-transcribe'
+    })
+
+    const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+    render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="stt" />)
+
+    expect(await screen.findByText('GPT-4o Mini Transcribe')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /GPT-4o Transcribe/ }))
+    await waitFor(() =>
+      expect(selectToolsetModel).toHaveBeenCalledWith('stt', 'openai/gpt-4o-transcribe', 'OpenRouter')
+    )
+  })
+
   it('does not fetch model catalogs for toolsets without them', async () => {
     const { ToolsetConfigPanel } = await import('./toolset-config-panel')
     render(<ToolsetConfigPanel onConfiguredChange={vi.fn()} toolset="tts" />)

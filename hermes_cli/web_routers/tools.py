@@ -302,7 +302,7 @@ async def get_toolset_config(name: str, profile: Optional[str] = None):
 async def get_toolset_models(
     name: str, provider: Optional[str] = None, profile: Optional[str] = None
 ):
-    """Return the model catalog for a toolset backend (image/video gen).
+    """Return the model catalog for a toolset backend (image/video gen or STT).
 
     The GUI counterpart of the model picker `hermes tools` runs after a
     backend is selected — e.g. FAL's multi-model catalog (speed / strengths /
@@ -324,6 +324,8 @@ async def get_toolset_models(
 
             catalog, default_model = _toolset_model_catalog(name, plugin)
             section_cfg = config.get(section)
+            if name == "stt" and isinstance(section_cfg, dict):
+                section_cfg = section_cfg.get(plugin)
             current = None
             if isinstance(section_cfg, dict):
                 raw = section_cfg.get("model")
@@ -369,7 +371,7 @@ async def get_toolset_models(
 async def select_toolset_model(
     name: str, body: ToolsetModelSelect, profile: Optional[str] = None
 ):
-    """Persist a backend model selection (``image_gen.model`` / ``video_gen.model``).
+    """Persist a backend model selection, including provider-scoped STT models.
 
     Validates the model against the resolved backend's catalog — the same
     write the CLI's post-selection model picker performs. Returns 400 for
@@ -408,6 +410,12 @@ async def select_toolset_model(
                 if not isinstance(section_cfg, dict):
                     section_cfg = {}
                     config[section] = section_cfg
+                if name == "stt":
+                    provider_cfg = section_cfg.setdefault(plugin, {})
+                    if not isinstance(provider_cfg, dict):
+                        provider_cfg = {}
+                        section_cfg[plugin] = provider_cfg
+                    section_cfg = provider_cfg
                 section_cfg["model"] = model_id
                 save_config(config)
         return plugin

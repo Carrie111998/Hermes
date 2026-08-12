@@ -25,6 +25,7 @@ from hermes_cli.tools_config import (  # noqa: E402
     _write_provider_config,
     apply_provider_selection,
 )
+from hermes_cli.models import fetch_openrouter_transcription_models  # noqa: E402
 
 
 def _stt_cat():
@@ -40,6 +41,11 @@ class TestSttCategory:
         cat = _stt_cat()
         assert cat["name"] == "Speech-to-Text"
         assert len(cat["providers"]) >= 5
+
+    def test_openrouter_is_a_first_class_stt_provider(self):
+        provider = _stt_provider_named("OpenRouter")
+        assert provider["stt_provider"] == "openrouter"
+        assert [row["key"] for row in provider["env_vars"]] == ["OPENROUTER_API_KEY"]
 
 
 
@@ -92,6 +98,29 @@ class TestModelPicker:
 
         assert set(STT_MODEL_CATALOG["openai"]) == OPENAI_MODELS
         assert set(STT_MODEL_CATALOG["groq"]) == GROQ_MODELS
+
+    def test_openrouter_catalog_is_live_and_filtered_to_transcription_models(self):
+        response = MagicMock()
+        response.read.return_value = b'{"data":[{"id":"openai/gpt-4o-transcribe","name":"GPT-4o Transcribe","architecture":{"output_modalities":["transcription"]}},{"id":"chat/model","name":"Chat","architecture":{"output_modalities":["text"]}}]}'
+        response.__enter__.return_value = response
+        response.__exit__.return_value = False
+        with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=response):
+            models = fetch_openrouter_transcription_models(force_refresh=True)
+        assert models == [("openai/gpt-4o-transcribe", "GPT-4o Transcribe")]
+
+    def test_configure_openrouter_model_uses_live_catalog(self):
+        config = {"stt": {"openrouter": {"model": "openai/gpt-4o-transcribe"}}}
+        live = [
+            ("openai/gpt-4o-mini-transcribe", "GPT-4o Mini Transcribe"),
+            ("openai/gpt-4o-transcribe", "GPT-4o Transcribe"),
+        ]
+        with patch("hermes_cli.models.fetch_openrouter_transcription_models", return_value=live), patch(
+            "hermes_cli.tools_config._prompt_choice", return_value=1
+        ) as pc:
+            _configure_stt_model("openrouter", config)
+        assert pc.call_args[0][1] == [model_id for model_id, _ in live]
+        assert pc.call_args[0][2] == 1
+        assert config["stt"]["openrouter"]["model"] == "openai/gpt-4o-transcribe"
 
 
 

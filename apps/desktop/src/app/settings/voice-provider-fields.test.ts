@@ -35,10 +35,16 @@ describe('voiceProviderKeys', () => {
   it('scopes to the exact provider segment (no prefix bleed)', () => {
     expect(voiceProviderKeys('tts', 'mini')).toEqual([])
     expect(voiceProviderKeys('stt', 'openai')).toEqual(['stt.openai.model'])
+    expect(voiceProviderKeys('stt', 'openrouter')).toEqual(['stt.openrouter.model'])
   })
 })
 
 describe('voice field option coverage', () => {
+  it('offers OpenRouter for STT and keeps its model ID editable', () => {
+    expect(ENUM_OPTIONS['stt.provider']).toContain('openrouter')
+    expect(FREE_INPUT_KEYS.has('stt.openrouter.model')).toBe(true)
+  })
+
   it('offers the current gpt-4o-mini-tts voice set, not just the tts-1 six', () => {
     const voices = ENUM_OPTIONS['tts.openai.voice']
 

@@ -2,7 +2,7 @@
 """
 Transcription Tools Module
 
-Provides speech-to-text transcription with six providers:
+Provides speech-to-text transcription with local and cloud providers:
 
   - **local** (default, free) — faster-whisper running locally, no API key needed.
     Auto-downloads the model (~150 MB for ``base``) on first use.
@@ -12,6 +12,8 @@ Provides speech-to-text transcription with six providers:
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
   - **elevenlabs** — ElevenLabs Scribe API, requires ``ELEVENLABS_API_KEY``.
+  - **openrouter** — OpenRouter's OpenAI-compatible transcription API,
+    requires ``OPENROUTER_API_KEY`` and ``stt.openrouter.model``.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -119,6 +121,7 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENROUTER_STT_BASE_URL = "https://openrouter.ai/api/v1"
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 # DeepInfra STT base URL now resolved via hermes_cli.models.deepinfra_base_url (shared).
@@ -385,6 +388,7 @@ BUILTIN_STT_PROVIDERS = frozenset({
     "xai",
     "elevenlabs",
     "deepinfra",
+    "openrouter",
 })
 
 
@@ -398,8 +402,8 @@ BUILTIN_STT_PROVIDERS = frozenset({
 # become an STT backend with zero Python.
 #
 # Resolution order:
-#   1. Built-in (``local``, ``local_command``, ``groq``, ``openai``,
-#      ``mistral``, ``xai``)              → native handler. **Always wins.**
+#   1. Built-in (the names in ``BUILTIN_STT_PROVIDERS``) → native handler.
+#      **Always wins.**
 #   2. ``stt.providers.<name>: type: command``  → command-provider runner.
 #   3. Plugin-registered TranscriptionProvider  → plugin dispatch.
 #   4. No match                                 → "No STT provider available".
@@ -1057,6 +1061,15 @@ def _get_provider(stt_config: dict) -> str:
                 return "openai"
             logger.warning(
                 "STT provider 'openai' configured but no API key available"
+            )
+            return "none"
+
+        if provider == "openrouter":
+            if _HAS_OPENAI and _resolve_provider_key("OPENROUTER_API_KEY", "openrouter"):
+                return "openrouter"
+            logger.warning(
+                "STT provider 'openrouter' configured but OPENROUTER_API_KEY not set "
+                "(or openai package missing)"
             )
             return "none"
 
@@ -2763,6 +2776,26 @@ def _dispatch_stt_provider(
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
         return _transcribe_openai(file_path, model_name)
 
+    if provider == "openrouter":
+        openrouter_cfg = stt_config.get("openrouter") or {}
+        model_name = model or openrouter_cfg.get("model") or ""
+        if not model_name:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "Set stt.openrouter.model before using OpenRouter STT.",
+            }
+        api_key = _resolve_provider_key("OPENROUTER_API_KEY", "openrouter")
+        if not api_key:
+            return {"success": False, "transcript": "", "error": "OPENROUTER_API_KEY not set"}
+        return _transcribe_openai(
+            file_path,
+            model_name,
+            api_key=api_key,
+            base_url=OPENROUTER_STT_BASE_URL,
+            provider_label="openrouter",
+        )
+
     if provider == "mistral":
         mistral_cfg = stt_config.get("mistral") or {}
         model_name = model or mistral_cfg.get("model", DEFAULT_MISTRAL_STT_MODEL)
@@ -2800,8 +2833,8 @@ def _dispatch_stt_provider(
             model_override=model,
         )
 
-    # Plugin-registered STT backend (e.g. OpenRouter, SenseAudio,
-    # Gemini-STT). Fires only when ``provider`` is neither a built-in
+    # Plugin-registered STT backend (e.g. SenseAudio, Gemini-STT). Fires only
+    # when ``provider`` is neither a built-in
     # nor ``"none"`` AND there is no same-name command provider. The
     # dispatcher enforces built-ins-always-win + command-wins-over-plugin
     # defensively. Returns None when no plugin is registered for the

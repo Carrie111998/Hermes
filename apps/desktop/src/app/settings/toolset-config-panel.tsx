@@ -44,7 +44,7 @@ interface ToolsetConfigPanelProps {
 
 /** Toolsets whose backends expose a selectable model catalog (mirrors the
  *  backend's _MODEL_CATALOG_TOOLSETS map). */
-const MODEL_CATALOG_TOOLSETS = new Set(['image_gen', 'video_gen'])
+const MODEL_CATALOG_TOOLSETS = new Set(['image_gen', 'video_gen', 'stt'])
 
 function providerConfigured(provider: ToolProvider, envState: Record<string, boolean>): boolean {
   if (provider.env_vars.length === 0) {
@@ -368,10 +368,8 @@ interface ModelCatalogPickerProps {
 
 /**
  * Backend model catalog — the GUI counterpart of the model picker `hermes
- * tools` runs after you choose an image/video generation backend (e.g. FAL's
- * multi-model catalog). Renders speed / strengths / price per model as a
- * radio-card list and persists the choice to `image_gen.model` /
- * `video_gen.model`.
+ * tools` runs after you choose a model-capable backend. Renders each model as
+ * a radio-card and persists the choice to the backend's config section.
  */
 function ModelCatalogPicker({ toolset, providerName, isActiveBackend }: ModelCatalogPickerProps) {
   const { t } = useI18n()

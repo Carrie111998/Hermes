@@ -446,6 +446,15 @@ TOOL_CATEGORIES = {
                 "stt_provider": "openai",
             },
             {
+                "name": "OpenRouter",
+                "badge": "paid · multi-model",
+                "tag": "Live transcription model catalog from openrouter.ai",
+                "env_vars": [
+                    {"key": "OPENROUTER_API_KEY", "prompt": "OpenRouter API key", "url": "https://openrouter.ai/keys"},
+                ],
+                "stt_provider": "openrouter",
+            },
+            {
                 "name": "Groq",
                 "badge": "free tier",
                 "tag": "Whisper large-v3 family — very fast",
@@ -4090,7 +4099,12 @@ def _configure_stt_model(stt_provider: str, config: dict) -> None:
     Providers without a static catalog (xai, deepinfra) skip the prompt —
     xAI has a single model and DeepInfra resolves from its live catalog.
     """
-    catalog = STT_MODEL_CATALOG.get(stt_provider)
+    if stt_provider == "openrouter":
+        from hermes_cli.models import fetch_openrouter_transcription_models
+
+        catalog = [model_id for model_id, _ in fetch_openrouter_transcription_models()]
+    else:
+        catalog = STT_MODEL_CATALOG.get(stt_provider)
     if not catalog:
         return
     stt_cfg = config.setdefault("stt", {})

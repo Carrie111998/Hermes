@@ -67,10 +67,10 @@ def _reset_registry():
 
 class TestRegistration:
     def test_happy_path(self):
-        p = _FakeProvider(name="openrouter")
+        p = _FakeProvider(name="senseaudio")
         transcription_registry.register_provider(p)
-        assert transcription_registry.get_provider("openrouter") is p
-        assert [r.name for r in transcription_registry.list_providers()] == ["openrouter"]
+        assert transcription_registry.get_provider("senseaudio") is p
+        assert [r.name for r in transcription_registry.list_providers()] == ["senseaudio"]
 
 
 
@@ -86,6 +86,7 @@ class TestRegistration:
             "xai",
             "elevenlabs",
             "deepinfra",
+            "openrouter",
         ],
     )
     def test_rejects_builtin_shadow_with_warning(self, builtin, caplog):
