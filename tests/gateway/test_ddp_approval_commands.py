@@ -17,6 +17,14 @@ from devflow_delegation.lifecycle import transition
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
+from tests.gateway.hang_guards import HANG_GUARD_S
+
+# How long a deliberately parked ledger read stays parked before giving up.
+# Not an assertion and not a speed claim: under the correct code the test
+# releases it immediately, and it exists only so that a regression (the read
+# back on the event loop, which cannot reach the release) FAILS the test
+# rather than wedging the file until pytest-timeout kills the process.
+_PARKED_READ_MAX_S = 5
 
 
 def _make_source(user_id: str = "admin-1", *, chat_type: str = "dm") -> SessionSource:
@@ -209,11 +217,22 @@ async def test_ddp_blocking_stage_read_keeps_event_loop_responsive(tmp_path, mon
     runner = _make_runner(ledger)
     entered = threading.Event()
     release = threading.Event()
+    # Set for exactly as long as the ledger read is parked. This is the
+    # ordering primitive the test turns on: "the loop ran a callback WHILE the
+    # read was in flight" is a question about state, not about elapsed time.
+    read_in_progress = threading.Event()
     original = ledger.get_request
 
     def blocking_read(*args, **kwargs):
+        read_in_progress.set()
         entered.set()
-        assert release.wait(timeout=2)
+        try:
+            # Bounded so that a REGRESSION fails the test instead of wedging
+            # the whole file — the return value is not an assertion. Under the
+            # correct code the release below arrives immediately.
+            release.wait(timeout=_PARKED_READ_MAX_S)
+        finally:
+            read_in_progress.clear()
         return original(*args, **kwargs)
 
     monkeypatch.setattr(ledger, "get_request", blocking_read)
@@ -221,10 +240,21 @@ async def test_ddp_blocking_stage_read_keeps_event_loop_responsive(tmp_path, mon
         _make_event(f"/ddp-approve {request_id} operator reviewed")
     ))
     try:
-        await asyncio.wait_for(asyncio.to_thread(entered.wait, 1), timeout=1.5)
+        await asyncio.wait_for(
+            asyncio.to_thread(entered.wait, HANG_GUARD_S), timeout=HANG_GUARD_S
+        )
+        # The read is parked right now. Schedule a loop callback and wait for
+        # it: if the read were running ON the event loop, this callback could
+        # not run until the read finished — and by then ``read_in_progress`` is
+        # clear, which is what the assertion below catches. The bound is a hang
+        # guard; the assertion after it is the test.
         ticked = asyncio.Event()
         asyncio.get_running_loop().call_soon(ticked.set)
-        await asyncio.wait_for(ticked.wait(), timeout=0.2)
+        await asyncio.wait_for(ticked.wait(), timeout=HANG_GUARD_S)
+        assert read_in_progress.is_set(), (
+            "the event loop only ticked after the ledger read had finished — "
+            "the blocking read is back on the event loop"
+        )
     finally:
         release.set()
 

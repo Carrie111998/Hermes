@@ -54,12 +54,10 @@ Deliberately NOT swept:
     kill on its FIRST test, and the same for
     test_pending_drain_no_recursion.py ("5 passed in 20.3s" -> killed).
     Both were reverted 2026-08-12.
-  * ``test_ddp_approval_commands.py`` -- ``wait_for(ticked.wait(), timeout=0.2)``
-    after a ``call_soon`` asserts the loop is not blocked by a sync ledger read.
 
-Those want a barrier or an ordering primitive, not a bigger number.
+That wants a barrier or an ordering primitive, not a bigger number.
 
-Worked example of that conversion, if you need one:
+Two worked examples of that conversion, if you need one:
 ``test_telegram_background_connect.py`` / ``test_whatsapp_background_connect.py``
 each carried two ``wait_for(runner.start(), timeout=30)`` calls whose timeout WAS
 the assertion ("start() does not block on a hung platform adapter"), boxed in
@@ -72,6 +70,20 @@ real hang guards -- semantic assertions follow them -- so they use the constant
 below. Verified both ways: green per file, and both ordering tests fail with a
 TimeoutError at the bind barrier when ``_should_connect_in_background`` is
 stubbed to ``False``.
+
+``test_ddp_approval_commands.py`` carried the other one:
+``wait_for(ticked.wait(), timeout=0.2)`` after a ``call_soon``, asserting the
+loop was not blocked by a sync ledger read. Converted 2026-08-12 by giving the
+parked read a ``read_in_progress`` threading.Event that is set for exactly as
+long as it is parked; the test schedules the callback, waits for it, and asserts
+``read_in_progress`` is STILL SET. If the read were back on the loop the
+callback could not run until the read finished, and the flag would be clear by
+then -- so the discriminator is state, not a deadline. Verified by moving the
+``asyncio.to_thread`` in ``gateway/slash_commands.py`` back onto the loop: the
+test fails with its own message ("the blocking read is back on the event loop").
+Note the parked read still needs a bound of its own (``_PARKED_READ_MAX_S``) so
+that regression FAILS rather than wedging the file -- that bound is a guard, and
+deliberately not inside an ``assert``.
 
 Verify per FILE, never by passing many files to one pytest. These files leak
 module-global state across file boundaries (``gateway/delivery_ledger._DB_LOCK``
