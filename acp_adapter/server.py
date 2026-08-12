@@ -1713,7 +1713,9 @@ class HermesACPAgent(acp.Agent):
         # fall through to the agent loop with the scaffolded body — not handled
         # as local-only static slash responses.
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
-            expanded_skill = self._expand_skill_or_bundle_slash(user_text)
+            expanded_skill = contextvars.copy_context().run(
+                self._expand_skill_or_bundle_slash, user_text, state
+            )
             if expanded_skill is not None:
                 user_text = expanded_skill
                 user_content = expanded_skill
@@ -2141,7 +2143,9 @@ class HermesACPAgent(acp.Agent):
         return commands
 
     @staticmethod
-    def _expand_skill_or_bundle_slash(text: str) -> str | None:
+    def _expand_skill_or_bundle_slash(
+        text: str, state: SessionState | None = None
+    ) -> str | None:
         """If *text* is a skill/bundle slash invoke, return expanded model message.
 
         Returns ``None`` when the command is not a skill/bundle (caller keeps
@@ -2151,6 +2155,7 @@ class HermesACPAgent(acp.Agent):
         if not raw.startswith("/"):
             return None
         try:
+            from agent.runtime_cwd import set_session_cwd
             from agent.skill_bundles import (
                 build_bundle_invocation_message,
                 resolve_bundle_command_key,
@@ -2164,12 +2169,23 @@ class HermesACPAgent(acp.Agent):
             logger.debug("skill modules unavailable for ACP slash expand", exc_info=True)
             return None
 
+        if state is not None:
+            set_session_cwd(state.cwd)
+
         # First token is the command; remainder is optional user instruction.
         parts = raw.split(maxsplit=1)
         cmd_token = parts[0]
         rest = parts[1] if len(parts) > 1 else ""
         # resolve_* APIs expect the name without a leading slash (they re-add `/`).
         bare = cmd_token.lstrip("/")
+
+        # Static Hermes/ACP commands always win over user-defined skills and
+        # bundles with the same slug. This keeps advertisement and dispatch in
+        # agreement and matches the TUI's command precedence.
+        from hermes_cli.commands import resolve_command
+
+        if resolve_command(bare) is not None:
+            return None
 
         def _as_message(payload) -> str | None:
             """Normalize skill/bundle builders (str or (msg, loaded, missing))."""
@@ -2182,18 +2198,17 @@ class HermesACPAgent(acp.Agent):
                 return msg if isinstance(msg, str) and msg.strip() else None
             return None
 
-        # Built-ins win over user bundles (TUI parity: tui_gateway/server.py).
-        # Without this, a bundle named ``help`` would shadow ACP ``/help``.
-        from hermes_cli.commands import resolve_command
-
-        bundle_key = (
-            resolve_bundle_command_key(bare)
-            if resolve_command(bare) is None
-            else None
-        )
+        bundle_key = resolve_bundle_command_key(bare)
         if bundle_key:
             try:
-                return _as_message(build_bundle_invocation_message(bundle_key, rest))
+                return _as_message(
+                    build_bundle_invocation_message(
+                        bundle_key,
+                        rest,
+                        task_id=state.session_id if state else None,
+                        platform="acp",
+                    )
+                )
             except Exception:
                 logger.warning("Failed to expand skill bundle %s", bundle_key, exc_info=True)
                 return None
@@ -2208,12 +2223,20 @@ class HermesACPAgent(acp.Agent):
                     from agent.skill_commands import build_stacked_skill_invocation_message
 
                     stacked = build_stacked_skill_invocation_message(
-                        [skill_key, *extra_keys], instruction
+                        [skill_key, *extra_keys],
+                        instruction,
+                        task_id=state.session_id if state else None,
                     )
                     msg = _as_message(stacked)
                     if msg:
                         return msg
-                return _as_message(build_skill_invocation_message(skill_key, rest))
+                return _as_message(
+                    build_skill_invocation_message(
+                        skill_key,
+                        rest,
+                        task_id=state.session_id if state else None,
+                    )
+                )
             except Exception:
                 logger.warning("Failed to expand skill %s", skill_key, exc_info=True)
                 return None

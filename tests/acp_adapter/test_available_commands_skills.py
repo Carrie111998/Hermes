@@ -10,13 +10,13 @@ on a developer-installed skill library (tests/conftest.py isolates skills/).
 from __future__ import annotations
 
 from pathlib import Path
-
 import pytest
 
 import agent.skill_bundles as skill_bundles
 import agent.skill_commands as skill_commands
 import tools.skills_tool as skills_tool
 from acp_adapter.server import HermesACPAgent
+from acp_adapter.session import SessionState
 
 # Long enough that expand assertions (len > 500) stay meaningful.
 _SKILL_BODY = (
@@ -153,6 +153,31 @@ def test_expand_skill_includes_body_and_instruction(synthetic_skill_library):
     assert "IMPORTANT" in msg
     assert "smoke-instruction-token" in msg
     assert len(msg) > 500
+
+
+def test_expand_skill_uses_acp_session_identity(
+    synthetic_skill_library, monkeypatch, tmp_path
+):
+    """Usage/provenance writes stay scoped to the ACP session and cwd."""
+    slug = synthetic_skill_library["skill"]
+    original = skill_commands.build_skill_invocation_message
+    captured = {}
+
+    def capture(*args, **kwargs):
+        captured.update(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(skill_commands, "build_skill_invocation_message", capture)
+    state = SessionState(
+        session_id="acp-session-123",
+        agent=object(),
+        cwd=str(tmp_path),
+    )
+
+    msg = HermesACPAgent._expand_skill_or_bundle_slash(f"/{slug} verify", state)
+
+    assert isinstance(msg, str)
+    assert captured["task_id"] == "acp-session-123"
 
 
 def test_expand_bundle_returns_string_message(synthetic_skill_library):
