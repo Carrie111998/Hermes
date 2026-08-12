@@ -312,3 +312,70 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
 
     assert result.status == "estimated"
     assert result.amount_usd is not None and result.amount_usd > 0
+
+
+def test_negative_pricing_sentinels_are_treated_as_unknown():
+    """OpenRouter publishes "-1" pricing sentinels for dynamically priced
+    models (e.g. openrouter/auto). Before this fix the sentinel flowed
+    straight into PricingEntry as -$1,000,000/M and produced large negative
+    session costs. Negative fields must degrade to None (unknown), and an
+    all-sentinel pricing block must yield no entry at all.
+    (Port of Kilo-Org/kilocode#13040.)
+    """
+    from agent.usage_pricing import _pricing_entry_from_metadata
+
+    all_sentinel = {
+        "openrouter/auto": {"pricing": {"prompt": "-1", "completion": "-1"}}
+    }
+    assert (
+        _pricing_entry_from_metadata(
+            all_sentinel,
+            "openrouter/auto",
+            source_url="https://example.test/models",
+            pricing_version="test",
+        )
+        is None
+    )
+
+
+def test_negative_pricing_fields_degrade_individually():
+    """A mixed pricing block keeps valid non-negative fields and drops only
+    the negative ones (including cache fields)."""
+    from decimal import Decimal
+
+    from agent.usage_pricing import _pricing_entry_from_metadata
+
+    mixed = {
+        "m": {
+            "pricing": {
+                "prompt": "-1",
+                "completion": "0.000002",
+                "cache_read": "-0.5",
+                "request": "-1",
+            }
+        }
+    }
+    entry = _pricing_entry_from_metadata(
+        mixed, "m", source_url="https://example.test/models", pricing_version="test"
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million is None
+    assert entry.output_cost_per_million == Decimal("2.000000")
+    assert entry.cache_read_cost_per_million is None
+    assert entry.request_cost is None
+
+
+def test_zero_pricing_still_produces_entry():
+    """Zero is a legitimate price (free models) and must NOT be dropped by
+    the negative-sentinel guard."""
+    from decimal import Decimal
+
+    from agent.usage_pricing import _pricing_entry_from_metadata
+
+    free = {"f": {"pricing": {"prompt": "0", "completion": "0"}}}
+    entry = _pricing_entry_from_metadata(
+        free, "f", source_url="https://example.test/models", pricing_version="test"
+    )
+    assert entry is not None
+    assert entry.input_cost_per_million == Decimal("0")
+    assert entry.output_cost_per_million == Decimal("0")

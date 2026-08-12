@@ -980,6 +980,23 @@ def _to_decimal(value: Any) -> Optional[Decimal]:
         return None
 
 
+def _to_nonnegative_decimal(value: Any) -> Optional[Decimal]:
+    """Parse a catalog pricing field, treating negative values as unknown.
+
+    Dynamic model catalogs use negative sentinels for "pricing varies":
+    OpenRouter publishes ``"-1"`` for auto-routed models (``openrouter/auto``),
+    and OpenAI-compatible endpoints mirror that convention. Multiplying a
+    sentinel through the usage ledger produces large NEGATIVE session costs
+    (-$1,000,000/M input on the auto router), so an unpriceable field must
+    degrade to "unknown" (None), never a signed price.
+    (Port of Kilo-Org/kilocode#13040.)
+    """
+    parsed = _to_decimal(value)
+    if parsed is None or parsed < 0:
+        return None
+    return parsed
+
+
 def _to_int(value: Any) -> int:
     try:
         return int(value or 0)
@@ -1138,15 +1155,17 @@ def _pricing_entry_from_metadata(
     if model_id not in metadata:
         return None
     pricing = metadata[model_id].get("pricing") or {}
-    prompt = _to_decimal(pricing.get("prompt"))
-    completion = _to_decimal(pricing.get("completion"))
-    request = _to_decimal(pricing.get("request"))
-    cache_read = _to_decimal(
+    # Negative values are dynamic-pricing sentinels (e.g. OpenRouter's "-1"
+    # on openrouter/auto), not real prices — treat them as unknown.
+    prompt = _to_nonnegative_decimal(pricing.get("prompt"))
+    completion = _to_nonnegative_decimal(pricing.get("completion"))
+    request = _to_nonnegative_decimal(pricing.get("request"))
+    cache_read = _to_nonnegative_decimal(
         pricing.get("cache_read")
         or pricing.get("cached_prompt")
         or pricing.get("input_cache_read")
     )
-    cache_write = _to_decimal(
+    cache_write = _to_nonnegative_decimal(
         pricing.get("cache_write")
         or pricing.get("cache_creation")
         or pricing.get("input_cache_write")
