@@ -18,9 +18,11 @@ import ast
 import importlib
 import json
 import logging
+import re
 import sys
 import threading
 import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set
 
@@ -798,6 +800,71 @@ class ToolRegistry:
             result_type=result_type,
         )
 
+    # ------------------------------------------------------------------
+    # Tool-name robustness (LLM call tolerance)
+    # ------------------------------------------------------------------
+    # Models routinely misremember tool names ("bash" for "terminal",
+    # "readfile" for "read_file"). Recovery is deliberately conservative:
+    # exact aliases win, then a normalized-name similarity pick that must be
+    # unambiguous (clear gap to the runner-up). Anything ambiguous falls
+    # through to the normal "Unknown tool" error so the model self-corrects.
+    _TOOL_NAME_ALIASES: Dict[str, str] = {
+        "bash": "terminal",           # opencode / Claude Code heritage
+        "shell": "terminal",
+        "execute": "terminal",
+        "execute_bash": "terminal",
+        "readfile": "read_file",
+        "writefile": "write_file",
+        "searchfile": "search_files",
+    }
+
+    _FUZZY_MIN_RATIO = 0.82   # minimum SequenceMatcher ratio to consider a pick
+    _FUZZY_MARGIN = 0.05      # required gap to the runner-up for a confident pick
+
+    @staticmethod
+    def _normalize_tool_name(name: str) -> str:
+        """Lowercase and strip non-alphanumerics for fuzzy comparison."""
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
+    def _fuzzy_resolve_tool_name(self, name: str) -> Optional[str]:
+        """Resolve a mistyped tool name to a registered name, or None."""
+        alias = self._TOOL_NAME_ALIASES.get(name.lower().strip())
+        if alias is not None:
+            return alias
+        nk = self._normalize_tool_name(name)
+        if not nk:
+            return None
+        # Prefix rule: an unambiguous prefix abbreviation ("browsernav" ->
+        # "browser_navigate") is a confident pick when exactly one candidate
+        # starts with the normalized input and the input is not tiny.
+        if len(nk) >= 4:
+            prefix_hits: List[str] = []
+            for entry in self._snapshot_entries():
+                ck = self._normalize_tool_name(entry.name)
+                if ck and ck.startswith(nk) and ck != nk:
+                    prefix_hits.append(entry.name)
+            if len(prefix_hits) == 1:
+                return prefix_hits[0]
+        best: Optional[tuple[float, str]] = None
+        second: Optional[tuple[float, str]] = None
+        for entry in self._snapshot_entries():
+            ck = self._normalize_tool_name(entry.name)
+            if not ck:
+                continue
+            if ck == nk:
+                return entry.name  # exact after normalization (readfile vs read_file)
+            ratio = SequenceMatcher(None, nk, ck).ratio()
+            pair = (ratio, entry.name)
+            if best is None or ratio > best[0]:
+                second, best = best, pair
+            elif second is None or ratio > second[0]:
+                second = pair
+        if best is None or best[0] < self._FUZZY_MIN_RATIO:
+            return None
+        if second is not None and second[0] >= best[0] - self._FUZZY_MARGIN:
+            return None  # ambiguous — don't guess
+        return best[1]
+
     def dispatch(self, name: str, args: dict, **kwargs) -> str | dict:
         """Execute a tool handler by name.
 
@@ -809,7 +876,17 @@ class ToolRegistry:
         """
         entry = self.get_entry(name)
         if not entry:
-            return tool_error(f"Unknown tool: {name}")
+            # LLM call tolerance: recover high-confidence tool-name mistakes
+            # instead of failing the call. Silent correction + log; ambiguous
+            # or low-similarity names still produce the standard error so the
+            # model can self-correct.
+            corrected = self._fuzzy_resolve_tool_name(name)
+            if corrected:
+                logger.info("Tool name corrected: %s -> %s", name, corrected)
+                entry = self.get_entry(corrected)
+            if not entry:
+                return tool_error(f"Unknown tool: {name}")
+            name = corrected
         try:
             if entry.is_async:
                 from model_tools import _run_async
