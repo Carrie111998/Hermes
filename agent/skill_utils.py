@@ -30,6 +30,7 @@ EXCLUDED_SKILL_DIRS = frozenset(
         ".github",
         ".hub",
         ".archive",
+        ".reflection_proposals",  # skill-evolution proposal queue (JSON, not skills)
         ".venv",
         "venv",
         "node_modules",
