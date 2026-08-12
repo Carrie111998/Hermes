@@ -349,23 +349,31 @@ def _wants_tui_early(argv: "list[str] | None" = None) -> bool:
 def _suppress_mouse_residue_early() -> None:
     if os.environ.get("HERMES_TUI_NO_EARLY_DISABLE") == "1":
         return
-    if not _wants_tui_early():
-        return
-    try:
-        # Skip when stdout is redirected (`hermes --tui … >log`, CI capture):
-        # the bytes can't reach the terminal anyway and would just pollute
-        # the log with raw CSI.
-        if not os.isatty(1):
-            return
-        # Disable every mouse-tracking variant we know about. Idempotent and
-        # safe to send even when no tracking is currently asserted.
-        os.write(
-            1,
-            b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
-            b"\x1b[?1006l\x1b[?1005l\x1b[?1015l\x1b[?1016l\x1b[?2029l",
-        )
-    except OSError:
-        pass
+    # Mouse-tracking residue suppression is TUI-specific: SGR/X10 mouse
+    # reports echo as ``^[[<…M`` text only during the window before the TUI
+    # takes stdin into raw mode. Skip entirely when TUI isn't wanted.
+    if _wants_tui_early():
+        try:
+            if not os.isatty(1):
+                return
+            os.write(
+                1,
+                b"\x1b[?1003l\x1b[?1002l\x1b[?1001l\x1b[?1000l\x1b[?9l"
+                b"\x1b[?1006l\x1b[?1005l\x1b[?1015l\x1b[?1016l\x1b[?2029l",
+            )
+        except OSError:
+            pass
+    # Cursor blink suppression: applies to ALL interactive sessions (CLI and
+    # TUI). The cursor-blink cycle on Windows ConPTY / Windows Terminal can
+    # leave residual screen updates (flicker artifact). Disable it once at
+    # startup rather than fighting it per-frame. Safe on all terminals: ignored
+    # by those that don't support cursor-blink control.
+    # See e.g. github/copilot-cli#1202.
+    if os.isatty(1) and os.environ.get("HERMES_NONINTERACTIVE") != "1":
+        try:
+            os.write(1, b"\x1b[?12l\x1b[?25h")
+        except OSError:
+            pass
 
 
 _suppress_mouse_residue_early()
@@ -2874,6 +2882,12 @@ def cmd_chat(args):
 def cmd_gateway(args):
     """Gateway management commands."""
     _sync_bundled_skills_quietly()
+
+    if sys.platform == "win32":
+        try:
+            _reap_orphaned_windows_gateway_processes()
+        except Exception:
+            logger.debug("Windows gateway orphan reaper skipped", exc_info=True)
 
     from hermes_cli.gateway import gateway_command
 
@@ -7593,6 +7607,7 @@ from hermes_cli.dashboard_procs import (  # noqa: F401
     _detect_concurrent_hermes_instances,
     _kill_stale_dashboard_processes,
     _scan_dashboard_processes,
+    _reap_orphaned_windows_gateway_processes,
 )
 
 def _find_stale_dashboard_pids(
@@ -11676,6 +11691,12 @@ def main():
             _recover_from_interrupted_install()
     except Exception:
         pass
+
+    if sys.platform == "win32":
+        try:
+            _reap_orphaned_windows_gateway_processes()
+        except Exception:
+            logger.debug("Windows gateway orphan reaper skipped", exc_info=True)
 
     if _try_termux_fast_tui_launch():
         return
