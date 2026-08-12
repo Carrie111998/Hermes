@@ -484,7 +484,21 @@ class ComputeHost:
             except Exception:
                 pass
             text = frame.get("text") if "text" in frame else frame.get("prompt", "")
-            server._run_prompt_submit(request_id, sid, session, text)
+            server._run_prompt_submit_compat(
+                request_id,
+                sid,
+                session,
+                text,
+                refresh_note=str(frame.get("refresh_note") or ""),
+                on_model_dispatch=lambda: self.emit(
+                    {
+                        "type": "turn.dispatched",
+                        "sid": sid,
+                        "request_id": request_id,
+                        "dispatched_ns": now_ns(),
+                    }
+                ),
+            )
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 run_thread.join()

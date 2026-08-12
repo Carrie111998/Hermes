@@ -302,12 +302,15 @@ def _(rid, params: dict) -> dict:
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
+        refresh_reservation = _claim_pending_refresh_note_locked(session)
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        isolated_response = _submit_prompt_to_compute_host(
+            rid, sid, session, text, refresh_reservation=refresh_reservation
+        )
         if not isolated_response.get("error"):
             return isolated_response
         logger.warning(
@@ -331,6 +334,10 @@ def _(rid, params: dict) -> dict:
             session["running"] = False
             session["last_active"] = time.time()
             _clear_inflight_turn(session)
+        if refresh_reservation:
+            _finish_pending_refresh_note(
+                session, refresh_reservation["token"], attempted=False
+            )
         if is_disk_full_error(exc):
             return _err(
                 rid,
@@ -364,6 +371,10 @@ def _(rid, params: dict) -> dict:
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+            if refresh_reservation:
+                _finish_pending_refresh_note(
+                    session, refresh_reservation["token"], attempted=False
+                )
             _emit("session.info", sid, _session_info(session.get("agent"), session))
             return
         with session["history_lock"]:
@@ -385,8 +396,19 @@ def _(rid, params: dict) -> dict:
                         else "Session no longer running before the agent was ready"
                     },
                 )
+                if refresh_reservation:
+                    _finish_pending_refresh_note_locked(
+                        session, refresh_reservation["token"], attempted=False
+                    )
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        _run_prompt_submit_compat(
+            rid,
+            sid,
+            session,
+            text,
+            refresh_note=str((refresh_reservation or {}).get("note") or ""),
+            refresh_reservation=refresh_reservation,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck

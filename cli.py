@@ -3147,10 +3147,26 @@ def _cprint(text: str):
     """
     _record_output_history(text)
 
+    # Redirected/captured output has no prompt_toolkit input area to protect
+    # and no ANSI terminal to render. Write directly to the live stream so a
+    # process-global prompt_toolkit/thread-routing cache cannot swallow it.
+    try:
+        if not sys.stdout.isatty():
+            print(text)
+            return
+    except Exception:
+        pass
+
+    def _write() -> None:
+        # Bind prompt_toolkit to the stream active at emission time. Its
+        # process-global output cache may otherwise retain pytest's collection
+        # capture (and similarly stale redirected streams in embedders).
+        _pt_print(_PT_ANSI(text), file=sys.stdout)
+
     try:
         from prompt_toolkit.application import get_app_or_none, run_in_terminal
     except Exception:
-        _pt_print(_PT_ANSI(text))
+        _write()
         return
 
     app = None
@@ -3164,7 +3180,7 @@ def _cprint(text: str):
     # (spinner frames, streamed tokens, tool activity prefixes, …).
     if app is None or not getattr(app, "_is_running", False):
         try:
-            _pt_print(_PT_ANSI(text))
+            _write()
         except Exception:
             # Fallback when stdout is not a real console (e.g. subprocess
             # worker logging to a file). prompt_toolkit raises
@@ -3180,7 +3196,7 @@ def _cprint(text: str):
     except Exception:
         loop = None
     if loop is None:
-        _pt_print(_PT_ANSI(text))
+        _write()
         return
 
     import asyncio as _asyncio
@@ -3196,7 +3212,7 @@ def _cprint(text: str):
         current_loop = None
     # Same thread as the app's loop → safe to print directly.
     if current_loop is loop and loop.is_running():
-        _pt_print(_PT_ANSI(text))
+        _write()
         return
 
     # Cross-thread emission: ask the app's event loop to schedule a
@@ -3217,7 +3233,7 @@ def _cprint(text: str):
         try:
             import asyncio as _aio
             import inspect as _inspect
-            coro = run_in_terminal(lambda: _pt_print(_PT_ANSI(text)))
+            coro = run_in_terminal(_write)
             if coro is not None and (_inspect.isawaitable(coro) or _inspect.iscoroutine(coro)):
                 _aio.ensure_future(coro)
             # else: run_in_terminal ran the lambda synchronously; nothing more
@@ -4786,6 +4802,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self._preload_skills_requested: list = []
         self._preload_skills_finalized = False
         self._active_session_lease = None
+        self._pending_refresh_notes = []
 
         # Voice mode state (also reinitialized inside run() for interactive TUI).
         self._voice_lock = threading.Lock()
@@ -4866,7 +4883,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             lease.release()
         except Exception:
             logger.debug("Failed to release active session slot", exc_info=True)
-        finally:
+            return
+        if getattr(self, "_active_session_lease", None) is lease:
             self._active_session_lease = None
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
@@ -10404,6 +10422,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.undo_last(_undo_n)
         elif canonical == "branch":
             self._handle_branch_command(cmd_original)
+        elif canonical == "refresh":
+            self._handle_refresh_command(cmd_original)
         elif canonical == "save":
             self.save_conversation()
         elif canonical == "cron":
@@ -14361,6 +14381,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if _srn:
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
+                _refresh_reservation = None
+                _refresh_queue = getattr(self, "_pending_refresh_notes", None)
+                if isinstance(_refresh_queue, list):
+                    for _record in _refresh_queue:
+                        if (
+                            isinstance(_record, dict)
+                            and isinstance(_record.get("token"), str)
+                            and _record.get("token")
+                            and isinstance(_record.get("note"), str)
+                            and _record.get("note")
+                            and _record.get("reserved") is False
+                        ):
+                            _record["reserved"] = True
+                            _refresh_reservation = _record
+                            agent_message = _prepend_note_to_message(
+                                agent_message, _record["note"]
+                            )
+                            break
                 # Barged mid-speech (VAD or record key)? Tell the model it was
                 # cut off — same one-shot, API-local note channel as above.
                 from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
@@ -14381,6 +14419,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self, "_pending_one_turn_model_restore", None
                 )
                 self._pending_one_turn_model_restore = None
+                _refresh_committed = False
+
+                def _on_model_attempt() -> None:
+                    nonlocal _refresh_committed
+                    if _refresh_committed or _refresh_reservation is None:
+                        return
+                    try:
+                        _refresh_queue.remove(_refresh_reservation)
+                    except ValueError:
+                        pass
+                    _refresh_committed = True
+
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
@@ -14389,7 +14439,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        on_model_attempt=_on_model_attempt,
                     )
+                    if _refresh_reservation is not None and not _refresh_committed:
+                        _refresh_reservation["reserved"] = False
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
                         for _key, _value in _restore.items():
@@ -14399,6 +14452,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._pending_moa_restore_model = None
                         self._pending_moa_disable_after_turn = False
                 except Exception as exc:
+                    if _refresh_reservation is not None and not _refresh_committed:
+                        _refresh_reservation["reserved"] = False
                     logging.error("run_conversation raised: %s", exc, exc_info=True)
                     _summary = getattr(self.agent, '_summarize_api_error', lambda e: str(e)[:300])(exc)
                     result = {

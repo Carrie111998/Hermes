@@ -92,6 +92,7 @@ interface HarnessHandle {
 
 function Harness({
   activeSessionIdRef: activeSessionIdRefProp,
+  branchCurrentSession,
   busyRef,
   getRoutedStoredSessionId,
   getRuntimeIdForStoredSession,
@@ -110,6 +111,7 @@ function Harness({
   createBackendSessionForSend
 }: {
   activeSessionIdRef?: MutableRefObject<string | null>
+  branchCurrentSession?: () => Promise<boolean>
   busyRef?: MutableRefObject<boolean>
   getRoutedStoredSessionId?: () => null | string
   getRuntimeIdForStoredSession?: (storedSessionId: string) => null | string
@@ -153,7 +155,7 @@ function Harness({
   const actions = usePromptActions({
     activeSessionId: activeSessionId === undefined ? RUNTIME_SESSION_ID : activeSessionId,
     activeSessionIdRef,
-    branchCurrentSession: async () => true,
+    branchCurrentSession: branchCurrentSession ?? (async () => true),
     busyRef: localBusyRef,
     createBackendSessionForSend: createBackendSessionForSend ?? (async () => RUNTIME_SESSION_ID),
     getRoutedStoredSessionId: getRoutedStoredSessionId ?? (() => null),
@@ -310,6 +312,107 @@ describe('usePromptActions /title', () => {
     )
     expect(refreshSessions).not.toHaveBeenCalled()
     expect($sessions.get()[0]?.title).toBe('Old title')
+  })
+})
+
+describe('usePromptActions /refresh --branch', () => {
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('consumes the refresh flag before invoking native branch behavior', async () => {
+    const branchCurrentSession = vi.fn(async () => true)
+    let resolveDispatch!: (value: { type: 'alias'; target: 'branch'; arg: string }) => void
+    let resolveCatalog!: (value: { pairs: [string, string][] }) => void
+
+    const dispatchDone = new Promise<{ type: 'alias'; target: 'branch'; arg: string }>(resolve => {
+      resolveDispatch = resolve
+    })
+
+    const catalogDone = new Promise<{ pairs: [string, string][] }>(resolve => {
+      resolveCatalog = resolve
+    })
+
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        throw new Error('slash worker unavailable')
+      }
+
+      if (method === 'command.dispatch') {
+        return dispatchDone as never
+      }
+
+      if (method === 'commands.catalog') {
+        return catalogDone as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        branchCurrentSession={branchCurrentSession}
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    const submission = handle!.submitText('/refresh --branch')
+
+    await vi.waitFor(() => {
+      expect(requestGateway).toHaveBeenCalledWith('command.dispatch', {
+        arg: '--branch',
+        name: 'refresh',
+        session_id: RUNTIME_SESSION_ID
+      })
+    })
+    expect(requestGateway).not.toHaveBeenCalledWith('commands.catalog', expect.anything())
+    expect(branchCurrentSession).not.toHaveBeenCalled()
+
+    resolveDispatch({ type: 'alias', target: 'branch', arg: '' })
+    await vi.waitFor(() => {
+      expect(requestGateway).toHaveBeenCalledWith('commands.catalog', { session_id: RUNTIME_SESSION_ID })
+    })
+    expect(branchCurrentSession).not.toHaveBeenCalled()
+
+    resolveCatalog({ pairs: [['/fresh-skill', 'fresh']] })
+    await submission
+    expect(branchCurrentSession).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenCalledWith('commands.catalog', { session_id: RUNTIME_SESSION_ID })
+  })
+
+  it('refetches the command catalog immediately after a soft refresh', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'slash.exec') {
+        throw new Error('slash worker unavailable')
+      }
+
+      if (method === 'command.dispatch') {
+        return { type: 'exec', output: 'Refreshed.' } as never
+      }
+
+      if (method === 'commands.catalog') {
+        return { pairs: [['/fresh-skill', 'fresh']] } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+      />
+    )
+
+    await handle!.submitText('/refresh')
+
+    expect(requestGateway).toHaveBeenCalledWith('commands.catalog', { session_id: RUNTIME_SESSION_ID })
   })
 })
 

@@ -212,6 +212,68 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     runner._post_turn_goal_continuation.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_full_dispatch_lease_rejection_rolls_back_refresh_for_exactly_one_resend(
+    monkeypatch, tmp_path
+):
+    """The authoritative lease rejection must not consume refresh context."""
+    from datetime import timedelta
+    from tests.gateway.test_42039_duplicate_user_message import _bootstrap, _event
+
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._turn_leases = SessionTurnLeaseRegistry()
+    session_key = "agent:main:telegram:group:-1001:12345"
+    first_event = _event()
+    runner._pending_refresh_notes = {
+        session_key: [
+            {
+                "token": "refresh-token",
+                "note": "REFRESH-NOTE",
+                "after": first_event.timestamp - timedelta(seconds=1),
+                "generation": 1,
+                "reserved_by": None,
+            }
+        ]
+    }
+    generations = iter([1, 2, 3])
+    runner._begin_session_run_generation = lambda _key: next(generations)
+    holder = await runner._turn_leases.acquire(
+        "sess-dedup", owner_key="holder-key", generation=99, timeout=1
+    )
+    monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
+    runner._set_session_env = MagicMock(return_value=object())
+    runner._clear_session_env = MagicMock()
+    runner._post_turn_goal_continuation = AsyncMock()
+
+    rejected = await runner._handle_message(first_event)
+    assert "resend" in rejected.lower()
+    assert runner._pending_refresh_notes[session_key][0]["reserved_by"] is None
+
+    assert runner._turn_leases.release(holder)
+    async def run_attempted(**kwargs):
+        kwargs["on_model_attempt"]()
+        return {
+            "final_response": "done",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    runner._run_agent = AsyncMock(side_effect=run_attempted)
+    resend = _event()
+    resend.message_id = "msg-resend"
+    await runner._handle_message(resend)
+
+    dispatched = runner._run_agent.await_args.kwargs["message"]
+    assert dispatched.startswith("REFRESH-NOTE\n\nhello world")
+    assert session_key not in runner._pending_refresh_notes
+
+    third = _event()
+    third.message_id = "msg-third"
+    await runner._handle_message(third)
+    assert runner._run_agent.await_args_list[-1].kwargs["message"] == "hello world"
+
+
 # ---------------------------------------------------------------------------
 # Bounded registry
 # ---------------------------------------------------------------------------

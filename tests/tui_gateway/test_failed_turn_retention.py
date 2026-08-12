@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import threading
 import types
+import sys
 
 import pytest
 
@@ -187,6 +188,104 @@ def test_completed_turn_still_clears_inflight(emits, turn_env):
     assert completes[0]["status"] == "complete"
     assert "error" not in completes[0]
     assert server._inflight_snapshot(session) is None
+
+
+def test_refresh_reservation_rolls_back_on_context_rejection_and_retry_dispatches_once(
+    monkeypatch, emits, turn_env
+):
+    calls = []
+    def run_conversation(prompt, *, on_model_attempt, **kwargs):
+        on_model_attempt()
+        calls.append(prompt)
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        model="test/model",
+        base_url="",
+        api_key="",
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._queue_pending_refresh_note(session, "REFRESH-NOTE")
+    reservation = server._claim_pending_refresh_note(session)
+    fake_ctx = types.ModuleType("agent.context_references")
+    fake_ctx.preprocess_context_references = lambda *_a, **_k: types.SimpleNamespace(
+        blocked=True, message="", warnings=["blocked"], references=[], injected_tokens=0
+    )
+    fake_meta = types.ModuleType("agent.model_metadata")
+    fake_meta.get_model_context_length = lambda *_a, **_k: 100000
+    monkeypatch.setitem(sys.modules, "agent.context_references", fake_ctx)
+    monkeypatch.setitem(sys.modules, "agent.model_metadata", fake_meta)
+
+    server._run_prompt_submit(
+        "rid", "sid", session, "@blocked", refresh_reservation=reservation
+    )
+    assert calls == []
+    assert session["pending_refresh_notes"][0]["reserved"] is False
+
+    fake_ctx.preprocess_context_references = lambda *_a, **_k: types.SimpleNamespace(
+        blocked=False, message="expanded", warnings=[], references=[], injected_tokens=0
+    )
+    session["running"] = True
+    retry = server._claim_pending_refresh_note(session)
+    server._run_prompt_submit(
+        "rid-2", "sid", session, "@retry", refresh_reservation=retry
+    )
+    assert calls == ["REFRESH-NOTE\n\nexpanded"]
+    assert "pending_refresh_notes" not in session
+
+
+def test_refresh_reservation_rolls_back_on_image_preprocessing_failure_then_retries(
+    monkeypatch, emits, turn_env
+):
+    calls = []
+    def run_conversation(prompt, *, on_model_attempt, **kwargs):
+        on_model_attempt()
+        calls.append(prompt)
+        return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        model="text-only",
+        provider="test",
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+    )
+    session = _session(agent=agent, running=True)
+    server._queue_pending_refresh_note(session, "REFRESH-NOTE")
+    reservation = server._claim_pending_refresh_note(session)
+    monkeypatch.setattr(
+        server,
+        "_enrich_with_attached_images",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("vision rejected")),
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "inspect",
+        image_paths=["/tmp/image.png"],
+        refresh_reservation=reservation,
+    )
+    assert calls == []
+    assert session["pending_refresh_notes"][0]["reserved"] is False
+
+    monkeypatch.setattr(server, "_enrich_with_attached_images", lambda *_a, **_k: "vision text")
+    session["running"] = True
+    retry = server._claim_pending_refresh_note(session)
+    server._run_prompt_submit(
+        "rid-2",
+        "sid",
+        session,
+        "inspect",
+        image_paths=["/tmp/image.png"],
+        refresh_reservation=retry,
+    )
+    assert calls == ["REFRESH-NOTE\n\nvision text"]
+    assert "pending_refresh_notes" not in session
 
 
 # ── Exception path ─────────────────────────────────────────────────────

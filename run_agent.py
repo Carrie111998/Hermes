@@ -7904,6 +7904,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        on_model_attempt: Optional[callable] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -7998,6 +7999,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    on_model_attempt=on_model_attempt,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
@@ -8079,10 +8081,11 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
+        on_model_attempt: Optional[callable] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory, on_model_attempt=on_model_attempt)
 
 def main(
     query: str = None,

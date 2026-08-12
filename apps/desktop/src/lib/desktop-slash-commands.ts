@@ -168,6 +168,12 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     aliases: ['/fork'],
     surface: action('branch')
   },
+  {
+    name: '/refresh',
+    description: 'Reload skills and current memory without restarting',
+    surface: exec(),
+    argumentMode: 'text'
+  },
   { name: '/yolo', description: 'Toggle YOLO — auto-approve dangerous commands', surface: action('yolo') },
   {
     name: '/wake',

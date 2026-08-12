@@ -682,6 +682,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    on_model_attempt: Optional[callable] = None,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -754,6 +755,8 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
+        if on_model_attempt is not None:
+            on_model_attempt()
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")

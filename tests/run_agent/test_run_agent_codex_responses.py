@@ -877,6 +877,34 @@ def test_codex_final_preflight_bounds_middleware_cache_key(monkeypatch):
     assert len(captured["prompt_cache_key"]) <= 64
 
 
+def test_model_attempt_fires_only_after_final_codex_preflight(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "_disable_streaming", True)
+    attempts = []
+    transport = agent._get_transport()
+    original = transport.preflight_kwargs
+    calls = 0
+
+    def fail_final_preflight(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("final preflight rejected request")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(transport, "preflight_kwargs", fail_final_preflight)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda _kwargs: pytest.fail("provider transport must not run"),
+    )
+
+    result = agent.run_conversation("Say OK", on_model_attempt=lambda: attempts.append(1))
+
+    assert result["failed"] is True
+    assert attempts == []
+
+
 def test_run_conversation_codex_empty_output_with_output_text(monkeypatch):
     """Regression: empty response.output + valid output_text should succeed,
     not trigger retry/fallback. The validation stage must defer to

@@ -8,10 +8,12 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Dict, Optional
 
-from hermes_constants import display_hermes_home
+from hermes_constants import display_hermes_home, get_hermes_home
 from agent.prompt_cache_boundary import register_stable_prefix
 from agent.skill_preprocessing import (
     expand_inline_shell as _expand_inline_shell,
@@ -23,6 +25,11 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_key: tuple[str, Optional[str]] | None = None
+_skill_commands_cache: dict[
+    tuple[str, Optional[str]], MappingProxyType
+] = {}
+_skill_commands_lock = threading.RLock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -199,13 +206,38 @@ def _resolve_skill_commands_platform() -> Optional[str]:
     try:
         from gateway.session_context import get_session_env
 
+        # A live gateway process can serve several adapters concurrently. Its
+        # per-task session scope is authoritative over any inherited process
+        # hint, which may describe the adapter that happened to start first.
         resolved_platform = (
-            os.getenv("HERMES_PLATFORM")
-            or get_session_env("HERMES_SESSION_PLATFORM")
+            get_session_env("HERMES_SESSION_PLATFORM")
+            or os.getenv("HERMES_PLATFORM")
         )
     except Exception:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
+
+
+def _skill_commands_cache_key() -> tuple[str, Optional[str]]:
+    """Return the active profile-home and platform discovery scope."""
+    return (str(get_hermes_home().resolve()), _resolve_skill_commands_platform())
+
+
+def _immutable_skill_commands(
+    commands: Dict[str, Dict[str, Any]],
+) -> MappingProxyType:
+    """Freeze a fully-built catalog before publishing it to shared readers."""
+    return MappingProxyType(
+        {
+            key: MappingProxyType(dict(value))
+            for key, value in commands.items()
+        }
+    )
+
+
+def _copy_skill_commands(commands) -> Dict[str, Dict[str, Any]]:
+    """Return an API-compatible mutable copy of an immutable cache snapshot."""
+    return {key: dict(value) for key, value in commands.items()}
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
@@ -405,11 +437,17 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands = {}
+    global _skill_commands, _skill_commands_platform, _skill_commands_key
+    cache_key = _skill_commands_cache_key()
+    commands: Dict[str, Dict[str, Any]] = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import (
+            _get_disabled_skill_names,
+            _parse_frontmatter,
+            _skills_dir,
+            skill_matches_environment,
+            skill_matches_platform,
+        )
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
@@ -417,8 +455,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         # Scan local dir first, then external dirs
         dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        # Resolve live from the active profile. The helper also preserves the
+        # documented explicit SKILLS_DIR override seam used by plugins/tests.
+        skills_dir = _skills_dir()
+        if skills_dir.exists():
+            dirs_to_scan.append(skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
@@ -475,14 +516,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
+                    if cmd_key in commands:
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
+                            name, cmd_key, commands[cmd_key]["name"],
                         )
                         continue
-                    _skill_commands[cmd_key] = {
+                    commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -492,7 +533,16 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+    snapshot = _immutable_skill_commands(commands)
+    # Publish only after the complete profile/platform catalog exists. Readers
+    # can therefore observe the old snapshot or the new one, never a partially
+    # cleared/populated dictionary.
+    with _skill_commands_lock:
+        _skill_commands_cache[cache_key] = snapshot
+        _skill_commands_key = cache_key
+        _skill_commands_platform = cache_key[1]
+        _skill_commands = _copy_skill_commands(snapshot)
+    return _copy_skill_commands(snapshot)
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -502,12 +552,15 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     process serving Telegram and Discord concurrently) so each platform
     sees its own ``skills.platform_disabled`` view (#14536).
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
-    return _skill_commands
+    cache_key = _skill_commands_cache_key()
+    with _skill_commands_lock:
+        snapshot = _skill_commands_cache.get(cache_key)
+        # Preserve the long-standing test/plugin reset convention of assigning
+        # an empty dict to the compatibility mirror to force a fresh scan.
+        force_scan = not _skill_commands and _skill_commands_key == cache_key
+    if snapshot is None or force_scan:
+        return scan_skill_commands()
+    return _copy_skill_commands(snapshot)
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -549,10 +602,13 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
-    before = _snapshot(_skill_commands)
+    cache_key = _skill_commands_cache_key()
+    with _skill_commands_lock:
+        previous = _skill_commands_cache.get(cache_key)
+    before = _snapshot(previous or {})
 
-    # Rescan the skills dir. ``scan_skill_commands`` resets
-    # ``_skill_commands = {}`` internally and repopulates it.
+    # Rescan the active profile/platform scope and atomically replace its
+    # immutable snapshot.
     new_commands = scan_skill_commands()
 
     after = _snapshot(new_commands)

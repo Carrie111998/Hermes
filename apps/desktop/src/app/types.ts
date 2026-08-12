@@ -126,6 +126,7 @@ export interface ExecCommandDispatchResponse {
 export interface AliasCommandDispatchResponse {
   type: 'alias'
   target: string
+  arg?: string
 }
 
 export interface SkillCommandDispatchResponse {

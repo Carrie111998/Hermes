@@ -516,6 +516,73 @@ describe('createSlashHandler', () => {
     expect(ctx.transcript.setHistoryItems).not.toHaveBeenCalled()
   })
 
+  it('consumes /refresh --branch before reusing native branch behavior', async () => {
+    patchUiState({ sid: 'sid-parent' })
+    let resolveDispatch!: (value: { type: string; target: string; arg: string }) => void
+    let resolveCatalog!: (value: { canon: Record<string, string>; pairs: [string, string][] }) => void
+
+    const dispatchDone = new Promise<{ type: string; target: string; arg: string }>(resolve => {
+      resolveDispatch = resolve
+    })
+
+    const catalogDone = new Promise<{ canon: Record<string, string>; pairs: [string, string][] }>(resolve => {
+      resolveCatalog = resolve
+    })
+
+    const request = vi.fn((method: string) => {
+      if (method === 'slash.exec') {
+        return Promise.reject(new Error('worker unavailable'))
+      }
+
+      if (method === 'command.dispatch') {
+        return dispatchDone
+      }
+
+      return Promise.resolve({})
+    })
+
+    const rpc = vi.fn((method: string) => {
+      if (method === 'command.dispatch') {
+        return Promise.resolve({ type: 'alias', target: 'branch', arg: '' })
+      }
+
+      if (method === 'session.branch') {
+        return Promise.resolve({ session_id: 'sid-branch', title: 'Branch' })
+      }
+
+      if (method === 'commands.catalog') {
+        return catalogDone
+      }
+
+      return Promise.resolve({})
+    })
+
+    const ctx = buildCtx({ gateway: { gw: { getLogTail: vi.fn(() => ''), request }, rpc } })
+
+    expect(createSlashHandler(ctx)('/refresh --branch')).toBe(true)
+
+    expect(rpc).toHaveBeenCalledWith('command.dispatch', {
+      arg: '--branch',
+      name: 'refresh',
+      session_id: 'sid-parent'
+    })
+    expect(rpc).not.toHaveBeenCalledWith('commands.catalog', expect.anything())
+    expect(rpc).not.toHaveBeenCalledWith('session.branch', expect.anything())
+
+    resolveDispatch({ type: 'alias', target: 'branch', arg: '' })
+    await vi.waitFor(() => {
+      expect(rpc).toHaveBeenCalledWith('commands.catalog', { session_id: 'sid-parent' })
+    })
+    expect(rpc).not.toHaveBeenCalledWith('session.branch', expect.anything())
+
+    resolveCatalog({ canon: { '/fresh': '/fresh' }, pairs: [['/fresh', 'fresh']] })
+    await vi.waitFor(() => {
+      expect(rpc).toHaveBeenCalledWith('session.branch', { name: '', session_id: 'sid-parent' })
+      expect(ctx.local.setCatalog).toHaveBeenCalledWith(expect.objectContaining({ canon: { '/fresh': '/fresh' } }))
+    })
+    expect(rpc).not.toHaveBeenCalledWith('session.branch', { name: '--branch', session_id: 'sid-parent' })
+  })
+
   it('reloads skills in the live gateway and refreshes the catalog', async () => {
     const rpc = vi.fn((method: string) => {
       if (method === 'skills.reload') {
@@ -541,6 +608,35 @@ describe('createSlashHandler', () => {
       )
     })
     expect(ctx.gateway.gw.request).not.toHaveBeenCalled()
+  })
+
+  it('soft-refreshes through the backend and replaces the live command catalog', async () => {
+    const rpc = vi.fn((method: string) => {
+      if (method === 'command.dispatch') {
+        return Promise.resolve({ type: 'exec', output: 'Refreshed.' })
+      }
+
+      if (method === 'commands.catalog') {
+        return Promise.resolve({ canon: { '/fresh-skill': '/fresh-skill' }, pairs: [['/fresh-skill', 'fresh']] })
+      }
+
+      return Promise.resolve({})
+    })
+
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    createSlashHandler(ctx)('/refresh')
+
+    expect(rpc).toHaveBeenCalledWith('command.dispatch', {
+      arg: '',
+      name: 'refresh',
+      session_id: null
+    })
+    await vi.waitFor(() => {
+      expect(ctx.local.setCatalog).toHaveBeenCalledWith(
+        expect.objectContaining({ canon: { '/fresh-skill': '/fresh-skill' } })
+      )
+    })
   })
 
   // Regressions from Copilot review on #19835: /voice output + frontend

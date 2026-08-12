@@ -10,13 +10,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-_original_stdout = sys.stdout
-
-
 @pytest.fixture(autouse=True)
 def _restore_stdout():
+    original_stdout = sys.stdout
     yield
-    sys.stdout = _original_stdout
+    sys.stdout = original_stdout
 
 
 @pytest.fixture()
@@ -40,7 +38,6 @@ def server():
     # ("slash.exec", "fast.ping", ...) directly in the module-level dict,
     # which is shared with every other test file in the process.
     methods = dict(mod._methods)
-    real_stdout = mod._real_stdout
     yield mod
     # Reset module-level state without re-importing. importlib.reload
     # would re-register the module's atexit hooks (ThreadPoolExecutor
@@ -50,7 +47,9 @@ def server():
     # test a clean slate.
     mod._methods.clear()
     mod._methods.update(methods)
-    mod._real_stdout = real_stdout
+    # Never restore a capture stream retained from module import/collection;
+    # pytest installs a fresh stream for each test phase.
+    mod._real_stdout = sys.stdout
     for sid in list(mod._sessions):
         mod._close_session_by_id(sid, end_reason="test_cleanup")
     mod._pending.clear()
@@ -88,6 +87,130 @@ def test_shared_fixture_cleanup_uses_full_session_teardown(server, monkeypatch):
 
     assert server._sessions == {}
     assert closed == {"worker": 1, "agent": 1, "lease": 1}
+
+
+def test_release_slot_retains_exact_lease_until_retry_succeeds(server):
+    class _Lease:
+        def __init__(self):
+            self.calls = 0
+
+        def release(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise OSError("transient")
+
+    lease = _Lease()
+    session = {"active_session_lease": lease}
+    server._release_active_session_slot(session)
+    assert session["active_session_lease"] is lease
+    server._release_active_session_slot(session)
+    assert "active_session_lease" not in session
+    assert lease.calls == 2
+
+
+def test_release_slot_retries_transient_registry_write_with_temp_home(
+    server, tmp_path, monkeypatch
+):
+    from hermes_cli import active_sessions
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="retry-tui",
+        surface="desktop",
+        config={"max_concurrent_sessions": 1},
+    )
+    assert message is None and lease is not None
+    session = {"active_session_lease": lease}
+    real_write = active_sessions._write_entries
+    calls = 0
+
+    def fail_once(path, entries):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("transient registry write failure")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_once)
+    server._release_active_session_slot(session)
+    assert session["active_session_lease"] is lease
+    server._release_active_session_slot(session)
+    assert session == {}
+    assert active_sessions.active_session_registry_snapshot() == []
+
+
+def test_public_close_then_prompt_immediately_recovers_slot_after_transient_release_failure(
+    server, tmp_path, monkeypatch
+):
+    from hermes_cli import active_sessions
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_concurrent_sessions": 1})
+    old = {"session_key": "old-key", "history": [], "history_lock": threading.Lock(),
+           "running": False, "attached_images": []}
+    new = {"session_key": "new-key", "history": [], "history_lock": threading.Lock(),
+           "running": False, "attached_images": [], "agent": object()}
+    lease, message = server._claim_active_session_slot(
+        "old-key", live_session_id="old", surface="desktop"
+    )
+    assert message is None and lease is not None
+    old["active_session_lease"] = lease
+    server._sessions.update({"old": old, "new": new})
+    real_write = active_sessions._write_entries
+    writes = 0
+
+    def fail_once(path, entries):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise OSError("transient registry write failure")
+        return real_write(path, entries)
+
+    monkeypatch.setattr(active_sessions, "_write_entries", fail_once)
+    monkeypatch.setattr(server, "_teardown_session", lambda session, **kwargs:
+                        server._release_active_session_slot(session))
+    closed = server._methods["session.close"]("close", {"session_id": "old"})
+    assert closed["result"]["closed"] is True
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *args, **kwargs: None)
+    response = server._methods["prompt.submit"](
+        "prompt", {"session_id": "new", "text": "hello"}
+    )
+    assert response["result"]["status"] == "streaming"
+    entries = active_sessions.active_session_registry_snapshot()
+    assert [entry["session_id"] for entry in entries] == ["new-key"]
+    assert new["active_session_lease"].lease_id == entries[0]["lease_id"]
+
+
+def test_transfer_retries_failed_old_lease_on_next_cleanup(server, monkeypatch):
+    class _Lease:
+        def __init__(self, fail=False):
+            self.fail = fail
+            self.calls = 0
+
+        def release(self):
+            self.calls += 1
+            if self.fail:
+                self.fail = False
+                raise OSError("transient")
+
+    old = _Lease(fail=True)
+    new = _Lease()
+    session = {"active_session_lease": old}
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (new, None))
+    monkeypatch.setattr("hermes_cli.active_sessions.transfer_active_session", lambda *a, **k: False)
+
+    assert server._transfer_active_session_slot("sid", session, new_session_id="new")
+    assert session["active_session_lease"] is new
+    assert session["_pending_active_session_leases"] == [old]
+    server._release_active_session_slot(session)
+    assert "active_session_lease" not in session
+    assert "_pending_active_session_leases" not in session
+    assert old.calls == 2 and new.calls == 1
 
 
 @pytest.fixture()
@@ -739,4 +862,3 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-

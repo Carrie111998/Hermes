@@ -31,6 +31,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -3654,6 +3655,21 @@ def _normalize_empty_agent_response(
     return response
 
 
+def _validated_actual_model_attempt(result: Any) -> bool:
+    """Fail-closed validator for legacy agent completion metadata."""
+    if type(result) is not dict:
+        return False
+    attempted = result.get("model_attempted")
+    if type(attempted) is bool and attempted:
+        return True
+    calls = result.get("api_calls")
+    if type(calls) is int:
+        return calls > 0
+    if type(calls) is float:
+        return math.isfinite(calls) and calls.is_integer() and calls > 0
+    return False
+
+
 def _is_gateway_hidden_reasoning_incomplete_turn(agent_result: dict) -> bool:
     """Detect retry-exhausted turns with hidden reasoning but no visible answer.
 
@@ -5620,7 +5636,20 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            try:
+                _run_params = inspect.signature(agent.run_conversation).parameters
+            except (TypeError, ValueError):
+                _run_params = {}
+            _supports_attempt_callback = "on_model_attempt" in _run_params
+            if _supports_attempt_callback and ctx.on_model_attempt is not None:
+                _conversation_kwargs["on_model_attempt"] = ctx.on_model_attempt
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            if (
+                not _supports_attempt_callback
+                and ctx.on_model_attempt is not None
+                and _validated_actual_model_attempt(result)
+            ):
+                ctx.on_model_attempt()
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
@@ -15976,6 +16005,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "branch":
             return await self._handle_branch_command(event)
 
+        if canonical == "refresh":
+            return await self._handle_refresh_command(event)
+
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
 
@@ -16339,15 +16371,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _quick_key,
             )
             return _limit_message
-        _claim_state = self._session_state(_quick_key)
-        if _active_session_lease is not None:
-            _claim_state.turn.lease = _active_session_lease
-        _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
-        _claim_state.turn.started_ts = time.time()
-        self._persist_active_agents()
-        _run_generation = self._begin_session_run_generation(_quick_key)
-
+        _run_generation = 0
+        refresh_reservation = None
         try:
+            _claim_state = self._session_state(_quick_key)
+            if _active_session_lease is not None:
+                _claim_state.turn.lease = _active_session_lease
+            _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
+            _claim_state.turn.started_ts = time.time()
+            self._persist_active_agents()
+            _run_generation = self._begin_session_run_generation(_quick_key)
+
+            # Claim refresh context only for a genuine inbound user event accepted
+            # after the command. Event timestamps keep an older FIFO entry from
+            # stealing the note; generation keeps an already-running turn out.
+            if not is_internal:
+                refresh_reservation = self._claim_refresh_context_note(
+                    _quick_key, event, _run_generation
+                )
+                if refresh_reservation:
+                    event.metadata["refresh_context_note"] = refresh_reservation["note"]
+                    event.metadata["refresh_context_token"] = refresh_reservation["token"]
+
             try:
                 _agent_result = await self._handle_message_with_agent(
                     event, source, _quick_key, _run_generation
@@ -16398,6 +16443,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
             return _agent_result
         finally:
+            try:
+                if not (getattr(event, "metadata", None) or {}).get(
+                    "refresh_context_note_committed"
+                ):
+                    _refresh_token = str(
+                        (getattr(event, "metadata", None) or {}).get(
+                            "refresh_context_token"
+                        )
+                        or (refresh_reservation or {}).get("token")
+                        or ""
+                    )
+                    self._finish_refresh_context_note(
+                        _quick_key,
+                        _refresh_token,
+                        _run_generation,
+                        attempted=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "Failed to roll back refresh context during turn cleanup",
+                    exc_info=True,
+                )
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
             # (_moa_restore_override), which is discarded once the event goes
@@ -16406,12 +16473,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # permanently (every later message silently fans out through MoA).
             # Putting it in finally guarantees the revert on success, exception,
             # and interrupt alike.
-            self._restore_moa_one_shot(event, _quick_key)
-            self._restore_pending_one_turn_model_override(_quick_key)
+            try:
+                self._restore_moa_one_shot(event, _quick_key)
+            except Exception:
+                logger.warning(
+                    "Failed to restore MoA one-shot override during turn cleanup",
+                    exc_info=True,
+                )
+            try:
+                self._restore_pending_one_turn_model_override(_quick_key)
+            except Exception:
+                logger.warning(
+                    "Failed to restore one-turn model override during turn cleanup",
+                    exc_info=True,
+                )
             # Normal completion/exception/interrupt owns and clears this exact
             # durable marker.  SIGKILL/OOM skips finally, leaving the marker for
             # the next unclean startup's recovery pass.
-            await self._clear_durable_active_turn(event)
+            try:
+                await self._clear_durable_active_turn(event)
+            except Exception:
+                logger.warning(
+                    "Failed to clear durable active turn during turn cleanup",
+                    exc_info=True,
+                )
             # Unconditional release covers every exit path. _release_running_agent_state
             # is idempotent (pop-on-absent is harmless) and, called without a
             # run_generation guard, always clears the slot regardless of which
@@ -16419,11 +16504,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            try:
+                self._release_running_agent_state(_quick_key)
+            except Exception:
+                logger.warning(
+                    "Failed to release running agent state during turn cleanup",
+                    exc_info=True,
+                )
+            # If setup failed before the lease was attached to SessionState,
+            # the normal state release above cannot see it. ActiveSessionLease
+            # release is idempotent, so this also safely covers attached leases.
+            if _active_session_lease is not None:
+                try:
+                    _active_session_lease.release()
+                except Exception:
+                    logger.warning(
+                        "Failed to release active session lease during turn cleanup",
+                        exc_info=True,
+                    )
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
-            self._release_turn_lease(_quick_key, _run_generation)
+            try:
+                self._release_turn_lease(_quick_key, _run_generation)
+            except Exception:
+                logger.warning(
+                    "Failed to release turn lease during turn cleanup",
+                    exc_info=True,
+                )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -18310,8 +18418,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
             _turn_started_monotonic = time.monotonic()
+            refresh_context_note = str(
+                (getattr(event, "metadata", None) or {}).get("refresh_context_note") or ""
+            )
+            agent_message_text = (
+                refresh_context_note + "\n\n" + message_text
+                if refresh_context_note
+                else message_text
+            )
+            _attempt_lock = threading.Lock()
+
+            def _on_model_attempt() -> None:
+                with _attempt_lock:
+                    if event.metadata.get("refresh_context_note_committed"):
+                        return
+                    if refresh_context_note:
+                        self._finish_refresh_context_note(
+                            session_key,
+                            str(event.metadata.get("refresh_context_token") or ""),
+                            run_generation,
+                            attempted=True,
+                        )
+                    event.metadata["refresh_context_note_committed"] = True
+
             agent_result = await self._run_agent(
-                message=message_text,
+                message=agent_message_text,
                 context_prompt=context_prompt,
                 history=history,
                 source=source,
@@ -18324,6 +18455,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                on_model_attempt=_on_model_attempt,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -19056,6 +19188,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Try again or use /reset to start a fresh session."
             )
         finally:
+            if not (getattr(event, "metadata", None) or {}).get(
+                "refresh_context_note_committed"
+            ):
+                self._finish_refresh_context_note(
+                    _quick_key,
+                    str((getattr(event, "metadata", None) or {}).get("refresh_context_token") or ""),
+                    run_generation,
+                    attempted=False,
+                )
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
@@ -23910,6 +24051,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if isinstance(pending_skills_reload_notes, dict):
             pending_skills_reload_notes.pop(session_key, None)
 
+        pending_refresh_notes = getattr(self, "_pending_refresh_notes", None)
+        if isinstance(pending_refresh_notes, dict):
+            pending_refresh_notes.pop(session_key, None)
+
         _sec_state = self._peek_session_state(session_key)
         if _sec_state is not None:
             _sec_state.persistent.approvals = None
@@ -24955,6 +25100,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        on_model_attempt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -25106,6 +25252,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             _timeout = ClientTimeout(total=0, sock_read=1800)
             async with _AioClientSession(timeout=_timeout) as session:
+                if on_model_attempt is not None:
+                    on_model_attempt()
                 async with session.post(
                     f"{proxy_url}/v1/chat/completions",
                     json=body,
@@ -25246,6 +25394,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        on_model_attempt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25264,7 +25413,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
+                message_type=message_type, on_model_attempt=on_model_attempt,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25276,7 +25425,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
+                message_type=message_type, on_model_attempt=on_model_attempt,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -25419,6 +25568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        on_model_attempt: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25443,6 +25593,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                on_model_attempt=on_model_attempt,
             )
 
         from run_agent import AIAgent
@@ -25703,6 +25854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            on_model_attempt=on_model_attempt,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

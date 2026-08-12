@@ -1333,6 +1333,52 @@ class CLICommandsMixin:
         _cprint(f"  Original session: {parent_session_id}")
         _cprint(f"  Branch session:   {new_session_id}")
 
+    def _handle_refresh_command(self, cmd_original: str) -> None:
+        """Refresh skills and memory without mutating the frozen prompt/history."""
+        from cli import _cprint
+
+        args = cmd_original.split()[1:]
+        if args == ["--branch"]:
+            if self.agent is not None:
+                # Refresh the active profile before native branch construction,
+                # so the child observes current memory and skill catalogs.
+                store = getattr(self.agent, "_memory_store", None)
+                if store is not None:
+                    store.load_from_disk()
+                from agent.skill_commands import get_skill_commands, reload_skills
+
+                reload_skills()
+                import cli as cli_module
+
+                cli_module._skill_commands = get_skill_commands()
+                if hasattr(self.agent, "_invalidate_system_prompt"):
+                    self.agent._invalidate_system_prompt()
+            # Keep the existing branch handler authoritative for lineage,
+            # transcript copying, and child/session construction.
+            self._handle_branch_command("/branch")
+            return
+        if args:
+            _cprint("  Usage: /refresh [--branch]")
+            return
+
+        from agent.session_refresh import build_soft_refresh
+
+        result = build_soft_refresh()
+        # Classic CLI keeps a compatibility mirror for dispatch/completion;
+        # refresh it from the canonical skill-command cache just rescanned.
+        import cli as cli_module
+        from agent.skill_commands import get_skill_commands
+
+        cli_module._skill_commands = get_skill_commands()
+        queue = getattr(self, "_pending_refresh_notes", None)
+        if not isinstance(queue, list):
+            queue = []
+            self._pending_refresh_notes = queue
+        queue.append(
+            {"token": uuid.uuid4().hex, "note": result.context_note, "reserved": False}
+        )
+        _cprint(f"  {result.report}")
+
     def _handle_personality_command(self, cmd: str):
         """Handle the /personality command to set predefined personalities.
 

@@ -25,6 +25,7 @@ it. New commands land often; `/help` in-session is always authoritative.
 /goal [text|sub]         Standing goal across turns (status|pause|resume|clear)
 /subgoal [text]          Add/manage criteria on the active goal
 /branch (/fork) [name]   Branch the session
+/refresh [--branch]      Re-scan skills + memory; optionally branch afterward
 /resume [name]           Resume a named session
 /sessions                Browse and resume previous sessions
 /handoff <platform>      Hand live session off to a messaging platform (CLI)
@@ -74,6 +75,12 @@ it. New commands land often; `/help` in-session is always authoritative.
 /browser [connect|status] CDP connection to your live browser (CLI)
 /plugins                 List plugins (CLI)
 ```
+
+`/refresh` is restart-free. A soft refresh preserves the session, transcript,
+frozen system prompt, and prompt-cache prefix; the refreshed memory context is
+attached API-locally to the next genuine user turn. `/refresh --branch` uses
+reloads the active profile's skills and memory first, then invokes the normal
+branch infrastructure with an empty name so child construction sees current context.
 
 ### Gateway
 ```

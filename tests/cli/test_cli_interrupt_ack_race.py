@@ -167,6 +167,7 @@ def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
 
         def run_conversation(self, **kwargs):
             self.captured = kwargs
+            kwargs["on_model_attempt"]()
             return {
                 "final_response": "done",
                 "messages": [{"role": "assistant", "content": "done"}],
@@ -206,6 +207,7 @@ def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
 
         def run_conversation(self, **kwargs):
             self.captured = kwargs
+            kwargs["on_model_attempt"]()
             return {
                 "final_response": "done",
                 "messages": [{"role": "assistant", "content": "done"}],
@@ -239,6 +241,201 @@ def test_chat_preserves_clean_multimodal_input_when_note_changes_api_message():
     api_parts = agent.captured["user_message"]
     assert api_parts[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
     assert api_parts[1] == clean_parts[1]
+
+
+def test_chat_refresh_note_keeps_multimodal_transcript_input_clean():
+    cli = _make_cli()
+
+    class _NoteAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.captured = None
+
+        def run_conversation(self, **kwargs):
+            self.captured = kwargs
+            kwargs["on_model_attempt"]()
+            return {
+                "final_response": "done", "messages": [], "api_calls": 1,
+                "completed": True, "partial": True, "response_previewed": True,
+            }
+
+    clean_parts = [
+        {"type": "text", "text": "Inspect"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    agent = _NoteAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "refresh", "note": "REFRESH-NOTE", "reserved": False}
+    ]
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat(clean_parts)
+
+    assert agent.captured["persist_user_message"] == clean_parts
+    assert agent.captured["user_message"][0]["text"] == "REFRESH-NOTE\n\nInspect"
+    assert cli._pending_refresh_notes == []
+
+
+def test_refresh_note_rolls_back_before_model_attempt_and_retries_once():
+    cli = _make_cli()
+
+    class _RetryAgent(_StubAgent):
+        def __init__(self, session_id):
+            super().__init__(session_id, turn_seconds=0)
+            self.inputs = []
+
+        def run_conversation(self, **kwargs):
+            self.inputs.append(kwargs["user_message"])
+            if len(self.inputs) == 1:
+                raise RuntimeError("pre-dispatch")
+            kwargs["on_model_attempt"]()
+            return {
+                "final_response": "done", "messages": [], "api_calls": 1,
+                "completed": True, "partial": True, "response_previewed": True,
+            }
+
+    agent = _RetryAgent(cli.session_id)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "one", "note": "NOTE-1", "reserved": False},
+        {"token": "two", "note": "NOTE-2", "reserved": False},
+    ]
+    common = (
+        patch.object(cli, "_ensure_runtime_credentials", return_value=True),
+        patch.object(cli, "_resolve_turn_agent_config", return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None, "runtime": None, "request_overrides": None,
+        }),
+        patch.object(cli, "_init_agent", return_value=True),
+    )
+    with common[0], common[1], common[2]:
+        cli.chat("first")
+        cli.chat("retry")
+        cli.chat("next")
+
+    assert agent.inputs == [
+        "NOTE-1\n\nfirst",
+        "NOTE-1\n\nretry",
+        "NOTE-2\n\nnext",
+    ]
+    assert cli._pending_refresh_notes == []
+
+
+def test_refresh_note_normal_zero_api_calls_rolls_back_for_retry():
+    cli = _make_cli()
+
+    class _Agent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            return {
+                "final_response": "no call",
+                "messages": [],
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    agent = _Agent(cli.session_id, turn_seconds=0)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "refresh", "note": "REFRESH-NOTE", "reserved": False}
+    ]
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("first")
+
+    assert cli._pending_refresh_notes[0]["reserved"] is False
+
+
+def test_refresh_note_normal_model_attempt_commits():
+    cli = _make_cli()
+
+    class _Agent(_StubAgent):
+        def run_conversation(self, *, on_model_attempt, **kwargs):
+            on_model_attempt()
+            return {
+                "final_response": "done",
+                "messages": [],
+                "api_calls": 1,
+                "completed": True,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    agent = _Agent(cli.session_id, turn_seconds=0)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "refresh", "note": "REFRESH-NOTE", "reserved": False}
+    ]
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli, "_resolve_turn_agent_config", return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None, "runtime": None, "request_overrides": None,
+        }
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("hello")
+
+    assert cli._pending_refresh_notes == []
+
+
+def test_refresh_note_exception_before_attempt_rolls_back_but_after_attempt_commits():
+    cli = _make_cli()
+
+    class _Agent(_StubAgent):
+        attempt = False
+
+        def run_conversation(self, *, on_model_attempt, **kwargs):
+            if self.attempt:
+                on_model_attempt()
+            raise RuntimeError("turn failed")
+
+    agent = _Agent(cli.session_id, turn_seconds=0)
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._pending_refresh_notes = [
+        {"token": "refresh", "note": "REFRESH-NOTE", "reserved": False}
+    ]
+    common = (
+        patch.object(cli, "_ensure_runtime_credentials", return_value=True),
+        patch.object(cli, "_resolve_turn_agent_config", return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None, "runtime": None, "request_overrides": None,
+        }),
+        patch.object(cli, "_init_agent", return_value=True),
+    )
+    with common[0], common[1], common[2]:
+        cli.chat("before")
+        assert cli._pending_refresh_notes[0]["reserved"] is False
+        agent.attempt = True
+        cli.chat("after")
+
+    assert cli._pending_refresh_notes == []
 
 
 def test_chat_multimodal_note_persists_clean_input_once(tmp_path, monkeypatch):

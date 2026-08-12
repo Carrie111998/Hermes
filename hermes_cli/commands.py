@@ -127,6 +127,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="<platform>", cli_only=True),
     CommandDef("branch", "Branch the current session (explore a different path)", "Session",
                aliases=("fork",), args_hint="[name]"),
+    CommandDef("refresh", "Reload skills and current memory without restarting", "Session",
+               args_hint="[--branch]"),
     CommandDef("compress", "Compress conversation context (add 'here [N]' to keep recent N turns; --preview shows what would happen)", "Session",
                aliases=("compact",), args_hint="[here [N] | focus topic | --preview|--dry-run]"),
     CommandDef("rollback", "List or restore filesystem checkpoints", "Session",
@@ -1277,7 +1279,7 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause", "refresh"})
 
 
 def _sanitize_slack_name(raw: str) -> str:

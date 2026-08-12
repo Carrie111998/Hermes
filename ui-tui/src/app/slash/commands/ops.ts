@@ -19,6 +19,8 @@ import { patchOverlayState } from '../../overlayStore.js'
 import { getSpawnHistory, pushDiskSnapshot, setDiffPair, type SpawnSnapshot } from '../../spawnHistoryStore.js'
 import type { SlashCommand } from '../types.js'
 
+import { sessionCommands } from './session.js'
+
 interface SkillInfo {
   category?: string
   description?: string
@@ -62,6 +64,80 @@ interface SkillsReloadResponse {
 }
 
 export const opsCommands: SlashCommand[] = [
+  {
+    help: 'reload skills and current memory without restarting',
+    name: 'refresh',
+    run: (arg, ctx) => {
+      if (arg.trim() === '--branch') {
+        ctx.gateway
+          .rpc<{ type?: string; target?: string; arg?: string }>('command.dispatch', {
+            arg: '--branch',
+            name: 'refresh',
+            session_id: ctx.sid
+          })
+          .then(
+            ctx.guarded(() => {
+              ctx.gateway
+                .rpc<CommandsCatalogResponse>('commands.catalog', { session_id: ctx.sid })
+                .then(
+                  ctx.guarded<CommandsCatalogResponse>(catalog => {
+                    if (catalog?.pairs) {
+                      ctx.local.setCatalog({
+                        canon: (catalog.canon ?? {}) as Record<string, string>,
+                        categories: catalog.categories ?? [],
+                        pairs: catalog.pairs as [string, string][],
+                        skillCount: (catalog.skill_count ?? 0) as number,
+                        sub: (catalog.sub ?? {}) as Record<string, string[]>
+                      })
+                    }
+
+                    sessionCommands.find(command => command.name === 'branch')?.run('', ctx, '/branch')
+                  })
+                )
+                .catch(ctx.guardedErr)
+            })
+          )
+          .catch(ctx.guardedErr)
+
+        return
+      }
+
+      if (arg.trim()) {
+        return ctx.transcript.sys('usage: /refresh [--branch]')
+      }
+
+      ctx.gateway
+        .rpc<{ output?: string; type?: string }>('command.dispatch', {
+          arg: '',
+          name: 'refresh',
+          session_id: ctx.sid
+        })
+        .then(
+          ctx.guarded<{ output?: string }>(result => {
+            ctx.transcript.sys(result.output || 'Refreshed.')
+            ctx.gateway
+              .rpc<CommandsCatalogResponse>('commands.catalog', { session_id: ctx.sid })
+              .then(
+                ctx.guarded<CommandsCatalogResponse>(catalog => {
+                  if (!catalog?.pairs) {
+                    return
+                  }
+
+                  ctx.local.setCatalog({
+                    canon: (catalog.canon ?? {}) as Record<string, string>,
+                    categories: catalog.categories ?? [],
+                    pairs: catalog.pairs as [string, string][],
+                    skillCount: (catalog.skill_count ?? 0) as number,
+                    sub: (catalog.sub ?? {}) as Record<string, string[]>
+                  })
+                })
+              )
+              .catch(() => {})
+          })
+        )
+        .catch(ctx.guardedErr)
+    }
+  },
   {
     help: 'stop background processes',
     name: 'stop',

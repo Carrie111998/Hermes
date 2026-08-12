@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import subprocess
@@ -514,7 +515,9 @@ def _claim_active_session_slot(
     *,
     live_session_id: str,
     surface: str = "tui",
+    exclude_release: Any = None,
 ) -> tuple[Any, str | None]:
+    _retry_failed_active_session_releases(exclude=exclude_release)
     try:
         from hermes_cli.active_sessions import try_acquire_active_session
 
@@ -556,16 +559,56 @@ def _ensure_active_session_slot(sid: str, session: dict) -> str | None:
     return None
 
 
+_retryable_active_session_releases: dict[int, Any] = {}
+
+
+def _retry_failed_active_session_releases(*, exclude: Any = None) -> None:
+    for key, stale in list(_retryable_active_session_releases.items()):
+        if stale is exclude:
+            continue
+        try:
+            stale.release()
+        except Exception:
+            logger.debug("Failed to retry active session slot release", exc_info=True)
+            continue
+        if _retryable_active_session_releases.get(key) is stale:
+            _retryable_active_session_releases.pop(key, None)
+
+
 def _release_active_session_slot(session: dict | None) -> None:
     if not session:
+        _retry_failed_active_session_releases()
         return
-    lease = session.pop("active_session_lease", None)
+    current_lease = session.get("active_session_lease")
+    _retry_failed_active_session_releases(exclude=current_lease)
+    pending = session.get("_pending_active_session_leases")
+    if isinstance(pending, list):
+        for stale in list(pending):
+            try:
+                stale.release()
+            except Exception:
+                logger.debug("Failed to release pending active session slot", exc_info=True)
+                _retryable_active_session_releases[id(stale)] = stale
+                continue
+            _retryable_active_session_releases.pop(id(stale), None)
+            try:
+                pending.remove(stale)
+            except ValueError:
+                pass
+        if not pending:
+            session.pop("_pending_active_session_leases", None)
+    lease = current_lease
     if lease is None:
         return
     try:
         lease.release()
     except Exception:
         logger.debug("Failed to release active session slot", exc_info=True)
+        _retryable_active_session_releases[id(lease)] = lease
+        return
+    _retryable_active_session_releases.pop(id(lease), None)
+    if session.get("active_session_lease") is lease:
+        session.pop("active_session_lease", None)
 
 
 def _transfer_active_session_slot(
@@ -600,15 +643,17 @@ def _transfer_active_session_slot(
         new_session_id,
         live_session_id=sid,
         surface=_session_source(session),
+        exclude_release=lease,
     )
     if new_lease is not None:
-        old_lease = session.pop("active_session_lease", None)
+        old_lease = session.get("active_session_lease")
+        session["active_session_lease"] = new_lease
         if old_lease is not None:
             try:
                 old_lease.release()
             except Exception:
                 logger.debug("Failed to release stale active session slot", exc_info=True)
-        session["active_session_lease"] = new_lease
+                session.setdefault("_pending_active_session_leases", []).append(old_lease)
         return True
     # Reserve failed — retain the existing lease rather than dropping it.
     if limit_message:
@@ -1197,7 +1242,9 @@ def _reclaim_orphaned_leases() -> None:
             live = {
                 lease.lease_id
                 for session in _sessions.values()
-                if (lease := session.get("active_session_lease")) is not None
+                for lease in [session.get("active_session_lease")]
+                + list(session.get("_pending_active_session_leases") or [])
+                if lease is not None
             }
         if dropped := release_orphaned_leases(live):
             logger.info("Reclaimed %d orphaned active-session lease(s)", dropped)
@@ -1460,6 +1507,36 @@ def _profile_scoped(handler):
     return wrapper
 
 
+def _session_catalog_scoped(handler):
+    """Bind catalog/config discovery to the requested live session.
+
+    Missing or unknown session ids retain the historical process-default
+    behavior. A valid live session supplies both axes used by skill-command
+    caching: its profile home and its client platform.
+    """
+
+    def wrapper(rid, params):
+        session = _sessions.get(params.get("session_id", ""))
+        if session is None:
+            return handler(rid, params)
+
+        from gateway.session_context import session_platform_scope
+
+        profile_home = session.get("profile_home")
+        home_token = (
+            set_hermes_home_override(profile_home) if profile_home else None
+        )
+        profile = Path(profile_home).name if profile_home else ""
+        try:
+            with session_platform_scope(_session_source(session), profile):
+                return handler(rid, params)
+        finally:
+            if home_token is not None:
+                reset_hermes_home_override(home_token)
+
+    return wrapper
+
+
 # Placeholder ``terminal.cwd`` values that don't name a real directory — the
 # gateway resolves these to the home dir at runtime, so they must NOT be treated
 # as an explicit workspace (mirrors gateway/run.py's config bridge).
@@ -1668,6 +1745,7 @@ def _compute_host_turn_frame(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    refresh_reservation: dict | None = None,
 ) -> dict:
     with session["history_lock"]:
         history = list(session.get("history", []))
@@ -1694,6 +1772,7 @@ def _compute_host_turn_frame(
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,
+        "refresh_note": str((refresh_reservation or {}).get("note") or ""),
     }
 
 
@@ -1764,6 +1843,25 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     _drain_queued_prompt(rid, sid, session)
 
 
+def _validated_model_attempt(done: Any) -> bool:
+    """Validate legacy completion evidence without coercion.
+
+    ``model_attempted`` is accepted only as the literal bool ``True``.
+    ``api_calls`` accepts only a built-in int/float that is finite, integral,
+    and positive.  Strings, bools, subclasses, and malformed numeric values
+    fail closed.
+    """
+    attempted = done.get("model_attempted") if isinstance(done, dict) else None
+    if type(attempted) is bool and attempted:
+        return True
+    calls = done.get("api_calls") if isinstance(done, dict) else None
+    if type(calls) is int:
+        return calls > 0
+    if type(calls) is float:
+        return math.isfinite(calls) and calls.is_integer() and calls > 0
+    return False
+
+
 def _submit_prompt_to_compute_host(
     rid: str,
     sid: str,
@@ -1771,6 +1869,7 @@ def _submit_prompt_to_compute_host(
     text: Any,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    refresh_reservation: dict | None = None,
 ) -> dict:
     cfg = _load_dashboard_process_isolation_config()
     frame = _compute_host_turn_frame(
@@ -1780,7 +1879,17 @@ def _submit_prompt_to_compute_host(
         text,
         image_paths=image_paths,
         queued_prompt_generation=queued_prompt_generation,
+        refresh_reservation=refresh_reservation,
     )
+
+    dispatch_state = {"attempted": False}
+
+    def _dispatched(_frame: dict) -> None:
+        dispatch_state["attempted"] = True
+        if refresh_reservation:
+            _finish_pending_refresh_note(
+                session, refresh_reservation["token"], attempted=True
+            )
 
     def _complete(done: dict) -> None:
         # submit_turn reports a synchronous pipe failure through the callback
@@ -1788,12 +1897,40 @@ def _submit_prompt_to_compute_host(
         # can fail open to the historical in-process path without emitting a
         # duplicate terminal error.
         if done.get("reason") == "send_failed":
+            if refresh_reservation and not dispatch_state["attempted"]:
+                _finish_pending_refresh_note(
+                    session, refresh_reservation["token"], attempted=False
+                )
             return
-        _on_compute_host_turn_done(rid, sid, session, done)
+        if refresh_reservation and not dispatch_state["attempted"]:
+            _finish_pending_refresh_note(
+                session,
+                refresh_reservation["token"],
+                attempted=_validated_model_attempt(done),
+            )
+        try:
+            _on_compute_host_turn_done(rid, sid, session, done)
+        finally:
+            if refresh_reservation and not dispatch_state["attempted"]:
+                _finish_pending_refresh_note(
+                    session, refresh_reservation["token"], attempted=False
+                )
 
     try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
+        supervisor = _get_compute_host_supervisor(cfg)
+        try:
+            submit_params = inspect.signature(supervisor.submit_turn).parameters
+        except (TypeError, ValueError):
+            submit_params = {}
+        submit_kwargs = {"on_complete": _complete}
+        if "on_dispatch" in submit_params:
+            submit_kwargs["on_dispatch"] = _dispatched
+        supervisor.submit_turn(frame, **submit_kwargs)
     except Exception as exc:
+        if refresh_reservation and not dispatch_state["attempted"]:
+            _finish_pending_refresh_note(
+                session, refresh_reservation["token"], attempted=False
+            )
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
@@ -7528,6 +7665,7 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    refresh_reservation: dict | None = None,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7540,6 +7678,11 @@ def _enqueue_prompt(
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
+    generation = int(session.get("_queued_prompt_generation", 0))
+    if generation or refresh_reservation:
+        queued["generation"] = generation
+    if refresh_reservation:
+        queued["refresh_reservation"] = refresh_reservation
     if image_paths:
         queued["image_paths"] = image_paths
     existing = session.get("queued_prompt")
@@ -7550,6 +7693,7 @@ def _enqueue_prompt(
         and not existing.get("image_paths")
         and not image_paths
         and not session.get("queued_prompts")
+        and not refresh_reservation
     ):
         prev = existing["text"]
         existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
@@ -7558,6 +7702,102 @@ def _enqueue_prompt(
         session.setdefault("queued_prompts", []).append(queued)
         return
     session["queued_prompt"] = queued
+
+
+def _queue_pending_refresh_note_locked(session: dict, note: str) -> dict:
+    """Append a refresh record; caller must own ``history_lock``."""
+    record = {"token": uuid.uuid4().hex, "note": str(note), "reserved": False}
+    session.setdefault("pending_refresh_notes", []).append(record)
+    return record
+
+
+def _queue_pending_refresh_note(session: dict, note: str) -> dict:
+    """Append one immutable refresh record and return its ownership token."""
+    with session["history_lock"]:
+        return _queue_pending_refresh_note_locked(session, note)
+
+
+def _claim_pending_refresh_note_locked(session: dict) -> dict | None:
+    """Reserve the oldest refresh record; caller must own ``history_lock``."""
+    records = session.get("pending_refresh_notes", [])
+    if not isinstance(records, list):
+        return None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        token = record.get("token")
+        note = record.get("note")
+        reserved = record.get("reserved")
+        if (
+            not isinstance(token, str)
+            or not token
+            or not isinstance(note, str)
+            or not note
+            or not isinstance(reserved, bool)
+            or reserved
+        ):
+            continue
+        record["reserved"] = True
+        return {"token": token, "note": note}
+    return None
+
+
+def _claim_pending_refresh_note(session: dict) -> dict | None:
+    """Reserve the oldest unclaimed refresh record for one genuine turn."""
+    with session["history_lock"]:
+        return _claim_pending_refresh_note_locked(session)
+
+
+def _finish_pending_refresh_note_locked(
+    session: dict, token: str, *, attempted: bool
+) -> bool:
+    """Finish one refresh reservation; caller must own ``history_lock``."""
+    records = session.get("pending_refresh_notes", [])
+    if not isinstance(records, list) or not isinstance(token, str) or not token:
+        return False
+    for index, record in enumerate(records):
+        if (
+            not isinstance(record, dict)
+            or record.get("token") != token
+            or record.get("reserved") is not True
+        ):
+            continue
+        if attempted:
+            records.pop(index)
+            if not records:
+                session.pop("pending_refresh_notes", None)
+        else:
+            record["reserved"] = False
+        return True
+    return False
+
+
+def _finish_pending_refresh_note(
+    session: dict, token: str, *, attempted: bool
+) -> bool:
+    """Commit or roll back exactly the record identified by ``token``."""
+    with session["history_lock"]:
+        return _finish_pending_refresh_note_locked(
+            session, token, attempted=attempted
+        )
+
+
+def _run_prompt_submit_compat(*args, **optional_kwargs) -> Any:
+    """Pass additive turn kwargs only when the active interface declares them."""
+    try:
+        parameters = inspect.signature(_run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    supported = {
+        key: value
+        for key, value in optional_kwargs.items()
+        if value is not None and (accepts_kwargs or key in parameters)
+    }
+    return _run_prompt_submit(*args, **supported)
 
 
 def _interrupt_busy_session(sid: str, session: dict, agent: Any) -> None:
@@ -7669,7 +7909,14 @@ def _handle_busy_submit(
             if image_paths:
                 session["attached_images"] = image_paths + list(session.get("attached_images", []))
             return None
-        _enqueue_prompt(session, text, transport, image_paths=image_paths)
+        refresh_reservation = _claim_pending_refresh_note_locked(session)
+        _enqueue_prompt(
+            session,
+            text,
+            transport,
+            image_paths=image_paths,
+            refresh_reservation=refresh_reservation,
+        )
         session["last_active"] = time.time()
 
     # Attachments need a separate model invocation. Queue them without
@@ -7690,7 +7937,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         queued = session.get("queued_prompt")
         if not queued or session.get("running"):
             return False
-        queue_generation = int(session.get("_queued_prompt_generation", 0))
+        queue_generation = int(
+            queued.get("generation", session.get("_queued_prompt_generation", 0))
+        )
         queued_prompts = session.get("queued_prompts") or []
         session["queued_prompt"] = queued_prompts.pop(0) if queued_prompts else None
         if not queued_prompts:
@@ -7702,6 +7951,11 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     with session["history_lock"]:
         if int(session.get("_queued_prompt_generation", 0)) != queue_generation:
             session["running"] = False
+            reservation = queued.get("refresh_reservation")
+            if reservation:
+                _finish_pending_refresh_note_locked(
+                    session, reservation["token"], attempted=False
+                )
             return True
     dispatch_failed = False
     try:
@@ -7714,10 +7968,16 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    refresh_reservation=queued.get("refresh_reservation"),
                 )
             else:
                 resp = _submit_prompt_to_compute_host(
-                    rid, sid, session, queued["text"], queued_prompt_generation=queue_generation
+                    rid,
+                    sid,
+                    session,
+                    queued["text"],
+                    queued_prompt_generation=queue_generation,
+                    refresh_reservation=queued.get("refresh_reservation"),
                 )
             if resp.get("error"):
                 message = str(((resp.get("error") or {}).get("message")) or "queued prompt failed")
@@ -7726,23 +7986,30 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
                     _clear_inflight_turn(session)
                 _emit("error", sid, {"message": message})
                 dispatch_failed = True
+                reservation = queued.get("refresh_reservation")
+                if reservation:
+                    _finish_pending_refresh_note(
+                        session, reservation["token"], attempted=False
+                    )
         else:
             if queued.get("image_paths"):
-                _run_prompt_submit(
+                _run_prompt_submit_compat(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     image_paths=queued["image_paths"],
                     queued_prompt_generation=queue_generation,
+                    refresh_reservation=queued.get("refresh_reservation"),
                 )
             else:
-                _run_prompt_submit(
+                _run_prompt_submit_compat(
                     rid,
                     sid,
                     session,
                     queued["text"],
                     queued_prompt_generation=queue_generation,
+                    refresh_reservation=queued.get("refresh_reservation"),
                 )
     except Exception as exc:
         print(
@@ -7752,6 +8019,9 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
         )
         with session["history_lock"]:
             session["running"] = False
+        reservation = queued.get("refresh_reservation")
+        if reservation:
+            _finish_pending_refresh_note(session, reservation["token"], attempted=False)
         dispatch_failed = True
     if dispatch_failed:
         with session["history_lock"]:
@@ -9714,13 +9984,22 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    refresh_note: str = "",
+    refresh_reservation: dict | None = None,
+    on_model_dispatch: Callable[[], None] | None = None,
 ) -> None:
+    if refresh_reservation and not refresh_note:
+        refresh_note = str(refresh_reservation.get("note") or "")
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
+            if refresh_reservation:
+                _finish_pending_refresh_note_locked(
+                    session, refresh_reservation["token"], attempted=False
+                )
             return
         if image_paths is None:
             images = list(session.get("attached_images", []))
@@ -9741,6 +10020,24 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run():
+        refresh_committed = False
+        refresh_commit_lock = threading.Lock()
+
+        def _on_model_attempt() -> None:
+            nonlocal refresh_committed
+            with refresh_commit_lock:
+                if refresh_committed:
+                    return
+                if refresh_reservation:
+                    _finish_pending_refresh_note(
+                        session, refresh_reservation["token"], attempted=True
+                    )
+                refresh_committed = True
+                if on_model_dispatch is not None:
+                    try:
+                        on_model_dispatch()
+                    except Exception:
+                        logger.warning("model dispatch callback failed", exc_info=True)
         # The conversation runs on a fresh thread, so ContextVars from the RPC
         # dispatcher do not follow automatically. Rebind the exact transport
         # stored on this session generation before any tool can commission a
@@ -9961,6 +10258,11 @@ def _run_prompt_submit(
             # Reactions the user added since the last turn.
             run_message = _prepend_note(run_message, _pending_reaction_notes(session))
 
+            # /refresh context is appended only with the next genuine user
+            # turn; consuming it here avoids a synthetic transcript row and
+            # keeps strict user/assistant alternation intact.
+            run_message = _prepend_note(run_message, refresh_note)
+
             # Which window the message was typed into. HUD mode is per-turn
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
@@ -10013,6 +10315,9 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            supports_attempt_callback = "on_model_attempt" in _run_params
+            if supports_attempt_callback:
+                run_kwargs["on_model_attempt"] = _on_model_attempt
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -10022,6 +10327,8 @@ def _run_prompt_submit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
             result = agent.run_conversation(run_message, **run_kwargs)
+            if not supports_attempt_callback and _validated_model_attempt(result):
+                _on_model_attempt()
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -10393,6 +10700,10 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            if refresh_reservation and not refresh_committed:
+                _finish_pending_refresh_note(
+                    session, refresh_reservation["token"], attempted=False
+                )
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.
@@ -12181,6 +12492,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "init",
         "compress",
         "compact",
+        "refresh",
     }
 )
 

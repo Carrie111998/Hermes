@@ -240,7 +240,7 @@ The following commands are handled directly by the TUI client. Unrecognized comm
 `/indicator`, `/yolo`, `/reasoning`, `/fast`, `/busy`, `/verbose`, `/usage`
 
 ### Ops (`ops.ts`)
-`/stop`, `/reload-mcp` (alias `/reload_mcp`), `/reload`, `/browser`,
+`/refresh [--branch]`, `/stop`, `/reload-mcp` (alias `/reload_mcp`), `/reload`, `/browser`,
 `/rollback`, `/agents` (alias `/tasks`), `/replay`, `/replay-diff`,
 `/skills`, `/reload-skills` (alias `/reload_skills`), `/plugins`, `/tools`
 

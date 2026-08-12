@@ -1431,6 +1431,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    on_model_attempt: Optional[callable] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1629,6 +1630,7 @@ def run_conversation(
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
+            on_model_attempt=on_model_attempt,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
@@ -2685,14 +2687,21 @@ def run_conversation(
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
                     if _use_streaming:
+                        if on_model_attempt is not None:
+                            on_model_attempt()
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
                     from agent import relay_llm
 
+                    def _call_provider(final_api_kwargs):
+                        if on_model_attempt is not None:
+                            on_model_attempt()
+                        return agent._interruptible_api_call(final_api_kwargs)
+
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _call_provider,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),
