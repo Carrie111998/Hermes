@@ -28041,6 +28041,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             profile_homes = _multiplex_profile_homes(runner.config)
             if profile_homes:
                 cron_start_kwargs["profile_homes"] = profile_homes
+                from hermes_cli.profiles import get_active_profile_name
+
+                active_profile = get_active_profile_name() or "default"
+                cron_start_kwargs["profile_adapters"] = {
+                    **runner._profile_adapters,
+                    active_profile: runner.adapters,
+                }
                 logger.info(
                     "Cron scheduler will tick %d profile(s) under multiplex: %s",
                     len(profile_homes),

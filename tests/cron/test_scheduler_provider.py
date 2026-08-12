@@ -414,3 +414,45 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
 
 
+def test_multiplex_ticker_uses_each_profiles_live_adapters(tmp_path):
+    """A named profile's cron delivery must use that profile's bot identity."""
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    default_home = tmp_path / "default"
+    sonnet_home = tmp_path / "sonnet"
+    disconnected_home = tmp_path / "disconnected"
+    for home in (default_home, sonnet_home, disconnected_home):
+        (home / "cron").mkdir(parents=True)
+
+    default_adapters = {"discord": object()}
+    sonnet_adapters = {"discord": object()}
+    profile_homes = [
+        ("default", default_home),
+        ("sonnet", sonnet_home),
+        ("disconnected", disconnected_home),
+    ]
+    profile_adapters = {
+        "default": default_adapters,
+        "sonnet": sonnet_adapters,
+    }
+    seen_adapters = []
+    stop = threading.Event()
+
+    def _tracking_tick(*args, **kwargs):
+        seen_adapters.append(kwargs["adapters"])
+        if len(seen_adapters) == len(profile_homes):
+            stop.set()
+        return 0
+
+    provider = InProcessCronScheduler()
+    with patch("cron.scheduler.tick", side_effect=_tracking_tick), \
+         patch("cron.jobs.record_ticker_heartbeat", lambda **kw: None):
+        provider.start(
+            stop,
+            interval=0,
+            profile_homes=profile_homes,
+            profile_adapters=profile_adapters,
+        )
+
+    assert seen_adapters == [default_adapters, sonnet_adapters, {}]
+

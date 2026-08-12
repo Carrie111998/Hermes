@@ -188,6 +188,7 @@ class InProcessCronScheduler(CronScheduler):
         stop_event,
         *,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -216,6 +217,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                profile_adapters=profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -276,6 +278,7 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -329,13 +332,19 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
+                        tick_adapters = (
+                            adapters
+                            if profile_adapters is None or profile_name is None
+                            else profile_adapters.get(profile_name, {})
+                        )
                         home_token = set_hermes_home_override(str(home))
                         try:
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
