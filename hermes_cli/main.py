@@ -483,6 +483,7 @@ from hermes_cli.subcommands.pairing import build_pairing_parser
 from hermes_cli.subcommands.plugins import build_plugins_parser
 from hermes_cli.subcommands.mcp import build_mcp_parser
 from hermes_cli.subcommands.claw import build_claw_parser
+from hermes_cli.subcommands.orchestrate import build_orchestrate_parser, cmd_orchestrate
 
 
 def _require_tty(command_name: str) -> None:
@@ -11778,6 +11779,8 @@ def main():
 
     kanban_parser = _build_kanban_parser(subparsers)
     kanban_parser.set_defaults(func=cmd_kanban)
+
+    build_orchestrate_parser(subparsers, cmd_orchestrate=cmd_orchestrate)
 
     # =========================================================================
     # project command — named, multi-folder workspaces
