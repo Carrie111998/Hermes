@@ -6,7 +6,9 @@ force-redacted in the staged archive, while the live profile remains untouched.
 Both default and named-profile export paths are covered.
 """
 
+import sqlite3
 import tarfile
+from pathlib import Path
 
 import pytest
 
@@ -48,6 +50,7 @@ class TestIsSensitiveExportName:
             "google_oauth_pending.json",
             "google_oauth.json",
             "webhook_subscriptions.json",
+            "feishu_comment_pairing.json",
             "bws_cache.json",
             "bws_cache.enc.json",
             "oauth_creds.json",
@@ -64,6 +67,13 @@ class TestIsSensitiveExportName:
             "config.yaml.bak-provider-key-cleanup-20260506_013334",
             "config.yml.bak.20260101_000000",
             "config.yaml.bak-kiro-context-20260529140131",
+            "config.yaml.corrupt.20260812-123456.bak",
+            "config.yaml.corrupt.20260812-123456.bak.copy",
+            "config.yaml.corrupt.20260812-123456.bak.old",
+            "config.yaml.corrupt.20260812-123456.bak.backup-before-reset",
+            "config.yaml.corrupt.20260812-123456.bak.tmp.4242",
+            "config.yaml.corrupt.20260812-123456.bak.20260813",
+            "config.yaml.corrupt.20260812-123456.bak~",
             # auth/config/tilde backups
             "auth.json.bak",
             "auth.json.20260101",
@@ -76,11 +86,15 @@ class TestIsSensitiveExportName:
             "google_oauth_pending.json.backup-20260101",
             "google_oauth.json.old",
             "webhook_subscriptions.json.copy",
+            "feishu_comment_pairing.json.bak",
             "bws_cache.json.20260101",
             "bws_cache.enc.json.bak",
             "oauth_creds.json.tmp.4242.deadbeef",
             # private keys / keystores
             "id_rsa.key",
+            "deploy.ppk",
+            "deploy.ppk.bak",
+            "deploy.ppk~",
             "store.p12",
             "cert.pfx",
             "release.keystore",
@@ -113,6 +127,7 @@ class TestIsSensitiveExportName:
             "USER.md",
             "profile.yaml",
             "distribution.yaml",
+            "feishu_comment_rules.json",
             "README.md",
             "ca-bundle.pem",
             "server-cert.pem",
@@ -135,6 +150,7 @@ class TestIsSensitiveExportName:
             "pairing.backup-20260101",
             # Backups of non-sensitive files remain portable.
             "notes.txt.bak",
+            "notes.corrupt.20260812-123456.bak",
             "draft.md.bak",
             "notes.txt~",
         ],
@@ -223,6 +239,8 @@ class TestCredentialExclusion:
             "google_oauth_pending.json.backup-20260101",
             "webhook_subscriptions.json",
             "webhook_subscriptions.json.copy",
+            "feishu_comment_pairing.json",
+            "feishu_comment_pairing.json.bak",
             "bws_cache.enc.json",
             "bws_cache.enc.json.bak",
             "oauth_creds.json",
@@ -236,16 +254,27 @@ class TestCredentialExclusion:
             ".pypirc",
             "config.yaml.bak.20260526_130938",
             "config.yaml.bak-pre-migrate-xai-20260410-040915",
+            "config.yaml.corrupt.20260812-123456.bak",
+            "config.yaml.corrupt.20260812-123456.bak.copy",
+            "config.yaml.corrupt.20260812-123456.bak.old",
+            "config.yaml.corrupt.20260812-123456.bak.backup-before-reset",
+            "config.yaml.corrupt.20260812-123456.bak.tmp.4242",
+            "config.yaml.corrupt.20260812-123456.bak.20260813",
+            "config.yaml.corrupt.20260812-123456.bak~",
             "config.yaml~",
             "credentials.json",
             "credentials.json.bak",
             "client_secret.json",
+            "deploy.ppk",
+            "deploy.ppk.bak",
+            "deploy.ppk~",
         ]
         # Files that MUST survive
         kept = [
             "config.yaml",
             "SOUL.md",
             "profile.yaml",
+            "feishu_comment_rules.json",
             ".env.example",
             "README.md",
             "public-ca.pem",
@@ -293,12 +322,18 @@ class TestCredentialExclusion:
         credential_tree_files = [
             profile_dir / "mcp-tokens" / "server.json",
             profile_dir / "mcp-tokens.bak" / "server.json",
+            profile_dir / "mcp-tokens.bak-pre-migrate" / "server.json",
             profile_dir / "pairing" / "device.json",
             profile_dir / "pairing.backup-20260101" / "device.json",
+            profile_dir / "pairing.backup-before-reset" / "device.json",
             profile_dir / "platforms" / "pairing" / "device.json",
             profile_dir
             / "platforms"
             / "pairing.backup-20260101"
+            / "device.json",
+            profile_dir
+            / "platforms"
+            / "pairing.bak-before-reset"
             / "device.json",
         ]
         # Same-named directories outside canonical paths are ordinary user data
@@ -306,6 +341,8 @@ class TestCredentialExclusion:
         ordinary_tree_files = [
             profile_dir / "pairing-old-notes" / "README.md",
             profile_dir / "mcp-tokens_copy_of_docs" / "README.md",
+            profile_dir / "pairing.tmp-notes" / "README.md",
+            profile_dir / "mcp-tokens.old-docs" / "README.md",
             profile_dir / "plugins" / "demo" / "pairing" / "README.md",
             profile_dir
             / "plugins"
@@ -333,6 +370,10 @@ class TestCredentialExclusion:
         home_sensitive = [
             profile_dir / "home" / ".ssh" / "custom-production-key",
             profile_dir / "home" / ".ssh.bak" / "custom-production-key",
+            profile_dir
+            / "home"
+            / ".ssh.bak-before-rotation"
+            / "custom-production-key",
             profile_dir / "home" / ".aws" / "credentials",
             profile_dir / "home" / ".gnupg" / "private-keys-v1.d" / "key",
             profile_dir / "home" / ".kube" / "config",
@@ -341,6 +382,11 @@ class TestCredentialExclusion:
             profile_dir / "home" / ".gcloud" / "credentials.db",
             profile_dir / "home" / ".config" / "gh" / "hosts.yml",
             profile_dir / "home" / ".config" / "gh.backup-20260101" / "hosts.yml",
+            profile_dir
+            / "home"
+            / ".config"
+            / "gh.backup-before-reset"
+            / "hosts.yml",
             profile_dir / "home" / ".config" / "gcloud" / "credentials.db",
             profile_dir / "home" / ".config" / "github-copilot" / "hosts.json",
             profile_dir
@@ -453,6 +499,8 @@ class TestCredentialExclusion:
             "google_oauth_pending.json.backup-20260101",
             "webhook_subscriptions.json",
             "webhook_subscriptions.json.copy",
+            "feishu_comment_pairing.json",
+            "feishu_comment_pairing.json.bak",
             "bws_cache.enc.json",
             "bws_cache.enc.json.bak",
             "oauth_creds.json",
@@ -466,6 +514,13 @@ class TestCredentialExclusion:
             ".pypirc",
             "config.yaml.bak.20260526_130938",
             "config.yaml.bak-pre-migrate-xai-20260410-040915",
+            "config.yaml.corrupt.20260812-123456.bak",
+            "config.yaml.corrupt.20260812-123456.bak.copy",
+            "config.yaml.corrupt.20260812-123456.bak.old",
+            "config.yaml.corrupt.20260812-123456.bak.backup-before-reset",
+            "config.yaml.corrupt.20260812-123456.bak.tmp.4242",
+            "config.yaml.corrupt.20260812-123456.bak.20260813",
+            "config.yaml.corrupt.20260812-123456.bak~",
             "config.yaml~",
             "private.pem",
         ]
@@ -495,6 +550,8 @@ class TestCredentialExclusion:
             nested_root / "google_token.json.bak",
             nested_root / "google_oauth_pending.json",
             nested_root / "google_oauth_pending.json.backup-20260101",
+            nested_root / "feishu_comment_pairing.json",
+            nested_root / "feishu_comment_pairing.json.bak",
             nested_root / "auth" / "google_oauth.json",
             nested_root / "auth" / "google_oauth.json.old",
             nested_root / "cache" / "bws_cache.json",
@@ -507,6 +564,15 @@ class TestCredentialExclusion:
             nested_root / ".env~",
             nested_root / "auth.json~",
             nested_root / "config.yaml~",
+            nested_root / "config.yaml.corrupt.20260812-123456.bak",
+            nested_root / "config.yaml.corrupt.20260812-123456.bak.copy",
+            nested_root
+            / "config.yaml.corrupt.20260812-123456.bak.backup-before-reset",
+            nested_root / "config.yaml.corrupt.20260812-123456.bak.tmp.4242",
+            nested_root / "config.yaml.corrupt.20260812-123456.bak~",
+            nested_root / "deploy.ppk",
+            nested_root / "deploy.ppk.bak",
+            nested_root / "deploy.ppk~",
             nested_root / "private.pem",
             nested_root / "private.pem.bak",
             nested_root / "private.pem.20260101",
@@ -632,8 +698,14 @@ class TestCredentialExclusion:
         (profile_dir / "config.yaml").write_text("model: test\n")
 
         nested = profile_dir / "plugins" / "demo"
+        metrics = profile_dir / "telemetry" / "shared_metrics"
         nested.mkdir(parents=True)
-        database_paths = [profile_dir / "state.db", nested / "kanban.db"]
+        metrics.mkdir(parents=True)
+        database_paths = [
+            profile_dir / "state.db",
+            nested / "kanban.db",
+            metrics / "metrics.sqlite3",
+        ]
         sidecar_paths = [
             profile_dir / "state.db-shm",
             profile_dir / "state.db-wal",
@@ -641,6 +713,9 @@ class TestCredentialExclusion:
             nested / "kanban.db-shm",
             nested / "kanban.db-wal",
             nested / "kanban.db-journal",
+            metrics / "metrics.sqlite3-shm",
+            metrics / "metrics.sqlite3-wal",
+            metrics / "metrics.sqlite3-journal",
         ]
         for path in database_paths + sidecar_paths:
             path.write_text("sqlite fixture\n")
@@ -701,8 +776,203 @@ class TestCredentialExclusion:
             member = f"default/{path.relative_to(default_home).as_posix()}"
             assert member not in names, f"{member} must NOT be in export"
 
+    @pytest.mark.parametrize(
+        ("profile_name", "relative_db"),
+        [
+            ("testprofile", "telemetry/shared_metrics/metrics.sqlite3"),
+            ("default", "plugins/demo/live.db"),
+            ("question", "plugins/demo/question?mark.db"),
+            ("hashmark", "plugins/demo/hash#mark.sqlite3"),
+            ("legacy", "plugins/demo/legacy.sqlite"),
+        ],
+    )
+    def test_export_snapshots_rows_committed_only_to_active_wal(
+        self, tmp_path, monkeypatch, profile_name, relative_db
+    ):
+        """Exports retain committed WAL rows while omitting live sidecars."""
+        if profile_name == "default":
+            profile_dir = tmp_path / ".hermes"
+            monkeypatch.setattr(
+                "hermes_cli.profiles._get_default_hermes_home",
+                lambda: profile_dir,
+            )
+        else:
+            profiles_root = tmp_path / "profiles"
+            profile_dir = profiles_root / profile_name
+            monkeypatch.setattr(
+                "hermes_cli.profiles._get_profiles_root", lambda: profiles_root
+            )
+
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        db_path = profile_dir / relative_db
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+
+        writer = sqlite3.connect(db_path)
+        try:
+            assert writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+            writer.execute("CREATE TABLE items (value TEXT)")
+            writer.execute("INSERT INTO items VALUES ('checkpointed')")
+            writer.commit()
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            writer.execute("INSERT INTO items VALUES ('fresh-in-wal')")
+            writer.commit()
+
+            wal_path = Path(f"{db_path}-wal")
+            shm_path = Path(f"{db_path}-shm")
+            assert wal_path.exists() and wal_path.stat().st_size > 0
+            assert shm_path.exists()
+
+            # Prove the second committed row has not reached the main file.
+            raw_main = tmp_path / f"raw-{profile_name}.db"
+            raw_main.write_bytes(db_path.read_bytes())
+            with sqlite3.connect(raw_main) as raw_conn:
+                assert raw_conn.execute(
+                    "SELECT value FROM items ORDER BY rowid"
+                ).fetchall() == [
+                    ("checkpointed",)
+                ]
+
+            monkeypatch.setattr(
+                "hermes_cli.profiles.get_profile_dir", lambda n: profile_dir
+            )
+            monkeypatch.setattr(
+                "hermes_cli.profiles.validate_profile_name", lambda n: None
+            )
+            result = export_profile(
+                profile_name, str(tmp_path / f"{profile_name}.tar.gz")
+            )
+
+            for delimiter in ("?", "#"):
+                if delimiter in db_path.name:
+                    truncated_name = db_path.name.split(delimiter, 1)[0]
+                    assert not db_path.with_name(truncated_name).exists()
+        finally:
+            writer.close()
+
+        member = f"{profile_name}/{relative_db}"
+        with tarfile.open(result, "r:gz") as tf:
+            names = set(tf.getnames())
+            archived_db = tmp_path / f"archived-{profile_name}.db"
+            archived_db.write_bytes(tf.extractfile(member).read())
+
+        with sqlite3.connect(archived_db) as archived_conn:
+            assert archived_conn.execute(
+                "SELECT value FROM items ORDER BY rowid"
+            ).fetchall() == [
+                ("checkpointed",),
+                ("fresh-in-wal",),
+            ]
+        assert f"{member}-wal" not in names
+        assert f"{member}-shm" not in names
+
+    @pytest.mark.parametrize(
+        ("relative_name", "content"),
+        [
+            ("auth.json", '{"opaque": "not-redactor-shaped"}'),
+            (
+                "config.yaml.corrupt.20260812-123456.bak",
+                "api_key: not-redactor-shaped",
+            ),
+            (
+                "config.yaml.corrupt.20260812-123456.bak.copy",
+                "api_key: not-redactor-shaped",
+            ),
+            ("feishu_comment_pairing.json", '{"approved": {"ou_user": {}}}'),
+            ("mcp-tokens/server.json", '{"opaque": "not-redactor-shaped"}'),
+            (
+                "mcp-tokens.bak-pre-migrate/server.json",
+                '{"opaque": "not-redactor-shaped"}',
+            ),
+            (
+                "pairing.backup-before-reset/device.json",
+                '{"opaque": "not-redactor-shaped"}',
+            ),
+            ("home/.ssh/id_ed25519", "not-redactor-shaped"),
+            ("home/.ssh.bak-before-rotation/id_ed25519", "not-redactor-shaped"),
+            ("deploy.ppk", "PuTTY-User-Key-File-3: ssh-rsa\nPrivate-Lines: 1\nopaque"),
+            ("private.pem", "-----BEGIN PRIVATE KEY-----\nopaque\n"),
+        ],
+    )
+    def test_extra_files_cannot_reintroduce_sensitive_export_entries(
+        self, tmp_path, monkeypatch, relative_name, content
+    ):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "extras"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        output = tmp_path / "extras.tar.gz"
+        with pytest.raises(ValueError, match="Refusing"):
+            export_profile(
+                "extras",
+                str(output),
+                extra_files={relative_name: content},
+            )
+        assert not output.exists()
+
+    def test_safe_extra_file_remains_exportable(self, tmp_path, monkeypatch):
+        profiles_root = tmp_path / "profiles"
+        profile_dir = profiles_root / "extras"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        _patch_named_profile(monkeypatch, profiles_root, profile_dir)
+
+        result = export_profile(
+            "extras",
+            str(tmp_path / "extras.tar.gz"),
+            extra_files={"desktop.json": '{"theme": "studio"}\n'},
+        )
+        with tarfile.open(result, "r:gz") as tf:
+            member = tf.extractfile("extras/desktop.json")
+            assert member is not None
+            assert member.read().decode("utf-8") == '{"theme": "studio"}\n'
+
 
 class TestExportSecretScrub:
+
+    @pytest.mark.parametrize("profile_name", ["templated", "default"])
+    def test_export_redacts_every_allowed_dotenv_template(
+        self, tmp_path, monkeypatch, profile_name
+    ):
+        """Every portable dotenv template is scrubbed in both export paths."""
+        template_names = (
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+        )
+        if profile_name == "default":
+            profile_dir = tmp_path / ".hermes"
+            monkeypatch.setattr(
+                "hermes_cli.profiles._get_default_hermes_home",
+                lambda: profile_dir,
+            )
+        else:
+            profiles_root = tmp_path / "profiles"
+            profile_dir = profiles_root / profile_name
+            monkeypatch.setattr(
+                "hermes_cli.profiles._get_profiles_root", lambda: profiles_root
+            )
+
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "config.yaml").write_text("model: test\n")
+        for name in template_names:
+            (profile_dir / name).write_text(f"API_KEY={_LEAKED_KEY}\n")
+
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir", lambda n: profile_dir
+        )
+        monkeypatch.setattr("hermes_cli.profiles.validate_profile_name", lambda n: None)
+        result = export_profile(profile_name, str(tmp_path / f"{profile_name}.tar.gz"))
+
+        with tarfile.open(result, "r:gz") as tf:
+            for name in template_names:
+                member = f"{profile_name}/{name}"
+                archived = tf.extractfile(member).read().decode("utf-8")
+                assert _LEAKED_KEY not in archived
+                assert _LEAKED_KEY in (profile_dir / name).read_text()
 
     def test_named_profile_export_redacts_secrets_in_text(self, tmp_path, monkeypatch):
         """Leaked keys in skills / SOUL / memories must not leave the archive."""

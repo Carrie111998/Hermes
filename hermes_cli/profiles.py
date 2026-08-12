@@ -1906,18 +1906,24 @@ def get_active_profile_name() -> str:
 # Transient entries excluded from every profile export. SQLite WAL, SHM, and
 # rollback-journal sidecars can disappear between copytree's directory scan and
 # file copy while a live database checkpoints, causing the whole export to fail.
+_EXPORT_SQLITE_SUFFIXES = (".db", ".sqlite", ".sqlite3")
+_EXPORT_SQLITE_SIDECAR_SUFFIXES = tuple(
+    f"{database_suffix}{sidecar_suffix}"
+    for database_suffix in _EXPORT_SQLITE_SUFFIXES
+    for sidecar_suffix in ("-shm", "-wal", "-journal")
+)
 _EXPORT_TRANSIENT_SUFFIXES = (
     ".sock",
     ".tmp",
-    ".db-shm",
-    ".db-wal",
-    ".db-journal",
 )
 
 
 def _is_transient_export_name(name: str) -> bool:
     """Return True for cache or transient files unsafe to copy live."""
-    return name == "__pycache__" or name.endswith(_EXPORT_TRANSIENT_SUFFIXES)
+    lowered = name.lower()
+    return name == "__pycache__" or lowered.endswith(
+        _EXPORT_TRANSIENT_SUFFIXES + _EXPORT_SQLITE_SIDECAR_SUFFIXES
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1958,6 +1964,7 @@ _EXPORT_SENSITIVE_BASENAMES = frozenset({
     "google_oauth_pending.json",
     "google_oauth.json",
     "webhook_subscriptions.json",
+    "feishu_comment_pairing.json",
     "bws_cache.json",
     "bws_cache.enc.json",
     "oauth_creds.json",
@@ -2012,6 +2019,16 @@ _EXPORT_ENV_TEMPLATE_NAMES = frozenset({
     ".env.dist",
 })
 
+# ``hermes_cli.config._backup_corrupt_config`` writes this exact base family
+# when a malformed config is preserved before a later rewrite. The final
+# ``.bak`` is not adjacent to ``config.yaml``, so ordinary backup-suffix peeling
+# alone cannot recover the sensitive basename. Separator-delimited derivatives
+# of that generated backup remain sensitive too.
+_EXPORT_CORRUPT_CONFIG_BACKUP_RE = re.compile(
+    r"^config\.ya?ml\.corrupt\.\d{8}-\d{6}\.bak(?:[._~-].*)?$",
+    re.IGNORECASE,
+)
+
 # Backup, renamed-copy, and stale atomic-temp suffixes for canonical stores and
 # any other name already classified as sensitive. Numeric and trailing-tilde
 # suffixes cover names such as ``auth.json.20260101`` and ``auth.json~``. The
@@ -2033,7 +2050,14 @@ _EXPORT_BACKUP_NAME_RE = re.compile(
 # and ``mcp-tokens_copy_of_docs`` remain portable.
 _EXPORT_DIRECTORY_BACKUP_NAME_RE = re.compile(
     r"^(?P<base>.+?)(?:"
-    r"[._-](?:bak|backup|old|copy|tmp)(?:[._-]\d[\w.-]*)?"
+    # ``bak`` and ``backup`` are unambiguous backup markers, including
+    # free-form reasons such as ``.bak-pre-migrate`` / ``.backup-before-reset``.
+    r"[._-](?:bak|backup)(?:[._-][\w.-]+)?"
+    # ``old``, ``copy``, and ``tmp`` are common words in ordinary directory
+    # names, so only bare or numeric-run forms are normalized. This preserves
+    # safe lookalikes such as ``pairing-old-notes`` and
+    # ``mcp-tokens_copy_of_docs``.
+    r"|[._-](?:old|copy|tmp)(?:[._-]\d[\w.-]*)?"
     r"|[._-]\d{8}(?:[._-]\d{4,6})?"
     r"|~"
     r")$",
@@ -2043,7 +2067,7 @@ _EXPORT_DIRECTORY_BACKUP_NAME_RE = re.compile(
 # Unambiguously private key / keystore extensions. PEM files are content-checked
 # separately because public CA bundles and certificates are also commonly PEM.
 _EXPORT_SENSITIVE_SUFFIXES = (
-    ".key", ".p12", ".pfx", ".keystore", ".jks",
+    ".key", ".ppk", ".p12", ".pfx", ".keystore", ".jks",
 )
 
 # Credential-/token-looking names. The keyword must be a whole token bounded by
@@ -2075,6 +2099,9 @@ def _is_sensitive_export_name(name: str) -> bool:
 
     if lowered in _EXPORT_ENV_TEMPLATE_NAMES:
         return False
+
+    if _EXPORT_CORRUPT_CONFIG_BACKUP_RE.fullmatch(lowered):
+        return True
 
     if lowered in _EXPORT_SENSITIVE_BASENAMES:
         return True
@@ -2313,9 +2340,94 @@ def _should_redact_export_file(path: Path) -> bool:
     name = path.name
     if name in _EXPORT_REDACT_NAMES:
         return True
-    if name.lower().endswith(".env.example"):
+    if name.lower() in _EXPORT_ENV_TEMPLATE_NAMES:
         return True
     return path.suffix.lower() in _EXPORT_REDACT_SUFFIXES
+
+
+def _safe_copy_export_sqlite_database(source: Path, destination: Path) -> None:
+    """Create a URI-safe, transactionally consistent SQLite snapshot."""
+    import sqlite3
+
+    source_connection = None
+    destination_connection = None
+    snapshot_error = None
+    try:
+        source_uri = f"{source.resolve().as_uri()}?mode=ro"
+        source_connection = sqlite3.connect(source_uri, uri=True)
+        destination_connection = sqlite3.connect(destination)
+        source_connection.backup(destination_connection)
+    except Exception as exc:
+        snapshot_error = exc
+    finally:
+        for connection in (destination_connection, source_connection):
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+    if snapshot_error is not None:
+        try:
+            destination.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Could not create a consistent SQLite export snapshot: {source.name}"
+        ) from snapshot_error
+
+
+def _snapshot_export_sqlite_databases(source_root: Path, staged_root: Path) -> None:
+    """Replace staged SQLite files with consistent live snapshots.
+
+    Export ignores transient WAL/SHM/journal sidecars because they can vanish
+    during ``copytree``. Copying only the main database file is not sufficient,
+    though: committed rows may still live exclusively in an active WAL. For
+    every staged ``*.db``, ``*.sqlite``, or ``*.sqlite3`` file with a SQLite
+    header, use SQLite's backup API and fail closed if a consistent snapshot
+    cannot be made. Files that merely use one of those suffixes without being
+    SQLite are untouched.
+    """
+    import stat
+    import tempfile
+
+    sqlite_header = b"SQLite format 3\x00"
+    for staged_db in staged_root.rglob("*"):
+        if (
+            staged_db.suffix.lower() not in _EXPORT_SQLITE_SUFFIXES
+            or staged_db.is_symlink()
+            or not staged_db.is_file()
+        ):
+            continue
+        try:
+            with staged_db.open("rb") as handle:
+                if handle.read(len(sqlite_header)) != sqlite_header:
+                    continue
+            relative = staged_db.relative_to(staged_root)
+            source_db = source_root / relative
+            if source_db.is_symlink() or not source_db.is_file():
+                raise RuntimeError(
+                    f"SQLite source changed during profile export: {relative}"
+                )
+            original_mode = stat.S_IMODE(staged_db.stat().st_mode)
+        except OSError as exc:
+            raise RuntimeError(
+                f"Could not inspect SQLite database during profile export: {staged_db}"
+            ) from exc
+
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{staged_db.name}.",
+            suffix=".snapshot",
+            dir=staged_db.parent,
+            delete=False,
+        ) as handle:
+            snapshot = Path(handle.name)
+        try:
+            _safe_copy_export_sqlite_database(source_db, snapshot)
+            snapshot.chmod(original_mode)
+            snapshot.replace(staged_db)
+        finally:
+            snapshot.unlink(missing_ok=True)
 
 
 def _scrub_export_secrets(staged: Path) -> None:
@@ -2392,7 +2504,34 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
         for rel, content in (extra_files or {}).items():
             parts = _normalize_profile_archive_parts(rel)
             target = staged.joinpath(*parts)
-            target.parent.mkdir(parents=True, exist_ok=True)
+
+            if (
+                any(_is_transient_export_name(part) for part in parts)
+                or any(_is_sensitive_export_name(part) for part in parts)
+                or _is_sensitive_profile_credential_tree_entry(
+                    str(target.parent), target.name, staged
+                )
+                or _is_sensitive_profile_home_entry(
+                    str(target.parent), target.name, staged
+                )
+            ):
+                raise ValueError(f"Refusing sensitive profile export extra: {rel}")
+
+            underlying_name = _strip_export_backup_suffixes(target.name)
+            if (
+                underlying_name.endswith(".pem")
+                and "PRIVATE KEY-----" in content.upper()
+            ):
+                raise ValueError(f"Refusing private-key profile export extra: {rel}")
+
+            parent = staged
+            for part in parts[:-1]:
+                parent = parent / part
+                if parent.is_symlink():
+                    raise ValueError(f"Refusing symlinked profile export extra: {rel}")
+                parent.mkdir(exist_ok=True)
+            if target.is_symlink():
+                raise ValueError(f"Refusing symlinked profile export extra: {rel}")
             target.write_text(content, encoding="utf-8")
 
     if canon == "default":
@@ -2407,6 +2546,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
                 symlinks=True,
                 ignore=_default_export_ignore(profile_dir),
             )
+            _snapshot_export_sqlite_databases(profile_dir, staged)
             _stage_extras(staged)
             _scrub_export_secrets(staged)
             result = _make_profile_archive(base, tmpdir, "default")
@@ -2434,6 +2574,7 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
             symlinks=True,
             ignore=_named_ignore,
         )
+        _snapshot_export_sqlite_databases(profile_dir, staged)
         _stage_extras(staged)
         _scrub_export_secrets(staged)
         result = _make_profile_archive(base, tmpdir, canon)
