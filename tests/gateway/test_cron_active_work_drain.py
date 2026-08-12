@@ -281,3 +281,57 @@ class TestKillToolSubprocessesMarksCronInterrupted:
             await runner.stop()
 
         mock_mark.assert_not_called()
+
+
+class TestCronShutdownGracePreservesSubprocess:
+    """Integration: the grace window must actually prevent the global
+    tool-subprocess sweep from amputating an in-flight cron job's
+    subprocess when that job clears (and its tool subprocess exits)
+    within the grace.
+
+    End-to-end guarantee the T24-verdict regression exercised: a
+    long-running cron tool subprocess that finishes during the grace must
+    survive ``_kill_tool_subprocesses("final-cleanup")`` instead of being
+    reaped with an interrupted mark (#60432 amputation).
+    """
+
+    @pytest.mark.asyncio
+    async def test_subprocess_survives_final_cleanup_via_grace(self, monkeypatch):
+        import sys
+        import cron.scheduler as sched
+        import tools.process_registry as _pr
+
+        runner = make_restart_runner()[0]
+        runner._load_cron_shutdown_grace = lambda: 5.0
+
+        # Spawn a REAL short-lived subprocess tracked by the process
+        # registry, so a global kill_all sweep would actually reap it if
+        # the grace did not run first.
+        session = _pr.process_registry.spawn_local(
+            command=f"{sys.executable!r} -c 'import time; time.sleep(0.3)'",
+            task_id="cron-verdict",
+        )
+        assert session is not None
+        sched._running_job_ids.add("cron-verdict")
+
+        async def _release_after_subprocess_exits():
+            # Mirror the real cron completion path: the scheduler drops the
+            # in-flight job id once run_one_job() returns (which happens
+            # after the tool subprocess it owns exits).
+            await asyncio.to_thread(session.process.wait, 5)
+            sched._running_job_ids.discard("cron-verdict")
+
+        releaser = asyncio.create_task(_release_after_subprocess_exits())
+        try:
+            # The grace must WAIT for the cron job to clear rather than
+            # returning immediately, so the subprocess gets to finish.
+            await asyncio.wait_for(runner._grant_cron_shutdown_grace(), timeout=5.0)
+            await releaser
+
+            assert "cron-verdict" not in sched._running_job_ids
+            # Final-cleanup sweep now finds nothing to reap — the job's
+            # tool subprocess exited on its own, surviving the shutdown.
+            assert _pr.process_registry.kill_all() == 0
+        finally:
+            _pr.process_registry.kill_all()
+
