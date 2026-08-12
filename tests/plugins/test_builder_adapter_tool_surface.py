@@ -57,6 +57,31 @@ def test_governed_worker_gets_only_minimal_kanban_lifecycle(monkeypatch):
     assert not names & FORBIDDEN_KANBAN_TOOLS
 
 
+def test_runtime_owned_allowlist_bypasses_progressive_tool_disclosure(monkeypatch):
+    from tools import tool_search
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
+    monkeypatch.setenv(
+        "HERMES_INTERNAL_WORKER_TOOL_ALLOWLIST",
+        json.dumps(sorted(EXPECTED_LIFECYCLE_TOOLS)),
+    )
+    monkeypatch.setattr(
+        tool_search,
+        "assemble_tool_defs",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact worker tools must not be deferred")
+        ),
+    )
+
+    definitions = model_tools._compute_tool_definitions(
+        enabled_toolsets=[], quiet_mode=True
+    )
+
+    assert {
+        definition["function"]["name"] for definition in definitions
+    } == EXPECTED_LIFECYCLE_TOOLS
+
+
 def test_ordinary_worker_behavior_remains_broad_and_unchanged(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task")
     monkeypatch.delenv("HERMES_INTERNAL_WORKER_TOOL_ALLOWLIST", raising=False)

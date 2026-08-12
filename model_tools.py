@@ -415,6 +415,13 @@ def _compute_tool_definitions(
                 worker_allowlist = set(parsed_allowlist)
         except (TypeError, ValueError):
             worker_allowlist = set()
+    if raw_worker_allowlist is not None:
+        # Runtime-owned worker policies attest and execute an exact literal tool
+        # surface. Progressive disclosure would replace approved plugin tools
+        # with tool_search/tool_describe/tool_call, changing both the attested
+        # contract and the model-visible authority. Ordinary sessions keep the
+        # configured tool-search behavior.
+        skip_tool_search_assembly = True
 
     if enabled_toolsets is not None:
         effective_enabled_toolsets = list(enabled_toolsets)
