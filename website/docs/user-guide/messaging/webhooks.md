@@ -456,6 +456,8 @@ The adapter validates incoming webhook signatures using the appropriate method f
 
 - **GitHub**: `X-Hub-Signature-256` header — HMAC-SHA256 hex digest prefixed with `sha256=`
 - **GitLab**: `X-Gitlab-Token` header — plain secret string match
+- **Linear**: `Linear-Signature` header — HMAC-SHA256 hex digest of the exact raw body. Hermes also requires the signed body's `webhookTimestamp` to be within ±60 seconds and rejects a mismatched `Linear-Timestamp` header.
+- **Bearer token**: `Authorization: Bearer <secret>` — timing-safe token comparison for providers such as Datadog that support custom headers but cannot calculate per-request HMACs
 - **Generic (V2, recommended)**: `X-Webhook-Signature-V2` + `X-Webhook-Timestamp` headers — HMAC-SHA256 hex digest of `<timestamp>.<body>`. The timestamp (Unix seconds) must be within ±300 seconds of the server clock, which prevents captured requests from being replayed later.
 - **Generic (V1, legacy)**: `X-Webhook-Signature` header — raw HMAC-SHA256 hex digest of the body only. Still accepted for backward compatibility, but it has no replay protection (a captured request replays indefinitely); the gateway logs a deprecation warning once per route. Switch senders to V2.
 
@@ -529,6 +531,8 @@ This is the same trust model that applies to everything the agent reads: web pag
 - Ensure the secret in your route config exactly matches the secret configured in the webhook source
 - For GitHub, the secret is HMAC-based — check `X-Hub-Signature-256`
 - For GitLab, the secret is a plain token match — check `X-Gitlab-Token`
+- For Linear, check `Linear-Signature` and the signed `webhookTimestamp`
+- For bearer-authenticated providers, check the exact `Authorization: Bearer <secret>` value
 - Check gateway logs for `Invalid signature` warnings
 
 ### Event being ignored

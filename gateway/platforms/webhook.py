@@ -706,7 +706,8 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Check event type filter
         event_type = (
-            request.headers.get("X-GitHub-Event", "")
+            request.headers.get("Linear-Event", "")
+            or request.headers.get("X-GitHub-Event", "")
             or request.headers.get("X-GitLab-Event", "")
             or payload.get("event_type", "")
             or payload.get("type", "")
@@ -800,10 +801,15 @@ class WebhookAdapter(BasePlatformAdapter):
 
         # Build a unique delivery ID
         delivery_id = request.headers.get(
-            "X-GitHub-Delivery",
+            "Linear-Delivery",
             request.headers.get(
-                "svix-id",
-                request.headers.get("X-Request-ID", str(int(time.time() * 1000))),
+                "X-GitHub-Delivery",
+                request.headers.get(
+                    "svix-id",
+                    request.headers.get(
+                        "X-Request-ID", str(int(time.time() * 1000))
+                    ),
+                ),
             ),
         )
 
@@ -1036,13 +1042,51 @@ class WebhookAdapter(BasePlatformAdapter):
     def _validate_signature(
         self, request: "web.Request", body: bytes, secret: str
     ) -> bool:
-        """Validate webhook signature (GitHub, GitLab, Svix, generic HMAC-SHA256)."""
+        """Validate webhook signature or token for supported providers."""
         def _header(name: str) -> str:
             return (
                 request.headers.get(name, "")
                 or request.headers.get(name.lower(), "")
                 or request.headers.get(name.upper(), "")
             )
+
+        def _has_header(name: str) -> bool:
+            target = name.lower()
+            return any(header.lower() == target for header in request.headers)
+
+        # Linear: Linear-Signature = <hex HMAC-SHA256 of raw body>.
+        # Header presence commits to Linear validation so an empty or invalid
+        # Linear signature cannot downgrade to another signature scheme.
+        # Linear recommends rejecting deliveries whose signed payload timestamp
+        # is more than one minute from the receiver's clock. The body timestamp
+        # is covered by the HMAC; when Linear-Timestamp is present, require it
+        # to agree instead of trusting an unsigned header for replay defense.
+        if _has_header("Linear-Signature"):
+            linear_sig = _header("Linear-Signature")
+            expected = hmac.new(
+                secret.encode(), body, hashlib.sha256
+            ).hexdigest()
+            if not _hmac_str_equal(linear_sig, expected):
+                return False
+            try:
+                payload = json.loads(body)
+                timestamp_ms = payload.get("webhookTimestamp")
+                timestamp_ms = int(timestamp_ms)
+            except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+                return False
+            linear_timestamp = _header("Linear-Timestamp")
+            if linear_timestamp:
+                try:
+                    if int(linear_timestamp) != timestamp_ms:
+                        return False
+                except (TypeError, ValueError):
+                    return False
+            if abs(time.time() * 1000 - timestamp_ms) > 60_000:
+                logger.warning(
+                    "[webhook] Linear signature timestamp outside replay window"
+                )
+                return False
+            return True
 
         # Svix / AgentMail:
         #   svix-id: msg_...
@@ -1074,6 +1118,12 @@ class WebhookAdapter(BasePlatformAdapter):
         gl_token = request.headers.get("X-Gitlab-Token", "")
         if gl_token:
             return _hmac_str_equal(gl_token, secret)
+
+        # Standard bearer authentication for providers such as Datadog that
+        # can attach custom headers but cannot calculate a per-request HMAC.
+        authorization = _header("Authorization")
+        if authorization.startswith("Bearer "):
+            return _hmac_str_equal(authorization.removeprefix("Bearer "), secret)
 
         # Generic V2: X-Webhook-Signature-V2 = <hex HMAC-SHA256 of "<timestamp>.<body>">
         #             X-Webhook-Timestamp = <unix seconds> (required for V2)

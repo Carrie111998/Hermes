@@ -26,7 +26,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import SendResult
@@ -104,6 +104,11 @@ def _generic_signature(body: bytes, secret: str) -> str:
     return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
+def _linear_signature(body: bytes, secret: str) -> str:
+    """Compute Linear-Signature for *body* using *secret*."""
+    return hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+
 def _generic_v2_signature(body: bytes, secret: str, timestamp: str) -> str:
     """Compute X-Webhook-Signature-V2 (HMAC-SHA256 of "<timestamp>.<body>")."""
     signed_content = timestamp.encode() + b"." + body
@@ -130,6 +135,109 @@ def _svix_signature(body: bytes, secret: str, msg_id: str, timestamp: str) -> st
 class TestValidateSignature:
     """Tests for WebhookAdapter._validate_signature."""
 
+    def test_validate_linear_signature_and_payload_timestamp(self):
+        """Linear HMAC and signed millisecond timestamp are accepted."""
+        adapter = _make_adapter()
+        timestamp = int(time.time() * 1000)
+        body = json.dumps({"webhookTimestamp": timestamp}).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": _linear_signature(body, secret),
+            "Linear-Timestamp": str(timestamp),
+        })
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_validate_linear_signature_rejects_stale_payload_timestamp(self):
+        """A replayed Linear body is rejected even with a valid HMAC."""
+        adapter = _make_adapter()
+        body = json.dumps({
+            "webhookTimestamp": int((time.time() - 61) * 1000),
+        }).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": _linear_signature(body, secret),
+        })
+        assert adapter._validate_signature(req, body, secret) is False
+
+    def test_validate_linear_signature_rejects_missing_payload_timestamp(self):
+        """A signed Linear body without replay metadata fails closed."""
+        adapter = _make_adapter()
+        body = json.dumps({"action": "create"}).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": _linear_signature(body, secret),
+        })
+        assert adapter._validate_signature(req, body, secret) is False
+
+    def test_validate_linear_signature_rejects_malformed_payload_timestamp(self):
+        """A signed but nonnumeric Linear timestamp fails closed."""
+        adapter = _make_adapter()
+        body = json.dumps({"webhookTimestamp": "not-a-timestamp"}).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": _linear_signature(body, secret),
+        })
+        assert adapter._validate_signature(req, body, secret) is False
+
+    def test_empty_linear_signature_does_not_fall_through(self):
+        """Header presence selects Linear even when another scheme is valid."""
+        adapter = _make_adapter()
+        timestamp = int(time.time() * 1000)
+        body = json.dumps({"webhookTimestamp": timestamp}).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": "",
+            "X-Webhook-Signature": _generic_signature(body, secret),
+        })
+        assert adapter._validate_signature(req, body, secret) is False
+
+    def test_linear_signature_header_is_case_insensitive(self):
+        """Mixed-case aiohttp headers select Linear validation."""
+        adapter = _make_adapter()
+        timestamp = int(time.time() * 1000)
+        body = json.dumps({"webhookTimestamp": timestamp}).encode()
+        secret = "linear-webhook-secret"
+        req = make_mocked_request(
+            "POST",
+            "/webhooks/linear",
+            headers={"lInEaR-SiGnAtUrE": _linear_signature(body, secret)},
+        )
+        assert adapter._validate_signature(req, body, secret) is True
+
+    def test_changed_delivery_cannot_replay_stale_linear_body(self):
+        """Changing the unsigned delivery ID cannot revive a stale body."""
+        adapter = _make_adapter()
+        body = json.dumps({
+            "webhookTimestamp": int((time.time() - 61) * 1000),
+        }).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": _linear_signature(body, secret),
+            "Linear-Delivery": "attacker-selected-new-delivery-id",
+        })
+        assert adapter._validate_signature(req, body, secret) is False
+
+    def test_validate_linear_signature_rejects_timestamp_header_mismatch(self):
+        """The unsigned timestamp header cannot override the signed body."""
+        adapter = _make_adapter()
+        timestamp = int(time.time() * 1000)
+        body = json.dumps({"webhookTimestamp": timestamp}).encode()
+        secret = "linear-webhook-secret"
+        req = _mock_request(headers={
+            "Linear-Signature": _linear_signature(body, secret),
+            "Linear-Timestamp": str(timestamp + 1),
+        })
+        assert adapter._validate_signature(req, body, secret) is False
+
+    def test_validate_bearer_token(self):
+        """A provider-supplied bearer token is timing-safely checked."""
+        adapter = _make_adapter()
+        secret = "datadog-webhook-token"
+        req = _mock_request(headers={"Authorization": f"Bearer {secret}"})
+        assert adapter._validate_signature(req, b"{}", secret) is True
+
+        wrong = _mock_request(headers={"Authorization": "Bearer wrong"})
+        assert adapter._validate_signature(wrong, b"{}", secret) is False
 
     def test_validate_no_signature_with_secret_rejects(self):
         """Secret configured but no recognised signature header → reject."""
@@ -348,6 +456,42 @@ class TestEventFilter:
             )
             assert resp.status == 202
 
+    @pytest.mark.asyncio
+    async def test_linear_headers_drive_event_filter_and_idempotency(self):
+        """Linear's native event and delivery headers map to Hermes contracts."""
+        routes = {
+            "linear": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["Issue"],
+                "prompt": "Issue: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        headers = {
+            "Linear-Event": "Issue",
+            "Linear-Delivery": "linear-delivery-1",
+        }
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            first = await cli.post(
+                "/webhooks/linear",
+                json={"action": "create"},
+                headers=headers,
+            )
+            assert first.status == 202
+
+            duplicate = await cli.post(
+                "/webhooks/linear",
+                json={"action": "create"},
+                headers=headers,
+            )
+            assert duplicate.status == 200
+            assert (await duplicate.json()) == {
+                "status": "duplicate",
+                "delivery_id": "linear-delivery-1",
+            }
 
 # ===================================================================
 # Payload filters
