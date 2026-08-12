@@ -69,8 +69,13 @@ Text-to-speech and speech-to-text across all messaging platforms:
 | **ElevenLabs** | Excellent | Paid | `ELEVENLABS_API_KEY` |
 | **OpenAI TTS** | Good | Paid | `VOICE_TOOLS_OPENAI_KEY` |
 | **MiniMax** | Good | Paid | `MINIMAX_API_KEY` |
+| **Mistral (Voxtral TTS)** | Excellent | Paid | `MISTRAL_API_KEY` |
+| **Google Gemini TTS** | Excellent | Free tier | `GEMINI_API_KEY` |
 | **xAI TTS** | Good | Paid | `XAI_API_KEY` |
+| **DeepInfra TTS** | Good | Paid | `DEEPINFRA_API_KEY` |
 | **NeuTTS** | Good | Free | None needed |
+| **KittenTTS** | Good | Free | None needed |
+| **Piper** | Good | Free | None needed |
 
 Speech-to-text supports eight providers: local faster-whisper (free, runs on-device), a local command wrapper, Groq, OpenAI Whisper API, Mistral, xAI, ElevenLabs Scribe, and DeepInfra. Voice message transcription works across Telegram, Discord, WhatsApp, and other messaging platforms. See [Voice & TTS](/user-guide/features/tts) and [Voice Mode](/user-guide/features/voice-mode) for details.
 
@@ -89,7 +94,7 @@ Speech-to-text supports eight providers: local faster-whisper (free, runs on-dev
 
 ## Messaging Platforms
 
-Hermes runs as a gateway bot on 27+ messaging platforms, all configured through the same `gateway` subsystem:
+Hermes runs as a gateway bot on 30+ messaging platforms, all configured through the same `gateway` subsystem:
 
 - **[Telegram](/user-guide/messaging/telegram)**, **[Discord](/user-guide/messaging/discord)**, **[Slack](/user-guide/messaging/slack)**, **[WhatsApp](/user-guide/messaging/whatsapp)**, **[Signal](/user-guide/messaging/signal)**, **[Matrix](/user-guide/messaging/matrix)**, **[Mattermost](/user-guide/messaging/mattermost)**, **[Email](/user-guide/messaging/email)**, **[SMS](/user-guide/messaging/sms)**, **[DingTalk](/user-guide/messaging/dingtalk)**, **[Feishu/Lark](/user-guide/messaging/feishu)**, **[WeCom](/user-guide/messaging/wecom)**, **[WeCom Callback](/user-guide/messaging/wecom-callback)**, **[Weixin](/user-guide/messaging/weixin)**, **[BlueBubbles](/user-guide/messaging/bluebubbles)**, **[Buzz](/user-guide/messaging/buzz)**, **[QQ Bot](/user-guide/messaging/qqbot)**, **[Yuanbao](/user-guide/messaging/yuanbao)**, **[Home Assistant](/user-guide/messaging/homeassistant)**, **[Microsoft Teams](/user-guide/messaging/teams)**, **[Microsoft Teams Meetings](/user-guide/messaging/teams-meetings)**, **[Microsoft Graph Webhook](/user-guide/messaging/msgraph-webhook)**, **[Google Chat](/user-guide/messaging/google_chat)**, **[LINE](/user-guide/messaging/line)**, **[ntfy](/user-guide/messaging/ntfy)**, **[SimpleX](/user-guide/messaging/simplex)**, **[Open WebUI](/user-guide/messaging/open-webui)**, **[Webhooks](/user-guide/messaging/webhooks)**
 

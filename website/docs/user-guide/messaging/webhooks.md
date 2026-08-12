@@ -85,7 +85,7 @@ Routes define how different webhook sources are handled. Each route is a named e
 | `filters` | No | Declarative payload filters evaluated after auth/body/event filtering and before agent or direct delivery work. Non-matches return `{"status":"ignored","reason":"filter"}` with HTTP 200. |
 | `script` | No | Filter/transform script under `~/.hermes/scripts/`. The webhook payload is passed as JSON on stdin. JSON object stdout replaces the payload before templating; text stdout is exposed as `script_output`; empty stdout, `[SILENT]`, or a nonzero exit code ignores the webhook. |
 | `skills` | No | List of skill names to load for the agent run. |
-| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `weixin`, `bluebubbles`, `qqbot`, or `log` (default). |
+| `deliver` | No | Where to send the response: `github_comment`, `telegram`, `discord`, `slack`, `signal`, `sms`, `whatsapp`, `matrix`, `mattermost`, `homeassistant`, `email`, `dingtalk`, `feishu`, `wecom`, `wecom_callback`, `weixin`, `bluebubbles`, `qqbot`, `yuanbao`, or `log` (default). |
 | `deliver_extra` | No | Additional delivery config — keys depend on `deliver` type (e.g. `repo`, `pr_number`, `chat_id`). Values support the same `{dot.notation}` templates as `prompt`. |
 | `deliver_only` | No | If `true`, skip the agent entirely — the rendered `prompt` template becomes the literal message that gets delivered. Zero LLM cost, sub-second delivery. See [Direct Delivery Mode](#direct-delivery-mode) for use cases. Requires `deliver` to be a real target (not `log`). |
 

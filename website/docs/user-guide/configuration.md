@@ -12,6 +12,8 @@ All settings are stored in the `~/.hermes/` directory for easy access.
 Run `hermes setup --portal` — one OAuth gets you a model provider and all four Tool Gateway tools without hand-editing YAML. Portal subscribers also get 10% off token-billed providers. See [Nous Portal](/integrations/nous-portal).
 :::
 
+The interactive wizard supports jumping straight to a section: `hermes setup model | terminal | gateway | tools | agent` (e.g. `hermes setup tools` to configure web search and browser backends). `hermes setup --quick` fills only missing items.
+
 ## Directory Structure
 
 ```text
