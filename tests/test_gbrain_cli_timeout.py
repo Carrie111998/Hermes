@@ -100,3 +100,32 @@ def test_run_text_capture_honours_cwd(tmp_path):
         cwd=tmp_path,
     )
     assert os.path.samefile(r.stdout.strip(), tmp_path)
+
+
+def test_run_text_capture_honours_env():
+    """The Node-ecosystem callers all pass ``env=with_hermes_node_path()``.
+
+    Without env passthrough they could not migrate off ``capture_output=True``
+    at all, and a silently-dropped env would resolve the *system* npm instead
+    of the Hermes-managed one.
+    """
+    r = run_text_capture(
+        [sys.executable, "-c", "import os; print(os.environ.get('HERMES_PROBE', 'MISSING'))"],
+        timeout=30,
+        env={**os.environ, "HERMES_PROBE": "sentinel"},
+    )
+    assert r.stdout.strip() == "sentinel"
+
+
+def test_run_text_capture_closes_stdin_by_default():
+    """Inheriting stdin is the second way this call outlives its timeout.
+
+    A child that prompts blocks on a read from a stdin nobody drives, and in a
+    gateway daemon there is no terminal behind it. Reading stdin must hit EOF
+    immediately rather than block.
+    """
+    r = run_text_capture(
+        [sys.executable, "-c", "import sys; print(repr(sys.stdin.read()))"],
+        timeout=30,
+    )
+    assert r.stdout.strip() == "''"

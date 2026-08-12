@@ -8379,14 +8379,20 @@ def _ensure_whatsapp_bridge_dependencies(bridge_dir: Path) -> None:
 
     timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
     try:
-        result = subprocess.run(
+        # run_text_capture, not capture_output=True: npm is npm.cmd on Windows,
+        # so cmd.exe is the direct child and the install is a node grandchild
+        # holding the capture pipes open. Under pipe capture the TimeoutExpired
+        # handler below is unreachable — subprocess.run kills cmd.exe and then
+        # blocks re-draining a pipe with no EOF, hanging this request handler
+        # rather than returning the 500 it promises. The helper applies
+        # CREATE_NO_WINDOW itself, replacing windows_hide_flags() here.
+        from hermes_cli._subprocess_compat import run_text_capture
+
+        result = run_text_capture(
             [npm, "install", "--silent"],
             cwd=str(bridge_dir),
-            capture_output=True,
-            text=True,
             timeout=timeout,
             env=with_hermes_node_path(),
-            creationflags=windows_hide_flags(),
         )
     except subprocess.TimeoutExpired as exc:
         raise HTTPException(
