@@ -64,6 +64,26 @@ def _python_install_cmd() -> str:
     return "python -m pip install" if _is_termux() else "uv pip install"
 
 
+def _editable_install_cmd(spec: str) -> str:
+    """The editable-install command that will actually RUN on this box.
+
+    Delegates to ``install_doctor.reinstall_command``, which picks pip or uv
+    by probing the environment instead of hardcoding either. A uv-created
+    venv has no pip at all, so a hardcoded ``pip install`` prints a
+    remediation that dies on "No module named pip"; hardcoding uv instead
+    would fail the same way on a pip-made venv.
+
+    Falls back to the platform hint if ``install_doctor`` cannot be
+    imported, so a problem there can never take down this section.
+    """
+    try:
+        from hermes_cli.install_doctor import reinstall_command
+
+        return reinstall_command(spec=spec)
+    except Exception:
+        return f"{_python_install_cmd()} {spec}"
+
+
 def _system_package_install_cmd(pkg: str) -> str:
     if _is_termux():
         return f"pkg install {pkg}"
@@ -1884,12 +1904,18 @@ def run_doctor(args):
         _cmd_link = _cmd_link_dir / "hermes"
 
         if _venv_bin is None:
+            # No `source venv/bin/activate` here: this branch is reached only
+            # when NEITHER venv/bin/hermes nor .venv/bin/hermes exists, so the
+            # activate script it told you to source was, by construction, not
+            # there either. The detected command names its interpreter
+            # explicitly instead, which is what activation was standing in for.
+            _reinstall = _editable_install_cmd("-e '.[all]'")
             check_warn(
                 "Venv entry point not found",
-                "(hermes not in venv/bin/ or .venv/bin/ — reinstall with pip install -e '.[all]')"
+                f"(hermes not in venv/bin/ or .venv/bin/ — reinstall with {_reinstall})"
             )
             manual_issues.append(
-                f"Reinstall entry point: cd {PROJECT_ROOT} && source venv/bin/activate && pip install -e '.[all]'"
+                f"Reinstall entry point: cd {PROJECT_ROOT} && {_reinstall}"
             )
         else:
             check_ok(f"Venv entry point exists ({_venv_bin.relative_to(PROJECT_ROOT)})")
