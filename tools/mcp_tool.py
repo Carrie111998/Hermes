@@ -1890,6 +1890,7 @@ class MCPServerTask:
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
         "_evaos_lease_manager", "_evaos_lease_auth",
+        "_evaos_lease_warning_emitted",
     )
 
     def __init__(self, name: str, registration_home: Optional[str] = None):
@@ -1938,6 +1939,7 @@ class MCPServerTask:
         # here; the source rereads it only for a mint.
         self._evaos_lease_manager: Optional[Any] = None
         self._evaos_lease_auth: Optional[Any] = None
+        self._evaos_lease_warning_emitted = False
         self._refresh_lock = asyncio.Lock()
         # MCP stdio sessions are a single JSON-RPC stream. Some servers emit
         # list_changed notifications during startup; if the notification
@@ -1984,6 +1986,8 @@ class MCPServerTask:
         """Reject connection or credential overrides for managed MCP auth."""
         if self._auth_type != "evaos_lease":
             return
+        from tools.evaos_mcp_lease import EvaosLeaseError
+
         conflicting = {
             "url",
             "headers",
@@ -1995,44 +1999,46 @@ class MCPServerTask:
             "client_cert",
         } & set(config)
         if conflicting or config.get("ssl_verify") is False:
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
             raise EvaosLeaseError(
                 "managed MCP config may specify only root-configured "
-                "customer, agent, and app identity plus non-credential "
-                "runtime options"
+                "profile identity plus non-credential runtime options"
             )
-        customer_id = config.get("customer_id")
-        if (
-            not isinstance(customer_id, str)
-            or re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", customer_id
-            )
-            is None
-        ):
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
-            raise EvaosLeaseError("managed MCP customer identity is invalid")
-        if config.get("agent_runtime") != "hermes":
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
-            raise EvaosLeaseError("managed MCP agent runtime is invalid")
-        agent_id = config.get("agent_id")
-        if (
-            not isinstance(agent_id, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]{1,120}", agent_id) is None
-        ):
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
-            raise EvaosLeaseError("managed MCP agent identity is invalid")
         app_slug = config.get("app_slug")
         if (
             not isinstance(app_slug, str)
             or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", app_slug) is None
         ):
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
             raise EvaosLeaseError("managed MCP app slug is invalid")
+        thin_keys = {"external_user_id", "account_id"} & set(config)
+        if thin_keys:
+            external_user_id = config.get("external_user_id")
+            account_id = config.get("account_id")
+            if (
+                not isinstance(external_user_id, str)
+                or re.fullmatch(r"acct_[A-Za-z0-9._:-]+_profile_[A-Za-z0-9._:-]+", external_user_id) is None
+                or not isinstance(account_id, str)
+                or re.fullmatch(r"apn_[A-Za-z0-9_-]+", account_id) is None
+            ):
+                raise EvaosLeaseError("managed MCP thin identity is invalid")
+            return
+        for key, pattern, label in (
+            ("customer_id", r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", "customer"),
+            ("agent_id", r"[A-Za-z0-9_-]{1,120}", "agent"),
+        ):
+            value = config.get(key)
+            if value is not None and (
+                not isinstance(value, str) or re.fullmatch(pattern, value) is None
+            ):
+                raise EvaosLeaseError(f"managed MCP {label} identity is invalid")
+        if config.get("agent_runtime") not in (None, "hermes"):
+            raise EvaosLeaseError("managed MCP agent runtime is invalid")
+
+    def _warn_evaos_lease_failure(self, exc: Exception) -> None:
+        if self._evaos_lease_warning_emitted:
+            return
+        self._evaos_lease_warning_emitted = True
+        logger.warning("MCP server '%s' profile '%s': managed Pipedream lease mint failed: %s",
+                       self.name, self.registration_home, exc)
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -2885,13 +2891,12 @@ class MCPServerTask:
 
             if self._evaos_lease_manager is None:
                 source = EvaosLeaseSource(
-                    profile_key=self.registration_home,
-                    customer_id=config["customer_id"],
-                    agent_runtime=config["agent_runtime"],
-                    agent_id=config["agent_id"],
-                    app_slug=config["app_slug"],
+                    profile_key=self.registration_home, app_slug=config["app_slug"],
+                    **{k: config[k] for k in ("external_user_id", "account_id", "customer_id", "agent_runtime", "agent_id") if k in config},
                 )
-                self._evaos_lease_manager = EvaosLeaseManager(source=source)
+                self._evaos_lease_manager = EvaosLeaseManager(
+                    source=source, on_mint_failure=self._warn_evaos_lease_failure
+                )
                 self._evaos_lease_auth = EvaosLeaseHttpAuth(
                     self._evaos_lease_manager
                 )

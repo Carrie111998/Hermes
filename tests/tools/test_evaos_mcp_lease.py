@@ -55,6 +55,27 @@ def _source(tmp_path, *, app_slug="google_sheets", profile_key="profile-a"):
     return source, broker
 
 
+def _thin_source(tmp_path, *, app_slug="google_sheets", profile_key="profile-a"):
+    broker = tmp_path / "broker-thin"
+    _write_secret(broker, "broker-secret-under-test\n")
+    values = {
+        "EVAOS_DESKTOP_RUNTIME_SESSION_URL": (
+            "https://example.supabase.co/functions/v1/desktop-runtime-session"
+        ),
+        "PIPEDREAM_AGENT_BROKER_SECRET_FILE": str(broker),
+    }
+    source = EvaosLeaseSource(
+        profile_key=profile_key,
+        app_slug=app_slug,
+        external_user_id="acct_test_profile_test",
+        account_id="apn_test_account",
+        secret_reader=values.get,
+        profile_resolver=lambda: profile_key,
+        root_uid=os.getuid(),
+    )
+    return source
+
+
 def _lease_payload(expires_at: datetime, token="lease-token-1"):
     return {
         "mcp_url": "https://remote.mcp.pipedream.net/v3",
@@ -64,7 +85,7 @@ def _lease_payload(expires_at: datetime, token="lease-token-1"):
             "x-pd-environment": "production",
             "x-pd-external-user-id": "server-derived",
             "x-pd-app-slug": "google_sheets",
-            "x-pd-account-id": "apn_server_resolved",
+            "x-pd-account-id": "apn_test_server_resolved",
         },
         "expires_at": expires_at.isoformat(),
     }
@@ -132,9 +153,48 @@ async def test_lease_request_uses_only_root_configured_profile_route(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_thin_lease_request_and_response_mount_headers(tmp_path):
+    now = datetime(2026, 8, 8, tzinfo=timezone.utc)
+    source = _thin_source(tmp_path)
+    calls = []
+
+    async def transport(url, headers, payload):
+        calls.append((url, headers, payload))
+        return _Response(
+            200,
+            {
+                "token": "thin-token",
+                "expires_at": (now + timedelta(minutes=10)).isoformat(),
+                "project_id": "project-test",
+                "environment": "production",
+            },
+        )
+
+    lease = await EvaosLeaseManager(
+        source=source, transport=transport, now=lambda: now
+    ).get_lease()
+
+    assert calls[0][2] == {
+        "action": "mint_connect_token",
+        "app_slug": "google_sheets",
+        "external_user_id": "acct_test_profile_test",
+        "account_id": "apn_test_account",
+    }
+    assert lease.mcp_url == "https://remote.mcp.pipedream.net/v3"
+    assert lease.headers == {
+        "Authorization": "Bearer thin-token",
+        "x-pd-project-id": "project-test",
+        "x-pd-environment": "production",
+        "x-pd-external-user-id": "acct_test_profile_test",
+        "x-pd-app-slug": "google_sheets",
+        "x-pd-account-id": "apn_test_account",
+    }
+
+
+@pytest.mark.asyncio
 async def test_expiry_refreshes_before_skew(tmp_path):
     clock = [datetime(2026, 8, 8, tzinfo=timezone.utc)]
-    source, _ = _source(tmp_path)
+    source = _thin_source(tmp_path)
     calls = 0
 
     async def transport(url, headers, payload):
@@ -142,10 +202,12 @@ async def test_expiry_refreshes_before_skew(tmp_path):
         calls += 1
         return _Response(
             200,
-            _lease_payload(
-                clock[0] + timedelta(seconds=90),
-                token=f"lease-token-{calls}",
-            ),
+            {
+                "token": f"thin-token-{calls}",
+                "expires_at": (clock[0] + timedelta(seconds=90)).isoformat(),
+                "project_id": "project-test",
+                "environment": "production",
+            },
         )
 
     manager = EvaosLeaseManager(
@@ -474,6 +536,41 @@ def test_managed_lease_config_is_http_without_a_static_url():
     task._validate_evaos_lease_config(task._config)
 
     assert task._is_http() is True
+
+
+def test_thin_managed_config_requires_only_connect_identity():
+    task = MCPServerTask("pipedream-google-sheets")
+    task._auth_type = "evaos_lease"
+    task._validate_evaos_lease_config(
+        {
+            "auth": "evaos_lease",
+            "app_slug": "google_sheets",
+            "external_user_id": "acct_test_profile_test",
+            "account_id": "apn_test_account",
+            "lazy": True,
+        }
+    )
+
+
+def test_keyless_old_shape_is_tolerated_until_connection_attempt():
+    task = MCPServerTask("pipedream-google-sheets")
+    task._auth_type = "evaos_lease"
+    task._validate_evaos_lease_config(
+        {"auth": "evaos_lease", "app_slug": "google_sheets", "lazy": True}
+    )
+
+
+def test_lease_mint_failure_warning_is_once_and_profile_scoped(caplog):
+    task = MCPServerTask("pipedream-google-sheets", "/tmp/profile-test")
+    with caplog.at_level("WARNING", logger="tools.mcp_tool"):
+        task._warn_evaos_lease_failure(EvaosLeaseError("service unavailable"))
+        task._warn_evaos_lease_failure(EvaosLeaseError("service unavailable"))
+
+    records = [r for r in caplog.records if "lease mint failed" in r.message]
+    assert len(records) == 1
+    assert "pipedream-google-sheets" in records[0].message
+    assert "/tmp/profile-test" in records[0].message
+    assert "apn_" not in records[0].message
 
 
 @pytest.mark.parametrize(
