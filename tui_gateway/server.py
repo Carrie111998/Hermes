@@ -20,6 +20,7 @@ from typing import Any, NamedTuple, Optional
 from hermes_constants import (
     get_hermes_home,
     get_hermes_home_override,
+    get_process_hermes_home,
     reset_hermes_home_override,
     set_hermes_home_override,
 )
@@ -53,7 +54,37 @@ load_hermes_dotenv(
 # AND re-emits a one-line summary to stderr so the TUI can surface it in
 # Activity — exactly what was missing when the voice-mode turns started
 # exiting the gateway mid-TTS.
-_CRASH_LOG = os.path.join(_hermes_home, "logs", "tui_gateway_crash.log")
+#
+# Resolved per write, NOT baked into a module constant at import.  Both hooks
+# below are installed process-wide the moment this module is imported, so every
+# process that merely imports it — 45 test modules, a scratch script, a REPL —
+# routes its unhandled exceptions here.  A constant resolved at import time
+# captured whatever ``HERMES_HOME`` was set then, which under pytest is the
+# developer's REAL home: ``tests/conftest.py``'s autouse ``_hermetic_environment``
+# fixture redirects ``HERMES_HOME`` to a per-test tempdir only AFTER collection
+# has imported this module.  Unrelated crashes therefore landed in the user's
+# live ~/.hermes/logs/tui_gateway_crash.log, indistinguishable from real gateway
+# forensics.  See GBrain concepts/import-time-hermes-home-snapshot-bug.
+#
+# ``_CRASH_LOG`` stays as an override seam so existing
+# ``monkeypatch.setattr(server, "_CRASH_LOG", ...)`` tests keep working.
+_CRASH_LOG: Optional[str] = None
+
+
+def _crash_log_path() -> str:
+    """Return the panic-log path, resolved at call time.
+
+    ``get_process_hermes_home()`` rather than ``get_hermes_home()``: the panic
+    log is a process-level forensic asset for the gateway, and resolving it
+    through the context-local override would scatter a turn's crash record into
+    whichever profile home that turn happened to be scoped to (the turn
+    dispatcher's ``except`` block runs while its ``set_hermes_home_override``
+    is still active).  No override is active at import, so this is the exact
+    live equivalent of what the old import-time constant captured.
+    """
+    if _CRASH_LOG is not None:
+        return _CRASH_LOG
+    return os.path.join(get_process_hermes_home(), "logs", "tui_gateway_crash.log")
 
 
 def _panic_hook(exc_type, exc_value, exc_tb):
@@ -61,8 +92,8 @@ def _panic_hook(exc_type, exc_value, exc_tb):
 
     trace = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== unhandled exception · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
             )
@@ -93,8 +124,8 @@ def _thread_panic_hook(args):
         traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)
     )
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== thread exception · {time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"· thread={args.thread.name} ===\n"
@@ -10392,8 +10423,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             trace = traceback.format_exc()
             try:
-                os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-                with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+                os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+                with open(_crash_log_path(), "a", encoding="utf-8") as f:
                     f.write(
                         f"\n=== turn-dispatcher exception · "
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} · sid={sid} ===\n"

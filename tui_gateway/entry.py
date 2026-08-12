@@ -19,7 +19,10 @@ import traceback
 from tui_gateway._stdin_recovery import handle_spurious_eof
 
 from tui_gateway import server
-from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
+# Import the RESOLVER, not the path: a ``from``-import of a module-level path
+# constant is a second import-time snapshot of HERMES_HOME (see
+# ``tui_gateway.server._crash_log_path``).
+from tui_gateway.server import _crash_log_path, dispatch, resolve_skin, write_json
 from tui_gateway.transport import TeeTransport
 
 logger = logging.getLogger(__name__)
@@ -99,8 +102,8 @@ def _log_signal(signum: int, frame) -> None:
             _signal_names[int(_sig)] = _attr
     name = _signal_names.get(signum, f"signal {signum}")
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== {name} received · {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
             )
@@ -195,8 +198,8 @@ def _log_exit(reason: str) -> None:
     crashes when the real story is "TUI read pipe closed on this event".
     """
     try:
-        os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
-        with open(_CRASH_LOG, "a", encoding="utf-8") as f:
+        os.makedirs(os.path.dirname(_crash_log_path()), exist_ok=True)
+        with open(_crash_log_path(), "a", encoding="utf-8") as f:
             f.write(
                 f"\n=== gateway exit · {time.strftime('%Y-%m-%d %H:%M:%S')} "
                 f"· reason={reason} ===\n"
