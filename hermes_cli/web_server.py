@@ -5127,6 +5127,16 @@ def _honcho_read_sources() -> tuple[Dict[str, Any], str, Dict[str, Any]]:
     return raw, host, host_block_of(raw, host)
 
 
+def _read_field_dep(when_pred: Dict[str, str], sources: tuple, env: Dict[str, str]) -> str | None:
+    """Return the stored value for the dependency key used in a ``when`` predicate."""
+
+    dep_key = next(iter(when_pred))
+    for source in sources:
+        if dep_key in source and source[dep_key] is not None:
+            return str(source[dep_key])
+    return None
+
+
 def _declared_provider_payload(provider: ProviderConfigSchema) -> Dict[str, Any]:
     fields: List[Dict[str, Any]] = []
     env = load_env()
@@ -5145,6 +5155,15 @@ def _declared_provider_payload(provider: ProviderConfigSchema) -> Dict[str, Any]
             return (data,)
 
     for field in provider.fields:
+        # Skip fields whose conditional visibility predicate is not met.
+        if field.when:
+            dep_value = _read_field_dep(field.when, sources_for(field), env)
+            if dep_value is None:
+                continue
+            dep_key = next(iter(field.when))
+            if str(dep_value) != str(field.when.get(dep_key)):
+                continue
+
         entry = _provider_field_entry(field)
         sources = sources_for(field)
 
