@@ -187,6 +187,7 @@ PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
     "togetherai": "togetherai",
     "perplexity": "perplexity",
     "cohere": "cohere",
+    "upstage": "upstage",
     "ollama-cloud": "ollama-cloud",
 }
 

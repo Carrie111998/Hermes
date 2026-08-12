@@ -350,6 +350,34 @@ class TestDefaultContextLengths:
                 )
 
 
+    def test_upstage_solar_pro4_and_syn_pro_context_lengths(self):
+        """#84482 — solar-pro4 (512K) and syn-pro (64K) fell through to the
+        256K default because neither id was in the hardcoded catalog.
+
+        With ``provider="upstage"`` the OpenRouter community-catalog fallback
+        is skipped on purpose, so the only correct resolution is the
+        hardcoded family entry (dated ids match via longest-first substring).
+        """
+        with patch("agent.model_metadata.get_cached_context_length", return_value=None), \
+             patch("agent.model_metadata.fetch_model_metadata", return_value={}), \
+             patch("agent.model_metadata.fetch_endpoint_model_metadata", return_value={}), \
+             patch("agent.model_metadata._query_ollama_api_show", return_value=None), \
+             patch("agent.models_dev.lookup_models_dev_context", return_value=None):
+            cases = [
+                ("solar-pro4", 524_288),
+                ("solar-pro4-260806", 524_288),
+                ("syn-pro", 65_536),
+                ("syn-pro-251021", 65_536),
+            ]
+            for model_id, expected_ctx in cases:
+                actual = get_model_context_length(
+                    model_id, provider="upstage", base_url="https://api.upstage.ai/v1"
+                )
+                assert actual == expected_ctx, (
+                    f"upstage/{model_id}: expected {expected_ctx}, got {actual}"
+                )
+
+
 
 
 
