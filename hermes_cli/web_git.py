@@ -544,13 +544,24 @@ def _parse_worktrees(out: str) -> list[dict]:
     return trees
 
 
+def _native_path(path: str) -> str:
+    """Git prints worktree paths with forward slashes even on Windows
+    (``C:/Users/…``). Every other path this API emits — ``/api/fs``, the
+    ``os.path.join``-built worktree targets — is native-separator, and callers
+    compare these against those by string equality, so re-spell git's answer in
+    the platform's own form. No-op on POSIX (a backslash there is a filename
+    character, not a separator, so ``normpath`` leaves it alone)."""
+    value = str(path or "").strip()
+    return os.path.normpath(value) if value else value
+
+
 def worktree_list(cwd: str) -> list[dict]:
     out = _git_out(cwd, ["worktree", "list", "--porcelain"])
     if not out:
         return []
     return [
         {
-            "path": tree["path"],
+            "path": _native_path(tree["path"]),
             "branch": tree["branch"],
             "isMain": index == 0,
             "detached": tree["detached"],
