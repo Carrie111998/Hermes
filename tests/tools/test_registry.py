@@ -137,6 +137,166 @@ class TestGetDefinitions:
         assert calls["count"] == 1
 
 
+class TestContextScopedCheckFnCache:
+    """Context-sensitive gates must not reuse another agent role's verdict."""
+
+    @staticmethod
+    def _kanban_show_visible(registry):
+        definitions = registry.get_definitions({"kanban_show"}, quiet=True)
+        return any(
+            definition.get("function", {}).get("name") == "kanban_show"
+            for definition in definitions
+        )
+
+    def test_parent_true_does_not_leak_into_delegated_child(self):
+        import tools.kanban_tools as kanban_tools
+        from agent.delegation_context import delegated_child_context
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        invalidate_check_fn_cache()
+        try:
+            with patch.object(
+                kanban_tools, "_profile_has_kanban_toolset", return_value=True
+            ):
+                assert self._kanban_show_visible(registry) is True
+                assert registry.is_toolset_available("kanban") is True
+                with delegated_child_context("child-session"):
+                    assert self._kanban_show_visible(registry) is False
+                    assert registry.is_toolset_available("kanban") is False
+        finally:
+            invalidate_check_fn_cache()
+
+    def test_parent_true_does_not_leak_into_non_dispatcher_context(
+        self, monkeypatch
+    ):
+        import tools.kanban_tools as kanban_tools
+        from agent.delegation_context import non_dispatcher_owned_context
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-task")
+        invalidate_check_fn_cache()
+        try:
+            with patch.object(
+                kanban_tools, "_profile_has_kanban_toolset", return_value=False
+            ):
+                assert self._kanban_show_visible(registry) is True
+                with non_dispatcher_owned_context():
+                    assert self._kanban_show_visible(registry) is False
+        finally:
+            invalidate_check_fn_cache()
+
+    def test_task_environment_transition_uses_distinct_verdict(self, monkeypatch):
+        import tools.kanban_tools as kanban_tools
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        invalidate_check_fn_cache()
+        try:
+            with patch.object(
+                kanban_tools, "_profile_has_kanban_toolset", return_value=False
+            ):
+                assert self._kanban_show_visible(registry) is False
+                monkeypatch.setenv("HERMES_KANBAN_TASK", "worker-task")
+                assert self._kanban_show_visible(registry) is True
+                monkeypatch.delenv("HERMES_KANBAN_TASK")
+                assert self._kanban_show_visible(registry) is False
+        finally:
+            invalidate_check_fn_cache()
+
+    def test_child_false_does_not_leak_into_parent(self):
+        import tools.kanban_tools as kanban_tools
+        from agent.delegation_context import delegated_child_context
+        from tools.registry import invalidate_check_fn_cache, registry
+
+        invalidate_check_fn_cache()
+        try:
+            with patch.object(
+                kanban_tools, "_profile_has_kanban_toolset", return_value=True
+            ):
+                with delegated_child_context("child-session"):
+                    assert self._kanban_show_visible(registry) is False
+                assert self._kanban_show_visible(registry) is True
+        finally:
+            invalidate_check_fn_cache()
+
+    def test_parent_last_good_does_not_suppress_child_denial(self, monkeypatch):
+        import tools.kanban_tools as kanban_tools
+        import tools.registry as registry_module
+        from agent.delegation_context import delegated_child_context
+
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(
+            registry_module.time, "monotonic", lambda: clock["now"]
+        )
+        registry_module.invalidate_check_fn_cache()
+        try:
+            with patch.object(
+                kanban_tools, "_profile_has_kanban_toolset", return_value=True
+            ):
+                assert self._kanban_show_visible(registry_module.registry) is True
+                clock["now"] += registry_module._CHECK_FN_TTL_SECONDS + 1
+                with delegated_child_context("child-session"):
+                    assert self._kanban_show_visible(registry_module.registry) is False
+        finally:
+            registry_module.invalidate_check_fn_cache()
+
+
+    def test_context_independent_check_still_shares_ttl_cache(self):
+        from agent.delegation_context import delegated_child_context
+        from tools.registry import ToolRegistry, invalidate_check_fn_cache
+
+        calls = {"count": 0}
+
+        def check():
+            calls["count"] += 1
+            return True
+
+        reg = ToolRegistry()
+        reg.register(
+            name="shared-probe",
+            toolset="shared-probe",
+            schema=_make_schema("shared-probe"),
+            handler=_dummy_handler,
+            check_fn=check,
+        )
+        invalidate_check_fn_cache()
+        try:
+            assert len(reg.get_definitions({"shared-probe"}, quiet=True)) == 1
+            with delegated_child_context("child-session"):
+                assert len(reg.get_definitions({"shared-probe"}, quiet=True)) == 1
+            assert calls["count"] == 1
+        finally:
+            invalidate_check_fn_cache()
+
+    def test_context_scoped_check_reuses_cache_within_same_child(self):
+        from agent.delegation_context import delegated_child_context
+        from tools.registry import ToolRegistry, invalidate_check_fn_cache
+
+        calls = {"count": 0}
+
+        def check():
+            calls["count"] += 1
+            return True
+
+        reg = ToolRegistry()
+        reg.register(
+            name="scoped-probe",
+            toolset="scoped-probe",
+            schema=_make_schema("scoped-probe"),
+            handler=_dummy_handler,
+            check_fn=check,
+            check_fn_context_scoped=True,
+        )
+        invalidate_check_fn_cache()
+        try:
+            with delegated_child_context("child-session"):
+                assert len(reg.get_definitions({"scoped-probe"}, quiet=True)) == 1
+                assert len(reg.get_definitions({"scoped-probe"}, quiet=True)) == 1
+            assert calls["count"] == 1
+        finally:
+            invalidate_check_fn_cache()
+
+
 class TestUnknownToolDispatch:
     def test_returns_error_json(self):
         reg = ToolRegistry()
