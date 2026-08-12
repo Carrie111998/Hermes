@@ -39,7 +39,9 @@ _OBLIGATION_SERVER_NAME = "law-firm-ops"
 
 def _configured_mcp_dynamic_tools(
     agent,
-) -> tuple[list[dict[str, Any]], Mapping[str, str], bool, frozenset[str]]:
+) -> tuple[
+    list[dict[str, Any]], Mapping[str, str], bool, frozenset[str], Mapping[str, frozenset[str]]
+]:
     """Project registered MCP schemas as safe aliases and their targets.
 
     ``agent.tools`` may be the tool-search bridge surface, so resolve the raw
@@ -47,7 +49,7 @@ def _configured_mcp_dynamic_tools(
     the extra provenance check: a registry/native tool that merely resembles
     an MCP name never crosses this boundary.
     """
-    empty_result = ([], MappingProxyType({}), False, frozenset())
+    empty_result = ([], MappingProxyType({}), False, frozenset(), MappingProxyType({}))
     enabled_toolsets = getattr(agent, "enabled_toolsets", None)
     try:
         from model_tools import get_tool_definitions
@@ -77,6 +79,7 @@ def _configured_mcp_dynamic_tools(
     dynamic_tools: list[dict[str, Any]] = []
     aliases: dict[str, str] = {}
     origin_session_targets: set[str] = set()
+    hidden_arguments: dict[str, frozenset[str]] = {}
     seen: set[str] = set()
     for tool in raw_tools:
         function = tool.get("function") if isinstance(tool, dict) else None
@@ -125,6 +128,7 @@ def _configured_mcp_dynamic_tools(
         ):
             hidden_fields.update({"limit", "offset"})
         if hidden_fields:
+            hidden_arguments[name] = frozenset(hidden_fields)
             input_schema = copy.deepcopy(parameters)
             properties = input_schema.get("properties")
             if isinstance(properties, dict):
@@ -150,6 +154,7 @@ def _configured_mcp_dynamic_tools(
         MappingProxyType(aliases),
         mcp_only,
         frozenset(origin_session_targets),
+        MappingProxyType(hidden_arguments),
     )
 
 
@@ -813,9 +818,10 @@ def run_codex_app_server_turn(
                 dynamic_tool_targets,
                 _restrict_native_tools,
                 origin_session_targets,
+                hidden_dynamic_arguments,
             ) = _configured_mcp_dynamic_tools(agent)
         else:
-            dynamic_tools, dynamic_tool_targets, origin_session_targets = [], {}, frozenset()
+            dynamic_tools, dynamic_tool_targets, origin_session_targets, hidden_dynamic_arguments = [], {}, frozenset(), {}
         allowed_dynamic_tools = frozenset(dynamic_tool_targets.values())
 
         def dispatch_dynamic_tool(
@@ -828,10 +834,13 @@ def run_codex_app_server_turn(
             registered_name = dynamic_tool_targets.get(tool_name)
             if registered_name is None:
                 raise ValueError("unknown Codex dynamic tool")
+            if any(
+                field in arguments
+                for field in hidden_dynamic_arguments.get(registered_name, ())
+            ):
+                raise ValueError("model-supplied hidden dynamic tool argument is not allowed")
             trusted_session_id = getattr(agent, "session_id", "") or ""
             if registered_name in origin_session_targets:
-                if "origin_session_id" in arguments:
-                    raise ValueError("model-supplied origin_session_id is not allowed")
                 if not isinstance(trusted_session_id, str) or not trusted_session_id.strip():
                     raise ValueError("missing trusted Hermes session id")
                 arguments = {**arguments, "origin_session_id": trusted_session_id}
