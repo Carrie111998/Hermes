@@ -59,6 +59,15 @@ class TestToolResolution:
 # Test 2-4: CWD handling for container backends
 # =========================================================================
 
+# ``host_cwd`` is a genuine *host* path used as the Docker bind-mount source, so
+# terminal_tool resolves it with ``os.path.abspath`` (relative host cwds must
+# resolve against the real host cwd). That makes a hardcoded POSIX sample wrong
+# on a Windows host: ``abspath("/Users/x")`` -> ``"C:\\Users\\x"``. Feed the
+# backend a host path that is already absolute *on this platform* instead.
+_HOST_CWD_SAMPLE = r"C:\Users\someone\projects" if os.name == "nt" else "/Users/someone/projects"
+_HOST_GETCWD_SAMPLE = r"C:\Users\user\project" if os.name == "nt" else "/home/user/project"
+
+
 class TestCwdHandling:
     """Verify host paths are sanitized for container backends."""
 
@@ -87,11 +96,11 @@ class TestCwdHandling:
     def test_users_path_maps_to_workspace_for_docker_when_enabled(self, monkeypatch):
         """Docker should map the host cwd into /workspace only when explicitly enabled."""
         monkeypatch.setenv("TERMINAL_ENV", "docker")
-        monkeypatch.setenv("TERMINAL_CWD", "/Users/someone/projects")
+        monkeypatch.setenv("TERMINAL_CWD", _HOST_CWD_SAMPLE)
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
         config = _tt_mod._get_env_config()
         assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/Users/someone/projects"
+        assert config["host_cwd"] == _HOST_CWD_SAMPLE
         assert config["docker_mount_cwd_to_workspace"] is True
 
     def test_windows_path_replaced_for_modal(self, monkeypatch):
@@ -114,13 +123,13 @@ class TestCwdHandling:
 
     def test_docker_default_cwd_maps_current_directory_when_enabled(self, monkeypatch):
         """Docker should use /workspace when cwd mounting is explicitly enabled."""
-        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: "/home/user/project")
+        monkeypatch.setattr("tools.terminal_tool.os.getcwd", lambda: _HOST_GETCWD_SAMPLE)
         monkeypatch.setenv("TERMINAL_ENV", "docker")
         monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
         monkeypatch.delenv("TERMINAL_CWD", raising=False)
         config = _tt_mod._get_env_config()
         assert config["cwd"] == "/workspace"
-        assert config["host_cwd"] == "/home/user/project"
+        assert config["host_cwd"] == _HOST_GETCWD_SAMPLE
 
     def test_local_backend_uses_getcwd(self, monkeypatch):
         """Local backend should use os.getcwd(), not /root."""
