@@ -280,6 +280,7 @@ describe('foreign live activity caption', () => {
   it('captions the live activity of a foreign working session', () => {
     const session = makeSession({
       is_active: true,
+      last_activity_at: Date.now() / 1000 - 10,
       last_activity_description: 'executing tool: terminal',
       title: 'Cron Feed'
     })
@@ -294,6 +295,7 @@ describe('foreign live activity caption', () => {
   it('does not caption a session an event-owned runtime is driving', () => {
     const session = makeSession({
       is_active: true,
+      last_activity_at: Date.now() / 1000 - 10,
       last_activity_description: 'executing tool: terminal',
       title: 'Local'
     })
