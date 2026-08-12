@@ -9110,13 +9110,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return text
         return (enriched_text or text).strip()
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    async def _handle_active_session_busy_message(
+        self, event: MessageEvent, session_key: str
+    ) -> bool:
+        """Run the complete busy path inside the routed profile's scope."""
+        source = event.source
+        if getattr(source, "profile_route_rejected", False) is True:
+            return True
+        if getattr(self.config, "multiplex_profiles", False) is True:
+            try:
+                profile_home = self._resolve_profile_home_for_source(source)
+            except Exception:
+                logger.warning(
+                    "Failed to resolve busy-message profile scope; dropping",
+                    exc_info=True,
+                )
+                return True
+            with _profile_runtime_scope(profile_home):
+                return await self._handle_active_session_busy_message_scoped(
+                    event, session_key
+                )
+        return await self._handle_active_session_busy_message_scoped(
+            event, session_key
+        )
+
+    async def _handle_active_session_busy_message_scoped(
+        self, event: MessageEvent, session_key: str
+    ) -> bool:
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
         # otherwise unauthorized users in shared threads (Slack/Telegram/Discord)
         # can inject messages into an active session they don't own.
-        if not self._is_user_authorized(event.source):
+        if not self._is_user_authorized_for_source(event.source):
             logger.warning(
                 "Dropping message from unauthorized user in active session: "
                 "user=%s (%s), platform=%s, session=%s",
@@ -10918,7 +10944,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # receive a full agent response on gateway restart just
             # because it has a resume-pending marker (issue #23778).
             try:
-                if not self._is_user_authorized(source):
+                if not self._is_user_authorized_for_source(source):
                     logger.warning(
                         "Skipping auto-resume for %s: session owner is no "
                         "longer authorized under the current allowlist",
@@ -13667,7 +13693,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         profiles polling the same bot token) are detected and refused here, the
         only point that sees every profile's resolved credentials together.
         """
-        if not getattr(self.config, "multiplex_profiles", False):
+        if (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            is not True
+        ):
             return 0
 
         try:
@@ -14102,6 +14131,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return _handler
 
+    def _is_user_authorized_for_source(self, source: SessionSource) -> bool:
+        """Run authorization under the runtime scope selected by *source*."""
+        if getattr(source, "profile_route_rejected", False) is True:
+            return False
+        if getattr(self.config, "multiplex_profiles", False) is not True:
+            return self._is_user_authorized(source)
+        try:
+            profile_home = self._resolve_profile_home_for_source(source)
+        except Exception:
+            logger.warning(
+                "Failed to resolve profile scope for authorization; denying",
+                exc_info=True,
+            )
+            return False
+        with _profile_runtime_scope(profile_home):
+            return self._is_user_authorized(source)
+
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Stamp an owning adapter's profile before resolving busy policy."""
         async def _handler(event, _session_key):
@@ -14118,10 +14164,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return _handler
 
     def _make_default_profile_message_handler(self):
-        """Scope a multiplexed default-profile message from ingress onward."""
-        profile_home = Path(get_hermes_home())
+        """Scope shared primary ingress to the profile selected by its source."""
+        default_profile_home = Path(get_hermes_home())
 
         async def _handler(event):
+            source = getattr(event, "source", None)
+            profile_home = default_profile_home
+            if getattr(source, "profile_route_rejected", False) is True:
+                return None
+            # ``build_source`` stamps a successful chat-based route on the
+            # source. Keep unstamped primary ingress on the default home;
+            # re-resolving a profile-less synthetic event can lose the
+            # runner's configured default scope.
+            if source is not None and str(getattr(source, "profile", "") or "").strip():
+                try:
+                    profile_home = self._resolve_profile_home_for_source(source)
+                except Exception:
+                    logger.warning(
+                        "Failed to resolve shared-adapter profile scope; "
+                        "dropping message",
+                        exc_info=True,
+                    )
+                    return None
             with _profile_runtime_scope(profile_home):
                 return await self._handle_message(event)
 
@@ -14382,7 +14446,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=user_id,
                 profile=profile_name,
             )
-            return self._is_user_authorized(source)
+            return self._is_user_authorized_for_source(source)
         return check
 
 
@@ -19922,7 +19986,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
         # Check authorization before processing voice input
-        if not self._is_user_authorized(source):
+        if not self._is_user_authorized_for_source(source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 

@@ -165,13 +165,15 @@ class TestSignalPassiveGroupContext:
 
     @pytest.mark.asyncio
     async def test_routed_profile_auth_prevents_cross_profile_context_leak(
-        self, monkeypatch
+        self, monkeypatch, tmp_path
     ):
+        from agent import secret_scope
         from gateway.config import GatewayConfig
         from gateway.run import GatewayRunner
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = GatewayConfig()
+        runner.config.multiplex_profiles = True
         runner.config.platforms[Platform.SIGNAL] = PlatformConfig(
             enabled=True,
             extra={
@@ -203,10 +205,19 @@ class TestSignalPassiveGroupContext:
             "default": default_store,
             "profile-b": profile_store,
         }
+        profile_home = tmp_path / "profile-b"
+        profile_home.mkdir()
+        # The routed profile deliberately has no Signal allowlist. Bob is
+        # authorized only by profile B's pairing store. The default profile's
+        # process-level allowlist must not bleed into this empty scope.
+        (profile_home / ".env").write_text("", encoding="utf-8")
+        runner._resolve_profile_home_for_source = lambda _source: profile_home
         runner._profile_name_for_source = lambda _source: "profile-b"
         assert adapter.gateway_runner is runner
 
-        with patch.dict("os.environ", {}, clear=True):
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15550001111")
+        secret_scope.set_multiplex_active(True)
+        try:
             await adapter._handle_envelope(
                 self._group_envelope("private default context")
             )
@@ -219,12 +230,54 @@ class TestSignalPassiveGroupContext:
                     mentioned=True,
                 )
             )
+        finally:
+            secret_scope.set_multiplex_active(False)
 
         event = adapter.handle_message.await_args.args[0]
         assert event.source.profile == "profile-b"
         assert event.channel_context is None
         assert not adapter._observed_group_context
         default_store.is_approved.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shared_primary_handler_uses_routed_profile_scope(
+        self, monkeypatch, tmp_path
+    ):
+        from agent import secret_scope
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+
+        profile_home = tmp_path / "profile-b"
+        profile_home.mkdir()
+        (profile_home / ".env").write_text(
+            "SIGNAL_ALLOWED_USERS=+15550002222\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("SIGNAL_ALLOWED_USERS", "+15550001111")
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda _source: profile_home
+        seen = []
+
+        async def fake_handle(event):
+            from agent.secret_scope import get_secret
+
+            seen.append(get_secret("SIGNAL_ALLOWED_USERS"))
+            return event.text
+
+        runner._handle_message = fake_handle
+        source = MagicMock(profile="profile-b")
+        event = MagicMock(source=source, text="hello")
+
+        secret_scope.set_multiplex_active(True)
+        try:
+            result = await runner._make_default_profile_message_handler()(event)
+        finally:
+            secret_scope.set_multiplex_active(False)
+
+        assert result == "hello"
+        assert seen == ["+15550002222"]
 
     @pytest.mark.asyncio
     async def test_rejected_profile_route_preserves_buffer_and_does_not_dispatch(

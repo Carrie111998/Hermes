@@ -29,32 +29,21 @@ from gateway.whatsapp_identity import (
 
 
 def _auth_env(name: str, default: str = "") -> str:
-    """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
-    if not name:
-        return default
-    try:
-        from agent.secret_scope import get_secret
-
-        val = get_secret(name)
-        if val is not None and str(val).strip():
-            return str(val).strip()
-    except Exception:
-        pass
-    return (os.getenv(name) or default).strip()
+    """Read allowlist/auth env with multiplex profile isolation."""
+    return _platform_gate_env(name, default)
 
 
 def _platform_gate_env(name: str, default: str = "") -> str:
     """Read a platform allow/deny gate env var with per-profile isolation.
 
-    Like ``_auth_env`` but authoritative under multiplex: when a profile
-    secret scope is installed AND multiplexing is active, a key absent from
-    the scope returns ``default`` instead of falling through to
-    ``os.environ``. Under multiplex the process env may hold ANOTHER
+    Authoritative under multiplex: a missing runtime scope or a key absent
+    from the active profile scope returns ``default`` instead of falling
+    through to ``os.environ``. Under multiplex the process env may hold ANOTHER
     profile's first-writer-bridged value (the YAML→env bridges in the
     Discord/Telegram adapters' ``_apply_yaml_config`` are first-writer-wins),
     so falling through would leak profile A's allowlist into profile B
-    (issue #72348). Single-profile deployments — no scope installed, or
-    multiplex off — behave exactly like the legacy ``os.getenv`` read.
+    (issue #72348). Single-profile deployments with multiplex off behave
+    exactly like the legacy ``os.getenv`` read.
     """
     if not name:
         return default
@@ -62,7 +51,9 @@ def _platform_gate_env(name: str, default: str = "") -> str:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
 
         scope = current_secret_scope()
-        if scope is not None and is_multiplex_active():
+        if is_multiplex_active():
+            if scope is None:
+                return default
             val = scope.get(name)
             if val is None:
                 return default

@@ -557,7 +557,7 @@ class SignalAdapter(BasePlatformAdapter):
         runner = getattr(self, "gateway_runner", None)
         if runner is not None:
             try:
-                return bool(runner._is_user_authorized(source))
+                return bool(runner._is_user_authorized_for_source(source))
             except Exception:
                 logger.warning(
                     "Signal: routed passive-context authorization failed; denying",

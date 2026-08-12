@@ -79,6 +79,7 @@ def _make_runner(authorized_users=None):
     runner.pairing_store.is_approved.return_value = False
     # Auth gate: only users in authorized_users set pass
     runner._is_user_authorized = lambda source: source.user_id in authorized_users
+    runner._is_user_authorized_for_source = runner._is_user_authorized
     return runner, _AGENT_PENDING_SENTINEL
 
 
