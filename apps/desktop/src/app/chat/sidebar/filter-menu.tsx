@@ -1,3 +1,5 @@
+import { useCallback, useMemo } from 'react'
+
 import { useStore } from '@nanostores/react'
 
 import { sessionDotClassName } from '@/app/chat/session-status-dot'
@@ -21,6 +23,8 @@ import {
 import { useI18n } from '@/i18n'
 import { desktopGit } from '@/lib/desktop-git'
 import { cn } from '@/lib/utils'
+import { useHermesConfigRecord, invalidateHermesConfig } from '@/app/hooks/use-config-record'
+import { saveHermesConfig } from '@/hermes'
 import {
   $sidebarFiltersActive,
   $sidebarGrouping,
@@ -57,7 +61,7 @@ import {
 import { runImportProfileFlow } from '@/store/profile-share'
 import { $projectTree } from '@/store/projects'
 import type { PullRequestBucket } from '@/store/pull-requests'
-import { $unreadFinishedSessionIds, markAllSessionsRead } from '@/store/session'
+import { $sessions, $unreadFinishedSessionIds, markAllSessionsRead } from '@/store/session'
 import type { SessionStatusBucket } from '@/store/session-dot-state'
 import { $sessionsHaveCost } from '@/store/sidebar-archive'
 
@@ -147,6 +151,44 @@ function OptionRadio({ option }: { option: Option }) {
 
 export function SidebarFilterMenu({ className }: { className?: string }) {
   const { t } = useI18n()
+
+  // #165: `sessions.exclude_sources` (default ['a2a']) is the single source of
+  // truth for hidden session sources. This menu is its interactive editor:
+  // checking a source writes it back to config.yaml via saveHermesConfig.
+  const { data: configRecord } = useHermesConfigRecord()
+  const sessions = useStore($sessions)
+  const sourceExcludes = useMemo(() => {
+    const s = (configRecord as { sessions?: { exclude_sources?: string[] } } | undefined)
+      ?.sessions?.exclude_sources
+    return Array.isArray(s) ? s : []
+  }, [configRecord])
+
+  // Every source that exists in the loaded sessions, plus any configured
+  // exclusion that may not have rows on disk yet (so a hidden source can be
+  // re-shown even when it has no current session).
+  const sourceOptions = useMemo(() => {
+    const seen = new Set<string>(sourceExcludes)
+    for (const session of sessions) {
+      if (session.source) seen.add(session.source)
+    }
+    return Array.from(seen).sort()
+  }, [sessions, sourceExcludes])
+
+  const toggleSourceExclude = useCallback(
+    async (source: string) => {
+      const next = sourceExcludes.includes(source)
+        ? sourceExcludes.filter(x => x !== source)
+        : [...sourceExcludes, source]
+      try {
+        await saveHermesConfig({ sessions: { exclude_sources: next } })
+        invalidateHermesConfig()
+      } catch {
+        // Non-fatal: the menu just keeps its last-known state.
+      }
+    },
+    [sourceExcludes]
+  )
+
   const grouping = useStore($sidebarGrouping)
   const ordering = useStore($sidebarOrdering)
   const rowMeta = useStore($sidebarRowMeta)
@@ -279,6 +321,22 @@ export function SidebarFilterMenu({ className }: { className?: string }) {
                   key={option.id}
                   onCheck={() => toggleSidebarStatusFilter(option.id)}
                   option={option}
+                />
+              ))}
+            </DropdownMenuSubContent>
+          </DropdownMenuSub>
+
+          {/* #165: interactive editor for sessions.exclude_sources. Checking a
+              source writes it back to config.yaml; unchecking removes it. */}
+          <DropdownMenuSub>
+            <DropdownMenuSubTrigger>Sources</DropdownMenuSubTrigger>
+            <DropdownMenuSubContent className="max-h-80 overflow-y-auto">
+              {sourceOptions.map(source => (
+                <OptionCheckbox
+                  checked={!sourceExcludes.includes(source)}
+                  key={source}
+                  onCheck={() => void toggleSourceExclude(source)}
+                  option={{ icon: 'broadcast', id: source, label: source }}
                 />
               ))}
             </DropdownMenuSubContent>
