@@ -11,6 +11,10 @@ from dataclasses import dataclass
 _ONESHOT_YOLO_POLICY: ContextVar[bool | None] = ContextVar(
     "_ONESHOT_YOLO_POLICY", default=None
 )
+# A process-level deny sentinel covers approval checks reached from plain
+# threads that did not inherit the invocation context.  The allow capability
+# is deliberately context-local: an unrelated or outliving worker must never
+# inherit an exact-true opt-in merely because one-shot is active elsewhere.
 _PROCESS_ONESHOT_YOLO_POLICY: bool | None = None
 _POLICY_LOCK = threading.RLock()
 
@@ -23,13 +27,11 @@ class OneShotPolicyToken:
 
 
 def current_oneshot_yolo_policy() -> bool | None:
-    """Return the exact active one-shot policy, including in plain workers.
+    """Return the invocation policy, denying unwrapped one-shot workers.
 
-    Context propagation remains the preferred worker boundary, but approval
-    sinks must not become fail-open merely because a third-party plugin starts
-    an unwrapped thread. A one-shot CLI invocation owns its process lifetime,
-    so the synchronized fallback keeps its resolved policy authoritative until
-    the invocation exits and restores the prior process state.
+    Context propagation carries both allow and deny decisions to authorized
+    work.  A plain worker sees only the process-level deny sentinel, so losing
+    the invocation context cannot either fail open or leak an allow capability.
     """
     context_policy = _ONESHOT_YOLO_POLICY.get()
     if context_policy is not None:
@@ -72,7 +74,9 @@ def configure_oneshot_approval_policy() -> OneShotPolicyToken | None:
             os.environ.pop("HERMES_YOLO_MODE", None)
 
         inherited_process_policy = _PROCESS_ONESHOT_YOLO_POLICY
-        _PROCESS_ONESHOT_YOLO_POLICY = enabled
+        # Never publish the allow capability process-wide. Context-aware work
+        # sees ``enabled`` through the ContextVar; unwrapped workers fail closed.
+        _PROCESS_ONESHOT_YOLO_POLICY = False
         return OneShotPolicyToken(
             context_token=_ONESHOT_YOLO_POLICY.set(enabled),
             inherited_yolo=inherited_yolo,

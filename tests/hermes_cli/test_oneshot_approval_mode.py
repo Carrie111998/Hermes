@@ -149,15 +149,11 @@ def test_oneshot_invocation_suppresses_opt_in_with_user_config_disabled(
     assert observed["execute_target_exists"] is False
 
 
-@pytest.mark.parametrize(
-    ("configured_value", "expected_approved"),
-    [("false", False), ("true", True)],
-    ids=["fail-closed", "exact-true"],
-)
+@pytest.mark.parametrize("configured_value", ["false", "true"])
 def test_oneshot_policy_reaches_both_sinks_in_plain_worker(
-    monkeypatch, tmp_path, configured_value, expected_approved
+    monkeypatch, tmp_path, configured_value
 ):
-    """An unwrapped plugin worker cannot fall back to inherited YOLO state."""
+    """An unwrapped worker neither fails open nor inherits an allow capability."""
     home = tmp_path / "hermes-home"
     _write_config(
         home,
@@ -191,6 +187,7 @@ def test_oneshot_policy_reaches_both_sinks_in_plain_worker(
     policy_token = configure_oneshot_approval_policy()
     assert policy_token is not None
     try:
+        assert current_oneshot_yolo_policy() is (configured_value == "true")
         thread = threading.Thread(target=worker)
         thread.start()
         thread.join(timeout=5)
@@ -198,9 +195,40 @@ def test_oneshot_policy_reaches_both_sinks_in_plain_worker(
     finally:
         reset_oneshot_approval_policy(policy_token)
 
-    assert observed["policy"] is expected_approved
-    assert observed["terminal"]["approved"] is expected_approved
-    assert observed["execute_code"]["approved"] is expected_approved
+    assert observed["policy"] is False
+    assert observed["terminal"]["approved"] is False
+    assert observed["execute_code"]["approved"] is False
+
+
+@pytest.mark.parametrize(
+    ("oneshot_policy", "frozen_yolo", "expected"),
+    [
+        (False, True, False),
+        (True, False, True),
+        (None, True, True),
+        (None, False, False),
+    ],
+    ids=[
+        "oneshot-deny-overrides-inherited",
+        "oneshot-exact-true",
+        "normal-yolo",
+        "normal-no-yolo",
+    ],
+)
+def test_session_persistence_uses_invocation_policy(
+    monkeypatch, oneshot_policy, frozen_yolo, expected
+):
+    """A fail-closed one-shot cannot persist inherited YOLO for later resume."""
+    from agent import agent_init
+    from hermes_cli import oneshot_policy as policy_module
+    from tools import approval
+
+    monkeypatch.setattr(
+        policy_module, "current_oneshot_yolo_policy", lambda: oneshot_policy
+    )
+    monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", frozen_yolo)
+
+    assert agent_init._should_persist_initial_yolo_mode() is expected
 
 
 @pytest.mark.parametrize("termux", [False, True], ids=["normal", "termux"])

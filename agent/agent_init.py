@@ -112,6 +112,21 @@ def _normalize_route_base_url(base_url: Any) -> str:
     return normalize_route_base_url(base_url)
 
 
+def _should_persist_initial_yolo_mode() -> bool:
+    """Return only the bypass authority belonging to this invocation.
+
+    One-shot policy is authoritative over process YOLO frozen before startup;
+    otherwise preserve the normal ``--yolo`` resume contract.
+    """
+    from hermes_cli.oneshot_policy import current_oneshot_yolo_policy
+    from tools.approval import _YOLO_MODE_FROZEN
+
+    oneshot_yolo = current_oneshot_yolo_policy()
+    if oneshot_yolo is not None:
+        return oneshot_yolo
+    return _YOLO_MODE_FROZEN
+
+
 def _provider_default_routes(provider: str) -> set[str]:
     """Return known exact default routes for a canonical provider id."""
     routes: set[str] = set()
@@ -1628,8 +1643,7 @@ def init_agent(
     # Session-scoped /yolo toggles persist separately through
     # SessionDB.set_session_yolo at toggle time.
     try:
-        from tools.approval import _YOLO_MODE_FROZEN
-        if _YOLO_MODE_FROZEN:
+        if _should_persist_initial_yolo_mode():
             agent._session_init_model_config["yolo_mode"] = True
     except Exception:
         pass
