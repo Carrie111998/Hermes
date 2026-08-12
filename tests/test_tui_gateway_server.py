@@ -12583,7 +12583,6 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
         "last_active": 20.0,
         "message_count": 1,
         "model": "model-a",
-        "provider": "",
         "preview": "find docs",
         "session_key": "key-a",
         "started_at": 10.0,
