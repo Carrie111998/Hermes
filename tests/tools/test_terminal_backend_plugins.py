@@ -69,8 +69,15 @@ def _reset_environment_state():
 
 @pytest.fixture(autouse=True)
 def _clean_terminal_backend_state(monkeypatch):
+    import tools.terminal_tool as terminal_tool
+
     terminal_backend_registry.unregister_plugin_backends()
     _reset_environment_state()
+    # Keep the background cleanup daemon out of every test in this module.
+    # _get_or_create_environment starts it on the first environment it builds,
+    # and it then evicts entries from the very caches these tests assert on,
+    # on its own schedule, for the rest of the process.
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setenv("TERMINAL_ENV", "local")
     yield
     terminal_backend_registry.unregister_plugin_backends()
