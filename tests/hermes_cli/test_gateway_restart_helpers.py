@@ -16,20 +16,61 @@ restart-subcommand path is covered by the existing manual_gateway_*
 fixtures elsewhere; the helpers here are the new additions.
 """
 
+import json
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from gateway import status as gw_status
 from hermes_cli import gateway as gw
 
 
 @pytest.fixture
 def isolated_hermes_home(tmp_path, monkeypatch):
-    """Point HERMES_HOME at a sandbox so cleanup operates on test files."""
+    """Point HERMES_HOME at a sandbox so cleanup operates on test files.
+
+    Also overrides ``HERMES_GATEWAY_LOCK_DIR``: scope locks are
+    MACHINE-LOCAL (``gateway.status._get_lock_dir()``), so without this
+    the cleanup under test would glob — and delete from — this box's real
+    ``~/.local/state/hermes/gateway-locks``.  The sandbox lock dir is
+    deliberately NOT ``HERMES_HOME/gateway-locks``: that path is what the
+    cleanup used to glob, and nothing has ever written there.
+    """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_GATEWAY_LOCK_DIR", str(tmp_path / "machine-locks"))
     return tmp_path
+
+
+@pytest.fixture
+def scope_lock_dir(isolated_hermes_home):
+    """The sandboxed machine-local scope-lock directory, created."""
+    lock_dir = gw_status._get_lock_dir()
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return lock_dir
+
+
+def _dead_pid() -> int:
+    """A PID that is provably not alive right now."""
+    for candidate in range(999_999, 999_899, -1):
+        if not gw_status._pid_exists(candidate):
+            return candidate
+    pytest.fail("could not find a dead PID to seed the test with")
+
+
+def _write_claim(path: Path, pid: int) -> None:
+    """Write a scope-lock record in acquire_scoped_lock's on-disk shape."""
+    path.write_text(
+        json.dumps({
+            "pid": pid,
+            "start_time": gw_status._get_process_start_time(pid),
+            "scope": "whatsapp-session",
+            "argv": ["hermes", "gateway", "run"],
+        }),
+        encoding="utf-8",
+    )
 
 
 class TestCleanupGatewayStateFiles:
@@ -47,15 +88,16 @@ class TestCleanupGatewayStateFiles:
         assert not pid_path.exists()
         assert not lock_path.exists()
 
-    def test_removes_per_platform_scope_locks(self, isolated_hermes_home):
+    def test_removes_stale_per_platform_scope_locks(self, scope_lock_dir):
         # Per-platform session-claim files survive WMI Terminate too.
         # Cleanup globs them so we don't have to enumerate scope names.
-        locks_dir = isolated_hermes_home / "gateway-locks"
-        locks_dir.mkdir()
-        wa_lock = locks_dir / "whatsapp-session-abcdef0123456789.lock"
-        tg_lock = locks_dir / "telegram-bot-token-abcdef0123456789.lock"
-        wa_lock.write_text("{}")
-        tg_lock.write_text("{}")
+        # They live in the machine-local lock dir — the same one
+        # acquire_scoped_lock() writes to — not under HERMES_HOME.
+        dead = _dead_pid()
+        wa_lock = scope_lock_dir / "whatsapp-session-abcdef0123456789.lock"
+        tg_lock = scope_lock_dir / "telegram-bot-token-abcdef0123456789.lock"
+        _write_claim(wa_lock, dead)
+        _write_claim(tg_lock, dead)
 
         removed = gw.cleanup_gateway_state_files()
 
@@ -63,6 +105,54 @@ class TestCleanupGatewayStateFiles:
         assert tg_lock.name in removed
         assert not wa_lock.exists()
         assert not tg_lock.exists()
+
+    def test_preserves_scope_lock_held_by_a_live_process(self, scope_lock_dir):
+        # THE regression this guard exists for. Scope locks are written and
+        # CLOSED (acquire_scoped_lock -> _write_json_file), so unlike
+        # gateway.lock the OS will happily delete a live claim. Deleting a
+        # live whatsapp-session claim can force a QR re-pair, and the dir is
+        # machine-local, so a restart in one profile must not evict another
+        # profile's running gateway. Decide staleness by pid liveness.
+        live_lock = scope_lock_dir / "whatsapp-session-0123456789abcdef.lock"
+        _write_claim(live_lock, os.getpid())
+
+        removed = gw.cleanup_gateway_state_files()
+
+        assert live_lock.name not in removed
+        assert live_lock.exists()
+
+    def test_preserves_scope_lock_with_an_unusable_record(self, scope_lock_dir):
+        # Deliberately more conservative than acquire_scoped_lock(), which
+        # treats a malformed record as stale and takes it over in-process.
+        # There is nothing to win by racing that from here, and guessing
+        # wrong deletes a live claim — so leave anything we cannot read a
+        # pid out of.
+        empty = scope_lock_dir / "telegram-bot-token-1111111111111111.lock"
+        garbage = scope_lock_dir / "telegram-bot-token-2222222222222222.lock"
+        pidless = scope_lock_dir / "telegram-bot-token-3333333333333333.lock"
+        empty.write_text("", encoding="utf-8")
+        garbage.write_text("not json {{{", encoding="utf-8")
+        pidless.write_text(json.dumps({"scope": "telegram-bot-token"}), encoding="utf-8")
+
+        removed = gw.cleanup_gateway_state_files()
+
+        assert removed == []
+        assert empty.exists() and garbage.exists() and pidless.exists()
+
+    def test_ignores_locks_dir_under_hermes_home(self, isolated_hermes_home):
+        # HERMES_HOME/gateway-locks is the path cleanup used to glob. Nothing
+        # writes there — _get_lock_dir() resolves $HERMES_GATEWAY_LOCK_DIR /
+        # $XDG_STATE_HOME/hermes/gateway-locks / ~/.local/state/... — so a
+        # file found there is not a session claim and is not ours to delete.
+        decoy_dir = isolated_hermes_home / "gateway-locks"
+        decoy_dir.mkdir()
+        decoy = decoy_dir / "whatsapp-session-abcdef0123456789.lock"
+        _write_claim(decoy, _dead_pid())
+
+        removed = gw.cleanup_gateway_state_files()
+
+        assert decoy.name not in removed
+        assert decoy.exists()
 
     def test_returns_empty_when_no_state_files(self, isolated_hermes_home):
         # Clean slate — nothing to remove. Must not raise.
