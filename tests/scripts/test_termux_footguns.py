@@ -98,6 +98,28 @@ def test_termux_regression_rejects_privileged_or_seccomp_disabled_container(lint
     assert {item.name for item in findings} == {"privileged Termux PR regression container"}
 
 
+def test_browser_smoke_invariant_rejects_playwright_on_android(linter, tmp_path, monkeypatch):
+    monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
+    _write(
+        tmp_path,
+        "apps/desktop/scripts/smoke-browser-host.mjs",
+        "import { chromium } from 'playwright'\n",
+    )
+    findings = linter.invariant_findings({"apps/desktop/scripts/smoke-browser-host.mjs"})
+    assert [item.name for item in findings] == ["Termux browser smoke depends on Playwright"]
+
+
+def test_browser_smoke_invariant_rejects_no_sandbox(linter, tmp_path, monkeypatch):
+    monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
+    _write(
+        tmp_path,
+        "apps/desktop/scripts/smoke-browser-host.mjs",
+        "const args = ['--no-sandbox']\n",
+    )
+    findings = linter.invariant_findings({"apps/desktop/scripts/smoke-browser-host.mjs"})
+    assert [item.name for item in findings] == ["Termux Chromium smoke disables the browser sandbox"]
+
+
 def test_renderer_invariant_accepts_locked_package_bin_runner(linter, tmp_path, monkeypatch):
     monkeypatch.setattr(linter, "REPO_ROOT", tmp_path)
     _write(

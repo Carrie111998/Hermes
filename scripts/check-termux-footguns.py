@@ -273,6 +273,37 @@ def invariant_findings(selected: set[str]) -> list[Finding]:
                 )
             )
 
+    browser_smoke_rel = "apps/desktop/scripts/smoke-browser-host.mjs"
+    if browser_smoke_rel in selected:
+        path = REPO_ROOT / browser_smoke_rel
+        try:
+            source = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            source = ""
+        lower = source.lower()
+        if "from 'playwright'" in lower or 'from "playwright"' in lower or "playwright-core" in lower:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "Playwright import",
+                    "Termux browser smoke depends on Playwright",
+                    "Playwright refuses to initialize on Node's native Android platform before it can launch Termux Chromium.",
+                    "Drive the installed Chromium directly over the Chrome DevTools Protocol instead of importing Playwright.",
+                )
+            )
+        if "--no-sandbox" in lower:
+            findings.append(
+                Finding(
+                    path,
+                    1,
+                    "--no-sandbox",
+                    "Termux Chromium smoke disables the browser sandbox",
+                    "The native regression must not trade Android compatibility for a disabled Chromium sandbox.",
+                    "Keep the smoke compatible with sandboxed Chromium and fix runner/container identity instead.",
+                )
+            )
+
     req_rel = "scripts/termux_requirements.py"
     if req_rel in selected:
         path = REPO_ROOT / req_rel
