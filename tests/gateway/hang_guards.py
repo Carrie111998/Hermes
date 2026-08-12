@@ -59,6 +59,20 @@ Deliberately NOT swept:
 
 Those want a barrier or an ordering primitive, not a bigger number.
 
+Worked example of that conversion, if you need one:
+``test_telegram_background_connect.py`` / ``test_whatsapp_background_connect.py``
+each carried two ``wait_for(runner.start(), timeout=30)`` calls whose timeout WAS
+the assertion ("start() does not block on a hung platform adapter"), boxed in
+with no legal range -- 30 already tied pytest-timeout's local cap, and the
+WhatsApp one measured ~30.7s standalone, so it was losing. They were rewritten
+on 2026-08-12 to park the connect on an unreleased ``asyncio.Event`` and assert
+the *ordering* instead: the api_server stand-in records, at the instant of its
+bind, whether the platform connect had returned yet. The bounds that remain are
+real hang guards -- semantic assertions follow them -- so they use the constant
+below. Verified both ways: green per file, and both ordering tests fail with a
+TimeoutError at the bind barrier when ``_should_connect_in_background`` is
+stubbed to ``False``.
+
 Verify per FILE, never by passing many files to one pytest. These files leak
 module-global state across file boundaries (``gateway/delivery_ledger._DB_LOCK``
 wedges a 25-file single-process run), and the nightly harness always spawns one
