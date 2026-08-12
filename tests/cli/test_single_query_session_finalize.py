@@ -133,6 +133,51 @@ def test_human_single_query_main_finalizes_after_query(monkeypatch):
     ]
 
 
+def test_human_single_query_normalizes_learn_before_chat(monkeypatch):
+    calls = []
+
+    import cli as cli_mod
+    import agent.learn_entrypoint as learn_entrypoint
+
+    class _Console:
+        def print(self, *_args, **_kwargs):
+            calls.append("query-label")
+
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            self.console = _Console()
+            self.session_id = "single-query-learn-session"
+            self.agent = SimpleNamespace(
+                session_id="single-query-learn-session",
+                platform="cli",
+            )
+
+        def _claim_active_session(self, surface, *, stderr=False):
+            return True
+
+        def _show_security_advisories(self):
+            pass
+
+        def chat(self, query, images=None):
+            calls.append(("chat", query, images))
+
+        def _print_exit_summary(self, clear_screen=True):
+            pass
+
+    monkeypatch.setattr(
+        learn_entrypoint,
+        "normalize_learn_query",
+        lambda query: f"normalized:{query}",
+    )
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod.atexit, "register", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+
+    cli_mod.main(query="/learn /tmp/large-book.pdf", quiet=False, toolsets="terminal")
+
+    assert ("chat", "normalized:/learn /tmp/large-book.pdf", None) in calls
+
+
 def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatch):
     calls = []
 

@@ -582,9 +582,9 @@ def _(rid, params: dict) -> dict:
         # normal agent turn. The live agent gathers whatever the user
         # described (dirs, URLs, this conversation, pasted text) with its own
         # tools and authors the skill via skill_manage. Works on any backend.
-        from agent.learn_prompt import build_learn_prompt
+        from agent.learn_entrypoint import build_learn_request
 
-        return _ok(rid, {"type": "send", "message": build_learn_prompt(arg)})
+        return _ok(rid, {"type": "send", "message": build_learn_request(arg)})
     if name == "init":
         # Generate-or-update AGENTS.md: build the guidance-laden prompt and
         # submit it as a normal agent turn (same pattern as /learn). The live

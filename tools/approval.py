@@ -1141,7 +1141,11 @@ def _home_prefix_fold_regex(path: str):
     # mirrors the historical ``count("/") >= 2`` guard (``/home/alice`` folds,
     # ``/home`` does not); for Windows it rejects a bare drive root (``C:\\``)
     # while accepting a real home (``C:\\Users\\alice``).
-    if len(components) < 2:
+    #
+    # Exception: uid 0's home is ``/root`` — a single component that is still
+    # a complete home. Without this, ``cat key >> /root/.ssh/authorized_keys``
+    # never folds to ``~/.ssh/authorized_keys`` and misses the redirect deny.
+    if len(components) < 2 and components != ["root"]:
         return None
     body = r"[/\\]+".join(re.escape(c) for c in components)
     # Optional leading root separator (POSIX ``/`` or UNC ``\\``); a Windows

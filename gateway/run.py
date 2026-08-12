@@ -15792,7 +15792,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # web_extract, this conversation, pasted text) and authors the skill
             # via skill_manage. Mirrors the /blueprint fall-through so role
             # alternation is preserved. No engine, works on any backend.
-            from agent.learn_prompt import build_learn_prompt
+            from agent.learn_entrypoint import build_learn_request
 
             _learn_req = event.get_command_args().strip()
             _ack = (
@@ -15808,7 +15808,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 logger.debug("learn ack send failed", exc_info=True)
             try:
-                event.text = build_learn_prompt(_learn_req)
+                event.text = build_learn_request(_learn_req)
                 # fall through to agent processing
             except Exception:
                 return "Could not start /learn — please try again."

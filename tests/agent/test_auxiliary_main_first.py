@@ -536,6 +536,45 @@ class TestResolveVisionCustomProvider:
         assert kwargs.get("explicit_api_key") == "sk-runtime-key"
         assert kwargs.get("is_vision") is True
 
+    def test_partial_legacy_patch_does_not_reuse_stale_runtime_identity(self, monkeypatch):
+        """A patched endpoint must not inherit an old provider/model mirror."""
+        import agent.auxiliary_client as aux
+
+        aux.clear_runtime_main()
+        token = aux.set_runtime_main(
+            "openai",
+            "gpt-5.5",
+            base_url="https://old.example/v1",
+            api_key="old-key",
+            api_mode="chat_completions",
+        )
+        aux.reset_runtime_main(token)
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_BASE_URL", "https://new.example/v1")
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_KEY", "new-key")
+        monkeypatch.setattr(aux, "_RUNTIME_MAIN_API_MODE", "anthropic_messages")
+
+        with patch(
+            "agent.auxiliary_client._read_main_provider", return_value="custom",
+        ), patch(
+            "agent.auxiliary_client._read_main_model", return_value="claude-opus-4-8",
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ), patch("agent.auxiliary_client.resolve_provider_client") as mock_resolve:
+            mock_client = MagicMock()
+            mock_resolve.return_value = (mock_client, "claude-opus-4-8")
+
+            from agent.auxiliary_client import resolve_vision_provider_client
+
+            provider, client, model = resolve_vision_provider_client()
+
+        assert provider == "custom"
+        assert client is mock_client
+        assert model == "claude-opus-4-8"
+        assert mock_resolve.call_args.kwargs["explicit_base_url"] == "https://new.example/v1"
+        assert mock_resolve.call_args.kwargs["explicit_api_key"] == "new-key"
+        aux.clear_runtime_main()
+
     def test_custom_prefixed_main_forwards_runtime_endpoint(self, monkeypatch):
         """A ``custom:<name>`` provider id also forwards the runtime endpoint."""
         import agent.auxiliary_client as aux

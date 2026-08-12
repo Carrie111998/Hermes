@@ -313,6 +313,23 @@ def _ts_float(ts) -> float:
     return 0.0
 
 
+def _state_db_path() -> Path:
+    """Return the SessionDB path EventBridge uses for the mtime poll gate."""
+    try:
+        from hermes_constants import get_hermes_home
+        return get_hermes_home() / "state.db"
+    except ImportError:
+        return Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
+
+
+def _state_db_mtime_ns(db_file: Path) -> int:
+    """Nanosecond mtime for the poll gate, or 0 when the file is missing."""
+    try:
+        return db_file.stat().st_mtime_ns if db_file.exists() else 0
+    except OSError:
+        return 0
+
+
 class EventBridge:
     """Background poller that watches SessionDB for new messages and
     maintains an in-memory event queue with waiter support.
@@ -332,7 +349,7 @@ class EventBridge:
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
         # mtime cache — skip expensive work when state.db hasn't changed
-        self._state_db_mtime: float = 0.0
+        self._state_db_mtime: int = 0
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -460,15 +477,7 @@ class EventBridge:
         db = _get_session_db()
         if not db:
             return
-        try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-        try:
-            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
-            self._state_db_mtime = 0.0
+        self._state_db_mtime = _state_db_mtime_ns(_state_db_path())
         try:
             self._cached_sessions_index = _load_sessions_index()
         except Exception:
@@ -512,16 +521,7 @@ class EventBridge:
         eliminating the old dual-file (sessions.json + state.db) race that
         could drop brand-new conversations (#8925).
         """
-        try:
-            from hermes_constants import get_hermes_home
-            db_file = get_hermes_home() / "state.db"
-        except ImportError:
-            db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
-
-        try:
-            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
-        except OSError:
-            db_mtime = 0.0
+        db_mtime = _state_db_mtime_ns(_state_db_path())
 
         if db_mtime == self._state_db_mtime:
             return  # Nothing changed since last poll — skip entirely
