@@ -7688,8 +7688,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _alignment = check_systemd_timing_alignment(self._restart_drain_timeout)
             if _alignment is not None and _alignment.get("mismatch"):
                 logger.warning(
-                    "Stale systemd unit detected: %s has TimeoutStopSec=%.0fs but "
-                    "drain_timeout=%.0fs (expected >=%.0fs). systemd may SIGKILL the "
+                    # %g, not %.0f: agent.restart_drain_timeout documents
+                    # 0 = no drain, interrupt immediately (hermes_cli/config.py),
+                    # so a sub-second drain window rendered as "drain_timeout=0s"
+                    # reads as "no drain is configured" — the opposite of the
+                    # condition being warned about. Rounding also made the three
+                    # numbers arithmetically incoherent to a reader comparing
+                    # them (e.g. "TimeoutStopSec=30s ... expected >=31s" for a
+                    # 0.5s window), so all three move together.
+                    "Stale systemd unit detected: %s has TimeoutStopSec=%gs but "
+                    "drain_timeout=%gs (expected >=%gs). systemd may SIGKILL the "
                     "gateway mid-drain. Run `hermes gateway install --force` "
                     "to regenerate the unit, or shorten agent.restart_drain_timeout.",
                     _alignment.get("unit", "(unknown)"),
@@ -10850,8 +10858,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if _should_evict:
                 logger.warning(
+                    # %g, not %.0f: this branch reads HERMES_AGENT_TIMEOUT,
+                    # where 0 means unlimited — the `_raw_stale_timeout > 0`
+                    # guard and the `float("inf")` wall-TTL right above are
+                    # that sentinel. A sub-second bound printed as
+                    # "timeout: 0s" reads as "no timeout was set" next to an
+                    # eviction that only a set timeout could have caused. The
+                    # elapsed fields go with it so the reader can still
+                    # compare idle against timeout.
                     "Evicting stale _running_agents entry for %s "
-                    "(age: %.0fs, idle: %.0fs, timeout: %.0fs)%s",
+                    "(age: %gs, idle: %gs, timeout: %gs)%s",
                     _quick_key, _stale_age, _stale_idle,
                     _raw_stale_timeout, _stale_detail,
                 )
@@ -22227,7 +22243,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _iter_max = _activity.get("max_iterations", 0)
 
                 logger.error(
-                    "Agent idle for %.0fs (timeout %.0fs) in session %s "
+                    # %g, not %.0f: HERMES_AGENT_TIMEOUT documents 0 =
+                    # unlimited (see the `> 0 else None` resolution above), so
+                    # rounding a sub-second bound down to "timeout 0s" tells
+                    # the operator no timeout was in force at the exact moment
+                    # one fired. Direct sibling of the cron inactivity message
+                    # fixed in 37ac04c63.
+                    "Agent idle for %gs (timeout %gs) in session %s "
                     "| last_activity=%s | iteration=%s/%s | tool=%s",
                     _secs_ago, _agent_timeout, session_key,
                     _last_desc, _iter_n, _iter_max,
