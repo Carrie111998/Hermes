@@ -245,6 +245,31 @@ When a session is reset, resumed, or expires:
 3. A temporary `AIAgent` runs a memory-only conversation turn
 4. Context is then discarded or archived
 
+### Resource Ownership and Teardown
+
+Resource cleanup has two boundaries:
+
+- **Hard session teardown:** gateway cleanup drains pending memory work, calls
+  `shutdown_memory_provider()`, then calls `AIAgent.close()`. Provider shutdown
+  is idempotent, so direct `AIAgent.close()` callers and gateway cleanup share
+  one owner boundary.
+- **Soft agent eviction:** `release_clients()` closes only model transports.
+  It preserves session tools, memory providers, and terminal state because an
+  evicted session may resume.
+
+Specific leak guards:
+
+- Lazy `SessionDB` handles opened by an agent for recall are agent-owned and
+  close with that agent. Explicit handles passed by a gateway remain shared.
+- Closed-loop entries in the auxiliary async-client cache run the real async
+  transport close. Clients owned by a live foreign loop are only neutered;
+  hard cross-thread close can corrupt TLS/SQLite FD reuse (see #70773).
+  Shutdown snapshots and clears the cache under its lock, then closes transports
+  outside the lock so slow async teardown cannot stall unrelated callers.
+- RetainDB allows one prefetch batch at a time. Its queue tracks connections
+  and closes writer/owner handles on their owning threads; handles left by an
+  exited memory worker are closed deterministically at shutdown.
+
 ## Background Maintenance
 
 The gateway runs periodic maintenance alongside message handling:
