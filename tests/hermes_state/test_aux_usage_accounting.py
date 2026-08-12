@@ -283,3 +283,118 @@ class TestInsightsAuxTotals:
         models = {m["model"] for m in report["models"]}
         assert {"main-model", "glm-5"} <= models
 
+    def test_aux_usage_reconciles_overview_models_daily_and_cost_buckets(self, db):
+        """Every Usage view derives from one main-plus-aux accounting population."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("s1", source="cli")
+        db.update_token_counts(
+            "s1",
+            model="main-model",
+            billing_provider="custom",
+            input_tokens=100,
+            output_tokens=10,
+            estimated_cost_usd=1.25,
+            actual_cost_usd=0.0,
+            cost_status="estimated",
+            cost_source="provider",
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+            estimated_cost_usd=2.5,
+        )
+        db.flush_token_counts()
+        with db._lock:
+            db._conn.execute(
+                "UPDATE session_model_usage SET cost_status='estimated', "
+                "cost_source='provider' WHERE session_id='s1' AND task='compression'"
+            )
+            db._conn.commit()
+
+        report = InsightsEngine(db).generate(days=30)
+        overview = report["overview"]
+        models = report["models"]
+        daily = report["daily_series"]
+        buckets = overview["cost_buckets"]
+
+        assert overview["total_input_tokens"] == sum(m["input_tokens"] for m in models) == 150
+        assert overview["total_output_tokens"] == sum(m["output_tokens"] for m in models) == 15
+        assert overview["total_input_tokens"] == sum(day["input_tokens"] for day in daily)
+        assert overview["total_output_tokens"] == sum(day["output_tokens"] for day in daily)
+        assert overview["estimated_cost"] == pytest.approx(sum(m["cost"] for m in models))
+        assert overview["estimated_cost"] == pytest.approx(
+            sum(day["estimated_cost_usd"] for day in daily)
+        )
+        assert overview["estimated_cost"] == pytest.approx(
+            sum(bucket["cost_usd"] for bucket in buckets.values())
+        )
+        assert overview["actual_cost"] == pytest.approx(sum(m["actual_cost"] for m in models))
+        assert sum(bucket["sessions"] for bucket in buckets.values()) == overview["total_sessions"] == 1
+        assert sum(m["api_calls"] for m in models) == 2
+
+    def test_aux_usage_does_not_inherit_main_loop_billing_route(self, db):
+        """An underspecified auxiliary row remains unknown, not plan-included."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("s1", source="cli", model="gpt-5.5")
+        db.update_token_counts(
+            "s1",
+            model="gpt-5.5",
+            billing_provider="openai-codex",
+            billing_mode="subscription_included",
+            input_tokens=100,
+            output_tokens=10,
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="aux-model",
+            input_tokens=50,
+            output_tokens=5,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        models = {model["model"]: model for model in report["models"]}
+
+        assert models["gpt-5.5"]["cost_status"] == "included"
+        assert models["aux-model"]["cost_status"] == "unknown"
+        assert report["overview"]["cost_buckets"]["unknown"]["sessions"] == 1
+
+    def test_actual_cost_availability_is_not_borrowed_by_auxiliary_models(self, db):
+        """A provider actual on the main route does not authorize an aux zero."""
+        from agent.insights import InsightsEngine
+
+        db.create_session("s1", source="cli")
+        db.update_token_counts(
+            "s1",
+            model="main-model",
+            billing_provider="custom",
+            input_tokens=100,
+            output_tokens=10,
+            actual_cost_usd=1.25,
+            api_call_count=1,
+        )
+        db.record_auxiliary_usage(
+            "s1",
+            "compression",
+            model="aux-model",
+            billing_provider="custom",
+            input_tokens=50,
+            output_tokens=5,
+        )
+        db.flush_token_counts()
+
+        report = InsightsEngine(db).generate(days=30)
+        models = {model["model"]: model for model in report["models"]}
+
+        assert models["main-model"]["actual_cost_available"] is True
+        assert models["aux-model"]["actual_cost_available"] is False
+

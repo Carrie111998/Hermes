@@ -144,7 +144,7 @@ export function SectionHeader({ action, description, eyebrow, title }: SectionHe
   )
 }
 
-function metricLabel(metric: UsageMetric, value: number, locale: string): string {
+function metricLabel(metric: UsageMetric, value: number | null, locale: string): string {
   if (metric === 'cost') {
     return formatCurrency(value, locale)
   }
@@ -158,8 +158,10 @@ function BurnChart({ metric, report }: { metric: UsageMetric; report: UsageRepor
   const u = t.usageDashboard
   const darkStyle = useMemo(() => usageDarkStyle(themeName), [themeName])
   const values = report.days.map(day => dailyMetricValue(day, metric))
-  const max = Math.max(1, ...values)
-  const total = values.reduce((sum, value) => sum + value, 0)
+  const availableValues = values.filter((value): value is number => value != null)
+  const complete = availableValues.length === values.length
+  const max = Math.max(1, ...availableValues)
+  const total = complete ? availableValues.reduce((sum, value) => sum + value, 0) : null
   const width = 760
   const height = 218
   const chartTop = 14
@@ -170,9 +172,9 @@ function BurnChart({ metric, report }: { metric: UsageMetric; report: UsageRepor
   let cumulative = 0
 
   const points = values.map((value, index) => {
-    cumulative += value
+    cumulative += value ?? 0
     const x = slot * index + slot / 2
-    const y = chartBottom - (cumulative / Math.max(total, 1)) * chartHeight
+    const y = chartBottom - (cumulative / Math.max(total ?? 0, 1)) * chartHeight
 
     return `${x},${y}`
   })
@@ -219,18 +221,20 @@ function BurnChart({ metric, report }: { metric: UsageMetric; report: UsageRepor
             />
           )
         })}
-        <polyline
-          fill="none"
-          opacity="0.62"
-          points={points.join(' ')}
-          stroke="var(--ui-text-tertiary)"
-          strokeDasharray="3 5"
-          strokeWidth="1.25"
-          vectorEffect="non-scaling-stroke"
-        />
+        {complete && (
+          <polyline
+            fill="none"
+            opacity="0.62"
+            points={points.join(' ')}
+            stroke="var(--ui-text-tertiary)"
+            strokeDasharray="3 5"
+            strokeWidth="1.25"
+            vectorEffect="non-scaling-stroke"
+          />
+        )}
         {report.days.map((day, index) => {
           const value = values[index]
-          const barHeight = value > 0 ? Math.max(1, (value / max) * chartHeight) : 0
+          const barHeight = value != null && value > 0 ? Math.max(1, (value / max) * chartHeight) : 0
           const x = slot * index + (slot - barWidth) / 2
 
           const tone =
@@ -246,7 +250,7 @@ function BurnChart({ metric, report }: { metric: UsageMetric; report: UsageRepor
                   className="usage-chart-bar"
                   fill={tone}
                   height={barHeight}
-                  opacity={value > 0 ? 0.86 : 0.18}
+                  opacity={value == null ? 0.08 : value > 0 ? 0.86 : 0.18}
                   role="img"
                   tabIndex={0}
                   width={barWidth}
@@ -294,7 +298,7 @@ function TokenTopology({ report }: { report: UsageReport }) {
     value != null && canonicalTotal != null && canonicalTotal > 0 ? value / canonicalTotal : null
 
   const reasoningShare =
-    report.totals.output_tokens != null && report.totals.output_tokens > 0
+    reasoningItem.value != null && report.totals.output_tokens != null && report.totals.output_tokens > 0
       ? reasoningItem.value / report.totals.output_tokens
       : null
 
@@ -386,7 +390,7 @@ function CostTruth({ meter, meterUnavailable, report }: MacroStripProps) {
         </div>
         <div className="text-end">
           <p className="font-mono text-sm tabular-nums text-ui-cyan">
-            {formatCurrency((report.totals.actual_cost ?? 0) > 0 ? report.totals.actual_cost : null, locale)}
+            {formatCurrency(report.totals.actual_cost, locale)}
           </p>
           <p className="text-[10px] text-muted-foreground">{u.cost.actual}</p>
         </div>
@@ -422,14 +426,14 @@ function modelSortValue(model: ModelUsage, sort: RouteSort): number {
   }
 
   if (sort === 'calls') {
-    return model.api_calls
+    return model.api_calls ?? -1
   }
 
   if (sort === 'cache') {
     return cacheRatio(model.cache_read_tokens, model.input_tokens) ?? 0
   }
 
-  return modelTokens(model)
+  return modelTokens(model) ?? -1
 }
 
 function ModelTable({ report }: { report: UsageReport }) {

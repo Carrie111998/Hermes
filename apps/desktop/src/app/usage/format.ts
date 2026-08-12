@@ -132,24 +132,30 @@ export function meterEstimatedCost(
   return meter.included_calls > 0 ? 0 : null
 }
 
-export function modelTokens(model: ModelUsage): number {
-  return model.input_tokens + model.output_tokens + model.cache_read_tokens + model.cache_write_tokens
+export function modelTokens(model: ModelUsage): number | null {
+  const values = [model.input_tokens, model.output_tokens, model.cache_read_tokens, model.cache_write_tokens]
+
+  return values.some(value => value == null) ? null : values.reduce<number>((sum, value) => sum + (value ?? 0), 0)
 }
 
-export function dailyMetricValue(day: DailyUsage, metric: UsageMetric): number {
+export function dailyMetricValue(day: DailyUsage, metric: UsageMetric): number | null {
   if (metric === 'cost') {
-    return day.cost ?? 0
+    return day.cost
   }
 
   if (metric === 'sessions') {
     return day.sessions
   }
 
-  return day.input_tokens + day.output_tokens + day.cache_read_tokens + day.cache_write_tokens
+  const values = [day.input_tokens, day.output_tokens, day.cache_read_tokens, day.cache_write_tokens]
+
+  return values.some(value => value == null) ? null : values.reduce<number>((sum, value) => sum + (value ?? 0), 0)
 }
 
-export function reportReasoningTokens(report: UsageReport): number {
-  return report.models.reduce((sum, model) => sum + model.reasoning_tokens, 0)
+export function reportReasoningTokens(report: UsageReport): number | null {
+  return report.models.some(model => model.reasoning_tokens == null)
+    ? null
+    : report.models.reduce((sum, model) => sum + (model.reasoning_tokens ?? 0), 0)
 }
 
 export function eventTokens(event: UsageMeterEvent): number {

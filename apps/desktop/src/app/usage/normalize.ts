@@ -12,7 +12,7 @@ function overviewMetric(value: unknown, empty: boolean): number | null {
   return numberOrNull(value) ?? (empty ? 0 : null)
 }
 
-function normalizeCostStatus(value: string, hasPricing: boolean): CostStatus {
+function normalizeCostStatus(value: string | undefined, hasPricing: boolean): CostStatus {
   if (value === 'included') {
     return 'included'
   }
@@ -72,16 +72,21 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
 
     return {
       model: model.model || 'unknown',
-      sessions: numberOrZero(model.sessions),
-      api_calls: numberOrZero(model.api_calls),
-      input_tokens: numberOrZero(model.input_tokens),
-      output_tokens: numberOrZero(model.output_tokens),
-      cache_read_tokens: numberOrZero(model.cache_read_tokens),
-      cache_write_tokens: numberOrZero(model.cache_write_tokens),
-      reasoning_tokens: numberOrZero(model.reasoning_tokens),
-      tool_calls: numberOrZero(model.tool_calls),
+      sessions: numberOrNull(model.sessions),
+      api_calls: numberOrNull(model.api_calls),
+      input_tokens: numberOrNull(model.input_tokens),
+      output_tokens: numberOrNull(model.output_tokens),
+      cache_read_tokens: numberOrNull(model.cache_read_tokens),
+      cache_write_tokens: numberOrNull(model.cache_write_tokens),
+      reasoning_tokens: numberOrNull(model.reasoning_tokens),
+      tool_calls: numberOrNull(model.tool_calls),
       estimated_cost: costStatus === 'unknown' || costStatus === 'unpriced' ? null : estimatedCost,
-      actual_cost: actualCost != null && actualCost > 0 ? actualCost : null,
+      actual_cost:
+        model.actual_cost_available === true || costStatus === 'actual'
+          ? actualCost
+          : actualCost != null && actualCost > 0
+            ? actualCost
+            : null,
       cost_status: costStatus,
       has_pricing: hasPricing
     }
@@ -99,12 +104,12 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
     source: response.source_filter ?? null,
     days: (response.daily_series ?? []).map(day => ({
       date: day.date,
-      sessions: numberOrZero(day.sessions),
-      input_tokens: numberOrZero(day.input_tokens),
-      output_tokens: numberOrZero(day.output_tokens),
-      cache_read_tokens: numberOrZero(day.cache_read_tokens),
-      cache_write_tokens: numberOrZero(day.cache_write_tokens),
-      cost: numberOrZero(day.estimated_cost_usd)
+      sessions: numberOrNull(day.sessions),
+      input_tokens: numberOrNull(day.input_tokens),
+      output_tokens: numberOrNull(day.output_tokens),
+      cache_read_tokens: numberOrNull(day.cache_read_tokens),
+      cache_write_tokens: numberOrNull(day.cache_write_tokens),
+      cost: numberOrNull(day.estimated_cost_usd)
     })),
     models,
     platforms: (response.platforms ?? []).map(platform => ({
@@ -124,14 +129,20 @@ export function normalizeUsageOverview(response: UsageOverviewResponse): UsageRe
     })),
     totals: {
       sessions: overviewMetric(overview.total_sessions, empty),
-      api_calls: rawModels == null ? null : models.reduce((sum, model) => sum + model.api_calls, 0),
+      api_calls:
+        rawModels == null || models.some(model => model.api_calls == null)
+          ? null
+          : models.reduce((sum, model) => sum + (model.api_calls ?? 0), 0),
       input_tokens: overviewMetric(overview.total_input_tokens, empty),
       output_tokens: overviewMetric(overview.total_output_tokens, empty),
       cache_read_tokens: overviewMetric(overview.total_cache_read_tokens, empty),
       cache_write_tokens: overviewMetric(overview.total_cache_write_tokens, empty),
       total_tokens: overviewMetric(overview.total_tokens, empty),
       cost: numberOrNull(overview.estimated_cost),
-      actual_cost: numberOrNull(overview.actual_cost),
+      actual_cost:
+        overview.actual_cost_available === true
+          ? numberOrNull(overview.actual_cost)
+          : null,
       tool_calls: overviewMetric(overview.total_tool_calls, empty),
       skill_calls: overviewMetric(response.skills?.summary?.total_skill_actions, empty),
       cost_buckets: {

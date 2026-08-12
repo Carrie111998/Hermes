@@ -29,24 +29,24 @@ export type UsageTotals = {
 
 export type DailyUsage = {
   date: string
-  sessions: number
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  cost: number
+  sessions: number | null
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  cost: number | null
 }
 
 export type ModelUsage = {
   model: string
-  sessions: number
-  api_calls: number
-  input_tokens: number
-  output_tokens: number
-  cache_read_tokens: number
-  cache_write_tokens: number
-  reasoning_tokens: number
-  tool_calls: number
+  sessions: number | null
+  api_calls: number | null
+  input_tokens: number | null
+  output_tokens: number | null
+  cache_read_tokens: number | null
+  cache_write_tokens: number | null
+  reasoning_tokens: number | null
+  tool_calls: number | null
   estimated_cost: number | null
   actual_cost: number | null
   cost_status: CostStatus
@@ -107,6 +107,7 @@ export type UsageOverviewResponse = {
     total_tokens: number
     estimated_cost: number
     actual_cost: number
+    actual_cost_available: boolean
     unknown_cost_sessions: number
     included_cost_sessions: number
     cost_buckets: {
@@ -117,19 +118,20 @@ export type UsageOverviewResponse = {
   }>
   models: Array<{
     model: string
-    sessions: number
-    api_calls: number
-    input_tokens: number
-    output_tokens: number
-    cache_read_tokens: number
-    cache_write_tokens: number
-    reasoning_tokens: number
-    total_tokens: number
-    tool_calls: number
-    cost: number
-    actual_cost: number
-    cost_status: string
-    has_pricing: boolean
+    sessions?: number
+    api_calls?: number
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_tokens?: number
+    cache_write_tokens?: number
+    reasoning_tokens?: number
+    total_tokens?: number
+    tool_calls?: number
+    cost?: number
+    actual_cost?: number
+    actual_cost_available?: boolean
+    cost_status?: string
+    has_pricing?: boolean
   }>
   platforms: Array<{
     platform: string
@@ -159,12 +161,12 @@ export type UsageOverviewResponse = {
   top_sessions: TopSession[]
   daily_series: Array<{
     date: string
-    sessions: number
-    input_tokens: number
-    output_tokens: number
-    cache_read_tokens: number
-    cache_write_tokens: number
-    estimated_cost_usd: number
+    sessions?: number
+    input_tokens?: number
+    output_tokens?: number
+    cache_read_tokens?: number
+    cache_write_tokens?: number
+    estimated_cost_usd?: number
   }>
 }
 
