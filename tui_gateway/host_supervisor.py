@@ -242,11 +242,19 @@ class HostSupervisor:
         on_complete: Callable[[dict], None] | None = None,
     ) -> str:
         self.start()
-        request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        client_request_id = frame.get("request_id")
+        # The client-supplied request_id is never trusted as the pending-turn
+        # key: two connections can send the same JSON-RPC id (e.g. "1") and
+        # would overwrite each other's entry, delivering one session's terminal
+        # frame to another's callback. Mint an internal UUID for correlation
+        # and preserve the client id only for diagnostics.
+        request_id = uuid.uuid4().hex
         sid = str(frame.get("sid") or "")
         payload = dict(frame)
         payload["type"] = "turn.start"
         payload["request_id"] = request_id
+        if client_request_id is not None:
+            payload["client_request_id"] = str(client_request_id)
         with self._lock:
             self._pending_turns[request_id] = (sid, on_complete)
         try:
@@ -290,7 +298,10 @@ class HostSupervisor:
         if route_name not in MUTATOR_ROUTE_TABLE:
             raise ValueError(f"unclassified host mutator route: {route_name}")
         self.start()
-        request_id = str((payload or {}).get("request_id") or uuid.uuid4().hex)
+        # Same rule as submit_turn: never key _pending_controls on a
+        # client-supplied id — mint an internal UUID so concurrent controls
+        # from different sessions can never collide in the pending map.
+        request_id = uuid.uuid4().hex
         frame = dict(payload or {})
         frame.setdefault("type", "control")
         frame["sid"] = sid
@@ -457,6 +468,16 @@ class HostSupervisor:
         if pending is None:
             return
         _sid, cb = pending
+        frame_sid = str(frame.get("sid") or "")
+        if _sid and frame_sid and _sid != frame_sid:
+            # Completion for a different session than the one that submitted
+            # this turn — a collision or stale generation. Never deliver it.
+            logger.warning(
+                "compute host turn completion sid mismatch: pending=%r frame=%r",
+                _sid,
+                frame_sid,
+            )
+            return
         if cb is not None:
             try:
                 cb(frame)
