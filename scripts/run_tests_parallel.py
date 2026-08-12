@@ -901,6 +901,48 @@ def main() -> int:
     # intuitive (``run_tests.sh tests/foo.py -q -- --tb=long`` → ``-q --tb=long``).
     pytest_passthrough = bare_passthrough + explicit_passthrough
 
+    # ── The passthrough must not smuggle in a second test path ──────────────
+    #
+    # Everything here is appended verbatim to ``python -m pytest <file> ...``,
+    # so a *path* in the passthrough makes that child collect more than the one
+    # file it was assigned. The run then reports "1 files" while executing two,
+    # and — because the child carries PER_FILE_ISOLATION_ENV — the conftest
+    # warning that exists to catch exactly this stays silent. Concretely:
+    #
+    #     run_tests_parallel.py tests/test_a.py -- tests/test_b.py
+    #
+    # discovered 1 file and ran 22 tests from 2 files in one interpreter, with
+    # no warning. That is the order-coupled state leakage this runner exists to
+    # prevent, re-entered through the back door.
+    #
+    # Only tokens that actually name an existing path (or a .py file) are
+    # rejected, so a bare value for a space-separated pytest flag (``-k expr``,
+    # ``-m mark``) is untouched — those are not paths.
+    # ``repo_root`` is not bound until after discovery, so resolve it locally.
+    _repo_root = Path(__file__).resolve().parent.parent
+    smuggled_paths = [
+        tok
+        for tok in pytest_passthrough
+        if not tok.startswith("-")
+        and (tok.endswith(".py") or (_repo_root / tok).exists() or Path(tok).exists())
+    ]
+    if smuggled_paths:
+        print(
+            "error: test paths are not allowed in the pytest passthrough: "
+            + " ".join(smuggled_paths),
+            file=sys.stderr,
+        )
+        print(
+            "  This runner is file-granular: it spawns one `pytest <file>` per\n"
+            "  test file. A path in the passthrough is appended to EVERY child,\n"
+            "  so those children collect more than their assigned file and the\n"
+            "  per-file isolation guarantee is silently lost.\n"
+            "  Pass test paths as positional arguments instead:\n"
+            f"    scripts/run_tests.sh {' '.join(smuggled_paths)}",
+            file=sys.stderr,
+        )
+        return 2
+
     # Parse --slice (or HERMES_TEST_SLICE) early so we can exit on bad input
     # before doing any expensive discovery.
     slice_raw = args.slice or os.environ.get("HERMES_TEST_SLICE")
