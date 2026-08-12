@@ -3575,3 +3575,36 @@ class TestStaleCrossSigningSignatureWarning:
         stale_check.assert_not_awaited()
 
         await adapter.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_connect_suppresses_verified_log_when_signature_stale(
+        self, monkeypatch, caplog
+    ):
+        """A stale server signature must not be reported as 'verified'.
+
+        The old code logged ``INFO cross-signing verified via recovery key``
+        unconditionally after ``verify_with_recovery_key()``, then logged the
+        stale-signature error afterwards — a self-contradicting log sequence
+        that misled operators into thinking the device was trusted when it
+        was not. When the server-side check returns False, no 'verified'
+        INFO line may be emitted; the actionable stale-signature error is
+        already logged by the helper.
+        """
+        import logging
+
+        monkeypatch.setenv("MATRIX_RECOVERY_KEY", "EsTfakerecoverykey")
+        adapter = self._encrypted_adapter()
+        mock_client, mock_olm = self._connect_mocks()
+        mock_olm.verify_with_recovery_key = AsyncMock()
+        stale_check = AsyncMock(return_value=False)
+
+        with caplog.at_level(logging.INFO):
+            assert await self._run_connect(
+                adapter, mock_client, mock_olm, stale_check
+            ) is True
+
+        mock_olm.verify_with_recovery_key.assert_awaited_once()
+        stale_check.assert_awaited_once_with(mock_client)
+        assert "cross-signing verified via recovery key" not in caplog.text
+
+        await adapter.disconnect()

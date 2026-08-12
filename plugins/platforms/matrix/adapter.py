@@ -2002,15 +2002,26 @@ class MatrixAdapter(BasePlatformAdapter):
                     if recovery_key:
                         try:
                             await olm.verify_with_recovery_key(recovery_key)
-                            logger.info("Matrix: cross-signing verified via recovery key")
                             # verify_with_recovery_key signs this device with the
                             # self-signing key and uploads the signature, but the
                             # homeserver silently keeps a pre-existing (possibly
                             # stale) signature and mautrix ignores per-key upload
                             # failures. A stale signature makes other clients show
                             # the bot as unverified and withhold room keys, so
-                            # check what the server actually serves.
-                            await self._warn_if_cross_signing_signature_stale(client)
+                            # check what the server actually serves rather than
+                            # trusting the local upload as proof of success.
+                            server_state = (
+                                await self._warn_if_cross_signing_signature_stale(client)
+                            )
+                            # Only claim "verified" when the server check did not
+                            # prove the signature stale. On a stale signature the
+                            # helper already logged the actionable error; logging
+                            # "verified" here would contradict it and mislead
+                            # operators into thinking the device is trusted.
+                            if server_state is not False:
+                                logger.info(
+                                    "Matrix: cross-signing verified via recovery key"
+                                )
                         except Exception as exc:
                             logger.warning("Matrix: recovery key verification failed: %s", exc)
                     else:
