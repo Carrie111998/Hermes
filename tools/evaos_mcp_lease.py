@@ -1,14 +1,15 @@
-"""Managed evaOS authentication for native Pipedream MCP transports.
+"""Managed evaOS authentication for Pipedream MCP transports.
 
-The desktop runtime receives only a short-lived MCP token response.  The
-deployment broker secret and exact customer / Hermes agent / app identity come
-from root-owned service configuration.  They are never persisted in the
-manager, included in errors, or exposed to MCP tool/model surfaces.
+The desktop runtime receives only a short-lived MCP lease.  The deployment
+broker secret and profile-scoped per-app provider grant are read from
+root-owned files only while minting that lease.  They are never persisted in
+the manager, included in errors, or exposed to MCP tool/model surfaces.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import stat
@@ -23,8 +24,7 @@ import httpx
 
 _APP_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,127}$")
 _ACCOUNT_ID_RE = re.compile(r"^apn_[A-Za-z0-9_-]+$")
-_CUSTOMER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,120}$")
+_GRANT_HANDLE_RE = re.compile(r"^[A-Za-z0-9._~:-]{16,512}$")
 _CREDENTIAL_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 _LEASE_ENDPOINT_PATH = "/functions/v1/desktop-runtime-session"
 _MCP_ORIGIN = ("https", "remote.mcp.pipedream.net")
@@ -48,9 +48,7 @@ class EvaosLeaseError(RuntimeError):
 class _LeaseSourceMaterial:
     endpoint: str
     broker_secret: str
-    customer_id: str
-    agent_runtime: str
-    agent_id: str
+    provider_grant: str
     app_slug: str
 
 
@@ -86,16 +84,20 @@ def _default_profile_resolver() -> str:
     return str(get_hermes_home().expanduser().resolve())
 
 
+def _reject_duplicate_pairs(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("duplicate provider grant key")
+    return result
+
+
 class EvaosLeaseSource:
-    """Resolve one profile's root-configured native Pipedream route."""
+    """Resolve the current profile's broker secret and selected app grant."""
 
     def __init__(
         self,
         *,
         profile_key: str,
-        customer_id: str,
-        agent_runtime: str,
-        agent_id: str,
         app_slug: str,
         secret_reader: Optional[Callable[[str], Optional[str]]] = None,
         profile_resolver: Optional[Callable[[], str]] = None,
@@ -104,24 +106,9 @@ class EvaosLeaseSource:
     ):
         if not isinstance(profile_key, str) or not profile_key:
             raise EvaosLeaseError("managed MCP profile authority is missing")
-        if (
-            not isinstance(customer_id, str)
-            or not _CUSTOMER_ID_RE.fullmatch(customer_id)
-        ):
-            raise EvaosLeaseError("managed MCP customer identity is invalid")
-        if agent_runtime != "hermes":
-            raise EvaosLeaseError("managed MCP agent runtime is invalid")
-        if (
-            not isinstance(agent_id, str)
-            or not _AGENT_ID_RE.fullmatch(agent_id)
-        ):
-            raise EvaosLeaseError("managed MCP agent identity is invalid")
         if not isinstance(app_slug, str) or not _APP_SLUG_RE.fullmatch(app_slug):
             raise EvaosLeaseError("managed MCP app slug is invalid")
         self._profile_key = profile_key
-        self._customer_id = customer_id
-        self._agent_runtime = agent_runtime
-        self._agent_id = agent_id
         self._app_slug = app_slug
         self._secret_reader = secret_reader or _default_secret_reader
         self._profile_resolver = profile_resolver or _default_profile_resolver
@@ -140,10 +127,7 @@ class EvaosLeaseSource:
     def __repr__(self) -> str:
         return (
             "EvaosLeaseSource("
-            f"profile_key={self._profile_key!r}, "
-            f"customer_id={self._customer_id!r}, "
-            f"agent_runtime={self._agent_runtime!r}, "
-            f"agent_id={self._agent_id!r}, app_slug={self._app_slug!r})"
+            f"profile_key={self._profile_key!r}, app_slug={self._app_slug!r})"
         )
 
     def _setting(self, name: str) -> str:
@@ -281,6 +265,30 @@ class EvaosLeaseSource:
             raise EvaosLeaseError("managed MCP broker secret file is malformed")
         return value
 
+    def _provider_grant(self) -> str:
+        raw = self._secure_file_text(
+            self._setting("PIPEDREAM_PROVIDER_GRANT_FILE"),
+            label="managed MCP provider grant file",
+        )
+        try:
+            grant_map = json.loads(raw, object_pairs_hook=_reject_duplicate_pairs)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise EvaosLeaseError("managed MCP provider grant map is malformed") from exc
+        if not isinstance(grant_map, dict) or not grant_map:
+            raise EvaosLeaseError("managed MCP provider grant map is malformed")
+        if any(
+            not isinstance(app_slug, str)
+            or not _APP_SLUG_RE.fullmatch(app_slug)
+            or not isinstance(handle, str)
+            or not _GRANT_HANDLE_RE.fullmatch(handle)
+            for app_slug, handle in grant_map.items()
+        ):
+            raise EvaosLeaseError("managed MCP provider grant map is malformed")
+        selected = grant_map.get(self._app_slug)
+        if selected is None:
+            raise EvaosLeaseError("managed MCP provider grant is unavailable")
+        return selected
+
     def read(self) -> _LeaseSourceMaterial:
         try:
             current_profile = self._profile_resolver()
@@ -291,9 +299,7 @@ class EvaosLeaseSource:
         return _LeaseSourceMaterial(
             endpoint=self._endpoint(),
             broker_secret=self._broker_secret(),
-            customer_id=self._customer_id,
-            agent_runtime=self._agent_runtime,
-            agent_id=self._agent_id,
+            provider_grant=self._provider_grant(),
             app_slug=self._app_slug,
         )
 
@@ -325,6 +331,7 @@ class EvaosLeaseManager:
         transport: Optional[LeaseTransport] = None,
         now: Optional[Callable[[], datetime]] = None,
         refresh_skew_seconds: float = 60,
+        on_mint_failure: Optional[Callable[[Exception], None]] = None,
     ):
         if refresh_skew_seconds < 0:
             raise ValueError("refresh_skew_seconds must be non-negative")
@@ -332,6 +339,7 @@ class EvaosLeaseManager:
         self._transport = transport or _default_transport
         self._now = now or (lambda: datetime.now(timezone.utc))
         self._refresh_skew = timedelta(seconds=refresh_skew_seconds)
+        self._on_mint_failure = on_mint_failure
         self._lock = asyncio.Lock()
         self._lease: Optional[EvaosMcpLease] = None
 
@@ -365,8 +373,13 @@ class EvaosLeaseManager:
                     return lease
             elif self._usable(lease):
                 return lease
-            material = self._source.read()
-            minted = await self._mint(material)
+            try:
+                material = self._source.read()
+                minted = await self._mint(material)
+            except Exception as exc:
+                if self._on_mint_failure is not None:
+                    self._on_mint_failure(exc)
+                raise
             self._lease = minted
             return minted
 
@@ -374,12 +387,10 @@ class EvaosLeaseManager:
         request_headers = {
             "Content-Type": "application/json",
             "X-Evaos-Desktop-Broker-Secret": material.broker_secret,
+            "X-Evaos-Provider-Grant": material.provider_grant,
         }
         request_body = {
             "action": "pipedream_mcp_lease",
-            "customer_id": material.customer_id,
-            "agent_runtime": material.agent_runtime,
-            "agent_id": material.agent_id,
             "app_slug": material.app_slug,
         }
         try:
@@ -391,7 +402,7 @@ class EvaosLeaseManager:
         status_code = getattr(response, "status_code", None)
         if status_code != 200:
             if status_code == 401:
-                message = "managed MCP broker authentication was rejected"
+                message = "managed MCP broker or provider grant was rejected"
             elif status_code == 403:
                 message = "managed MCP profile authority is no longer valid"
             elif status_code == 400:

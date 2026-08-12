@@ -44,9 +44,6 @@ Example config::
                               # MCP over POST. Default: false.
       pipedream_google_sheets:
         auth: evaos_lease     # managed in-memory evaOS lease; no static URL
-        customer_id: customer-fixture
-        agent_runtime: hermes
-        agent_id: profile-agent
         app_slug: google_sheets
       searxng:
         url: "http://localhost:8000/sse"
@@ -1890,6 +1887,7 @@ class MCPServerTask:
         "initialize_result", "_ping_unsupported",
         "_reconnect_retries", "_session_proven", "_was_parked",
         "_evaos_lease_manager", "_evaos_lease_auth",
+        "_evaos_lease_warning_emitted",
     )
 
     def __init__(self, name: str, registration_home: Optional[str] = None):
@@ -1934,10 +1932,11 @@ class MCPServerTask:
         self._was_parked: bool = False
         self._auth_type: str = ""
         # Managed Pipedream credentials remain in this in-memory lease manager
-        # across transport reconnects. The broker secret is never retained
-        # here; the source rereads it only for a mint.
+        # across transport reconnects. Neither the broker secret nor provider
+        # grant is retained here; the source rereads them only for a mint.
         self._evaos_lease_manager: Optional[Any] = None
         self._evaos_lease_auth: Optional[Any] = None
+        self._evaos_lease_warning_emitted = False
         self._refresh_lock = asyncio.Lock()
         # MCP stdio sessions are a single JSON-RPC stream. Some servers emit
         # list_changed notifications during startup; if the notification
@@ -1984,6 +1983,8 @@ class MCPServerTask:
         """Reject connection or credential overrides for managed MCP auth."""
         if self._auth_type != "evaos_lease":
             return
+        from tools.evaos_mcp_lease import EvaosLeaseError
+
         conflicting = {
             "url",
             "headers",
@@ -1995,44 +1996,25 @@ class MCPServerTask:
             "client_cert",
         } & set(config)
         if conflicting or config.get("ssl_verify") is False:
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
             raise EvaosLeaseError(
                 "managed MCP config may specify only root-configured "
-                "customer, agent, and app identity plus non-credential "
-                "runtime options"
+                "app identity plus non-credential runtime options"
             )
-        customer_id = config.get("customer_id")
-        if (
-            not isinstance(customer_id, str)
-            or re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", customer_id
-            )
-            is None
-        ):
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
-            raise EvaosLeaseError("managed MCP customer identity is invalid")
-        if config.get("agent_runtime") != "hermes":
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
-            raise EvaosLeaseError("managed MCP agent runtime is invalid")
-        agent_id = config.get("agent_id")
-        if (
-            not isinstance(agent_id, str)
-            or re.fullmatch(r"[A-Za-z0-9_-]{1,120}", agent_id) is None
-        ):
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
-            raise EvaosLeaseError("managed MCP agent identity is invalid")
         app_slug = config.get("app_slug")
         if (
             not isinstance(app_slug, str)
             or re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,127}", app_slug) is None
         ):
-            from tools.evaos_mcp_lease import EvaosLeaseError
-
             raise EvaosLeaseError("managed MCP app slug is invalid")
+
+    def _warn_evaos_lease_failure(self, exc: Exception) -> None:
+        if self._evaos_lease_warning_emitted:
+            return
+        self._evaos_lease_warning_emitted = True
+        logger.warning(
+            "MCP server '%s' profile '%s': managed Pipedream lease mint failed: %s",
+            self.name, Path(self.registration_home).name, exc,
+        )
 
     def _advertises_tools(self) -> bool:
         """Whether the server advertises the ``tools`` capability.
@@ -2886,12 +2868,11 @@ class MCPServerTask:
             if self._evaos_lease_manager is None:
                 source = EvaosLeaseSource(
                     profile_key=self.registration_home,
-                    customer_id=config["customer_id"],
-                    agent_runtime=config["agent_runtime"],
-                    agent_id=config["agent_id"],
                     app_slug=config["app_slug"],
                 )
-                self._evaos_lease_manager = EvaosLeaseManager(source=source)
+                self._evaos_lease_manager = EvaosLeaseManager(
+                    source=source, on_mint_failure=self._warn_evaos_lease_failure
+                )
                 self._evaos_lease_auth = EvaosLeaseHttpAuth(
                     self._evaos_lease_manager
                 )
