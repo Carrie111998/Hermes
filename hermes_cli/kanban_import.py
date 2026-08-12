@@ -12,6 +12,7 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Protocol
@@ -43,6 +44,7 @@ _SUPPORTED_FIELDS = {
 class ImportAdapter(Protocol):
     def scan(self) -> Iterable["ExternalTask"]: ...
     def write_state(self, task: "ExternalTask", state: str, marker: dict[str, Any]) -> None: ...
+    def claim(self, task: "ExternalTask", marker: dict[str, Any]): ...
 
 
 @dataclass(frozen=True)
@@ -135,17 +137,32 @@ class MarkdownAdapter:
         unknown = sorted(set(metadata) - _SUPPORTED_FIELDS)
         if unknown:
             raise ValueError(f"{path.name}: unsupported field(s): {', '.join(unknown)}")
-        source_id = str(metadata.get("id") or "").strip()
-        title = str(metadata.get("title") or "").strip()
-        status = str(metadata.get("status") or "pending").strip().lower()
+        for field in ("id", "title", "status", "assignee", "tenant", "workspace"):
+            value = metadata.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{path.name}: {field} must be a string")
+        marker = metadata.get("hermes_kanban")
+        if marker is not None and not isinstance(marker, dict):
+            raise ValueError(f"{path.name}: hermes_kanban must be an object")
+        priority_value = metadata.get("priority", 0)
+        if isinstance(priority_value, bool) or not isinstance(priority_value, int):
+            raise ValueError(f"{path.name}: priority must be an integer")
+        source_id = (metadata.get("id") or "").strip()
+        title = (metadata.get("title") or "").strip()
+        status = (metadata.get("status") or "pending").strip().lower()
         if not source_id or not title:
             raise ValueError(f"{path.name}: id and title are required")
         if status not in _SOURCE_RUNNABLE | _SOURCE_OWNED:
             raise ValueError(f"{path.name}: unsupported status {status!r}")
         depends = metadata.get("depends_on") or []
         skills = metadata.get("skills") or []
-        if not isinstance(depends, list) or not isinstance(skills, list):
-            raise ValueError(f"{path.name}: depends_on and skills must be lists")
+        if (
+            not isinstance(depends, list)
+            or not all(isinstance(value, str) for value in depends)
+            or not isinstance(skills, list)
+            or not all(isinstance(value, str) for value in skills)
+        ):
+            raise ValueError(f"{path.name}: depends_on and skills must be lists of strings")
         kind, workspace_path = self._workspace(metadata.get("workspace"), path)
         semantic = {k: v for k, v in metadata.items() if k != "hermes_kanban"}
         revision = hashlib.sha256(
@@ -157,7 +174,7 @@ class MarkdownAdapter:
             body=body,
             status=status,
             assignee=(str(metadata["assignee"]).strip() if metadata.get("assignee") else None),
-            priority=int(metadata.get("priority") or 0),
+            priority=priority_value,
             depends_on=tuple(str(v).strip() for v in depends if str(v).strip()),
             workspace_kind=kind,
             workspace_path=workspace_path,
@@ -191,6 +208,56 @@ class MarkdownAdapter:
             except FileNotFoundError:
                 pass
 
+    @contextmanager
+    def claim(self, task: ExternalTask, marker: dict[str, Any]):
+        """Serialize ownership transfer and compare against the scanned record."""
+        lock_path = task.path.with_name(f".{task.path.name}.hermes.lock")
+        lock_path.touch(exist_ok=True)
+        with lock_path.open("r+b") as handle:
+            deadline = time.monotonic() + 5.0
+            while True:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        handle.seek(0)
+                        if handle.read(1) == b"":
+                            handle.seek(0)
+                            handle.write(b"0")
+                            handle.flush()
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (OSError, BlockingIOError):
+                    if time.monotonic() >= deadline:
+                        raise ValueError(f"{task.path.name}: timed out acquiring source ownership")
+                    time.sleep(0.05)
+            try:
+                current = self._read(task.path)
+                current_marker = current.metadata.get("hermes_kanban") or {}
+                same_resume = (
+                    current.status == "importing"
+                    and current_marker.get("import_id") == marker["import_id"]
+                )
+                if not same_resume and (
+                    current.revision != task.revision or current.status not in _SOURCE_RUNNABLE
+                ):
+                    raise ValueError(
+                        f"{task.path.name}: source changed or is already owned by another importer"
+                    )
+                self.write_state(current, "importing", marker)
+                yield current
+            finally:
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
 
 def _ensure_schema(conn) -> None:
     with kb.write_txn(conn):
@@ -204,6 +271,7 @@ def _ensure_schema(conn) -> None:
                 mirrored_status TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (import_id, source_id),
+                UNIQUE (source_path),
                 UNIQUE (task_id)
             )
         """)
@@ -239,7 +307,7 @@ def sync_import(
     results: list[ImportResult] = []
     try:
         tasks = list(adapter.scan())
-    except ValueError as exc:
+    except (OSError, TypeError, ValueError) as exc:
         return [ImportResult(source_id="", action="error", error=str(exc))]
     by_id: dict[str, ExternalTask] = {}
     duplicate_ids: set[str] = set()
@@ -297,6 +365,9 @@ def sync_import(
         and task.status in _SOURCE_RUNNABLE | {"importing"}
     ]
     unresolved = {task.source_id: task for task in pending}
+    planned_task_ids: dict[str, str] = {
+        source_id: row["task_id"] for source_id, row in ledger.items()
+    }
     while unresolved:
         progressed = False
         for source_id, task in list(unresolved.items()):
@@ -316,50 +387,60 @@ def sync_import(
             dep_error = None
             for dep in task.depends_on:
                 if dry_run:
-                    continue
-                dep_row = conn.execute(
-                    "SELECT task_id FROM task_imports WHERE import_id=? AND source_id=?",
-                    (import_id, dep),
-                ).fetchone()
-                if not dep_row:
+                    dep_task_id = planned_task_ids.get(dep)
+                else:
+                    dep_row = conn.execute(
+                        "SELECT task_id FROM task_imports WHERE import_id=? AND source_id=?",
+                        (import_id, dep),
+                    ).fetchone()
+                    dep_task_id = dep_row["task_id"] if dep_row else None
+                if not dep_task_id:
                     dep_error = f"dependency {dep!r} was not imported"
                     break
-                parent_ids.append(dep_row["task_id"])
+                parent_ids.append(dep_task_id)
             if dep_error:
                 results.append(ImportResult(source_id, "error", error=dep_error))
                 del unresolved[source_id]
                 continue
             if dry_run:
                 results.append(ImportResult(source_id, "would_import"))
+                planned_task_ids[source_id] = f"planned:{source_id}"
                 del unresolved[source_id]
                 progressed = True
                 continue
             # Source lock first: after this durable transition no external
             # consumer should claim the record. A crash here is recoverable
             # because subsequent syncs accept `importing` as resumable.
-            adapter.write_state(task, "importing", {"import_id": import_id, "state": "importing"})
-            with kb.write_txn(conn):
-                native_id = kb.create_task(
-                    conn,
-                    title=task.title,
-                    body=task.body or None,
-                    assignee=assignee,
-                    created_by=f"import:{import_id}",
-                    workspace_kind=task.workspace_kind,
-                    workspace_path=task.workspace_path,
-                    priority=task.priority,
-                    parents=parent_ids,
-                    tenant=task.tenant,
-                    idempotency_key=f"import:{import_id}:{source_id}",
-                    max_runtime_seconds=task.max_runtime_seconds,
-                    skills=task.skills,
-                )
-                conn.execute(
-                    "INSERT INTO task_imports VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (import_id, source_id, str(task.path), task.revision, native_id, "imported", int(time.time())),
-                )
-                _event(conn, native_id, "imported", {"import_id": import_id, "source_id": source_id, "source_revision": task.revision})
-            adapter.write_state(task, "imported", {"import_id": import_id, "task_id": native_id, "state": "imported"})
+            claim_marker = {"import_id": import_id, "state": "importing"}
+            try:
+                with adapter.claim(task, claim_marker) as claimed:
+                    source_key = hashlib.sha256(str(task.path).encode("utf-8")).hexdigest()
+                    with kb.write_txn(conn):
+                        native_id = kb.create_task(
+                            conn,
+                            title=task.title,
+                            body=task.body or None,
+                            assignee=assignee,
+                            created_by=f"import:{import_id}",
+                            workspace_kind=task.workspace_kind,
+                            workspace_path=task.workspace_path,
+                            priority=task.priority,
+                            parents=parent_ids,
+                            tenant=task.tenant,
+                            idempotency_key=f"external-import:{source_key}",
+                            max_runtime_seconds=task.max_runtime_seconds,
+                            skills=task.skills,
+                        )
+                        conn.execute(
+                            "INSERT INTO task_imports VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            (import_id, source_id, str(task.path), task.revision, native_id, "imported", int(time.time())),
+                        )
+                        _event(conn, native_id, "imported", {"import_id": import_id, "source_id": source_id, "source_revision": task.revision})
+                    adapter.write_state(claimed, "imported", {"import_id": import_id, "task_id": native_id, "state": "imported"})
+            except (OSError, ValueError) as exc:
+                results.append(ImportResult(source_id, "conflict", error=str(exc)))
+                del unresolved[source_id]
+                continue
             results.append(ImportResult(source_id, "imported", native_id))
             del unresolved[source_id]
             progressed = True

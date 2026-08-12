@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import argparse
+import threading
 from pathlib import Path
 
 import pytest
@@ -194,3 +196,110 @@ def test_cli_import_json_exercises_public_surface(import_env):
     )
     assert '"source_id": "ext-1"' in output
     assert '"action": "would_import"' in output
+
+
+def test_malformed_scalar_fields_fail_closed_without_raising(import_env):
+    _write(import_env, "bad", {
+        "id": "bad", "title": "Bad", "status": "pending", "assignee": "worker",
+        "priority": [1],
+    })
+    with kb.connect_closing() as conn:
+        result = sync_import(
+            conn, adapter=MarkdownAdapter(import_env), import_id="pool",
+        )
+        assert result[0].action == "error"
+        assert result[0].error == "bad.md: priority must be an integer"
+        assert kb.list_tasks(conn) == []
+
+
+def test_dry_run_and_real_import_reject_same_missing_ledger_dependency(import_env):
+    _write(import_env, "parent", {
+        "id": "parent", "title": "Parent", "status": "done", "assignee": "worker",
+    })
+    _write(import_env, "child", {
+        "id": "child", "title": "Child", "status": "pending", "assignee": "worker",
+        "depends_on": ["parent"],
+    })
+    with kb.connect_closing() as conn:
+        dry = sync_import(
+            conn, adapter=MarkdownAdapter(import_env), import_id="pool", dry_run=True,
+        )
+        real = sync_import(
+            conn, adapter=MarkdownAdapter(import_env), import_id="pool",
+        )
+        expected = [("error", "dependency 'parent' was not imported")]
+        assert [(row.action, row.error) for row in dry] == expected
+        assert [(row.action, row.error) for row in real] == expected
+
+
+def test_concurrent_import_ids_create_one_native_card(import_env):
+    _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    barrier = threading.Barrier(2)
+
+    class ConcurrentAdapter(MarkdownAdapter):
+        def scan(self):
+            tasks = list(super().scan())
+            barrier.wait(timeout=5)
+            return tasks
+
+    outcomes = []
+
+    def run(import_id):
+        with kb.connect_closing() as conn:
+            outcomes.extend(sync_import(
+                conn, adapter=ConcurrentAdapter(import_env), import_id=import_id,
+            ))
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in ("a", "b")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+    assert sorted(result.action for result in outcomes) == ["conflict", "imported"]
+
+
+def test_watch_mirrors_lifecycle_changes_without_manual_rerun(import_env, monkeypatch):
+    path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    sleeps = 0
+
+    def advance(_interval):
+        nonlocal sleeps
+        sleeps += 1
+        if sleeps == 1:
+            with kb.connect_closing() as conn:
+                conn.execute("UPDATE tasks SET status='done', completed_at=1")
+                conn.commit()
+        else:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(kc.time, "sleep", advance)
+    args = argparse.Namespace(
+        source=str(import_env), assignee_map=None, adapter="markdown",
+        import_id="pool", dry_run=False, watch=True, interval=0.01, json=False,
+    )
+    assert kc._cmd_import(args) == 0
+    assert _read(path)["status"] == "done"
+
+
+def test_cli_conflict_returns_nonzero(import_env):
+    path = _write(import_env, "one", {
+        "id": "ext-1", "title": "One", "status": "pending", "assignee": "worker",
+    })
+    with kb.connect_closing() as conn:
+        sync_import(conn, adapter=MarkdownAdapter(import_env), import_id="pool")
+    metadata = _read(path)
+    metadata["status"] = "pending"
+    _write(import_env, "one", metadata)
+    args = argparse.Namespace(
+        source=str(import_env), assignee_map=None, adapter="markdown",
+        import_id="pool", dry_run=False, watch=False, interval=5.0, json=False,
+    )
+    assert kc._cmd_import(args) == 1

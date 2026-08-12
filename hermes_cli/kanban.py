@@ -264,6 +264,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Optional YAML mapping from source assignees to Hermes profiles")
     p_import.add_argument("--dry-run", action="store_true",
                           help="Validate and report without changing the board or source")
+    p_import.add_argument("--watch", action="store_true",
+                          help="Keep reconciling native lifecycle changes until interrupted")
+    p_import.add_argument("--interval", type=float, default=5.0,
+                          help="Seconds between watch reconciliations (default: 5)")
     p_import.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- boards (new in v2: multi-project support) ---
@@ -1531,14 +1535,27 @@ def _cmd_import(args: argparse.Namespace) -> int:
         mapping = parsed
     try:
         adapter = MarkdownAdapter(source)
-        with kb.connect_closing() as conn:
-            results = sync_import(
-                conn,
-                adapter=adapter,
-                import_id=args.import_id,
-                assignee_map=mapping,
-                dry_run=bool(args.dry_run),
-            )
+        if args.watch and args.dry_run:
+            raise ValueError("--watch and --dry-run cannot be combined")
+        if args.interval <= 0:
+            raise ValueError("--interval must be greater than zero")
+        results = []
+        while True:
+            with kb.connect_closing() as conn:
+                results = sync_import(
+                    conn,
+                    adapter=adapter,
+                    import_id=args.import_id,
+                    assignee_map=mapping,
+                    dry_run=bool(args.dry_run),
+                )
+            if not args.watch:
+                break
+            if any(result.action in {"error", "conflict"} for result in results):
+                break
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
     except (OSError, ValueError) as exc:
         print(f"kanban import: {exc}", file=sys.stderr)
         return 1
@@ -1551,7 +1568,7 @@ def _cmd_import(args: argparse.Namespace) -> int:
             if result.error:
                 detail += f" ({result.error})"
             print(f"{result.source_id or '(source)'}: {result.action}{detail}")
-    return 1 if any(result.action == "error" for result in results) else 0
+    return 1 if any(result.action in {"error", "conflict"} for result in results) else 0
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
