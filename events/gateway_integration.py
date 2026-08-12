@@ -219,10 +219,11 @@ def startup(adapters: Optional[Dict] = None) -> None:
     _stop_event.clear()
     _subscriber_thread = threading.Thread(
         target=_subscriber_poll_loop,
-        # Capture the heartbeat target NOW — at startup, where its meaning is
-        # fixed — and carry it. shutdown()'s join has a 5s timeout, so on a
-        # loaded box this thread can outlive the test that started it.
-        args=(gateway_heartbeat_path(),),
+        # Capture the env-derived write targets NOW — at startup, where their
+        # meaning is fixed — and carry them. shutdown()'s join has a 5s
+        # timeout, so on a loaded box this thread can outlive the test that
+        # started it.
+        args=(gateway_heartbeat_path(), whatsapp_flush_state_path()),
         daemon=True,
         name="event-subscribers",
     )
@@ -591,13 +592,38 @@ def _should_attempt_whatsapp_flush(
     return (now - last_flush_attempt) >= retry_interval
 
 
-def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
+def _resolve_whatsapp_state_path(path: Optional[Path]) -> Path:
+    """Return the carried whatsapp flush-state path, or resolve one live.
+
+    Direct (non-deferred) callers pass ``None`` and resolve against the current
+    ``HERMES_HOME`` — correct, because the process still holds the home it was
+    launched with. A deferred caller binds the path at the moment its meaning is
+    fixed and passes it in, so a later env change cannot move the write.
+    """
+    return path if path is not None else whatsapp_flush_state_path()
+
+
+def _resolve_digest_state_path(path: Optional[Path]) -> Path:
+    """Return the carried digest-state path, or resolve one live.
+
+    Same contract as :func:`_resolve_whatsapp_state_path`.
+    """
+    return path if path is not None else digest_state_path()
+
+
+def _subscriber_poll_loop(
+    heartbeat_path: Optional[Path] = None,
+    whatsapp_state_path: Optional[Path] = None,
+    digest_path: Optional[Path] = None,
+) -> None:
     """Background thread that polls all subscribers at their configured intervals.
 
-    ``heartbeat_path`` is captured by :func:`startup` and carried in, so a tick
-    that lands after ``shutdown()``'s bounded ``join(timeout=5)`` gives up still
-    writes to the home this loop was started with. Re-resolving it per tick
-    would follow ``HERMES_HOME`` into whatever a test's teardown restored.
+    ``heartbeat_path`` and ``whatsapp_state_path`` are captured by
+    :func:`startup` and carried in, so a tick that lands after ``shutdown()``'s
+    bounded ``join(timeout=5)`` gives up still writes to the home this loop was
+    started with. Re-resolving either per tick would follow ``HERMES_HOME`` into
+    whatever a test's teardown restored — and ``save_state`` mkdirs its parent
+    before writing, so it would create the directory too.
 
     Outer try/except is a safety net: every sub-operation below already has
     its own try/except, but a handful of state saves and iterations are not
@@ -606,6 +632,8 @@ def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
     the 2026-04-16 Post-Silence-Fix Addendum.  If the outer catch fires,
     we log, emit an agent_error event (rate-limited), and continue ticking.
     """
+    whatsapp_state_target = _resolve_whatsapp_state_path(whatsapp_state_path)
+    digest_state_target = _resolve_digest_state_path(digest_path)
     last_poll_times: Dict[str, float] = {}
     last_mailbox_scan: float = 0
     last_health_check: float = 0
@@ -630,7 +658,7 @@ def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
     last_wal_truncate: float = time.monotonic()
     last_heartbeat: float = 0
     last_batch_flush: float = 0
-    _state = load_state(digest_state_path(), default={})
+    _state = load_state(digest_state_target, default={})
     # ``fired_digest_keys`` is a list of YYYY-MM-DD-HH keys fired today.
     # Migrated from the legacy scalar ``last_digest_key`` on first post-
     # upgrade start: the legacy value is seeded into the set so we don't
@@ -641,7 +669,7 @@ def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
     fired_digest_keys: List[str] = list(_state.get("fired_digest_keys", []))
     if _legacy_digest_key and _legacy_digest_key not in fired_digest_keys:
         fired_digest_keys.append(_legacy_digest_key)
-    _flush_state = load_state(whatsapp_flush_state_path(), default={})
+    _flush_state = load_state(whatsapp_state_target, default={})
     last_flush_date: str = _flush_state.get("last_flush_date", "")
     # Monotonic timestamp of the last morning-flush ATTEMPT (success or fail),
     # throttling failed-flush retries. In-memory only (resets on restart, which
@@ -722,7 +750,7 @@ def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
                     # against a 2026-04-19 bug I introduced in the initial
                     # first-and-latest implementation.
                     try:
-                        _state = load_state(digest_state_path(), default={})
+                        _state = load_state(digest_state_target, default={})
                     except Exception:
                         logger.exception("Failed to reload digest state before merge")
                     _state["fired_digest_keys"] = fired_digest_keys
@@ -731,7 +759,7 @@ def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
                     # startup already copied it into fired_digest_keys.
                     _state.pop("last_digest_key", None)
                     try:
-                        save_state(digest_state_path(), _state)
+                        save_state(digest_state_target, _state)
                     except Exception:
                         logger.exception("Failed to save digest state")
 
@@ -782,7 +810,7 @@ def _subscriber_poll_loop(heartbeat_path: Optional[Path] = None) -> None:
                     if all_drained:
                         last_flush_date = today_et
                         try:
-                            save_state(whatsapp_flush_state_path(), {"last_flush_date": today_et})
+                            save_state(whatsapp_state_target, {"last_flush_date": today_et})
                         except Exception:
                             logger.exception("Failed to save whatsapp flush state")
 

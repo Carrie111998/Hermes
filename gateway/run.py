@@ -23525,6 +23525,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # HERMES_HOME and touches the auth store — under pytest that lands
         # long after the test that called start_gateway() has torn down.
         _stop_nous_keepalive_quietly()
+        # The planned-stop watcher was started ~70 lines above, but its stop
+        # sits at the very bottom of this function. Same defect, same reason:
+        # it is an unbounded 0.5s poll loop, and every tick calls
+        # planned_stop_marker_targets_self(), which re-resolves the marker
+        # path and unlinks stale/malformed markers.
+        _planned_stop_watcher_stop.set()
         return False
     if runner.should_exit_cleanly:
         if runner.exit_reason:
@@ -23532,6 +23538,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # Same reason as the `not success` path above — this branch returns
         # (or raises SystemExit) without ever reaching wait_for_shutdown().
         _stop_nous_keepalive_quietly()
+        _planned_stop_watcher_stop.set()
         # A clean exit that carries an explicit exit code (e.g. a fatal
         # config error stamped with GATEWAY_FATAL_CONFIG_EXIT_CODE) must
         # propagate that code to the process so the s6 finish script can
@@ -23545,6 +23552,12 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if not runner._running:
         # Startup was intentionally aborted by restart/shutdown before entering
         # running mode; preserve that lifecycle path without starting cron.
+        #
+        # Both returns below skip the stop that sits at the bottom of this
+        # function, and the watcher has been polling since well before
+        # runner.start(). cron_stop does not exist yet on this path, so the
+        # watcher is the only boot thread that can leak here.
+        _planned_stop_watcher_stop.set()
         await runner.wait_for_shutdown()
         if runner.should_exit_with_failure:
             if runner.exit_reason:
@@ -23616,6 +23629,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
+        # This return skips the cron_stop.set() / _planned_stop_watcher_stop.set()
+        # that sit below it, leaking both loops for the life of the process.
+        # Housekeeping is the costly one: its hourly chore calls
+        # cleanup_image_cache(), which resolves get_image_cache_dir() live and
+        # unlinks every file older than 24h — so once HERMES_HOME is restored,
+        # a leaked thread deletes real ~/.hermes/image_cache entries.
+        cron_stop.set()
+        _planned_stop_watcher_stop.set()
         return False
     
     # Stop cron scheduler + housekeeping cleanly.
