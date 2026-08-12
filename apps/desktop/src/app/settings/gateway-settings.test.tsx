@@ -1,24 +1,38 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { atom } from 'nanostores'
-import type { ComponentType } from 'react'
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { ProfileInfo } from '@/types/hermes'
-
-let GatewaySettings: ComponentType
+import { GatewaySettings } from './gateway-settings'
 
 const getConnectionConfig = vi.fn()
 const saveConnectionConfig = vi.fn()
-const profiles = atom<ProfileInfo[]>([])
 
-vi.mock('@/store/profile', () => ({
-  $profiles: profiles,
-  refreshActiveProfile: vi.fn()
-}))
+vi.mock('@/store/profile', async () => {
+  const { atom } = await import('nanostores')
 
-beforeAll(async () => {
-  ;({ GatewaySettings } = await import('./gateway-settings'))
-}, 60_000)
+  return {
+    $profiles: atom([
+      {
+        has_env: false,
+        is_default: true,
+        model: null,
+        name: 'default',
+        path: '/tmp/hermes',
+        provider: null,
+        skill_count: 0
+      },
+      {
+        has_env: false,
+        is_default: false,
+        model: null,
+        name: 'work',
+        path: '/tmp/hermes/profiles/work',
+        provider: null,
+        skill_count: 0
+      }
+    ]),
+    refreshActiveProfile: vi.fn()
+  }
+})
 
 const localConnection = {
   cloudOrg: '',
@@ -32,26 +46,6 @@ const localConnection = {
 }
 
 beforeEach(() => {
-  profiles.set([
-    {
-      has_env: false,
-      is_default: true,
-      model: null,
-      name: 'default',
-      path: '/tmp/hermes',
-      provider: null,
-      skill_count: 0
-    },
-    {
-      has_env: false,
-      is_default: false,
-      model: null,
-      name: 'work',
-      path: '/tmp/hermes/profiles/work',
-      provider: null,
-      skill_count: 0
-    }
-  ])
   getConnectionConfig.mockResolvedValue(localConnection)
   saveConnectionConfig.mockResolvedValue(localConnection)
   Object.defineProperty(window, 'hermesDesktop', {
