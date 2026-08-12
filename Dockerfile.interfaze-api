@@ -104,6 +104,12 @@ RUN apt-get update \
         tini \
     && rm -rf /var/lib/apt/lists/*
 
+# Pin the ENTRYPOINT binary to a path this file owns, and assert it runs. A
+# hardcoded ENTRYPOINT that is missing or non-executable fails at *exec* time,
+# which surfaces as a bare "failed to spawn command: ... No such file or
+# directory" and a restart loop with no application log — cheaper to catch here.
+RUN ln -sf "$(command -v tini)" /usr/local/bin/tini && /usr/local/bin/tini --version
+
 COPY --from=builder /opt/venv /opt/venv
 
 # Bundled skills are NOT shipped inside the wheel (pyproject's
@@ -141,13 +147,20 @@ ENV INTERFAZE_DATABASE_PATH=/data/interfaze/interfaze.db \
 # uid/gid 10001 to avoid colliding with the upstream image's hermes user
 # (10000). Docker seeds a fresh named volume from the image directory it is
 # mounted over, ownership included, so /data stays writable for this user.
+# Other runtimes do NOT: a Fly volume mounts as an empty filesystem (it applies
+# the uid/gid, but creates no directories), so the layout below exists only for
+# the compose path and the CMD recreates it at boot.
 RUN groupadd --gid 10001 interfaze \
     && useradd --uid 10001 --gid 10001 --create-home --shell /bin/bash interfaze \
     && mkdir -p /data/interfaze/uploads /data/workspace \
     && chown -R interfaze:interfaze /data
 
 USER interfaze
-WORKDIR /data/workspace
+# NOT /data/workspace: that path lives under the volume mount point, so on a
+# fresh volume it does not exist at spawn time and the container fails to start
+# with a bare ENOENT — no application log, just a restart loop. The CMD creates
+# the directory and cd's into it once the mount is live.
+WORKDIR /opt/interfaze
 
 EXPOSE 8000
 VOLUME ["/data"]
@@ -157,9 +170,14 @@ VOLUME ["/data"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
     CMD ["/bin/sh", "-c", "curl -fsS \"http://127.0.0.1:${INTERFAZE_PORT:-8000}/health\" || exit 1"]
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
-# Sync bundled skills into $HERMES_HOME/skills (idempotent; user edits under
-# /data are preserved by skills_sync's manifest), then hand PID 1 to uvicorn.
+ENTRYPOINT ["/usr/local/bin/tini", "--"]
+# Recreate the /data layout first: on a mounted volume the image's directories
+# are shadowed, and the agent workspace, upload dir, and SQLite parent must all
+# exist before the app touches them. mkdir -p is a no-op on the compose path
+# where the volume was seeded from the image.
+#
+# Then sync bundled skills into $HERMES_HOME/skills (idempotent; user edits
+# under /data are preserved by skills_sync's manifest) and hand PID 1 to uvicorn.
 # `--host` comes from INTERFAZE_HOST because server/api_cli.py's argparse
 # default is 127.0.0.1, which would be unreachable from outside the container.
-CMD ["sh", "-c", "python -m tools.skills_sync || echo '[interfaze] warning: skills sync failed; continuing'; exec interfaze-api --host \"${INTERFAZE_HOST:-0.0.0.0}\" --port \"${INTERFAZE_PORT:-8000}\""]
+CMD ["sh", "-c", "mkdir -p /data/interfaze/uploads /data/workspace && cd /data/workspace && { python -m tools.skills_sync || echo '[interfaze] warning: skills sync failed; continuing'; }; exec interfaze-api --host \"${INTERFAZE_HOST:-0.0.0.0}\" --port \"${INTERFAZE_PORT:-8000}\""]

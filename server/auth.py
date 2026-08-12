@@ -240,9 +240,16 @@ class AuthService:
             (_token_hash(token), row["id"], now() + 3600, None, now()),
         )
         self.db.activity(None, row["id"], "password_reset_requested", "user", row["id"])
-        # Local auth is a development backend. Returning the token makes its
-        # reset flow usable without pretending an email delivery service exists.
-        return {"accepted": True, "reset_token": token}
+        # This endpoint is unauthenticated, so returning the token hands account
+        # takeover to anyone who knows an email address — and in local auth mode
+        # the admin account reads every tenant's data. There is no system-mail
+        # sender to deliver it through either (the outreach mailboxes belong to
+        # tenants), so in production the token is issued and simply not exposed:
+        # recovery is an operator task, see TODO.md. Dev keeps the shortcut,
+        # gated on the same localhost signal app.py uses to detect a dev deploy.
+        if self.settings.public_base_url.startswith("http://localhost"):
+            return {"accepted": True, "reset_token": token}
+        return {"accepted": True}
 
     def confirm_supabase_password_reset(self, access_token: str, password: str) -> dict:
         try:

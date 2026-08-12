@@ -158,6 +158,24 @@ def test_local_password_reset_flow():
                                                     "password": "new-secure-password"}).status_code == 200
 
 
+def test_production_password_reset_withholds_the_token():
+    """The reset endpoint is unauthenticated, so a returned token is takeover."""
+    root = Path(tempfile.mkdtemp(prefix="interfaze-api-prod-"))
+    settings = Settings(
+        database_path=root / "test.db",
+        upload_dir=root / "uploads",
+        bootstrap_admin_email="admin@example.test",
+        bootstrap_admin_password="correct-horse-battery",
+        credential_key=TEST_CREDENTIAL_KEY,
+        public_base_url="https://agent.example.com",
+    )
+    client = TestClient(create_app(settings, run_executor=StubRunExecutor()))
+    requested = client.post("/api/v1/auth/password-reset/request",
+                            json={"email": settings.bootstrap_admin_email})
+    assert requested.status_code == 202
+    assert "reset_token" not in requested.json(), requested.text
+
+
 def test_message_revision_invalidates_approval():
     _, client, headers, _ = make_client()
     lead, _ = seed_lead_and_contact(client, headers)

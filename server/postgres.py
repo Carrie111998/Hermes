@@ -77,8 +77,23 @@ class PostgresDatabase:
         self.thread = threading.Thread(target=self.loop.run_forever, daemon=True,
                                        name="interfaze-postgres")
         self.thread.start()
-        self.pool = self._run(asyncpg.create_pool(url, min_size=1, max_size=10,
-                                                   command_timeout=30))
+        # The pool must be BUILT on the loop it will be used from, not merely
+        # awaited there. asyncpg binds internal futures to the running loop, so
+        # calling create_pool() on this thread and awaiting the Pool on
+        # self.loop attaches those futures to the wrong loop — the await then
+        # never completes and __init__ dies on the _run timeout, 60s after boot.
+        #
+        # statement_cache_size=0 so the Supabase transaction pooler (port 6543)
+        # works: it multiplexes connections, so asyncpg's cached prepared
+        # statements collide with DuplicatePreparedStatementError.
+        # ponytail: unconditional, not pooler-sniffing — re-parsing each query
+        # is invisible next to a hosted-Postgres round trip.
+        async def _open_pool():
+            return await asyncpg.create_pool(url, min_size=1, max_size=10,
+                                             command_timeout=30,
+                                             statement_cache_size=0)
+
+        self.pool = self._run(_open_pool())
         try:
             self.one("SELECT id FROM companies LIMIT 1")
         except Exception as exc:
@@ -109,8 +124,19 @@ class PostgresDatabase:
                   "004 and 005 enable row-level security."
             )
 
-    def _run(self, coroutine):
-        return asyncio.run_coroutine_threadsafe(coroutine, self.loop).result(timeout=60)
+    def _run(self, awaitable):
+        """Run any awaitable on the background loop and return its result.
+
+        run_coroutine_threadsafe accepts *coroutines only*. asyncpg's
+        create_pool() returns a Pool — awaitable via __await__, but not a
+        coroutine — so passing it straight through raised
+        TypeError("A coroutine object is required") before a single query ran.
+        Wrapping in a coroutine covers both shapes.
+        """
+        async def _await():
+            return await awaitable
+
+        return asyncio.run_coroutine_threadsafe(_await(), self.loop).result(timeout=60)
 
     async def _one(self, sql: str, params):
         async with self.pool.acquire() as conn:

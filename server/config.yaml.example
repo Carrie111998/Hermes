@@ -1,0 +1,51 @@
+# Non-secret runtime configuration for the interfaze-agent Sales Agent API.
+#
+# Copy to $HERMES_HOME/config.yaml — /data/config.yaml in the Fly deployment,
+# ~/.hermes/config.yaml locally. ONE file, TWO consumers:
+#
+#   model:            read by the `hermes` CLI subprocess that runs every agent
+#                     task (lead discovery, research, outreach generation) —
+#                     see server/agent_service.py:186
+#   interfaze_server: read by server/config.py for the API process itself
+#
+# Secrets are NOT here. API keys come from the environment (`fly secrets set`),
+# because this file sits on a volume that gets snapshotted.
+
+model:
+  # Both "default" and "model" work as the key name.
+  default: "minimax/MiniMax-M3"
+  # "auto" would infer from whichever credential happens to be present; naming
+  # the provider makes a missing MINIMAX_API_KEY fail loudly instead of silently
+  # routing through some other configured backend. Requires MINIMAX_API_KEY.
+  #
+  # Leave base_url unset. The profile defaults to
+  # https://api.minimax.io/anthropic (api_mode anthropic_messages), where
+  # thinking is handled natively. Pointing it at api.minimax.io/v1 instead
+  # switches to the OpenAI-compatible route, which needs MiniMax-specific
+  # reasoning_split/thinking flags in extra_body — the provider injects those
+  # automatically, but it is a second code path for no gain here.
+  provider: "minimax"
+
+interfaze_server:
+  # Bootstrap admin + password hashes in the users table. "supabase" instead
+  # delegates login to GoTrue and needs SUPABASE_ANON_KEY.
+  auth_mode: local
+
+  # Dashboard chat. Empty means the agent falls back to its own default, which
+  # is not necessarily the model above — set it explicitly. The provider comes
+  # from the `model:` block above, so chat and agent runs share one backend.
+  chat_model: "minimax/MiniMax-M3"
+  chat_enabled: true
+  chat_toolset: none
+
+  # Only needed for a dashboard served from a different origin. The bundled
+  # server/webui is same-origin, so this is inert until interagent-web ships.
+  cors_origins:
+    - https://agent-rota.fly.dev
+
+  # 8 failed sign-ins per 5 minutes per email (server/auth.py:95).
+  auth_max_attempts: 8
+  auth_window_seconds: 300
+
+  max_upload_bytes: 26214400  # 25 MiB
+  webui_enabled: true
