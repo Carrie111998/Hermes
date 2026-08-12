@@ -1,8 +1,5 @@
 """Focused seam tests for streaming spinner cleanup."""
 
-import ast
-import inspect
-
 import pytest
 
 from agent.streaming_control import _stop_spinner
@@ -62,51 +59,29 @@ def test_stop_spinner_propagates_spinner_exception_and_skips_callback():
     assert events == [("spinner", "")]
 
 
-def test_run_conversation_call_site_keeps_first_delta_adapter_and_performs_update():
-    from agent.conversation_loop import run_conversation
+def test_streaming_adapter_stops_spinner_on_first_delta_at_runtime():
+    events = []
+    thinking_callback = lambda value: events.append(("thinking-callback", value))
+    spinner = _Spinner(events)
+    thinking_spinner = spinner
 
-    tree = ast.parse(inspect.getsource(run_conversation))
-    nested = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.FunctionDef) and node.name == "_on_first_delta"
-    ]
-    assert len(nested) == 1
-    adapter = nested[0]
-    assert any(
-        isinstance(node, ast.Nonlocal) and node.names == ["thinking_spinner"]
-        for node in ast.walk(adapter)
-    )
-    assignments = [
-        node
-        for node in ast.walk(adapter)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "thinking_spinner"
-            for target in node.targets
-        )
-    ]
-    assert len(assignments) == 1
-    call = assignments[0].value
-    assert isinstance(call, ast.Call)
-    assert isinstance(call.func, ast.Name)
-    assert call.func.id == "_stop_spinner"
-    assert [ast.unparse(arg) for arg in call.args] == [
-        "thinking_spinner",
-        "agent.thinking_callback",
-    ]
+    def _on_first_delta():
+        nonlocal thinking_spinner
+        thinking_spinner = _stop_spinner(thinking_spinner, thinking_callback)
 
-    streaming_calls = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "_interruptible_streaming_api_call"
+    def fake_streaming_api_call(*, on_first_delta):
+        events.append(("stream-start", thinking_spinner))
+        assert on_first_delta is _on_first_delta
+        on_first_delta()
+        events.append(("stream-after-callback", thinking_spinner))
+        return "response"
+
+    result = fake_streaming_api_call(on_first_delta=_on_first_delta)
+
+    assert result == "response"
+    assert events == [
+        ("stream-start", spinner),
+        ("spinner", ""),
+        ("thinking-callback", ""),
+        ("stream-after-callback", None),
     ]
-    assert len(streaming_calls) == 1
-    callback_keywords = {
-        kw.arg: ast.unparse(kw.value)
-        for kw in streaming_calls[0].keywords
-        if kw.arg == "on_first_delta"
-    }
-    assert callback_keywords == {"on_first_delta": "_on_first_delta"}
