@@ -953,3 +953,483 @@ def _reap_orphaned_tui_nodes(
             pass
 
     return {"matched": matched, "killed": killed, "failed": failed}
+
+
+# --- Orphaned Desktop-local ``hermes serve`` reaper ---------------------------------
+#
+# Restored after the 317851373 dashboard_procs rewrite dropped these helpers while
+# leaving a live call site in ``hermes_cli/web_server.py`` (desktop boot). The
+# ``_process_ppid`` POSIX-ps helper that previously lived here is intentionally NOT
+# restored: the cross-platform psutil-based ``_process_ppid`` defined above (line
+# 573) is used instead, so the reaper keeps one parent-pid lookup. All other
+# helpers are restored verbatim from the pre-rewrite source to preserve the
+# backend.lock.json safety model that spares SSH remote backends.
+
+
+def _is_desktop_local_serve_cmdline(command: str) -> bool:
+    """True for the Desktop-local serve spawn shape (loopback + ephemeral port).
+
+    Desktop primary/pool backends launch as::
+
+        hermes serve --host 127.0.0.1 --port 0
+        hermes serve --isolated --host 127.0.0.1 --port 0 ...
+
+    Intentional long-lived headless serves (e.g. ``--host <tailscale-ip>
+    --port 9119``) must never match — those are operator-managed remote
+    backends and may legitimately run with ppid 1 under launchd/nohup.
+    """
+    cmd = command.lower()
+    if "serve" not in cmd:
+        return False
+    if "hermes" not in cmd and "hermes_cli" not in cmd:
+        return False
+    # Ephemeral desktop bind: host loopback + port 0 (exact tokens).
+    has_loopback = (
+        "--host 127.0.0.1" in cmd
+        or "--host=127.0.0.1" in cmd
+        or "--host localhost" in cmd
+        or "--host=localhost" in cmd
+    )
+    has_ephemeral = "--port 0" in cmd or "--port=0" in cmd
+    if not (has_loopback and has_ephemeral):
+        return False
+    # Spare anything with a concrete non-zero port flag first (defensive).
+    # (port 0 already required above.)
+    return True
+
+
+def _exclude_pids_from_env() -> set[int]:
+    """PIDs Desktop marks as live backends (HERMES_DESKTOP_CHILD_PID)."""
+    raw = os.environ.get("HERMES_DESKTOP_CHILD_PID", "")
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return out
+
+
+# --- SSH remote-backend lock ownership -------------------------------------
+#
+# ``backend.lock.json`` is the ownership record the Desktop SSH runtime writes
+# on the *remote* host for every ``hermes serve`` backend it spawns over SSH
+# (see apps/desktop/electron/remote-lifecycle.ts). A backend started from
+# another client/machine — e.g. a MacBook driving a ``hermes serve`` on a Mac
+# Mini over SSH — is a *legitimate, lock-owned* backend even though it has no
+# parent on this host (sshd has long since exited, reparenting it to pid 1).
+#
+# The orphan reap must NEVER kill a PID that a valid ``backend.lock.json``
+# claims as its owner. Doing so murdered a real production SSH remote backend
+# on a Mac Mini the first time the local Desktop app rebooted. The lock file is
+# the source of truth for "is this serve legitimately owned by some client",
+# regardless of which machine started it.
+
+# Mirror the schema constants in remote-lifecycle.ts (the writer). Bumping one
+# side without the other makes the lock unreadable on purpose, which is the
+# safe failure mode for reuse — but for the reap we only ever *spare*, so a
+# mismatched-schema record is simply ignored (never used to kill).
+_LOCKFILE_SCHEMA_VERSION = 2
+_PROTOCOL_VERSION = 1
+_REMOTE_LOCK_SUBDIR = "desktop-ssh"
+_HEX32 = set("0123456789abcdef")
+_HEX16 = _HEX32
+
+
+def _hermes_home_dir() -> Path:
+    """Resolved Hermes home (HERMES_HOME override or ~/.hermes)."""
+    override = os.environ.get("HERMES_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".hermes"
+
+
+def _valid_lockfile_payload(parsed: object, ownership_id: str) -> bool:
+    """Validate a parsed ``backend.lock.json`` body, mirroring readLockfile().
+
+    Returns True only when every structural field the SSH runtime writes is
+    present and well-formed. A lock that fails validation is ignored (treated
+    as "no ownership claim"), which never causes a kill — the reap only ever
+    *adds* lock-owned PIDs to its spare-set.
+    """
+    if not isinstance(parsed, dict):
+        return False
+    if parsed.get("schemaVersion") != _LOCKFILE_SCHEMA_VERSION:
+        return False
+    if parsed.get("protocolVersion") != _PROTOCOL_VERSION:
+        return False
+    if parsed.get("ownershipId") != ownership_id:
+        return False
+    spawn_nonce = parsed.get("spawnNonce")
+    if not isinstance(spawn_nonce, str) or len(spawn_nonce) != 16:
+        return False
+    if set(spawn_nonce) - _HEX16:
+        return False
+    token_fp = parsed.get("tokenFingerprint")
+    if not isinstance(token_fp, str) or len(token_fp) != 32 or set(token_fp) - _HEX32:
+        return False
+    pid = parsed.get("pid")
+    if not isinstance(pid, int) or pid <= 0 or pid > 4194304:
+        return False
+    port = parsed.get("port")
+    if not isinstance(port, int) or port < 0 or port > 65535:
+        return False
+    # String fields must be present and bounded (the writer enforces <=1024).
+    for field in ("profile", "hermesPath", "hermesHome", "logPath", "startedAt"):
+        value = parsed.get(field)
+        if not isinstance(value, str) or len(value) > 1024:
+            return False
+    # logPath is written as ``{lock_root}/{ownership_id}/{spawnNonce}.log``. We
+    # only check the suffix so a relocated HERMES_HOME (different leading path)
+    # doesn't falsely reject a legitimate remote-owned backend — a false reject
+    # here would re-introduce the exact kill we're fixing.
+    log_path = parsed["logPath"]
+    if not log_path.endswith(f"/{ownership_id}/{spawn_nonce}.log"):
+        return False
+    return True
+
+
+def _lock_owned_serve_pids(base_dir: Path | None = None) -> set[int]:
+    """PIDs claimed as owners by valid ``backend.lock.json`` records on this host.
+
+    Scans ``{hermes_home}/desktop-ssh/<ownershipId>/backend.lock.json`` (the
+    same directory the Desktop SSH runtime writes to). Any PID a valid lock
+    names is a legitimately-owned backend — including backends another client
+    or machine started over SSH — and must be spared by the orphan reap.
+
+    Best-effort: any read/parse/IO error for a single record is swallowed and
+    that record contributes no PID. Never raises.
+    """
+    import json
+
+    root = base_dir if base_dir is not None else (
+        _hermes_home_dir() / _REMOTE_LOCK_SUBDIR
+    )
+    owned: set[int] = set()
+    if not root.is_dir():
+        return owned
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return owned
+    for entry in entries:
+        try:
+            if not entry.is_dir():
+                continue
+        except OSError:
+            continue
+        ownership_id = entry.name
+        # Mirror validateOwnershipId(): exactly 32 lowercase hex chars.
+        if len(ownership_id) != 32 or set(ownership_id) - _HEX32:
+            continue
+        lock_path = entry / "backend.lock.json"
+        try:
+            if not lock_path.is_file():
+                continue
+            with open(lock_path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        if len(data) > 65536:
+            continue
+        try:
+            parsed = json.loads(data)
+        except (UnicodeDecodeError, ValueError):
+            continue
+        if _valid_lockfile_payload(parsed, ownership_id):
+            try:
+                owned.add(int(parsed["pid"]))
+            except (TypeError, ValueError):
+                continue
+    return owned
+
+
+def _reap_orphaned_desktop_local_serves(
+    *,
+    reason: str = "orphaned desktop-local hermes serve",
+    signal_term=None,
+    signal_kill=None,
+    sleep_fn=None,
+    lock_owned_pids_fn=None,
+) -> dict[str, list]:
+    """Kill leftover Desktop-local ``hermes serve`` backends with no parent.
+
+    When Electron dies uncleanly (crash / SIGKILL / update handoff), local
+    ``serve --host 127.0.0.1 --port 0`` children can be reparented to pid 1 and
+    keep their full MCP trees alive. The next Desktop boot then stacks a fresh
+    backend on top of the corpses until the machine hits EMFILE and the UI
+    loses tabs/sidebar.
+
+    The parent-death watchdog prevents *future* orphans once a backend is
+    running under HERMES_PARENT_PID; this helper clears *already* orphaned
+    corpses at the start of a new Desktop backend.
+
+    Safety:
+    - only the Desktop-local spawn shape (loopback + ``--port 0``)
+    - only processes whose current ppid is 1 (or 0 on some supervisors)
+    - never self / never HERMES_DESKTOP_CHILD_PID entries
+    - never a PID a valid ``backend.lock.json`` claims as its owner — that is
+      a legitimately lock-owned backend, *including SSH remote backends started
+      by another client/machine* which legitimately sit at ppid 1 after sshd
+      exits. Killing those is a production incident, not cleanup.
+    - never fixed-port remote serves (e.g. ``--port 9119``)
+    - best-effort; failures never raise to the caller
+    """
+    import signal as _signal
+    import time as _time
+
+    if signal_term is None:
+        signal_term = _signal.SIGTERM
+    if signal_kill is None:
+        signal_kill = getattr(_signal, "SIGKILL", _signal.SIGTERM)
+    if sleep_fn is None:
+        sleep_fn = _time.sleep
+    if lock_owned_pids_fn is None:
+        lock_owned_pids_fn = _lock_owned_serve_pids
+
+    if sys.platform == "win32":
+        # Windows desktop uses taskkill tree teardown; orphan scan here is POSIX.
+        return {"matched": [], "killed": [], "failed": []}
+
+    exclude = _exclude_pids_from_env()
+    exclude.add(os.getpid())
+    # Also spare our direct parent (the desktop / sshd wrapper).
+    try:
+        exclude.add(os.getppid())
+    except Exception:
+        pass
+    # Spare every PID a valid backend.lock.json owns — SSH remote backends
+    # started by other clients/machines are legitimate, lock-owned owners even
+    # though they are orphaned (ppid 1) on this host. (#78872 regression)
+    try:
+        exclude |= set(lock_owned_pids_fn())
+    except Exception:
+        # Best-effort: never let lock scanning block or widen the reap.
+        pass
+
+    try:
+        scanned = _scan_dashboard_processes(exclude_pids=exclude)
+    except Exception:
+        return {"matched": [], "killed": [], "failed": []}
+
+    # Re-read lock ownership defensively: the scan above already filtered
+    # exclude PIDs, but a lock file may have been written between the scan and
+    # now. Defense in depth — never kill a freshly-claimed owner.
+    try:
+        owned_now = set(lock_owned_pids_fn())
+    except Exception:
+        owned_now = set()
+
+    targets: list[tuple[int, str]] = []
+    for pid, cmd in scanned:
+        if not _is_desktop_local_serve_cmdline(cmd):
+            continue
+        if pid in owned_now:
+            continue
+        ppid = _process_ppid(pid)
+        if ppid is None:
+            continue
+        # Orphaned under init/launchd.
+        if ppid not in (0, 1):
+            continue
+        targets.append((pid, cmd))
+
+    if not targets:
+        return {"matched": [], "killed": [], "failed": []}
+
+    matched = [pid for pid, _ in targets]
+    killed: list[int] = []
+    failed: list[int] = []
+
+    for pid, _cmd in targets:
+        try:
+            os.kill(pid, signal_term)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            failed.append(pid)
+            continue
+        except OSError:
+            failed.append(pid)
+            continue
+
+    # Brief grace, then SIGKILL survivors.
+    sleep_fn(1.5)
+    # psutil.pid_exists for the liveness probe: os.kill(pid, 0) is a
+    # Windows footgun (sends CTRL_C_EVENT, bpo-14484). This path is
+    # POSIX-only (win32 early-returns above), but the linter blocks the
+    # pattern everywhere and psutil is a core dependency anyway.
+    import psutil
+
+    for pid, _cmd in targets:
+        if pid in failed:
+            continue
+        if not psutil.pid_exists(pid):
+            killed.append(pid)
+            continue
+        try:
+            os.kill(pid, signal_kill)
+            killed.append(pid)
+        except ProcessLookupError:
+            killed.append(pid)
+        except OSError:
+            failed.append(pid)
+
+    if matched:
+        try:
+            print(
+                f"⟲ Reaped {len(killed)} orphaned desktop-local serve "
+                f"backend(s) ({reason}): {killed or matched}"
+            )
+        except Exception:
+            pass
+
+    return {"matched": matched, "killed": killed, "failed": failed}
+
+
+def _scan_windows_gateway_processes(
+    *,
+    exclude_pids: set[int] | None = None,
+) -> list[tuple[int, str]]:
+    """Return orphaned ``python.exe`` gateway processes on Windows.
+
+    Scans for ``python.exe`` processes whose command line contains
+    ``hermes_cli.main gateway run --replace`` and whose parent process is
+    dead. Returns ``(pid, cmdline)`` tuples. Excludes any PIDs in
+    ``exclude_pids``. Returns an empty list on any scan error.
+    """
+    if sys.platform != "win32":
+        return []
+    exclude_pids = exclude_pids or set()
+    try:
+        import psutil  # type: ignore
+
+        matches: list[tuple[int, str]] = []
+        for proc in psutil.process_iter(["pid", "name", "cmdline", "ppid"]):
+            try:
+                info = proc.info
+                pid = info.get("pid")
+                if not pid or pid in exclude_pids:
+                    continue
+                name = (info.get("name") or "").lower()
+                if name not in ("python.exe", "pythonw.exe"):
+                    continue
+                cmdline = " ".join(info.get("cmdline") or [])
+                if "hermes_cli.main gateway run --replace" not in cmdline:
+                    continue
+                ppid = info.get("ppid")
+                if ppid is None or ppid <= 1:
+                    continue
+                if _is_alive_parent(ppid):
+                    continue
+                matches.append((int(pid), cmdline))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+            except Exception:
+                continue
+        return matches
+    except Exception:
+        return []
+
+
+def _reap_orphaned_windows_gateway_processes(
+    *,
+    reason: str = "orphaned windows gateway python",
+) -> dict[str, list]:
+    """Kill orphaned ``python.exe`` gateway backends on Windows.
+
+    When a ``hermes gateway run --replace`` parent exits uncleanly, the
+    child ``python.exe`` can survive with a dead parent PID. These orphans
+    keep gateway state, port bindings, and MCP trees alive, causing
+    silent frontend/backend mismatches on the next launch (similar to the
+    desktop-local serve reaper, but for the gateway/python spawn shape on
+    Windows, which the POSIX-only ``_reap_orphaned_desktop_local_serves``
+    does not cover).
+
+    Safety:
+    - only processes whose cmdline matches ``hermes_cli.main gateway run --replace``
+    - only processes whose current ppid is dead (not merely reparented to
+      a live supervisor)
+    - never self / never ``HERMES_DESKTOP_CHILD_PID`` entries
+    - never a PID a valid ``backend.lock.json`` claims as its owner
+    - uses ``taskkill /T /F /PID`` tree-kill, same as the rest of the
+      Windows codebase
+    - best-effort; failures never raise to the caller
+    """
+    if sys.platform != "win32":
+        return {"matched": [], "killed": [], "failed": []}
+
+    exclude = _exclude_pids_from_env()
+    exclude.add(os.getpid())
+    try:
+        exclude.add(os.getppid())
+    except Exception:
+        pass
+    try:
+        exclude |= set(_lock_owned_serve_pids())
+    except Exception:
+        pass
+
+    try:
+        scanned = _scan_windows_gateway_processes(exclude_pids=exclude)
+    except Exception:
+        return {"matched": [], "killed": [], "failed": []}
+
+    targets: list[tuple[int, str]] = []
+    try:
+        owned_now = set(_lock_owned_serve_pids())
+    except Exception:
+        owned_now = set()
+    for pid, cmd in scanned:
+        if pid in owned_now:
+            continue
+        ppid = _process_ppid(pid)
+        if ppid is None:
+            continue
+        if _is_alive_parent(ppid):
+            continue
+        targets.append((pid, cmd))
+
+    if not targets:
+        return {"matched": [], "killed": [], "failed": []}
+
+    matched = [pid for pid, _ in targets]
+    killed: list[int] = []
+    failed: list[int] = []
+
+    from hermes_cli._subprocess_compat import windows_hide_flags
+
+    for pid, _cmd in targets:
+        try:
+            result = subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                creationflags=windows_hide_flags(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if result.returncode == 0:
+                killed.append(pid)
+            else:
+                failed.append(pid)
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            failed.append(pid)
+
+    if matched:
+        try:
+            print(
+                f"⟲ Reaped {len(killed)} orphaned windows gateway "
+                f"process(es) ({reason}): {killed or matched}"
+            )
+        except Exception:
+            pass
+
+    return {"matched": matched, "killed": killed, "failed": failed}

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import time
 import uuid
 from dataclasses import dataclass
@@ -19,6 +20,27 @@ from typing import Any, Optional
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _get_terminal_surface_id() -> str:
+    """Return a best-effort identifier for the current terminal surface.
+
+    Used to prevent multiple Hermes CLI/TUI instances from sharing one TTY,
+    which causes stacked prompt_toolkit status frames on Windows.
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            title_buf = ctypes.create_unicode_buffer(1024)
+            length = ctypes.windll.kernel32.GetConsoleTitleW(title_buf, 1024)
+            if length:
+                return f"win32-console:{title_buf.value}"
+            return f"win32-pid:{os.getpid()}"
+        fd = sys.stdout.fileno()
+        return f"tty:{os.ttyname(fd)}"
+    except Exception:
+        return f"pid:{os.getpid()}"
 
 
 def coerce_max_concurrent_sessions(value: Any, key: str = "max_concurrent_sessions") -> Optional[int]:
@@ -278,23 +300,19 @@ def try_acquire_active_session(
     """Acquire an active-session slot.
 
     Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
-    a no-op object so callers can unconditionally call ``release()``.
+    a lightweight no-op that still records the surface in the registry so that
+    concurrent CLI/TUI instances on the same terminal surface can be detected
+    and refused (prevents stacked prompt_toolkit status frames).
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
-        return ActiveSessionLease(
-            lease_id=lease_id,
-            session_id=session_id,
-            surface=surface,
-            enabled=False,
-        ), None
-
+    terminal_surface = _get_terminal_surface_id()
     now = time.time()
     entry = {
         "lease_id": lease_id,
         "session_id": str(session_id),
         "surface": str(surface),
+        "terminal_surface": terminal_surface,
         "pid": os.getpid(),
         "process_start_time": _process_start_time(os.getpid()),
         "started_at": now,
@@ -312,17 +330,33 @@ def try_acquire_active_session(
         pruned = len(raw_entries) - len(entries)
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
-        active_count = len(entries)
-        if active_count >= max_sessions:
+
+        same_surface_holder = next(
+            (
+                e
+                for e in entries
+                if e.get("terminal_surface") == terminal_surface
+                and e.get("pid") != os.getpid()
+            ),
+            None,
+        )
+        if same_surface_holder:
+            _write_entries(state_path, entries)
+            return None, (
+                "Another Hermes session is already using this terminal surface. "
+                "Close the other session first, or switch to a different terminal."
+            )
+
+        if max_sessions is not None and len(entries) >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",
-                active_count,
+                len(entries),
                 max_sessions,
                 surface,
             )
             return None, active_session_limit_message(
-                active_count, max_sessions, entries
+                len(entries), max_sessions, entries
             )
         entries.append(entry)
         _write_entries(state_path, entries)
@@ -331,6 +365,7 @@ def try_acquire_active_session(
         lease_id=lease_id,
         session_id=str(session_id),
         surface=str(surface),
+        enabled=max_sessions is not None,
     ), None
 
 
