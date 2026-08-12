@@ -359,22 +359,28 @@ def _audit_npm_target(
             else:
                 vuln_detail = (
                     f"{critical} critical, {high} high, {moderate} moderate — "
-                    "build-tool advisory; clears via lockfile bump"
+                    "clears via a lockfile/package bump"
                 )
             check_warn(
                 f"{label} deps",
                 f"({vuln_detail})"
             )
             if audit_extra and audit_extra[0] == "--workspace":
-                # The web/ui-tui workspace advisories are in build-time
-                # tooling (esbuild/vite, etc.), not runtime code that ships
-                # to users. Manual npm remediation may error with a known
-                # arborist crash (edgesOut / isDescendantOf) on this monorepo
-                # tree — in that case it is an npm bug, not a Hermes one.
+                # Do NOT claim these are build-time-only. The 2026-08-11 triage
+                # of this exact output found genuine runtime advisories mixed in
+                # with the build tooling: react-router-dom (GHSA-qwww-vcr4-c8h2,
+                # ships to the browser) in `web`, and a direct `undici` dep in
+                # `ui-tui`. Blanket-labelling the block "build-time" is how they
+                # went untriaged. Point at `npm audit --json --workspace <name>`
+                # so the reader classifies each advisory instead of dismissing
+                # the set. Manual npm remediation may error with a known arborist
+                # crash (edgesOut / isDescendantOf) on this monorepo tree — that
+                # is an npm bug, not a Hermes one.
                 check_info(
-                    "  ^ build-time tooling (not runtime); if manual npm remediation "
-                    "errors with an arborist crash it's a known npm bug — clears "
-                    "via a lockfile bump"
+                    "  ^ mixed build-time and runtime advisories — triage each with "
+                    f"`npm audit --json --workspace {audit_extra[1]}`; remediate by "
+                    "bumping the dep/override and re-resolving the lockfile "
+                    "(an arborist crash from manual npm remediation is a known npm bug)"
                 )
             issues.append(
                 f"{label} has {total} npm "
