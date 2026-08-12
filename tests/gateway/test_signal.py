@@ -1188,7 +1188,9 @@ class TestSignalAutomaticQuoteRouting:
         event = captured_event["event"]
         anchor = _reply_anchor_for_event(event)
         metadata = _thread_metadata_for_source(event.source, anchor)
-        assert event.message_id == "1712345678000"
+        # The edit is a distinct transport event for dedupe/persistence, while
+        # native replies and reactions still address the replaced message.
+        assert event.message_id == "1712345680000"
         assert event.raw_message["timestamp_ms"] == 1712345678000
         assert int(event.timestamp.timestamp() * 1000) == 1712345680000
 
@@ -1208,6 +1210,40 @@ class TestSignalAutomaticQuoteRouting:
         assert captured_rpc[0]["params"]["quoteAuthor"] == (
             "68680952-6d86-45bc-85e0-1a4d186d53ee"
         )
+
+    @pytest.mark.asyncio
+    async def test_debounce_keeps_latest_signal_native_reply_anchor(self, monkeypatch):
+        from gateway.platforms.base import MessageEvent, _reply_anchor_for_event
+        from gateway.session import SessionSource
+
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._busy_text_debounce_seconds = 60.0
+        source = SessionSource(
+            platform=Platform.SIGNAL,
+            chat_id="+15551230000",
+            chat_type="dm",
+            user_id="+15551230000",
+        )
+        first = MessageEvent(
+            text="first edit",
+            source=source,
+            message_id="1712345680000",
+            raw_message={"timestamp_ms": 1712345678000},
+        )
+        second = MessageEvent(
+            text="second edit",
+            source=source,
+            message_id="1712345690000",
+            raw_message={"timestamp_ms": 1712345679000},
+        )
+
+        await adapter._queue_text_debounce("signal:dm", first)
+        await adapter._queue_text_debounce("signal:dm", second)
+
+        merged = adapter._text_debounce["signal:dm"].event
+        assert merged.message_id == "1712345690000"
+        assert _reply_anchor_for_event(merged) == "1712345679000"
+        await adapter._flush_text_debounce_now("signal:dm")
 
 
 class TestSignalQuoteExtraction:

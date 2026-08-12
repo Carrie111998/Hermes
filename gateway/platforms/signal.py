@@ -808,7 +808,7 @@ class SignalAdapter(BasePlatformAdapter):
         target_ts_ms = _parse_signal_timestamp(
             edit_message.get("targetSentTimestamp")
         )
-        message_ts_ms = target_ts_ms or event_ts_ms
+        native_anchor_ts_ms = target_ts_ms or event_ts_ms
         if event_ts_ms:
             try:
                 timestamp = datetime.fromtimestamp(
@@ -829,10 +829,13 @@ class SignalAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             timestamp=timestamp,
-            message_id=str(message_ts_ms) if message_ts_ms else None,
+            # The fresh data-message timestamp identifies this inbound event
+            # for dedupe and durable delivery.  Edits keep their original
+            # target separately as the Signal-native quote/reaction anchor.
+            message_id=str(event_ts_ms) if event_ts_ms else None,
             raw_message={
                 "sender": sender,
-                "timestamp_ms": message_ts_ms,
+                "timestamp_ms": native_anchor_ts_ms,
                 "quote": quote_data if quote_data else None,
             },
             reply_to_message_id=reply_to_id,

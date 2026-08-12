@@ -175,6 +175,25 @@ def _reply_anchor_for_event(event) -> str | None:
     platform = _platform_name(getattr(source, "platform", None))
     thread_id = getattr(source, "thread_id", None)
     raw_message = getattr(event, "raw_message", None)
+    if platform == "signal" and isinstance(raw_message, dict):
+        # Signal edits have a fresh transport timestamp (the event identity)
+        # but replace the message identified by targetSentTimestamp.  The
+        # adapter retains that stable native anchor in raw_message so replies
+        # and reactions address the displayed message without collapsing
+        # distinct edit events onto one dedupe/message id.
+        signal_anchor = raw_message.get("timestamp_ms")
+        if (
+            isinstance(signal_anchor, int)
+            and not isinstance(signal_anchor, bool)
+            and signal_anchor > 0
+        ):
+            return str(signal_anchor)
+        if (
+            isinstance(signal_anchor, str)
+            and signal_anchor.isdigit()
+            and int(signal_anchor) > 0
+        ):
+            return str(int(signal_anchor))
     if (
         platform == "slack"
         and isinstance(raw_message, dict)
@@ -5649,6 +5668,14 @@ class BasePlatformAdapter(ABC):
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
                 state.event.message_id = str(latest_message_id)
+            event_source = getattr(event, "source", None)
+            if (
+                _platform_name(getattr(event_source, "platform", None)) == "signal"
+                and isinstance(getattr(event, "raw_message", None), dict)
+            ):
+                # Keep the Signal-native quote/reaction anchor aligned with
+                # the latest event when a rapid text burst is debounced.
+                state.event.raw_message = event.raw_message
             if latest_anchor is not None and hasattr(state.event, "reply_to_message_id"):
                 state.event.reply_to_message_id = str(latest_anchor)
             state.last_ts = now
