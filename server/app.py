@@ -27,7 +27,7 @@ from .agent_service import AgentRunService, StubRunExecutor
 from .chat_bridge import ChatBridge
 from .scheduler import DailyDigestScheduler
 from .lead_research import LeadResearchService
-from .routes import admin, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, oauth, research_campaigns, sales_intelligence, unsubscribe
+from .routes import admin, admin_documents, agent_runs, auth, chat, company, integrations, knowledge, onboarding, operations, outreach, oauth, research_campaigns, sales_intelligence, unsubscribe
 
 
 def create_app(settings: Settings | None = None, db: Database | None = None,
@@ -128,6 +128,7 @@ def create_app(settings: Settings | None = None, db: Database | None = None,
     api_prefix = "/api/v1"
     app.include_router(auth.router, prefix=api_prefix)
     app.include_router(admin.router, prefix=api_prefix)
+    app.include_router(admin_documents.router, prefix=api_prefix)
     app.include_router(company.router, prefix=api_prefix)
     app.include_router(onboarding.router, prefix=api_prefix)
     app.include_router(agent_runs.router, prefix=api_prefix)
