@@ -4442,6 +4442,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 "prompt_tokens": usage.get("input_tokens", 0),
                 "completion_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                # Context-window fields (populated by _run_agent in
+                # gateway/run.py) so WebUI/Hermex context-ring indicator
+                # gets the data via /v1/chat/completions responses.
+                "last_prompt_tokens": usage.get("last_prompt_tokens", 0),
+                "context_length": usage.get("context_length", 0),
+                "threshold_tokens": usage.get("threshold_tokens", 0),
             },
         }
         if is_partial or is_failed or not completed:
@@ -4803,6 +4809,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "input_tokens": usage.get("input_tokens", 0),
                 "output_tokens": usage.get("output_tokens", 0),
                 "total_tokens": usage.get("total_tokens", 0),
+                "last_prompt_tokens": usage.get("last_prompt_tokens", 0),
+                "context_length": usage.get("context_length", 0),
+                "threshold_tokens": usage.get("threshold_tokens", 0),
             }
             incomplete_history = list(conversation_history)
             incomplete_history.append({"role": "user", "content": user_message})
@@ -5145,6 +5154,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
+                    "last_prompt_tokens": usage.get("last_prompt_tokens", 0),
+                    "context_length": usage.get("context_length", 0),
+                    "threshold_tokens": usage.get("threshold_tokens", 0),
                 }
                 _failed_history = list(conversation_history)
                 _failed_history.append({"role": "user", "content": user_message})
@@ -5249,6 +5261,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     "input_tokens": usage.get("input_tokens", 0),
                     "output_tokens": usage.get("output_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
+                    "last_prompt_tokens": usage.get("last_prompt_tokens", 0),
+                    "context_length": usage.get("context_length", 0),
+                    "threshold_tokens": usage.get("threshold_tokens", 0),
                 }
                 await _write_event("response.failed", {
                     "type": "response.failed",
