@@ -1311,6 +1311,28 @@ class TestOutboundThreadRouting:
         )
         assert result == "spaces/X/threads/CACHED"
 
+    def test_resolve_falls_back_to_cached_thread_for_normal_conversation(self, adapter):
+        """A normal (non-cron) conversation with empty metadata still uses
+        the last-inbound-thread fallback, exactly like the DM path."""
+        adapter._last_inbound_thread["spaces/X"] = "spaces/X/threads/CACHED"
+        result = adapter._resolve_thread_id(
+            reply_to=None,
+            metadata={},
+            chat_id="spaces/X",
+        )
+        assert result == "spaces/X/threads/CACHED"
+
+    def test_resolve_skips_cached_thread_for_cron_delivery(self, adapter):
+        """Cron deliveries carry job_id in route_metadata and must land at
+        top-level, not as a reply inside the last active thread."""
+        adapter._last_inbound_thread["spaces/X"] = "spaces/X/threads/CACHED"
+        result = adapter._resolve_thread_id(
+            reply_to=None,
+            metadata={"job_id": "job-123"},
+            chat_id="spaces/X",
+        )
+        assert result is None
+
 
 # ===========================================================================
 # Send file delegation (voice/video/animation route through send_document)

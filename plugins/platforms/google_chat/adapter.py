@@ -2501,7 +2501,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
              intentionally drops thread_id from the source so the session
              key stays stable. Without this fallback, DM replies would
              land at top-level (a fresh thread separate from the user's),
-             visually disconnected from the user's question.
+             visually disconnected from the user's question. Skipped for
+             cron deliveries (route_metadata carries ``job_id``): those
+             must land at top-level, not in the last active thread.
         """
         if metadata:
             for key in ("thread_id", "thread_name", "thread_ts"):
@@ -2511,6 +2513,10 @@ class GoogleChatAdapter(BasePlatformAdapter):
         if reply_to and "/threads/" in reply_to and "/messages/" not in reply_to:
             return reply_to
         if chat_id:
+            # Cron deliveries carry job_id in route_metadata; they must land
+            # at top-level, not in the last active thread.
+            if metadata and metadata.get("job_id"):
+                return None
             cached = self._last_inbound_thread.get(chat_id)
             if cached:
                 return cached
