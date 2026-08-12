@@ -381,6 +381,19 @@ def _web_toolchain_roots(web_dir: Path) -> tuple[Path, ...]:
     """
     return (web_dir, web_dir.parent)
 
+def _webui_build_skipped_via_install_marker() -> bool:
+    """True when install.sh was run with --skip-build (persistent opt-out).
+
+    ``install.sh --skip-build`` writes ``$HERMES_HOME/.skip-webui-build`` so the
+    web dashboard SPA is never built at first launch. ``hermes update`` should
+    honor the same opt-out: if the marker is present, skip the web UI build
+    here too (mirrors the launch-time skip in ``_build_web_ui``).
+    """
+    try:
+        return (get_hermes_home() / ".skip-webui-build").exists()
+    except Exception:
+        return False
+
 def _print_curator_first_run_notice() -> None:
     """Print a short heads-up about the skill curator after `hermes update`.
 
@@ -1010,7 +1023,12 @@ def _update_via_zip(args):
         _m().sys.exit(1)
 
     node_failures = _update_node_dependencies()
-    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+    if getattr(args, "skip_build", False):
+        print("→ Skipping web UI build (--skip-build); using existing dist")
+    elif _webui_build_skipped_via_install_marker():
+        print("→ Skipping web UI build (install was run with --skip-build); using existing dist")
+    else:
+        _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
     # Sync skills
     try:
@@ -4489,7 +4507,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("    https://hermes-agent.nousresearch.com")
 
         node_failures = _update_node_dependencies()
-        _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+        if getattr(args, "skip_build", False):
+            print("→ Skipping web UI build (--skip-build); using existing dist")
+        elif _webui_build_skipped_via_install_marker():
+            print("→ Skipping web UI build (install was run with --skip-build); using existing dist")
+        else:
+            _m()._build_web_ui(_m().PROJECT_ROOT / "web")
 
         # Rebuild the desktop app if the source tree changed since the last
         # build.  ``hermes desktop --build-only`` uses the content-hash stamp

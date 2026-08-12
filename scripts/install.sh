@@ -81,6 +81,7 @@ STAGE_NAME=""
 JSON_OUTPUT=false
 NON_INTERACTIVE=false
 INCLUDE_DESKTOP=false
+SKIP_WEBUI_BUILD=false
 
 # Detect non-interactive mode (e.g. curl | bash)
 # When stdin is not a terminal, read -p will fail with EOF,
@@ -142,6 +143,10 @@ while [[ $# -gt 0 ]]; do
             INCLUDE_DESKTOP=true
             shift
             ;;
+        --skip-build|-SkipBuild)
+            SKIP_WEBUI_BUILD=true
+            shift
+            ;;
         --dir)
             INSTALL_DIR="$2"
             INSTALL_DIR_EXPLICIT=true
@@ -177,6 +182,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --json         Print a JSON result frame for --stage"
             echo "  --non-interactive  Skip stages that require user input"
             echo "  --include-desktop  Also build the desktop app (apps/desktop -> Hermes.app)"
+            echo "  --skip-build   Skip the web dashboard UI build at first launch"
+            echo "                   (writes \$HERMES_HOME/.skip-webui-build; 'hermes serve'/"
+            echo "                   'hermes dashboard' will not run 'npm run build' and will"
+            echo "                   serve a 404 / require a manual build if no dist exists)"
             echo "  --dir PATH     Installation directory"
             echo "                   default (non-root):  ~/.hermes/hermes-agent"
             echo "                   default (root, Linux): /usr/local/lib/hermes-agent"
@@ -3300,6 +3309,17 @@ run_stage_body() {
             resolve_install_layout
             print_success
             write_bootstrap_marker
+            # --skip-build: leave a persistent opt-out marker so the web UI is
+            # NOT built at first launch (hermes serve/dashboard/gui would
+            # otherwise run `npm run build`). The install itself never builds
+            # the web SPA — it's built lazily on first launch — so this marker
+            # is what actually defers/skips that build. Same idea as the
+            # pre-existing `hermes update --skip-build` / `hermes serve
+            # --skip-build` flags, but set at install time and sticky per HOME.
+            if [ "$SKIP_WEBUI_BUILD" = true ]; then
+                touch "$HERMES_HOME/.skip-webui-build"
+                log_info "Wrote $HERMES_HOME/.skip-webui-build (web UI build skipped at first launch)"
+            fi
             # Code-scoped stamp: write next to the install tree, not into
             # $HERMES_HOME. $HERMES_HOME is a shared data dir (it can be
             # bind-mounted into a Docker gateway too), so a stamp there gets

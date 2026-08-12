@@ -5680,6 +5680,14 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
     """
     if not (web_dir / "package.json").exists():
         return True
+    # --skip-build left at install time (or by hand): never build the web UI
+    # on launch. The install script writes $HERMES_HOME/.skip-webui-build to
+    # carry the opt-out forward; honor it here so `hermes serve` / `hermes
+    # dashboard` / `hermes gui` start without running `npm run build`.
+    from hermes_constants import get_hermes_home
+
+    if (get_hermes_home() / ".skip-webui-build").exists():
+        return True
     try:
         import fcntl
     except ImportError:
