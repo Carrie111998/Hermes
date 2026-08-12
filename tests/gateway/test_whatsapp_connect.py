@@ -13,6 +13,7 @@ Regression tests for two bugs in WhatsAppAdapter.connect():
 """
 
 import asyncio
+import contextlib
 import signal
 from pathlib import Path
 from types import SimpleNamespace
@@ -84,17 +85,47 @@ def _mock_aiohttp(status=200, json_data=None, json_side_effect=None):
     return MagicMock(return_value=_AsyncCM(mock_session))
 
 
+class _AllPatches:
+    """Enter every patch needed to reach the health-check loop, as one CM.
+
+    This used to return a plain list that each call site spelled out by index
+    (``patches[0], patches[1], ... patches[7]``). That shape fails silently in
+    the one direction that matters: add a patch to the list and every call site
+    still applies only the indices it already named, so the new patch never
+    takes effect and the test reaches real subprocesses instead. That is
+    precisely what happened when the npm install moved from ``subprocess.run``
+    to ``run_text_capture`` — five tests in this file went red because a real
+    ``npm install`` ran, failed, and returned from ``connect()`` long before
+    the assertions' code path. A single context manager cannot under-apply.
+    """
+
+    def __init__(self, patchers):
+        self._patchers = patchers
+
+    def __enter__(self):
+        self._stack = contextlib.ExitStack()
+        for patcher in self._patchers:
+            self._stack.enter_context(patcher)
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._stack.__exit__(*exc_info)
+
+
 def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
-    """Return a dict of common patches needed to reach the health-check loop."""
-    patches = {
-        "plugins.platforms.whatsapp.adapter.check_whatsapp_requirements": True,
-        "plugins.platforms.whatsapp.adapter.asyncio.create_task": MagicMock(),
-    }
+    """Common patches needed to reach the health-check loop, as one CM."""
     base = [
         patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
         patch.object(Path, "exists", return_value=True),
         patch.object(Path, "mkdir", return_value=None),
         patch("subprocess.run", return_value=MagicMock(returncode=0)),
+        # The dependency install goes through run_text_capture, not
+        # subprocess.run -- npm.cmd spawns a node grandchild that inherits the
+        # capture pipes, so the stdlib timeout cannot bound it. Patch the seam
+        # the adapter actually calls; patching subprocess.run alone lets a real
+        # npm install run against the tmp_path bridge dir.
+        patch("hermes_cli._subprocess_compat.run_text_capture",
+              return_value=MagicMock(returncode=0, stdout="", stderr="")),
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
         patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock),
@@ -102,7 +133,7 @@ def _connect_patches(mock_proc, mock_fh, mock_client_cls=None):
     ]
     if mock_client_cls is not None:
         base.append(patch("aiohttp.ClientSession", mock_client_cls))
-    return base
+    return _AllPatches(base)
 
 
 # ---------------------------------------------------------------------------
@@ -174,8 +205,7 @@ class TestDataInitialized:
 
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8], \
+        with patches, \
              patch.object(type(adapter), "_poll_messages", return_value=MagicMock()):
             # Must NOT raise NameError
             result = await adapter.connect()
@@ -204,8 +234,7 @@ class TestFileHandleClosedOnError:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7]:
+        with patches:
             result = await adapter.connect()
 
         assert result is False
@@ -223,11 +252,11 @@ class TestConnectCleanup:
         def _path_exists(path_obj):
             return not str(path_obj).endswith("node_modules")
 
-        install_result = MagicMock(returncode=1, stderr="install failed")
+        install_result = MagicMock(returncode=1, stdout="", stderr="install failed")
 
         with patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True), \
              patch.object(Path, "exists", autospec=True, side_effect=_path_exists), \
-             patch("subprocess.run", return_value=install_result), \
+             patch("hermes_cli._subprocess_compat.run_text_capture", return_value=install_result), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("gateway.status.release_scoped_lock") as mock_release:
             result = await adapter.connect()
@@ -403,8 +432,7 @@ class TestBridgeRuntimeFailure:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8]:
+        with patches:
             result = await adapter.connect()
 
         assert result is False
@@ -434,8 +462,7 @@ class TestBridgeRuntimeFailure:
         mock_fh = MagicMock()
         patches = _connect_patches(mock_proc, mock_fh, mock_client_cls)
 
-        with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7], patches[8]:
+        with patches:
             result = await adapter.connect()
 
         assert result is False
@@ -453,6 +480,8 @@ class TestBridgeRuntimeFailure:
              patch.object(Path, "exists", return_value=True), \
              patch.object(Path, "mkdir", return_value=None), \
              patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+             patch("hermes_cli._subprocess_compat.run_text_capture",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")), \
              patch("subprocess.Popen", side_effect=OSError("spawn failed")), \
              patch("builtins.open", return_value=mock_fh):
             result = await adapter.connect()
@@ -527,81 +556,158 @@ class TestWaitForPortRelease:
 # _kill_port_process() cross-platform tests
 # ---------------------------------------------------------------------------
 
-class TestKillPortProcess:
-    """Verify _kill_port_process uses platform-appropriate commands.
+def _sconn(port, pid, status):
+    """A stand-in for one psutil connection row."""
+    return SimpleNamespace(
+        status=status, laddr=SimpleNamespace(port=port), pid=pid,
+    )
 
-    Windows PID lookup no longer parses ``netstat -ano``: that command was
-    measured at 5.3-36.3s on a dev box against the 5s subprocess cap that used
-    to guard it, and the resulting TimeoutExpired was swallowed — so the whole
-    cleanup was a silent no-op on Windows. Both platforms now resolve the
-    target through ``_listener_pids_on_port`` (psutil first), which is also why
-    these tests stub that helper rather than a command's stdout. The
-    behavioural contract is unchanged and is what they still pin: kill the PID
-    LISTENING on the requested port, and nothing else.
+
+class TestKillPortProcess:
+    """Verify _kill_port_process resolves listeners the way the adapter does.
+
+    Discovery is psutil-first on every platform, with netstat kept only as a
+    Windows fallback; netstat spawns a process, which was measured at 8.2s,
+    9.6s and 21.3s on an idle box here, so it cannot be the primary path.
+
+    Every test below patches psutil explicitly. An earlier version of this
+    class patched only ``adapter.subprocess.run`` and let the real
+    ``psutil.net_connections`` run, which on a developer box means the tests
+    read the HOST's live TCP table -- and :3000 is the port the real WhatsApp
+    bridge listens on. ``test_does_not_kill_wrong_port`` then found a genuine
+    listener and "failed" by observing a taskkill it had itself provoked. Only
+    the mock on ``subprocess.run`` stopped that from being a real kill.
     """
 
-    def test_taskkills_listener_pid_on_windows(self):
+    def test_psutil_is_the_primary_discovery_path(self):
+        """A LISTEN row for the port is killed without ever shelling out."""
         from plugins.platforms.whatsapp.adapter import _kill_port_process
+        import psutil
+
+        conns = [
+            _sconn(3000, 12345, psutil.CONN_LISTEN),
+            _sconn(3001, 99999, psutil.CONN_LISTEN),
+        ]
 
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
-             patch(
-                 "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
-                 return_value=[12345],
-             ) as mock_lookup, \
+             patch("psutil.net_connections", return_value=conns), \
              patch("plugins.platforms.whatsapp.adapter.subprocess.run") as mock_run:
             _kill_port_process(3000)
 
-        # The port actually asked about is the one we resolved.
-        assert mock_lookup.call_args.args[0] == 3000
-        # taskkill called with the resolved PID.
+        assert any(
+            call.args[0] == ["taskkill", "/PID", "12345", "/F"]
+            for call in mock_run.call_args_list
+        )
+        # The whole point of psutil-first: no process spawned to find the PID.
+        assert not any(
+            call.args[0][0] == "netstat" for call in mock_run.call_args_list
+        )
+
+    def test_never_signals_a_mere_client_of_the_port(self):
+        """Only LISTEN sockets. A client whose connection merely involves this
+        port number -- a browser tab on a local dev server -- must never be
+        signalled; killing those closed the user's browser at irregular
+        intervals until the LISTEN filter was added."""
+        from plugins.platforms.whatsapp.adapter import _kill_port_process
+        import psutil
+
+        conns = [_sconn(3000, 4242, psutil.CONN_ESTABLISHED)]
+
+        with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
+             patch("psutil.net_connections", return_value=conns), \
+             patch("plugins.platforms.whatsapp.adapter.subprocess.run",
+                   return_value=MagicMock(stdout="")) as mock_run:
+            _kill_port_process(3000)
+
+        assert not any(
+            call.args[0][0] == "taskkill" for call in mock_run.call_args_list
+        )
+
+    def test_falls_back_to_netstat_when_psutil_is_unavailable(self):
+        """psutil missing or denied the table -> the Windows shell fallback."""
+        from plugins.platforms.whatsapp.adapter import _kill_port_process
+
+        netstat_output = (
+            "  Proto  Local Address          Foreign Address        State           PID\n"
+            "  TCP    0.0.0.0:3000           0.0.0.0:0              LISTENING       12345\n"
+            "  TCP    0.0.0.0:3001           0.0.0.0:0              LISTENING       99999\n"
+        )
+
+        def run_side_effect(cmd, **kwargs):
+            if cmd[0] == "netstat":
+                return MagicMock(stdout=netstat_output)
+            return MagicMock()
+
+        with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
+             patch("psutil.net_connections", side_effect=OSError("no table")), \
+             patch("plugins.platforms.whatsapp.adapter.subprocess.run",
+                   side_effect=run_side_effect) as mock_run:
+            _kill_port_process(3000)
+
+        assert any(
+            call.args[0][0] == "netstat" for call in mock_run.call_args_list
+        )
         assert any(
             call.args[0] == ["taskkill", "/PID", "12345", "/F"]
             for call in mock_run.call_args_list
         )
 
-    def test_does_not_kill_wrong_port_on_windows(self):
+    def test_netstat_fallback_budget_is_not_five_seconds(self):
+        """The fallback's cap must exceed netstat's measured cost here.
+
+        At timeout=5 the call raised TimeoutExpired on this box, the caller
+        read that as "no listener", and the stale bridge survived every time.
+        """
         from plugins.platforms.whatsapp.adapter import _kill_port_process
 
-        # Nothing is LISTENING on the requested port — a process bound to some
-        # other port must never be signalled.
+        seen = {}
+
+        def run_side_effect(cmd, **kwargs):
+            if cmd[0] == "netstat":
+                seen.update(kwargs)
+            return MagicMock(stdout="")
+
         with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
-             patch(
-                 "plugins.platforms.whatsapp.adapter._listener_pids_on_port",
-                 return_value=[],
-             ), \
-             patch("plugins.platforms.whatsapp.adapter.subprocess.run") as mock_run:
+             patch("psutil.net_connections", side_effect=OSError("no table")), \
+             patch("plugins.platforms.whatsapp.adapter.subprocess.run",
+                   side_effect=run_side_effect):
+            _kill_port_process(3000)
+
+        assert seen.get("timeout", 0) >= 60, (
+            "netstat ran under a %r-second budget" % seen.get("timeout")
+        )
+
+    def test_does_not_kill_wrong_port(self):
+        """A listener on 30000 must not be mistaken for one on 3000.
+
+        Both discovery paths are exercised: psutil returns no match for 3000,
+        which falls through to the netstat fallback, whose line matching is a
+        string suffix test and so is exactly where ``:30000`` could be read as
+        ``:3000``.
+        """
+        from plugins.platforms.whatsapp.adapter import _kill_port_process
+        import psutil
+
+        netstat_output = (
+            "  TCP    0.0.0.0:30000          0.0.0.0:0              LISTENING       55555\n"
+        )
+
+        def run_side_effect(cmd, **kwargs):
+            if cmd[0] == "netstat":
+                return MagicMock(stdout=netstat_output)
+            return MagicMock()
+
+        with patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", True), \
+             patch("psutil.net_connections",
+                   return_value=[_sconn(30000, 55555, psutil.CONN_LISTEN)]), \
+             patch("plugins.platforms.whatsapp.adapter.subprocess.run",
+                   side_effect=run_side_effect) as mock_run:
             _kill_port_process(3000)
 
         assert not any(
             call.args[0][0] == "taskkill"
             for call in mock_run.call_args_list
         )
-
-    def test_listener_lookup_filters_by_port_and_listen_state(self):
-        """The psutil path returns only LISTENers on the requested port.
-
-        This is the guarantee that spares clients: a browser tab connected to
-        the bridge's port appears in net_connections as an ESTABLISHED entry
-        whose laddr.port is ephemeral, and must never be returned.
-        """
-        import plugins.platforms.whatsapp.adapter as adapter_mod
-
-        def _conn(status, port, pid):
-            return SimpleNamespace(
-                status=status, pid=pid, laddr=SimpleNamespace(port=port)
-            )
-
-        fake_psutil = MagicMock()
-        fake_psutil.CONN_LISTEN = "LISTEN"
-        fake_psutil.net_connections.return_value = [
-            _conn("LISTEN", 3000, 111),        # target
-            _conn("LISTEN", 3001, 222),        # different port
-            _conn("ESTABLISHED", 3000, 333),   # a client, not a listener
-            _conn("LISTEN", 3000, None),       # no pid attributable
-        ]
-
-        with patch.dict("sys.modules", {"psutil": fake_psutil}):
-            assert adapter_mod._listener_pids_on_port(3000) == [111]
 
     def test_kills_only_listeners_on_linux(self):
         """POSIX path SIGTERMs only LISTENer PIDs (never clients) — the #43846 fix.

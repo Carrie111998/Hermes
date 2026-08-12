@@ -122,7 +122,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
 
-from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from hermes_cli._subprocess_compat import run_text_capture
 
 try:
     import fcntl  # POSIX only; Windows falls back to best-effort without flock.
@@ -457,16 +457,19 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> Dict[str, Any]:
         return result
 
     t0 = time.monotonic()
-    _popen_kwargs = {"creationflags": windows_hide_flags()} if IS_WINDOWS else {}
+    # run_text_capture, not capture_output=True: ``spec.command`` is whatever
+    # the user configured under hooks.*, so the child is arbitrary — commonly a
+    # wrapper script that shells out again. On Windows a grandchild inherits
+    # the capture pipe handles and holds the write end open, so the pipe never
+    # reaches EOF: subprocess.run kills only the direct child at ``timeout``
+    # and then blocks re-draining forever. ``spec.timeout`` is validated and
+    # capped at MAX_TIMEOUT_SECONDS precisely so a hook cannot stall the agent
+    # — pipes silently voided that guarantee. Temp-file capture restores it.
     try:
-        proc = subprocess.run(
+        proc = run_text_capture(
             argv,
             input=stdin_json,
-            capture_output=True,
             timeout=spec.timeout,
-            text=True,
-            shell=False,
-            **_popen_kwargs,
         )
     except subprocess.TimeoutExpired:
         result["timed_out"] = True
