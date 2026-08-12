@@ -369,7 +369,15 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
     return false
   }
 
-  const tokenFilePath = ownershipId ? `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(spawnNonce)}.token` : ''
+  let tokenFilePath = ''
+
+  if (ownershipId) {
+    try {
+      tokenFilePath = `${ownershipDirectory(ownershipId)}/${validateSpawnNonce(spawnNonce)}.token`
+    } catch {
+      return false
+    }
+  }
 
   try {
     const script =
@@ -382,7 +390,7 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
       ' raw=open(f"/proc/{pid}/cmdline","rb").read()\n' +
       ' args=[x.decode("utf-8","surrogateescape") for x in raw.split(b"\\0") if x]\n' +
       'except OSError:\n' +
-      ' line=subprocess.check_output(["ps","-o","command=","-p",str(pid)],text=True).strip()\n' +
+      ' line=subprocess.check_output(["ps","-ww","-o","command=","-p",str(pid)],text=True).strip()\n' +
       ' args=shlex.split(line)\n' +
       'ok=False\n' +
       'try:\n' +
@@ -393,10 +401,12 @@ async function pidIsOurDashboard(ssh, pid, spawnNonce, hermesPath = '', ownershi
       ' executable_match=direct or python_entry\n' +
       ' wrapper_owned=False\n' +
       ' if tokenfile:\n' +
-      '  token=args.index("--ssh-session-token-file",serve+1)\n' +
-      '  host=args.index("--host",serve+1)\n' +
-      '  port=args.index("--port",serve+1)\n' +
-      '  wrapper_owned=(args[token+1]==tokenfile and args[host+1]=="127.0.0.1" and args[port+1]=="0")\n' +
+      '  try:\n' +
+      '   token=args.index("--ssh-session-token-file",serve+1)\n' +
+      '   host=args.index("--host",serve+1)\n' +
+      '   port=args.index("--port",serve+1)\n' +
+      '   wrapper_owned=(os.path.normpath(args[token+1])==os.path.normpath(tokenfile) and args[host+1]=="127.0.0.1" and args[port+1]=="0")\n' +
+      '  except (ValueError,IndexError):pass\n' +
       ' ok=(executable_match or wrapper_owned) and "--isolated" in args[serve+1:] and args[owner+1]==nonce\n' +
       'except (ValueError,IndexError):pass\n' +
       'print("OWNED" if ok else "FOREIGN")'

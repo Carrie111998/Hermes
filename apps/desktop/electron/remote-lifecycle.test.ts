@@ -324,12 +324,34 @@ function spawnThroughExecWrapper(extraServeArgs: string[]) {
   return { launcher, entrypoint, pid: child.pid as number, cleanup }
 }
 
-// Poll until the exec has actually happened, so we probe the replaced argv.
-async function waitForServeArgv(pid: number) {
-  for (let attempt = 0; attempt < 60; attempt++) {
-    const line = execFileSync('ps', ['-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+function spawnDirectHermes(extraServeArgs: string[]) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hermes-direct-'))
+  const hermesPath = path.join(dir, 'hermes')
+  fs.writeFileSync(hermesPath, '#!/usr/bin/env python3\nimport time\ntime.sleep(120)\n', { mode: 0o755 })
 
-    if (line.includes('serve')) {
+  const child = spawn(hermesPath, ['serve', '--isolated', '--host', '127.0.0.1', '--port', '0', ...extraServeArgs], {
+    stdio: 'ignore'
+  })
+
+  const cleanup = () => {
+    try {
+      child.kill('SIGKILL')
+    } catch {
+      void 0
+    }
+
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+
+  return { hermesPath, pid: child.pid as number, cleanup }
+}
+
+// Poll until the exec has actually happened, so we probe the replaced argv.
+async function waitForServeArgv(pid: number, entrypoint: string) {
+  for (let attempt = 0; attempt < 60; attempt++) {
+    const line = execFileSync('ps', ['-ww', '-o', 'command=', '-p', String(pid)], { encoding: 'utf8' })
+
+    if (line.includes(entrypoint) && line.includes('serve')) {
       return line.trim()
     }
 
@@ -350,10 +372,16 @@ test('pidIsOurDashboard reclaims a dashboard whose exec wrapper rewrote argv', a
   }
 
   const tokenFilePath = `${ownershipDirectory(OWNERSHIP_ID).replace(/^~/, os.homedir())}/${SPAWN_NONCE}.token`
-  const wrapper = spawnThroughExecWrapper(['--ssh-session-token-file', tokenFilePath, '--ssh-owner-nonce', SPAWN_NONCE])
+
+  const wrapper = spawnThroughExecWrapper([
+    '--ssh-session-token-file',
+    tokenFilePath.replace('/.hermes/', '//.hermes/'),
+    '--ssh-owner-nonce',
+    SPAWN_NONCE
+  ])
 
   try {
-    const argv = await waitForServeArgv(wrapper.pid)
+    const argv = await waitForServeArgv(wrapper.pid, wrapper.entrypoint)
     assert.ok(!argv.includes(wrapper.launcher), 'the recorded launcher path must be absent from the live argv')
 
     assert.equal(
@@ -385,11 +413,32 @@ test.each([
   const wrapper = spawnThroughExecWrapper(extraServeArgs)
 
   try {
-    await waitForServeArgv(wrapper.pid)
+    await waitForServeArgv(wrapper.pid, wrapper.entrypoint)
     assert.equal(await pidIsOurDashboard(shellSsh(), wrapper.pid, SPAWN_NONCE, wrapper.launcher, OWNERSHIP_ID), false)
   } finally {
     wrapper.cleanup()
   }
+})
+
+test('pidIsOurDashboard keeps direct launcher matching when the token argument is absent', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const direct = spawnDirectHermes(['--ssh-owner-nonce', SPAWN_NONCE])
+
+  try {
+    await waitForServeArgv(direct.pid, direct.hermesPath)
+    assert.equal(await pidIsOurDashboard(shellSsh(), direct.pid, SPAWN_NONCE, direct.hermesPath, OWNERSHIP_ID), true)
+  } finally {
+    direct.cleanup()
+  }
+})
+
+test('pidIsOurDashboard rejects a malformed ownership ID without probing the process', async () => {
+  const ssh = fakeSsh([])
+  assert.equal(await pidIsOurDashboard(ssh, 5, SPAWN_NONCE, '/x/hermes', 'not-hex'), false)
+  assert.deepEqual(ssh.calls, [])
 })
 
 test('cleanupStale kills ONLY a provably-ours pid, always drops the lockfile', async () => {
