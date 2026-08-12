@@ -289,3 +289,48 @@ def test_next_turn_replaces_retained_error_snapshot(emits, turn_env):
     completes = _events(emits, "message.complete")
     assert len(completes) == 1
     assert completes[0]["status"] == "complete"
+
+
+# ── Compression rebound + marker merge (no duplication) ───────────────
+
+
+def test_compression_rebound_merge_does_not_duplicate_history(emits, turn_env):
+    """A marker-only desync where the agent's messages shrank (compression
+    rebound) must REPLACE the original history with the compressed result +
+    the marker — not concatenate both (which duplicated the pre-compression
+    history and grew the transcript)."""
+    original = [
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+    ]
+    compressed = [
+        {"role": "user", "content": "SUMMARY"},
+        {"role": "assistant", "content": "final"},
+    ]
+
+    session = _session(
+        agent=None, history=list(original), history_version=0, running=True
+    )
+
+    def _run(message, **kwargs):
+        # Mid-turn model switch: bumps history_version → marker-only desync.
+        server._append_model_switch_marker(session, model="new-model", provider="p")
+        return {"final_response": "ok", "messages": list(compressed)}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+    )
+    session["agent"] = agent
+    server._start_inflight_turn(session, "hi")
+
+    server._run_prompt_submit("rid", "sid", session, "hi")
+
+    hist = session["history"]
+    # Original 4 entries are gone; compressed result + one marker remain.
+    assert len(hist) == len(compressed) + 1
+    assert hist[: len(compressed)] == compressed
+    assert server._is_model_switch_marker(hist[-1])

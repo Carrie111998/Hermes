@@ -10126,11 +10126,21 @@ def _run_prompt_submit(
                                 # shorter than history (#77274 review).
                                 if len(result["messages"]) > len(history):
                                     new_messages = result["messages"][len(history):]
+                                    session["history"] = current_history + new_messages
                                 else:
                                     # Compression rebound the messages list —
-                                    # use the full result as the base.
-                                    new_messages = list(result["messages"])
-                                session["history"] = current_history + new_messages
+                                    # the compressed result REPLACES the
+                                    # original history. Re-apply only the
+                                    # marker current_history added; never
+                                    # concatenate the uncompressed originals
+                                    # back on (that duplicated the whole
+                                    # pre-compression history).
+                                    markers = [
+                                        e
+                                        for e in current_history
+                                        if _is_model_switch_marker(e)
+                                    ]
+                                    session["history"] = list(result["messages"]) + markers
                                 session["history_version"] = current_version + 1
                             else:
                                 # Genuine desync (undo/compress/retry/rollback).
