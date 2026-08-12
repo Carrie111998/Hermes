@@ -3094,8 +3094,9 @@ def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     """Return the visible text portion of a response before direct send().
 
     Queued follow-up resends only replay explicit ``MEDIA:`` attachments in
-    this path. Keep bare local paths and ordinary image URLs visible because
-    the post-stream uploader intentionally ignores them (#20834).
+    this path. Bare local paths stay visible as text; explicit image tags
+    (``http(s)://`` / ``file://``) in the response are delivered separately
+    by the post-stream uploader after the text is sent.
 
     Do not apply a broad ``MEDIA:`` regex after ``extract_media()`` — the
     extractor deliberately preserves protected code/inline spans and
@@ -20133,9 +20134,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         already shown to the user as text, or (b) stale tool/inspected
         content that was never part of the intended visible reply. Promoting
         such paths into uploads after the fact sent files the model never
-        asked to deliver (#20834). Only ``MEDIA:`` directives and explicit
-        ``file://`` markdown/HTML image tags — the explicit attachment
-        contracts — trigger post-stream uploads.
+        asked to deliver (#20834). Only explicit attachment directives
+        trigger post-stream uploads: ``MEDIA:`` paths, and explicit
+        ``file://`` / ``http(s)://`` markdown/HTML image tags extracted by
+        ``extract_images``.
         """
         from pathlib import Path
         from urllib.parse import quote as _quote

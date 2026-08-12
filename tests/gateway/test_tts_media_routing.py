@@ -656,6 +656,78 @@ def test_normalize_file_url_drive_relative_rejected():
     assert BasePlatformAdapter._normalize_file_url("file://C%3Arelative.png") is None
 
 
+def test_normalize_file_url_encoded_three_slash_drive():
+    """The encoded three-slash variant (no authority, drive letter encoded
+    in the path) must normalize identically to the plain form: the second
+    drive-letter re-check added after percent-decoding handles it."""
+    assert BasePlatformAdapter._normalize_file_url("file:///C%3A/dir/a.png") == "C:/dir/a.png"
+
+
+@pytest.mark.parametrize("raw_path", [
+    r"C:\Users\KK\image.png",
+    r"C:\Users\KK\AppData\Local\Temp\shot.png",
+    r"C:\path with spaces\image.png",
+])
+def test_normalize_file_url_accepts_production_default_quote_windows_uri(raw_path):
+    """P1 regression: gateway delivery producers wrap local paths with the
+    DEFAULT ``urllib.parse.quote()`` (safe='/'), which percent-encodes the
+    Windows drive letter and backslashes into the authority segment:
+
+        file://C%3A%5CUsers%5CKK%5Cimage.png
+
+    Before the fix this form was rejected as a bogus UNC authority, so the
+    image silently fell back to ``send_image`` with the raw URI.  It must
+    normalize to the Windows local path instead.
+    """
+    import urllib.parse
+
+    uri = "file://" + urllib.parse.quote(raw_path)
+    assert uri.startswith("file://C%3A"), uri  # sanity: encoding actually happened
+
+    normed = BasePlatformAdapter._normalize_file_url(uri)
+    assert normed is not None, f"production quote form rejected: {uri!r}"
+    expected = raw_path.replace("\\", "/")
+    assert os.path.normcase(normed) == os.path.normcase(expected), (
+        f"normalize {normed!r} != expected {expected!r} for {uri!r}"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw_path", [
+    r"C:\Users\KK\image.png",
+    r"C:\Users\KK\AppData\Local\Temp\shot.png",
+])
+async def test_send_multiple_images_default_quote_windows_uri_goes_to_send_image_file(raw_path):
+    """P1 regression: a local image wrapped by the production default
+    ``quote()`` must be decoded and delivered via ``send_image_file``, and
+    MUST NOT fall back to ``send_image`` with the raw ``file://`` URI.
+    """
+    import urllib.parse
+
+    adapter = _RoundtripAdapter()
+    adapter.send_image = AsyncMock(return_value=SendResult(success=True, message_id="remote"))
+    uri = "file://" + urllib.parse.quote(raw_path)
+
+    await adapter.send_multiple_images(
+        chat_id="chat-1",
+        images=[(uri, "alt")],
+    )
+
+    adapter.send_image_file.assert_awaited_once()
+    _, kwargs = adapter.send_image_file.call_args
+    received_path = kwargs.get("image_path")
+    assert received_path is not None, f"image_path kwarg missing in {kwargs}"
+    expected = raw_path.replace("\\", "/")
+    assert os.path.normcase(received_path) == os.path.normcase(expected), (
+        f"send_image_file received {received_path!r}, expected {expected!r}"
+    )
+    # The whole point of the fix: the URI must never be treated as a remote URL
+    adapter.send_image.assert_not_awaited()
+    assert not any(
+        str(call).startswith("file://") for call in adapter.send_image.call_args_list
+    )
+
+
 @pytest.mark.asyncio
 async def test_post_stream_dedup_file_url_media_same_file(tmp_path, monkeypatch):
     """MEDIA local path + file:// URI for the same file deliver once."""

@@ -4307,8 +4307,6 @@ class BasePlatformAdapter(ABC):
         Override in subclasses to bundle into a single native API call
         (e.g. Signal's multi-attachment RPC)
         """
-        from urllib.parse import unquote as _unquote
-
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -4385,7 +4383,19 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def _normalize_file_url(url: str) -> Optional[str]:
-        """Normalize a file:// URI to a local file path."""
+        """Normalize a file:// URI to a local file path.
+
+        Accepts the canonical forms produced across the codebase:
+        - ``file:///tmp/a.png`` (POSIX, three slashes)
+        - ``file:///C:/dir/a.png`` (Windows, three slashes + drive)
+        - ``file://C:/dir/a.png`` (Windows, drive as authority)
+        - ``file://C%3A%5Cdir%5Ca.png`` (Windows path wrapped with the
+          default ``urllib.parse.quote()`` — the form produced by
+          ``file://{quote(path)}`` producers such as the gateway delivery
+          batching code).  The encoded drive+backslashes land entirely in
+          the authority segment because ``quote()`` (safe='/') percent-encodes
+          both ``:`` and ``\\``, leaving no ``/`` for urlparse to split on.
+        """
         import urllib.parse
         if not url:
             return None
@@ -4402,14 +4412,37 @@ class BasePlatformAdapter(ABC):
             if len(parsed.netloc) == 2 and parsed.netloc[1] == ':':
                 local = parsed.netloc + parsed.path
             else:
-                logger.debug("Rejecting UNC file:// URI: %s", _log_safe_path(url))
-                return None
+                # Authority is not a bare drive letter.  It may still be an
+                # encoded Windows path (file://C%3A%5Cdir%5Ca.png): decode
+                # the authority and accept it ONLY when it resolves to an
+                # absolute drive path ("C:/...").  Any other authority —
+                # UNC hosts, encoded UNC (file://server%2Fshare%2Fa.png),
+                # drive-relative (file://C%3Arelative.png) — stays rejected.
+                # Note: a forward-slash variant with only the drive colon
+                # encoded (file://C%3A/dir/a.png) is intentionally NOT
+                # accepted here — no in-tree producer emits it (they wrap
+                # backslash paths), and rejecting it fails safe to text.
+                decoded_netloc = urllib.parse.unquote(parsed.netloc).replace('\\', '/')
+                if (len(decoded_netloc) >= 3
+                        and decoded_netloc[1] == ':'
+                        and decoded_netloc[2] == '/'):
+                    local = decoded_netloc + parsed.path
+                else:
+                    logger.debug("Rejecting UNC file:// URI: %s", _log_safe_path(url))
+                    return None
         else:
             local = parsed.path
             if len(local) >= 3 and local[0] == '/' and local[1].isalpha() and local[2] == ':':
                 local = local[1:]
         local = urllib.parse.unquote(local)
         local = local.replace('\\', '/')
+        # Re-check the drive-letter form after percent-decoding: the
+        # encoded variant file:///C%3A/dir/a.png only becomes /C:/dir/a.png
+        # after unquote, and must normalize to C:/dir/a.png like the plain
+        # form.  POSIX absolute paths are untouched because local[2] is
+        # never ':' there.
+        if len(local) >= 3 and local[0] == '/' and local[1].isalpha() and local[2] == ':':
+            local = local[1:]
         if local.startswith('//'):
             logger.debug("Rejecting decoded UNC file:// URI: %s", _log_safe_path(url))
             return None
