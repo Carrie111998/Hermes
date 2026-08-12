@@ -693,6 +693,73 @@ def _reset_module_state():
     yield
 
 
+# ── hermes_logging file handlers — module-global, tmp_path-rooted ──────────
+
+def _live_hermes_logging():
+    """Return ``hermes_logging`` if it is imported AND is the real module.
+
+    Looked up in ``sys.modules`` rather than imported, for the same reason as
+    every block in ``_reset_module_state`` above: a module that was never
+    imported has no handlers to reset, and importing it here would charge its
+    cost (concurrent-log-handler, portalocker) to every test's fixture setup.
+
+    Several tests stub the name with a ``types.SimpleNamespace`` via
+    ``monkeypatch.setitem(sys.modules, "hermes_logging", ...)``; the attribute
+    check filters those out so we never call a stub.
+    """
+    mod = sys.modules.get("hermes_logging")
+    return mod if hasattr(mod, "_reset_queued_handlers") else None
+
+
+@pytest.fixture(autouse=True)
+def _reset_hermes_file_logging():
+    """Tear down hermes_logging's rotating file handlers around every test.
+
+    ``hermes_logging`` holds its file handlers in a module-global list
+    (``_queued_file_handlers``) that a background ``QueueListener`` thread
+    dispatches to. That global is correct in production — a process has one
+    HERMES_HOME for its whole life — but every test here gets a *different*
+    HERMES_HOME under its own ``tmp_path`` (see ``_hermetic_environment``),
+    and ``tmp_path_retention_policy = "failed"`` deletes that directory the
+    moment the test passes. A handler registered by one test therefore
+    outlives its log directory, and the next test in the process that emits a
+    record makes the listener thread write into a path that no longer exists::
+
+        --- Logging error ---
+        concurrent_log_handler ... FileNotFoundError: [Errno 2] No such file
+        or directory: '...\\pytest-NNN\\test_xxx0\\hermes_test\\logs\\.__errors.lock'
+
+    Because it is raised on the listener thread, that spew is attributed to no
+    test and fails nothing — it just corrupts the output of whatever ran next.
+
+    Resetting on *teardown* also lets pytest actually reclaim the tempdir: on
+    Windows ``concurrent-log-handler`` keeps its ``.__<name>.lock`` file open
+    for the handler's lifetime, and an open handle blocks the directory
+    removal that the "failed" retention policy is there to perform.
+
+    ``_logging_initialized`` is cleared alongside the handlers because
+    ``setup_logging()`` checks it *before* registering agent.log/errors.log:
+    left set with an empty handler list, the next test's ``setup_logging()``
+    call would silently attach nothing. The two are reset together in
+    tests/test_hermes_logging.py's own fixture for the same reason.
+
+    Pinned by tests/test_logging_handler_isolation.py.
+    """
+    def _reset(mod):
+        if mod is None:
+            return
+        mod._reset_queued_handlers()
+        mod._logging_initialized = False
+
+    # Capture at setup: a test may replace sys.modules["hermes_logging"] with a
+    # stub in its body, and monkeypatch's undo runs after this fixture's
+    # teardown, so the lookup below could otherwise come back empty.
+    captured = _live_hermes_logging()
+    _reset(captured)
+    yield
+    _reset(_live_hermes_logging() or captured)
+
+
 @pytest.fixture()
 def tmp_dir(tmp_path):
     """Provide a temporary directory that is cleaned up automatically."""
