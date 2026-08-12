@@ -104,6 +104,24 @@ describe('Excalidraw documents', () => {
       await expect(loadDrawing(identity)).rejects.toThrow('Invalid Excalidraw document')
     }
   })
+  it('discards serialized collaborators before handing app state to the editor', async () => {
+    const text = JSON.stringify({
+      type: 'excalidraw',
+      version: 2,
+      elements: [],
+      appState: { collaborators: {} }
+    })
+    readDesktopDrawingFileText.mockResolvedValue({
+      path: identity.path,
+      text,
+      byteSize: text.length,
+      fingerprint: 'collaborators-fingerprint'
+    })
+
+    const drawing = await loadDrawing(identity)
+
+    expect(drawing.appState).not.toHaveProperty('collaborators')
+  })
 
   it('preserves the full document envelope and unknown keys when saving', async () => {
     readDesktopDrawingFileText.mockResolvedValue(sourceRead())

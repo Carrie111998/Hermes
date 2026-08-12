@@ -57,9 +57,11 @@ function parseDrawing(text: string): Omit<LoadedDrawing, 'fingerprint' | 'identi
   ) {
     throw new Error('Invalid Excalidraw document')
   }
+  const editorAppState = { ...(appState as Record<string, unknown>) }
+  delete editorAppState.collaborators
 
   return {
-    appState: appState as Record<string, unknown>,
+    appState: editorAppState,
     elements: envelope.elements,
     envelope,
     files: files as Record<string, unknown>
