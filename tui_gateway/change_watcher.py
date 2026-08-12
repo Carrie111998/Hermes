@@ -21,20 +21,28 @@ module object at call time (patch-inert for the test suite): the registry
 server module (``server._skin_sig``, ``server.resolve_skin``) go through the
 module object at call time for the same reason.
 
-``server`` is imported at the END of this module (not the top) on purpose:
+``server`` is resolved from the import registry at call time on purpose:
 ``tui_gateway.server`` re-exports this module's names at module level, so a
-top-of-file ``from tui_gateway import server`` would deadlock the
-change_watcher-first import order. Importing at the end keeps both orders
-clean: this module's functions only touch ``server`` at call time.
+top-of-file import would cycle. A module captured during that cycle can also
+become stale when an importer temporarily replaces dependencies in
+``sys.modules``; resolving afresh preserves the live server monkeypatch seam.
 """
 
+import importlib
 import threading
 import time
 from pathlib import Path
 
 from hermes_constants import get_hermes_home_override
 
+
+def _server_module():
+    """Return the live server module without retaining a cyclic import binding."""
+    return importlib.import_module("tui_gateway.server")
+
+
 def resolve_skin() -> dict:
+    server = _server_module()
     try:
         from hermes_cli.skin_engine import init_skin_from_config, get_active_skin
 
@@ -60,6 +68,7 @@ def resolve_skin() -> dict:
 def _skin_sig() -> tuple[str, float | None]:
     """(active skin name, its user-file mtime). Built-ins have no file, so only
     their name moves; a user skin's mtime lets an in-place color edit repaint too."""
+    server = _server_module()
     name = str((server._load_cfg().get("display") or {}).get("skin") or "default")
     override = get_hermes_home_override()
     home = override if isinstance(override, str) and override else server._hermes_home
@@ -73,6 +82,7 @@ def _skin_sig() -> tuple[str, float | None]:
 def _note_skin_broadcast() -> None:
     """Sync the reconcile baseline after the /skin RPC emits, so the per-tool
     check doesn't re-broadcast the skin /skin just applied."""
+    server = _server_module()
     try:
         server._last_skin_sig = server._skin_sig()
     except Exception:
@@ -88,6 +98,7 @@ def _broadcast_skin_if_changed() -> None:
     repaints, no slash command. The signature check is a dict lookup + one stat,
     so polling it is ~free.
     """
+    server = _server_module()
     try:
         sig = server._skin_sig()
     except Exception:
@@ -103,6 +114,7 @@ def _broadcast_skin_if_changed() -> None:
 
 def _watcher_home() -> Path:
     """Active profile home for the change watcher's signature probes."""
+    server = _server_module()
     override = get_hermes_home_override()
     return Path(override if isinstance(override, str) and override else server._hermes_home)
 
@@ -113,6 +125,7 @@ def _pet_sig() -> tuple:
     Cheap by construction: config comes from the mtime-cached ``_load_cfg`` and
     the sheet revision is one stat. Moves when ``/pet`` (de)activates a pet, the
     hatch flow rebuilds a sheet, or the scale changes."""
+    server = _server_module()
     display = server._load_cfg().get("display") or {}
     pet_cfg = display.get("pet") if isinstance(display.get("pet"), dict) else {}
     if not pet_cfg or not pet_cfg.get("enabled"):
@@ -129,6 +142,7 @@ def _pet_sig() -> tuple:
 def _pet_changed_payload() -> dict:
     """``pet.info.meta``-shaped payload for ``pet.changed`` — enough for the
     renderer to decide whether the heavy sprite payload needs a refetch."""
+    server = _server_module()
     try:
         enabled, pet, scale = server._pet_active_selection()
         if not enabled or pet is None or not pet.exists:
@@ -223,6 +237,7 @@ def _broadcast_watched_changes(now: float | None = None) -> None:
     """One pass over ``_CHANGE_WATCHES``: recompute due signatures, broadcast
     the events whose signature moved. First sighting seeds silently so a
     gateway boot never fires a spurious refresh storm."""
+    server = _server_module()
     now = time.monotonic() if now is None else now
     for event, (interval, sig_fn, payload_fn) in server._CHANGE_WATCHES.items():
         if now - server._change_checked_at.get(event, -interval) < interval:
@@ -273,8 +288,3 @@ def _ensure_skin_watcher() -> None:
             _broadcast_watched_changes()
 
     threading.Thread(target=_loop, name="hermes-change-watcher", daemon=True).start()
-
-
-# Imported last: see module docstring ("Seam contract") for why a top-of-file
-# import would deadlock the change_watcher-first import order.
-from tui_gateway import server  # noqa: E402
