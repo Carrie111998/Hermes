@@ -2394,6 +2394,17 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Progress pings: while a task is 'running', the dispatcher emits a
+        # ``progress`` task event roughly every this many seconds, which the
+        # notifier delivers to that task's subscribers as a plain-English
+        # "still working on it" message (task title, minutes elapsed, and the
+        # latest ``kanban_heartbeat`` note if the worker left one). Timing is
+        # deliberately approximate — the check only runs once per
+        # ``dispatch_interval_seconds`` tick, so the real gap is this value
+        # rounded up to the next tick. Nothing is emitted when no task is
+        # running, and pings stop as soon as the task leaves 'running'.
+        # 0 disables progress pings entirely.
+        "progress_notify_interval_seconds": 300,
         # Orphaned-card reconciliation: each dispatcher tick, requeue
         # 'running' cards whose claim bookkeeping is broken (claim_lock or
         # claim_expires NULL with a dead/gone worker) — zombies invisible

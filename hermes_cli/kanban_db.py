@@ -7340,6 +7340,129 @@ def heartbeat_worker(
     return True
 
 
+def emit_progress_events(
+    conn: sqlite3.Connection,
+    interval_seconds: int,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
+    """Emit a ``progress`` event for every long-running task.
+
+    This is the "still working on it" signal a user gets in chat while a
+    task is in flight, so a slow task doesn't look like a dead one. It is
+    dispatcher-side and purely additive: the notifier picks the events up
+    and renders them, nothing else in the lifecycle reads them.
+
+    Deliberately NOT the ``heartbeat`` kind. A ``heartbeat`` event is the
+    worker telling the dispatcher it is alive (feeding stale detection in
+    :func:`detect_stale_running`); ``progress`` is the dispatcher telling
+    the human how it's going. The two have different writers, different
+    cadences, and different consumers — overloading one kind for both
+    would make a missing worker heartbeat indistinguishable from a
+    delivered user ping.
+
+    A task is due for a ping when ``interval_seconds`` have passed since
+    its most recent ``progress`` event, or — for a task that has never had
+    one — since the current run started. Only ``status='running'`` tasks
+    are considered, so nothing is emitted on an idle board and pings stop
+    on their own the moment a task completes, blocks, or is reclaimed.
+
+    The payload carries everything the notifier needs to write a message
+    without re-querying: ``task_id``, ``title``, ``assignee``, ``board``,
+    ``elapsed_minutes`` (total time in the current run, not time since the
+    last ping) and ``note`` — the most recent ``kanban_heartbeat`` note
+    left within the window just measured, or ``None`` when the worker
+    hasn't said anything since the last ping.
+
+    Timing is approximate by design: the caller only checks once per
+    dispatcher tick, so the real gap is ``interval_seconds`` rounded up to
+    the next tick. ``interval_seconds <= 0`` disables the check entirely.
+
+    Returns the list of task IDs that got a new ``progress`` event.
+    """
+    if interval_seconds <= 0:
+        return []
+
+    now = int(time.time())
+    emitted: list[str] = []
+
+    rows = conn.execute(
+        "SELECT t.id, t.title, t.assignee, t.current_run_id, "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.status = 'running'"
+    ).fetchall()
+
+    for row in rows:
+        tid = row["id"]
+        # A running task with no start timestamp shouldn't happen, but a
+        # legacy/hand-edited row must not crash the dispatcher tick.
+        if row["active_started_at"] is None:
+            continue
+        started_at = int(row["active_started_at"])
+
+        last_progress = conn.execute(
+            "SELECT created_at FROM task_events "
+            "WHERE task_id = ? AND kind = 'progress' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        window_start = (
+            int(last_progress["created_at"])
+            if last_progress is not None
+            else started_at
+        )
+        if now - window_start < interval_seconds:
+            continue
+
+        # Most recent thing the worker actually said since the last ping.
+        # Older notes are intentionally not repeated — the user already saw
+        # them on the previous ping.
+        note = None
+        hb_row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'heartbeat' AND created_at >= ? "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (tid, window_start),
+        ).fetchone()
+        if hb_row is not None and hb_row["payload"]:
+            try:
+                hb_payload = json.loads(hb_row["payload"])
+            except (ValueError, TypeError):
+                hb_payload = None
+            if isinstance(hb_payload, dict) and hb_payload.get("note"):
+                note = str(hb_payload["note"])
+
+        payload = {
+            "task_id": tid,
+            "title": row["title"],
+            "assignee": row["assignee"],
+            "board": board or get_current_board(),
+            "elapsed_minutes": int(max(0, now - started_at) // 60),
+            "note": note,
+        }
+
+        with write_txn(conn):
+            # Re-check under the write lock: the task may have completed
+            # between the SELECT above and here, and a "still working"
+            # ping racing its own completion message is exactly the
+            # confusing double-notification this guard exists to avoid.
+            still_running = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (tid,),
+            ).fetchone()
+            if still_running is None or still_running["status"] != "running":
+                continue
+            run_id = row["current_run_id"]
+            _append_event(
+                conn, tid, "progress", payload,
+                run_id=int(run_id) if run_id else None,
+            )
+        emitted.append(tid)
+
+    return emitted
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,

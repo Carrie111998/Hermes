@@ -226,7 +226,25 @@ up on the next tick (60s by default).
 kanban:
   dispatch_in_gateway: true        # default
   dispatch_interval_seconds: 60    # default
+  progress_notify_interval_seconds: 300   # default; 0 disables
 ```
+
+`progress_notify_interval_seconds` controls the "still working on it"
+pings. While a task is `running`, the dispatcher emits a `progress` event
+roughly every 5 minutes, and anyone subscribed to that task gets a short
+plain-English message in chat — task title, how long it's been going, and
+the most recent `kanban_heartbeat` note if the worker left one:
+
+```
+⏳ Still working on reindex the archive (running as scribe) — about 7 minutes in.
+Latest update: halfway through the backlog
+```
+
+Timing is approximate: the check only runs once per dispatcher tick, so
+the real gap is this value rounded up to the next tick. Nothing is sent
+while no task is running, and the pings stop as soon as the task leaves
+`running` — a ping that loses the race with completion is dropped rather
+than delivered next to the completion message.
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
 for debugging. Standard gateway supervision applies: run `hermes gateway
@@ -1022,6 +1040,7 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
 | `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+| `progress` | `{task_id, title, assignee, board, elapsed_minutes, note}` | Dispatcher-side "still working on it" ping for a task that has been `running` for `kanban.progress_notify_interval_seconds` (default 5 min) since the last ping. Delivered to the task's notification subscribers as a plain-English message; `note` carries the most recent `kanban_heartbeat` note left since the previous ping, or `null`. Purely informational — it never changes task state, never ends a subscription, and is not emitted once the task stops running. |
 | `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. |
 | `crashed` | `{pid, claimer}` | Worker PID no longer alive but TTL hadn't expired yet. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
