@@ -17924,10 +17924,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             path = resolve_config_path()
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                stat = path.stat()
+                # Size participates in the key, not just mtime. Windows advances
+                # a file's last-write time on the ~15.6ms system tick, so a
+                # rewrite landing in the same tick as the previous one is
+                # invisible to an mtime-only key and the stale memo is served.
+                # That is a real (if narrow) staleness window in production and
+                # it made the memo's own test fail roughly 1 run in 3.
+                identity = (stat.st_mtime_ns, stat.st_size)
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                identity = None
+            memo_key = (str(path), identity)
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
