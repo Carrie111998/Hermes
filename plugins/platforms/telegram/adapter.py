@@ -6748,6 +6748,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button resolved (id=%s, choice=%r, user=%s)",
                         clarify_id, resolved_text, user_display,
                     )
+                    if query_chat_id is not None:
+                        self.resume_typing_for_chat(str(query_chat_id))
                 else:
                     # Entry evicted (clarify_timeout) or gateway restarted
                     # between ask and tap — surface this instead of leaving a

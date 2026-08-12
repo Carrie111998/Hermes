@@ -153,6 +153,8 @@ class TestTelegramClarifyCallback:
         # Pre-register a clarify entry so the callback can look up the choice text
         cm.register("cidA", "sk-cb", "Pick", ["red", "green", "blue"])
         adapter._clarify_state["cidA"] = "sk-cb"
+        adapter.pause_typing_for_chat("12345")
+        assert "12345" in adapter._typing_paused
 
         query = AsyncMock()
         query.data = "cl:cidA:1"  # green
@@ -186,6 +188,7 @@ class TestTelegramClarifyCallback:
         assert entry.event.is_set()
         query.answer.assert_called_once()
         query.edit_message_text.assert_called_once()
+        assert "12345" not in adapter._typing_paused
 
 
     @pytest.mark.asyncio
@@ -277,4 +280,3 @@ class TestBaseAdapterClarifyFallback:
         assert "Pick a fruit" in text
         assert "1." in text and "apple" in text
         assert "2." in text and "banana" in text
-
