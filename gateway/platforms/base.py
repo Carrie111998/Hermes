@@ -6903,6 +6903,29 @@ class BasePlatformAdapter(ABC):
         self._release_session_guard(session_key, guard=interrupt_event)
         if session_key not in self._active_sessions:
             self._session_tasks.pop(session_key, None)
+
+    def active_message_work_count(self) -> int:
+        """Return live adapter-owned message tasks, including final delivery.
+
+        The runner's agent entry is released when its handler returns, but
+        this owner task remains live while the response is recorded in the
+        delivery ledger, sent, acknowledged, and cleaned up.  Planned restart
+        uses this count to keep the adapter connected through that boundary.
+
+        Completed tasks are deliberately ignored: guard reconciliation can
+        briefly retain a done owner in ``_session_tasks`` so the next inbound
+        message can heal stale bookkeeping, and that must not pin shutdown.
+        """
+        active = 0
+        for task in list(self._session_tasks.values()):
+            try:
+                if not task.done():
+                    active += 1
+            except Exception:
+                # A non-Task owner is unexpected in production but should be
+                # treated conservatively while its liveness is unknown.
+                active += 1
+        return active
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.
