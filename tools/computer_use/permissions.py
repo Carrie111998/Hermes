@@ -43,6 +43,12 @@ def _resolve_driver_cmd(override: Optional[str]) -> Optional[str]:
     return resolve_cua_driver_cmd(override)
 
 
+def _driver_argv(binary: str, *args: str) -> List[str]:
+    from tools.computer_use.cua_backend import cua_driver_argv
+
+    return cua_driver_argv(binary, *args)
+
+
 def _child_env() -> Dict[str, str]:
     """cua-driver child env: telemetry opt-in policy + secret sanitization.
 
@@ -66,7 +72,7 @@ def _child_env() -> Dict[str, str]:
 
 def _run(binary: str, *args: str, timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [binary, *args],
+        _driver_argv(binary, *args),
         capture_output=True,
         text=True, encoding='utf-8', errors='replace',
         timeout=timeout,
@@ -186,7 +192,7 @@ def request_permissions_grant(driver_cmd: Optional[str] = None) -> int:
     try:
         return int(
             subprocess.run(
-                [binary, "permissions", "grant"],
+                _driver_argv(binary, "permissions", "grant"),
                 env=_child_env(),
                 stdin=subprocess.DEVNULL,
             ).returncode

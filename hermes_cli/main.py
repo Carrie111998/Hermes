@@ -12047,6 +12047,7 @@ def main():
         if action == "status":
             import subprocess
             from tools.computer_use.cua_backend import (
+                cua_driver_argv,
                 cua_driver_update_check,
                 resolve_cua_driver_cmd,
             )
@@ -12058,7 +12059,7 @@ def main():
                 try:
                     from hermes_cli.tools_config import _cua_driver_env
                     version = subprocess.run(
-                        [path, "--version"],
+                        cua_driver_argv(path, "--version"),
                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5,
                         env=_cua_driver_env(),
                     ).stdout.strip()

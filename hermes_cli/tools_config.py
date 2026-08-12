@@ -776,6 +776,12 @@ def _resolved_cua_driver_cmd() -> Optional[str]:
     return resolve_cua_driver_cmd()
 
 
+def _cua_driver_argv(binary: str, *args: str) -> List[str]:
+    from tools.computer_use.cua_backend import cua_driver_argv
+
+    return cua_driver_argv(binary, *args)
+
+
 def _cua_driver_env() -> dict:
     """cua-driver child env with the Hermes telemetry policy applied.
 
@@ -1001,7 +1007,7 @@ def install_cua_driver(
     if binary and not upgrade:
         try:
             version = subprocess.run(
-                [binary, "--version"],
+                _cua_driver_argv(binary, "--version"),
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env=_cua_driver_env(),
                 creationflags=_post_setup_no_window_flags(),
             ).stdout.strip()
@@ -1088,7 +1094,7 @@ def install_cua_driver(
         # Show before/after version when we have a baseline. Best-effort.
         try:
             before = subprocess.run(
-                [binary, "--version"],
+                _cua_driver_argv(binary, "--version"),
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env=_cua_driver_env(),
                 creationflags=_post_setup_no_window_flags(),
             ).stdout.strip()
@@ -1106,7 +1112,7 @@ def install_cua_driver(
     if ok and before:
         try:
             after = subprocess.run(
-                [binary, "--version"],
+                _cua_driver_argv(binary, "--version"),
                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5, env=_cua_driver_env(),
                 creationflags=_post_setup_no_window_flags(),
             ).stdout.strip()

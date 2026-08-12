@@ -86,6 +86,12 @@ def _sanitized_cua_env() -> Dict[str, str]:
         return env
 
 
+def _driver_argv(binary: str, *args: str) -> List[str]:
+    from tools.computer_use.cua_backend import cua_driver_argv
+
+    return cua_driver_argv(binary, *args)
+
+
 def _is_valid_health_report(payload: Any) -> bool:
     """True when *payload* looks like a schema_version=1 health_report."""
     if not isinstance(payload, dict):
@@ -110,7 +116,7 @@ def _read_cli_version(binary: str, *, timeout: float = 5.0) -> Optional[str]:
     """
     try:
         completed = subprocess.run(
-            [binary, "--version"],
+            _driver_argv(binary, "--version"),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -208,7 +214,7 @@ def _open_mcp(binary: str) -> subprocess.Popen:
     # default Windows install — which raises UnicodeDecodeError on the
     # first non-ASCII byte. Pin the codec.
     return subprocess.Popen(
-        [binary, "mcp"],
+        _driver_argv(binary, "mcp"),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -312,7 +318,7 @@ def _cli_driver_version(binary: str, timeout: float = 5.0) -> Tuple[str, Optiona
     """Return (status, version_or_message) from ``cua-driver --version``."""
     try:
         completed = subprocess.run(
-            [binary, "--version"],
+            _driver_argv(binary, "--version"),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -339,7 +345,7 @@ def _cli_doctor_snippet(binary: str, timeout: float = 8.0) -> Optional[str]:
     """Optional one-shot ``cua-driver doctor`` text (best-effort, never fatal)."""
     try:
         completed = subprocess.run(
-            [binary, "doctor"],
+            _driver_argv(binary, "doctor"),
             capture_output=True,
             text=True,
             encoding="utf-8",
