@@ -2715,7 +2715,7 @@ function Set-PathVariable {
     if ($NoVenv) {
         $hermesBin = "$InstallDir"
     } else {
-        # Expose ONLY the hermes launchers on PATH — never the whole
+        # Expose ONLY the hermes launchers on PATH -- never the whole
         # venv\Scripts directory. venv\Scripts contains python.exe /
         # pythonw.exe / pip.exe, and putting it on the user PATH silently
         # hijacks the `python` command in every terminal on the machine
@@ -2737,7 +2737,7 @@ function Set-PathVariable {
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
 
     # Migrate installs that got venv\Scripts onto PATH from earlier
-    # installer versions — remove it so the python shadowing stops.
+    # installer versions -- remove it so the python shadowing stops.
     $legacyBin = "$InstallDir\venv\Scripts"
     if ((-not $NoVenv) -and $currentPath -like "*$legacyBin*") {
         $cleaned = ($currentPath -split ';' | Where-Object { $_ -and $_ -ne $legacyBin }) -join ';'
