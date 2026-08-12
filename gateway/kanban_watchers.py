@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.i18n import t
+from gateway.heartbeat_text import format_progress_heartbeat
 
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
@@ -504,38 +505,15 @@ class GatewayKanbanWatchersMixin:
                                 # advances past the event.
                                 continue
                             payload = ev.payload or {}
-                            progress_title = str(
-                                payload.get("title") or title
-                            )[:120]
-                            who_progress = (
-                                payload.get("assignee")
-                                or (task.assignee if task else "")
-                            )
-                            as_who = (
-                                f" (running as {who_progress})"
-                                if who_progress else ""
-                            )
-                            try:
-                                minutes = int(payload["elapsed_minutes"])
-                            except (KeyError, TypeError, ValueError):
-                                minutes = None
-                            if minutes is None:
-                                elapsed_phrase = "still going"
-                            elif minutes < 1:
-                                elapsed_phrase = "less than a minute in"
-                            elif minutes == 1:
-                                elapsed_phrase = "about 1 minute in"
-                            else:
-                                elapsed_phrase = f"about {minutes} minutes in"
-                            note = payload.get("note")
-                            update = (
-                                f"Latest update: {str(note)[:200]}"
-                                if note else "No status update yet."
-                            )
-                            msg = (
-                                f"⏳ {board_tag}Still working on "
-                                f"{progress_title}{as_who} — {elapsed_phrase}."
-                                f"\n{update}"
+                            msg = format_progress_heartbeat(
+                                title=payload.get("title") or title,
+                                who=(
+                                    payload.get("assignee")
+                                    or (task.assignee if task else "")
+                                ),
+                                elapsed_minutes=payload.get("elapsed_minutes"),
+                                note=payload.get("note"),
+                                board_tag=board_tag,
                             )
                         elif kind == "block_loop_detected":
                             # A task re-blocked for the same cause past the

@@ -1366,7 +1366,8 @@ display:
   # acks or heartbeats), but interim_assistant_messages and
   # long_running_notifications STAY ON so the user has real signal between
   # turn start and final answer (mid-turn assistant commentary + a single
-  # edit-in-place "⏳ Working — N min" heartbeat). Override under
+  # edit-in-place "⏳ Still working — about N minutes in." heartbeat).
+  # Override under
   # display.platforms.telegram.
 
   # Auto-cleanup of temporary progress bubbles after the final response lands.
@@ -1396,7 +1397,7 @@ display:
   interim_assistant_messages: true
 
   # Gateway-only long-running status heartbeats.
-  # When false, the platform does not receive periodic "⏳ Working — N min"
+  # When false, the platform does not receive periodic "⏳ Still working"
   # notifications even if agent.gateway_notify_interval is non-zero. The
   # heartbeat edits a single message in place (where the adapter supports
   # editing) instead of posting a new bubble each interval.
@@ -1406,9 +1407,10 @@ display:
 
   # Include detailed iteration/tool/status context in busy acknowledgments
   # and long-running heartbeats. When true, busy acks show "iteration 21/60,
-  # terminal, 10 min" and the heartbeat shows "⏳ Working — 12 min,
-  # iteration 21/60, terminal". When false (Telegram default), both stay
-  # terse: "Interrupting current task" and "⏳ Working — 12 min, terminal".
+  # terminal, 10 min" and the heartbeat shows "⏳ Still working — about 12
+  # minutes in. / Latest update: iteration 21/60, terminal". When false
+  # (Telegram default), both stay terse: "Interrupting current task" and
+  # "⏳ Still working — about 12 minutes in. / Latest update: terminal".
   busy_ack_detail: true
 
   # What Enter does when Hermes is already busy (CLI and gateway platforms).

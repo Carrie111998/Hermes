@@ -134,7 +134,14 @@ def test_programmatic_surfaces_keep_raw_status():
         )
 
 
-@pytest.mark.parametrize("message", ["still on it", "⏳ Working — 3 min"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        "still on it",
+        # The real CoS heartbeat shape (gateway.heartbeat_text).
+        "⏳ Still working — about 3 minutes in.\nLatest update: iteration 4/40, delegate_task",
+    ],
+)
 def test_telegram_status_keeps_legitimate_heartbeat_messages(message):
     """The compression filter must not swallow user-facing work heartbeats."""
     assert _prepare_gateway_status_message(Platform.TELEGRAM, "lifecycle", message) == message

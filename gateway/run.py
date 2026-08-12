@@ -2433,6 +2433,7 @@ from gateway.session_state import (
     legacy_lease_token_property,
 )
 from gateway.authz_mixin import GatewayAuthorizationMixin
+from gateway.heartbeat_text import format_progress_heartbeat
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.turn_context import TurnContext
@@ -25278,7 +25279,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
         # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
-        # from the tool-progress / "⏳ Working — N min" / status-callback bubbles
+        # from the tool-progress / "⏳ Still working" / status-callback bubbles
         # are collected here and deleted after the final response lands.
         # Failed runs skip cleanup so the bubbles remain as breadcrumbs.
         _cleanup_progress = bool(
@@ -25816,13 +25817,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if _action:
                             _parts.append(str(_action))
                         if _parts:
-                            _status_detail = " — " + ", ".join(_parts)
+                            _status_detail = ", ".join(_parts)
                     except Exception:
                         pass
+                # Same wording as the kanban task heartbeat (shared renderer)
+                # so one user sees one style of "still working" ping whether
+                # the work is a CoS turn or a dispatched kanban task. This
+                # path has no task title or assignee, so those clauses are
+                # omitted; the activity detail plays the "latest update" role.
                 _heartbeat_text = (
                     _generic_status_phrase("status")
                     if _long_running_mode == "generic"
-                    else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
+                    else format_progress_heartbeat(
+                        elapsed_minutes=_elapsed_mins,
+                        note=_status_detail or None,
+                    )
                 )
                 try:
                     _notify_res = None
