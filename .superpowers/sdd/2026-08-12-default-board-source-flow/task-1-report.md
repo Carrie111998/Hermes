@@ -30,7 +30,7 @@ Commands and results:
 
 ## Commit
 
-`7d92ccd1adf2292dec7c57b4be3d36bfb0b6dc51` — `fix(kanban): expose default source policy`
+`a3b6dad5fa23ab94cc698ec4e5d1a16c9f6f84b5` — `fix(kanban): expose default source policy`
 
 ## Concerns
 
