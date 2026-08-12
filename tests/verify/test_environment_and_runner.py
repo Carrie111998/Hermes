@@ -8,6 +8,8 @@ import sys
 import threading
 import time
 
+import pytest
+
 from agent.verify.environment import (
     load_manifest,
     load_or_detect,
@@ -155,6 +157,42 @@ class TestReadiness:
                 break
         else:
             raise AssertionError("start process tree still owns the readiness port")
+
+    @pytest.mark.windows_only
+    def test_exited_launcher_descendant_is_terminated(self, tmp_path):
+        port = _free_port()
+        server = tmp_path / "server.py"
+        server.write_text(
+            "import http.server, sys\n"
+            "http.server.HTTPServer(('127.0.0.1', int(sys.argv[1])), "
+            "http.server.SimpleHTTPRequestHandler).serve_forever()\n",
+            encoding="utf-8",
+        )
+        launcher = tmp_path / "launcher.py"
+        launcher.write_text(
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, sys.argv[1], sys.argv[2]])\n",
+            encoding="utf-8",
+        )
+        command = subprocess.list2cmdline([sys.executable, str(launcher), str(server), str(port)])
+
+        result = run_verify(
+            tmp_path,
+            Recipe(name="exited-launcher", start=command, port=port),
+            phases=("start",),
+            ready_timeout=15,
+        )
+
+        assert result.ok
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                    time.sleep(0.05)
+            except OSError:
+                break
+        else:
+            raise AssertionError("descendant outlived its exited launcher")
 
     def test_readiness_against_live_server(self, tmp_path):
         port = _free_port()
