@@ -965,6 +965,39 @@ class TestSlackWorkspaceSessionKeys:
         unscoped = replace(source, scope_id=None, guild_id=None)
         assert build_session_key(unscoped) == "agent:main:slack:dm:D123"
 
+    def test_colon_bearing_legacy_binding_migrates_across_workspace_scope(
+        self, tmp_path, monkeypatch
+    ):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C:123",
+            chat_type="channel",
+            thread_id="1700000000.000001",
+            scope_id="T_ALPHA",
+        )
+        legacy_source = replace(source, scope_id=None, guild_id=None)
+        legacy_key = _legacy_session_key(legacy_source)
+        existing = SessionEntry(
+            session_key=legacy_key,
+            session_id="legacy-colon-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            origin=source,
+            platform=source.platform,
+            chat_type=source.chat_type,
+        )
+        store._entries[legacy_key] = existing
+
+        migrated = store.get_or_create_session(source)
+
+        assert migrated is existing
+        assert migrated.session_key == build_session_key(source)
+        assert legacy_key not in store._entries
+
 
     def test_scope_less_legacy_entry_is_not_adopted_by_a_workspace(
         self, tmp_path, monkeypatch

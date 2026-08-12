@@ -1910,7 +1910,7 @@ class SessionStore:
         if source.platform != Platform.SLACK or not source.scope_id:
             return None
         legacy_source = replace(source, scope_id=None, guild_id=None)
-        return build_session_key(
+        return _legacy_session_key(
             legacy_source,
             group_sessions_per_user=getattr(
                 self.config, "group_sessions_per_user", True
