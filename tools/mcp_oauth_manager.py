@@ -91,7 +91,7 @@ def _StrictRedirectAsyncClient(*args: Any, **kwargs: Any) -> Any:
     import types
     import httpx
 
-    redirect_origin = kwargs.pop("redirect_origin")
+    kwargs.pop("redirect_origin")
     configured_header_names = frozenset(kwargs.pop("configured_header_names"))
     client = httpx.AsyncClient(*args, **kwargs)
     original_builder = client._build_redirect_request
@@ -99,10 +99,11 @@ def _StrictRedirectAsyncClient(*args: Any, **kwargs: Any) -> Any:
     def build_redirect_request(self: Any, request: Any, response: Any) -> Any:
         next_request = original_builder(request, response)
         target = next_request.url
+        current = request.url
         if (target.scheme, target.host, target.port) != (
-            redirect_origin.scheme,
-            redirect_origin.host,
-            redirect_origin.port,
+            current.scheme,
+            current.host,
+            current.port,
         ):
             next_request.headers.pop("authorization", None)
             for name in configured_header_names:

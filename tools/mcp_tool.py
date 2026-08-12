@@ -3019,7 +3019,13 @@ class MCPServerTask:
         _configured_header_names = {key.lower() for key in headers}
         # Optional per-user identity header (config-gated; static or
         # profile-derived). Explicit headers of the same name win.
+        _configured_header_names_before_identity = set(_configured_header_names)
         headers = _apply_identity_header(self.name, config, headers)
+        _configured_header_names.update(
+            key.lower()
+            for key in headers
+            if key.lower() not in _configured_header_names_before_identity
+        )
         # Some MCP servers require MCP-Protocol-Version on the initial
         # initialize request and reject session-less POSTs otherwise.
         # Seed it as a client-level default, but treat user overrides as
