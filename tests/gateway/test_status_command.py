@@ -142,6 +142,99 @@ async def test_status_command_includes_live_agent_model_and_context():
 
 
 @pytest.mark.asyncio
+async def test_status_command_includes_live_agent_activity():
+    """Issue #83077: when the agent is running, /status must surface what it is
+    currently doing — iteration, running tool, and idle seconds — via the shared
+    AIAgent.get_activity_summary() contract (same source as the heartbeat)."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+        ),
+        interrupt=MagicMock(),
+        get_activity_summary=lambda: {
+            "current_tool": "web_fetch",
+            "api_call_count": 3,
+            "max_iterations": 20,
+            # >= 5s idle-display threshold → idle fragment is rendered.
+            "seconds_since_activity": 7.0,
+            "last_activity_desc": "executing tool: web_fetch",
+        },
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Activity:**" in result
+    assert "iteration 3/20" in result
+    assert "running: web_fetch" in result
+    assert "idle 7s" in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_agent_without_activity_summary_does_not_crash():
+    """Agents lacking get_activity_summary() (e.g. stub agents) must not crash
+    /status and must not render an Activity line."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    running_agent = SimpleNamespace(
+        model="openai/gpt-test",
+        provider="openai",
+        context_compressor=SimpleNamespace(
+            last_prompt_tokens=12_345,
+            context_length=100_000,
+        ),
+        interrupt=MagicMock(),
+    )
+    runner._running_agents[build_session_key(_make_source())] = running_agent
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Agent Running:** Yes" in result
+    assert "**Activity:**" not in result
+
+
+@pytest.mark.asyncio
+async def test_status_command_idle_shows_no_activity_block():
+    """When no agent is running, /status must not render an Activity line."""
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+
+    result = await runner._handle_message(_make_event("/status"))
+
+    assert "**Agent Running:** No" in result
+    assert "**Activity:**" not in result
+
+
+@pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())
     session_entry = SessionEntry(

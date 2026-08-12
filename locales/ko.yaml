@@ -328,6 +328,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "아니오"
     queued:                "**대기 중인 후속 작업:** {count}"
     platforms:             "**연결된 플랫폼:** {platforms}"
+    activity:              "**활동:** {detail}"
+    iteration:             "반복 {used}/{max}"
+    running:               "실행 중: {action}"
+    idle:                  "유휴 {seconds}초"
 
   stop:
     stopped_pending:       "⚡ 중지되었습니다. 에이전트가 아직 시작되지 않았습니다 — 이 세션을 계속할 수 있습니다."

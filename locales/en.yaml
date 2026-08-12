@@ -341,6 +341,10 @@ gateway:
     state_no:              "No"
     queued:                "**Queued follow-ups:** {count}"
     platforms:             "**Connected Platforms:** {platforms}"
+    activity:              "**Activity:** {detail}"
+    iteration:             "iteration {used}/{max}"
+    running:               "running: {action}"
+    idle:                  "idle {seconds}s"
 
   stop:
     stopped_pending:       "⚡ Stopped. The agent hadn't started yet — you can continue this session."

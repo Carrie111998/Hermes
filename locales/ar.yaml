@@ -330,6 +330,10 @@ gateway:
     state_no:              "لا"
     queued:                "**المتابعات في الطابور:** {count}"
     platforms:             "**المنصّات المتصلة:** {platforms}"
+    activity:              "**النشاط:** {detail}"
+    iteration:             "التكرار {used}/{max}"
+    running:               "قيد التشغيل: {action}"
+    idle:                  "خامل {seconds}ث"
 
   stop:
     stopped_pending:       "⚡ تم الإيقاف. لم يكن الوكيل قد بدأ بعد — يمكنك متابعة هذه الجلسة."

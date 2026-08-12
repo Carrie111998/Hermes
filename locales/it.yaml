@@ -328,6 +328,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "No"
     queued:                "**Follow-up in coda:** {count}"
     platforms:             "**Piattaforme connesse:** {platforms}"
+    activity:              "**Attività:** {detail}"
+    iteration:             "iterazione {used}/{max}"
+    running:               "in esecuzione: {action}"
+    idle:                  "inattivo {seconds}s"
 
   stop:
     stopped_pending:       "⚡ Fermato. L'agente non era ancora partito — puoi continuare questa sessione."

@@ -325,6 +325,10 @@ gateway:
     state_no:              "No"
     queued:                "**Seguimientos en cola:** {count}"
     platforms:             "**Plataformas conectadas:** {platforms}"
+    activity:              "**Actividad:** {detail}"
+    iteration:             "iteración {used}/{max}"
+    running:               "ejecutando: {action}"
+    idle:                  "inactivo {seconds}s"
 
   stop:
     stopped_pending:       "⚡ Detenido. El agente aún no había comenzado — puedes continuar esta sesión."

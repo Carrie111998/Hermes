@@ -328,6 +328,10 @@ Future messages in this room will use that transcript until `/reset` or another 
     state_no:              "いいえ"
     queued:                "**キュー内の後続:** {count}"
     platforms:             "**接続プラットフォーム:** {platforms}"
+    activity:              "**アクティビティ:** {detail}"
+    iteration:             "イテレーション {used}/{max}"
+    running:               "実行中: {action}"
+    idle:                  "アイドル {seconds}秒"
 
   stop:
     stopped_pending:       "⚡ 停止しました。エージェントはまだ開始していません — このセッションを続行できます。"
