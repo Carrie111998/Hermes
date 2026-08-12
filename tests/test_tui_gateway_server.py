@@ -12711,6 +12711,54 @@ def test_session_active_list_reports_foreign_db_rows(monkeypatch):
     assert "old_cli_session" not in rows
 
 
+def test_session_resume_does_not_reopen_ended_session(monkeypatch):
+    """#liveness-stale-end: abrir (resume) uma sessão finalizada é LEITURA —
+    a linha deve permanecer com ended_at set até o primeiro turno real
+    (prompt.submit). O resume atual reabre incondicionalmente."""
+    import uuid as _uuid
+
+    class _DB:
+        def __init__(self):
+            self.reopened = []
+
+        def get_session_title(self, key):
+            return ""
+
+        def get_session_by_title(self, key):
+            return None
+
+        def get_messages_as_conversation(self, target, repair_alternation=False):
+            return []
+
+        def get_resume_conversations(self, target):
+            return [], []
+
+        def reopen_session(self, session_id):
+            self.reopened.append(session_id)
+
+        def get_session(self, key):
+            return {"id": key, "ended_at": 123.0, "started_at": 100.0}
+
+    fake = _DB()
+    previous_sessions = dict(server._sessions)
+    server._sessions.clear()
+    monkeypatch.setattr(server, "_get_db", lambda: fake)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "finalized-1", "lazy": True},
+            }
+        )
+    finally:
+        server._sessions.clear()
+        server._sessions.update(previous_sessions)
+
+    assert resp.get("result") is not None, resp
+    assert fake.reopened == [], f"resume reabriu sessão finalizada: {fake.reopened}"
+
+
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
     """Switching into a still-running live session must hydrate partial output.
