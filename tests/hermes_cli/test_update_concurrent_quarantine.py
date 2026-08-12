@@ -735,6 +735,98 @@ def test_manual_serve_under_plain_parent_still_nominated(monkeypatch):
     ) == [400]
 
 
+# ---------------------------------------------------------------------------
+# serve/dashboard backend restart after update (#81774)
+#
+# The venv-holder guard stops headless serve/dashboard backends it cannot
+# otherwise clear (e.g. a manual secondary-profile serve). Gateways are
+# resumed by _resume_windows_gateways_after_update; serve/dashboard have no
+# supervisor, so their argv is captured before the kill and respawned when
+# the update finishes (_capture_serve_backend_argvs / _respawn_stopped_
+# serve_backends).
+# ---------------------------------------------------------------------------
+
+
+def _fake_psutil_capture(argv_by_pid):
+    """psutil stand-in exposing only the live argv for the respawn winnower."""
+
+    class FakeProc:
+        def __init__(self, pid):
+            if pid not in argv_by_pid:
+                raise ValueError(f"no such pid {pid}")
+            self._argv = argv_by_pid[pid]
+
+        def cmdline(self):
+            return list(self._argv)
+
+    return types.SimpleNamespace(Process=FakeProc)
+
+
+def test_capture_serve_backend_argvs_keeps_serve_drops_gateway(monkeypatch):
+    """The respawn winnower must snapshot a manual `serve` backend's argv but
+    NOT a gateway's (gateways are resumed by their own pause/resume token)."""
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_psutil_capture(
+            {
+                400: SERVE_ARGV,
+                500: GATEWAY_ARGV,
+            }
+        ),
+    )
+
+    argvs = cli_main._capture_serve_backend_argvs([400, 500])
+    assert argvs == [SERVE_ARGV]
+
+
+def test_capture_serve_backend_argvs_drops_unreadable(monkeypatch):
+    """A PID whose argv cannot be read is dropped, never a crash."""
+    monkeypatch.setitem(
+        sys.modules,
+        "psutil",
+        _fake_psutil_capture({}),
+    )
+    assert cli_main._capture_serve_backend_argvs([999]) == []
+
+
+def test_respawn_stopped_serve_backends_calls_shared_respawner(monkeypatch, capsys):
+    """The atexit restart delegates to the shared detached respawner, and
+    prints a manual hint only when a respawn failed."""
+    captured = False
+
+    def fake_respawn(commandss):
+        nonlocal captured
+        captured = True
+        assert commandss == [SERVE_ARGV]
+        return []  # nothing failed
+
+    monkeypatch.setattr(cli_main, "_respawn_dashboard_processes", fake_respawn)
+    cli_main._respawn_stopped_serve_backends([SERVE_ARGV])
+    out = capsys.readouterr().out
+    assert captured is True
+    assert "Restart any backend not auto-restarted" not in out
+
+    def fake_respawn_fail(commandss):
+        return [SERVE_ARGV]
+
+    monkeypatch.setattr(cli_main, "_respawn_dashboard_processes", fake_respawn_fail)
+    cli_main._respawn_stopped_serve_backends([SERVE_ARGV])
+    out = capsys.readouterr().out
+    assert "Restart any backend not auto-restarted" in out
+
+
+def test_respawn_stopped_serve_backends_is_noop_for_empty(monkeypatch):
+    """No captured argvs → nothing respawned, no output."""
+    called = []
+    monkeypatch.setattr(cli_main, "_respawn_dashboard_processes", lambda cmds: called.append(cmds))
+    cli_main._respawn_stopped_serve_backends([])
+    assert called == []
+
+
+
+
+
 
 
 

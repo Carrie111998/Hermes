@@ -161,3 +161,36 @@ def test_rejects_non_pausable(cmd):
     assert matches_pausable(cmd) is False
 
 
+# ---------------------------------------------------------------------------
+# _top_level_value_flags — derived from the authoritative parser source
+#
+# The subcommand matcher must skip the VALUES of top-level value-taking flags
+# (e.g. ``--model gpt5 serve`` dispatches ``serve``). The value-flag set is
+# derived from ``hermes_cli.main._TOP_LEVEL_VALUE_FLAGS`` (the canonical list
+# mirroring ``hermes_cli/_parser.py``), so adding/removing a top-level flag in
+# the real parser cannot silently drift this matcher into a misparse.
+# ---------------------------------------------------------------------------
+
+
+def test_top_level_value_flags_derives_from_main():
+    from gateway.status import _top_level_value_flags
+    from hermes_cli.main import _TOP_LEVEL_VALUE_FLAGS as main_value_flags
+
+    assert _top_level_value_flags() == main_value_flags
+
+
+def test_top_level_value_flags_covers_signal_shape_specimen():
+    """The canonical set must at least understand the specimen the triage
+    flagged (`--model gpt5 serve`) and the stable value-flags.
+
+    ``--profile``/``-p`` is deliberately NOT in this set — the matcher strips
+    it and its value inline before the value-flag walk, because a profile
+    literally named ``serve``/``gateway`` must not shadow the subcommand.
+    """
+    from gateway.status import _top_level_value_flags
+
+    flags = _top_level_value_flags()
+    assert {"-m", "--model", "--provider", "--in", "-t", "--toolsets"} <= flags, flags
+    assert "-p" not in flags and "--profile" not in flags, flags
+
+

@@ -234,3 +234,78 @@ def test_main_exempts_serve_backend_but_keeps_other_holders(monkeypatch, capsys)
     assert data["blocked"] is True
     assert [p["pid"] for p in data["processes"]] == [56]
     assert data["pausable_gateways"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Desktop-managed classification consistency (#81869 triage)
+#
+# The venv-holder GUARD refuses on a Desktop-supervised serve/dashboard
+# backend (the app respawns it within seconds, so stopping it is futile). The
+# preflight MUST classify the same holder as a blocker too, or a terminal
+# `hermes update` while the Desktop is open reads "clear" from the preflight
+# and then hard-refuses in the guard — the no-drift invariant the triage asked
+# for. The shared predicate is `_is_pausable_hermes_process(cmdline, proc)`,
+# which both the preflight `main()` and the guard call.
+# ---------------------------------------------------------------------------
+
+
+def _psutil_desktop_fake(env_by_pid: dict[int, dict]) -> dict:
+    """psutil stand-in whose Process exposes per-pid environ.
+
+    `parent` and `pid` raise AttributeError (not modelled), so the env signal
+    alone decides — exactly the real "unreadable env / parent" contract that
+    a fake argv-only process must degrade to.
+    """
+
+    class FakeProc:
+        def __init__(self, pid):
+            if not isinstance(pid, int):
+                raise ValueError("pid must be int")
+            self._env = env_by_pid.get(pid, {})
+
+        def environ(self):
+            return self._env
+
+        def parent(self):
+            raise AttributeError("parent not modelled")
+
+        @property
+        def pid(self):
+            raise AttributeError("pid not modelled")
+
+    return {"psutil": types.SimpleNamespace(Process=FakeProc)}
+
+
+def test_preflight_blocks_desktop_managed_serve_like_the_guard(monkeypatch, capsys):
+    """A Desktop-supervised serve backend (HERMES_DESKTOP=1) must scan BLOCKED
+    in the preflight — the same verdict the venv-holder guard gives — so the
+    two views of a desktop-open update cannot drift ("clear" preflight, hard
+    refusal in the guard)."""
+    serve_arg = (
+        r"C:\x\venv\Scripts\python.exe -m hermes_cli.main --profile secondary serve"
+    )
+    holders = [(88, "python.exe", serve_arg)]
+
+    for name, mod in _psutil_desktop_fake({88: {"HERMES_DESKTOP": "1"}}).items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    import hermes_cli.main as cli_main
+
+    monkeypatch.setattr(cli_main, "_detect_venv_python_processes", lambda: holders)
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    data = json.loads(capsys.readouterr().out)
+    assert excinfo.value.code == 0
+    assert data["blocked"] is True
+    assert [p["pid"] for p in data["processes"]] == [88]
+    assert data["pausable_gateways"] == 0
+
+    # A manually-started (non-desktop) serve backend stays clear — the
+    # secondary-profile #81774 case the updater can reap itself.
+    for name, mod in _psutil_desktop_fake({88: {"HERMES_DESKTOP": None}}).items():
+        monkeypatch.setitem(sys.modules, name, mod)
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+    data = json.loads(capsys.readouterr().out)
+    assert data["blocked"] is False
+    assert data["processes"] == []
+    assert data["pausable_gateways"] == 1

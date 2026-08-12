@@ -34,7 +34,7 @@ import sys
 import time as _time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from hermes_cli.config import get_hermes_home
 from hermes_constants import venv_python_path
@@ -3031,99 +3031,6 @@ def _venv_launcher_ancestors(pids: list[int]) -> list[int]:
     return found
 
 
-def _parse_desktop_child_pids(raw: str | None) -> set[int]:
-    """Parse the Desktop's ``HERMES_DESKTOP_CHILD_PID`` env value.
-
-    The Desktop hands the update process the PIDs of every backend it
-    manages (comma-separated; a lone int parses for back-compat) so the
-    reaper can skip them — the same value ``_kill_stale_dashboard_processes``
-    reads from its own environment. Tolerant of junk, exactly like that
-    reader. Returns an empty set when unset or unparsable.
-    """
-    if not raw:
-        return set()
-    parsed: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            parsed.add(int(part))
-        except (ValueError, TypeError):
-            pass
-    return parsed
-
-
-def _is_desktop_managed_backend(proc: Any, argv: str) -> bool:
-    """Return True when *proc* is a ``serve``/``dashboard`` backend the
-    Desktop app spawned and supervises.
-
-    The Desktop marks every backend it spawns (primary + pool profiles) with
-    ``HERMES_DESKTOP=1`` in the child environment (apps/desktop/electron/
-    main.ts), the same marker that routes the backend into its cron ticker.
-    Killing a desktop-managed backend is futile — the app respawns it within
-    seconds — so the pausable classification must refuse on it, exactly as
-    ``_orphaned_desktop_backend_pids`` refuses on any live-parent backend.
-
-    Three signals, first hit wins:
-
-    - ``HERMES_DESKTOP=1`` in the holder's own environment — authoritative,
-      works even when the parent hop is a ``cmd.exe`` launcher, and cannot
-      be confused with a manually-started backend.
-    - the holder's PID in OUR ``HERMES_DESKTOP_CHILD_PID`` — the Desktop
-      passes the PIDs of every backend it manages to the update process it
-      spawns (the same list ``_kill_stale_dashboard_processes`` reads and
-      skips); a holder on that list is desktop-managed by the Desktop's own
-      admission.
-    - parent fallback for unreadable holder env: a live parent whose
-      executable is the packaged Electron app
-      (``.../release/<plat>-unpacked/Hermes[.exe]``).
-
-    psutil errors never raise — an undecidable holder simply does not count
-    as desktop-managed and the pausable classification stands.
-    """
-    try:
-        env = proc.environ() or {}
-        marker = env.get("HERMES_DESKTOP")
-        if isinstance(marker, bytes):
-            marker = marker.decode("utf-8", "replace")
-        if str(marker) == "1":
-            return True
-    except Exception:
-        pass  # fall through to the parent check
-
-    try:
-        if int(proc.pid) in _parse_desktop_child_pids(
-            os.environ.get("HERMES_DESKTOP_CHILD_PID")
-        ):
-            return True
-    except (TypeError, ValueError, AttributeError):
-        pass
-
-    try:
-        parent = proc.parent()
-    except Exception:
-        return False
-    if parent is None or not parent.is_running():
-        return False
-    low = argv.lower()
-    if not (
-        "hermes_cli.main" in low
-        and (
-            " serve" in low
-            or " dashboard" in low
-            or low.endswith(" serve")
-            or low.endswith(" dashboard")
-        )
-    ):
-        return False
-    try:
-        parent_low = (parent.exe() or "").lower()
-    except Exception:
-        return False
-    return parent_low.endswith(("hermes.exe", "hermes")) and "-unpacked" in parent_low
-
-
 def _leftover_pausable_gateway_pids(
     matches: list[tuple[int, str, str]],
 ) -> list[int] | None:
@@ -3141,19 +3048,20 @@ def _leftover_pausable_gateway_pids(
     (``_kill_stale_dashboard_processes``), so it too must not dead-end the
     guard.
 
-    Holders are classified with the same matcher the Desktop preflight uses
-    to exempt them (``_is_pausable_hermes_process``), so the preflight's
-    exemption and this guard's tolerance cannot drift apart — matcher drift
-    between two views of the same process table is what produced the
-    launcher/worker dead-end fixed above. The scan captures only a 120-char
-    cmdline prefix, so the live argv is re-read where psutil allows; an
-    unreadable argv falls back to the captured prefix.
+    Holders are classified with the same shared predicate the Desktop
+    preflight uses to exempt them (``_scan_venv_blockers._is_pausable_
+    hermes_process``), so the preflight's exemption and this guard's
+    tolerance cannot drift apart — matcher drift between two views of the
+    same process table is what produced the launcher/worker dead-end fixed
+    above. The scan captures only a 120-char cmdline prefix, so the live argv
+    is re-read where psutil allows; an unreadable argv falls back to the
+    captured prefix.
 
     Desktop-MANAGED ``serve``/``dashboard`` backends are excluded from the
-    pausable class: the Desktop app marks its spawned backends with
-    ``HERMES_DESKTOP=1`` in their environment, and killing one is futile
-    (the app supervises and respawns it within seconds — see
-    ``_orphaned_desktop_backend_pids`` below for that contract, and
+    pausable class inside that same shared predicate: the Desktop app marks
+    its spawned backends with ``HERMES_DESKTOP=1`` in their environment, and
+    killing one is futile (the app supervises and respawns it within seconds
+    — see ``_orphaned_desktop_backend_pids`` below for that contract, and
     ``_kill_stale_dashboard_processes`` for the identical
     ``HERMES_DESKTOP_CHILD_PID`` skip). A desktop-owned holder therefore
     keeps the hard refusal; only backends the updater genuinely reaps later
@@ -3181,9 +3089,11 @@ def _leftover_pausable_gateway_pids(
                 argv = " ".join(proc.cmdline()) or cmdline
             except Exception:
                 pass
-        if not _is_pausable_hermes_process(argv):
-            return None
-        if proc is not None and _is_desktop_managed_backend(proc, argv):
+        # _is_pausable_hermes_process folds in the desktop-managed exclusion
+        # (it refuses when *proc* is a Desktop-supervised serve/dashboard
+        # backend), so the guard and the Desktop preflight classify one argv
+        # identically via the single shared predicate.
+        if not _is_pausable_hermes_process(argv, proc):
             # The Desktop app is still open and would respawn this backend
             # within seconds; stopping it here is futile. Keep the hard
             # refusal (the same contract _orphaned_desktop_backend_pids
@@ -3191,6 +3101,89 @@ def _leftover_pausable_gateway_pids(
             return None
         pids.append(int(pid))
     return pids
+
+
+def _capture_serve_backend_argvs(pids: list[int]) -> list[list[str]]:
+    """Read the live argv of *pids* that are headless ``serve``/``dashboard``
+    backends (excluding gateways) so they can be respawned after the update.
+
+    The venv-holder guard nominates both gateways and ``serve``/``dashboard``
+    backends for ``terminate_pid``. Gateways are brought back later by
+    ``_resume_windows_gateways_after_update`` (the pause→resume token), but
+    a manually-started ``serve`` backend — e.g. a secondary profile's, the
+    #81774 case — has no supervisor to respawn it: ``_kill_stale_dashboard_
+    processes`` restarts it only when it itself kills a *still-running* PID,
+    and by the time that reaper runs the guard has already removed the
+    backend from the process table. So we snapshot the exact argv here and
+    respawn it after the update completes.
+
+    ``_respawn_dashboard_processes`` keeps respawns detached and headless
+    (logs to ``logs/dashboard-restart.log``); on failure the caller prints
+    the manual re-launch hint. psutil/read failures simply drop the PID — a
+    backend we cannot reconstruct stays down with the manual hint.
+
+    Returns the argv lists (each its ``proc.cmdline()``), never raises.
+    """
+    from gateway.status import (
+        looks_like_pausable_hermes_process,
+        looks_like_gateway_command_line,
+    )
+
+    try:
+        import psutil  # type: ignore
+    except Exception:
+        psutil = None
+
+    argvs: list[list[str]] = []
+    if psutil is None:
+        return argvs
+    for pid in pids:
+        try:
+            raw = psutil.Process(int(pid)).cmdline()
+        except Exception:
+            continue
+        if not raw:
+            continue
+        argv_str = " ".join(str(t) for t in raw)
+        # A serve/dashboard backend (pausable) that is NOT a gateway chain.
+        if (
+            looks_like_pausable_hermes_process(argv_str)
+            and not looks_like_gateway_command_line(argv_str)
+        ):
+            argvs.append([str(t) for t in raw])
+    return argvs
+
+
+def _respawn_stopped_serve_backends(argvs: list[list[str]]) -> None:
+    """Bring back headless ``serve``/``dashboard`` backends the venv-holder
+    guard stopped, after the update has swapped the code underneath them.
+
+    Registered as an ``atexit`` handler by ``_cmd_update_impl`` right after it
+    nominates the pids (see ``_capture_serve_backend_argvs``). Because it is
+    ``atexit``-registered it also runs when the update exits early (the venv
+    guard finding a non-pausable holder, a failed install) — the backend was
+    already killed, so the least-surprise behaviour is to restore it rather
+    than leave the user's profile silently offline.
+
+    Delegates to ``hermes_cli.main._respawn_dashboard_processes``, which
+    starts each recovered argv detached and headless (output to
+    ``logs/dashboard-restart.log``); any command it fails to spawn is already
+    printed with the manual re-launch hint there. Never raises.
+    """
+    if not argvs:
+        return
+    try:
+        from hermes_cli.main import _respawn_dashboard_processes  # noqa: PLC0415
+    except Exception:
+        return
+    try:
+        failed = _respawn_dashboard_processes(argvs)
+    except Exception:
+        return
+    if failed:
+        print()
+        print("  Restart any backend not auto-restarted when you're ready:")
+        print("    hermes serve --profile <profile>   (or: hermes dashboard --port <port>)")
 
 
 def _orphaned_desktop_backend_pids(
@@ -3981,12 +3974,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 # (`_kill_stale_dashboard_processes`). Stop them and
                 # re-check instead of dead-ending; the post-update resume
                 # (and the supervisor that respawned them) brings gateways
-                # back afterwards.
+                # back afterwards. Headless serve/dashboard backends have no
+                # supervisor, so snapshot their argv BEFORE killing and
+                # respawn them when the update finishes (#81774).
                 from gateway.status import terminate_pid
 
                 print(
                     f"  ⚠ {len(_gateway_holders)} Hermes backend process(es) "
                     "still hold the venv after the pause; stopping them"
+                )
+                _restart_serve_argvs = _m()._capture_serve_backend_argvs(
+                    _gateway_holders
                 )
                 for _pid in _gateway_holders:
                     try:
@@ -3995,6 +3993,13 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         logger.debug(
                             "Could not stop leftover gateway %s: %s", _pid, exc
                         )
+                if _restart_serve_argvs:
+                    import atexit as _atexit
+
+                    _atexit.register(
+                        _m()._respawn_stopped_serve_backends,
+                        _restart_serve_argvs,
+                    )
                 _time.sleep(1.0)
                 _venv_holders = _m()._detect_venv_python_processes()
         if _venv_holders:

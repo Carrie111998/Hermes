@@ -37,11 +37,19 @@ else:
 # Top-level flags that take a value. Used by ``_hermes_subcommand`` so that
 # in ``-m hermes_cli.main --model gpt5 serve``, ``gpt5`` is correctly
 # skipped as a flag value rather than misclassified as the subcommand.
-# Mirrors ``hermes_cli.main._TOP_LEVEL_VALUE_FLAGS`` (the canonical list,
-# kept in sync with ``hermes_cli/_parser.py``); ``--profile``/``-p`` is
-# handled inline because it is stripped from argv by ``_apply_profile_override``
-# before argparse runs and never appears on the parser.
-_TOP_LEVEL_VALUE_FLAGS = frozenset(
+# ``--profile``/``-p`` is handled inline because it is stripped from argv by
+# ``_apply_profile_override`` before argparse runs and never appears on the
+# parser.
+#
+# The authoritative copy lives on ``hermes_cli.main`` (kept in sync with the
+# options declared in ``hermes_cli/_parser.py``). We derive from it lazily so
+# a re-adding/removing a top-level value-flag in the real parser is picked up
+# here instead of silently drifting into a misparsed subcommand. The import
+# is deliberately deferred: ``hermes_cli.main`` is a heavy module and
+# ``gateway.status`` runs inside the Desktop preflight, so pulling it in at
+# import time would bloat every status call. On failure we fall back to a
+# bundled copy, which stays correct for the known stable flags.
+_FALLBACK_TOP_LEVEL_VALUE_FLAGS = frozenset(
     {
         "-z", "--oneshot",
         "-m", "--model",
@@ -54,6 +62,30 @@ _TOP_LEVEL_VALUE_FLAGS = frozenset(
         "-c", "--continue",
     }
 )
+_top_level_value_flags_cache: frozenset[str] | None = None
+
+
+def _top_level_value_flags() -> frozenset[str]:
+    """Return the top-level value-taking flags (derived, then cached).
+
+    Derives once from ``hermes_cli.main._TOP_LEVEL_VALUE_FLAGS`` — the
+    canonical list mirroring the real parser — so this module cannot drift
+    from it. Falls back to the bundled copy if that import fails or lacks the
+    attribute (keep serving the preflight / matcher regardless).
+    """
+    global _top_level_value_flags_cache
+    if _top_level_value_flags_cache is None:
+        derived = _FALLBACK_TOP_LEVEL_VALUE_FLAGS
+        try:
+            from hermes_cli.main import (  # noqa: PLC0415
+                _TOP_LEVEL_VALUE_FLAGS as _main_value_flags,
+            )
+        except Exception:
+            _main_value_flags = None
+        if isinstance(_main_value_flags, frozenset) and _main_value_flags:
+            derived = _main_value_flags
+        _top_level_value_flags_cache = derived
+    return _top_level_value_flags_cache
 
 _GATEWAY_KIND = "hermes-gateway"
 _RUNTIME_STATUS_FILE = "gateway_state.json"
@@ -542,7 +574,7 @@ def _hermes_subcommand(command: str | None) -> str | None:
             if "=" in token:
                 i += 1
                 continue
-            if token in _TOP_LEVEL_VALUE_FLAGS and i + 1 < len(filtered):
+            if token in _top_level_value_flags() and i + 1 < len(filtered):
                 i += 2
                 continue
             i += 1
