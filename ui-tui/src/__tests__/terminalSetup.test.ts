@@ -335,7 +335,7 @@ describe('configureTerminalKeybindings', () => {
     const readMissing = vi.fn().mockRejectedValue(Object.assign(new Error('missing'), { code: 'ENOENT' }))
     await expect(
       shouldPromptForTerminalSetup({
-        env: { TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv,
+        env: { TERM_PROGRAM: 'vscode', APPDATA: 'C:/Users/me/AppData/Roaming' } as NodeJS.ProcessEnv,
         fileOps: { readFile: readMissing }
       })
     ).resolves.toBe(true)
@@ -383,7 +383,7 @@ describe('configureTerminalKeybindings', () => {
 
     await expect(
       shouldPromptForTerminalSetup({
-        env: { TERM_PROGRAM: 'vscode' } as NodeJS.ProcessEnv,
+        env: { TERM_PROGRAM: 'vscode', APPDATA: 'C:/Users/me/AppData/Roaming' } as NodeJS.ProcessEnv,
         fileOps: { readFile: readComplete }
       })
     ).resolves.toBe(false)
