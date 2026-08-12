@@ -50,6 +50,18 @@ def _make_packaged_executable(root: Path, monkeypatch, platform: str = "darwin")
     return exe
 
 
+def _symlink_file_or_skip(link: Path, target: Path) -> None:
+    """Create *link* -> *target*, skipping when the OS refuses.
+
+    Windows needs Developer Mode or an elevated process to create symlinks;
+    without it ``symlink_to`` raises OSError [WinError 1314].
+    """
+    try:
+        link.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"symlinks unavailable in test environment: {exc}")
+
+
 def test_gui_installs_packages_and_launches_desktop_app(tmp_path, monkeypatch):
     root = _make_desktop_tree(tmp_path)
     desktop_dir = root / "apps" / "desktop"
@@ -159,7 +171,11 @@ def test_gui_exits_when_npm_missing(tmp_path, monkeypatch, capsys):
     root = _make_desktop_tree(tmp_path)
     monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
 
-    with patch("hermes_cli.main.shutil.which", return_value=None), \
+    # Patch the resolver cmd_gui actually calls. ``shutil.which`` is not it:
+    # on Windows ``find_node_executable_on_path`` walks PATH itself (to prefer
+    # the launchable ``npm.cmd`` shim), so a patched ``which`` is ignored and a
+    # real npm gets resolved.
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value=None), \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
 
@@ -227,7 +243,7 @@ def test_gui_linux_rejects_symlink_sandbox(tmp_path, monkeypatch):
     target = tmp_path / "dangerous"
     target.write_text("pwned", encoding="utf-8")
     sandbox = packaged_exe.parent / "chrome-sandbox"
-    sandbox.symlink_to(target)
+    _symlink_file_or_skip(sandbox, target)
 
     with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/sudo"), \
          patch("hermes_cli.main.subprocess.run") as mock_run, \
@@ -312,7 +328,9 @@ def test_gui_source_mode_uses_renderer_build_and_electron(tmp_path, monkeypatch)
     build_ok = subprocess.CompletedProcess(["npm", "run", "build"], 0)
     launch_ok = subprocess.CompletedProcess(["npm", "exec", "--", "electron", "."], 0)
 
-    with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+    # ``_resolve_node_runtime_npm``, not ``shutil.which``, is the seam cmd_gui
+    # resolves npm through — see test_gui_exits_when_npm_missing.
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
          patch("hermes_cli.main._run_npm_install_deterministic", return_value=install_ok), \
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._write_desktop_build_stamp"), \
@@ -351,7 +369,10 @@ def test_desktop_build_stamp_skips_build_when_up_to_date(tmp_path, monkeypatch):
 
     launch_ok = subprocess.CompletedProcess([], 0)
 
-    with patch("hermes_cli.main._desktop_build_needed", return_value=False), \
+    # npm is resolved before the stamp check, so it must be stubbed even though
+    # this test is about skipping the build.
+    with patch("hermes_cli.main._resolve_node_runtime_npm", return_value="/usr/bin/npm"), \
+         patch("hermes_cli.main._desktop_build_needed", return_value=False), \
          patch("hermes_cli.main._run_npm_install_deterministic") as mock_install, \
          patch("hermes_cli.main.subprocess.run", return_value=launch_ok) as mock_run, \
          patch("hermes_cli.main._desktop_macos_relaunchable_fixup"), \
