@@ -6,7 +6,7 @@ name: orshot
 description: >-
   Render on-brand images, PDFs, and video from reusable templates —
   plus brand kit, template design, and automation workflows.
-source: https://orshot.com/docs/integrations/mcp-server
+source: https://orshot.com/agents/hermes
 
 # Orshot ships a hosted remote MCP server with native OAuth 2.1 + Dynamic
 # Client Registration over Streamable HTTP. Hermes's MCP client +
