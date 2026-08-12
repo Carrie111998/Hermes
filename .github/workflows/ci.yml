@@ -269,11 +269,25 @@ jobs:
       - lockfile-diff
       - docker-lint
       - supply-chain
-      - review-labels
       - osv-scanner
       # comment-live is a polling job — it doesn't block the gate.
       # we don't require docker to pass rn because it's so slow lol
       # - docker
+      #
+      # review-labels is deliberately NOT in this list, and the consequence is
+      # worth stating rather than discovering: a PR that touches CI-sensitive
+      # files (workflows, actions, eslint config), changes the MCP catalog, or
+      # trips a critical supply-chain finding can now merge with **no human
+      # having looked at it**. That gate asks for the `ci-reviewed` label, and a
+      # label is by definition something a person adds — so requiring it here
+      # would mean every such PR waits for a human, which is the opposite of
+      # what this repo's automation is for.
+      #
+      # It still runs, and still reports red on the PR, so the signal is not
+      # gone — it just doesn't block. Removed on the owner's explicit
+      # instruction, in the same change that made this gate real; before that
+      # it never blocked anything anyway, because nothing was waiting on the
+      # aggregator. Put it back by restoring the line.
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 10

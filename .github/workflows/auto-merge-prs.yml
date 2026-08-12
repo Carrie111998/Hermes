@@ -1,61 +1,101 @@
 name: Auto-Merge Pull Requests
 
+# Merge a PR when — and only when — CI's aggregate gate has actually passed.
+#
+# ── Why this changed ────────────────────────────────────────────────────────
+#
+# This used to trigger on `pull_request: [opened, ready_for_review]` and call
+# `gh pr merge --auto` straight away. `--auto` does not wait for CI on its own:
+# it waits for whatever *branch protection* requires. This repo has no required
+# status checks configured, so "wait for the required checks" resolved to "wait
+# for nothing" and PRs merged within seconds of being opened, before CI could
+# finish or fail.
+#
+# That is not hypothetical. #183 merged with `All required checks pass` RED.
+# #185 merged 11 seconds after it was created. Neither was reviewed by CI in
+# any meaningful sense.
+#
+# So the trigger is now the *completion of the CI workflow*, and the decision
+# is read from the `All required checks pass` check run on the head commit —
+# the aggregator job that already encodes which lanes are required (see
+# `all-checks-pass` in ci.yml). A lane that is `skipped` counts as passing
+# there, so a Python-only PR is not held up waiting on frontend lanes.
+#
+# Keyed on that check run rather than on `workflow_run.conclusion`, and the
+# difference matters: the CI workflow as a whole can conclude `failure` because
+# of a lane nobody requires — the Docker build is deliberately left out of the
+# gate's `needs` list, with a comment saying so. Gating on the workflow's
+# overall conclusion would block merges on lanes the repo has explicitly
+# decided are not blocking. The aggregator is the contract; read the contract.
+#
+# ── One re-run, then stop ───────────────────────────────────────────────────
+#
+# A red gate blocks the merge. If the run has not already been retried, its
+# failed jobs are re-run once — the known `ui-tui / check` flake
+# (`ink-resize.test.ts`, seen once on #183's run and not reproducible in 23
+# local runs) should not permanently wedge a good PR. The re-run produces a
+# fresh `workflow_run` completion, which re-enters this workflow at attempt 2,
+# where the retry is not offered again. A genuinely broken PR therefore fails
+# twice and stays blocked, which is the intended outcome.
+#
+# ── What this is not ────────────────────────────────────────────────────────
+#
+# This is a workflow-level gate, not branch protection. It stops *this
+# automation* from merging red, which is the hole that actually bit us three
+# times. It does not stop a human merging by hand, or a direct push to main.
+# Requiring `All required checks pass` in the branch rules is still the real
+# fence; it composes with this rather than being replaced by it.
+
 on:
-  pull_request:
+  workflow_run:
+    workflows:
+      - CI
     types:
-      - opened
-      - ready_for_review
-      - reopened
-  pull_request_review:
-    types:
-      - submitted
+      - completed
   workflow_dispatch:
     inputs:
       pull_request_number:
-        description: 'Pull request number (leave empty to enable on all open PRs)'
+        description: 'Pull request number (leave empty to evaluate all open PRs)'
         required: false
         type: string
 
 concurrency:
-  group: auto-merge-${{ github.event.pull_request.number }}
+  # Keyed on the head SHA for workflow_run (the PR number is not a top-level
+  # field on that event) and on the input for a manual dispatch.
+  group: auto-merge-${{ github.event.workflow_run.head_sha || github.event.inputs.pull_request_number || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   auto-merge:
     name: Enable Auto-Merge
     runs-on: ubuntu-latest
+    # Fork PRs never reach the merge path. `workflow_run` runs in the base
+    # repo's context with a write token, so honouring one for code that came
+    # from a fork would hand that token's reach to anyone who can open a PR.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.head_repository.full_name == github.repository
     permissions:
       pull-requests: write
       contents: write
+      checks: read
+      actions: write # re-run failed jobs
     steps:
-      - name: Enable auto-merge for pull request(s)
+      - name: Merge PRs whose required checks have passed
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+          INPUT_PR: ${{ github.event.inputs.pull_request_number }}
         run: |
-          REPO=${{ github.repository }}
+          set -euo pipefail
 
-          # Determine which PRs to process
-          if [ -n "${{ github.event.inputs.pull_request_number }}" ]; then
-            # Manual trigger with specific PR - validate input (must be numeric)
-            INPUT="${{ github.event.inputs.pull_request_number }}"
-            if ! echo "$INPUT" | grep -qE '^[0-9]( [0-9])*$'; then
-              echo "Error: Invalid PR number format. Must be numeric, space-separated."
-              exit 1
-            fi
-            PR_NUMBERS="$INPUT"
-          elif [ -n "${{ github.event.pull_request.number }}" ]; then
-            # Automatic trigger from PR event
-            PR_NUMBERS="${{ github.event.pull_request.number }}"
-          else
-            # Manual trigger without PR number - enable on all open PRs
-            echo "Fetching all open PRs..."
-            PR_NUMBERS=$(gh pr list --repo $REPO --state open --json number --jq '.[].number' | tr '\n' ' ')
-          fi
-
-          if [ -z "$PR_NUMBERS" ]; then
-            echo "No PRs to process"
-            exit 0
-          fi
-
-          echo "Processing PRs: $PR_NUMBERS"
+          # The single check run that decides everything. Must match the `name:`
+          # of the `all-checks-pass` job in ci.yml.
+          GATE='All required checks pass'
 
           retry_with_backoff() {
             local max_attempts=3
@@ -69,7 +109,7 @@ jobs:
                 exitcode=$?
               fi
               if [ $attempt -lt $max_attempts ]; then
-                echo "Attempt $attempt failed. Retrying in ${timeout}s..."
+                echo "  attempt $attempt failed; retrying in ${timeout}s..."
                 sleep $timeout
                 timeout=$((timeout * 2))
               fi
@@ -78,30 +118,107 @@ jobs:
             return $exitcode
           }
 
-          for PR_NUMBER in $PR_NUMBERS; do
-            echo "Processing PR #$PR_NUMBER..."
+          # ── Which PRs are we deciding about? ──────────────────────────────
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ -n "$INPUT_PR" ]; then
+              if ! echo "$INPUT_PR" | grep -qE '^[0-9]+( [0-9]+)*$'; then
+                echo "Error: PR numbers must be numeric and space-separated."
+                exit 1
+              fi
+              PR_NUMBERS="$INPUT_PR"
+            else
+              PR_NUMBERS=$(gh pr list --repo "$REPO" --state open --json number --jq '.[].number' | tr '\n' ' ')
+            fi
+          else
+            # Every open PR whose head is the commit CI just finished. Uses the
+            # commit→PR endpoint rather than `workflow_run.pull_requests`,
+            # which is empty in several documented cases.
+            PR_NUMBERS=$(gh api "repos/$REPO/commits/$HEAD_SHA/pulls" \
+              --jq '.[] | select(.state == "open") | .number' | tr '\n' ' ')
+          fi
 
-            # Check if PR is already merged or closed (with retry)
-            PR_STATE=$(retry_with_backoff gh pr view $PR_NUMBER --repo $REPO --json state --jq '.state') || {
-              echo "  ✗ Failed to fetch PR #$PR_NUMBER state after retries"
+          if [ -z "${PR_NUMBERS// /}" ]; then
+            echo "No open PRs to evaluate."
+            exit 0
+          fi
+
+          echo "Evaluating PRs: $PR_NUMBERS"
+          RERUN_REQUESTED=0
+
+          for PR_NUMBER in $PR_NUMBERS; do
+            echo "PR #$PR_NUMBER"
+
+            PR_JSON=$(retry_with_backoff gh pr view "$PR_NUMBER" --repo "$REPO" \
+              --json state,isDraft,headRefOid,labels) || {
+              echo "  ✗ could not read PR #$PR_NUMBER after retries"
               continue
             }
 
-            if [ "$PR_STATE" = "MERGED" ] || [ "$PR_STATE" = "CLOSED" ]; then
-              echo "  PR #$PR_NUMBER is already $PR_STATE, skipping"
+            STATE=$(jq -r '.state' <<<"$PR_JSON")
+            IS_DRAFT=$(jq -r '.isDraft' <<<"$PR_JSON")
+            PR_SHA=$(jq -r '.headRefOid' <<<"$PR_JSON")
+            HELD=$(jq -r '[.labels[].name] | index("do-not-merge") // empty' <<<"$PR_JSON")
+
+            if [ "$STATE" != "OPEN" ]; then
+              echo "  already $STATE — skipping"
               continue
             fi
 
-            # Enable auto-merge with squash merge strategy (with retry and exponential backoff)
-            if retry_with_backoff gh pr merge $PR_NUMBER \
-              --repo $REPO \
-              --auto \
+            if [ "$IS_DRAFT" = "true" ]; then
+              echo "  draft — skipping"
+              continue
+            fi
+
+            # A human escape hatch that survives all of this automation.
+            if [ -n "$HELD" ]; then
+              echo "  labelled do-not-merge — skipping"
+              continue
+            fi
+
+            # Guard against a stale event: CI may have finished for a commit
+            # that has since been superseded by a push.
+            if [ "$EVENT_NAME" = "workflow_run" ] && [ "$PR_SHA" != "$HEAD_SHA" ]; then
+              echo "  head moved on ($HEAD_SHA -> $PR_SHA) — skipping, the newer run decides"
+              continue
+            fi
+
+            # ── The gate ────────────────────────────────────────────────────
+            # `filter=latest` is the endpoint's default, but state it: after a
+            # re-run there are several check runs by this name and only the
+            # newest one is the current verdict.
+            CONCLUSION=$(gh api "repos/$REPO/commits/$PR_SHA/check-runs?filter=latest" --paginate \
+              --jq ".check_runs[] | select(.name == \"$GATE\") | .conclusion" | tail -1)
+
+            if [ -z "$CONCLUSION" ]; then
+              echo "  no '$GATE' check run on $PR_SHA yet — not merging"
+              continue
+            fi
+
+            if [ "$CONCLUSION" != "success" ]; then
+              echo "  '$GATE' concluded $CONCLUSION — not merging"
+
+              # One retry per run, and only for the run that just reported.
+              if [ "$EVENT_NAME" = "workflow_run" ] && [ "${RUN_ATTEMPT:-1}" -lt 2 ] && [ "$RERUN_REQUESTED" -eq 0 ]; then
+                echo "  re-running failed jobs once (attempt ${RUN_ATTEMPT:-1})"
+                if gh run rerun "$RUN_ID" --repo "$REPO" --failed; then
+                  RERUN_REQUESTED=1
+                else
+                  echo "  ✗ could not request a re-run; leaving the PR blocked"
+                fi
+              else
+                echo "  already retried (attempt ${RUN_ATTEMPT:-1}) — leaving it blocked for a human"
+              fi
+
+              continue
+            fi
+
+            echo "  ✓ '$GATE' passed — merging"
+            if retry_with_backoff gh pr merge "$PR_NUMBER" \
+              --repo "$REPO" \
               --squash \
-              --delete-branch 2>/dev/null; then
-              echo "  ✓ Auto-merge enabled for PR #$PR_NUMBER"
+              --delete-branch; then
+              echo "  ✓ merged PR #$PR_NUMBER"
             else
-              echo "  ✗ Failed to enable auto-merge for PR #$PR_NUMBER (may already have auto-merge enabled)"
+              echo "  ✗ merge failed for PR #$PR_NUMBER"
             fi
           done
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
