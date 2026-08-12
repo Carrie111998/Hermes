@@ -1602,6 +1602,174 @@ def _is_channel_dm_topic(
     return is_channel
 
 
+_MAX_SECTION_MESSAGES = 8
+_SECTION_HEADING_RE = re.compile(
+    r"(?:\*[^*\n]+\*|_[^_\n]+_|#{1,3}\s+\S.*)\s*$"
+)
+
+
+def _split_section_messages(content: str) -> list[str]:
+    """Split conservative top-level report sections without touching code fences.
+
+    This parser deliberately accepts only heading-only Slack emphasis lines and
+    Markdown H1--H3 lines.  Anything without at least two usable sections, or
+    a report that would create an accidental message burst, remains one payload.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return [content]
+
+    lines = content.splitlines(keepends=True)
+    headings: list[int] = []
+    fence: Optional[tuple[str, int]] = None
+    for index, line in enumerate(lines):
+        fence_match = re.match(r"\s*(([`~])\2{2,})", line)
+        if fence_match:
+            marker = fence_match.group(1)
+            marker_char = fence_match.group(2)
+            if fence is None:
+                fence = (marker_char, len(marker))
+            elif marker_char == fence[0] and len(marker) >= fence[1]:
+                fence = None
+            continue
+        if fence is None and _SECTION_HEADING_RE.fullmatch(line.rstrip("\r\n")):
+            headings.append(index)
+
+    if len(headings) < 2 or len(headings) > _MAX_SECTION_MESSAGES:
+        return [content]
+
+    sections: list[str] = []
+    preamble = "".join(lines[:headings[0]])
+    for position, start in enumerate(headings):
+        end = headings[position + 1] if position + 1 < len(headings) else len(lines)
+        segment = (preamble if position == 0 else "") + "".join(lines[start:end])
+        segment = segment.strip()
+        if segment:
+            sections.append(segment)
+
+    return sections if 2 <= len(sections) <= _MAX_SECTION_MESSAGES else [content]
+
+
+def _deliver_sectioned_slack_payloads(
+    *,
+    job: dict,
+    platform,
+    platform_name: str,
+    pconfig,
+    config,
+    adapters,
+    runtime_adapter,
+    loop,
+    chat_id: str,
+    thread_id: Optional[str],
+    payloads: list[str],
+    transport,
+) -> Optional[str]:
+    """Deliver Slack sections in order without retrying an aggregate payload.
+
+    A section whose live send never dispatched may use the existing standalone
+    transport.  An in-flight confirmation timeout is intentionally terminal:
+    re-sending could duplicate that section after earlier sections succeeded.
+    """
+    from tools.send_message_tool import _send_to_platform
+
+    confirmed = 0
+    live_ready = runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)()
+    router = route_target = route_metadata = None
+    if live_ready:
+        from gateway.delivery import DeliveryRouter, DeliveryTarget
+        router = DeliveryRouter(config, adapters)
+        route_target = DeliveryTarget(
+            platform=platform, chat_id=str(chat_id),
+            thread_id=str(thread_id) if thread_id is not None else None, is_explicit=True,
+        )
+        route_metadata = {"job_id": job["id"]}
+        if thread_id:
+            route_metadata["thread_id"] = str(thread_id)
+
+    def incomplete(reason: str) -> str:
+        return (
+            f"section delivery incomplete: {confirmed}/{len(payloads)} confirmed for "
+            f"{platform_name}:{chat_id}; {reason}"
+        )
+
+    for section_number, payload in enumerate(payloads, start=1):
+        fallback_needed = not live_ready
+        if live_ready:
+            assert router is not None and route_target is not None and route_metadata is not None
+            from agent.async_utils import safe_schedule_threadsafe
+            future = safe_schedule_threadsafe(
+                router._deliver_to_platform(route_target, payload, route_metadata), loop,
+            )
+            if future is None:
+                fallback_needed = True
+            else:
+                try:
+                    send_result = future.result(timeout=60)
+                except TimeoutError:
+                    if not future.cancel():
+                        return incomplete(
+                            f"section {section_number} was dispatched but confirmation is uncertain; not retried"
+                        )
+                    fallback_needed = True
+                except Exception as exc:
+                    logger.warning(
+                        "Job '%s': live section %s send to %s:%s failed: %s",
+                        job["id"], section_number, platform_name, chat_id, exc,
+                    )
+                    fallback_needed = True
+                else:
+                    if isinstance(send_result, dict):
+                        send_success = bool(send_result.get("success", False))
+                    else:
+                        send_success = _confirm_adapter_delivery(send_result)
+                    if send_success:
+                        confirmed += 1
+                        continue
+                    fallback_needed = True
+
+        if fallback_needed:
+            if transport is not None and transport.is_relay:
+                return incomplete(
+                    f"section {section_number} could not be confirmed through relay transport"
+                )
+            if _interpreter_shutting_down():
+                return incomplete(f"section {section_number} skipped — interpreter is shutting down")
+            coro = _send_to_platform(
+                platform, pconfig, chat_id, payload, thread_id=thread_id, media_files=[]
+            )
+            try:
+                result = asyncio.run(coro)
+            except RuntimeError as run_err:
+                # Match the aggregate path: an already-running event loop means
+                # this coroutine was never started, so close it and retry only
+                # this section in a fresh thread.
+                coro.close()
+                if _interpreter_shutting_down(run_err):
+                    return incomplete(f"section {section_number} skipped — interpreter is shutting down")
+                try:
+                    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                    try:
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform, pconfig, chat_id, payload,
+                                thread_id=thread_id, media_files=[],
+                            ),
+                        )
+                        result = future.result(timeout=30)
+                    finally:
+                        pool.shutdown(wait=False)
+                except Exception as exc:
+                    return incomplete(f"section {section_number} fallback failed: {exc}")
+            except Exception as exc:
+                return incomplete(f"section {section_number} fallback failed: {exc}")
+            if result and result.get("error"):
+                return incomplete(f"section {section_number} fallback failed: {result['error']}")
+            confirmed += 1
+
+    return None
+
+
 def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
@@ -1873,6 +2041,68 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # and (worse) suppresses the DM-fallback mirror via thread_seeded.
                 thread_id = new_thread_id
                 opened_thread_id = new_thread_id
+
+        # Opt-in Slack-only section delivery.  Build the payloads after target
+        # and continuation routing are resolved so every send uses the same
+        # logical platform, channel, and thread.  MEDIA delivery stays on the
+        # existing aggregate path to preserve one attachment transaction.
+        split_payloads = [cleaned_delivery_content.strip()]
+        split_requested = (
+            user_cfg is not None
+            and isinstance(user_cfg.get("cron", {}), dict)
+            and user_cfg.get("cron", {}).get("split_section_messages") is True
+            and not wrap_response
+            and platform == Platform.SLACK
+            and not media_files
+        )
+        if split_requested:
+            split_payloads = _split_section_messages(cleaned_delivery_content.strip())
+        if len(split_payloads) > 1:
+            section_error = _deliver_sectioned_slack_payloads(
+                job=job,
+                platform=platform,
+                platform_name=platform_name,
+                pconfig=pconfig,
+                config=config,
+                adapters=adapters,
+                runtime_adapter=runtime_adapter,
+                loop=loop,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                payloads=split_payloads,
+                transport=transport,
+            )
+            if section_error:
+                logger.warning("Job '%s': %s", job["id"], section_error)
+                delivery_errors.append(section_error)
+                continue
+
+            logger.info(
+                "Job '%s': delivered %s sections to %s:%s",
+                job["id"], len(split_payloads), platform_name, chat_id,
+            )
+            # The combined clean result is the continuation record.  Section
+            # sends are transport detail, not separate conversation turns.
+            if opened_thread_id and not thread_seeded:
+                _seed_cron_thread_session(
+                    job, runtime_adapter, platform_name, chat_id,
+                    opened_thread_id, mirror_text,
+                    chat_name=origin.get("chat_name"),
+                )
+                thread_seeded = True
+            if in_channel_surface and mirror_this_target and not thread_seeded:
+                inchannel_seeded = _seed_cron_channel_session(
+                    job, runtime_adapter, platform_name, chat_id,
+                    mirror_text, is_dm=is_dm_target,
+                    user_id=origin_user_id,
+                    chat_name=origin.get("chat_name"),
+                )
+            _maybe_mirror_cron_delivery(
+                job, platform_name, chat_id, mirror_text,
+                thread_id=thread_id, user_id=origin_user_id,
+                enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
+            )
+            continue
 
         if live_adapter_ready:
             # Telegram topic routing (#22773, regression fixed #52060): a

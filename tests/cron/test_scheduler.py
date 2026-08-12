@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, _split_section_messages, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -284,6 +284,145 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+
+
+class TestCronSlackSectionDelivery:
+    def _safe_media_path(self, tmp_path, monkeypatch, name, data=b"media"):
+        root = tmp_path / "media-cache"
+        media_file = root / name
+        media_file.parent.mkdir(parents=True, exist_ok=True)
+        media_file.write_bytes(data)
+        monkeypatch.setattr(
+            "gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS",
+            (root,),
+        )
+        return media_file.resolve()
+
+    def _slack_config(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        config = MagicMock()
+        config.platforms = {Platform.SLACK: pconfig}
+        return config
+
+    def test_parser_preserves_preamble_and_ignores_code_fences(self):
+        content = (
+            "Preamble\n"
+            "*Report*\nhealthy\n"
+            "```\n*not a heading*\n```\n"
+            "~~~\n*also not a heading*\n~~~\n"
+            "````\n```\n*still not a heading*\n````\n"
+            "## Actions\nreview approval\n"
+        )
+        assert _split_section_messages(content) == [
+            "Preamble\n*Report*\nhealthy\n```\n*not a heading*\n```\n~~~\n*also not a heading*\n~~~\n````\n```\n*still not a heading*\n````",
+            "## Actions\nreview approval",
+        ]
+
+    def test_parser_falls_back_for_no_or_excessive_sections(self):
+        plain = "ordinary report\nwith no boundary"
+        assert _split_section_messages(plain) == [plain]
+        excessive = "\n".join(f"*S{n}*\nbody" for n in range(9))
+        assert _split_section_messages(excessive) == [excessive]
+
+    def test_enabled_slack_sends_ordered_sections_to_same_thread(self):
+        from gateway.config import Platform
+
+        sent = AsyncMock(return_value={"success": True})
+        job = {"id": "sections", "deliver": "slack:C01234567:1700000000.000100"}
+        content = "Preamble\n*Report*\nhealthy\n*Actions*\nreview approval"
+        with (
+            patch("gateway.config.load_gateway_config", return_value=self._slack_config()),
+            patch("cron.scheduler.load_config", return_value={"cron": {
+                "wrap_response": False, "split_section_messages": True,
+            }}),
+            patch("tools.send_message_tool._send_to_platform", new=sent),
+        ):
+            assert _deliver_result(job, content) is None
+
+        assert sent.await_count == 2
+        assert [call.args[3] for call in sent.await_args_list] == [
+            "Preamble\n*Report*\nhealthy", "*Actions*\nreview approval",
+        ]
+        assert all(call.args[0] == Platform.SLACK for call in sent.await_args_list)
+        assert all(call.args[2] == "C01234567" for call in sent.await_args_list)
+        assert all(call.kwargs["thread_id"] == "1700000000.000100" for call in sent.await_args_list)
+
+    def test_default_off_and_non_slack_stay_single_message(self):
+        from gateway.config import Platform
+
+        for deliver, config in [
+            ("slack:C123", {"cron": {"wrap_response": False}}),
+            ("telegram:123", {"cron": {"wrap_response": False, "split_section_messages": True}}),
+        ]:
+            pconfig = MagicMock()
+            pconfig.enabled = True
+            gateway_config = MagicMock()
+            gateway_config.platforms = {Platform(deliver.split(":", 1)[0]): pconfig}
+            sent = AsyncMock(return_value={"success": True})
+            with (
+                patch("gateway.config.load_gateway_config", return_value=gateway_config),
+                patch("cron.scheduler.load_config", return_value=config),
+                patch("tools.send_message_tool._send_to_platform", new=sent),
+            ):
+                assert _deliver_result({"id": deliver, "deliver": deliver}, "*One*\na\n*Two*\nb") is None
+            sent.assert_awaited_once()
+
+    def test_media_delivery_stays_aggregate(self, tmp_path, monkeypatch):
+        media_path = self._safe_media_path(tmp_path, monkeypatch, "report.mp3")
+        sent = AsyncMock(return_value={"success": True})
+        content = f"*One*\na\nMEDIA:{media_path}\n*Two*\nb"
+        with (
+            patch("gateway.config.load_gateway_config", return_value=self._slack_config()),
+            patch("cron.scheduler.load_config", return_value={"cron": {
+                "wrap_response": False, "split_section_messages": True,
+            }}),
+            patch("tools.send_message_tool._send_to_platform", new=sent),
+        ):
+            assert _deliver_result({"id": "media", "deliver": "slack:C01234567"}, content) is None
+
+        sent.assert_awaited_once()
+        assert sent.await_args is not None
+        assert sent.await_args.kwargs["media_files"]
+
+    def test_live_timeout_after_second_section_reports_partial_without_resend(self):
+        from concurrent.futures import Future
+        from gateway.config import Platform
+
+        adapter = AsyncMock()
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        first = Future()
+        first.set_result(MagicMock(success=True))
+        second = Future()
+        second.result = MagicMock(side_effect=TimeoutError("timed out"))
+        second.cancel = MagicMock(return_value=False)
+        futures = iter([first, second])
+
+        def fake_schedule(coro, _loop):
+            coro.close()
+            return next(futures)
+
+        standalone = AsyncMock(return_value={"success": True})
+        with (
+            patch("gateway.config.load_gateway_config", return_value=self._slack_config()),
+            patch("cron.scheduler.load_config", return_value={"cron": {
+                "wrap_response": False, "split_section_messages": True,
+            }}),
+            patch("asyncio.run_coroutine_threadsafe", side_effect=fake_schedule),
+            patch("tools.send_message_tool._send_to_platform", new=standalone),
+        ):
+            result = _deliver_result(
+                {"id": "partial", "deliver": "slack:C123"}, "*One*\na\n*Two*\nb",
+                adapters={Platform.SLACK: adapter}, loop=loop,
+            )
+
+        assert result is not None
+        assert "section delivery incomplete: 1/2 confirmed" in result
+        assert "not retried" in result
+        standalone.assert_not_awaited()
 
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
