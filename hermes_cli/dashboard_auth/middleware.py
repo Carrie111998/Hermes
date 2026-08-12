@@ -16,6 +16,7 @@ binds.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Awaitable, Callable
 
@@ -297,6 +298,10 @@ def _verify_bearer(request: Request, *, access_token: str):
     401, so the desktop retries instead of dropping the user to full re-login.
     Unlike the cookie path there is no server-side refresh — the desktop owns
     its refresh token and rotates via ``/auth/native/refresh``.
+
+    Blocking: performs provider IDP I/O (``verify_session`` may re-fetch the
+    IDP's JWKS). Callers on the event loop must invoke it through
+    ``asyncio.to_thread``.
     """
     unreachable_provider: str | None = None
     for provider in list_session_providers():
@@ -356,7 +361,9 @@ async def gated_auth_middleware(
     bearer = _extract_bearer(request)
     if bearer:
         try:
-            bearer_session = _verify_bearer(request, access_token=bearer)
+            bearer_session = await asyncio.to_thread(
+                _verify_bearer, request, access_token=bearer
+            )
         except ProviderError as e:
             # At least one provider's IDP/JWKS was unreachable and none
             # verified the token — transient outage, not bad credentials.
