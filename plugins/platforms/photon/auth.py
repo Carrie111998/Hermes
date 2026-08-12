@@ -3,29 +3,29 @@ Photon Dashboard API client + device-code login flow.
 
 This module is pure Python — it intentionally does not depend on
 ``spectrum-ts``.  Every management-plane operation (login, find/create
-project, enable Spectrum, rotate the project secret, register a user,
-list the assigned iMessage line) talks to Photon's **Dashboard API** on a
-single host, exactly like the official Photon CLI (``photon-hq/cli``):
+project, rotate the project secret, register a user, list the assigned
+iMessage line) talks to Photon's **Dashboard API** on a single host,
+exactly like the official Photon CLI (``photon-hq/cli``):
 
     Dashboard API   https://app.photon.codes/api/...
                     OAuth 2.0 device flow, Bearer access token
 
-A Photon project carries two distinct identifiers:
-
-    * ``id``                — the Dashboard project id (used in API paths)
-    * ``spectrumProjectId`` — the Spectrum Cloud project id, populated when
-                              Spectrum is enabled on the project
+A Photon project has a single identifier: the dashboard ``id`` *is* the
+Spectrum Cloud project id. They used to diverge (a separate
+``spectrumProjectId`` field), but the dashboard unified them — every
+project is created with matching ids and the pre-existing diverged rows
+were backfilled so ``project.id == spectrumProjectId`` everywhere
+(dashboard ENG-1582). Spectrum is always enabled and provisioned at
+create-time, so there is no enable/toggle step anymore.
 
 The ``spectrum-ts`` SDK (run by the Node sidecar) authenticates to Spectrum
-Cloud with ``(spectrumProjectId, projectSecret)`` — so the value we persist
-as ``PHOTON_PROJECT_ID`` for the runtime is the **spectrumProjectId**, not
-the Dashboard ``id``.  The Dashboard ``id`` is kept only for management
-calls.
+Cloud with ``(id, projectSecret)`` — the same ``id`` used in Dashboard API
+paths — which we persist as ``PHOTON_PROJECT_ID`` for the runtime.
 
 Credential storage mirrors every other Hermes channel:
 
     * runtime SDK creds  -> ``~/.hermes/.env``  (``PHOTON_PROJECT_ID`` =
-      spectrumProjectId, ``PHOTON_PROJECT_SECRET``) via ``save_env_value``
+      project id, ``PHOTON_PROJECT_SECRET``) via ``save_env_value``
     * management metadata -> ``~/.hermes/auth.json`` under
       ``credential_pool.photon`` (device token),
       ``credential_pool.photon_project`` (dashboard id, spectrum id, name), and
@@ -40,7 +40,9 @@ import json
 import logging
 import os
 import re
+import stat
 import time
+import uuid
 from base64 import b64encode
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +52,30 @@ try:
     import httpx
 except ImportError:  # pragma: no cover - httpx is a hermes dependency
     httpx = None  # type: ignore[assignment]
+
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
 
 logger = logging.getLogger(__name__)
 
@@ -109,14 +135,46 @@ def _load_auth() -> Dict[str, Any]:
 def _save_auth(data: Dict[str, Any]) -> None:
     path = _auth_json_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
+    # Per-process random temp suffix avoids collisions between concurrent
+    # writers and stale leftovers from a crashed prior write.
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    # Create with 0o600 atomically via os.open(O_EXCL) + fdopen: the old
+    # open() → write → chmod() sequence left a window where the bearer
+    # token sat world-readable at process umask (typically 0o644), and the
+    # predictable temp name could be pre-planted (symlink attack). Mirrors
+    # hermes_cli/auth.py:_save_auth_store (#19673, #21148).
+    fd = os.open(
+        str(tmp),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        # os.fdopen() failed before taking ownership of the raw descriptor,
+        # so nothing else will ever close it — do it here, then drop the
+        # just-created temp file.
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+    try:
+        with fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def load_photon_token() -> Optional[str]:
@@ -136,11 +194,56 @@ def load_photon_token() -> Optional[str]:
 
 def store_photon_token(token: str) -> None:
     """Persist a dashboard bearer token under ``credential_pool.photon``."""
+    from hermes_cli.auth import _auth_store_lock
+
+    with _auth_store_lock():
+        auth = _load_auth()
+        auth.setdefault("credential_pool", {})["photon"] = [
+            {"access_token": token, "issued_at": int(time.time())}
+        ]
+        _save_auth(auth)
+
+
+def clear_photon_token() -> None:
+    """Remove any stored Photon dashboard token from auth.json.
+
+    Used to discard a stale/expired token before re-authentication.
+    """
     auth = _load_auth()
-    auth.setdefault("credential_pool", {})["photon"] = [
-        {"access_token": token, "issued_at": int(time.time())}
-    ]
-    _save_auth(auth)
+    pool = auth.get("credential_pool", {})
+    photon = pool.get("photon", [])
+    if isinstance(photon, list) and photon:
+        pool["photon"] = []
+        _save_auth(auth)
+    # Also clear the legacy shape if present.
+    providers = auth.get("providers", {})
+    if "photon" in providers:
+        providers["photon"] = {}
+        _save_auth(auth)
+
+
+def check_photon_token_valid(token: str) -> bool:
+    """Return True if the token is accepted by the dashboard API.
+
+    Delegates to :func:`validate_photon_token`, which checks both
+    ``/api/auth/get-session`` and ``/api/projects/`` — the device flow can
+    mint tokens that pass the session lookup but are rejected by the project
+    APIs, and setup's management calls all hit the project APIs.  A
+    definitive rejection (``PhotonDashboardAuthError``) is treated as stale;
+    transient failures (network blips, 5xx) are treated as "probably valid"
+    so they don't force an unnecessary re-login.
+    """
+    if not token:
+        return False
+    try:
+        validate_photon_token(token)
+        return True
+    except PhotonDashboardAuthError:
+        return False
+    except Exception:
+        # Transient error — don't force a re-auth; let the caller's
+        # management-call error propagate if the token really is bad.
+        return True
 
 
 def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
@@ -148,11 +251,11 @@ def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
 
     Precedence: process env (``~/.hermes/.env`` is loaded into the gateway's
     environment at startup) wins, then ``auth.json`` for offline / status
-    use.  This is the pair the Node sidecar feeds to ``spectrum-ts`` — the id
-    is the **spectrumProjectId**, not the Dashboard id.
+    use.  This is the pair the Node sidecar feeds to ``spectrum-ts``; the id
+    is the unified project id (dashboard id == spectrumProjectId).
     """
     env_id = os.getenv("PHOTON_PROJECT_ID")
-    env_sec = os.getenv("PHOTON_PROJECT_SECRET")
+    env_sec = _get_scoped_secret("PHOTON_PROJECT_SECRET")
     if env_id and env_sec:
         return env_id, env_sec
     auth = _load_auth()
@@ -166,14 +269,26 @@ def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
 
 
 def load_dashboard_project_id() -> Optional[str]:
-    """Return the Dashboard project id (for management API calls)."""
+    """Return the project id used for management API calls.
+
+    Post-unification the dashboard id and the Spectrum id are the same value,
+    so we prefer the stored ``spectrum_project_id``: for pre-backfill installs
+    the old ``dashboard_project_id`` is the diverged id that the unification
+    rewrote (it now 404s), while the Spectrum id always matches the live row.
+    Falls back to the legacy keys for older records.
+    """
     env_id = os.getenv("PHOTON_DASHBOARD_PROJECT_ID")
     if env_id:
         return env_id
     auth = _load_auth()
     proj = auth.get("credential_pool", {}).get("photon_project") or []
     if isinstance(proj, list) and proj:
-        return proj[0].get("dashboard_project_id") or proj[0].get("project_id")
+        entry = proj[0]
+        return (
+            entry.get("spectrum_project_id")
+            or entry.get("dashboard_project_id")
+            or entry.get("project_id")
+        )
     return None
 
 
@@ -193,18 +308,21 @@ def store_project_credentials(
     ``auth.json`` so management commands work even when ``.env`` hasn't been
     loaded into the current process.
     """
-    auth = _load_auth()
-    record: Dict[str, Any] = {
-        "spectrum_project_id": spectrum_project_id,
-        "project_secret": project_secret,
-        "issued_at": int(time.time()),
-    }
-    if dashboard_project_id:
-        record["dashboard_project_id"] = dashboard_project_id
-    if name:
-        record["name"] = name
-    auth.setdefault("credential_pool", {})["photon_project"] = [record]
-    _save_auth(auth)
+    from hermes_cli.auth import _auth_store_lock
+
+    with _auth_store_lock():
+        auth = _load_auth()
+        record: Dict[str, Any] = {
+            "spectrum_project_id": spectrum_project_id,
+            "project_secret": project_secret,
+            "issued_at": int(time.time()),
+        }
+        if dashboard_project_id:
+            record["dashboard_project_id"] = dashboard_project_id
+        if name:
+            record["name"] = name
+        auth.setdefault("credential_pool", {})["photon_project"] = [record]
+        _save_auth(auth)
     _persist_runtime_env(spectrum_project_id, project_secret)
 
 
@@ -218,18 +336,21 @@ def store_user_numbers(
     """Persist non-secret Photon user numbers for offline ``status`` output."""
     if not phone_number and not assigned_phone_number:
         return
-    auth = _load_auth()
-    record: Dict[str, Any] = {"issued_at": int(time.time())}
-    if phone_number:
-        record["phone_number"] = phone_number
-    if assigned_phone_number:
-        record["assigned_phone_number"] = assigned_phone_number
-    if user_id:
-        record["user_id"] = user_id
-    if dashboard_project_id:
-        record["dashboard_project_id"] = dashboard_project_id
-    auth.setdefault("credential_pool", {})["photon_user"] = [record]
-    _save_auth(auth)
+    from hermes_cli.auth import _auth_store_lock
+
+    with _auth_store_lock():
+        auth = _load_auth()
+        record: Dict[str, Any] = {"issued_at": int(time.time())}
+        if phone_number:
+            record["phone_number"] = phone_number
+        if assigned_phone_number:
+            record["assigned_phone_number"] = assigned_phone_number
+        if user_id:
+            record["user_id"] = user_id
+        if dashboard_project_id:
+            record["dashboard_project_id"] = dashboard_project_id
+        auth.setdefault("credential_pool", {})["photon_user"] = [record]
+        _save_auth(auth)
 
 
 def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:
@@ -646,64 +767,42 @@ def find_project_by_name(token: str, name: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_project(token: str, project_id: str) -> Dict[str, Any]:
-    """GET ``/api/projects/{id}`` — includes ``spectrum`` + ``spectrumProjectId``."""
-    if httpx is None:
-        raise RuntimeError("httpx is required for Photon")
-    url = f"{_dashboard_host()}/api/projects/{project_id}"
-    resp = httpx.get(url, headers=_bearer(token), timeout=30.0)
-    resp.raise_for_status()
-    return resp.json() or {}
-
-
 def create_project(
     token: str,
     *,
     name: str = DEFAULT_PROJECT_NAME,
     location: str = "United States",
 ) -> Dict[str, Any]:
-    """POST ``/api/projects`` with ``spectrum: true`` and return ``{success, id}``."""
+    """POST ``/api/projects`` and return ``{success, id}``.
+
+    Spectrum is always provisioned at create-time, so the request body no
+    longer carries a ``spectrum`` flag (the field was dropped from the API).
+    """
     if httpx is None:
         raise RuntimeError("httpx is required for Photon project creation")
     url = f"{_dashboard_host()}/api/projects"
     body: Dict[str, Any] = {
         "name": name,
         "location": location,
-        "spectrum": True,
         "template": False,
         "observability": False,
     }
     resp = httpx.post(url, json=body, headers=_bearer(token), timeout=30.0)
     resp.raise_for_status()
     data = resp.json() or {}
+    if not isinstance(data, dict):
+        raise RuntimeError("Photon create-project returned an unexpected response")
     if data.get("error"):
         raise RuntimeError(f"Photon create-project failed: {data['error']}")
-    if not data.get("id"):
-        raise RuntimeError("Photon create-project did not return a project id")
-    return data
-
-
-def ensure_spectrum_enabled(token: str, project_id: str) -> Dict[str, Any]:
-    """Enable Spectrum on the project if needed; return the project dict.
-
-    The dashboard exposes Spectrum as a toggle, so we only flip it when
-    ``spectrum`` is currently false, then re-fetch to pick up the freshly
-    populated ``spectrumProjectId``.
-    """
-    if httpx is None:
-        raise RuntimeError("httpx is required for Photon")
-    proj = get_project(token, project_id)
-    if not proj.get("spectrum"):
-        url = f"{_dashboard_host()}/api/projects/{project_id}/spectrum/toggle"
-        resp = httpx.post(url, json={}, headers=_bearer(token), timeout=30.0)
-        resp.raise_for_status()
-        proj = get_project(token, project_id)
-    if not proj.get("spectrumProjectId"):
+    if data.get("succeed") is False:
         raise RuntimeError(
-            "Spectrum is enabled but the project has no spectrumProjectId yet — "
-            "retry in a moment, or enable Spectrum from the dashboard."
+            f"Photon create-project failed: {data.get('message') or data}"
         )
-    return proj
+    project_candidate = data.get("data")
+    project: Dict[str, Any] = project_candidate if isinstance(project_candidate, dict) else data
+    if not project.get("id"):
+        raise RuntimeError("Photon create-project did not return a project id")
+    return project
 
 
 def regenerate_project_secret(token: str, project_id: str) -> str:
@@ -1007,8 +1106,9 @@ def print_credential_summary(emit: Any = print) -> None:
         else "✗ missing (run `hermes photon setup`)"
     )
     sid, sec = load_project_credentials()
-    labels["spectrum_project_id"] = sid if sid else "✗ missing"
-    labels["dashboard_project_id"] = load_dashboard_project_id() or "—"
+    # Dashboard id and Spectrum id are the same value now (ids unified), so
+    # there's a single project id to show.
+    labels["project_id"] = sid if sid else "✗ missing"
     labels["project_key"] = "✓ stored" if sec else "✗ missing"
     phone, assigned = load_user_numbers()
     labels["phone_number"] = (
@@ -1022,8 +1122,7 @@ def print_credential_summary(emit: Any = print) -> None:
         "Photon iMessage status",
         "──────────────────────",
         "  device token        : " + labels["device_token"],
-        "  dashboard project   : " + labels["dashboard_project_id"],
-        "  spectrum project id : " + labels["spectrum_project_id"],
+        "  project id          : " + labels["project_id"],
         "  project secret      : " + labels["project_key"],
         "  my number           : " + labels["phone_number"],
         "  assigned number     : " + labels["assigned_phone_number"],
@@ -1039,7 +1138,7 @@ def credential_summary() -> Dict[str, str]:
             else "✗ missing (run `hermes photon setup`)"
         )
 
-    def _present_spectrum_id() -> str:
+    def _present_project_id() -> str:
         sid, _sec = load_project_credentials()
         return sid or "✗ missing"
 
@@ -1057,8 +1156,7 @@ def credential_summary() -> Dict[str, str]:
 
     return {
         "device_token": _present_token(),
-        "dashboard_project_id": load_dashboard_project_id() or "—",
-        "spectrum_project_id": _present_spectrum_id(),
+        "project_id": _present_project_id(),
         "project_key": _present_secret(),
         "phone_number": _present_phone(),
         "assigned_phone_number": _present_assigned_phone(),
